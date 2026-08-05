@@ -320,6 +320,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "cas_app_server_contract_data", .module = cas_app_server_contract_data.createModule() },
+            .{ .name = "definition_core", .module = definition_core },
         },
     });
     const cas_budget_governor_root = b.createModule(.{

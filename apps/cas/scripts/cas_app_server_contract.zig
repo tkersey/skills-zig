@@ -1,4 +1,5 @@
 const std = @import("std");
+const definition_core = @import("definition_core");
 
 pub const baseline_json = @import("cas_app_server_contract_data").json;
 
@@ -6,6 +7,704 @@ const max_methods = 256;
 const max_shapes = 64;
 const max_documents = 64;
 const max_document_bytes = 8 * 1024 * 1024;
+
+const cache_schema = "cas-app-server-schema-cache/v1";
+const default_contract_id = "codex-app-server-0.146.0";
+const max_cache_documents: usize = 768;
+const max_cache_file_bytes: u64 = 8 * 1024 * 1024;
+const max_cache_total_bytes: u64 = 64 * 1024 * 1024;
+const max_cache_relative_path: usize = 4096;
+const max_binary_bytes: u64 = 512 * 1024 * 1024;
+const max_manifest_bytes: usize = 64 * 1024;
+
+pub const CodexVersion = struct {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    text: []u8,
+    banner: []u8,
+    pre: ?[]const u8,
+    build: ?[]const u8,
+
+    pub fn deinit(self: *CodexVersion, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.banner);
+        self.* = undefined;
+    }
+
+    pub fn prerelease(self: CodexVersion) bool {
+        return self.pre != null;
+    }
+};
+
+pub const ExecutableIdentity = struct {
+    resolved_path: [:0]u8,
+    path_fingerprint: []u8,
+    binary_digest: []u8,
+    inode: u64,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+
+    pub fn deinit(self: *ExecutableIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolved_path);
+        allocator.free(self.path_fingerprint);
+        allocator.free(self.binary_digest);
+        self.* = undefined;
+    }
+};
+
+pub const CachedSchemas = struct {
+    cache_path: []u8,
+    stable_path: []u8,
+    experimental_path: []u8,
+    stable_digest: []u8,
+    experimental_digest: []u8,
+    stable_file_count: usize,
+    stable_byte_count: u64,
+    experimental_file_count: usize,
+    experimental_byte_count: u64,
+    version: CodexVersion,
+    executable: ExecutableIdentity,
+    hit: bool,
+    _lock_io: std.Io,
+    _lock_file: std.Io.File,
+
+    pub fn deinit(self: *CachedSchemas, allocator: std.mem.Allocator) void {
+        allocator.free(self.cache_path);
+        allocator.free(self.stable_path);
+        allocator.free(self.experimental_path);
+        allocator.free(self.stable_digest);
+        allocator.free(self.experimental_digest);
+        self.version.deinit(allocator);
+        self.executable.deinit(allocator);
+        self._lock_file.unlock(self._lock_io);
+        self._lock_file.close(self._lock_io);
+        self.* = undefined;
+    }
+};
+
+pub const CacheOptions = struct {
+    cache_root: []const u8,
+    codex_path: ?[]const u8 = null,
+    contract_id: []const u8 = default_contract_id,
+};
+
+const CacheLimits = struct {
+    version_timeout_ms: u64 = 5_000,
+    version_stdout_bytes: usize = 4 * 1024,
+    version_stderr_bytes: usize = 16 * 1024,
+    generator_timeout_ms: u64 = 30_000,
+    generator_stdout_bytes: usize = 64 * 1024,
+    generator_stderr_bytes: usize = 64 * 1024,
+    lock_timeout_ms: u64 = 5_000,
+    lock_retry_ms: u64 = 25,
+    binary_bytes: u64 = max_binary_bytes,
+    bundle_documents: usize = max_cache_documents,
+    bundle_file_bytes: u64 = max_cache_file_bytes,
+    bundle_total_bytes: u64 = max_cache_total_bytes,
+    bundle_path_bytes: usize = max_cache_relative_path,
+};
+
+const BundleDigest = struct {
+    digest: []u8,
+    file_count: usize,
+    byte_count: u64,
+
+    fn deinit(self: *BundleDigest, allocator: std.mem.Allocator) void {
+        allocator.free(self.digest);
+    }
+};
+
+const ManifestView = struct {
+    stable_digest: []u8,
+    stable_file_count: usize,
+    stable_byte_count: u64,
+    experimental_digest: []u8,
+    experimental_file_count: usize,
+    experimental_byte_count: u64,
+};
+
+pub fn ensureSchemaCache(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: CacheOptions,
+) !CachedSchemas {
+    return ensureSchemaCacheWithLimits(allocator, io, options, .{});
+}
+
+fn ensureSchemaCacheWithLimits(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: CacheOptions,
+    limits: CacheLimits,
+) !CachedSchemas {
+    if (options.cache_root.len == 0 or options.contract_id.len == 0) return error.InvalidCacheOptions;
+    const cache_root = try absoluteCacheRootAlloc(allocator, io, options.cache_root);
+    defer allocator.free(cache_root);
+
+    var identity = try resolveExecutableIdentity(allocator, io, options.codex_path, limits.binary_bytes);
+    errdefer identity.deinit(allocator);
+    var version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
+    errdefer version.deinit(allocator);
+    if (version.prerelease()) return error.PrereleaseCodex;
+    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+
+    const path_hex = identity.path_fingerprint["sha256:".len..];
+    const executable_root = try std.fs.path.join(allocator, &.{ cache_root, path_hex });
+    defer allocator.free(executable_root);
+    try std.Io.Dir.cwd().createDirPath(io, executable_root);
+    const lock_path = try std.fs.path.join(allocator, &.{ executable_root, ".lock" });
+    defer allocator.free(lock_path);
+    var lock = try acquireCacheLock(io, lock_path, limits);
+    errdefer {
+        lock.unlock(io);
+        lock.close(io);
+    }
+
+    // Bind the generation to the identity and banner observed after lock acquisition.
+    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+    const cache_path = try std.fs.path.join(allocator, &.{ executable_root, version.text });
+    errdefer allocator.free(cache_path);
+    const stable_path = try std.fs.path.join(allocator, &.{ cache_path, "stable" });
+    errdefer allocator.free(stable_path);
+    const experimental_path = try std.fs.path.join(allocator, &.{ cache_path, "experimental" });
+    errdefer allocator.free(experimental_path);
+
+    if (try validateCacheHit(allocator, io, cache_path, &identity, version, options.contract_id, limits)) |manifest| {
+        return .{
+            .cache_path = cache_path,
+            .stable_path = stable_path,
+            .experimental_path = experimental_path,
+            .stable_digest = manifest.stable_digest,
+            .experimental_digest = manifest.experimental_digest,
+            .stable_file_count = manifest.stable_file_count,
+            .stable_byte_count = manifest.stable_byte_count,
+            .experimental_file_count = manifest.experimental_file_count,
+            .experimental_byte_count = manifest.experimental_byte_count,
+            .version = version,
+            .executable = identity,
+            .hit = true,
+            ._lock_io = io,
+            ._lock_file = lock,
+        };
+    }
+
+    const nonce = std.Io.Clock.awake.now(io).nanoseconds;
+    const staging_path = try std.fmt.allocPrint(allocator, "{s}.staging.{d}", .{ cache_path, nonce });
+    defer allocator.free(staging_path);
+    try std.Io.Dir.cwd().deleteTree(io, staging_path);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
+    const staging_stable = try std.fs.path.join(allocator, &.{ staging_path, "stable" });
+    defer allocator.free(staging_stable);
+    const staging_experimental = try std.fs.path.join(allocator, &.{ staging_path, "experimental" });
+    defer allocator.free(staging_experimental);
+    try std.Io.Dir.cwd().createDirPath(io, staging_stable);
+    try std.Io.Dir.cwd().createDirPath(io, staging_experimental);
+
+    try generateBundle(allocator, io, identity.resolved_path, staging_stable, false, limits);
+    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+    try generateBundle(allocator, io, identity.resolved_path, staging_experimental, true, limits);
+    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+    var final_version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
+    defer final_version.deinit(allocator);
+    if (!versionsEqual(version, final_version)) return error.ExecutableChanged;
+    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+
+    var stable = try digestBundle(allocator, io, staging_stable, limits);
+    defer stable.deinit(allocator);
+    var experimental = try digestBundle(allocator, io, staging_experimental, limits);
+    defer experimental.deinit(allocator);
+    const manifest = try manifestAlloc(allocator, &identity, version, options.contract_id, stable, experimental);
+    defer allocator.free(manifest);
+    if (manifest.len > max_manifest_bytes) return error.ManifestTooLarge;
+    const manifest_path = try std.fs.path.join(allocator, &.{ staging_path, "preflight.json" });
+    defer allocator.free(manifest_path);
+    try writeSyncedFile(io, manifest_path, manifest);
+    try syncDirectory(io, staging_stable);
+    try syncDirectory(io, staging_experimental);
+    try syncDirectory(io, staging_path);
+    try promoteCacheDirectory(allocator, io, staging_path, cache_path, nonce);
+
+    const owned_stable_digest = try allocator.dupe(u8, stable.digest);
+    errdefer allocator.free(owned_stable_digest);
+    const owned_experimental_digest = try allocator.dupe(u8, experimental.digest);
+    return .{
+        .cache_path = cache_path,
+        .stable_path = stable_path,
+        .experimental_path = experimental_path,
+        .stable_digest = owned_stable_digest,
+        .experimental_digest = owned_experimental_digest,
+        .stable_file_count = stable.file_count,
+        .stable_byte_count = stable.byte_count,
+        .experimental_file_count = experimental.file_count,
+        .experimental_byte_count = experimental.byte_count,
+        .version = version,
+        .executable = identity,
+        .hit = false,
+        ._lock_io = io,
+        ._lock_file = lock,
+    };
+}
+
+fn absoluteCacheRootAlloc(allocator: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(raw)) return std.fs.path.resolve(allocator, &.{raw});
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, raw });
+}
+
+fn parseCodexVersion(allocator: std.mem.Allocator, raw: []const u8) !CodexVersion {
+    if (raw.len == 0 or raw[raw.len - 1] != '\n' or std.mem.countScalar(u8, raw, '\n') != 1 or
+        std.mem.indexOfScalar(u8, raw, '\r') != null)
+        return error.InvalidCodexVersion;
+    const banner = raw[0 .. raw.len - 1];
+    const prefix = "codex-cli ";
+    if (!std.mem.startsWith(u8, banner, prefix)) return error.InvalidCodexVersion;
+    const semver = banner[prefix.len..];
+    if (semver.len == 0 or std.mem.indexOfScalar(u8, semver, ' ') != null or
+        std.mem.indexOfScalar(u8, semver, '\t') != null)
+        return error.InvalidCodexVersion;
+
+    const plus = std.mem.indexOfScalar(u8, semver, '+');
+    const without_build = if (plus) |index| semver[0..index] else semver;
+    const dash = std.mem.indexOfScalar(u8, without_build, '-');
+    const core = if (dash) |index| without_build[0..index] else without_build;
+    const pre_slice = if (dash) |index| without_build[index + 1 ..] else null;
+    const build_slice = if (plus) |index| semver[index + 1 ..] else null;
+    if ((pre_slice != null and !validSemverIdentifiers(pre_slice.?)) or
+        (build_slice != null and !validSemverIdentifiers(build_slice.?)))
+        return error.InvalidCodexVersion;
+    var parts = std.mem.splitScalar(u8, core, '.');
+    const major_text = parts.next() orelse return error.InvalidCodexVersion;
+    const minor_text = parts.next() orelse return error.InvalidCodexVersion;
+    const patch_text = parts.next() orelse return error.InvalidCodexVersion;
+    if (parts.next() != null or !validCoreNumber(major_text) or !validCoreNumber(minor_text) or !validCoreNumber(patch_text))
+        return error.InvalidCodexVersion;
+
+    const owned_text = try allocator.dupe(u8, semver);
+    errdefer allocator.free(owned_text);
+    const pre = if (dash) |index| owned_text[index + 1 .. (plus orelse semver.len)] else null;
+    const build = if (plus) |index| owned_text[index + 1 ..] else null;
+    return .{
+        .major = std.fmt.parseUnsigned(u64, major_text, 10) catch return error.InvalidCodexVersion,
+        .minor = std.fmt.parseUnsigned(u64, minor_text, 10) catch return error.InvalidCodexVersion,
+        .patch = std.fmt.parseUnsigned(u64, patch_text, 10) catch return error.InvalidCodexVersion,
+        .text = owned_text,
+        .banner = try allocator.dupe(u8, banner),
+        .pre = pre,
+        .build = build,
+    };
+}
+
+fn validCoreNumber(text: []const u8) bool {
+    if (text.len == 0 or (text.len > 1 and text[0] == '0')) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn validSemverIdentifiers(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return false;
+        for (part) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+    }
+    return true;
+}
+
+fn readCodexVersion(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, limits: CacheLimits) !CodexVersion {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ executable, "--version" },
+        .stdout_limit = .limited(limits.version_stdout_bytes),
+        .stderr_limit = .limited(limits.version_stderr_bytes),
+        .timeout = .{ .deadline = awakeDeadline(io, limits.version_timeout_ms) },
+    }) catch |err| return mapProcessError(err);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (!termSucceeded(result.term)) return error.CodexVersionFailed;
+    if (result.stderr.len != 0) return error.CodexVersionFailed;
+    return parseCodexVersion(allocator, result.stdout);
+}
+
+fn generateBundle(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, output: []const u8, experimental: bool, limits: CacheLimits) !void {
+    const argv: []const []const u8 = if (experimental)
+        &.{ executable, "app-server", "generate-json-schema", "--experimental", "--out", output }
+    else
+        &.{ executable, "app-server", "generate-json-schema", "--out", output };
+    const result = std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(limits.generator_stdout_bytes),
+        .stderr_limit = .limited(limits.generator_stderr_bytes),
+        .timeout = .{ .deadline = awakeDeadline(io, limits.generator_timeout_ms) },
+    }) catch |err| return mapProcessError(err);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (!termSucceeded(result.term)) return error.SchemaGenerationFailed;
+}
+
+fn mapProcessError(err: anyerror) anyerror {
+    return switch (err) {
+        error.Timeout => error.ProcessTimedOut,
+        error.StreamTooLong => error.ProcessOutputTooLarge,
+        else => err,
+    };
+}
+
+fn awakeDeadline(io: std.Io, milliseconds: u64) std.Io.Clock.Timestamp {
+    return .fromNow(io, .{
+        .raw = .fromMilliseconds(@intCast(milliseconds)),
+        .clock = .awake,
+    });
+}
+
+fn termSucceeded(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn versionsEqual(left: CodexVersion, right: CodexVersion) bool {
+    return std.mem.eql(u8, left.text, right.text) and std.mem.eql(u8, left.banner, right.banner);
+}
+
+fn resolveExecutableIdentity(allocator: std.mem.Allocator, io: std.Io, explicit_path: ?[]const u8, binary_limit: u64) !ExecutableIdentity {
+    const candidate = if (explicit_path) |path|
+        try allocator.dupe(u8, path)
+    else
+        try findOnPath(allocator, io, "codex");
+    defer allocator.free(candidate);
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator);
+    errdefer allocator.free(resolved);
+    var file = try std.Io.Dir.openFileAbsolute(io, resolved, .{ .follow_symlinks = false, .allow_directory = false });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.InvalidCodexExecutable;
+    if (!hasExecutablePermission(stat.permissions)) return error.InvalidCodexExecutable;
+    if (stat.size > binary_limit) return error.CodexBinaryTooLarge;
+    const binary_digest = try fileDigestAlloc(allocator, io, file, binary_limit);
+    errdefer allocator.free(binary_digest);
+    return .{
+        .resolved_path = resolved,
+        .path_fingerprint = try digestAlloc(allocator, resolved),
+        .binary_digest = binary_digest,
+        .inode = @intCast(stat.inode),
+        .size = stat.size,
+        .mtime_ns = stat.mtime.nanoseconds,
+        .ctime_ns = stat.ctime.nanoseconds,
+    };
+}
+
+fn findOnPath(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
+    const path_value = std.Io.Threaded.global_single_threaded.environString("PATH") orelse return error.CodexNotFound;
+    var components = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (components.next()) |component| {
+        const directory = if (component.len == 0) "." else component;
+        const candidate = try std.fs.path.join(allocator, &.{ directory, name });
+        var file = std.Io.Dir.cwd().openFile(io, candidate, .{ .allow_directory = false }) catch {
+            allocator.free(candidate);
+            continue;
+        };
+        defer file.close(io);
+        const stat = file.stat(io) catch {
+            allocator.free(candidate);
+            continue;
+        };
+        if (stat.kind != .file or !hasExecutablePermission(stat.permissions)) {
+            allocator.free(candidate);
+            continue;
+        }
+        return candidate;
+    }
+    return error.CodexNotFound;
+}
+
+fn hasExecutablePermission(permissions: std.Io.File.Permissions) bool {
+    if (comptime std.Io.File.Permissions.has_executable_bit) return permissions.toMode() & 0o111 != 0;
+    return true;
+}
+
+fn requireIdentityUnchanged(allocator: std.mem.Allocator, io: std.Io, expected: *const ExecutableIdentity, binary_limit: u64) !void {
+    var actual = try resolveExecutableIdentity(allocator, io, expected.resolved_path, binary_limit);
+    defer actual.deinit(allocator);
+    if (!identitiesEqual(expected.*, actual)) return error.ExecutableChanged;
+}
+
+fn identitiesEqual(left: ExecutableIdentity, right: ExecutableIdentity) bool {
+    return std.mem.eql(u8, left.resolved_path, right.resolved_path) and
+        std.mem.eql(u8, left.path_fingerprint, right.path_fingerprint) and
+        std.mem.eql(u8, left.binary_digest, right.binary_digest) and
+        left.inode == right.inode and left.size == right.size and
+        left.mtime_ns == right.mtime_ns and left.ctime_ns == right.ctime_ns;
+}
+
+fn fileDigestAlloc(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, limit: u64) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &buffer);
+    var total: u64 = 0;
+    while (true) {
+        const slice = reader.interface.peek(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        total = std.math.add(u64, total, slice.len) catch return error.CodexBinaryTooLarge;
+        if (total > limit) return error.CodexBinaryTooLarge;
+        hasher.update(slice);
+        reader.interface.toss(slice.len);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digestBytesAlloc(allocator, &digest);
+}
+
+fn digestAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digestBytesAlloc(allocator, &digest);
+}
+
+fn digestBytesAlloc(allocator: std.mem.Allocator, digest: *const [32]u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "sha256:{x}", .{digest.*});
+}
+
+fn acquireCacheLock(io: std.Io, path: []const u8, limits: CacheLimits) !std.Io.File {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+    errdefer file.close(io);
+    const deadline = awakeDeadline(io, limits.lock_timeout_ms);
+    while (!(try file.tryLock(io, .exclusive))) {
+        if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.CacheLockTimedOut;
+        std.Io.sleep(io, .fromMilliseconds(@intCast(limits.lock_retry_ms)), .awake) catch {};
+    }
+    return file;
+}
+
+const BundleFile = struct {
+    path: []u8,
+    digest: [32]u8,
+};
+
+fn digestBundle(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, limits: CacheLimits) !BundleDigest {
+    var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
+    defer root.close(io);
+    var walker = try root.walk(allocator);
+    defer walker.deinit();
+    var files: std.ArrayList(BundleFile) = .empty;
+    defer {
+        for (files.items) |file| allocator.free(file.path);
+        files.deinit(allocator);
+    }
+    var total_bytes: u64 = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.path.len > limits.bundle_path_bytes) return error.BundlePathTooLong;
+        switch (entry.kind) {
+            .directory => {},
+            .file => {
+                if (!std.mem.endsWith(u8, entry.path, ".json")) return error.InvalidBundleEntry;
+                if (files.items.len == limits.bundle_documents) return error.BundleTooManyFiles;
+                var file = try entry.dir.openFile(io, entry.basename, .{ .follow_symlinks = false, .allow_directory = false });
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.kind != .file) return error.InvalidBundleEntry;
+                if (stat.size > limits.bundle_file_bytes) return error.BundleFileTooLarge;
+                total_bytes = std.math.add(u64, total_bytes, stat.size) catch return error.BundleTooLarge;
+                if (total_bytes > limits.bundle_total_bytes) return error.BundleTooLarge;
+                const raw = try readFileBounded(allocator, io, file, @intCast(limits.bundle_file_bytes));
+                defer allocator.free(raw);
+                var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidBundleJson;
+                defer parsed.deinit();
+                const canonical = try definition_core.canonical_json.canonicalJsonAlloc(allocator, parsed.value);
+                defer allocator.free(canonical);
+                var canonical_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(canonical, &canonical_digest, .{});
+                const owned_path = try allocator.dupe(u8, entry.path);
+                errdefer allocator.free(owned_path);
+                try files.append(allocator, .{ .path = owned_path, .digest = canonical_digest });
+            },
+            else => return error.InvalidBundleEntry,
+        }
+    }
+    if (files.items.len == 0) return error.EmptyBundle;
+    std.mem.sort(BundleFile, files.items, {}, struct {
+        fn lessThan(_: void, left: BundleFile, right: BundleFile) bool {
+            return std.mem.order(u8, left.path, right.path) == .lt;
+        }
+    }.lessThan);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("cas-app-server-schema-bundle/v1\x00");
+    for (files.items) |file| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, file.path.len, .big);
+        hasher.update(&length);
+        hasher.update(file.path);
+        std.mem.writeInt(u64, &length, file.digest.len, .big);
+        hasher.update(&length);
+        hasher.update(&file.digest);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .digest = try digestBytesAlloc(allocator, &digest), .file_count = files.items.len, .byte_count = total_bytes };
+}
+
+fn readFileBounded(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, limit: usize) ![]u8 {
+    const stat = try file.stat(io);
+    if (stat.size > limit) return error.FileTooLarge;
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(bytes);
+    const read = try file.readPositionalAll(io, bytes, 0);
+    if (read != bytes.len) return error.UnexpectedEndOfFile;
+    return bytes;
+}
+
+fn validateCacheHit(allocator: std.mem.Allocator, io: std.Io, cache_path: []const u8, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8, limits: CacheLimits) !?ManifestView {
+    const manifest_path = try std.fs.path.join(allocator, &.{ cache_path, "preflight.json" });
+    defer allocator.free(manifest_path);
+    var file = std.Io.Dir.openFileAbsolute(io, manifest_path, .{ .follow_symlinks = false, .allow_directory = false }) catch return null;
+    defer file.close(io);
+    const raw = readFileBounded(allocator, io, file, max_manifest_bytes) catch return null;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (!manifestIdentityMatches(parsed.value, identity, version, contract_id)) return null;
+    const stable_path = try std.fs.path.join(allocator, &.{ cache_path, "stable" });
+    defer allocator.free(stable_path);
+    const experimental_path = try std.fs.path.join(allocator, &.{ cache_path, "experimental" });
+    defer allocator.free(experimental_path);
+    var stable = digestBundle(allocator, io, stable_path, limits) catch return null;
+    defer stable.deinit(allocator);
+    var experimental = digestBundle(allocator, io, experimental_path, limits) catch return null;
+    defer experimental.deinit(allocator);
+    const stable_object = objectField(parsed.value, "stable") catch return null;
+    const experimental_object = objectField(parsed.value, "experimental") catch return null;
+    const manifest_stable_digest = stringField(stable_object, "digest") catch return null;
+    const manifest_experimental_digest = stringField(experimental_object, "digest") catch return null;
+    const stable_files = decimalUsizeField(stable_object, "fileCount") catch return null;
+    const stable_bytes = decimalU64Field(stable_object, "byteCount") catch return null;
+    const experimental_files = decimalUsizeField(experimental_object, "fileCount") catch return null;
+    const experimental_bytes = decimalU64Field(experimental_object, "byteCount") catch return null;
+    if (!std.mem.eql(u8, manifest_stable_digest, stable.digest) or
+        !std.mem.eql(u8, manifest_experimental_digest, experimental.digest) or
+        stable_files != stable.file_count or stable_bytes != stable.byte_count or
+        experimental_files != experimental.file_count or experimental_bytes != experimental.byte_count)
+        return null;
+    const owned_stable_digest = try allocator.dupe(u8, stable.digest);
+    errdefer allocator.free(owned_stable_digest);
+    const owned_experimental_digest = try allocator.dupe(u8, experimental.digest);
+    return .{
+        .stable_digest = owned_stable_digest,
+        .stable_file_count = stable.file_count,
+        .stable_byte_count = stable.byte_count,
+        .experimental_digest = owned_experimental_digest,
+        .experimental_file_count = experimental.file_count,
+        .experimental_byte_count = experimental.byte_count,
+    };
+}
+
+fn manifestIdentityMatches(root: std.json.Value, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8) bool {
+    return std.mem.eql(u8, stringField(root, "schema") catch return false, cache_schema) and
+        std.mem.eql(u8, stringField(root, "contractId") catch return false, contract_id) and
+        std.mem.eql(u8, stringField(root, "resolvedPath") catch return false, identity.resolved_path) and
+        std.mem.eql(u8, stringField(root, "pathFingerprint") catch return false, identity.path_fingerprint) and
+        std.mem.eql(u8, stringField(root, "version") catch return false, version.text) and
+        std.mem.eql(u8, stringField(root, "banner") catch return false, version.banner) and
+        (boolField(root, "prerelease") catch return false) == version.prerelease() and
+        std.mem.eql(u8, stringField(root, "binaryDigest") catch return false, identity.binary_digest) and
+        (decimalU64Field(root, "inode") catch return false) == identity.inode and
+        (decimalU64Field(root, "size") catch return false) == identity.size and
+        (decimalI128Field(root, "mtimeNs") catch return false) == identity.mtime_ns and
+        (decimalI128Field(root, "ctimeNs") catch return false) == identity.ctime_ns;
+}
+
+fn decimalU64Field(value: std.json.Value, name: []const u8) !u64 {
+    return std.fmt.parseUnsigned(u64, try stringField(value, name), 10);
+}
+fn decimalUsizeField(value: std.json.Value, name: []const u8) !usize {
+    return std.fmt.parseUnsigned(usize, try stringField(value, name), 10);
+}
+fn decimalI128Field(value: std.json.Value, name: []const u8) !i128 {
+    return std.fmt.parseInt(i128, try stringField(value, name), 10);
+}
+
+fn manifestAlloc(allocator: std.mem.Allocator, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8, stable: BundleDigest, experimental: BundleDigest) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    try writer.writeByte('{');
+    try manifestStringField(writer, "schema", cache_schema, false);
+    try manifestStringField(writer, "contractId", contract_id, true);
+    try manifestStringField(writer, "resolvedPath", identity.resolved_path, true);
+    try manifestStringField(writer, "pathFingerprint", identity.path_fingerprint, true);
+    try manifestStringField(writer, "version", version.text, true);
+    try manifestStringField(writer, "banner", version.banner, true);
+    try writer.print(",\"prerelease\":{}", .{version.prerelease()});
+    try manifestStringField(writer, "binaryDigest", identity.binary_digest, true);
+    try manifestDecimalField(writer, "inode", identity.inode);
+    try manifestDecimalField(writer, "size", identity.size);
+    try manifestDecimalField(writer, "mtimeNs", identity.mtime_ns);
+    try manifestDecimalField(writer, "ctimeNs", identity.ctime_ns);
+    try writer.writeAll(",\"stable\":{");
+    try manifestStringField(writer, "digest", stable.digest, false);
+    try manifestDecimalField(writer, "fileCount", stable.file_count);
+    try manifestDecimalField(writer, "byteCount", stable.byte_count);
+    try writer.writeAll("},\"experimental\":{");
+    try manifestStringField(writer, "digest", experimental.digest, false);
+    try manifestDecimalField(writer, "fileCount", experimental.file_count);
+    try manifestDecimalField(writer, "byteCount", experimental.byte_count);
+    try writer.writeAll("}}\n");
+    return output.toOwnedSlice();
+}
+
+fn manifestStringField(writer: *std.Io.Writer, name: []const u8, value: []const u8, comma: bool) !void {
+    if (comma) try writer.writeByte(',');
+    try definition_core.canonical_json.writeCanonicalString(writer, name);
+    try writer.writeByte(':');
+    try definition_core.canonical_json.writeCanonicalString(writer, value);
+}
+
+fn manifestDecimalField(writer: *std.Io.Writer, name: []const u8, value: anytype) !void {
+    try writer.writeByte(',');
+    try definition_core.canonical_json.writeCanonicalString(writer, name);
+    try writer.writeAll(":\"");
+    try writer.print("{d}", .{value});
+    try writer.writeByte('"');
+}
+
+fn writeSyncedFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+}
+
+fn syncDirectory(io: std.Io, path: []const u8) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer dir.close(io);
+    const file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    try file.sync(io);
+}
+
+fn promoteCacheDirectory(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, target: []const u8, nonce: i128) !void {
+    const backup = try std.fmt.allocPrint(allocator, "{s}.rollback.{d}", .{ target, nonce });
+    defer allocator.free(backup);
+    try std.Io.Dir.cwd().deleteTree(io, backup);
+    var had_target = true;
+    std.Io.Dir.renameAbsolute(target, backup, io) catch |err| switch (err) {
+        error.FileNotFound => had_target = false,
+        else => return err,
+    };
+    std.Io.Dir.renameAbsolute(staging, target, io) catch |err| {
+        if (had_target) std.Io.Dir.renameAbsolute(backup, target, io) catch {};
+        return err;
+    };
+    const parent = std.fs.path.dirname(target) orelse return error.InvalidCachePath;
+    syncDirectory(io, parent) catch |err| {
+        std.Io.Dir.cwd().deleteTree(io, target) catch {};
+        if (had_target) std.Io.Dir.renameAbsolute(backup, target, io) catch {};
+        return err;
+    };
+    if (had_target) std.Io.Dir.cwd().deleteTree(io, backup) catch {};
+}
 
 pub const Profile = enum { core, review, session_inquiry, full };
 pub const Status = enum { compatible, incompatible };
@@ -742,4 +1441,248 @@ test "missing experimental notification is incompatible" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expect(contains(report.missing_required.items, method));
+}
+
+test "exact codex version parsing distinguishes prerelease from build metadata" {
+    const cases = [_]struct { raw: []const u8, prerelease: bool }{
+        .{ .raw = "codex-cli 0.146.0\n", .prerelease = false },
+        .{ .raw = "codex-cli 0.146.0-alpha.1\n", .prerelease = true },
+        .{ .raw = "codex-cli 0.146.0+darwin.arm64\n", .prerelease = false },
+        .{ .raw = "codex-cli 0.146.0-rc.1+build.7\n", .prerelease = true },
+    };
+    for (cases) |case| {
+        var version = try parseCodexVersion(std.testing.allocator, case.raw);
+        defer version.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.prerelease, version.prerelease());
+    }
+    const malformed = [_][]const u8{
+        "codex 0.146.0\n",
+        "codex-cli 0.146\n",
+        "codex-cli 00.146.0\n",
+        "codex-cli 0.146.0\ntrailing\n",
+        "codex-cli 0.146.0 trailing\n",
+        "codex-cli 0.146.0",
+        "codex-cli 0.146.0\r\n",
+        "codex-cli 0.146.0-\n",
+    };
+    for (malformed) |raw| try std.testing.expectError(error.InvalidCodexVersion, parseCodexVersion(std.testing.allocator, raw));
+}
+
+test "canonical bundle digest ignores object and creation order but binds path and content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const left = try std.fs.path.join(std.testing.allocator, &.{ root, "left" });
+    defer std.testing.allocator.free(left);
+    const right = try std.fs.path.join(std.testing.allocator, &.{ root, "right" });
+    defer std.testing.allocator.free(right);
+    try std.Io.Dir.cwd().createDirPath(io, left);
+    try std.Io.Dir.cwd().createDirPath(io, right);
+    try writeTestFile(io, left, "a.json", "{\"z\":1,\"a\":[2,3]}\n");
+    try writeTestFile(io, left, "b.json", "{\"k\":true}\n");
+    try writeTestFile(io, right, "b.json", "{\"k\":true}\n");
+    try writeTestFile(io, right, "a.json", "{\"a\":[2,3],\"z\":1}\n");
+    var left_digest = try digestBundle(std.testing.allocator, io, left, .{});
+    defer left_digest.deinit(std.testing.allocator);
+    var right_digest = try digestBundle(std.testing.allocator, io, right, .{});
+    defer right_digest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(left_digest.digest, right_digest.digest);
+
+    try writeTestFile(io, right, "a.json", "{\"a\":[3,2],\"z\":1}\n");
+    var content_drift = try digestBundle(std.testing.allocator, io, right, .{});
+    defer content_drift.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, left_digest.digest, content_drift.digest));
+    const old_path = try std.fs.path.join(std.testing.allocator, &.{ right, "a.json" });
+    defer std.testing.allocator.free(old_path);
+    try std.Io.Dir.cwd().deleteFile(io, old_path);
+    try writeTestFile(io, right, "renamed.json", "{\"z\":1,\"a\":[2,3]}\n");
+    var path_drift = try digestBundle(std.testing.allocator, io, right, .{});
+    defer path_drift.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, left_digest.digest, path_drift.digest));
+}
+
+test "bundle bounds reject symlink count and byte excess" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try writeTestFile(io, root, "a.json", "{}\n");
+    const link = try std.fs.path.join(std.testing.allocator, &.{ root, "link.json" });
+    defer std.testing.allocator.free(link);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "a.json" });
+    defer std.testing.allocator.free(target);
+    try std.Io.Dir.symLinkAbsolute(io, target, link, .{});
+    try std.testing.expectError(error.InvalidBundleEntry, digestBundle(std.testing.allocator, io, root, .{}));
+    try std.Io.Dir.cwd().deleteFile(io, link);
+
+    try writeTestFile(io, root, "b.json", "{}\n");
+    try std.testing.expectError(error.BundleTooManyFiles, digestBundle(std.testing.allocator, io, root, .{ .bundle_documents = 1 }));
+    try std.testing.expectError(error.BundleFileTooLarge, digestBundle(std.testing.allocator, io, root, .{ .bundle_file_bytes = 1 }));
+    try std.testing.expectError(error.BundleTooLarge, digestBundle(std.testing.allocator, io, root, .{ .bundle_total_bytes = 4 }));
+}
+
+test "schema cache hits only after exact identity manifest and canonical bundles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(executable);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "invocations.log" });
+    defer allocator.free(log_path);
+    const cache_root = try std.fs.path.join(allocator, &.{ root, "cache" });
+    defer allocator.free(cache_root);
+    const script = try fakeCodexScriptAlloc(allocator, log_path, false, false);
+    defer allocator.free(script);
+    try writeAbsoluteTestFile(io, executable, script);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    const SavedPaths = struct { stable: []u8, cache: []u8 };
+    const saved: SavedPaths = saved: {
+        var first = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        defer first.deinit(allocator);
+        try std.testing.expect(!first.hit);
+        const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
+        defer allocator.free(first_log);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, first_log, "app-server generate-json-schema"));
+        try std.testing.expectError(
+            error.CacheLockTimedOut,
+            ensureSchemaCacheWithLimits(
+                allocator,
+                io,
+                .{ .cache_root = cache_root, .codex_path = executable },
+                .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
+            ),
+        );
+        break :saved .{
+            .stable = try allocator.dupe(u8, first.stable_path),
+            .cache = try allocator.dupe(u8, first.cache_path),
+        };
+    };
+    defer allocator.free(saved.stable);
+    defer allocator.free(saved.cache);
+
+    const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
+    defer allocator.free(first_log);
+    {
+        var second = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        defer second.deinit(allocator);
+        try std.testing.expect(second.hit);
+        const second_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
+        defer allocator.free(second_log);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, second_log, "app-server generate-json-schema"));
+        try std.testing.expectEqual(std.mem.count(u8, first_log, "--version") + 1, std.mem.count(u8, second_log, "--version"));
+    }
+
+    try writeTestFile(io, saved.stable, "root.json", "{\"drift\":true}\n");
+    {
+        var bundle_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        defer bundle_regenerated.deinit(allocator);
+        try std.testing.expect(!bundle_regenerated.hit);
+    }
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ saved.cache, "preflight.json" });
+    defer allocator.free(manifest_path);
+    try writeAbsoluteTestFile(io, manifest_path, "{}\n");
+    {
+        var manifest_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        defer manifest_regenerated.deinit(allocator);
+        try std.testing.expect(!manifest_regenerated.hit);
+    }
+
+    const changed_script = try std.mem.concat(allocator, u8, &.{ script, "# identity drift\n" });
+    defer allocator.free(changed_script);
+    try writeAbsoluteTestFile(io, executable, changed_script);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    {
+        var identity_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        defer identity_regenerated.deinit(allocator);
+        try std.testing.expect(!identity_regenerated.hit);
+    }
+}
+
+test "relative cache root is normalized to an absolute isolated path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(executable);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "relative.log" });
+    defer allocator.free(log_path);
+    const absolute_cache = try std.fs.path.join(allocator, &.{ root, "relative-cache", "missing-child" });
+    defer allocator.free(absolute_cache);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+    const relative_cache = try std.fs.path.relative(allocator, cwd, null, cwd, absolute_cache);
+    defer allocator.free(relative_cache);
+    const script = try fakeCodexScriptAlloc(allocator, log_path, false, false);
+    defer allocator.free(script);
+    try writeAbsoluteTestFile(io, executable, script);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    var schemas = try ensureSchemaCache(allocator, io, .{ .cache_root = relative_cache, .codex_path = executable });
+    defer schemas.deinit(allocator);
+    try std.testing.expect(std.fs.path.isAbsolute(schemas.cache_path));
+    try std.testing.expect(std.mem.startsWith(u8, schemas.cache_path, absolute_cache));
+}
+
+test "tiny process deadline and output limits fail closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const cache_root = try std.fs.path.join(allocator, &.{ root, "cache" });
+    defer allocator.free(cache_root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(executable);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "log" });
+    defer allocator.free(log_path);
+
+    const slow = try fakeCodexScriptAlloc(allocator, log_path, true, false);
+    defer allocator.free(slow);
+    try writeAbsoluteTestFile(io, executable, slow);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.testing.expectError(error.ProcessTimedOut, ensureSchemaCacheWithLimits(allocator, io, .{ .cache_root = cache_root, .codex_path = executable }, .{ .version_timeout_ms = 10 }));
+
+    const noisy = try fakeCodexScriptAlloc(allocator, log_path, false, true);
+    defer allocator.free(noisy);
+    try writeAbsoluteTestFile(io, executable, noisy);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.testing.expectError(error.ProcessOutputTooLarge, ensureSchemaCacheWithLimits(allocator, io, .{ .cache_root = cache_root, .codex_path = executable }, .{ .version_stdout_bytes = 16 }));
+}
+
+fn writeTestFile(io: std.Io, root: []const u8, name: []const u8, bytes: []const u8) !void {
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, name });
+    defer std.testing.allocator.free(path);
+    try writeAbsoluteTestFile(io, path, bytes);
+}
+
+fn writeAbsoluteTestFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+
+fn readAbsoluteTestFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    return readFileBounded(allocator, io, file, limit);
+}
+
+fn fakeCodexScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8, slow: bool, noisy: bool) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{s}'\nif [ \"$1\" = \"--version\" ]; then\n  {s}\n  {s}\n  printf 'codex-cli 0.146.0\\n'\n  exit 0\nfi\nout=''\nprofile='stable'\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --experimental) profile='experimental' ;;\n    --out) shift; out=\"$1\" ;;\n  esac\n  shift\ndone\nmkdir -p \"$out\"\nprintf '{{\"profile\":\"%s\",\"object\":{{\"z\":1,\"a\":2}}}}\\n' \"$profile\" > \"$out/root.json\"\n",
+        .{ log_path, if (slow) "sleep 1" else ":", if (noisy) "printf '0123456789012345678901234567890123456789'" else ":" },
+    );
 }
