@@ -1,0 +1,9 @@
+version = 1
+id = "cron-0.2.13-oracle"
+name = "Quoted \"Name\""
+prompt = "Freeze exact \"bytes\" \\ slash"
+status = "ACTIVE"
+rrule = "RRULE:FREQ=WEEKLY;BYDAY=FR,MO;BYHOUR=6;BYMINUTE=5"
+cwds = ["/work/a", "/work/space path"]
+created_at = 4102358400000
+updated_at = 4102444800000
