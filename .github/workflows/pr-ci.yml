@@ -338,6 +338,8 @@ jobs:
           echo "${bin_dir}" >> "${GITHUB_PATH}"
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
+      - name: Verify exact Codex 0.146.0 app-server contract
+        run: .github/scripts/test_cas_app_server_preflight_0146.sh "${CODEX_BIN}"
       - name: Verify packaged Linux CAS dispatcher layout
         if: matrix.platform == 'linux-x86_64'
         run: |

@@ -15,10 +15,15 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `scripts/cas_review_session.zig`
 - `scripts/cas_session_inquiry.zig`
 - `scripts/cas_proxy_client.zig`
+- `scripts/cas_app_server_contract.zig`
+- `scripts/cas_app_server_preflight.zig`
+- `scripts/cas_app_server_probes.zig`
+- `scripts/cas_automation.zig`
 
 ## Behavior
 
-- `cas` dispatches `account`, `capabilities`, `conformance`, `goal`, `smoke_check`, `instance_runner`, `review`, and `session_inquiry`.
+- `cas` dispatches `account`, `app-server`, `automation`, `capabilities`, `conformance`, `goal`, `smoke_check`, `instance_runner`, `review`, and `session_inquiry`.
+- `cas app-server schema` resolves the exact Codex executable, generates or reuses stable and experimental schema bundles, and checks the compact Codex 0.146 contract without running live probes. `cas app-server preflight` adds profile-scoped live probes and fails closed when a required behavior is unavailable. Compile-time capability flags report CAS implementation only; runtime support comes from this exact-binary preflight.
 - `cas_account` reads account status through safe app-server account APIs. It reports account/auth/rate-limit status, optional usage summary data, and a normalized budget-governor classification. It never requests token-bearing auth data, never refreshes credentials, never mutates account state, and redacts account email unless `--show-email` is supplied.
 - `cas_goal` manages Codex app-server v2 thread goals through `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`. It adds safe target selection over `thread/list`, explicit `resolve`/`--dry-run` previews, create-by-default `set`, and lifecycle `wait` through `thread/resume` plus goal polling.
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
@@ -46,13 +51,27 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - Thread-backed inquiry rejects paginated source history before `thread/fork`, which Codex 0.145 does not support. Use a legacy-history thread or the verified `rollout_transcript` lineage.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports both `thread_fork_replay` and `rollout_transcript_replay` support.
-- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, `cas_workflow_bound_owner_lived_review_v1`, `cas_review_scoped_instructions_v1`, and `cas_codex_0145_structured_review_v4` (`v1` through `v3` remain advertised for compatibility).
+- `cas capabilities --json` includes compiled feature flags for the current implementation, including `cas_app_server_contract_0146_v1` and `cas_app_server_schema_probe_v1`. It advertises no retired Codex 0.145 capability identities.
 
 ## API Examples
 
 ```bash
 # Run the dispatcher help surface.
 ./zig-out/bin/cas --help
+
+# Inspect the exact runtime schemas without live behavioral probes.
+./zig-out/bin/cas app-server schema \
+  --cwd /path/to/workspace \
+  --codex-path /exact/path/to/codex \
+  --profile full \
+  --json
+
+# Require the core structural and live app-server contract.
+./zig-out/bin/cas app-server preflight \
+  --cwd /path/to/workspace \
+  --codex-path /exact/path/to/codex \
+  --profile core \
+  --json
 
 # Read sanitized account/auth/rate-limit status.
 ./zig-out/bin/cas account status \
@@ -191,6 +210,8 @@ zig build build-cas -Doptimize=ReleaseFast
 ./zig-out/bin/cas_conformance_suite --help
 ./zig-out/bin/cas_session_inquiry --help
 ./zig-out/bin/cas goal --help
+./zig-out/bin/cas app-server schema --cwd . --profile full --json
+./zig-out/bin/cas app-server preflight --cwd . --profile core --json
 ./zig-out/bin/cas session_inquiry preflight --json
 zig build test-cas-session-inquiry
 bash apps/cas/scripts/perf/budget_governor_gate.sh
