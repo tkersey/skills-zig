@@ -109,8 +109,16 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
 
-    const validated_transport = launch.validateTransport(parsed.requested_transport, parsed.transport_endpoint) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), "--app-server-transport/--app-server-endpoint");
+    const validated_transport = launch.validateTransport(
+        parsed.requested_transport,
+        parsed.transport_endpoint,
+    ) catch |err| {
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            @errorName(err),
+            "--app-server-transport/--app-server-endpoint",
+        );
     };
     var code_mode_host = if (parsed.code_mode_host) |raw|
         launch.CodeModeHost.init(allocator, raw) catch |err| {
@@ -431,10 +439,19 @@ pub fn main(init: std.process.Init) !void {
         const stdout = &stdout_writer.interface;
         try stdout.print("cas smoke-check\n", .{});
         try stdout.print("cwd: {s}\n", .{cwd});
-        try stdout.print("codexPath: {s}\n", .{acquired.codex_path_identity orelse "external-endpoint"});
-        try stdout.print("transport: {s} ({s})\n", .{ acquired.selected_transport.asString(), acquired.endpoint_identity });
+        try stdout.print(
+            "codexPath: {s}\n",
+            .{acquired.codex_path_identity orelse "external-endpoint"},
+        );
+        try stdout.print("transport: {s} ({s})\n", .{
+            acquired.selected_transport.asString(),
+            acquired.endpoint_identity,
+        });
         if (code_mode_report) |identity| {
-            try stdout.print("codeModeHost: {s} (sha256:{s})\n", .{ identity.endpoint, identity.digest });
+            try stdout.print(
+                "codeModeHost: {s} (sha256:{s})\n",
+                .{ identity.endpoint, identity.digest },
+            );
         }
         try stdout.print("threadId: {s}\n", .{thread_id orelse "n/a"});
         try stdout.print("overall: {s}\n", .{if (overall_ok) "pass" else "fail"});
@@ -489,7 +506,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--app-server-transport")) {
-            out.requested_transport = launch.RequestedTransport.parse(value) orelse return error.InvalidAppServerTransport;
+            out.requested_transport = launch.RequestedTransport.parse(value) orelse
+                return error.InvalidAppServerTransport;
             continue;
         }
         if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
@@ -582,9 +600,27 @@ fn acquireClient(
             };
         },
         .auto => blk: {
-            const managed_server = startManaged(allocator, io, cwd, parsed, code_mode_host) catch |err| {
-                if (!launch.autoMayFallback(.auto, .managed_websocket, .stdio, .before_first_rpc, true)) return err;
-                break :blk acquireStdio(allocator, io, cwd, parsed, code_mode_host);
+            const managed_server = startManaged(
+                allocator,
+                io,
+                cwd,
+                parsed,
+                code_mode_host,
+            ) catch |err| {
+                if (!launch.autoMayFallback(
+                    .auto,
+                    .managed_websocket,
+                    .stdio,
+                    .before_first_rpc,
+                    true,
+                )) return err;
+                break :blk acquireStdio(
+                    allocator,
+                    io,
+                    cwd,
+                    parsed,
+                    code_mode_host,
+                );
             };
             // From this point Client.start performs initialize, so a failure is
             // observable protocol work and must not trigger a transport retry.
@@ -640,9 +676,22 @@ fn startManaged(
     const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, parsed.codex_path);
     defer allocator.free(resolved_codex_path);
     return if (code_mode_host) |host|
-        websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, resolved_codex_path, parsed.hook_policy, host, io)
+        websocket.startManagedLoopbackServerWithCodeModeHost(
+            allocator,
+            cwd,
+            resolved_codex_path,
+            parsed.hook_policy,
+            host,
+            io,
+        )
     else
-        websocket.startManagedLoopbackServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io);
+        websocket.startManagedLoopbackServer(
+            allocator,
+            cwd,
+            resolved_codex_path,
+            parsed.hook_policy,
+            io,
+        );
 }
 
 fn connectManaged(
@@ -816,7 +865,10 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expectEqualStrings("/opt/codex-0.146.0", parsed.codex_path);
     try std.testing.expectEqual(launch.RequestedTransport.unix_socket, parsed.requested_transport);
     try std.testing.expectEqualStrings("unix:///tmp/cas.sock", parsed.transport_endpoint.?);
-    try std.testing.expectEqualStrings("wss://example.com/code?token=redacted", parsed.code_mode_host.?);
+    try std.testing.expectEqualStrings(
+        "wss://example.com/code?token=redacted",
+        parsed.code_mode_host.?,
+    );
     try std.testing.expectEqual(@as(?[]const u8, "thr_123"), parsed.thread_id);
     try std.testing.expectEqual(@as(u32, 45_000), parsed.request_timeout_ms);
     try std.testing.expect(parsed.json);

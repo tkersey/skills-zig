@@ -137,6 +137,72 @@ const ManifestView = struct {
     experimental_byte_count: u64,
 };
 
+const CachePaths = struct {
+    cache: []u8,
+    stable: []u8,
+    experimental: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        executable_root: []const u8,
+        version: []const u8,
+    ) !CachePaths {
+        const cache = try std.fs.path.join(allocator, &.{ executable_root, version });
+        errdefer allocator.free(cache);
+        const stable = try std.fs.path.join(allocator, &.{ cache, "stable" });
+        errdefer allocator.free(stable);
+        const experimental = try std.fs.path.join(allocator, &.{ cache, "experimental" });
+        return .{ .cache = cache, .stable = stable, .experimental = experimental };
+    }
+
+    fn deinit(self: CachePaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.cache);
+        allocator.free(self.stable);
+        allocator.free(self.experimental);
+    }
+};
+
+const StagingPaths = struct {
+    root: []u8,
+    stable: []u8,
+    experimental: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cache_path: []const u8,
+        nonce: i128,
+    ) !StagingPaths {
+        const root = try std.fmt.allocPrint(allocator, "{s}.staging.{d}", .{ cache_path, nonce });
+        errdefer allocator.free(root);
+        try std.Io.Dir.cwd().deleteTree(io, root);
+        errdefer std.Io.Dir.cwd().deleteTree(io, root) catch |err| ignoreError(err);
+        const stable = try std.fs.path.join(allocator, &.{ root, "stable" });
+        errdefer allocator.free(stable);
+        const experimental = try std.fs.path.join(allocator, &.{ root, "experimental" });
+        errdefer allocator.free(experimental);
+        try std.Io.Dir.cwd().createDirPath(io, stable);
+        try std.Io.Dir.cwd().createDirPath(io, experimental);
+        return .{ .root = root, .stable = stable, .experimental = experimental };
+    }
+
+    fn deinit(self: StagingPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.root);
+        allocator.free(self.stable);
+        allocator.free(self.experimental);
+    }
+};
+
+const GeneratedBundles = struct {
+    stable: BundleDigest,
+    experimental: BundleDigest,
+
+    fn deinit(self: *GeneratedBundles, allocator: std.mem.Allocator) void {
+        self.stable.deinit(allocator);
+        self.experimental.deinit(allocator);
+    }
+};
+
 pub fn ensureSchemaCache(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -151,11 +217,18 @@ fn ensureSchemaCacheWithLimits(
     options: CacheOptions,
     limits: CacheLimits,
 ) !CachedSchemas {
-    if (options.cache_root.len == 0 or options.contract_id.len == 0) return error.InvalidCacheOptions;
+    if (options.cache_root.len == 0 or options.contract_id.len == 0) {
+        return error.InvalidCacheOptions;
+    }
     const cache_root = try absoluteCacheRootAlloc(allocator, io, options.cache_root);
     defer allocator.free(cache_root);
 
-    var identity = try resolveExecutableIdentity(allocator, io, options.codex_path, limits.binary_bytes);
+    var identity = try resolveExecutableIdentity(
+        allocator,
+        io,
+        options.codex_path,
+        limits.binary_bytes,
+    );
     errdefer identity.deinit(allocator);
     var version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
     errdefer version.deinit(allocator);
@@ -175,91 +248,171 @@ fn ensureSchemaCacheWithLimits(
         lock.close(io);
     }
 
+    return ensureSchemaCacheLocked(
+        allocator,
+        io,
+        options,
+        limits,
+        executable_root,
+        &identity,
+        version,
+        lock,
+    );
+}
+
+fn ensureSchemaCacheLocked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: CacheOptions,
+    limits: CacheLimits,
+    executable_root: []const u8,
+    identity: *ExecutableIdentity,
+    version: CodexVersion,
+    lock: std.Io.File,
+) !CachedSchemas {
     // Bind the generation to the identity and banner observed after lock acquisition.
-    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
-    const cache_path = try std.fs.path.join(allocator, &.{ executable_root, version.text });
-    errdefer allocator.free(cache_path);
-    const stable_path = try std.fs.path.join(allocator, &.{ cache_path, "stable" });
-    errdefer allocator.free(stable_path);
-    const experimental_path = try std.fs.path.join(allocator, &.{ cache_path, "experimental" });
-    errdefer allocator.free(experimental_path);
+    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+    const paths = try CachePaths.init(allocator, executable_root, version.text);
+    errdefer paths.deinit(allocator);
 
     if (!options.refresh) {
-        if (try validateCacheHit(allocator, io, cache_path, &identity, version, options.contract_id, limits)) |manifest| {
-            return .{
-                .cache_path = cache_path,
-                .stable_path = stable_path,
-                .experimental_path = experimental_path,
-                .stable_digest = manifest.stable_digest,
-                .experimental_digest = manifest.experimental_digest,
-                .stable_file_count = manifest.stable_file_count,
-                .stable_byte_count = manifest.stable_byte_count,
-                .experimental_file_count = manifest.experimental_file_count,
-                .experimental_byte_count = manifest.experimental_byte_count,
-                .version = version,
-                .executable = identity,
-                .hit = true,
-                ._lock_io = io,
-                ._lock_file = lock,
-            };
+        if (try validateCacheHit(
+            allocator,
+            io,
+            paths.cache,
+            identity,
+            version,
+            options.contract_id,
+            limits,
+        )) |manifest| {
+            return cachedSchemasFromManifest(paths, identity.*, version, io, lock, manifest);
         }
     }
 
-    const nonce = std.Io.Clock.awake.now(io).nanoseconds;
-    const staging_path = try std.fmt.allocPrint(allocator, "{s}.staging.{d}", .{ cache_path, nonce });
-    defer allocator.free(staging_path);
-    try std.Io.Dir.cwd().deleteTree(io, staging_path);
-    errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
-    const staging_stable = try std.fs.path.join(allocator, &.{ staging_path, "stable" });
-    defer allocator.free(staging_stable);
-    const staging_experimental = try std.fs.path.join(allocator, &.{ staging_path, "experimental" });
-    defer allocator.free(staging_experimental);
-    try std.Io.Dir.cwd().createDirPath(io, staging_stable);
-    try std.Io.Dir.cwd().createDirPath(io, staging_experimental);
+    return generateSchemaCache(
+        allocator,
+        io,
+        paths,
+        identity,
+        version,
+        lock,
+        options.contract_id,
+        limits,
+    );
+}
 
-    try generateBundle(allocator, io, identity.resolved_path, staging_stable, false, limits);
-    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
-    try generateBundle(allocator, io, identity.resolved_path, staging_experimental, true, limits);
-    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
-    var final_version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
-    defer final_version.deinit(allocator);
-    if (!versionsEqual(version, final_version)) return error.ExecutableChanged;
-    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
-
-    var stable = try digestBundle(allocator, io, staging_stable, limits);
-    defer stable.deinit(allocator);
-    var experimental = try digestBundle(allocator, io, staging_experimental, limits);
-    defer experimental.deinit(allocator);
-    const manifest = try manifestAlloc(allocator, &identity, version, options.contract_id, stable, experimental);
-    defer allocator.free(manifest);
-    if (manifest.len > max_manifest_bytes) return error.ManifestTooLarge;
-    const manifest_path = try std.fs.path.join(allocator, &.{ staging_path, "preflight.json" });
-    defer allocator.free(manifest_path);
-    try writeSyncedFile(io, manifest_path, manifest);
-    try syncDirectory(io, staging_stable);
-    try syncDirectory(io, staging_experimental);
-    try syncDirectory(io, staging_path);
-    try promoteCacheDirectory(allocator, io, staging_path, cache_path, nonce);
-
-    const owned_stable_digest = try allocator.dupe(u8, stable.digest);
-    errdefer allocator.free(owned_stable_digest);
-    const owned_experimental_digest = try allocator.dupe(u8, experimental.digest);
+fn cachedSchemasFromManifest(
+    paths: CachePaths,
+    identity: ExecutableIdentity,
+    version: CodexVersion,
+    io: std.Io,
+    lock: std.Io.File,
+    manifest: ManifestView,
+) CachedSchemas {
     return .{
-        .cache_path = cache_path,
-        .stable_path = stable_path,
-        .experimental_path = experimental_path,
-        .stable_digest = owned_stable_digest,
-        .experimental_digest = owned_experimental_digest,
-        .stable_file_count = stable.file_count,
-        .stable_byte_count = stable.byte_count,
-        .experimental_file_count = experimental.file_count,
-        .experimental_byte_count = experimental.byte_count,
+        .cache_path = paths.cache,
+        .stable_path = paths.stable,
+        .experimental_path = paths.experimental,
+        .stable_digest = manifest.stable_digest,
+        .experimental_digest = manifest.experimental_digest,
+        .stable_file_count = manifest.stable_file_count,
+        .stable_byte_count = manifest.stable_byte_count,
+        .experimental_file_count = manifest.experimental_file_count,
+        .experimental_byte_count = manifest.experimental_byte_count,
         .version = version,
         .executable = identity,
+        .hit = true,
+        ._lock_io = io,
+        ._lock_file = lock,
+    };
+}
+
+fn generateSchemaCache(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: CachePaths,
+    identity: *ExecutableIdentity,
+    version: CodexVersion,
+    lock: std.Io.File,
+    contract_id: []const u8,
+    limits: CacheLimits,
+) !CachedSchemas {
+    const nonce = std.Io.Clock.awake.now(io).nanoseconds;
+    const staging = try StagingPaths.init(allocator, io, paths.cache, nonce);
+    defer staging.deinit(allocator);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging.root) catch |err| ignoreError(err);
+    var generated = try stageSchemaCache(
+        allocator,
+        io,
+        staging,
+        identity,
+        version,
+        contract_id,
+        limits,
+    );
+    defer generated.deinit(allocator);
+    try promoteCacheDirectory(allocator, io, staging.root, paths.cache, nonce);
+
+    const owned_stable_digest = try allocator.dupe(u8, generated.stable.digest);
+    errdefer allocator.free(owned_stable_digest);
+    const owned_experimental_digest = try allocator.dupe(u8, generated.experimental.digest);
+    return .{
+        .cache_path = paths.cache,
+        .stable_path = paths.stable,
+        .experimental_path = paths.experimental,
+        .stable_digest = owned_stable_digest,
+        .experimental_digest = owned_experimental_digest,
+        .stable_file_count = generated.stable.file_count,
+        .stable_byte_count = generated.stable.byte_count,
+        .experimental_file_count = generated.experimental.file_count,
+        .experimental_byte_count = generated.experimental.byte_count,
+        .version = version,
+        .executable = identity.*,
         .hit = false,
         ._lock_io = io,
         ._lock_file = lock,
     };
+}
+
+fn stageSchemaCache(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    staging: StagingPaths,
+    identity: *ExecutableIdentity,
+    version: CodexVersion,
+    contract_id: []const u8,
+    limits: CacheLimits,
+) !GeneratedBundles {
+    try generateBundle(allocator, io, identity.resolved_path, staging.stable, false, limits);
+    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+    try generateBundle(allocator, io, identity.resolved_path, staging.experimental, true, limits);
+    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+    var final_version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
+    defer final_version.deinit(allocator);
+    if (!versionsEqual(version, final_version)) return error.ExecutableChanged;
+    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+
+    var stable = try digestBundle(allocator, io, staging.stable, limits);
+    errdefer stable.deinit(allocator);
+    var experimental = try digestBundle(allocator, io, staging.experimental, limits);
+    errdefer experimental.deinit(allocator);
+    const manifest = try manifestAlloc(
+        allocator,
+        identity,
+        version,
+        contract_id,
+        stable,
+        experimental,
+    );
+    defer allocator.free(manifest);
+    if (manifest.len > max_manifest_bytes) return error.ManifestTooLarge;
+    const manifest_path = try std.fs.path.join(allocator, &.{ staging.root, "preflight.json" });
+    defer allocator.free(manifest_path);
+    try writeSyncedFile(io, manifest_path, manifest);
+    try syncDirectory(io, staging.stable);
+    try syncDirectory(io, staging.experimental);
+    try syncDirectory(io, staging.root);
+    return .{ .stable = stable, .experimental = experimental };
 }
 
 pub fn versionAtLeast(version: CodexVersion, major: u64, minor: u64, patch: u64) bool {
@@ -313,7 +466,10 @@ fn parseCodexVersion(allocator: std.mem.Allocator, raw: []const u8) !CodexVersio
     const major_text = parts.next() orelse return error.InvalidCodexVersion;
     const minor_text = parts.next() orelse return error.InvalidCodexVersion;
     const patch_text = parts.next() orelse return error.InvalidCodexVersion;
-    if (parts.next() != null or !validCoreNumber(major_text) or !validCoreNumber(minor_text) or !validCoreNumber(patch_text))
+    if (parts.next() != null or
+        !validCoreNumber(major_text) or
+        !validCoreNumber(minor_text) or
+        !validCoreNumber(patch_text))
         return error.InvalidCodexVersion;
 
     const owned_text = try allocator.dupe(u8, semver);
@@ -347,7 +503,12 @@ fn validSemverIdentifiers(text: []const u8) bool {
     return true;
 }
 
-fn readCodexVersion(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, limits: CacheLimits) !CodexVersion {
+fn readCodexVersion(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    limits: CacheLimits,
+) !CodexVersion {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ executable, "--version" },
         .stdout_limit = .limited(limits.version_stdout_bytes),
@@ -361,7 +522,14 @@ fn readCodexVersion(allocator: std.mem.Allocator, io: std.Io, executable: []cons
     return parseCodexVersion(allocator, result.stdout);
 }
 
-fn generateBundle(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, output: []const u8, experimental: bool, limits: CacheLimits) !void {
+fn generateBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    output: []const u8,
+    experimental: bool,
+    limits: CacheLimits,
+) !void {
     const argv: []const []const u8 = if (experimental)
         &.{ executable, "app-server", "generate-json-schema", "--experimental", "--out", output }
     else
@@ -403,7 +571,12 @@ fn versionsEqual(left: CodexVersion, right: CodexVersion) bool {
     return std.mem.eql(u8, left.text, right.text) and std.mem.eql(u8, left.banner, right.banner);
 }
 
-fn resolveExecutableIdentity(allocator: std.mem.Allocator, io: std.Io, explicit_path: ?[]const u8, binary_limit: u64) !ExecutableIdentity {
+fn resolveExecutableIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    explicit_path: ?[]const u8,
+    binary_limit: u64,
+) !ExecutableIdentity {
     const candidate = if (explicit_path) |path|
         try allocator.dupe(u8, path)
     else
@@ -411,7 +584,10 @@ fn resolveExecutableIdentity(allocator: std.mem.Allocator, io: std.Io, explicit_
     defer allocator.free(candidate);
     const resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator);
     errdefer allocator.free(resolved);
-    var file = try std.Io.Dir.openFileAbsolute(io, resolved, .{ .follow_symlinks = false, .allow_directory = false });
+    var file = try std.Io.Dir.openFileAbsolute(io, resolved, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    });
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.InvalidCodexExecutable;
@@ -431,7 +607,8 @@ fn resolveExecutableIdentity(allocator: std.mem.Allocator, io: std.Io, explicit_
 }
 
 fn findOnPath(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
-    const path_value = std.Io.Threaded.global_single_threaded.environString("PATH") orelse return error.CodexNotFound;
+    const path_value = std.Io.Threaded.global_single_threaded.environString("PATH") orelse
+        return error.CodexNotFound;
     var components = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
     while (components.next()) |component| {
         const directory = if (component.len == 0) "." else component;
@@ -455,11 +632,18 @@ fn findOnPath(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 
 }
 
 fn hasExecutablePermission(permissions: std.Io.File.Permissions) bool {
-    if (comptime std.Io.File.Permissions.has_executable_bit) return permissions.toMode() & 0o111 != 0;
+    if (comptime std.Io.File.Permissions.has_executable_bit) {
+        return permissions.toMode() & 0o111 != 0;
+    }
     return true;
 }
 
-fn requireIdentityUnchanged(allocator: std.mem.Allocator, io: std.Io, expected: *const ExecutableIdentity, binary_limit: u64) !void {
+fn requireIdentityUnchanged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    expected: *const ExecutableIdentity,
+    binary_limit: u64,
+) !void {
     var actual = try resolveExecutableIdentity(allocator, io, expected.resolved_path, binary_limit);
     defer actual.deinit(allocator);
     if (!identitiesEqual(expected.*, actual)) return error.ExecutableChanged;
@@ -486,7 +670,7 @@ fn fileDigestAlloc(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, 
     var buffer: [64 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io, &buffer);
     var total: u64 = 0;
-    while (true) {
+    while (true) { // tiger: event-loop
         const slice = reader.interface.peek(1) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
@@ -517,7 +701,11 @@ fn acquireCacheLock(io: std.Io, path: []const u8, limits: CacheLimits) !std.Io.F
     const deadline = awakeDeadline(io, limits.lock_timeout_ms);
     while (!(try file.tryLock(io, .exclusive))) {
         if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.CacheLockTimedOut;
-        std.Io.sleep(io, .fromMilliseconds(@intCast(limits.lock_retry_ms)), .awake) catch {};
+        std.Io.sleep(
+            io,
+            .fromMilliseconds(@intCast(limits.lock_retry_ms)),
+            .awake,
+        ) catch |err| ignoreError(err);
     }
     return file;
 }
@@ -527,7 +715,12 @@ const BundleFile = struct {
     digest: [32]u8,
 };
 
-fn digestBundle(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, limits: CacheLimits) !BundleDigest {
+fn digestBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    limits: CacheLimits,
+) !BundleDigest {
     var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
     defer root.close(io);
     var walker = try root.walk(allocator);
@@ -542,28 +735,7 @@ fn digestBundle(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8,
         if (entry.path.len > limits.bundle_path_bytes) return error.BundlePathTooLong;
         switch (entry.kind) {
             .directory => {},
-            .file => {
-                if (!std.mem.endsWith(u8, entry.path, ".json")) return error.InvalidBundleEntry;
-                if (files.items.len == limits.bundle_documents) return error.BundleTooManyFiles;
-                var file = try entry.dir.openFile(io, entry.basename, .{ .follow_symlinks = false, .allow_directory = false });
-                defer file.close(io);
-                const stat = try file.stat(io);
-                if (stat.kind != .file) return error.InvalidBundleEntry;
-                if (stat.size > limits.bundle_file_bytes) return error.BundleFileTooLarge;
-                total_bytes = std.math.add(u64, total_bytes, stat.size) catch return error.BundleTooLarge;
-                if (total_bytes > limits.bundle_total_bytes) return error.BundleTooLarge;
-                const raw = try readFileBounded(allocator, io, file, @intCast(limits.bundle_file_bytes));
-                defer allocator.free(raw);
-                var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidBundleJson;
-                defer parsed.deinit();
-                const canonical = try definition_core.canonical_json.canonicalJsonAlloc(allocator, parsed.value);
-                defer allocator.free(canonical);
-                var canonical_digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(canonical, &canonical_digest, .{});
-                const owned_path = try allocator.dupe(u8, entry.path);
-                errdefer allocator.free(owned_path);
-                try files.append(allocator, .{ .path = owned_path, .digest = canonical_digest });
-            },
+            .file => try appendBundleFile(allocator, io, entry, limits, &files, &total_bytes),
             else => return error.InvalidBundleEntry,
         }
     }
@@ -586,10 +758,57 @@ fn digestBundle(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8,
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
-    return .{ .digest = try digestBytesAlloc(allocator, &digest), .file_count = files.items.len, .byte_count = total_bytes };
+    return .{
+        .digest = try digestBytesAlloc(allocator, &digest),
+        .file_count = files.items.len,
+        .byte_count = total_bytes,
+    };
 }
 
-fn readFileBounded(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, limit: usize) ![]u8 {
+fn appendBundleFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entry: std.Io.Dir.Walker.Entry,
+    limits: CacheLimits,
+    files: *std.ArrayList(BundleFile),
+    total_bytes: *u64,
+) !void {
+    if (!std.mem.endsWith(u8, entry.path, ".json")) return error.InvalidBundleEntry;
+    if (files.items.len == limits.bundle_documents) return error.BundleTooManyFiles;
+    var file = try entry.dir.openFile(io, entry.basename, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.InvalidBundleEntry;
+    if (stat.size > limits.bundle_file_bytes) return error.BundleFileTooLarge;
+    total_bytes.* = std.math.add(u64, total_bytes.*, stat.size) catch
+        return error.BundleTooLarge;
+    if (total_bytes.* > limits.bundle_total_bytes) return error.BundleTooLarge;
+    const raw = try readFileBounded(allocator, io, file, @intCast(limits.bundle_file_bytes));
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return error.InvalidBundleJson;
+    defer parsed.deinit();
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        parsed.value,
+    );
+    defer allocator.free(canonical);
+    var canonical_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical, &canonical_digest, .{});
+    const owned_path = try allocator.dupe(u8, entry.path);
+    errdefer allocator.free(owned_path);
+    try files.append(allocator, .{ .path = owned_path, .digest = canonical_digest });
+}
+
+fn readFileBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    limit: usize,
+) ![]u8 {
     const stat = try file.stat(io);
     if (stat.size > limit) return error.FileTooLarge;
     const bytes = try allocator.alloc(u8, @intCast(stat.size));
@@ -599,10 +818,21 @@ fn readFileBounded(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, 
     return bytes;
 }
 
-fn validateCacheHit(allocator: std.mem.Allocator, io: std.Io, cache_path: []const u8, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8, limits: CacheLimits) !?ManifestView {
+fn validateCacheHit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cache_path: []const u8,
+    identity: *const ExecutableIdentity,
+    version: CodexVersion,
+    contract_id: []const u8,
+    limits: CacheLimits,
+) !?ManifestView {
     const manifest_path = try std.fs.path.join(allocator, &.{ cache_path, "preflight.json" });
     defer allocator.free(manifest_path);
-    var file = std.Io.Dir.openFileAbsolute(io, manifest_path, .{ .follow_symlinks = false, .allow_directory = false }) catch return null;
+    var file = std.Io.Dir.openFileAbsolute(io, manifest_path, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch return null;
     defer file.close(io);
     const raw = readFileBounded(allocator, io, file, max_manifest_bytes) catch return null;
     defer allocator.free(raw);
@@ -620,15 +850,22 @@ fn validateCacheHit(allocator: std.mem.Allocator, io: std.Io, cache_path: []cons
     const stable_object = objectField(parsed.value, "stable") catch return null;
     const experimental_object = objectField(parsed.value, "experimental") catch return null;
     const manifest_stable_digest = stringField(stable_object, "digest") catch return null;
-    const manifest_experimental_digest = stringField(experimental_object, "digest") catch return null;
+    const manifest_experimental_digest = stringField(
+        experimental_object,
+        "digest",
+    ) catch return null;
     const stable_files = decimalUsizeField(stable_object, "fileCount") catch return null;
     const stable_bytes = decimalU64Field(stable_object, "byteCount") catch return null;
-    const experimental_files = decimalUsizeField(experimental_object, "fileCount") catch return null;
+    const experimental_files = decimalUsizeField(
+        experimental_object,
+        "fileCount",
+    ) catch return null;
     const experimental_bytes = decimalU64Field(experimental_object, "byteCount") catch return null;
     if (!std.mem.eql(u8, manifest_stable_digest, stable.digest) or
         !std.mem.eql(u8, manifest_experimental_digest, experimental.digest) or
         stable_files != stable.file_count or stable_bytes != stable.byte_count or
-        experimental_files != experimental.file_count or experimental_bytes != experimental.byte_count)
+        experimental_files != experimental.file_count or
+        experimental_bytes != experimental.byte_count)
         return null;
     const owned_stable_digest = try allocator.dupe(u8, stable.digest);
     errdefer allocator.free(owned_stable_digest);
@@ -643,15 +880,32 @@ fn validateCacheHit(allocator: std.mem.Allocator, io: std.Io, cache_path: []cons
     };
 }
 
-fn manifestIdentityMatches(root: std.json.Value, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8) bool {
+fn manifestIdentityMatches(
+    root: std.json.Value,
+    identity: *const ExecutableIdentity,
+    version: CodexVersion,
+    contract_id: []const u8,
+) bool {
     return std.mem.eql(u8, stringField(root, "schema") catch return false, cache_schema) and
         std.mem.eql(u8, stringField(root, "contractId") catch return false, contract_id) and
-        std.mem.eql(u8, stringField(root, "resolvedPath") catch return false, identity.resolved_path) and
-        std.mem.eql(u8, stringField(root, "pathFingerprint") catch return false, identity.path_fingerprint) and
+        std.mem.eql(
+            u8,
+            stringField(root, "resolvedPath") catch return false,
+            identity.resolved_path,
+        ) and
+        std.mem.eql(
+            u8,
+            stringField(root, "pathFingerprint") catch return false,
+            identity.path_fingerprint,
+        ) and
         std.mem.eql(u8, stringField(root, "version") catch return false, version.text) and
         std.mem.eql(u8, stringField(root, "banner") catch return false, version.banner) and
         (boolField(root, "prerelease") catch return false) == version.prerelease() and
-        std.mem.eql(u8, stringField(root, "binaryDigest") catch return false, identity.binary_digest) and
+        std.mem.eql(
+            u8,
+            stringField(root, "binaryDigest") catch return false,
+            identity.binary_digest,
+        ) and
         (decimalU64Field(root, "inode") catch return false) == identity.inode and
         (decimalU64Field(root, "size") catch return false) == identity.size and
         (decimalI128Field(root, "mtimeNs") catch return false) == identity.mtime_ns and
@@ -668,7 +922,14 @@ fn decimalI128Field(value: std.json.Value, name: []const u8) !i128 {
     return std.fmt.parseInt(i128, try stringField(value, name), 10);
 }
 
-fn manifestAlloc(allocator: std.mem.Allocator, identity: *const ExecutableIdentity, version: CodexVersion, contract_id: []const u8, stable: BundleDigest, experimental: BundleDigest) ![]u8 {
+fn manifestAlloc(
+    allocator: std.mem.Allocator,
+    identity: *const ExecutableIdentity,
+    version: CodexVersion,
+    contract_id: []const u8,
+    stable: BundleDigest,
+    experimental: BundleDigest,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     const writer = &output.writer;
@@ -697,7 +958,12 @@ fn manifestAlloc(allocator: std.mem.Allocator, identity: *const ExecutableIdenti
     return output.toOwnedSlice();
 }
 
-fn manifestStringField(writer: *std.Io.Writer, name: []const u8, value: []const u8, comma: bool) !void {
+fn manifestStringField(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    value: []const u8,
+    comma: bool,
+) !void {
     if (comma) try writer.writeByte(',');
     try definition_core.canonical_json.writeCanonicalString(writer, name);
     try writer.writeByte(':');
@@ -726,7 +992,13 @@ fn syncDirectory(io: std.Io, path: []const u8) !void {
     try file.sync(io);
 }
 
-fn promoteCacheDirectory(allocator: std.mem.Allocator, io: std.Io, staging: []const u8, target: []const u8, nonce: i128) !void {
+fn promoteCacheDirectory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    staging: []const u8,
+    target: []const u8,
+    nonce: i128,
+) !void {
     const backup = try std.fmt.allocPrint(allocator, "{s}.rollback.{d}", .{ target, nonce });
     defer allocator.free(backup);
     try std.Io.Dir.cwd().deleteTree(io, backup);
@@ -736,16 +1008,28 @@ fn promoteCacheDirectory(allocator: std.mem.Allocator, io: std.Io, staging: []co
         else => return err,
     };
     std.Io.Dir.renameAbsolute(staging, target, io) catch |err| {
-        if (had_target) std.Io.Dir.renameAbsolute(backup, target, io) catch {};
+        if (had_target) {
+            std.Io.Dir.renameAbsolute(backup, target, io) catch |restore_err|
+                ignoreError(restore_err);
+        }
         return err;
     };
     const parent = std.fs.path.dirname(target) orelse return error.InvalidCachePath;
     syncDirectory(io, parent) catch |err| {
-        std.Io.Dir.cwd().deleteTree(io, target) catch {};
-        if (had_target) std.Io.Dir.renameAbsolute(backup, target, io) catch {};
+        std.Io.Dir.cwd().deleteTree(io, target) catch |delete_err| ignoreError(delete_err);
+        if (had_target) {
+            std.Io.Dir.renameAbsolute(backup, target, io) catch |restore_err|
+                ignoreError(restore_err);
+        }
         return err;
     };
-    if (had_target) std.Io.Dir.cwd().deleteTree(io, backup) catch {};
+    if (had_target) {
+        std.Io.Dir.cwd().deleteTree(io, backup) catch |err| ignoreError(err);
+    }
+}
+
+fn ignoreError(err: anyerror) void {
+    _ = @errorName(err);
 }
 
 pub const Profile = enum { core, review, session_inquiry, full };
@@ -879,14 +1163,22 @@ pub fn loadRequiredSchemaBundle(
     var loaded: usize = 0;
     errdefer for (contents[0..loaded]) |bytes| allocator.free(bytes);
     for (required_schema_documents, 0..) |name, index| {
-        var file = try root.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false });
+        var file = try root.openFile(io, name, .{
+            .follow_symlinks = false,
+            .allow_directory = false,
+        });
         defer file.close(io);
         const stat = try file.stat(io);
         if (stat.kind != .file) return error.InvalidSchemaDocument;
         if (stat.size > max_document_bytes) return error.SchemaTooLarge;
         contents[index] = try readFileBounded(allocator, io, file, max_document_bytes);
         loaded += 1;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents[index], .{}) catch return error.InvalidBundleJson;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            contents[index],
+            .{},
+        ) catch return error.InvalidBundleJson;
         parsed.deinit();
     }
     var documents: [required_schema_documents.len]Document = undefined;
@@ -936,90 +1228,101 @@ pub fn inspect(
 
     const stable_contract = try objectField(baseline.*, "stable");
     const experimental_contract = try objectField(baseline.*, "experimental");
-
-    var stable_clients = try collectMethods(allocator, try documentBytes(stable, "ClientRequest.json"));
-    defer stable_clients.deinit(allocator);
-    var stable_servers = try collectMethods(allocator, try documentBytes(stable, "ServerRequest.json"));
-    defer stable_servers.deinit(allocator);
-    var stable_notifications = try collectMethods(allocator, try documentBytes(stable, "ServerNotification.json"));
-    defer stable_notifications.deinit(allocator);
-    var experimental_clients = try collectMethods(allocator, try documentBytes(experimental, "ClientRequest.json"));
-    defer experimental_clients.deinit(allocator);
-    var experimental_servers = try collectMethods(allocator, try documentBytes(experimental, "ServerRequest.json"));
-    defer experimental_servers.deinit(allocator);
-    var experimental_notifications = try collectMethods(allocator, try documentBytes(experimental, "ServerNotification.json"));
-    defer experimental_notifications.deinit(allocator);
-
-    const required_stable_clients = try arrayField(stable_contract, "requiredClientMethods");
-    const required_stable_servers = try arrayField(stable_contract, "requiredServerRequests");
-    const required_notifications = try arrayField(stable_contract, "requiredNotifications");
-    const required_experimental_clients = try arrayField(experimental_contract, "requiredClientMethods");
-
-    try compareRequired(allocator, required_stable_clients, stable_clients.items.items, &report.missing_required);
-    try compareRequired(allocator, required_stable_clients, experimental_clients.items.items, &report.missing_required);
-    try compareRequired(allocator, required_stable_servers, stable_servers.items.items, &report.missing_required);
-    try compareRequired(allocator, required_stable_servers, experimental_servers.items.items, &report.missing_required);
-    try compareRequired(allocator, required_notifications, stable_notifications.items.items, &report.missing_required);
-    try compareRequired(allocator, required_notifications, experimental_notifications.items.items, &report.missing_required);
-    switch (profile) {
-        .core, .review => {},
-        .session_inquiry => {
-            try requireMethod(allocator, required_experimental_clients, experimental_clients.items.items, "thread/turns/list", &report.missing_required);
-            try requireMethod(allocator, required_experimental_clients, experimental_clients.items.items, "thread/items/list", &report.missing_required);
-        },
-        .full => try compareRequired(allocator, required_experimental_clients, experimental_clients.items.items, &report.missing_required),
-    }
-    try collectAdditive(allocator, stable_clients.items.items, required_stable_clients, &report.additive_client_methods);
-    try collectAdditive(allocator, experimental_clients.items.items, required_experimental_clients, &report.additive_client_methods);
-    try collectAdditive(allocator, stable_notifications.items.items, required_notifications, &report.additive_notifications);
-    try collectAdditive(allocator, experimental_notifications.items.items, required_notifications, &report.additive_notifications);
-
+    var methods = try InspectionMethods.init(allocator, stable, experimental);
+    defer methods.deinit(allocator);
+    const required = try RequiredMethods.init(stable_contract, experimental_contract);
+    try inspectRequiredMethods(allocator, required, &methods, profile, &report);
+    try inspectAdditiveMethods(allocator, required, &methods, &report);
     const policies = try objectField(baseline.*, "serverRequestPolicies");
-    try inspectHandlerParity(allocator, policies, &report.handler_failures);
-    try comparePolicyRequired(allocator, policies, experimental_servers.items.items, &report.missing_required);
-    try classifyServerAdditions(allocator, stable_servers.items.items, required_stable_servers, policies, &report);
-    try classifyExperimentalServerAdditions(allocator, experimental_servers.items.items, policies, &report);
-
-    try inspectShapes(allocator, stable, try arrayField(stable_contract, "requiredShapes"), &report.shape_failures);
-    switch (profile) {
-        .core, .review => {},
-        .session_inquiry, .full => try inspectShapes(allocator, experimental, try arrayField(experimental_contract, "requiredShapes"), &report.shape_failures),
-    }
-
-    if (report.missing_required.items.len != 0 or report.shape_failures.items.len != 0 or report.handler_failures.items.len != 0 or
-        (profile == .full and report.unclassified_server_requests.items.len != 0))
-    {
-        report.status = .incompatible;
-    }
+    try inspectServerPolicies(allocator, required, &methods, policies, &report);
+    try inspectShapesForProfile(
+        allocator,
+        stable_contract,
+        experimental_contract,
+        stable,
+        experimental,
+        profile,
+        &report,
+    );
+    if (inspectionFailed(report, profile)) report.status = .incompatible;
     return report;
 }
 
 fn validateBaseline(root: std.json.Value) !void {
+    try validateBaselineHeader(root);
+    const stable = try objectField(root, "stable");
+    const experimental = try objectField(root, "experimental");
+    try validateBaselineMethodSets(stable, experimental);
+    const policies = try objectField(root, "serverRequestPolicies");
+    try validateBaselinePolicies(stable, policies);
+    try validateHandlerParity(policies);
+    const probes = try arrayField(root, "behavioralProbes");
+    try validateStringArray(probes);
+    try validateProbeParity(probes);
+}
+
+fn validateBaselineHeader(root: std.json.Value) !void {
     const object = switch (root) {
         .object => |value| value,
         else => return error.InvalidContract,
     };
-    const keys = [_][]const u8{ "schema", "contractId", "minimumCodexVersion", "stable", "experimental", "serverRequestPolicies", "behavioralProbes" };
+    const keys = [_][]const u8{
+        "schema",
+        "contractId",
+        "minimumCodexVersion",
+        "stable",
+        "experimental",
+        "serverRequestPolicies",
+        "behavioralProbes",
+    };
     if (object.count() != keys.len) return error.InvalidContract;
     for (keys) |key| if (!object.contains(key)) return error.InvalidContract;
-    if (!std.mem.eql(u8, try stringField(root, "schema"), "cas-app-server-contract/v1")) return error.InvalidContract;
-    if (!std.mem.eql(u8, try stringField(root, "contractId"), "codex-app-server-0.146.0")) return error.InvalidContract;
-    if (!std.mem.eql(u8, try stringField(root, "minimumCodexVersion"), "0.146.0")) return error.InvalidContract;
+    if (!std.mem.eql(
+        u8,
+        try stringField(root, "schema"),
+        "cas-app-server-contract/v1",
+    )) return error.InvalidContract;
+    if (!std.mem.eql(
+        u8,
+        try stringField(root, "contractId"),
+        "codex-app-server-0.146.0",
+    )) return error.InvalidContract;
+    if (!std.mem.eql(
+        u8,
+        try stringField(root, "minimumCodexVersion"),
+        "0.146.0",
+    )) return error.InvalidContract;
+}
 
-    const stable = try objectField(root, "stable");
-    const experimental = try objectField(root, "experimental");
-    if ((try arrayField(stable, "requiredClientMethods")).items.len != 90) return error.InvalidContract;
-    if ((try arrayField(stable, "requiredServerRequests")).items.len != 10) return error.InvalidContract;
-    if ((try arrayField(stable, "requiredNotifications")).items.len != 70) return error.InvalidContract;
-    if ((try arrayField(experimental, "requiredClientMethods")).items.len != 127) return error.InvalidContract;
-    if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) return error.ContractTooLarge;
-    if ((try arrayField(experimental, "requiredShapes")).items.len > max_shapes) return error.ContractTooLarge;
+fn validateBaselineMethodSets(
+    stable: std.json.Value,
+    experimental: std.json.Value,
+) !void {
+    if ((try arrayField(stable, "requiredClientMethods")).items.len != 90) {
+        return error.InvalidContract;
+    }
+    if ((try arrayField(stable, "requiredServerRequests")).items.len != 10) {
+        return error.InvalidContract;
+    }
+    if ((try arrayField(stable, "requiredNotifications")).items.len != 70) {
+        return error.InvalidContract;
+    }
+    if ((try arrayField(experimental, "requiredClientMethods")).items.len != 127) {
+        return error.InvalidContract;
+    }
+    if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {
+        return error.ContractTooLarge;
+    }
+    if ((try arrayField(experimental, "requiredShapes")).items.len > max_shapes) {
+        return error.ContractTooLarge;
+    }
     try validateStringArray(try arrayField(stable, "requiredClientMethods"));
     try validateStringArray(try arrayField(stable, "requiredServerRequests"));
     try validateStringArray(try arrayField(stable, "requiredNotifications"));
     try validateStringArray(try arrayField(experimental, "requiredClientMethods"));
+}
 
-    const policies = try objectField(root, "serverRequestPolicies");
+fn validateBaselinePolicies(stable: std.json.Value, policies: std.json.Value) !void {
     for ((try arrayField(stable, "requiredServerRequests")).items) |item| {
         const method = switch (item) {
             .string => |value| value,
@@ -1034,7 +1337,9 @@ fn validateBaseline(root: std.json.Value) !void {
         .object => |value| value,
         else => return error.InvalidContract,
     };
-    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) return error.InvalidContract;
+    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) {
+        return error.InvalidContract;
+    }
     var policy_iterator = policy_object.iterator();
     while (policy_iterator.next()) |entry| {
         const policy = switch (entry.value_ptr.*) {
@@ -1043,10 +1348,6 @@ fn validateBaseline(root: std.json.Value) !void {
         };
         if (std.mem.trim(u8, policy, " \t\r\n").len == 0) return error.InvalidContract;
     }
-    try validateHandlerParity(policies);
-    const probes = try arrayField(root, "behavioralProbes");
-    try validateStringArray(probes);
-    try validateProbeParity(probes);
 }
 
 const MethodSet = struct {
@@ -1056,6 +1357,245 @@ const MethodSet = struct {
         deinitStrings(&self.items, allocator);
     }
 };
+
+const RequiredMethods = struct {
+    stable_clients: std.json.Array,
+    stable_servers: std.json.Array,
+    notifications: std.json.Array,
+    experimental_clients: std.json.Array,
+
+    fn init(
+        stable_contract: std.json.Value,
+        experimental_contract: std.json.Value,
+    ) !RequiredMethods {
+        return .{
+            .stable_clients = try arrayField(stable_contract, "requiredClientMethods"),
+            .stable_servers = try arrayField(stable_contract, "requiredServerRequests"),
+            .notifications = try arrayField(stable_contract, "requiredNotifications"),
+            .experimental_clients = try arrayField(
+                experimental_contract,
+                "requiredClientMethods",
+            ),
+        };
+    }
+};
+
+const InspectionMethods = struct {
+    stable_clients: MethodSet,
+    stable_servers: MethodSet,
+    stable_notifications: MethodSet,
+    experimental_clients: MethodSet,
+    experimental_servers: MethodSet,
+    experimental_notifications: MethodSet,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        stable: SchemaBundle,
+        experimental: SchemaBundle,
+    ) !InspectionMethods {
+        var stable_clients = try collectMethods(
+            allocator,
+            try documentBytes(stable, "ClientRequest.json"),
+        );
+        errdefer stable_clients.deinit(allocator);
+        var stable_servers = try collectMethods(
+            allocator,
+            try documentBytes(stable, "ServerRequest.json"),
+        );
+        errdefer stable_servers.deinit(allocator);
+        var stable_notifications = try collectMethods(
+            allocator,
+            try documentBytes(stable, "ServerNotification.json"),
+        );
+        errdefer stable_notifications.deinit(allocator);
+        var experimental_clients = try collectMethods(
+            allocator,
+            try documentBytes(experimental, "ClientRequest.json"),
+        );
+        errdefer experimental_clients.deinit(allocator);
+        var experimental_servers = try collectMethods(
+            allocator,
+            try documentBytes(experimental, "ServerRequest.json"),
+        );
+        errdefer experimental_servers.deinit(allocator);
+        var experimental_notifications = try collectMethods(
+            allocator,
+            try documentBytes(experimental, "ServerNotification.json"),
+        );
+        errdefer experimental_notifications.deinit(allocator);
+        return .{
+            .stable_clients = stable_clients,
+            .stable_servers = stable_servers,
+            .stable_notifications = stable_notifications,
+            .experimental_clients = experimental_clients,
+            .experimental_servers = experimental_servers,
+            .experimental_notifications = experimental_notifications,
+        };
+    }
+
+    fn deinit(self: *InspectionMethods, allocator: std.mem.Allocator) void {
+        self.experimental_notifications.deinit(allocator);
+        self.experimental_servers.deinit(allocator);
+        self.experimental_clients.deinit(allocator);
+        self.stable_notifications.deinit(allocator);
+        self.stable_servers.deinit(allocator);
+        self.stable_clients.deinit(allocator);
+    }
+};
+
+fn inspectRequiredMethods(
+    allocator: std.mem.Allocator,
+    required: RequiredMethods,
+    methods: *const InspectionMethods,
+    profile: Profile,
+    report: *InspectionReport,
+) !void {
+    const Comparison = struct { required: std.json.Array, actual: []const []u8 };
+    const comparisons = [_]Comparison{
+        .{ .required = required.stable_clients, .actual = methods.stable_clients.items.items },
+        .{
+            .required = required.stable_clients,
+            .actual = methods.experimental_clients.items.items,
+        },
+        .{ .required = required.stable_servers, .actual = methods.stable_servers.items.items },
+        .{
+            .required = required.stable_servers,
+            .actual = methods.experimental_servers.items.items,
+        },
+        .{ .required = required.notifications, .actual = methods.stable_notifications.items.items },
+        .{
+            .required = required.notifications,
+            .actual = methods.experimental_notifications.items.items,
+        },
+    };
+    for (comparisons) |comparison| {
+        try compareRequired(
+            allocator,
+            comparison.required,
+            comparison.actual,
+            &report.missing_required,
+        );
+    }
+    switch (profile) {
+        .core, .review => {},
+        .session_inquiry => {
+            try requireMethod(
+                allocator,
+                required.experimental_clients,
+                methods.experimental_clients.items.items,
+                "thread/turns/list",
+                &report.missing_required,
+            );
+            try requireMethod(
+                allocator,
+                required.experimental_clients,
+                methods.experimental_clients.items.items,
+                "thread/items/list",
+                &report.missing_required,
+            );
+        },
+        .full => try compareRequired(
+            allocator,
+            required.experimental_clients,
+            methods.experimental_clients.items.items,
+            &report.missing_required,
+        ),
+    }
+}
+
+fn inspectAdditiveMethods(
+    allocator: std.mem.Allocator,
+    required: RequiredMethods,
+    methods: *const InspectionMethods,
+    report: *InspectionReport,
+) !void {
+    try collectAdditive(
+        allocator,
+        methods.stable_clients.items.items,
+        required.stable_clients,
+        &report.additive_client_methods,
+    );
+    try collectAdditive(
+        allocator,
+        methods.experimental_clients.items.items,
+        required.experimental_clients,
+        &report.additive_client_methods,
+    );
+    try collectAdditive(
+        allocator,
+        methods.stable_notifications.items.items,
+        required.notifications,
+        &report.additive_notifications,
+    );
+    try collectAdditive(
+        allocator,
+        methods.experimental_notifications.items.items,
+        required.notifications,
+        &report.additive_notifications,
+    );
+}
+
+fn inspectServerPolicies(
+    allocator: std.mem.Allocator,
+    required: RequiredMethods,
+    methods: *const InspectionMethods,
+    policies: std.json.Value,
+    report: *InspectionReport,
+) !void {
+    try inspectHandlerParity(allocator, policies, &report.handler_failures);
+    try comparePolicyRequired(
+        allocator,
+        policies,
+        methods.experimental_servers.items.items,
+        &report.missing_required,
+    );
+    try classifyServerAdditions(
+        allocator,
+        methods.stable_servers.items.items,
+        required.stable_servers,
+        policies,
+        report,
+    );
+    try classifyExperimentalServerAdditions(
+        allocator,
+        methods.experimental_servers.items.items,
+        policies,
+        report,
+    );
+}
+
+fn inspectShapesForProfile(
+    allocator: std.mem.Allocator,
+    stable_contract: std.json.Value,
+    experimental_contract: std.json.Value,
+    stable: SchemaBundle,
+    experimental: SchemaBundle,
+    profile: Profile,
+    report: *InspectionReport,
+) !void {
+    try inspectShapes(
+        allocator,
+        stable,
+        try arrayField(stable_contract, "requiredShapes"),
+        &report.shape_failures,
+    );
+    switch (profile) {
+        .core, .review => {},
+        .session_inquiry, .full => try inspectShapes(
+            allocator,
+            experimental,
+            try arrayField(experimental_contract, "requiredShapes"),
+            &report.shape_failures,
+        ),
+    }
+}
+
+fn inspectionFailed(report: InspectionReport, profile: Profile) bool {
+    return report.missing_required.items.len != 0 or
+        report.shape_failures.items.len != 0 or
+        report.handler_failures.items.len != 0 or
+        (profile == .full and report.unclassified_server_requests.items.len != 0);
+}
 
 fn collectMethods(allocator: std.mem.Allocator, raw: []const u8) !MethodSet {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
@@ -1079,7 +1619,12 @@ fn collectMethods(allocator: std.mem.Allocator, raw: []const u8) !MethodSet {
     return methods;
 }
 
-fn compareRequired(allocator: std.mem.Allocator, required: std.json.Array, actual: []const []u8, failures: *std.ArrayList([]u8)) !void {
+fn compareRequired(
+    allocator: std.mem.Allocator,
+    required: std.json.Array,
+    actual: []const []u8,
+    failures: *std.ArrayList([]u8),
+) !void {
     for (required.items) |item| {
         const method = switch (item) {
             .string => |value| value,
@@ -1100,8 +1645,17 @@ fn requireMethod(
     if (!contains(actual, method)) try appendUnique(allocator, failures, method);
 }
 
-fn collectAdditive(allocator: std.mem.Allocator, actual: []const []u8, required: std.json.Array, output: *std.ArrayList([]u8)) !void {
-    for (actual) |method| if (!jsonArrayContains(required, method)) try appendUnique(allocator, output, method);
+fn collectAdditive(
+    allocator: std.mem.Allocator,
+    actual: []const []u8,
+    required: std.json.Array,
+    output: *std.ArrayList([]u8),
+) !void {
+    for (actual) |method| {
+        if (!jsonArrayContains(required, method)) {
+            try appendUnique(allocator, output, method);
+        }
+    }
 }
 
 fn classifyServerAdditions(
@@ -1118,7 +1672,9 @@ fn classifyServerAdditions(
     for (actual) |method| {
         if (jsonArrayContains(required, method)) continue;
         try appendUnique(allocator, &report.additive_server_requests, method);
-        if (!policy_object.contains(method)) try appendUnique(allocator, &report.unclassified_server_requests, method);
+        if (!policy_object.contains(method)) {
+            try appendUnique(allocator, &report.unclassified_server_requests, method);
+        }
     }
 }
 
@@ -1139,14 +1695,21 @@ fn classifyExperimentalServerAdditions(
     }
 }
 
-fn comparePolicyRequired(allocator: std.mem.Allocator, policies: std.json.Value, actual: []const []u8, failures: *std.ArrayList([]u8)) !void {
+fn comparePolicyRequired(
+    allocator: std.mem.Allocator,
+    policies: std.json.Value,
+    actual: []const []u8,
+    failures: *std.ArrayList([]u8),
+) !void {
     const policy_object = switch (policies) {
         .object => |value| value,
         else => return error.InvalidContract,
     };
     var iterator = policy_object.iterator();
     while (iterator.next()) |entry| {
-        if (!contains(actual, entry.key_ptr.*)) try appendUnique(allocator, failures, entry.key_ptr.*);
+        if (!contains(actual, entry.key_ptr.*)) {
+            try appendUnique(allocator, failures, entry.key_ptr.*);
+        }
     }
 }
 
@@ -1155,11 +1718,17 @@ fn validateHandlerParity(policies: std.json.Value) !void {
         .object => |value| value,
         else => return error.InvalidContract,
     };
-    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) return error.InvalidContract;
+    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) {
+        return error.InvalidContract;
+    }
     for (proxy_client.server_request_handler_descriptors, 0..) |descriptor, index| {
         if (descriptor.kind == .unknown) return error.InvalidContract;
         for (proxy_client.server_request_handler_descriptors[0..index]) |prior| {
-            if (std.mem.eql(u8, descriptor.method, prior.method) or descriptor.kind == prior.kind) return error.InvalidContract;
+            if (std.mem.eql(u8, descriptor.method, prior.method) or
+                descriptor.kind == prior.kind)
+            {
+                return error.InvalidContract;
+            }
         }
         const value = policy_object.get(descriptor.method) orelse return error.InvalidContract;
         const policy = switch (value) {
@@ -1170,7 +1739,8 @@ fn validateHandlerParity(policies: std.json.Value) !void {
     }
     var iterator = policy_object.iterator();
     while (iterator.next()) |entry| {
-        const descriptor = proxy_client.serverRequestHandler(entry.key_ptr.*) orelse return error.InvalidContract;
+        const descriptor = proxy_client.serverRequestHandler(entry.key_ptr.*) orelse
+            return error.InvalidContract;
         const policy = switch (entry.value_ptr.*) {
             .string => |text| text,
             else => return error.InvalidContract,
@@ -1209,7 +1779,9 @@ fn inspectHandlerParity(
                 continue;
             },
         };
-        if (!std.mem.eql(u8, policy, descriptor.policy)) try appendUnique(allocator, failures, descriptor.method);
+        if (!std.mem.eql(u8, policy, descriptor.policy)) {
+            try appendUnique(allocator, failures, descriptor.method);
+        }
     }
     var iterator = policy_object.iterator();
     while (iterator.next()) |entry| {
@@ -1224,7 +1796,9 @@ fn inspectHandlerParity(
                 continue;
             },
         };
-        if (!std.mem.eql(u8, policy, descriptor.policy)) try appendUnique(allocator, failures, entry.key_ptr.*);
+        if (!std.mem.eql(u8, policy, descriptor.policy)) {
+            try appendUnique(allocator, failures, entry.key_ptr.*);
+        }
     }
 }
 
@@ -1245,8 +1819,15 @@ fn validateProbeParity(probes: std.json.Array) !void {
     }
 }
 
-fn inspectShapes(allocator: std.mem.Allocator, bundle: SchemaBundle, shapes: std.json.Array, failures: *std.ArrayList([]u8)) !void {
-    if (bundle.documents.len > max_documents or shapes.items.len > max_shapes) return error.SchemaTooLarge;
+fn inspectShapes(
+    allocator: std.mem.Allocator,
+    bundle: SchemaBundle,
+    shapes: std.json.Array,
+    failures: *std.ArrayList([]u8),
+) !void {
+    if (bundle.documents.len > max_documents or shapes.items.len > max_shapes) {
+        return error.SchemaTooLarge;
+    }
     for (shapes.items) |shape| {
         const id = try stringField(shape, "id");
         const document = try stringField(shape, "document");
@@ -1266,7 +1847,8 @@ fn inspectShapes(allocator: std.mem.Allocator, bundle: SchemaBundle, shapes: std
             try appendUnique(allocator, failures, id);
             continue;
         };
-        if (!schemaHasKind(node.*, expected_kind) or schemaIsNullable(node.*) != expected_nullable or
+        if (!schemaHasKind(node.*, expected_kind) or
+            schemaIsNullable(node.*) != expected_nullable or
             !requiredNamesPresent(shape, node.*) or !enumValuesPresent(shape, node.*))
         {
             try appendUnique(allocator, failures, id);
@@ -1274,12 +1856,17 @@ fn inspectShapes(allocator: std.mem.Allocator, bundle: SchemaBundle, shapes: std
     }
 }
 
-fn resolveShapeNode(root: *const std.json.Value, selector: std.json.Value, pointer: []const u8) !*const std.json.Value {
+fn resolveShapeNode(
+    root: *const std.json.Value,
+    selector: std.json.Value,
+    pointer: []const u8,
+) !*const std.json.Value {
     const selector_object = switch (selector) {
         .object => |value| value,
         else => return error.InvalidContract,
     };
-    const variant_pointer_value = selector_object.get("variantPointer") orelse return resolvePointer(root, pointer);
+    const variant_pointer_value = selector_object.get("variantPointer") orelse
+        return resolvePointer(root, pointer);
     const variant_pointer = switch (variant_pointer_value) {
         .string => |value| value,
         else => return error.InvalidContract,
@@ -1311,7 +1898,9 @@ fn resolveShapeNode(root: *const std.json.Value, selector: std.json.Value, point
             .array => |value| value,
             else => continue,
         };
-        if (jsonArrayContains(enum_values, discriminator_value)) return resolvePointer(variant, pointer);
+        if (jsonArrayContains(enum_values, discriminator_value)) {
+            return resolvePointer(variant, pointer);
+        }
     }
     return error.MissingDiscriminatorVariant;
 }
@@ -1343,7 +1932,9 @@ fn schemaHasKind(value: std.json.Value, expected: []const u8) bool {
     };
     if (std.mem.eql(u8, expected, "ref")) {
         if (object.get("$ref") != null) return true;
-        return unionHasRef(object.get("anyOf")) or unionHasRef(object.get("oneOf")) or unionHasRef(object.get("allOf"));
+        return unionHasRef(object.get("anyOf")) or
+            unionHasRef(object.get("oneOf")) or
+            unionHasRef(object.get("allOf"));
     }
     if (object.get("type")) |type_value| switch (type_value) {
         .string => |kind| if (std.mem.eql(u8, kind, expected)) return true,
@@ -1353,7 +1944,8 @@ fn schemaHasKind(value: std.json.Value, expected: []const u8) bool {
         },
         else => {},
     };
-    return unionHasKind(object.get("anyOf"), expected) or unionHasKind(object.get("oneOf"), expected);
+    return unionHasKind(object.get("anyOf"), expected) or
+        unionHasKind(object.get("oneOf"), expected);
 }
 
 fn unionHasRef(value: ?std.json.Value) bool {
@@ -1572,21 +2164,56 @@ fn methodSchema(allocator: std.mem.Allocator, methods: std.json.Array) ![]u8 {
 fn makeTestBundles(allocator: std.mem.Allocator, baseline: std.json.Value) !TestBundles {
     const stable = try objectField(baseline, "stable");
     const experimental = try objectField(baseline, "experimental");
-    const experimental_server_base = try methodSchema(allocator, try arrayField(stable, "requiredServerRequests"));
+    const experimental_server_base = try methodSchema(
+        allocator,
+        try arrayField(stable, "requiredServerRequests"),
+    );
     defer allocator.free(experimental_server_base);
-    const current_time_addition = ",{\"properties\":{\"method\":{\"enum\":[\"currentTime/read\"]}}}]}";
+    const current_time_addition =
+        ",{\"properties\":{\"method\":{\"enum\":[\"currentTime/read\"]}}}]}";
     return .{
-        .stable_client = try methodSchema(allocator, try arrayField(stable, "requiredClientMethods")),
-        .stable_server = try methodSchema(allocator, try arrayField(stable, "requiredServerRequests")),
-        .stable_notification = try methodSchema(allocator, try arrayField(stable, "requiredNotifications")),
-        .experimental_client = try methodSchema(allocator, try arrayField(experimental, "requiredClientMethods")),
-        .experimental_server = try std.mem.concat(allocator, u8, &.{ experimental_server_base[0 .. experimental_server_base.len - 2], current_time_addition }),
-        .experimental_notification = try methodSchema(allocator, try arrayField(stable, "requiredNotifications")),
+        .stable_client = try methodSchema(
+            allocator,
+            try arrayField(stable, "requiredClientMethods"),
+        ),
+        .stable_server = try methodSchema(
+            allocator,
+            try arrayField(stable, "requiredServerRequests"),
+        ),
+        .stable_notification = try methodSchema(
+            allocator,
+            try arrayField(stable, "requiredNotifications"),
+        ),
+        .experimental_client = try methodSchema(
+            allocator,
+            try arrayField(experimental, "requiredClientMethods"),
+        ),
+        .experimental_server = try std.mem.concat(allocator, u8, &.{
+            experimental_server_base[0 .. experimental_server_base.len - 2],
+            current_time_addition,
+        }),
+        .experimental_notification = try methodSchema(
+            allocator,
+            try arrayField(stable, "requiredNotifications"),
+        ),
     };
 }
 
-fn inspectTestBundles(allocator: std.mem.Allocator, baseline: *const std.json.Value, bundles: *const TestBundles, stable_shape_doc: []const u8, experimental_shape_doc: []const u8) !InspectionReport {
-    return inspectTestBundlesForProfile(allocator, baseline, bundles, stable_shape_doc, experimental_shape_doc, .full);
+fn inspectTestBundles(
+    allocator: std.mem.Allocator,
+    baseline: *const std.json.Value,
+    bundles: *const TestBundles,
+    stable_shape_doc: []const u8,
+    experimental_shape_doc: []const u8,
+) !InspectionReport {
+    return inspectTestBundlesForProfile(
+        allocator,
+        baseline,
+        bundles,
+        stable_shape_doc,
+        experimental_shape_doc,
+        .full,
+    );
 }
 
 fn inspectTestBundlesForProfile(
@@ -1612,14 +2239,32 @@ fn inspectTestBundlesForProfile(
         experimental_docs[0], experimental_docs[1], experimental_docs[2],
     };
     var adjusted = experimental_docs_with_shapes;
-    adjusted[0].bytes = try mergeDefinitionsIntoMethodSchema(allocator, bundles.experimental_client, experimental_shape_doc);
+    adjusted[0].bytes = try mergeDefinitionsIntoMethodSchema(
+        allocator,
+        bundles.experimental_client,
+        experimental_shape_doc,
+    );
     defer allocator.free(adjusted[0].bytes);
-    return inspect(allocator, baseline, .{ .documents = &stable_docs }, .{ .documents = &adjusted }, profile);
+    return inspect(
+        allocator,
+        baseline,
+        .{ .documents = &stable_docs },
+        .{ .documents = &adjusted },
+        profile,
+    );
 }
 
-fn mergeDefinitionsIntoMethodSchema(allocator: std.mem.Allocator, methods: []const u8, definitions: []const u8) ![]u8 {
+fn mergeDefinitionsIntoMethodSchema(
+    allocator: std.mem.Allocator,
+    methods: []const u8,
+    definitions: []const u8,
+) ![]u8 {
     if (methods.len < 2 or definitions.len < 2) return error.InvalidJsonShape;
-    return std.fmt.allocPrint(allocator, "{{\"definitions\":{s},\"oneOf\":{s}", .{ definitions[15 .. definitions.len - 1], methods[9..] });
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"definitions\":{s},\"oneOf\":{s}",
+        .{ definitions[15 .. definitions.len - 1], methods[9..] },
+    );
 }
 
 test "baseline method-set cardinalities and exact compatible bundles" {
@@ -1627,7 +2272,13 @@ test "baseline method-set cardinalities and exact compatible bundles" {
     defer baseline.deinit();
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.compatible, report.status);
     try std.testing.expectEqual(@as(usize, 0), report.additive_server_requests.items.len);
@@ -1645,7 +2296,12 @@ test "PathUri round trips opaquely without native path normalization" {
         var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer output.deinit();
         try std.json.Stringify.value(uri.raw, .{}, &output.writer);
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            output.written(),
+            .{},
+        );
         defer parsed.deinit();
         try std.testing.expectEqualStrings(raw, parsed.value.string);
     }
@@ -1657,134 +2313,176 @@ test "PathUri round trips opaquely without native path normalization" {
 test "profiles select only their experimental client and shape obligations" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
+    try expectExperimentalMethodProfiles(&baseline.value, "thread/search", &.{.full});
+    try expectExperimentalMethodProfiles(
+        &baseline.value,
+        "thread/turns/list",
+        &.{ .session_inquiry, .full },
+    );
+    try expectExperimentalShapeProfiles(&baseline.value);
+}
 
-    {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-        defer bundles.deinit(std.testing.allocator);
-        const method = "thread/search";
-        const offset = std.mem.indexOf(u8, bundles.experimental_client, method) orelse return error.TestExpectedEqual;
-        bundles.experimental_client[offset + method.len - 1] = 'x';
-        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
-            var report = try inspectTestBundlesForProfile(
-                std.testing.allocator,
-                &baseline.value,
-                &bundles,
-                stable_shapes,
-                experimental_shapes,
-                profile,
-            );
-            defer report.deinit(std.testing.allocator);
-            try std.testing.expectEqual(if (profile == .full) Status.incompatible else Status.compatible, report.status);
-        }
+fn expectExperimentalMethodProfiles(
+    baseline: *const std.json.Value,
+    method: []const u8,
+    required_profiles: []const Profile,
+) !void {
+    var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
+    defer bundles.deinit(std.testing.allocator);
+    const offset = std.mem.indexOf(u8, bundles.experimental_client, method) orelse
+        return error.TestExpectedEqual;
+    bundles.experimental_client[offset + method.len - 1] = 'x';
+    for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+        var report = try inspectTestBundlesForProfile(
+            std.testing.allocator,
+            baseline,
+            &bundles,
+            stable_shapes,
+            experimental_shapes,
+            profile,
+        );
+        defer report.deinit(std.testing.allocator);
+        const expected: Status = if (containsProfile(required_profiles, profile))
+            .incompatible
+        else
+            .compatible;
+        try std.testing.expectEqual(expected, report.status);
     }
+}
 
-    {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-        defer bundles.deinit(std.testing.allocator);
-        const method = "thread/turns/list";
-        const offset = std.mem.indexOf(u8, bundles.experimental_client, method) orelse return error.TestExpectedEqual;
-        bundles.experimental_client[offset + method.len - 1] = 'x';
-        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
-            var report = try inspectTestBundlesForProfile(
-                std.testing.allocator,
-                &baseline.value,
-                &bundles,
-                stable_shapes,
-                experimental_shapes,
-                profile,
-            );
-            defer report.deinit(std.testing.allocator);
-            const requires_method = profile == .session_inquiry or profile == .full;
-            try std.testing.expectEqual(if (requires_method) Status.incompatible else Status.compatible, report.status);
-        }
+fn expectExperimentalShapeProfiles(baseline: *const std.json.Value) !void {
+    var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
+    defer bundles.deinit(std.testing.allocator);
+    const drifted = try std.testing.allocator.dupe(u8, experimental_shapes);
+    defer std.testing.allocator.free(drifted);
+    const method = "beforeTurnId";
+    const offset = std.mem.indexOf(u8, drifted, method) orelse
+        return error.TestExpectedEqual;
+    drifted[offset + method.len - 1] = 'x';
+    for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+        var report = try inspectTestBundlesForProfile(
+            std.testing.allocator,
+            baseline,
+            &bundles,
+            stable_shapes,
+            drifted,
+            profile,
+        );
+        defer report.deinit(std.testing.allocator);
+        const expected: Status = if (profile == .session_inquiry or profile == .full)
+            .incompatible
+        else
+            .compatible;
+        try std.testing.expectEqual(expected, report.status);
     }
+}
 
-    {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-        defer bundles.deinit(std.testing.allocator);
-        const drifted = try std.testing.allocator.dupe(u8, experimental_shapes);
-        defer std.testing.allocator.free(drifted);
-        const method = "beforeTurnId";
-        const offset = std.mem.indexOf(u8, drifted, method) orelse return error.TestExpectedEqual;
-        drifted[offset + method.len - 1] = 'x';
-        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
-            var report = try inspectTestBundlesForProfile(
-                std.testing.allocator,
-                &baseline.value,
-                &bundles,
-                stable_shapes,
-                drifted,
-                profile,
-            );
-            defer report.deinit(std.testing.allocator);
-            const requires_shape = profile == .session_inquiry or profile == .full;
-            try std.testing.expectEqual(if (requires_shape) Status.incompatible else Status.compatible, report.status);
-        }
-    }
+fn containsProfile(profiles: []const Profile, expected: Profile) bool {
+    for (profiles) |profile| if (profile == expected) return true;
+    return false;
 }
 
 test "stable method server notification shape and handler drift fail every profile" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
-    const profiles = [_]Profile{ .core, .review, .session_inquiry, .full };
+    try expectMethodDriftAllProfiles(
+        &baseline.value,
+        .stable_client,
+        "externalAgentConfig/import/recordHistory",
+    );
+    try expectMethodDriftAllProfiles(&baseline.value, .experimental_server, "currentTime/read");
+    try expectMethodDriftAllProfiles(&baseline.value, .stable_notification, "error");
+    try expectShapeDriftAllProfiles(&baseline.value);
+    try expectPolicyDriftAllProfiles(&baseline.value);
+}
 
-    for (profiles) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+const TestMethodSurface = enum { stable_client, experimental_server, stable_notification };
+
+fn expectMethodDriftAllProfiles(
+    baseline: *const std.json.Value,
+    surface: TestMethodSurface,
+    method: []const u8,
+) !void {
+    for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
         defer bundles.deinit(std.testing.allocator);
-        const method = "externalAgentConfig/import/recordHistory";
-        const offset = std.mem.indexOf(u8, bundles.stable_client, method) orelse return error.TestExpectedEqual;
-        bundles.stable_client[offset + method.len - 1] = 'x';
-        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        const bytes = switch (surface) {
+            .stable_client => bundles.stable_client,
+            .experimental_server => bundles.experimental_server,
+            .stable_notification => bundles.stable_notification,
+        };
+        const offset = std.mem.indexOf(u8, bytes, method) orelse
+            return error.TestExpectedEqual;
+        bytes[offset + method.len - 1] = 'x';
+        var report = try inspectTestBundlesForProfile(
+            std.testing.allocator,
+            baseline,
+            &bundles,
+            stable_shapes,
+            experimental_shapes,
+            profile,
+        );
         defer report.deinit(std.testing.allocator);
         try std.testing.expectEqual(Status.incompatible, report.status);
     }
+}
 
-    for (profiles) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-        defer bundles.deinit(std.testing.allocator);
-        const method = "currentTime/read";
-        const offset = std.mem.indexOf(u8, bundles.experimental_server, method) orelse return error.TestExpectedEqual;
-        bundles.experimental_server[offset + method.len - 1] = 'x';
-        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
-        defer report.deinit(std.testing.allocator);
-        try std.testing.expectEqual(Status.incompatible, report.status);
-    }
-
-    for (profiles) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-        defer bundles.deinit(std.testing.allocator);
-        const method = "error";
-        const offset = std.mem.indexOf(u8, bundles.stable_notification, method) orelse return error.TestExpectedEqual;
-        bundles.stable_notification[offset + method.len - 1] = 'x';
-        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
-        defer report.deinit(std.testing.allocator);
-        try std.testing.expectEqual(Status.incompatible, report.status);
-    }
-
-    for (profiles) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+fn expectShapeDriftAllProfiles(baseline: *const std.json.Value) !void {
+    for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
         defer bundles.deinit(std.testing.allocator);
         const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
         defer std.testing.allocator.free(drifted);
         const needle = "isPinned";
-        const offset = std.mem.indexOf(u8, drifted, needle) orelse return error.TestExpectedEqual;
+        const offset = std.mem.indexOf(u8, drifted, needle) orelse
+            return error.TestExpectedEqual;
         drifted[offset + needle.len - 1] = 'x';
-        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes, profile);
+        var report = try inspectTestBundlesForProfile(
+            std.testing.allocator,
+            baseline,
+            &bundles,
+            drifted,
+            experimental_shapes,
+            profile,
+        );
         defer report.deinit(std.testing.allocator);
         try std.testing.expectEqual(Status.incompatible, report.status);
     }
+}
 
-    const policy_value = baseline.value.object.getPtr("serverRequestPolicies") orelse return error.TestExpectedEqual;
-    const policy = policy_value.object.getPtr("currentTime/read") orelse return error.TestExpectedEqual;
+fn expectPolicyDriftAllProfiles(baseline: *std.json.Value) !void {
+    const policy_value = baseline.object.getPtr("serverRequestPolicies") orelse
+        return error.TestExpectedEqual;
+    const policy = policy_value.object.getPtr("currentTime/read") orelse
+        return error.TestExpectedEqual;
     policy.* = .{ .string = "wrong-policy" };
-    for (profiles) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+    for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
         defer bundles.deinit(std.testing.allocator);
-        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        var report = try inspectTestBundlesForProfile(
+            std.testing.allocator,
+            baseline,
+            &bundles,
+            stable_shapes,
+            experimental_shapes,
+            profile,
+        );
         defer report.deinit(std.testing.allocator);
         try std.testing.expectEqual(Status.incompatible, report.status);
         try std.testing.expect(contains(report.handler_failures.items, "currentTime/read"));
     }
+}
+
+fn expectProbeRequirement(
+    expected: ProbeRequirement,
+    profile: Profile,
+    selection: ProbeSelection,
+    probe_id: []const u8,
+) !void {
+    try std.testing.expectEqual(
+        expected,
+        probeRequirement(profile, selection, probe_id).?,
+    );
 }
 
 test "behavioral probe descriptors exactly cover contract and select required probes" {
@@ -1797,15 +2495,20 @@ test "behavioral probe descriptors exactly cover contract and select required pr
     }
 
     const stdio = ProbeSelection{ .transport = .stdio };
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, stdio, "initialize-lifecycle").?);
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, stdio, "stdio-transport").?);
-    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.core, stdio, "managed-websocket-transport").?);
-    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.core, stdio, "remote-code-mode-host").?);
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.review, stdio, "structured-review").?);
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.session_inquiry, stdio, "paginated-fork").?);
-    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.review, stdio, "paginated-fork").?);
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.full, stdio, "thread-pinning-round-trip").?);
-    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, .{ .transport = .stdio, .code_mode_host = true }, "remote-code-mode-host").?);
+    try expectProbeRequirement(.required, .core, stdio, "initialize-lifecycle");
+    try expectProbeRequirement(.required, .core, stdio, "stdio-transport");
+    try expectProbeRequirement(.not_applicable, .core, stdio, "managed-websocket-transport");
+    try expectProbeRequirement(.not_applicable, .core, stdio, "remote-code-mode-host");
+    try expectProbeRequirement(.required, .review, stdio, "structured-review");
+    try expectProbeRequirement(.required, .session_inquiry, stdio, "paginated-fork");
+    try expectProbeRequirement(.not_applicable, .review, stdio, "paginated-fork");
+    try expectProbeRequirement(.required, .full, stdio, "thread-pinning-round-trip");
+    try expectProbeRequirement(
+        .required,
+        .core,
+        .{ .transport = .stdio, .code_mode_host = true },
+        "remote-code-mode-host",
+    );
     try std.testing.expect(probeRequirement(.core, stdio, "future-probe") == null);
 }
 
@@ -1815,18 +2518,39 @@ test "additive client notification and object fields remain compatible" {
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
     const client_addition = ",{\"properties\":{\"method\":{\"enum\":[\"future/client\"]}}}]}";
-    const notification_addition = ",{\"properties\":{\"method\":{\"enum\":[\"future/notification\"]}}}]}";
-    const experimental_notification_addition = ",{\"properties\":{\"method\":{\"enum\":[\"future/experimental-notification\"]}}}]}";
+    const notification_addition =
+        ",{\"properties\":{\"method\":{\"enum\":[\"future/notification\"]}}}]}";
+    const experimental_notification_addition =
+        ",{\"properties\":{\"method\":{\"enum\":[\"future/experimental-notification\"]}}}]}";
     const old_client = bundles.stable_client;
     const old_notification = bundles.stable_notification;
     const old_experimental_notification = bundles.experimental_notification;
-    bundles.stable_client = try std.mem.concat(std.testing.allocator, u8, &.{ old_client[0 .. old_client.len - 2], client_addition });
-    bundles.stable_notification = try std.mem.concat(std.testing.allocator, u8, &.{ old_notification[0 .. old_notification.len - 2], notification_addition });
-    bundles.experimental_notification = try std.mem.concat(std.testing.allocator, u8, &.{ old_experimental_notification[0 .. old_experimental_notification.len - 2], experimental_notification_addition });
+    bundles.stable_client = try std.mem.concat(std.testing.allocator, u8, &.{
+        old_client[0 .. old_client.len - 2],
+        client_addition,
+    });
+    bundles.stable_notification = try std.mem.concat(std.testing.allocator, u8, &.{
+        old_notification[0 .. old_notification.len - 2],
+        notification_addition,
+    });
+    bundles.experimental_notification = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            old_experimental_notification[0 .. old_experimental_notification.len - 2],
+            experimental_notification_addition,
+        },
+    );
     std.testing.allocator.free(old_client);
     std.testing.allocator.free(old_notification);
     std.testing.allocator.free(old_experimental_notification);
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.compatible, report.status);
     try std.testing.expectEqual(@as(usize, 1), report.additive_client_methods.items.len);
@@ -1839,9 +2563,19 @@ test "missing required method and discriminator drift are incompatible" {
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
     const needle = "externalAgentConfig/import/recordHistory";
-    const offset = std.mem.indexOf(u8, bundles.stable_client, needle) orelse return error.TestExpectedEqual;
-    @memcpy(bundles.stable_client[offset .. offset + needle.len], "externalAgentConfig/import/recordHistorx");
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    const offset = std.mem.indexOf(u8, bundles.stable_client, needle) orelse
+        return error.TestExpectedEqual;
+    @memcpy(
+        bundles.stable_client[offset .. offset + needle.len],
+        "externalAgentConfig/import/recordHistorx",
+    );
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expect(report.missing_required.items.len != 0);
@@ -1855,13 +2589,24 @@ test "required shape kind and nullability drift are incompatible" {
     const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
     defer std.testing.allocator.free(drifted);
     const kind_needle = "\"isPinned\":{\"type\":\"boolean\"";
-    const kind_offset = std.mem.indexOf(u8, drifted, kind_needle) orelse return error.TestExpectedEqual;
-    @memcpy(drifted[kind_offset + kind_needle.len - 8 .. kind_offset + kind_needle.len - 1], "integer");
+    const kind_offset = std.mem.indexOf(u8, drifted, kind_needle) orelse
+        return error.TestExpectedEqual;
+    @memcpy(
+        drifted[kind_offset + kind_needle.len - 8 .. kind_offset + kind_needle.len - 1],
+        "integer",
+    );
     const nullability_needle = "\"path\":{\"type\":[\"string\",\"null\"]}";
-    const nullability_offset = std.mem.indexOf(u8, drifted, nullability_needle) orelse return error.TestExpectedEqual;
+    const nullability_offset = std.mem.indexOf(u8, drifted, nullability_needle) orelse
+        return error.TestExpectedEqual;
     const null_offset = nullability_offset + nullability_needle.len - 7;
     @memcpy(drifted[null_offset .. null_offset + 4], "bool");
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        drifted,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
@@ -1878,11 +2623,18 @@ test "review target branch and commit identity remain strings" {
         "\"branch\":{\"type\":\"string\"}",
         "\"sha\":{\"type\":\"string\"}",
     }) |needle| {
-        const offset = std.mem.indexOf(u8, drifted, needle) orelse return error.TestExpectedEqual;
+        const offset = std.mem.indexOf(u8, drifted, needle) orelse
+            return error.TestExpectedEqual;
         const kind_offset = offset + needle.len - "string\"}".len;
         @memcpy(drifted[kind_offset .. kind_offset + "string".len], "number");
     }
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        drifted,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
@@ -1896,12 +2648,19 @@ test "discriminated variant and required enum drift are incompatible" {
     const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
     defer std.testing.allocator.free(drifted);
     const discriminator = "commandExecution";
-    const discriminator_offset = std.mem.indexOf(u8, drifted, discriminator) orelse return error.TestExpectedEqual;
+    const discriminator_offset = std.mem.indexOf(u8, drifted, discriminator) orelse
+        return error.TestExpectedEqual;
     drifted[discriminator_offset + discriminator.len - 1] = 'x';
     const plan = "ent26";
     const plan_offset = std.mem.indexOf(u8, drifted, plan) orelse return error.TestExpectedEqual;
     drifted[plan_offset + plan.len - 1] = '7';
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        drifted,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expectEqual(@as(usize, 3), report.shape_failures.items.len);
@@ -1914,9 +2673,18 @@ test "unclassified additive server request fails full profile" {
     defer bundles.deinit(std.testing.allocator);
     const addition = ",{\"properties\":{\"method\":{\"enum\":[\"future/server\"]}}}]}";
     const old = bundles.experimental_server;
-    bundles.experimental_server = try std.mem.concat(std.testing.allocator, u8, &.{ old[0 .. old.len - 2], addition });
+    bundles.experimental_server = try std.mem.concat(std.testing.allocator, u8, &.{
+        old[0 .. old.len - 2],
+        addition,
+    });
     std.testing.allocator.free(old);
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expectEqual(@as(usize, 1), report.unclassified_server_requests.items.len);
@@ -1928,9 +2696,16 @@ test "missing experimental current time request is incompatible" {
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
     const method = "currentTime/read";
-    const offset = std.mem.indexOf(u8, bundles.experimental_server, method) orelse return error.TestExpectedEqual;
+    const offset = std.mem.indexOf(u8, bundles.experimental_server, method) orelse
+        return error.TestExpectedEqual;
     bundles.experimental_server[offset + method.len - 1] = 'x';
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expect(contains(report.missing_required.items, method));
@@ -1942,9 +2717,16 @@ test "missing experimental notification is incompatible" {
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
     const method = "error";
-    const offset = std.mem.indexOf(u8, bundles.experimental_notification, method) orelse return error.TestExpectedEqual;
+    const offset = std.mem.indexOf(u8, bundles.experimental_notification, method) orelse
+        return error.TestExpectedEqual;
     bundles.experimental_notification[offset + method.len - 1] = 'x';
-    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        stable_shapes,
+        experimental_shapes,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expect(contains(report.missing_required.items, method));
@@ -1972,7 +2754,12 @@ test "exact codex version parsing distinguishes prerelease from build metadata" 
         "codex-cli 0.146.0\r\n",
         "codex-cli 0.146.0-\n",
     };
-    for (malformed) |raw| try std.testing.expectError(error.InvalidCodexVersion, parseCodexVersion(std.testing.allocator, raw));
+    for (malformed) |raw| {
+        try std.testing.expectError(
+            error.InvalidCodexVersion,
+            parseCodexVersion(std.testing.allocator, raw),
+        );
+    }
 }
 
 test "canonical bundle digest ignores object and creation order but binds path and content" {
@@ -2022,13 +2809,25 @@ test "bundle bounds reject symlink count and byte excess" {
     const target = try std.fs.path.join(std.testing.allocator, &.{ root, "a.json" });
     defer std.testing.allocator.free(target);
     try std.Io.Dir.symLinkAbsolute(io, target, link, .{});
-    try std.testing.expectError(error.InvalidBundleEntry, digestBundle(std.testing.allocator, io, root, .{}));
+    try std.testing.expectError(
+        error.InvalidBundleEntry,
+        digestBundle(std.testing.allocator, io, root, .{}),
+    );
     try std.Io.Dir.cwd().deleteFile(io, link);
 
     try writeTestFile(io, root, "b.json", "{}\n");
-    try std.testing.expectError(error.BundleTooManyFiles, digestBundle(std.testing.allocator, io, root, .{ .bundle_documents = 1 }));
-    try std.testing.expectError(error.BundleFileTooLarge, digestBundle(std.testing.allocator, io, root, .{ .bundle_file_bytes = 1 }));
-    try std.testing.expectError(error.BundleTooLarge, digestBundle(std.testing.allocator, io, root, .{ .bundle_total_bytes = 4 }));
+    try std.testing.expectError(
+        error.BundleTooManyFiles,
+        digestBundle(std.testing.allocator, io, root, .{ .bundle_documents = 1 }),
+    );
+    try std.testing.expectError(
+        error.BundleFileTooLarge,
+        digestBundle(std.testing.allocator, io, root, .{ .bundle_file_bytes = 1 }),
+    );
+    try std.testing.expectError(
+        error.BundleTooLarge,
+        digestBundle(std.testing.allocator, io, root, .{ .bundle_total_bytes = 4 }),
+    );
 }
 
 test "executable identity verification rejects an in-place replacement" {
@@ -2041,13 +2840,16 @@ test "executable identity verification rejects an in-place replacement" {
     const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
     defer allocator.free(executable);
     try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 0\n");
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try makeTestExecutable(io, executable);
     var identity = try resolveExecutableIdentity(allocator, io, executable, max_binary_bytes);
     defer identity.deinit(allocator);
 
     try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 1\n");
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
-    try std.testing.expectError(error.ExecutableChanged, verifyExecutableIdentity(allocator, io, &identity));
+    try makeTestExecutable(io, executable);
+    try std.testing.expectError(
+        error.ExecutableChanged,
+        verifyExecutableIdentity(allocator, io, &identity),
+    );
 }
 
 test "schema cache hits only after exact identity manifest and canonical bundles" {
@@ -2066,58 +2868,109 @@ test "schema cache hits only after exact identity manifest and canonical bundles
     const script = try fakeCodexScriptAlloc(allocator, log_path, false, false);
     defer allocator.free(script);
     try writeAbsoluteTestFile(io, executable, script);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try makeTestExecutable(io, executable);
 
-    const SavedPaths = struct { stable: []u8, cache: []u8 };
-    const saved: SavedPaths = saved: {
-        var first = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
-        defer first.deinit(allocator);
-        try std.testing.expect(!first.hit);
-        const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
-        defer allocator.free(first_log);
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, first_log, "app-server generate-json-schema"));
-        try std.testing.expectError(
-            error.CacheLockTimedOut,
-            ensureSchemaCacheWithLimits(
-                allocator,
-                io,
-                .{ .cache_root = cache_root, .codex_path = executable },
-                .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
-            ),
-        );
-        first.releaseLock();
-        first.releaseLock();
-        var concurrent_reader = try ensureSchemaCacheWithLimits(
+    const saved = try primeSchemaCache(allocator, io, cache_root, executable, log_path);
+    defer allocator.free(saved.stable);
+    defer allocator.free(saved.cache);
+    try expectSchemaCacheHit(allocator, io, cache_root, executable, log_path);
+    try expectSchemaCacheRegeneration(
+        allocator,
+        io,
+        cache_root,
+        executable,
+        script,
+        saved,
+    );
+}
+
+const SavedCachePaths = struct { stable: []u8, cache: []u8 };
+
+fn primeSchemaCache(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cache_root: []const u8,
+    executable: []const u8,
+    log_path: []const u8,
+) !SavedCachePaths {
+    var first = try ensureSchemaCache(allocator, io, .{
+        .cache_root = cache_root,
+        .codex_path = executable,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expect(!first.hit);
+    const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
+    defer allocator.free(first_log);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, first_log, "app-server generate-json-schema"),
+    );
+    try std.testing.expectError(
+        error.CacheLockTimedOut,
+        ensureSchemaCacheWithLimits(
             allocator,
             io,
             .{ .cache_root = cache_root, .codex_path = executable },
             .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
-        );
-        defer concurrent_reader.deinit(allocator);
-        try std.testing.expect(concurrent_reader.hit);
-        break :saved .{
-            .stable = try allocator.dupe(u8, first.stable_path),
-            .cache = try allocator.dupe(u8, first.cache_path),
-        };
+        ),
+    );
+    first.releaseLock();
+    first.releaseLock();
+    var concurrent_reader = try ensureSchemaCacheWithLimits(
+        allocator,
+        io,
+        .{ .cache_root = cache_root, .codex_path = executable },
+        .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
+    );
+    defer concurrent_reader.deinit(allocator);
+    try std.testing.expect(concurrent_reader.hit);
+    return .{
+        .stable = try allocator.dupe(u8, first.stable_path),
+        .cache = try allocator.dupe(u8, first.cache_path),
     };
-    defer allocator.free(saved.stable);
-    defer allocator.free(saved.cache);
+}
 
+fn expectSchemaCacheHit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cache_root: []const u8,
+    executable: []const u8,
+    log_path: []const u8,
+) !void {
     const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
     defer allocator.free(first_log);
-    {
-        var second = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
-        defer second.deinit(allocator);
-        try std.testing.expect(second.hit);
-        const second_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
-        defer allocator.free(second_log);
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, second_log, "app-server generate-json-schema"));
-        try std.testing.expectEqual(std.mem.count(u8, first_log, "--version") + 1, std.mem.count(u8, second_log, "--version"));
-    }
+    var second = try ensureSchemaCache(allocator, io, .{
+        .cache_root = cache_root,
+        .codex_path = executable,
+    });
+    defer second.deinit(allocator);
+    try std.testing.expect(second.hit);
+    const second_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
+    defer allocator.free(second_log);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, second_log, "app-server generate-json-schema"),
+    );
+    try std.testing.expectEqual(
+        std.mem.count(u8, first_log, "--version") + 1,
+        std.mem.count(u8, second_log, "--version"),
+    );
+}
 
+fn expectSchemaCacheRegeneration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cache_root: []const u8,
+    executable: []const u8,
+    script: []const u8,
+    saved: SavedCachePaths,
+) !void {
     try writeTestFile(io, saved.stable, "root.json", "{\"drift\":true}\n");
     {
-        var bundle_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        var bundle_regenerated = try ensureSchemaCache(allocator, io, .{
+            .cache_root = cache_root,
+            .codex_path = executable,
+        });
         defer bundle_regenerated.deinit(allocator);
         try std.testing.expect(!bundle_regenerated.hit);
     }
@@ -2126,7 +2979,10 @@ test "schema cache hits only after exact identity manifest and canonical bundles
     defer allocator.free(manifest_path);
     try writeAbsoluteTestFile(io, manifest_path, "{}\n");
     {
-        var manifest_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
+        var manifest_regenerated = try ensureSchemaCache(allocator, io, .{
+            .cache_root = cache_root,
+            .codex_path = executable,
+        });
         defer manifest_regenerated.deinit(allocator);
         try std.testing.expect(!manifest_regenerated.hit);
     }
@@ -2134,12 +2990,13 @@ test "schema cache hits only after exact identity manifest and canonical bundles
     const changed_script = try std.mem.concat(allocator, u8, &.{ script, "# identity drift\n" });
     defer allocator.free(changed_script);
     try writeAbsoluteTestFile(io, executable, changed_script);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
-    {
-        var identity_regenerated = try ensureSchemaCache(allocator, io, .{ .cache_root = cache_root, .codex_path = executable });
-        defer identity_regenerated.deinit(allocator);
-        try std.testing.expect(!identity_regenerated.hit);
-    }
+    try makeTestExecutable(io, executable);
+    var identity_regenerated = try ensureSchemaCache(allocator, io, .{
+        .cache_root = cache_root,
+        .codex_path = executable,
+    });
+    defer identity_regenerated.deinit(allocator);
+    try std.testing.expect(!identity_regenerated.hit);
 }
 
 test "relative cache root is normalized to an absolute isolated path" {
@@ -2153,7 +3010,10 @@ test "relative cache root is normalized to an absolute isolated path" {
     defer allocator.free(executable);
     const log_path = try std.fs.path.join(allocator, &.{ root, "relative.log" });
     defer allocator.free(log_path);
-    const absolute_cache = try std.fs.path.join(allocator, &.{ root, "relative-cache", "missing-child" });
+    const absolute_cache = try std.fs.path.join(
+        allocator,
+        &.{ root, "relative-cache", "missing-child" },
+    );
     defer allocator.free(absolute_cache);
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     defer allocator.free(cwd);
@@ -2162,9 +3022,12 @@ test "relative cache root is normalized to an absolute isolated path" {
     const script = try fakeCodexScriptAlloc(allocator, log_path, false, false);
     defer allocator.free(script);
     try writeAbsoluteTestFile(io, executable, script);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try makeTestExecutable(io, executable);
 
-    var schemas = try ensureSchemaCache(allocator, io, .{ .cache_root = relative_cache, .codex_path = executable });
+    var schemas = try ensureSchemaCache(allocator, io, .{
+        .cache_root = relative_cache,
+        .codex_path = executable,
+    });
     defer schemas.deinit(allocator);
     try std.testing.expect(std.fs.path.isAbsolute(schemas.cache_path));
     try std.testing.expect(std.mem.startsWith(u8, schemas.cache_path, absolute_cache));
@@ -2187,14 +3050,30 @@ test "tiny process deadline and output limits fail closed" {
     const slow = try fakeCodexScriptAlloc(allocator, log_path, true, false);
     defer allocator.free(slow);
     try writeAbsoluteTestFile(io, executable, slow);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
-    try std.testing.expectError(error.ProcessTimedOut, ensureSchemaCacheWithLimits(allocator, io, .{ .cache_root = cache_root, .codex_path = executable }, .{ .version_timeout_ms = 10 }));
+    try makeTestExecutable(io, executable);
+    try std.testing.expectError(
+        error.ProcessTimedOut,
+        ensureSchemaCacheWithLimits(
+            allocator,
+            io,
+            .{ .cache_root = cache_root, .codex_path = executable },
+            .{ .version_timeout_ms = 10 },
+        ),
+    );
 
     const noisy = try fakeCodexScriptAlloc(allocator, log_path, false, true);
     defer allocator.free(noisy);
     try writeAbsoluteTestFile(io, executable, noisy);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
-    try std.testing.expectError(error.ProcessOutputTooLarge, ensureSchemaCacheWithLimits(allocator, io, .{ .cache_root = cache_root, .codex_path = executable }, .{ .version_stdout_bytes = 16 }));
+    try makeTestExecutable(io, executable);
+    try std.testing.expectError(
+        error.ProcessOutputTooLarge,
+        ensureSchemaCacheWithLimits(
+            allocator,
+            io,
+            .{ .cache_root = cache_root, .codex_path = executable },
+            .{ .version_stdout_bytes = 16 },
+        ),
+    );
 }
 
 fn writeTestFile(io: std.Io, root: []const u8, name: []const u8, bytes: []const u8) !void {
@@ -2209,16 +3088,49 @@ fn writeAbsoluteTestFile(io: std.Io, path: []const u8, bytes: []const u8) !void 
     try file.writeStreamingAll(io, bytes);
 }
 
-fn readAbsoluteTestFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
+fn readAbsoluteTestFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    limit: usize,
+) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
     defer file.close(io);
     return readFileBounded(allocator, io, file, limit);
 }
 
-fn fakeCodexScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8, slow: bool, noisy: bool) ![]u8 {
+fn fakeCodexScriptAlloc(
+    allocator: std.mem.Allocator,
+    log_path: []const u8,
+    slow: bool,
+    noisy: bool,
+) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{s}'\nif [ \"$1\" = \"--version\" ]; then\n  {s}\n  {s}\n  printf 'codex-cli 0.146.0\\n'\n  exit 0\nfi\nout=''\nprofile='stable'\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --experimental) profile='experimental' ;;\n    --out) shift; out=\"$1\" ;;\n  esac\n  shift\ndone\nmkdir -p \"$out\"\nprintf '{{\"profile\":\"%s\",\"object\":{{\"z\":1,\"a\":2}}}}\\n' \"$profile\" > \"$out/root.json\"\n",
-        .{ log_path, if (slow) "sleep 1" else ":", if (noisy) "printf '0123456789012345678901234567890123456789'" else ":" },
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{s}'\n" ++
+            "if [ \"$1\" = \"--version\" ]; then\n  {s}\n  {s}\n" ++
+            "  printf 'codex-cli 0.146.0\\n'\n  exit 0\nfi\n" ++
+            "out=''\nprofile='stable'\nwhile [ \"$#\" -gt 0 ]; do\n" ++
+            "  case \"$1\" in\n    --experimental) profile='experimental' ;;\n" ++
+            "    --out) shift; out=\"$1\" ;;\n  esac\n  shift\ndone\n" ++
+            "mkdir -p \"$out\"\nprintf '{{\"profile\":\"%s\"," ++
+            "\"object\":{{\"z\":1,\"a\":2}}}}\\n' \"$profile\" > \"$out/root.json\"\n",
+        .{
+            log_path,
+            if (slow) "sleep 1" else ":",
+            if (noisy)
+                "printf '0123456789012345678901234567890123456789'"
+            else
+                ":",
+        },
+    );
+}
+
+fn makeTestExecutable(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
     );
 }

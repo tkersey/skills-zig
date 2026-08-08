@@ -42,11 +42,18 @@ pub fn validateTransport(
     requested: RequestedTransport,
     endpoint: ?[]const u8,
 ) !ValidatedTransport {
-    if (endpoint) |value| if (value.len == 0 or value.len > max_endpoint_bytes) return error.InvalidTransportEndpoint;
+    if (endpoint) |value| {
+        if (value.len == 0 or value.len > max_endpoint_bytes) {
+            return error.InvalidTransportEndpoint;
+        }
+    }
     return switch (requested) {
         .auto => if (endpoint == null) .auto else error.TransportEndpointForbidden,
         .stdio => if (endpoint == null) .stdio else error.TransportEndpointForbidden,
-        .managed_websocket => if (endpoint == null) .managed_websocket else error.TransportEndpointForbidden,
+        .managed_websocket => if (endpoint == null)
+            .managed_websocket
+        else
+            error.TransportEndpointForbidden,
         .explicit_websocket => blk: {
             const value = endpoint orelse return error.TransportEndpointRequired;
             try validateInboundWebSocket(value);
@@ -63,8 +70,18 @@ pub fn validateTransport(
 
 pub const FallbackPhase = enum { before_first_rpc, rpc_started };
 
-pub fn autoMayFallback(requested: RequestedTransport, failed: RequestedTransport, to: RequestedTransport, phase: FallbackPhase, managed_retired: bool) bool {
-    return requested == .auto and failed == .managed_websocket and to == .stdio and phase == .before_first_rpc and managed_retired;
+pub fn autoMayFallback(
+    requested: RequestedTransport,
+    failed: RequestedTransport,
+    to: RequestedTransport,
+    phase: FallbackPhase,
+    managed_retired: bool,
+) bool {
+    return requested == .auto and
+        failed == .managed_websocket and
+        to == .stdio and
+        phase == .before_first_rpc and
+        managed_retired;
 }
 
 pub fn validateInboundWebSocket(raw: []const u8) !void {
@@ -72,11 +89,16 @@ pub fn validateInboundWebSocket(raw: []const u8) !void {
     const prefix_len: usize = if (std.mem.startsWith(u8, raw, "ws://")) 5 else 0;
     const remainder = raw[prefix_len..];
     const authority_end = std.mem.indexOfAny(u8, remainder, "/?#") orelse remainder.len;
-    if (std.mem.indexOfAny(u8, remainder, "?#") != null) return error.WebSocketQueryOrFragmentForbidden;
-    if (std.mem.indexOfScalar(u8, remainder[0..authority_end], '@') != null) return error.WebSocketUserinfoForbidden;
+    if (std.mem.indexOfAny(u8, remainder, "?#") != null) {
+        return error.WebSocketQueryOrFragmentForbidden;
+    }
+    if (std.mem.indexOfScalar(u8, remainder[0..authority_end], '@') != null) {
+        return error.WebSocketUserinfoForbidden;
+    }
     const authority = try websocketAuthority(raw, false);
     if (!isLoopbackHost(authority.host)) return error.NonLoopbackWebSocketEndpoint;
-    const port = authorityPort(authority.authority_no_userinfo) orelse return error.WebSocketPortRequired;
+    const port = authorityPort(authority.authority_no_userinfo) orelse
+        return error.WebSocketPortRequired;
     if (port == 0) return error.WebSocketPortZero;
 }
 
@@ -115,7 +137,11 @@ pub fn validateUnixPath(path: []const u8) !void {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidUnixEndpoint;
 }
 
-pub fn resolveUnixPathAlloc(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
+pub fn resolveUnixPathAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    path: []const u8,
+) ![]u8 {
     try validateUnixPath(path);
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     return std.fs.path.resolve(allocator, &.{ cwd, path });
@@ -126,10 +152,18 @@ pub fn defaultUnixPathAlloc(allocator: std.mem.Allocator) ![]u8 {
         .windows, .wasi => error.UnixSocketUnsupported,
         else => blk: {
             const environ = std.Io.Threaded.global_single_threaded.environ.process_environ;
-            if (std.process.Environ.getPosix(environ, "CODEX_HOME")) |value|
-                break :blk std.fs.path.join(allocator, &.{ value, "app-server-control", "app-server-control.sock" });
-            const home = std.process.Environ.getPosix(environ, "HOME") orelse return error.HomeNotSet;
-            break :blk std.fs.path.join(allocator, &.{ home, ".codex", "app-server-control", "app-server-control.sock" });
+            if (std.process.Environ.getPosix(environ, "CODEX_HOME")) |value| {
+                break :blk std.fs.path.join(
+                    allocator,
+                    &.{ value, "app-server-control", "app-server-control.sock" },
+                );
+            }
+            const home = std.process.Environ.getPosix(environ, "HOME") orelse
+                return error.HomeNotSet;
+            break :blk std.fs.path.join(
+                allocator,
+                &.{ home, ".codex", "app-server-control", "app-server-control.sock" },
+            );
         },
     };
 }
@@ -157,7 +191,12 @@ pub const CodeModeHost = struct {
         });
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
-        return .{ .allocator = allocator, .raw = raw_owned, .redacted_origin = origin, .digest = digest };
+        return .{
+            .allocator = allocator,
+            .raw = raw_owned,
+            .redacted_origin = origin,
+            .digest = digest,
+        };
     }
 
     pub fn deinit(self: *CodeModeHost) void {
@@ -167,7 +206,9 @@ pub const CodeModeHost = struct {
     }
 
     pub fn digestHex(self: *const CodeModeHost, out: *[64]u8) []const u8 {
-        _ = std.fmt.bufPrint(out, "{x}", .{self.digest}) catch unreachable;
+        _ = std.fmt.bufPrint(out, "{x}", .{self.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         return out;
     }
 };
@@ -190,7 +231,12 @@ const Authority = struct {
 
 fn websocketAuthority(raw: []const u8, allow_secure: bool) !Authority {
     const secure = std.mem.startsWith(u8, raw, "wss://");
-    const prefix_len: usize = if (secure) 6 else if (std.mem.startsWith(u8, raw, "ws://")) 5 else return error.InvalidWebSocketUrl;
+    const prefix_len: usize = if (secure)
+        6
+    else if (std.mem.startsWith(u8, raw, "ws://"))
+        5
+    else
+        return error.InvalidWebSocketUrl;
     if (secure and !allow_secure) return error.InvalidWebSocketUrl;
     const remainder = raw[prefix_len..];
     const end = std.mem.indexOfAny(u8, remainder, "/?#") orelse remainder.len;
@@ -199,14 +245,19 @@ fn websocketAuthority(raw: []const u8, allow_secure: bool) !Authority {
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
     if (authority.len == 0) return error.InvalidWebSocketUrl;
     const host = if (authority[0] == '[') blk: {
-        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return error.InvalidWebSocketUrl;
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse
+            return error.InvalidWebSocketUrl;
         break :blk authority[0 .. close + 1];
     } else blk: {
         const colon = std.mem.lastIndexOfScalar(u8, authority, ':');
         break :blk if (colon) |index| authority[0..index] else authority;
     };
     if (host.len == 0) return error.InvalidWebSocketUrl;
-    return .{ .secure = secure, .host = host, .authority_no_userinfo = authority };
+    return .{
+        .secure = secure,
+        .host = host,
+        .authority_no_userinfo = authority,
+    };
 }
 
 pub fn appendAppServerArgs(

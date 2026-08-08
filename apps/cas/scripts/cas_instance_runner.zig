@@ -177,21 +177,81 @@ fn startInstance(
 ) !InstanceSlot {
     switch (selected_transport) {
         .auto => {
-            var server = startManagedServer(allocator, io, cwd, codex_path, opts.hook_policy, code_mode_host) catch |err| {
-                if (!cas.app_server_launch.autoMayFallback(.auto, .managed_websocket, .stdio, .before_first_rpc, true)) return err;
-                var direct = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, code_mode_host);
+            var server = startManagedServer(
+                allocator,
+                io,
+                cwd,
+                codex_path,
+                opts.hook_policy,
+                code_mode_host,
+            ) catch |err| {
+                if (!cas.app_server_launch.autoMayFallback(
+                    .auto,
+                    .managed_websocket,
+                    .stdio,
+                    .before_first_rpc,
+                    true,
+                )) return err;
+                var direct = clientOptions(
+                    opts,
+                    cwd,
+                    codex_path,
+                    client_name,
+                    state_file,
+                    auth_refresh_response,
+                    attestation_response,
+                    code_mode_host,
+                );
                 direct.io = io;
                 direct.transport = .stdio;
                 return .{ .client = try cas.Client.start(allocator, direct), .transport = "stdio" };
             };
-            return finishManagedStart(allocator, io, opts, cwd, codex_path, state_file, client_name, auth_refresh_response, attestation_response, &server);
+            return finishManagedStart(
+                allocator,
+                io,
+                opts,
+                cwd,
+                codex_path,
+                state_file,
+                client_name,
+                auth_refresh_response,
+                attestation_response,
+                &server,
+            );
         },
         .managed_websocket => {
-            var server = try startManagedServer(allocator, io, cwd, codex_path, opts.hook_policy, code_mode_host);
-            return finishManagedStart(allocator, io, opts, cwd, codex_path, state_file, client_name, auth_refresh_response, attestation_response, &server);
+            var server = try startManagedServer(
+                allocator,
+                io,
+                cwd,
+                codex_path,
+                opts.hook_policy,
+                code_mode_host,
+            );
+            return finishManagedStart(
+                allocator,
+                io,
+                opts,
+                cwd,
+                codex_path,
+                state_file,
+                client_name,
+                auth_refresh_response,
+                attestation_response,
+                &server,
+            );
         },
         .stdio, .explicit_websocket, .unix_socket => {
-            var direct = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, code_mode_host);
+            var direct = clientOptions(
+                opts,
+                cwd,
+                codex_path,
+                client_name,
+                state_file,
+                auth_refresh_response,
+                attestation_response,
+                code_mode_host,
+            );
             direct.io = io;
             direct.transport = selected_transport;
             const identity: []const u8 = switch (selected_transport) {
@@ -214,7 +274,14 @@ fn startManagedServer(
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) !cas_websocket.ManagedServer {
     if (code_mode_host) |host| {
-        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, codex_path, hook_policy, host, io);
+        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
+            allocator,
+            cwd,
+            codex_path,
+            hook_policy,
+            host,
+            io,
+        );
     }
     return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
 }
@@ -235,7 +302,16 @@ fn finishManagedStart(
         server.kill();
         server.deinit(allocator);
     }
-    var socket = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, null);
+    var socket = clientOptions(
+        opts,
+        cwd,
+        codex_path,
+        client_name,
+        state_file,
+        auth_refresh_response,
+        attestation_response,
+        null,
+    );
     socket.io = io;
     socket.websocket_url = server.listen_url;
     return .{
@@ -248,12 +324,23 @@ fn finishManagedStart(
 fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, source: []const u8) ![]u8 {
     if (std.mem.eql(u8, source, "-")) {
         var reader = std.Io.File.stdin().reader(io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(cas.max_server_request_carrier_bytes));
+        return reader.interface.allocRemaining(
+            allocator,
+            .limited(cas.max_server_request_carrier_bytes),
+        );
     }
     var file = if (std.fs.path.isAbsolute(source))
-        try std.Io.Dir.openFileAbsolute(io, source, .{ .follow_symlinks = false, .allow_directory = false })
+        try std.Io.Dir.openFileAbsolute(
+            io,
+            source,
+            .{ .follow_symlinks = false, .allow_directory = false },
+        )
     else
-        try std.Io.Dir.cwd().openFile(io, source, .{ .follow_symlinks = false, .allow_directory = false });
+        try std.Io.Dir.cwd().openFile(
+            io,
+            source,
+            .{ .follow_symlinks = false, .allow_directory = false },
+        );
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.InvalidSecretCarrierFile;
@@ -262,7 +349,10 @@ fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, source: []co
         if (mode & 0o400 == 0 or mode & 0o077 != 0) return error.InsecureSecretCarrierPermissions;
     }
     var reader = file.reader(io, &.{});
-    return reader.interface.allocRemaining(allocator, .limited(cas.max_server_request_carrier_bytes));
+    return reader.interface.allocRemaining(
+        allocator,
+        .limited(cas.max_server_request_carrier_bytes),
+    );
 }
 
 fn wipeSecretCarrier(allocator: std.mem.Allocator, carrier: ?[]u8) void {
@@ -308,7 +398,10 @@ pub fn main(init: std.process.Init) !void {
 
     const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
     defer allocator.free(params);
-    const selected_transport = try cas.app_server_launch.validateTransport(opts.requested_transport, opts.transport_endpoint);
+    const selected_transport = try cas.app_server_launch.validateTransport(
+        opts.requested_transport,
+        opts.transport_endpoint,
+    );
     var code_mode_host: ?cas.app_server_launch.CodeModeHost = if (opts.code_mode_host) |raw|
         try cas.app_server_launch.CodeModeHost.init(allocator, raw)
     else
@@ -395,7 +488,10 @@ pub fn main(init: std.process.Init) !void {
                 .@"error" = msg,
             });
             if (opts.verbose) {
-                var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+                var stderr_writer = std.Io.File.stderr().writer(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    &.{},
+                );
                 const stderr = &stderr_writer.interface;
                 try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
             }
@@ -526,12 +622,16 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("instances started:   {d}\n", .{instances_started});
         try stdout.print("requests ok:      {d}\n", .{requests_ok});
         try stdout.print("requests failed:  {d}\n", .{requests_failed});
-        try stdout.print("transport counts: managed_websocket={d}, websocket={d}, unix_socket={d}, stdio={d}\n", .{
-            managed_websocket_count,
-            websocket_count,
-            unix_socket_count,
-            stdio_count,
-        });
+        try stdout.print(
+            "transport counts: managed_websocket={d}, websocket={d}, " ++
+                "unix_socket={d}, stdio={d}\n",
+            .{
+                managed_websocket_count,
+                websocket_count,
+                unix_socket_count,
+                stdio_count,
+            },
+        );
         try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
             hook_summary.policy,
             hook_summary.observed,
@@ -709,7 +809,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--app-server-transport")) {
-            out.requested_transport = cas.app_server_launch.RequestedTransport.parse(value) orelse return error.InvalidTransport;
+            out.requested_transport = cas.app_server_launch.RequestedTransport.parse(value) orelse
+                return error.InvalidTransport;
             continue;
         }
         if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
@@ -748,7 +849,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     {
         return error.DuplicateSecretStdinSource;
     }
-    _ = try cas.app_server_launch.validateTransport(out.requested_transport, out.transport_endpoint);
+    _ = try cas.app_server_launch.validateTransport(
+        out.requested_transport,
+        out.transport_endpoint,
+    );
     out.opt_out_methods = try methods.toOwnedSlice(allocator);
     return out;
 }
@@ -1027,29 +1131,47 @@ test "parseArgs accepts typed transport initialization and secret sources" {
     };
     const parsed = try parseArgs(std.testing.allocator, &argv);
     defer std.testing.allocator.free(parsed.opt_out_methods);
-    try std.testing.expectEqual(cas.app_server_launch.RequestedTransport.unix_socket, parsed.requested_transport);
+    try std.testing.expectEqual(
+        cas.app_server_launch.RequestedTransport.unix_socket,
+        parsed.requested_transport,
+    );
     try std.testing.expectEqualStrings("unix:///tmp/codex.sock", parsed.transport_endpoint.?);
     try std.testing.expectEqualStrings("/opt/codex", parsed.codex_path);
     try std.testing.expect(!parsed.experimental_api);
-    try std.testing.expectEqualStrings("{\"futureCapability\":true}", parsed.additional_initialize_capabilities_json.?);
-    try std.testing.expectEqualStrings("{\"action\":\"decline\"}", parsed.elicitation_response_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"futureCapability\":true}",
+        parsed.additional_initialize_capabilities_json.?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"decline\"}",
+        parsed.elicitation_response_json.?,
+    );
     try std.testing.expectEqualStrings("/secure/auth.json", parsed.auth_refresh_response_source.?);
-    try std.testing.expectEqualStrings("/secure/attestation.json", parsed.attestation_response_source.?);
+    try std.testing.expectEqualStrings(
+        "/secure/attestation.json",
+        parsed.attestation_response_source.?,
+    );
 }
 
 test "parseArgs rejects ambiguous stdin secrets and incomplete explicit transport" {
-    try std.testing.expectError(error.DuplicateSecretStdinSource, parseArgs(std.testing.allocator, &.{
-        "cas_instance_runner",
-        "--auth-refresh-response-file",
-        "-",
-        "--attestation-response-file",
-        "-",
-    }));
-    try std.testing.expectError(error.TransportEndpointRequired, parseArgs(std.testing.allocator, &.{
-        "cas_instance_runner",
-        "--app-server-transport",
-        "ws",
-    }));
+    try std.testing.expectError(
+        error.DuplicateSecretStdinSource,
+        parseArgs(std.testing.allocator, &.{
+            "cas_instance_runner",
+            "--auth-refresh-response-file",
+            "-",
+            "--attestation-response-file",
+            "-",
+        }),
+    );
+    try std.testing.expectError(
+        error.TransportEndpointRequired,
+        parseArgs(std.testing.allocator, &.{
+            "cas_instance_runner",
+            "--app-server-transport",
+            "ws",
+        }),
+    );
 }
 
 test "secret carrier files must be regular and owner only" {

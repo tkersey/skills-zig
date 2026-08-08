@@ -4,7 +4,7 @@ pub fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
     var stderr_file = std.Io.File.stderr();
     var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
-    _ = stderr.print("error: " ++ fmt ++ "\n", args) catch {};
+    stderr.print("error: " ++ fmt ++ "\n", args) catch return error.UserInput;
     return error.UserInput;
 }
 
@@ -85,12 +85,23 @@ pub fn renderTomlStringArray(allocator: std.mem.Allocator, values: []const []con
     return writer_alloc.toOwnedSlice();
 }
 
-pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
+pub fn writeFileAtomic(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    contents: []const u8,
+) !void {
+    const timestamp = std.Io.Clock.awake.now(
+        std.Io.Threaded.global_single_threaded.io(),
+    ).nanoseconds;
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, timestamp });
     defer allocator.free(tmp);
 
     {
-        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp, .{}) catch |err| {
+        var file = std.Io.Dir.cwd().createFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            tmp,
+            .{},
+        ) catch |err| {
             return userErrorFmt("unable to create temp file ({s}): {s}", .{ tmp, @errorName(err) });
         };
         defer file.close(std.Io.Threaded.global_single_threaded.io());
@@ -99,8 +110,15 @@ pub fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents:
         };
     }
 
-    std.Io.Dir.renameAbsolute(tmp, path, std.Io.Threaded.global_single_threaded.io()) catch |err| {
-        return userErrorFmt("unable to move temp file to target ({s}): {s}", .{ path, @errorName(err) });
+    std.Io.Dir.renameAbsolute(
+        tmp,
+        path,
+        std.Io.Threaded.global_single_threaded.io(),
+    ) catch |err| {
+        return userErrorFmt(
+            "unable to move temp file to target ({s}): {s}",
+            .{ path, @errorName(err) },
+        );
     };
 }
 
@@ -134,7 +152,12 @@ pub fn buildAutomationRowJsonAlloc(allocator: std.mem.Allocator, row: anytype) !
     return writer_alloc.toOwnedSlice();
 }
 
-pub fn printAutomationRowJson(stdout: anytype, row: anytype, indent: usize, trailing_comma: bool) !void {
+pub fn printAutomationRowJson(
+    stdout: anytype,
+    row: anytype,
+    indent: usize,
+    trailing_comma: bool,
+) !void {
     const pad = "                                ";
     const prefix = pad[0..@min(indent, pad.len)];
     const field = pad[0..@min(indent + 2, pad.len)];

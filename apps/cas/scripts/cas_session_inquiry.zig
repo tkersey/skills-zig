@@ -816,9 +816,11 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
             .valid = false,
             .failure_code = .codex_incompatible,
             .hint = if (dcp.source_thread_id != null)
-                "exact Codex app-server preflight did not prove the required paginated thread-fork inquiry behavior"
+                "exact Codex app-server preflight did not prove the required " ++
+                    "paginated thread-fork inquiry behavior"
             else
-                "exact Codex app-server preflight did not prove the required rollout-transcript inquiry behavior",
+                "exact Codex app-server preflight did not prove the required " ++
+                    "rollout-transcript inquiry behavior",
         };
         try persistInvalidRunArtifacts(
             allocator,
@@ -1158,12 +1160,15 @@ fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !Pre
         .{ shared.stable_schema_digest, shared.experimental_schema_digest },
     );
     defer allocator.free(fingerprint_source);
-    const fingerprint = sha256HexAlloc(allocator, fingerprint_source) catch return error.SchemaFingerprintFailed;
+    const fingerprint = sha256HexAlloc(allocator, fingerprint_source) catch
+        return error.SchemaFingerprintFailed;
     errdefer allocator.free(fingerprint);
     const caps = try deriveCapabilitiesFromCache(allocator, shared.experimental_path);
     var missing: std.ArrayList([]const u8) = .empty;
     defer missing.deinit(allocator);
-    if (!shared.route_neutral_compatible) try missing.append(allocator, "codex-app-server/session-inquiry-profile");
+    if (!shared.route_neutral_compatible) {
+        try missing.append(allocator, "codex-app-server/session-inquiry-profile");
+    }
     if (!caps.thread_fork) try missing.append(allocator, "thread/fork");
     if (!caps.thread_rollback) try missing.append(allocator, "thread/rollback");
     if (!caps.thread_start) try missing.append(allocator, "thread/start");
@@ -1176,23 +1181,37 @@ fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !Pre
     if (!caps.fork_last_turn_id_field) try missing.append(allocator, "thread/fork.lastTurnId");
     if (!caps.fork_before_turn_id_field) try missing.append(allocator, "thread/fork.beforeTurnId");
     if (!caps.fork_exclude_turns_field) try missing.append(allocator, "thread/fork.excludeTurns");
-    if (!caps.fork_lineage_field) try missing.append(allocator, "thread/fork.response.thread.forkedFromId");
-    if (!caps.turns_list_cursor_field or !caps.turns_list_limit_field or !caps.turns_list_sort_direction_field or
-        !caps.turns_list_items_view_field or !caps.turns_list_data_field or !caps.turns_list_next_cursor_field)
+    if (!caps.fork_lineage_field) {
+        try missing.append(allocator, "thread/fork.response.thread.forkedFromId");
+    }
+    if (!caps.turns_list_cursor_field or
+        !caps.turns_list_limit_field or
+        !caps.turns_list_sort_direction_field or
+        !caps.turns_list_items_view_field or
+        !caps.turns_list_data_field or
+        !caps.turns_list_next_cursor_field)
     {
         try missing.append(allocator, "thread/turns/list.pagination-shape");
     }
-    if (!shared.paginated_fork_passed) try missing.append(allocator, "thread/fork.paginated-behavior");
-    if (!shared.ephemeral_fork_passed) try missing.append(allocator, "thread/fork.ephemeral-behavior");
-    if (!shared.paginated_inquiry_passed) try missing.append(allocator, "session-inquiry.paginated-behavior");
+    if (!shared.paginated_fork_passed) {
+        try missing.append(allocator, "thread/fork.paginated-behavior");
+    }
+    if (!shared.ephemeral_fork_passed) {
+        try missing.append(allocator, "thread/fork.ephemeral-behavior");
+    }
+    if (!shared.paginated_inquiry_passed) {
+        try missing.append(allocator, "session-inquiry.paginated-behavior");
+    }
 
     const missing_owned = try allocator.dupe([]const u8, missing.items);
     errdefer allocator.free(missing_owned);
     const thread_fork_replay = shared.route_neutral_compatible and shared.paginated_fork_passed and
         shared.ephemeral_fork_passed and shared.paginated_inquiry_passed and
         caps.exactAnchorSupported() and caps.turn_start and caps.turn_interrupt and
-        (caps.thread_archive or caps.thread_delete) and (caps.fork_permissions_field or caps.fork_sandbox_field);
-    const rollout_transcript_replay = shared.route_neutral_compatible and caps.rolloutTranscriptSupported();
+        (caps.thread_archive or caps.thread_delete) and
+        (caps.fork_permissions_field or caps.fork_sandbox_field);
+    const rollout_transcript_replay =
+        shared.route_neutral_compatible and caps.rolloutTranscriptSupported();
     const allowed = thread_fork_replay or rollout_transcript_replay;
     const codex_path = try allocator.dupe(u8, shared.codex_path);
     errdefer allocator.free(codex_path);
@@ -1200,7 +1219,10 @@ fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !Pre
     errdefer allocator.free(codex_version);
     const cache_dir = try allocator.dupe(u8, shared.cache_dir);
     errdefer allocator.free(cache_dir);
-    const code_mode_host_redacted = try dupeOptionalString(allocator, shared.code_mode_host_redacted);
+    const code_mode_host_redacted = try dupeOptionalString(
+        allocator,
+        shared.code_mode_host_redacted,
+    );
     errdefer if (code_mode_host_redacted) |value| allocator.free(value);
     const code_mode_host_digest = try dupeOptionalString(allocator, shared.code_mode_host_digest);
     errdefer if (code_mode_host_digest) |value| allocator.free(value);
@@ -1233,7 +1255,10 @@ fn runSharedSessionInquiryPreflight(
     };
     defer allocator.free(self_path);
     const executable_dir = std.fs.path.dirname(self_path) orelse return error.InvalidExecutablePath;
-    const preflight_path = std.fs.path.join(allocator, &.{ executable_dir, "cas_app_server_preflight" }) catch
+    const preflight_path = std.fs.path.join(
+        allocator,
+        &.{ executable_dir, "cas_app_server_preflight" },
+    ) catch
         return error.PreflightPathOutOfMemory;
     defer allocator.free(preflight_path);
 
@@ -1253,8 +1278,10 @@ fn runSharedSessionInquiryPreflight(
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.PreflightArgumentsOutOfMemory,
     };
-    if (options.code_mode_host) |host| argv.appendSlice(allocator, &.{ "--code-mode-host", host }) catch
-        return error.PreflightArgumentsOutOfMemory;
+    if (options.code_mode_host) |host| {
+        argv.appendSlice(allocator, &.{ "--code-mode-host", host }) catch
+            return error.PreflightArgumentsOutOfMemory;
+    }
     argv.append(allocator, "--json") catch return error.PreflightArgumentsOutOfMemory;
 
     var child = std.process.spawn(io, .{
@@ -1271,7 +1298,10 @@ fn runSharedSessionInquiryPreflight(
     const stdout_file = child.stdout orelse return error.PreflightMissingStdout;
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_reader = stdout_file.reader(io, &stdout_buffer);
-    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+    const stdout = stdout_reader.interface.allocRemaining(
+        allocator,
+        .limited(2 * 1024 * 1024),
+    ) catch |err| switch (err) {
         error.StreamTooLong => return error.PreflightOutputTooLarge,
         error.OutOfMemory => return error.PreflightOutputOutOfMemory,
         else => return err,
@@ -1283,14 +1313,22 @@ fn runSharedSessionInquiryPreflight(
         else => return error.AppServerPreflightFailed,
     };
     if (exit_code > 1) return error.AppServerPreflightFailed;
-    var receipt = parseSharedSessionInquiryPreflightAlloc(allocator, stdout) catch |err| switch (err) {
+    var receipt = parseSharedSessionInquiryPreflightAlloc(
+        allocator,
+        stdout,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.PreflightReceiptOutOfMemory,
         else => return err,
     };
     errdefer receipt.deinit(allocator);
-    if ((exit_code == 0) != receipt.overall_compatible) return error.AppServerPreflightStatusMismatch;
-    const host_identity_present = receipt.code_mode_host_redacted != null and receipt.code_mode_host_digest != null;
-    if ((options.code_mode_host != null) != host_identity_present) return error.AppServerPreflightHostIdentityMismatch;
+    if ((exit_code == 0) != receipt.overall_compatible) {
+        return error.AppServerPreflightStatusMismatch;
+    }
+    const host_identity_present = receipt.code_mode_host_redacted != null and
+        receipt.code_mode_host_digest != null;
+    if ((options.code_mode_host != null) != host_identity_present) {
+        return error.AppServerPreflightHostIdentityMismatch;
+    }
     return receipt;
 }
 
@@ -1315,20 +1353,30 @@ fn parseSharedSessionInquiryPreflightAlloc(
     if (!std.mem.eql(u8, status, "compatible") and !std.mem.eql(u8, status, "incompatible"))
         return error.InvalidAppServerPreflightReceipt;
     const codex = rootObject(root, "codex") orelse return error.InvalidAppServerPreflightReceipt;
-    const schemas = rootObject(root, "schemas") orelse return error.InvalidAppServerPreflightReceipt;
-    const methods = rootObject(root, "methods") orelse return error.InvalidAppServerPreflightReceipt;
-    const handler_coverage = rootObject(root, "handlerCoverage") orelse return error.InvalidAppServerPreflightReceipt;
-    const shape_checks = rootObject(root, "shapeChecks") orelse return error.InvalidAppServerPreflightReceipt;
-    const transport = rootObject(root, "transport") orelse return error.InvalidAppServerPreflightReceipt;
-    const probes_value = root.get("behavioralProbes") orelse return error.InvalidAppServerPreflightReceipt;
+    const schemas = rootObject(root, "schemas") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const methods = rootObject(root, "methods") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const handler_coverage = rootObject(root, "handlerCoverage") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const shape_checks = rootObject(root, "shapeChecks") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const transport = rootObject(root, "transport") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const probes_value = root.get("behavioralProbes") orelse
+        return error.InvalidAppServerPreflightReceipt;
     const experimental_path = try requiredString(schemas, "experimentalPath");
-    const cache_dir_slice = std.fs.path.dirname(experimental_path) orelse return error.InvalidAppServerPreflightReceipt;
+    const cache_dir_slice = std.fs.path.dirname(experimental_path) orelse
+        return error.InvalidAppServerPreflightReceipt;
     const stable_schema_digest_raw = try requiredString(schemas, "stableDigest");
     const experimental_schema_digest_raw = try requiredString(schemas, "experimentalDigest");
-    if (!isSha256Digest(stable_schema_digest_raw) or !isSha256Digest(experimental_schema_digest_raw))
+    if (!isSha256Digest(stable_schema_digest_raw) or
+        !isSha256Digest(experimental_schema_digest_raw))
         return error.InvalidAppServerPreflightReceipt;
     const selected_transport = try requiredString(transport, "selected");
-    if (!std.mem.eql(u8, selected_transport, "managed-ws")) return error.InvalidAppServerPreflightReceipt;
+    if (!std.mem.eql(u8, selected_transport, "managed-ws")) {
+        return error.InvalidAppServerPreflightReceipt;
+    }
     const structural_compatible = try requiredListLen(methods, "missingRequired") == 0 and
         std.mem.eql(u8, try requiredString(handler_coverage, "status"), "passed") and
         try requiredListLen(handler_coverage, "failures") == 0 and
@@ -1350,7 +1398,10 @@ fn parseSharedSessionInquiryPreflightAlloc(
     if (transport.get("codeModeHost")) |identity_value| switch (identity_value) {
         .null => {},
         .object => |identity| {
-            code_mode_host_redacted = try allocator.dupe(u8, try requiredString(identity, "origin"));
+            code_mode_host_redacted = try allocator.dupe(
+                u8,
+                try requiredString(identity, "origin"),
+            );
             const digest = try requiredString(identity, "sha256");
             if (!isLowerSha256Hex(digest)) return error.InvalidAppServerPreflightReceipt;
             code_mode_host_digest = try std.fmt.allocPrint(allocator, "sha256:{s}", .{digest});
@@ -1388,7 +1439,10 @@ fn parseSharedSessionInquiryPreflightAlloc(
         .selected_transport = selected_transport_owned,
         .paginated_fork_passed = requiredBehavioralProbePassed(probes_value, "paginated-fork"),
         .ephemeral_fork_passed = requiredBehavioralProbePassed(probes_value, "ephemeral-fork"),
-        .paginated_inquiry_passed = requiredBehavioralProbePassed(probes_value, "paginated-session-inquiry"),
+        .paginated_inquiry_passed = requiredBehavioralProbePassed(
+            probes_value,
+            "paginated-session-inquiry",
+        ),
         .code_mode_host_redacted = code_mode_host_redacted,
         .code_mode_host_digest = code_mode_host_digest,
     };
@@ -1497,18 +1551,39 @@ fn validateLedgerInput(
     };
 }
 
-fn deriveCapabilitiesFromCache(allocator: std.mem.Allocator, cache_dir: []const u8) !SchemaCapabilities {
-    const client_request_path = try std.fs.path.join(allocator, &.{ cache_dir, "ClientRequest.json" });
+fn deriveCapabilitiesFromCache(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+) !SchemaCapabilities {
+    const client_request_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "ClientRequest.json" },
+    );
     defer allocator.free(client_request_path);
-    const fork_params_path = try std.fs.path.join(allocator, &.{ cache_dir, "v2", "ThreadForkParams.json" });
+    const fork_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadForkParams.json" },
+    );
     defer allocator.free(fork_params_path);
-    const fork_response_path = try std.fs.path.join(allocator, &.{ cache_dir, "v2", "ThreadForkResponse.json" });
+    const fork_response_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadForkResponse.json" },
+    );
     defer allocator.free(fork_response_path);
-    const rollback_params_path = try std.fs.path.join(allocator, &.{ cache_dir, "v2", "ThreadRollbackParams.json" });
+    const rollback_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadRollbackParams.json" },
+    );
     defer allocator.free(rollback_params_path);
-    const turns_list_params_path = try std.fs.path.join(allocator, &.{ cache_dir, "v2", "ThreadTurnsListParams.json" });
+    const turns_list_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadTurnsListParams.json" },
+    );
     defer allocator.free(turns_list_params_path);
-    const turns_list_response_path = try std.fs.path.join(allocator, &.{ cache_dir, "v2", "ThreadTurnsListResponse.json" });
+    const turns_list_response_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadTurnsListResponse.json" },
+    );
     defer allocator.free(turns_list_response_path);
 
     const client_request_raw = try readFileAlloc(allocator, client_request_path, MaxSchemaBytes);
@@ -1519,22 +1594,55 @@ fn deriveCapabilitiesFromCache(allocator: std.mem.Allocator, cache_dir: []const 
     defer allocator.free(fork_response_raw);
     const rollback_params_raw = try readFileAlloc(allocator, rollback_params_path, MaxSchemaBytes);
     defer allocator.free(rollback_params_raw);
-    const turns_list_params_raw = try readFileAlloc(allocator, turns_list_params_path, MaxSchemaBytes);
+    const turns_list_params_raw = try readFileAlloc(
+        allocator,
+        turns_list_params_path,
+        MaxSchemaBytes,
+    );
     defer allocator.free(turns_list_params_raw);
-    const turns_list_response_raw = try readFileAlloc(allocator, turns_list_response_path, MaxSchemaBytes);
+    const turns_list_response_raw = try readFileAlloc(
+        allocator,
+        turns_list_response_path,
+        MaxSchemaBytes,
+    );
     defer allocator.free(turns_list_response_raw);
 
-    var client_request = try std.json.parseFromSlice(std.json.Value, allocator, client_request_raw, .{});
+    var client_request = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        client_request_raw,
+        .{},
+    );
     defer client_request.deinit();
     var fork_params = try std.json.parseFromSlice(std.json.Value, allocator, fork_params_raw, .{});
     defer fork_params.deinit();
-    var fork_response = try std.json.parseFromSlice(std.json.Value, allocator, fork_response_raw, .{});
+    var fork_response = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        fork_response_raw,
+        .{},
+    );
     defer fork_response.deinit();
-    var rollback_params = try std.json.parseFromSlice(std.json.Value, allocator, rollback_params_raw, .{});
+    var rollback_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        rollback_params_raw,
+        .{},
+    );
     defer rollback_params.deinit();
-    var turns_list_params = try std.json.parseFromSlice(std.json.Value, allocator, turns_list_params_raw, .{});
+    var turns_list_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        turns_list_params_raw,
+        .{},
+    );
     defer turns_list_params.deinit();
-    var turns_list_response = try std.json.parseFromSlice(std.json.Value, allocator, turns_list_response_raw, .{});
+    var turns_list_response = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        turns_list_response_raw,
+        .{},
+    );
     defer turns_list_response.deinit();
 
     return deriveCapabilitiesFromSchemas(
@@ -1572,11 +1680,18 @@ fn deriveCapabilitiesFromSchemas(
         .fork_last_turn_id_field = schemaTopPropertyPresent(fork_params, "lastTurnId"),
         .fork_before_turn_id_field = schemaTopPropertyPresent(fork_params, "beforeTurnId"),
         .fork_exclude_turns_field = schemaTopPropertyPresent(fork_params, "excludeTurns"),
-        .fork_lineage_field = schemaDefinitionPropertyPresent(fork_response, "Thread", "forkedFromId"),
+        .fork_lineage_field = schemaDefinitionPropertyPresent(
+            fork_response,
+            "Thread",
+            "forkedFromId",
+        ),
         .rollback_num_turns = schemaTopPropertyPresent(rollback_params, "numTurns"),
         .turns_list_cursor_field = schemaTopPropertyPresent(turns_list_params, "cursor"),
         .turns_list_limit_field = schemaTopPropertyPresent(turns_list_params, "limit"),
-        .turns_list_sort_direction_field = schemaTopPropertyPresent(turns_list_params, "sortDirection"),
+        .turns_list_sort_direction_field = schemaTopPropertyPresent(
+            turns_list_params,
+            "sortDirection",
+        ),
         .turns_list_items_view_field = schemaTopPropertyPresent(turns_list_params, "itemsView"),
         .turns_list_data_field = schemaTopPropertyPresent(turns_list_response, "data"),
         .turns_list_next_cursor_field = schemaTopPropertyPresent(turns_list_response, "nextCursor"),
@@ -1624,7 +1739,11 @@ fn schemaTopPropertyPresent(schema: std.json.Value, property: []const u8) bool {
     return properties.get(property) != null;
 }
 
-fn schemaDefinitionPropertyPresent(schema: std.json.Value, definition: []const u8, property: []const u8) bool {
+fn schemaDefinitionPropertyPresent(
+    schema: std.json.Value,
+    definition: []const u8,
+    property: []const u8,
+) bool {
     const root = switch (schema) {
         .object => |object| object,
         else => return false,
@@ -2520,15 +2639,17 @@ fn startInquiryManagedServer(
         null;
     defer if (code_mode_host) |*host| host.deinit();
     if (owner_receipt_dir) |receipt_dir| {
-        if (code_mode_host) |*host| return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
-            allocator,
-            cwd,
-            receipt_dir,
-            codex_path,
-            hook_policy,
-            host,
-            io,
-        );
+        if (code_mode_host) |*host| {
+            return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
+                allocator,
+                cwd,
+                receipt_dir,
+                codex_path,
+                hook_policy,
+                host,
+                io,
+            );
+        }
         return cas_websocket.startOwnerLivedLoopbackServer(
             allocator,
             cwd,
@@ -2707,8 +2828,14 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
             .thread_fork_replay = false,
             .paginated_thread_fork = false,
             .rollout_transcript_replay = false,
-            .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0) record.code_mode_host_redacted else null,
-            .code_mode_host_digest = if (record.code_mode_host_digest.len > 0) record.code_mode_host_digest else null,
+            .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0)
+                record.code_mode_host_redacted
+            else
+                null,
+            .code_mode_host_digest = if (record.code_mode_host_digest.len > 0)
+                record.code_mode_host_digest
+            else
+                null,
             .missing = &.{},
             .inquiry_allowed = true,
         },
@@ -2806,8 +2933,14 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
                 .thread_fork_replay = false,
                 .paginated_thread_fork = false,
                 .rollout_transcript_replay = false,
-                .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0) record.code_mode_host_redacted else null,
-                .code_mode_host_digest = if (record.code_mode_host_digest.len > 0) record.code_mode_host_digest else null,
+                .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0)
+                    record.code_mode_host_redacted
+                else
+                    null,
+                .code_mode_host_digest = if (record.code_mode_host_digest.len > 0)
+                    record.code_mode_host_digest
+                else
+                    null,
                 .missing = &.{},
                 .inquiry_allowed = true,
             },
@@ -2847,11 +2980,25 @@ fn verifySourceThread(
     );
     defer source.deinit(allocator);
     if (source.digest.count != dcp.total_turns) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source.digest, dcp.total_turns, dcp.source_turn_digest, "source_stale");
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            events_path,
+            source.digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_stale",
+        );
         return error.SourceStale;
     }
     if (!std.mem.eql(u8, source.digest.digest, dcp.source_turn_digest)) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source.digest, dcp.total_turns, dcp.source_turn_digest, "source_turn_digest_mismatch");
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            events_path,
+            source.digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_turn_digest_mismatch",
+        );
         return error.SourceDigestMismatch;
     }
 }
@@ -2984,8 +3131,14 @@ fn loadDetachedRecordAlloc(allocator: std.mem.Allocator, home: []const u8, inqui
         .managed_server_pid = try requiredU64(transport, "managed_server_pid"),
         .codex_version = try allocator.dupe(u8, try requiredString(transport, "codex_version")),
         .schema_fingerprint = try allocator.dupe(u8, try requiredString(transport, "schema_fingerprint")),
-        .code_mode_host_redacted = try allocator.dupe(u8, optionalString(transport, "code_mode_host_redacted") orelse ""),
-        .code_mode_host_digest = try allocator.dupe(u8, optionalString(transport, "code_mode_host_digest") orelse ""),
+        .code_mode_host_redacted = try allocator.dupe(
+            u8,
+            optionalString(transport, "code_mode_host_redacted") orelse "",
+        ),
+        .code_mode_host_digest = try allocator.dupe(
+            u8,
+            optionalString(transport, "code_mode_host_digest") orelse "",
+        ),
         .failure_code = try allocator.dupe(u8, optionalString(record, "failure_code") orelse ""),
         .failure_hint = try allocator.dupe(u8, optionalString(record, "failure_hint") orelse ""),
     };
@@ -3141,8 +3294,17 @@ fn startLaneFork(
     );
     defer source_history.deinit(allocator);
     const before_digest = source_history.digest;
-    if (before_digest.count != dcp.total_turns or !std.mem.eql(u8, before_digest.digest, dcp.source_turn_digest)) {
-        try appendSourceDigestMismatchEvent(allocator, lane_events, before_digest, dcp.total_turns, dcp.source_turn_digest, "source_stale");
+    if (before_digest.count != dcp.total_turns or
+        !std.mem.eql(u8, before_digest.digest, dcp.source_turn_digest))
+    {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            lane_events,
+            before_digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_stale",
+        );
         return error.SourceStale;
     }
     const keep_count: usize = @intCast(anchor.keep_through_turn_index);
@@ -3151,7 +3313,9 @@ fn startLaneFork(
     const boundary_turn_id = if (keep_count == 0)
         source_history.turn_ids[0]
     else blk: {
-        if (!source_history.completed_boundaries[keep_count - 1]) return error.DecisionAnchorUnavailable;
+        if (!source_history.completed_boundaries[keep_count - 1]) {
+            return error.DecisionAnchorUnavailable;
+        }
         break :blk source_history.turn_ids[keep_count - 1];
     };
     const boundary_event = try stringifyAnyAlloc(allocator, .{
@@ -4310,7 +4474,10 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
     return snapshot.digest;
 }
 
-fn threadHistorySnapshotFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !ThreadHistorySnapshot {
+fn threadHistorySnapshotFromThreadRead(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !ThreadHistorySnapshot {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -4370,34 +4537,62 @@ fn readThreadHistorySnapshot(
     events_path: []const u8,
 ) !ThreadHistorySnapshot {
     if (expected_turns > MaxThreadHistoryPages * ThreadHistoryPageLimit) return error.SourceStale;
-    const metadata_params = try stringifyAnyAlloc(allocator, .{ .threadId = thread_id, .includeTurns = false });
+    const metadata_params = try stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .includeTurns = false,
+    });
     defer allocator.free(metadata_params);
-    const metadata_json = client.requestJson("thread/read", metadata_params) catch return error.SourceNotFound;
+    const metadata_json = client.requestJson("thread/read", metadata_params) catch
+        return error.SourceNotFound;
     defer allocator.free(metadata_json);
     const mode = try threadHistoryModeFromRead(allocator, metadata_json);
     try appendHistoryReadEvent(allocator, events_path, thread_id, mode, false, 0, false);
     if (mode == .legacy) {
-        const read_params = try stringifyAnyAlloc(allocator, .{ .threadId = thread_id, .includeTurns = true });
+        const read_params = try stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .includeTurns = true,
+        });
         defer allocator.free(read_params);
-        const read_json = client.requestJson("thread/read", read_params) catch return error.SourceNotFound;
+        const read_json = client.requestJson("thread/read", read_params) catch
+            return error.SourceNotFound;
         defer allocator.free(read_json);
         const snapshot = try threadHistorySnapshotFromThreadRead(allocator, read_json);
-        try appendHistoryReadEvent(allocator, events_path, thread_id, mode, true, snapshot.turn_ids.len, false);
+        try appendHistoryReadEvent(
+            allocator,
+            events_path,
+            thread_id,
+            mode,
+            true,
+            snapshot.turn_ids.len,
+            false,
+        );
         return snapshot;
     }
 
-    var metadata_parsed = try std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{});
+    var metadata_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        metadata_json,
+        .{},
+    );
     defer metadata_parsed.deinit();
     const metadata_root = switch (metadata_parsed.value) {
         .object => |object| object,
         else => return error.SourceStale,
     };
-    const metadata_thread = core_json.objectField(metadata_root, "thread") orelse return error.SourceStale;
+    const metadata_thread = core_json.objectField(metadata_root, "thread") orelse
+        return error.SourceStale;
     var trace = canonical_trace.CanonicalSessionTrace{
-        .session = try canonical_trace.SessionRecord.init(allocator, core_json.stringField(metadata_thread, "path") orelse ""),
+        .session = try canonical_trace.SessionRecord.init(
+            allocator,
+            core_json.stringField(metadata_thread, "path") orelse "",
+        ),
     };
     defer trace.deinit(allocator);
-    trace.session.session_id = try allocator.dupe(u8, core_json.stringField(metadata_thread, "id") orelse thread_id);
+    trace.session.session_id = try allocator.dupe(
+        u8,
+        core_json.stringField(metadata_thread, "id") orelse thread_id,
+    );
     var turn_ids: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (turn_ids.items) |turn_id| allocator.free(turn_id);
@@ -4425,7 +4620,8 @@ fn readThreadHistorySnapshot(
                 .itemsView = "full",
             });
         defer allocator.free(params);
-        const page_json = client.requestJson("thread/turns/list", params) catch return error.SourceNotFound;
+        const page_json = client.requestJson("thread/turns/list", params) catch
+            return error.SourceNotFound;
         defer allocator.free(page_json);
         var page = try std.json.parseFromSlice(std.json.Value, allocator, page_json, .{});
         defer page.deinit();
@@ -4446,9 +4642,21 @@ fn readThreadHistorySnapshot(
             turn_value,
         );
         const next_cursor_text = optionalString(page_root, "nextCursor");
-        try appendHistoryReadEvent(allocator, events_path, thread_id, mode, true, data.items.len, next_cursor_text != null);
+        try appendHistoryReadEvent(
+            allocator,
+            events_path,
+            thread_id,
+            mode,
+            true,
+            data.items.len,
+            next_cursor_text != null,
+        );
         if (next_cursor_text == null) {
-            const digest = try trace_core.retainedTraceDigest(allocator, trace, @intCast(turn_ids.items.len));
+            const digest = try trace_core.retainedTraceDigest(
+                allocator,
+                trace,
+                @intCast(turn_ids.items.len),
+            );
             return .{
                 .mode = mode,
                 .digest = .{ .count = turn_ids.items.len, .digest = digest },
@@ -4478,7 +4686,11 @@ fn appendThreadTurnToSnapshot(
         else => return error.SourceStale,
     };
     const turn_id = core_json.stringField(turn, "id") orelse return error.SourceStale;
-    if (turn_ids.items.len > 0 and std.mem.eql(u8, turn_ids.items[turn_ids.items.len - 1], turn_id)) return error.SourceStale;
+    if (turn_ids.items.len > 0 and
+        std.mem.eql(u8, turn_ids.items[turn_ids.items.len - 1], turn_id))
+    {
+        return error.SourceStale;
+    }
     const turn_index: i64 = @intCast(turn_ids.items.len + 1);
     var record = canonical_trace.TurnRecord{
         .path = try allocator.dupe(u8, trace.session.path),
@@ -4492,7 +4704,10 @@ fn appendThreadTurnToSnapshot(
     try trace.turns.append(allocator, record);
     try appendToolRecordsFromThreadItems(allocator, trace, turn, turn_index);
     try turn_ids.append(allocator, try allocator.dupe(u8, turn_id));
-    try completed_boundaries.append(allocator, std.mem.eql(u8, core_json.stringField(turn, "status") orelse "", "completed"));
+    try completed_boundaries.append(
+        allocator,
+        std.mem.eql(u8, core_json.stringField(turn, "status") orelse "", "completed"),
+    );
 }
 
 fn appendHistoryReadEvent(
@@ -5441,7 +5656,14 @@ test "deriveCapabilities recognizes exact schema method and local field surface"
         \\{"properties":{"data":{},"nextCursor":{}}}
     , .{});
     defer turns_list_response.deinit();
-    const caps = deriveCapabilitiesFromSchemas(requests.value, fork_params.value, fork_response.value, rollback_params.value, turns_list_params.value, turns_list_response.value);
+    const caps = deriveCapabilitiesFromSchemas(
+        requests.value,
+        fork_params.value,
+        fork_response.value,
+        rollback_params.value,
+        turns_list_params.value,
+        turns_list_response.value,
+    );
     try std.testing.expect(caps.thread_fork);
     try std.testing.expect(caps.thread_rollback);
     try std.testing.expect(caps.thread_start);
@@ -6003,7 +6225,10 @@ test "shared session inquiry preflight parser preserves exact profile evidence" 
     try std.testing.expectEqualStrings("/tmp/codex-0.146.0", receipt.codex_path);
     try std.testing.expectEqualStrings("codex-cli 0.146.0", receipt.codex_version);
     try std.testing.expectEqualStrings("/tmp/cache/0.146.0", receipt.cache_dir);
-    try std.testing.expectEqualStrings("sha256:3333333333333333333333333333333333333333333333333333333333333333", receipt.code_mode_host_digest.?);
+    try std.testing.expectEqualStrings(
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        receipt.code_mode_host_digest.?,
+    );
 }
 
 test "failed fork witnesses preserve route neutral transcript compatibility" {

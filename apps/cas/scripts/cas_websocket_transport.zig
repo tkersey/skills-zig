@@ -192,12 +192,18 @@ pub const Connection = struct {
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
             .clock = .awake,
         });
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by timeout_ms.
             const stream = address.connect(io) catch |err| switch (err) {
                 error.FileNotFound, error.WouldBlock => {
                     const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
                     if (now_ms - started_ms >= timeout_ms) return err;
-                    std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+                    std.Io.sleep(
+                        io,
+                        .fromMilliseconds(25),
+                        .awake,
+                    ) catch |sleep_err| switch (sleep_err) {
+                        else => {},
+                    };
                     continue;
                 },
                 else => return err,
@@ -294,7 +300,9 @@ pub const Connection = struct {
 
             switch (frame.opcode) {
                 0x1 => {
-                    if (fragment_type != null) return self.protocolFailure(error.WebSocketInvalidFragmentSequence);
+                    if (fragment_type != null) {
+                        return self.protocolFailure(error.WebSocketInvalidFragmentSequence);
+                    }
                     if (frame.fin) {
                         if (!std.unicode.utf8ValidateSlice(frame.payload.?))
                             return self.protocolFailure(error.WebSocketInvalidUtf8);
@@ -308,10 +316,16 @@ pub const Connection = struct {
                 },
                 0x2 => return self.protocolFailure(error.WebSocketBinaryMessageUnsupported),
                 0x0 => {
-                    if (fragment_type == null) return self.protocolFailure(error.WebSocketUnexpectedContinuation);
+                    if (fragment_type == null) {
+                        return self.protocolFailure(error.WebSocketUnexpectedContinuation);
+                    }
                     fragment_count += 1;
-                    if (fragment_count > max_fragments) return self.protocolFailure(error.WebSocketTooManyFragments);
-                    if (fragmented.items.len > max_message_bytes - frame.payload.?.len) return self.protocolFailure(error.WebSocketMessageTooLarge);
+                    if (fragment_count > max_fragments) {
+                        return self.protocolFailure(error.WebSocketTooManyFragments);
+                    }
+                    if (fragmented.items.len > max_message_bytes - frame.payload.?.len) {
+                        return self.protocolFailure(error.WebSocketMessageTooLarge);
+                    }
                     fragmented.appendSlice(self.allocator, frame.payload.?) catch |err|
                         return self.protocolFailure(err);
                     if (frame.fin) {
@@ -374,16 +388,28 @@ pub const Connection = struct {
         } else if (payload_len == 127) {
             var extended: [8]u8 = undefined;
             try readStreamExact(self.stream, &extended, deadline);
-            if ((extended[0] & 0x80) != 0) return self.protocolFailure(error.WebSocketInvalidPayloadLength);
+            if ((extended[0] & 0x80) != 0) {
+                return self.protocolFailure(error.WebSocketInvalidPayloadLength);
+            }
             payload_len = mem.readInt(u64, &extended, .big);
-            if (payload_len <= std.math.maxInt(u16)) return self.protocolFailure(error.WebSocketInvalidPayloadLength);
+            if (payload_len <= std.math.maxInt(u16)) {
+                return self.protocolFailure(error.WebSocketInvalidPayloadLength);
+            }
         }
 
         const control = (opcode & 0x08) != 0;
-        if (control and (!fin or payload_len > 125)) return self.protocolFailure(error.WebSocketInvalidControlFrame);
-        if (opcode == 0x8 and payload_len == 1) return self.protocolFailure(error.WebSocketInvalidClosePayload);
-        if (payload_len > max_message_bytes) return self.protocolFailure(error.WebSocketMessageTooLarge);
-        if (payload_len > std.math.maxInt(usize)) return self.protocolFailure(error.WebSocketMessageTooLarge);
+        if (control and (!fin or payload_len > 125)) {
+            return self.protocolFailure(error.WebSocketInvalidControlFrame);
+        }
+        if (opcode == 0x8 and payload_len == 1) {
+            return self.protocolFailure(error.WebSocketInvalidClosePayload);
+        }
+        if (payload_len > max_message_bytes) {
+            return self.protocolFailure(error.WebSocketMessageTooLarge);
+        }
+        if (payload_len > std.math.maxInt(usize)) {
+            return self.protocolFailure(error.WebSocketMessageTooLarge);
+        }
 
         const payload = if (payload_len == 0)
             try self.allocator.dupe(u8, "")
@@ -439,7 +465,16 @@ pub fn startManagedLoopbackServerWithCodeModeHost(
     code_mode_host: *const launch.CodeModeHost,
     io: std.Io,
 ) !ManagedServer {
-    return startManagedLoopbackServerWithOwnership(allocator, cwd, null, codex_path, hook_policy, false, code_mode_host, io);
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        null,
+        codex_path,
+        hook_policy,
+        false,
+        code_mode_host,
+        io,
+    );
 }
 
 pub fn startOwnerLivedLoopbackServer(
@@ -500,7 +535,13 @@ fn startManagedLoopbackServerWithOwnership(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, codex_path);
-    try launch.appendAppServerArgs(allocator, &argv, hook_policy == .off, requested_listen_url, code_mode_host);
+    try launch.appendAppServerArgs(
+        allocator,
+        &argv,
+        hook_policy == .off,
+        requested_listen_url,
+        code_mode_host,
+    );
 
     if (owner_lived) {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
@@ -514,7 +555,9 @@ fn startManagedLoopbackServerWithOwnership(
             .{ owner_receipt_dir, std.Io.Clock.real.now(io).nanoseconds },
         );
         defer allocator.free(capture_path);
-        defer std.Io.Dir.deleteFileAbsolute(io, capture_path) catch {};
+        defer std.Io.Dir.deleteFileAbsolute(io, capture_path) catch |err| switch (err) {
+            else => {},
+        };
         const mkfifo = try std.process.run(allocator, io, .{
             .argv = &.{ "/usr/bin/mkfifo", capture_path },
             .stdout_limit = .limited(1024),
@@ -594,9 +637,16 @@ fn startManagedLoopbackServerWithOwnership(
 
 const ManagedStartup = struct { listen_url: []u8, readyz_url: []u8 };
 
-fn readManagedStartup(allocator: std.mem.Allocator, file: std.Io.File, timeout_ms: u32) !ManagedStartup {
+fn readManagedStartup(
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    timeout_ms: u32,
+) !ManagedStartup {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(timeout_ms),
+        .clock = .awake,
+    });
     var total: usize = 0;
     var listening: ?[]u8 = null;
     errdefer if (listening) |owned| allocator.free(owned);
@@ -610,7 +660,11 @@ fn readManagedStartup(allocator: std.mem.Allocator, file: std.Io.File, timeout_m
         if (std.mem.startsWith(u8, line, "  listening on: ")) {
             const value = line["  listening on: ".len..];
             try launch.validateInboundWebSocket(value);
-            if (!std.mem.startsWith(u8, value, "ws://127.0.0.1:") or std.mem.endsWith(u8, value, ":0")) return error.InvalidManagedListenAddress;
+            if (!std.mem.startsWith(u8, value, "ws://127.0.0.1:") or
+                std.mem.endsWith(u8, value, ":0"))
+            {
+                return error.InvalidManagedListenAddress;
+            }
             if (listening != null) return error.DuplicateManagedListenAddress;
             listening = try allocator.dupe(u8, value);
         } else if (std.mem.startsWith(u8, line, "  readyz: ")) {
@@ -620,8 +674,10 @@ fn readManagedStartup(allocator: std.mem.Allocator, file: std.Io.File, timeout_m
             readyz = try allocator.dupe(u8, value);
         }
         if (listening != null and readyz != null) {
-            const listen_port = portSuffix(listening.?) orelse return error.InvalidManagedListenAddress;
-            const ready_port = httpLoopbackPort(readyz.?) orelse return error.InvalidManagedReadyzAddress;
+            const listen_port = portSuffix(listening.?) orelse
+                return error.InvalidManagedListenAddress;
+            const ready_port = httpLoopbackPort(readyz.?) orelse
+                return error.InvalidManagedReadyzAddress;
             if (listen_port != ready_port) return error.ManagedStartupPortMismatch;
             return .{ .listen_url = listening.?, .readyz_url = readyz.? };
         }
@@ -632,11 +688,18 @@ fn readManagedStartup(allocator: std.mem.Allocator, file: std.Io.File, timeout_m
 fn readFdLine(file: std.Io.File, buffer: []u8, deadline: std.Io.Clock.Timestamp) ![]const u8 {
     var used: usize = 0;
     const io = std.Io.Threaded.global_single_threaded.io();
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by deadline and buffer length.
         const remaining_ms = deadline.durationFromNow(io).raw.toMilliseconds();
         if (remaining_ms <= 0) return error.Timeout;
-        var fds = [_]std.posix.pollfd{.{ .fd = file.handle, .events = std.posix.POLL.IN | std.posix.POLL.ERR, .revents = 0 }};
-        if (try std.posix.poll(&fds, @intCast(@min(remaining_ms, std.math.maxInt(i32)))) == 0) return error.Timeout;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = file.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(
+            &fds,
+            @intCast(@min(remaining_ms, std.math.maxInt(i32))),
+        ) == 0) return error.Timeout;
         var byte: [1]u8 = undefined;
         const count = try std.posix.read(file.handle, &byte);
         if (count == 0) return error.EndOfStream;
@@ -665,12 +728,14 @@ fn requireReady(url: []const u8, timeout_ms: u32) !void {
     const address = try std.Io.net.IpAddress.parse(loopback_host, port);
     const io = std.Io.Threaded.global_single_threaded.io();
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by timeout_ms.
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
         if (now_ms - started_ms >= timeout_ms) return error.Timeout;
         const remaining: u32 = @intCast(timeout_ms - @as(u32, @intCast(now_ms - started_ms)));
         checkReadyOnce(address, remaining) catch {
-            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch |sleep_err| switch (sleep_err) {
+                else => {},
+            };
             continue;
         };
         return;
@@ -681,22 +746,37 @@ fn checkReadyOnce(address: std.Io.net.IpAddress, timeout_ms: u32) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
-    try writeStreamAllUntil(stream, "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", deadline);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(timeout_ms),
+        .clock = .awake,
+    });
+    try writeStreamAllUntil(
+        stream,
+        "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        deadline,
+    );
     var response: [max_readyz_bytes]u8 = undefined;
     var used: usize = 0;
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by response length and deadline.
         if (used == response.len) return error.ManagedReadyzResponseTooLarge;
-        const incoming = try stream.socket.receiveTimeout(io, response[used..], .{ .deadline = deadline });
+        const incoming = try stream.socket.receiveTimeout(
+            io,
+            response[used..],
+            .{ .deadline = deadline },
+        );
         if (incoming.data.len == 0) break;
         used += incoming.data.len;
     }
     const bytes = response[0..used];
-    const header_end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return error.ManagedReadyzMalformed;
-    const status_line_end = std.mem.indexOf(u8, bytes[0..header_end], "\r\n") orelse return error.ManagedReadyzMalformed;
+    const header_end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse
+        return error.ManagedReadyzMalformed;
+    const status_line_end = std.mem.indexOf(u8, bytes[0..header_end], "\r\n") orelse
+        return error.ManagedReadyzMalformed;
     const status_line = bytes[0..status_line_end];
-    if ((!std.mem.startsWith(u8, status_line, "HTTP/1.1 200 ") and !std.mem.eql(u8, status_line, "HTTP/1.1 200")) and
-        (!std.mem.startsWith(u8, status_line, "HTTP/1.0 200 ") and !std.mem.eql(u8, status_line, "HTTP/1.0 200")))
+    if ((!std.mem.startsWith(u8, status_line, "HTTP/1.1 200 ") and
+        !std.mem.eql(u8, status_line, "HTTP/1.1 200")) and
+        (!std.mem.startsWith(u8, status_line, "HTTP/1.0 200 ") and
+            !std.mem.eql(u8, status_line, "HTTP/1.0 200")))
         return error.ManagedReadyzRejected;
     if (bytes[header_end + 4 ..].len != 0) return error.ManagedReadyzNonEmptyBody;
 }
@@ -1080,7 +1160,9 @@ fn retireProcessGroup(process_group_id: u64) void {
                 else => {},
             };
             if (waitForProcessGroupExit(process_group_id, owner_watchdog_shutdown_grace_ms)) return;
-            std.posix.kill(-positive, std.posix.SIG.KILL) catch {};
+            std.posix.kill(-positive, std.posix.SIG.KILL) catch |err| switch (err) {
+                else => {},
+            };
             _ = waitForProcessGroupExit(process_group_id, owner_watchdog_shutdown_grace_ms);
         },
     }
@@ -1091,7 +1173,9 @@ fn forceKillProcessGroup(process_group_id: u64) void {
         .windows, .wasi => return,
         else => {
             const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse return;
-            std.posix.kill(-positive, std.posix.SIG.KILL) catch {};
+            std.posix.kill(-positive, std.posix.SIG.KILL) catch |err| switch (err) {
+                else => {},
+            };
         },
     }
 }
@@ -1179,11 +1263,16 @@ fn parseWsUrl(ws_url: []const u8) !ParsedWsUrl {
     const authority = remainder[0..slash_idx];
     const path = if (slash_idx < remainder.len) remainder[slash_idx..] else "/";
     const colon_idx = mem.lastIndexOfScalar(u8, authority, ':') orelse return error.InvalidWebSocketUrl;
-    const port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch return error.InvalidWebSocketUrl;
+    const port = std.fmt.parseInt(
+        u16,
+        authority[colon_idx + 1 ..],
+        10,
+    ) catch return error.InvalidWebSocketUrl;
     const raw_host = authority[0..colon_idx];
     const host = if (raw_host.len >= 2 and raw_host[0] == '[' and raw_host[raw_host.len - 1] == ']')
         raw_host[1 .. raw_host.len - 1]
-    else if (std.ascii.eqlIgnoreCase(raw_host, "localhost") or std.ascii.eqlIgnoreCase(raw_host, "localhost."))
+    else if (std.ascii.eqlIgnoreCase(raw_host, "localhost") or
+        std.ascii.eqlIgnoreCase(raw_host, "localhost."))
         "127.0.0.1"
     else
         raw_host;
@@ -1211,13 +1300,23 @@ fn handshakeClient(
     const request = if (port == 0)
         try std.fmt.allocPrint(
             allocator,
-            "GET {s} HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {s}\r\n\r\n",
+            "GET {s} HTTP/1.1\r\n" ++
+                "Host: {s}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "Sec-WebSocket-Key: {s}\r\n\r\n",
             .{ path, host, key },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {s}\r\n\r\n",
+            "GET {s} HTTP/1.1\r\n" ++
+                "Host: {s}:{d}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "Sec-WebSocket-Key: {s}\r\n\r\n",
             .{ path, host, port, key },
         );
     defer allocator.free(request);
@@ -1226,7 +1325,9 @@ fn handshakeClient(
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
     while (mem.indexOf(u8, response_buf.items, "\r\n\r\n") == null) {
-        if (response_buf.items.len >= max_handshake_header_bytes) return error.WebSocketHandshakeHeadersTooLarge;
+        if (response_buf.items.len >= max_handshake_header_bytes) {
+            return error.WebSocketHandshakeHeadersTooLarge;
+        }
         var tmp: [1]u8 = undefined;
         readStreamExact(stream, &tmp, deadline) catch |err| switch (err) {
             error.EndOfStream => return error.WebSocketHandshakeClosed,
@@ -1237,13 +1338,15 @@ fn handshakeClient(
 
     const header_end = mem.indexOf(u8, response_buf.items, "\r\n\r\n").? + 4;
     const headers = response_buf.items[0..header_end];
-    const status_line_end = mem.indexOf(u8, headers, "\r\n") orelse return error.WebSocketHandshakeRejected;
+    const status_line_end = mem.indexOf(u8, headers, "\r\n") orelse
+        return error.WebSocketHandshakeRejected;
     const status_line = headers[0..status_line_end];
     if (!mem.startsWith(u8, status_line, "HTTP/1.1 101 ") and
         !mem.eql(u8, status_line, "HTTP/1.1 101")) return error.WebSocketHandshakeRejected;
     const upgrade = headerValue(headers, "upgrade") orelse return error.WebSocketMissingUpgrade;
     if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return error.WebSocketInvalidUpgrade;
-    const connection = headerValue(headers, "connection") orelse return error.WebSocketMissingConnection;
+    const connection = headerValue(headers, "connection") orelse
+        return error.WebSocketMissingConnection;
     if (!headerHasToken(connection, "upgrade")) return error.WebSocketInvalidConnection;
     const accept = headerValue(headers, "sec-websocket-accept") orelse return error.WebSocketMissingAccept;
 
@@ -1454,13 +1557,25 @@ test "server frame protocol violations poison before allocation" {
     try expectRawServerFrameError(error.WebSocketBinaryMessageUnsupported, &.{ 0x82, 0x00 });
     try expectRawServerFrameError(error.WebSocketInvalidControlFrame, &.{ 0x09, 0x00 });
     try expectRawServerFrameError(error.WebSocketUnexpectedContinuation, &.{ 0x80, 0x00 });
-    try expectRawServerFrameError(error.WebSocketMessageTooLarge, &.{ 0x81, 0x7F, 0, 0, 0, 0, 0, 128, 0, 1 });
-    try expectRawServerFrameError(error.WebSocketInvalidPayloadLength, &.{ 0x81, 0x7F, 0x80, 0, 0, 0, 0, 0, 0, 1 });
+    try expectRawServerFrameError(
+        error.WebSocketMessageTooLarge,
+        &.{ 0x81, 0x7F, 0, 0, 0, 0, 0, 128, 0, 1 },
+    );
+    try expectRawServerFrameError(
+        error.WebSocketInvalidPayloadLength,
+        &.{ 0x81, 0x7F, 0x80, 0, 0, 0, 0, 0, 0, 1 },
+    );
     try expectRawServerFrameError(error.WebSocketInvalidPayloadLength, &.{ 0x81, 0x7E, 0, 1, 'x' });
-    try expectRawServerFrameError(error.WebSocketInvalidPayloadLength, &.{ 0x81, 0x7F, 0, 0, 0, 0, 0, 0, 0, 126 });
+    try expectRawServerFrameError(
+        error.WebSocketInvalidPayloadLength,
+        &.{ 0x81, 0x7F, 0, 0, 0, 0, 0, 0, 0, 126 },
+    );
     try expectRawServerFrameError(error.WebSocketInvalidClosePayload, &.{ 0x88, 0x01, 0x00 });
     try expectRawServerFrameError(error.WebSocketInvalidClosePayload, &.{ 0x88, 0x02, 0x03, 0xEE });
-    try expectRawServerFrameError(error.WebSocketInvalidClosePayload, &.{ 0x88, 0x03, 0x03, 0xE8, 0xFF });
+    try expectRawServerFrameError(
+        error.WebSocketInvalidClosePayload,
+        &.{ 0x88, 0x03, 0x03, 0xE8, 0xFF },
+    );
     try expectRawServerFrameError(error.WebSocketInvalidUtf8, &.{ 0x81, 0x01, 0xFF });
 
     var fragments: [2 * (max_fragments + 1)]u8 = undefined;
@@ -1586,7 +1701,8 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
         &.{
             "/bin/sh",
             "-c",
-            "sleep 600 & descendant=$!; pid_tmp=\"$1.tmp\"; printf '%s %s\\n' \"$$\" \"$descendant\" > \"$pid_tmp\"; " ++
+            "sleep 600 & descendant=$!; pid_tmp=\"$1.tmp\"; " ++
+                "printf '%s %s\\n' \"$$\" \"$descendant\" > \"$pid_tmp\"; " ++
                 "mv \"$pid_tmp\" \"$1\"; while :; do sleep 1; done",
             "cas-owner-lived-test-server",
             pid_path,
@@ -1619,8 +1735,16 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
         };
         defer allocator.free(pid_bytes);
         var pid_fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
-        server_pid = try std.fmt.parseInt(u64, pid_fields.next() orelse return error.InvalidPidFixture, 10);
-        descendant_pid = try std.fmt.parseInt(u64, pid_fields.next() orelse return error.InvalidPidFixture, 10);
+        server_pid = try std.fmt.parseInt(
+            u64,
+            pid_fields.next() orelse return error.InvalidPidFixture,
+            10,
+        );
+        descendant_pid = try std.fmt.parseInt(
+            u64,
+            pid_fields.next() orelse return error.InvalidPidFixture,
+            10,
+        );
         break;
     }
     try std.testing.expect(server_pid != null);
@@ -1670,14 +1794,12 @@ test "ordinary managed teardown retires its process group descendants" {
     defer allocator.free(root);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "ordinary.pid" });
     defer allocator.free(pid_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "trap '' TERM; sleep 600 & descendant=$!; printf '%s %s\\n' \"$$\" \"$descendant\" > '{s}'; wait",
-        .{pid_path},
-    );
-    defer allocator.free(script);
+    const script =
+        "trap '' TERM; sleep 600 & descendant=$!; pid_tmp=\"$1.tmp\"; " ++
+        "printf '%s %s\\n' \"$$\" \"$descendant\" > \"$pid_tmp\"; " ++
+        "mv \"$pid_tmp\" \"$1\"; wait";
     const child = try std.process.spawn(io, .{
-        .argv = &.{ "/bin/sh", "-c", script },
+        .argv = &.{ "/bin/sh", "-c", script, "cas-ordinary-managed-test", pid_path },
         .cwd = .{ .path = root },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -1696,14 +1818,29 @@ test "ordinary managed teardown retires its process group descendants" {
     var server_pid: ?u64 = null;
     var descendant_pid: ?u64 = null;
     for (0..500) |_| {
-        const pid_bytes = std.Io.Dir.cwd().readFileAlloc(io, pid_path, allocator, .limited(64)) catch {
-            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        const pid_bytes = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            pid_path,
+            allocator,
+            .limited(64),
+        ) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+                else => {},
+            };
             continue;
         };
         defer allocator.free(pid_bytes);
         var fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
-        server_pid = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidPidFixture, 10);
-        descendant_pid = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidPidFixture, 10);
+        server_pid = try std.fmt.parseInt(
+            u64,
+            fields.next() orelse return error.InvalidPidFixture,
+            10,
+        );
+        descendant_pid = try std.fmt.parseInt(
+            u64,
+            fields.next() orelse return error.InvalidPidFixture,
+            10,
+        );
         break;
     }
     try std.testing.expectEqual(child_pid, server_pid.?);
@@ -1730,12 +1867,24 @@ test "ordinary managed startup failure retires its process group descendants" {
     defer allocator.free(pid_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nset -eu\nsleep 600 & descendant=$!\nprintf '%s %s\\n' \"$$\" \"$descendant\" > '{s}'\ni=0\nwhile [ \"$i\" -lt 16 ]; do printf 'malformed\\n' >&2; i=$((i + 1)); done\nwait\n",
+        "#!/bin/sh\n" ++
+            "set -eu\n" ++
+            "sleep 600 & descendant=$!\n" ++
+            "printf '%s %s\\n' \"$$\" \"$descendant\" > '{s}'\n" ++
+            "i=0\n" ++
+            "while [ \"$i\" -lt 16 ]; do " ++
+            "printf 'malformed\\n' >&2; i=$((i + 1)); done\n" ++
+            "wait\n",
         .{pid_path},
     );
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "malformed-codex", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        executable,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 
     try std.testing.expectError(
         error.ManagedStartupIncomplete,
@@ -1745,8 +1894,16 @@ test "ordinary managed startup failure retires its process group descendants" {
     const pid_bytes = try tmp.dir.readFileAlloc(io, "malformed.pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
     var fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
-    const server_pid = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidPidFixture, 10);
-    const descendant_pid = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidPidFixture, 10);
+    const server_pid = try std.fmt.parseInt(
+        u64,
+        fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
+    const descendant_pid = try std.fmt.parseInt(
+        u64,
+        fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
     try std.testing.expect(waitForProcessExit(server_pid, 2_000));
     try std.testing.expect(waitForProcessExit(descendant_pid, 2_000));
     try std.testing.expect(waitForProcessGroupExit(server_pid, 2_000));

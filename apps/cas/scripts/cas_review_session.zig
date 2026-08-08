@@ -1061,7 +1061,8 @@ fn parseReviewRuntimeGateAlloc(
         .object => |value| value,
         else => return error.InvalidReviewPreflightReceipt,
     };
-    if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", "cas-app-server-preflight/v1") or
+    const schema = jsonStringField(root, "schema") orelse "";
+    if (!std.mem.eql(u8, schema, "cas-app-server-preflight/v1") or
         !std.mem.eql(u8, jsonStringField(root, "action") orelse "", "preflight") or
         !std.mem.eql(u8, jsonStringField(root, "profile") orelse "", "review") or
         !std.mem.eql(u8, jsonStringField(root, "status") orelse "", "compatible") or
@@ -1069,14 +1070,22 @@ fn parseReviewRuntimeGateAlloc(
     {
         return error.IncompatibleReviewRuntime;
     }
-    const codex = core_json.objectField(root, "codex") orelse return error.InvalidReviewPreflightReceipt;
-    const schemas = core_json.objectField(root, "schemas") orelse return error.InvalidReviewPreflightReceipt;
-    const methods = core_json.objectField(root, "methods") orelse return error.InvalidReviewPreflightReceipt;
-    const handler_coverage = core_json.objectField(root, "handlerCoverage") orelse return error.InvalidReviewPreflightReceipt;
-    const shape_checks = core_json.objectField(root, "shapeChecks") orelse return error.InvalidReviewPreflightReceipt;
-    const transport = core_json.objectField(root, "transport") orelse return error.InvalidReviewPreflightReceipt;
-    const behavioral_probes = root.get("behavioralProbes") orelse return error.InvalidReviewPreflightReceipt;
-    const missing_required = methods.get("missingRequired") orelse return error.InvalidReviewPreflightReceipt;
+    const codex = core_json.objectField(root, "codex") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const schemas = core_json.objectField(root, "schemas") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const methods = core_json.objectField(root, "methods") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const handler_coverage = core_json.objectField(root, "handlerCoverage") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const shape_checks = core_json.objectField(root, "shapeChecks") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const transport = core_json.objectField(root, "transport") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const behavioral_probes = root.get("behavioralProbes") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const missing_required = methods.get("missingRequired") orelse
+        return error.InvalidReviewPreflightReceipt;
     if (missing_required != .array or missing_required.array.items.len != 0 or
         !std.mem.eql(u8, jsonStringField(handler_coverage, "status") orelse "", "passed") or
         !std.mem.eql(u8, jsonStringField(shape_checks, "status") orelse "", "passed") or
@@ -1086,10 +1095,14 @@ fn parseReviewRuntimeGateAlloc(
         return error.IncompatibleReviewRuntime;
     }
     const path = jsonStringField(codex, "path") orelse return error.InvalidReviewPreflightReceipt;
-    const version = jsonStringField(codex, "version") orelse return error.InvalidReviewPreflightReceipt;
-    const binary_digest = jsonStringField(codex, "binaryDigest") orelse return error.InvalidReviewPreflightReceipt;
-    const stable_digest = jsonStringField(schemas, "stableDigest") orelse return error.InvalidReviewPreflightReceipt;
-    const experimental_digest = jsonStringField(schemas, "experimentalDigest") orelse return error.InvalidReviewPreflightReceipt;
+    const version = jsonStringField(codex, "version") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const binary_digest = jsonStringField(codex, "binaryDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const stable_digest = jsonStringField(schemas, "stableDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const experimental_digest = jsonStringField(schemas, "experimentalDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
     if (path.len == 0 or version.len == 0 or
         !std.mem.startsWith(u8, binary_digest, "sha256:") or
         !std.mem.startsWith(u8, stable_digest, "sha256:") or
@@ -1247,7 +1260,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "CAS review requires the compiled 0.146 structured-review capability and a compatible review schema profile for the exact resolved Codex binary",
+                .hint = "CAS review requires the compiled 0.146 structured-review capability " ++
+                    "and a compatible review schema profile for the exact resolved Codex binary",
             },
         );
     };
@@ -1273,7 +1287,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 },
                 .{
                     .code = "invalid_code_mode_host",
-                    .hint = "use ws:// only for a loopback Code Mode host and wss:// for every non-loopback host",
+                    .hint = "use ws:// only for a loopback Code Mode host and wss:// for every " ++
+                        "non-loopback host",
                 },
             );
         }
@@ -1282,7 +1297,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     defer if (code_mode_host) |*host| host.deinit();
     var code_mode_digest_buffer: [64]u8 = undefined;
     const code_mode_host_redacted = if (code_mode_host) |*host| host.redacted_origin else null;
-    const code_mode_host_digest = if (code_mode_host) |*host| host.digestHex(&code_mode_digest_buffer) else null;
+    const code_mode_host_digest = if (code_mode_host) |*host|
+        host.digestHex(&code_mode_digest_buffer)
+    else
+        null;
     var output_receipt = OutputReceipt{
         .surface_action = action_name,
         .resolved_codex_path = resolved_codex_path,
@@ -1395,7 +1413,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             output_receipt,
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "the exact Codex runtime could not be revalidated after app-server initialization",
+                .hint = "the exact Codex runtime could not be revalidated after app-server " ++
+                    "initialization",
             },
         );
     };
@@ -1411,7 +1430,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             output_receipt,
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "retry after the exact resolved Codex executable is stable across preflight and initialization",
+                .hint = "retry after the exact resolved Codex executable is stable across " ++
+                    "preflight and initialization",
             },
         );
     }
@@ -2617,11 +2637,13 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 .structured_review_capability = structured_review_capability,
                 .compatibility_verdict = "incompatible",
                 .selected_transport = record.transport_kind orelse "websocket",
-                .selection_reason = record.transport_selection_reason orelse "recorded_review_runtime",
+                .selection_reason = record.transport_selection_reason orelse
+                    "recorded_review_runtime",
             }, record),
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "cas review wait requires the recorded exact Codex binary to continue satisfying the 0.146 review schema contract",
+                .hint = "cas review wait requires the recorded exact Codex binary to continue " ++
+                    "satisfying the 0.146 review schema contract",
             },
         );
     };
@@ -2646,11 +2668,13 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 .structured_review_capability = structured_review_capability,
                 .compatibility_verdict = "incompatible",
                 .selected_transport = record.transport_kind orelse "websocket",
-                .selection_reason = record.transport_selection_reason orelse "recorded_review_runtime",
+                .selection_reason = record.transport_selection_reason orelse
+                    "recorded_review_runtime",
             }, record),
             .{
                 .code = "review_tuple_mismatch",
-                .hint = "the recorded review attempt is bound to a different Codex binary digest or app-server contract",
+                .hint = "the recorded review attempt is bound to a different Codex binary " ++
+                    "digest or app-server contract",
             },
         );
     }
@@ -8601,10 +8625,14 @@ fn renderErrorAndExit(
             .structuredReviewCapability = receipt.structured_review_capability,
             .compatibilityVerdict = receipt.compatibility_verdict,
             .selectedTransport = receipt.selected_transport,
-            .codeModeHost = if (receipt.code_mode_host_redacted != null or receipt.code_mode_host_digest != null) .{
-                .origin = receipt.code_mode_host_redacted,
-                .sha256 = receipt.code_mode_host_digest,
-            } else null,
+            .codeModeHost = if (receipt.code_mode_host_redacted != null or
+                receipt.code_mode_host_digest != null)
+                .{
+                    .origin = receipt.code_mode_host_redacted,
+                    .sha256 = receipt.code_mode_host_digest,
+                }
+            else
+                null,
             .requestedMultiAgentMode = if (receipt.requested_multi_agent_mode) |mode|
                 mode.configValue()
             else
@@ -8818,11 +8846,24 @@ fn printStatusJson(
     const review_text_json = if (status.review_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const structured_review_capability_json = if (receipt.structured_review_capability) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or receipt.code_mode_host_digest != null)
-        try stringifyAnyAlloc(allocator, .{ .origin = receipt.code_mode_host_redacted, .sha256 = receipt.code_mode_host_digest })
+    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
+        receipt.code_mode_host_digest != null)
+        try stringifyAnyAlloc(allocator, .{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        })
     else
         "null";
     const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
@@ -9309,11 +9350,24 @@ fn printStartJson(
     const review_result_json = if (status) |value| value.review_result_json orelse "null" else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const structured_review_capability_json = if (receipt.structured_review_capability) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or receipt.code_mode_host_digest != null)
-        try stringifyAnyAlloc(allocator, .{ .origin = receipt.code_mode_host_redacted, .sha256 = receipt.code_mode_host_digest })
+    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
+        receipt.code_mode_host_digest != null)
+        try stringifyAnyAlloc(allocator, .{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        })
     else
         "null";
     const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
@@ -10587,11 +10641,26 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(allocator, optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest")),
-        .app_server_contract_id = try dupOptional(allocator, optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id")),
-        .selected_transport = try dupOptional(allocator, optionalStringFromRootKeys(root, "selectedTransport", "transport_kind")),
-        .code_mode_host_redacted = try dupOptional(allocator, receiptCodeModeHostField(root, "origin")),
-        .code_mode_host_digest = try dupOptional(allocator, receiptCodeModeHostField(root, "sha256")),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(verdict, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10657,11 +10726,26 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(allocator, optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest")),
-        .app_server_contract_id = try dupOptional(allocator, optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id")),
-        .selected_transport = try dupOptional(allocator, optionalStringFromRootKeys(root, "selectedTransport", "transport_kind")),
-        .code_mode_host_redacted = try dupOptional(allocator, receiptCodeModeHostField(root, "origin")),
-        .code_mode_host_digest = try dupOptional(allocator, receiptCodeModeHostField(root, "sha256")),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10767,11 +10851,26 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(allocator, optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest")),
-        .app_server_contract_id = try dupOptional(allocator, optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id")),
-        .selected_transport = try dupOptional(allocator, optionalStringFromRootKeys(root, "selectedTransport", "transport_kind")),
-        .code_mode_host_redacted = try dupOptional(allocator, receiptCodeModeHostField(root, "origin")),
-        .code_mode_host_digest = try dupOptional(allocator, receiptCodeModeHostField(root, "sha256")),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10956,11 +11055,26 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(allocator, optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest")),
-        .app_server_contract_id = try dupOptional(allocator, optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id")),
-        .selected_transport = try dupOptional(allocator, optionalStringFromRootKeys(root, "selectedTransport", "transport_kind")),
-        .code_mode_host_redacted = try dupOptional(allocator, receiptCodeModeHostField(root, "origin")),
-        .code_mode_host_digest = try dupOptional(allocator, receiptCodeModeHostField(root, "sha256")),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try allocator.dupe(u8, review_thread_id),
@@ -12657,7 +12771,8 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
             "\"detached_review_requires_cross_process_truth\",\"event_log_path\":\"{s}\"," ++
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
-            "\"codex_binary_digest\":\"sha256:test\",\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"codex_binary_digest\":\"sha256:test\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\"," ++
@@ -12704,7 +12819,8 @@ test "session record owns and validates workflow binding across reload" {
             "\"detached_review_requires_cross_process_truth\",\"event_log_path\":\"{s}\"," ++
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
-            "\"codex_binary_digest\":\"sha256:test\",\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"codex_binary_digest\":\"sha256:test\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\",\"accountFingerprintReducedProtection\":false," ++
@@ -17974,14 +18090,23 @@ test "review runtime gate requires live managed structured-review preflight" {
     const schema_only =
         \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
     ;
-    try std.testing.expectError(error.IncompatibleReviewRuntime, parseReviewRuntimeGateAlloc(allocator, schema_only));
+    try std.testing.expectError(
+        error.IncompatibleReviewRuntime,
+        parseReviewRuntimeGateAlloc(allocator, schema_only),
+    );
 }
 
 test "review behavioral gate rejects missing failed or duplicate required probes" {
     var passed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "[{\"id\":\"initialize-lifecycle\",\"requirement\":\"required\",\"status\":\"passed\"},{\"id\":\"managed-websocket-transport\",\"requirement\":\"required\",\"status\":\"passed\"},{\"id\":\"server-request-coverage\",\"requirement\":\"required\",\"status\":\"passed\"},{\"id\":\"bounded-overload-retry\",\"requirement\":\"required\",\"status\":\"passed\"},{\"id\":\"structured-review\",\"requirement\":\"required\",\"status\":\"passed\"}]",
+        "[{\"id\":\"initialize-lifecycle\",\"requirement\":\"required\",\"status\":\"passed\"}," ++
+            "{\"id\":\"managed-websocket-transport\",\"requirement\":\"required\"," ++
+            "\"status\":\"passed\"},{\"id\":\"server-request-coverage\"," ++
+            "\"requirement\":\"required\",\"status\":\"passed\"}," ++
+            "{\"id\":\"bounded-overload-retry\",\"requirement\":\"required\"," ++
+            "\"status\":\"passed\"},{\"id\":\"structured-review\"," ++
+            "\"requirement\":\"required\",\"status\":\"passed\"}]",
         .{},
     );
     defer passed.deinit();

@@ -87,8 +87,9 @@ const UsageText =
 ;
 
 const InstalledBinarySet =
-    "cas, cas_account, cas_automation, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
-    "cas_session_inquiry, cas_conformance_suite, cas_goal, cas_app_server_preflight";
+    "cas, cas_account, cas_automation, cas_smoke_check, cas_instance_runner, " ++
+    "cas_review_session, cas_session_inquiry, cas_conformance_suite, cas_goal, " ++
+    "cas_app_server_preflight";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -333,10 +334,22 @@ test "capabilities advertise only current review boundary features" {
         text_output.written(),
         "cas_review_scoped_instructions_v1=true",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_app_server_contract_0146_v1=true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_app_server_schema_probe_v1=true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_app_server_contract_0146_v1=true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_app_server_schema_probe_v1=true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_codex_0145_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_automation_v1=true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_automation_v1=true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
@@ -359,10 +372,22 @@ test "capabilities advertise only current review boundary features" {
         "\"cas_workflow_bound_owner_lived_review_v1\": true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_app_server_contract_0146_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_app_server_schema_probe_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_app_server_contract_0146_v1\": true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_app_server_schema_probe_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "cas_codex_0145_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_automation_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_automation_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),

@@ -534,16 +534,78 @@ const LedgerCoverages = [_]perf_contract.CommandCoverage{
 };
 
 const CasAutomationCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "cas-automation-help", .binary = "cas", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-automation-list", .binary = "cas", .family = "list", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-automation-show-deep", .binary = "cas", .family = "show", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-create-deep", .binary = "cas", .family = "create", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-update-deep", .binary = "cas", .family = "update", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-enable-deep", .binary = "cas", .family = "enable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-disable-deep", .binary = "cas", .family = "disable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-run-now-deep", .binary = "cas", .family = "run-now", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-delete-deep", .binary = "cas", .family = "delete", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cas-automation-run-due-deep", .binary = "cas", .family = "run-due", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{
+        .case_id = "cas-automation-help",
+        .binary = "cas",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-automation-list",
+        .binary = "cas",
+        .family = "list",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-automation-show-deep",
+        .binary = "cas",
+        .family = "show",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-create-deep",
+        .binary = "cas",
+        .family = "create",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-update-deep",
+        .binary = "cas",
+        .family = "update",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-enable-deep",
+        .binary = "cas",
+        .family = "enable",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-disable-deep",
+        .binary = "cas",
+        .family = "disable",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-run-now-deep",
+        .binary = "cas",
+        .family = "run-now",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-delete-deep",
+        .binary = "cas",
+        .family = "delete",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-run-due-deep",
+        .binary = "cas",
+        .family = "run-due",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
 };
 
 const CasAutomationCoverages = buildCasAutomationCoverages();
@@ -619,8 +681,22 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_help, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_version, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
-    .{ .descriptor = CasAutomationCases[0], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_automation_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = CasAutomationCases[1], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_automation_list, .tolerance_pct = 35.0 },
+    .{
+        .descriptor = CasAutomationCases[0],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas",
+        .setup = .cas_automation_help,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[1],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas",
+        .setup = .cas_automation_list,
+        .tolerance_pct = 35.0,
+    },
 };
 
 const DeepCases = [_]DeepCase{
@@ -633,16 +709,47 @@ const DeepCases = [_]DeepCase{
         .batch_iterations = 8,
     },
     .{ .descriptor = CasAutomationCases[2], .setup = .cas_automation_show, .tolerance_pct = 200.0 },
-    .{ .descriptor = CasAutomationCases[3], .setup = .cas_automation_create, .tolerance_pct = 25.0 },
-    .{ .descriptor = CasAutomationCases[4], .setup = .cas_automation_update, .tolerance_pct = 25.0 },
-    .{ .descriptor = CasAutomationCases[5], .setup = .cas_automation_enable, .tolerance_pct = 250.0 },
-    .{ .descriptor = CasAutomationCases[6], .setup = .cas_automation_disable, .tolerance_pct = 100.0 },
-    .{ .descriptor = CasAutomationCases[7], .setup = .cas_automation_run_now, .tolerance_pct = 70.0 },
-    .{ .descriptor = CasAutomationCases[8], .setup = .cas_automation_delete, .tolerance_pct = 60.0 },
-    .{ .descriptor = CasAutomationCases[9], .setup = .cas_automation_run_due, .tolerance_pct = 125.0 },
+    .{
+        .descriptor = CasAutomationCases[3],
+        .setup = .cas_automation_create,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[4],
+        .setup = .cas_automation_update,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[5],
+        .setup = .cas_automation_enable,
+        .tolerance_pct = 250.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[6],
+        .setup = .cas_automation_disable,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[7],
+        .setup = .cas_automation_run_now,
+        .tolerance_pct = 70.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[8],
+        .setup = .cas_automation_delete,
+        .tolerance_pct = 60.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[9],
+        .setup = .cas_automation_run_due,
+        .tolerance_pct = 125.0,
+    },
 };
 
-fn buildCasAutomationCoverages() [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage {
+const CasAutomationCoverageArray =
+    [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage;
+
+fn buildCasAutomationCoverages() CasAutomationCoverageArray {
     var out: [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
     for (cas_automation_cli.commandDefinitions(), 0..) |def, idx| {
         const coverage, const reason = if (def.command == .list)
@@ -4726,7 +4833,10 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
         .cas_instance_runner_help,
         .cas_review_session_help,
         => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .cas_automation_help => try args.appendSlice(allocator, &.{ binary_path, "automation", "--help" }),
+        .cas_automation_help => try args.appendSlice(
+            allocator,
+            &.{ binary_path, "automation", "--help" },
+        ),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -4753,7 +4863,10 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)});
             const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
             try seedCasAutomationDb(allocator, db_path);
-            try args.appendSlice(allocator, &.{ binary_path, "automation", "--db", db_path, "list" });
+            try args.appendSlice(
+                allocator,
+                &.{ binary_path, "automation", "--db", db_path, "list" },
+            );
         },
         else => return error.InvalidCommand,
     }
@@ -5014,7 +5127,10 @@ fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void 
     if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
         if (err_msg) |msg| {
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stderr_writer.interface.print("seedCasAutomationDb sqlite error: {s}\n", .{std.mem.sliceTo(msg, 0)});
+            try stderr_writer.interface.print(
+                "seedCasAutomationDb sqlite error: {s}\n",
+                .{std.mem.sliceTo(msg, 0)},
+            );
         }
         return error.InvalidData;
     }

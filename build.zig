@@ -328,7 +328,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "cas_app_server_contract_data", .module = cas_app_server_contract_data.createModule() },
+            .{
+                .name = "cas_app_server_contract_data",
+                .module = cas_app_server_contract_data.createModule(),
+            },
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
@@ -443,7 +446,11 @@ pub fn build(b: *std.Build) void {
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
     const cas_goal = addExecutable(b, "cas_goal", cas_goal_root);
     const cas_account = addExecutable(b, "cas_account", cas_account_root);
-    const cas_app_server_preflight = addExecutable(b, "cas_app_server_preflight", cas_app_server_preflight_root);
+    const cas_app_server_preflight = addExecutable(
+        b,
+        "cas_app_server_preflight",
+        cas_app_server_preflight_root,
+    );
     cas_app_server_preflight.root_module.linkSystemLibrary("c", .{});
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
@@ -805,7 +812,19 @@ pub fn build(b: *std.Build) void {
     );
 
     const cas_build_deps: []const *std.Build.Step =
-        &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_app_server_preflight_install.step, &cas_budget_perf_install.step, &cas_install.step, &cas_automation_install.step };
+        &.{
+            &cas_smoke_check_install.step,
+            &cas_instance_runner_install.step,
+            &cas_review_session_install.step,
+            &cas_session_inquiry_install.step,
+            &cas_conformance_suite_install.step,
+            &cas_goal_install.step,
+            &cas_account_install.step,
+            &cas_app_server_preflight_install.step,
+            &cas_budget_perf_install.step,
+            &cas_install.step,
+            &cas_automation_install.step,
+        };
     const app_surfaces = [_]AppSurface{
         .{
             .path = b.path("apps/seq"),

@@ -9,9 +9,16 @@ pub fn setAutomationRootOverride(path: ?[]const u8) void {
 
 pub fn parseCwdsJson(allocator: std.mem.Allocator, raw_json: []const u8) !std.ArrayList([]u8) {
     var result = std.ArrayList([]u8).empty;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return userErrorFmt("cwds_json must be valid JSON", .{});
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw_json,
+        .{},
+    ) catch return userErrorFmt("cwds_json must be valid JSON", .{});
     defer parsed.deinit();
-    if (parsed.value != .array) return userErrorFmt("cwds_json must be a JSON array of strings", .{});
+    if (parsed.value != .array) {
+        return userErrorFmt("cwds_json must be a JSON array of strings", .{});
+    }
     for (parsed.value.array.items) |item| {
         if (item != .string) return userErrorFmt("cwds_json must be a JSON array of strings", .{});
         try result.append(allocator, try allocator.dupe(u8, item.string));
@@ -83,12 +90,26 @@ pub fn automationDirPath(allocator: std.mem.Allocator, automation_id: []const u8
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, safe_id });
 }
 
-pub fn readPrompt(allocator: std.mem.Allocator, inline_prompt: ?[]const u8, prompt_file: ?[]const u8) ![]u8 {
-    if (inline_prompt != null and prompt_file != null) return userErrorFmt("use either --prompt or --prompt-file", .{});
+pub fn readPrompt(
+    allocator: std.mem.Allocator,
+    inline_prompt: ?[]const u8,
+    prompt_file: ?[]const u8,
+) ![]u8 {
+    if (inline_prompt != null and prompt_file != null) {
+        return userErrorFmt("use either --prompt or --prompt-file", .{});
+    }
     if (inline_prompt) |text| return allocator.dupe(u8, text);
     if (prompt_file) |path| {
-        const raw = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(2 * 1024 * 1024)) catch |err| {
-            return userErrorFmt("unable to read prompt file ({s}): {s}", .{ path, @errorName(err) });
+        const raw = std.Io.Dir.cwd().readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+            allocator,
+            .limited(2 * 1024 * 1024),
+        ) catch |err| {
+            return userErrorFmt(
+                "unable to read prompt file ({s}): {s}",
+                .{ path, @errorName(err) },
+            );
         };
         defer allocator.free(raw);
         return allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
@@ -98,16 +119,33 @@ pub fn readPrompt(allocator: std.mem.Allocator, inline_prompt: ?[]const u8, prom
 
 fn validateAutomationId(raw: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, "..")) return userErrorFmt("automation id must not be empty", .{});
-    if (std.mem.indexOfScalar(u8, trimmed, std.fs.path.sep) != null) return userErrorFmt("automation id must not contain path separators", .{});
-    if (std.fs.path.sep == '\\' and std.mem.indexOfScalar(u8, trimmed, '/') != null) return userErrorFmt("automation id must not contain path separators", .{});
+    if (trimmed.len == 0 or
+        std.mem.eql(u8, trimmed, ".") or
+        std.mem.eql(u8, trimmed, ".."))
+    {
+        return userErrorFmt("automation id must not be empty", .{});
+    }
+    if (std.mem.indexOfScalar(u8, trimmed, std.fs.path.sep) != null) {
+        return userErrorFmt("automation id must not contain path separators", .{});
+    }
+    if (std.fs.path.sep == '\\' and
+        std.mem.indexOfScalar(u8, trimmed, '/') != null)
+    {
+        return userErrorFmt("automation id must not contain path separators", .{});
+    }
     return trimmed;
 }
 
 pub fn writeAutomationFilesForRow(allocator: std.mem.Allocator, row: anytype) !void {
     const target_dir = try automationDirPath(allocator, row.id);
     defer allocator.free(target_dir);
-    std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| return userErrorFmt("unable to create automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
+    std.Io.Dir.cwd().createDirPath(
+        std.Io.Threaded.global_single_threaded.io(),
+        target_dir,
+    ) catch |err| return userErrorFmt(
+        "unable to create automation dir ({s}): {s}",
+        .{ target_dir, @errorName(err) },
+    );
 
     const toml_text = try renderAutomationTomlAlloc(allocator, row);
     defer allocator.free(toml_text);
@@ -118,8 +156,15 @@ pub fn writeAutomationFilesForRow(allocator: std.mem.Allocator, row: anytype) !v
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
     defer allocator.free(memory_path);
     std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
-        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch |err| {
-            return userErrorFmt("unable to create memory.md ({s}): {s}", .{ memory_path, @errorName(err) });
+        var file = std.Io.Dir.cwd().createFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            memory_path,
+            .{},
+        ) catch |err| {
+            return userErrorFmt(
+                "unable to create memory.md ({s}): {s}",
+                .{ memory_path, @errorName(err) },
+            );
         };
         file.close(std.Io.Threaded.global_single_threaded.io());
     };
@@ -128,17 +173,35 @@ pub fn writeAutomationFilesForRow(allocator: std.mem.Allocator, row: anytype) !v
 pub fn deleteAutomationFiles(allocator: std.mem.Allocator, automation_id: []const u8) !void {
     const target_dir = try automationDirPath(allocator, automation_id);
     defer allocator.free(target_dir);
-    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), target_dir, .{}) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(
+        std.Io.Threaded.global_single_threaded.io(),
+        target_dir,
+        .{},
+    ) catch |err| switch (err) {
         error.FileNotFound => return,
-        else => return userErrorFmt("unable to open automation dir ({s}): {s}", .{ target_dir, @errorName(err) }),
+        else => return userErrorFmt(
+            "unable to open automation dir ({s}): {s}",
+            .{ target_dir, @errorName(err) },
+        ),
     };
     dir.close(std.Io.Threaded.global_single_threaded.io());
-    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| {
-        return userErrorFmt("unable to delete automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
+    std.Io.Dir.cwd().deleteTree(
+        std.Io.Threaded.global_single_threaded.io(),
+        target_dir,
+    ) catch |err| {
+        return userErrorFmt(
+            "unable to delete automation dir ({s}): {s}",
+            .{ target_dir, @errorName(err) },
+        );
     };
 }
 
-pub fn writeMemorySummary(allocator: std.mem.Allocator, automation_id: []const u8, summary: []const u8, started_ms: i64) !void {
+pub fn writeMemorySummary(
+    allocator: std.mem.Allocator,
+    automation_id: []const u8,
+    summary: []const u8,
+    started_ms: i64,
+) !void {
     const folder = try automationDirPath(allocator, automation_id);
     defer allocator.free(folder);
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), folder);
@@ -146,9 +209,17 @@ pub fn writeMemorySummary(allocator: std.mem.Allocator, automation_id: []const u
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{folder});
     defer allocator.free(memory_path);
 
-    const existing = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), memory_path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+    const existing = std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        memory_path,
+        allocator,
+        .limited(10 * 1024 * 1024),
+    ) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
-        else => return userErrorFmt("failed reading memory file ({s}): {s}", .{ memory_path, @errorName(err) }),
+        else => return userErrorFmt(
+            "failed reading memory file ({s}): {s}",
+            .{ memory_path, @errorName(err) },
+        ),
     };
     defer allocator.free(existing);
 
@@ -157,13 +228,21 @@ pub fn writeMemorySummary(allocator: std.mem.Allocator, automation_id: []const u
     const ts = try timestampStringUtc(allocator, started_ms);
     defer allocator.free(ts);
 
-    const block = try std.fmt.allocPrint(allocator, "Last run summary ({s}): {s}\nRun time: {s}\n", .{ date, summary, ts });
+    const block = try std.fmt.allocPrint(
+        allocator,
+        "Last run summary ({s}): {s}\nRun time: {s}\n",
+        .{ date, summary, ts },
+    );
     defer allocator.free(block);
 
     const merged = if (existing.len == 0)
         try allocator.dupe(u8, block)
     else
-        try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ std.mem.trim(u8, existing, "\n"), block });
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}",
+            .{ std.mem.trim(u8, existing, "\n"), block },
+        );
     defer allocator.free(merged);
 
     try output.writeFileAtomic(allocator, memory_path, merged);
@@ -175,13 +254,22 @@ fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
     const z = days_since_unix_epoch + 719_468;
     const era = @divFloor(z, 146_097);
     const doe = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const yoe = @divFloor(
+        doe - @divFloor(doe, 1_460) +
+            @divFloor(doe, 36_524) -
+            @divFloor(doe, 146_096),
+        365,
+    );
     const y = yoe + era * 400;
     const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
     const mp = @divFloor(5 * doy + 2, 153);
     const d = doy - @divFloor(153 * mp + 2, 5) + 1;
     const m = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
-    return .{ .year = y + (if (m <= 2) @as(i64, 1) else @as(i64, 0)), .month = @intCast(m), .day = @intCast(d) };
+    return .{
+        .year = y + (if (m <= 2) @as(i64, 1) else @as(i64, 0)),
+        .month = @intCast(m),
+        .day = @intCast(d),
+    };
 }
 
 fn parseHmsFromMs(ms: i64) struct { hour: u8, minute: u8, second: u8, days: i64 } {
@@ -192,13 +280,22 @@ fn parseHmsFromMs(ms: i64) struct { hour: u8, minute: u8, second: u8, days: i64 
     const rem = sec_of_day - hour * 3600;
     const minute = @divFloor(rem, 60);
     const second = rem - minute * 60;
-    return .{ .hour = @intCast(hour), .minute = @intCast(minute), .second = @intCast(second), .days = days };
+    return .{
+        .hour = @intCast(hour),
+        .minute = @intCast(minute),
+        .second = @intCast(second),
+        .days = days,
+    };
 }
 
 fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second });
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000",
+        .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second },
+    );
 }
 
 fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {

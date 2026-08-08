@@ -62,7 +62,13 @@ pub const RRule = struct {
     byday: std.ArrayList(Day),
 
     pub fn init(_: std.mem.Allocator) RRule {
-        return .{ .freq = .DAILY, .interval = 1, .byhour = null, .byminute = null, .byday = std.ArrayList(Day).empty };
+        return .{
+            .freq = .DAILY,
+            .interval = 1,
+            .byhour = null,
+            .byminute = null,
+            .byday = std.ArrayList(Day).empty,
+        };
     }
 
     pub fn deinit(self: *RRule, allocator: std.mem.Allocator) void {
@@ -96,8 +102,10 @@ pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
         if (part.len == 0) continue;
 
         var kv = std.mem.splitScalar(u8, part, '=');
-        const key_raw = kv.next() orelse return userErrorFmt("rrule token missing key: {s}", .{part});
-        const value_raw = kv.next() orelse return userErrorFmt("rrule token missing value: {s}", .{part});
+        const key_raw = kv.next() orelse
+            return userErrorFmt("rrule token missing key: {s}", .{part});
+        const value_raw = kv.next() orelse
+            return userErrorFmt("rrule token missing value: {s}", .{part});
         if (kv.next() != null) return userErrorFmt("rrule token has multiple '=': {s}", .{part});
 
         const key = std.mem.trim(u8, key_raw, " \t\r\n");
@@ -114,16 +122,12 @@ pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYHOUR")) {
-            const parsed = std.fmt.parseInt(i64, value, 10) catch return userErrorFmt("BYHOUR must be an integer 0..23", .{});
-            if (parsed < 0 or parsed > 23) return userErrorFmt("BYHOUR must be in 0..23", .{});
-            out.byhour = @intCast(parsed);
+            out.byhour = try parseBoundedU8(value, "BYHOUR", 23);
             have_byhour = true;
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYMINUTE")) {
-            const parsed = std.fmt.parseInt(i64, value, 10) catch return userErrorFmt("BYMINUTE must be an integer 0..59", .{});
-            if (parsed < 0 or parsed > 59) return userErrorFmt("BYMINUTE must be in 0..59", .{});
-            out.byminute = @intCast(parsed);
+            out.byminute = try parseBoundedU8(value, "BYMINUTE", 59);
             have_byminute = true;
             continue;
         }
@@ -141,19 +145,35 @@ pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
     }
 
     if (!have_freq) return userErrorFmt("rrule must include FREQ=...", .{});
-    switch (out.freq) {
+    try validateRruleShape(out, have_byminute, have_byhour, have_byday);
+    return out;
+}
+
+fn validateRruleShape(
+    rule: RRule,
+    have_byminute: bool,
+    have_byhour: bool,
+    have_byday: bool,
+) !void {
+    switch (rule.freq) {
         .HOURLY => {
             if (!have_byminute) return userErrorFmt("HOURLY rrules must include BYMINUTE", .{});
             if (have_byhour) return userErrorFmt("HOURLY rrules must not include BYHOUR", .{});
             if (have_byday) return userErrorFmt("HOURLY rrules must not include BYDAY", .{});
         },
         .DAILY => {
-            if (!have_byhour or !have_byminute) return userErrorFmt("DAILY rrules must include BYHOUR and BYMINUTE", .{});
+            if (!have_byhour or !have_byminute) {
+                return userErrorFmt("DAILY rrules must include BYHOUR and BYMINUTE", .{});
+            }
             if (have_byday) return userErrorFmt("DAILY rrules must not include BYDAY", .{});
         },
-        .WEEKLY => if (!have_byday or !have_byhour or !have_byminute) return userErrorFmt("WEEKLY rrules must include BYDAY, BYHOUR, and BYMINUTE", .{}),
+        .WEEKLY => if (!have_byday or !have_byhour or !have_byminute) {
+            return userErrorFmt(
+                "WEEKLY rrules must include BYDAY, BYHOUR, and BYMINUTE",
+                .{},
+            );
+        },
     }
-    return out;
 }
 
 pub fn renderCanonicalRrule(allocator: std.mem.Allocator, rule: RRule) ![]u8 {
@@ -181,16 +201,26 @@ pub fn containsDay(items: []const Day, needle: Day) bool {
 }
 
 fn parsePositiveUsize(raw: []const u8, field: []const u8) !usize {
-    const parsed = std.fmt.parseInt(usize, raw, 10) catch return userErrorFmt("{s} must be a positive integer", .{field});
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch
+        return userErrorFmt("{s} must be a positive integer", .{field});
     if (parsed == 0) return userErrorFmt("{s} must be a positive integer", .{field});
     return parsed;
+}
+
+fn parseBoundedU8(raw: []const u8, field: []const u8, max: u8) !u8 {
+    const parsed = std.fmt.parseInt(i64, raw, 10) catch
+        return userErrorFmt("{s} must be an integer 0..{d}", .{ field, max });
+    if (parsed < 0 or parsed > max) {
+        return userErrorFmt("{s} must be in 0..{d}", .{ field, max });
+    }
+    return @intCast(parsed);
 }
 
 fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
     var stderr_file = std.Io.File.stderr();
     var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
-    _ = stderr.print("error: " ++ fmt ++ "\n", args) catch {};
+    stderr.print("error: " ++ fmt ++ "\n", args) catch return error.UserInput;
     return error.UserInput;
 }
 
@@ -209,7 +239,12 @@ pub fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
     const z = days_since_unix_epoch + 719_468;
     const era = @divFloor(z, 146_097);
     const doe = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const yoe = @divFloor(
+        doe - @divFloor(doe, 1_460) +
+            @divFloor(doe, 36_524) -
+            @divFloor(doe, 146_096),
+        365,
+    );
     const y = yoe + era * 400;
     const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
     const mp = @divFloor(5 * doy + 2, 153);
@@ -235,13 +270,22 @@ pub fn parseHmsFromMs(ms: i64) struct { hour: u8, minute: u8, second: u8, days: 
     const rem = sec_of_day - hour * 3600;
     const minute = @divFloor(rem, 60);
     const second = rem - minute * 60;
-    return .{ .hour = @intCast(hour), .minute = @intCast(minute), .second = @intCast(second), .days = days };
+    return .{
+        .hour = @intCast(hour),
+        .minute = @intCast(minute),
+        .second = @intCast(second),
+        .days = days,
+    };
 }
 
 pub fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second });
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000",
+        .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second },
+    );
 }
 
 pub fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {

@@ -26,12 +26,18 @@ pub const InitializeCapabilityBuilder = struct {
     const max_method_bytes: usize = 1024;
 
     pub fn validate(self: InitializeCapabilityBuilder, allocator: std.mem.Allocator) !void {
-        if (self.opt_out_notification_methods.len > max_notification_methods) return error.InitializeCapabilitiesTooLarge;
+        if (self.opt_out_notification_methods.len > max_notification_methods) {
+            return error.InitializeCapabilitiesTooLarge;
+        }
         for (self.opt_out_notification_methods) |method| {
-            if (method.len == 0 or method.len > max_method_bytes) return error.InvalidInitializeCapabilities;
+            if (method.len == 0 or method.len > max_method_bytes) {
+                return error.InvalidInitializeCapabilities;
+            }
         }
         const raw = self.additional_json orelse return;
-        if (raw.len > max_initialize_capabilities_bytes) return error.InitializeCapabilitiesTooLarge;
+        if (raw.len > max_initialize_capabilities_bytes) {
+            return error.InitializeCapabilitiesTooLarge;
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
             return error.InvalidInitializeCapabilities;
         defer parsed.deinit();
@@ -73,7 +79,9 @@ pub const InitializeCapabilityBuilder = struct {
             }
         }
         try writer.writeByte('}');
-        if (output.written().len > max_initialize_capabilities_bytes) return error.InitializeCapabilitiesTooLarge;
+        if (output.written().len > max_initialize_capabilities_bytes) {
+            return error.InitializeCapabilitiesTooLarge;
+        }
         return output.toOwnedSlice();
     }
 
@@ -111,16 +119,56 @@ pub const ServerRequestHandlerDescriptor = struct {
 };
 
 pub const server_request_handler_descriptors = [_]ServerRequestHandlerDescriptor{
-    .{ .method = "item/commandExecution/requestApproval", .policy = "configured-approval-or-decline", .kind = .command_execution_approval },
-    .{ .method = "item/fileChange/requestApproval", .policy = "configured-approval-or-decline", .kind = .file_change_approval },
-    .{ .method = "item/tool/requestUserInput", .policy = "exact-response-or-decline", .kind = .request_user_input },
-    .{ .method = "mcpServer/elicitation/request", .policy = "mode-aware-exact-response-or-decline", .kind = .mcp_elicitation },
-    .{ .method = "item/permissions/requestApproval", .policy = "configured-approval-or-decline", .kind = .permissions_approval },
-    .{ .method = "item/tool/call", .policy = "configured-tool-handler-or-error", .kind = .dynamic_tool_call },
-    .{ .method = "account/chatgptAuthTokens/refresh", .policy = "exact-secret-provider-or-typed-error", .kind = .auth_tokens_refresh },
-    .{ .method = "attestation/generate", .policy = "exact-attestation-provider-or-typed-error", .kind = .attestation_generate },
-    .{ .method = "applyPatchApproval", .policy = "deprecated-reject", .kind = .apply_patch_approval },
-    .{ .method = "execCommandApproval", .policy = "deprecated-reject", .kind = .exec_command_approval },
+    .{
+        .method = "item/commandExecution/requestApproval",
+        .policy = "configured-approval-or-decline",
+        .kind = .command_execution_approval,
+    },
+    .{
+        .method = "item/fileChange/requestApproval",
+        .policy = "configured-approval-or-decline",
+        .kind = .file_change_approval,
+    },
+    .{
+        .method = "item/tool/requestUserInput",
+        .policy = "exact-response-or-decline",
+        .kind = .request_user_input,
+    },
+    .{
+        .method = "mcpServer/elicitation/request",
+        .policy = "mode-aware-exact-response-or-decline",
+        .kind = .mcp_elicitation,
+    },
+    .{
+        .method = "item/permissions/requestApproval",
+        .policy = "configured-approval-or-decline",
+        .kind = .permissions_approval,
+    },
+    .{
+        .method = "item/tool/call",
+        .policy = "configured-tool-handler-or-error",
+        .kind = .dynamic_tool_call,
+    },
+    .{
+        .method = "account/chatgptAuthTokens/refresh",
+        .policy = "exact-secret-provider-or-typed-error",
+        .kind = .auth_tokens_refresh,
+    },
+    .{
+        .method = "attestation/generate",
+        .policy = "exact-attestation-provider-or-typed-error",
+        .kind = .attestation_generate,
+    },
+    .{
+        .method = "applyPatchApproval",
+        .policy = "deprecated-reject",
+        .kind = .apply_patch_approval,
+    },
+    .{
+        .method = "execCommandApproval",
+        .policy = "deprecated-reject",
+        .kind = .exec_command_approval,
+    },
     .{ .method = "currentTime/read", .policy = "exact-unix-seconds", .kind = .current_time_read },
 };
 
@@ -157,10 +205,16 @@ pub const OverloadRetryTelemetry = struct {
 
 pub fn validateOverloadRetryPolicy(policy: OverloadRetryPolicy) !void {
     if (policy.max_retries > max_overload_retries) return error.InvalidOverloadRetryPolicy;
-    if (policy.base_delay_ms == 0 or policy.base_delay_ms > max_overload_delay_ms) return error.InvalidOverloadRetryPolicy;
-    if (policy.max_delay_ms == 0 or policy.max_delay_ms > max_overload_delay_ms) return error.InvalidOverloadRetryPolicy;
+    if (policy.base_delay_ms == 0 or policy.base_delay_ms > max_overload_delay_ms) {
+        return error.InvalidOverloadRetryPolicy;
+    }
+    if (policy.max_delay_ms == 0 or policy.max_delay_ms > max_overload_delay_ms) {
+        return error.InvalidOverloadRetryPolicy;
+    }
     if (policy.base_delay_ms > policy.max_delay_ms) return error.InvalidOverloadRetryPolicy;
-    if (policy.jitter_percent > max_overload_jitter_percent) return error.InvalidOverloadRetryPolicy;
+    if (policy.jitter_percent > max_overload_jitter_percent) {
+        return error.InvalidOverloadRetryPolicy;
+    }
 }
 
 fn resolveOverloadRetrySeed(explicit: ?u64, io: std.Io) !u64 {
@@ -332,10 +386,20 @@ pub const Client = struct {
         const overload_retry_seed = try resolveOverloadRetrySeed(opts.overload_retry_seed, opts.io);
         if (opts.transport) |transport| switch (transport) {
             .stdio => return startStdio(allocator, opts, overload_retry_seed),
-            .explicit_websocket => |url| return startWebsocket(allocator, opts, overload_retry_seed, url, .websocket),
+            .explicit_websocket => |url| return startWebsocket(
+                allocator,
+                opts,
+                overload_retry_seed,
+                url,
+                .websocket,
+            ),
             .unix_socket => |maybe_path| {
                 if (maybe_path) |path| {
-                    const resolved = try app_server_launch.resolveUnixPathAlloc(allocator, opts.cwd, path);
+                    const resolved = try app_server_launch.resolveUnixPathAlloc(
+                        allocator,
+                        opts.cwd,
+                        path,
+                    );
                     defer allocator.free(resolved);
                     return startUnix(allocator, opts, overload_retry_seed, resolved);
                 }
@@ -352,17 +416,33 @@ pub const Client = struct {
         return startStdio(allocator, opts, overload_retry_seed);
     }
 
-    fn startStdio(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64) !Client {
+    fn startStdio(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        overload_retry_seed: u64,
+    ) !Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
         const resolved_codex_path = try resolveExecutableAlloc(allocator, opts.codex_path);
         defer allocator.free(resolved_codex_path);
-        try hooks.ensureLaunchSupportsPolicy(allocator, opts.io, resolved_codex_path, opts.cwd, opts.hook_policy);
+        try hooks.ensureLaunchSupportsPolicy(
+            allocator,
+            opts.io,
+            resolved_codex_path,
+            opts.cwd,
+            opts.hook_policy,
+        );
 
         try argv.append(allocator, resolved_codex_path);
         try appendCodexEnableFeatureArgs(allocator, &argv, opts.codex_enable_features);
-        try app_server_launch.appendAppServerArgs(allocator, &argv, opts.hook_policy == .off, null, opts.code_mode_host);
+        try app_server_launch.appendAppServerArgs(
+            allocator,
+            &argv,
+            opts.hook_policy == .off,
+            null,
+            opts.code_mode_host,
+        );
 
         const io = opts.io;
         const child = try std.process.spawn(io, .{
@@ -414,18 +494,58 @@ pub const Client = struct {
         return client;
     }
 
-    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, url: []const u8, kind: TransportKind) !Client {
-        const websocket = try websocket_transport.Connection.connect(allocator, url, opts.websocket_connect_timeout_ms);
+    fn startWebsocket(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        overload_retry_seed: u64,
+        url: []const u8,
+        kind: TransportKind,
+    ) !Client {
+        const websocket = try websocket_transport.Connection.connect(
+            allocator,
+            url,
+            opts.websocket_connect_timeout_ms,
+        );
 
-        return startSocketConnection(allocator, opts, overload_retry_seed, websocket, kind, "websocket");
+        return startSocketConnection(
+            allocator,
+            opts,
+            overload_retry_seed,
+            websocket,
+            kind,
+            "websocket",
+        );
     }
 
-    fn startUnix(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, path: []const u8) !Client {
-        const websocket = try websocket_transport.Connection.connectUnix(allocator, path, opts.websocket_connect_timeout_ms);
-        return startSocketConnection(allocator, opts, overload_retry_seed, websocket, .unix_socket, "unix_socket");
+    fn startUnix(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        overload_retry_seed: u64,
+        path: []const u8,
+    ) !Client {
+        const websocket = try websocket_transport.Connection.connectUnix(
+            allocator,
+            path,
+            opts.websocket_connect_timeout_ms,
+        );
+        return startSocketConnection(
+            allocator,
+            opts,
+            overload_retry_seed,
+            websocket,
+            .unix_socket,
+            "unix_socket",
+        );
     }
 
-    fn startSocketConnection(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, websocket: websocket_transport.Connection, kind: TransportKind, identity: []const u8) !Client {
+    fn startSocketConnection(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        overload_retry_seed: u64,
+        websocket: websocket_transport.Connection,
+        kind: TransportKind,
+        identity: []const u8,
+    ) !Client {
         var client = Client{
             .allocator = allocator,
             .io = opts.io,
@@ -557,20 +677,28 @@ pub const Client = struct {
     ) ![]u8 {
         try validateOverloadRetryPolicy(self.overload_retry_policy);
         const previous_deadline_ms = self.request_deadline_ms;
-        if (previous_deadline_ms == null) self.request_deadline_ms = monotonicMillis() + default_request_timeout_ms;
+        if (previous_deadline_ms == null) {
+            self.request_deadline_ms = monotonicMillis() + default_request_timeout_ms;
+        }
         defer self.request_deadline_ms = previous_deadline_ms;
         self.request_send_started = false;
         if (self.overload_retry_telemetry) |telemetry| telemetry.reset();
         var captured_notification_bytes: usize = 0;
         if (notification_lines) |lines| {
-            if (lines.items.len > max_captured_notifications) return error.AppServerNotificationLimitExceeded;
+            if (lines.items.len > max_captured_notifications) {
+                return error.AppServerNotificationLimitExceeded;
+            }
             for (lines.items) |line| {
-                captured_notification_bytes = try addCapturedNotificationBytes(captured_notification_bytes, line.len);
+                captured_notification_bytes = try addCapturedNotificationBytes(
+                    captured_notification_bytes,
+                    line.len,
+                );
             }
         }
         var interleaved: usize = 0;
         var retry_index: u32 = 0;
-        while (true) {
+        // The retry policy and request deadline bound this request-attempt loop.
+        while (true) { // tiger: event-loop
             if (monotonicMillis() >= self.request_deadline_ms.?) return error.ConnectionTimedOut;
             const request_id = self.next_request_id;
             self.next_request_id += 1;
@@ -596,7 +724,9 @@ pub const Client = struct {
                 .rpc_error => |rpc_error| {
                     self.setLastErrorOwned(rpc_error.json);
                     if (!rpc_error.retryable_overload) return error.RequestFailed;
-                    if (self.overload_retry_telemetry) |telemetry| telemetry.overload_responses += 1;
+                    if (self.overload_retry_telemetry) |telemetry| {
+                        telemetry.overload_responses += 1;
+                    }
                     if (retry_index >= self.overload_retry_policy.max_retries) {
                         if (self.overload_retry_telemetry) |telemetry| telemetry.exhausted = true;
                         return error.RequestFailed;
@@ -612,7 +742,9 @@ pub const Client = struct {
                         telemetry.retries += 1;
                     }
                     const remaining_ms = self.request_deadline_ms.? - monotonicMillis();
-                    if (remaining_ms <= 0 or delay_ms > remaining_ms) return error.ConnectionTimedOut;
+                    if (remaining_ms <= 0 or delay_ms > remaining_ms) {
+                        return error.ConnectionTimedOut;
+                    }
                     try std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake);
                     retry_index += 1;
                 },
@@ -635,9 +767,12 @@ pub const Client = struct {
         captured_notification_bytes: *usize,
         interleaved: *usize,
     ) !RequestAttemptResponse {
-        while (true) {
+        // The explicit interleaving cap below bounds this response-routing loop.
+        while (true) { // tiger: event-loop
             interleaved.* += 1;
-            if (interleaved.* > max_interleaved_messages) return error.AppServerInterleavingLimitExceeded;
+            if (interleaved.* > max_interleaved_messages) {
+                return error.AppServerInterleavingLimitExceeded;
+            }
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -652,8 +787,13 @@ pub const Client = struct {
 
             if (notification_lines) |lines| {
                 if (isNotificationMessage(msg_obj)) {
-                    if (lines.items.len >= max_captured_notifications) return error.AppServerNotificationLimitExceeded;
-                    const updated_bytes = try addCapturedNotificationBytes(captured_notification_bytes.*, line.len);
+                    if (lines.items.len >= max_captured_notifications) {
+                        return error.AppServerNotificationLimitExceeded;
+                    }
+                    const updated_bytes = try addCapturedNotificationBytes(
+                        captured_notification_bytes.*,
+                        line.len,
+                    );
                     try lines.append(self.allocator, try self.allocator.dupe(u8, line));
                     captured_notification_bytes.* = updated_bytes;
                 }
@@ -763,7 +903,9 @@ pub const Client = struct {
         send_observer: ?RequestSendObserver,
     ) !void {
         if (params_json) |raw| {
-            if (raw.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
+            if (raw.len > websocket_transport.max_message_bytes) {
+                return error.AppServerMessageTooLarge;
+            }
             var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
             defer parsed_params.deinit();
 
@@ -807,12 +949,15 @@ pub const Client = struct {
         payload: []const u8,
         send_observer: ?RequestSendObserver,
     ) !void {
-        if (payload.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
+        if (payload.len > websocket_transport.max_message_bytes) {
+            return error.AppServerMessageTooLarge;
+        }
         switch (self.transport_kind) {
             .stdio => {
                 if (send_observer) |observer| try observer.before_send(observer.context);
                 self.request_send_started = true;
-                const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
+                const deadline_ms = self.request_deadline_ms orelse
+                    monotonicMillis() + default_request_timeout_ms;
                 writeFileAllUntil(self.stdin_file.?, payload, deadline_ms) catch |err| {
                     self.close();
                     return err;
@@ -905,7 +1050,8 @@ pub const Client = struct {
         defer self.allocator.free(payload);
         switch (self.transport_kind) {
             .stdio => {
-                const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
+                const deadline_ms = self.request_deadline_ms orelse
+                    monotonicMillis() + default_request_timeout_ms;
                 try writeFileAllUntil(self.stdin_file.?, payload, deadline_ms);
                 try writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms);
             },
@@ -913,13 +1059,21 @@ pub const Client = struct {
         }
     }
 
-    fn serverReplyPayloadAlloc(allocator: std.mem.Allocator, id: JsonRpcId, reply: ServerReply) ![]u8 {
+    fn serverReplyPayloadAlloc(
+        allocator: std.mem.Allocator,
+        id: JsonRpcId,
+        reply: ServerReply,
+    ) ![]u8 {
         var payload_writer: std.Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
 
         try payload_writer.writer.writeAll("{\"id\":");
         switch (id) {
-            .integer => |integer| try std.json.Stringify.value(integer, .{}, &payload_writer.writer),
+            .integer => |integer| try std.json.Stringify.value(
+                integer,
+                .{},
+                &payload_writer.writer,
+            ),
             .string => |string| try std.json.Stringify.value(string, .{}, &payload_writer.writer),
         }
         switch (reply) {
@@ -941,7 +1095,8 @@ pub const Client = struct {
         payload: []const u8,
         send_observer: ?RequestSendObserver,
     ) !void {
-        const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
+        const deadline_ms = self.request_deadline_ms orelse
+            monotonicMillis() + default_request_timeout_ms;
         var remaining_ms = deadline_ms - monotonicMillis();
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
         if (send_observer) |observer| {
@@ -980,7 +1135,12 @@ pub const Client = struct {
     ) !ServerReply {
         return switch (method) {
             .command_execution_approval => try self.prepareCommandApproval(msg_obj),
-            .file_change_approval => .{ .result_json = try approvalResultAlloc(self.allocator, self.resolveFileDecision()) },
+            .file_change_approval => .{
+                .result_json = try approvalResultAlloc(
+                    self.allocator,
+                    self.resolveFileDecision(),
+                ),
+            },
             .permissions_approval => .{ .result_json = try self.preparePermissionsResult(msg_obj) },
             .request_user_input => .{ .result_json = try self.prepareUserInputResult() },
             .mcp_elicitation => .{ .result_json = try self.prepareMcpElicitationResult(msg_obj) },
@@ -1008,12 +1168,16 @@ pub const Client = struct {
             .current_time_read => .{ .result_json = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"currentTimeAt\":{d}}}",
-                .{@as(i64, @intCast(@divFloor(std.Io.Clock.real.now(self.io).nanoseconds, 1_000_000_000)))},
+                .{@as(i64, @intCast(@divFloor(
+                    std.Io.Clock.real.now(self.io).nanoseconds,
+                    1_000_000_000,
+                )))},
             ) },
             .apply_patch_approval, .exec_command_approval => .{
                 .result_json = try self.allocator.dupe(
                     u8,
-                    "{\"decision\":{\"denied\":{\"rejection\":\"deprecated approval request is unsupported\"}}}",
+                    "{\"decision\":{\"denied\":{\"rejection\":" ++
+                        "\"deprecated approval request is unsupported\"}}}",
                 ),
             },
             .unknown => .{ .server_error = .{
@@ -1093,8 +1257,14 @@ pub const Client = struct {
                 "{{\"action\":\"accept\",\"content\":{s},\"_meta\":null}}",
                 .{content_json},
             ),
-            .decline => self.allocator.dupe(u8, "{\"action\":\"decline\",\"content\":null,\"_meta\":null}"),
-            .cancel => self.allocator.dupe(u8, "{\"action\":\"cancel\",\"content\":null,\"_meta\":null}"),
+            .decline => self.allocator.dupe(
+                u8,
+                "{\"action\":\"decline\",\"content\":null,\"_meta\":null}",
+            ),
+            .cancel => self.allocator.dupe(
+                u8,
+                "{\"action\":\"cancel\",\"content\":null,\"_meta\":null}",
+            ),
         };
     }
 
@@ -1198,10 +1368,14 @@ pub fn validateClientOptions(allocator: std.mem.Allocator, opts: ClientOptions) 
 }
 
 fn validateCodexEnableFeatures(opts: ClientOptions) !void {
-    if (opts.codex_enable_features.len > max_codex_enable_features) return error.TooManyCodexEnableFeatures;
+    if (opts.codex_enable_features.len > max_codex_enable_features) {
+        return error.TooManyCodexEnableFeatures;
+    }
     if (opts.codex_enable_features.len != 0) {
         if (opts.websocket_url != null) return error.CodexEnableFeaturesRequireStdio;
-        if (opts.transport) |transport| if (transport != .stdio) return error.CodexEnableFeaturesRequireStdio;
+        if (opts.transport) |transport| {
+            if (transport != .stdio) return error.CodexEnableFeaturesRequireStdio;
+        }
     }
     for (opts.codex_enable_features) |feature| {
         if (feature.len == 0 or feature.len > 128) return error.InvalidCodexEnableFeature;
@@ -1265,7 +1439,8 @@ fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !vo
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
 
-    const original_flags: usize = while (true) {
+    // The kernel terminates this EINTR retry with a non-INTR result.
+    const original_flags: usize = while (true) { // tiger: event-loop
         const rc = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(usize, 0));
         switch (std.posix.errno(rc)) {
             .SUCCESS => break @intCast(rc),
@@ -1273,9 +1448,16 @@ fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !vo
             else => return error.AppServerWriteFailed,
         }
     };
-    const nonblocking_flags = original_flags | @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
-    while (true) {
-        switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.SETFL, nonblocking_flags))) {
+    const nonblocking_flags = original_flags |
+        @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    // The kernel terminates this EINTR retry with a non-INTR result.
+    while (true) { // tiger: event-loop
+        const rc = std.posix.system.fcntl(
+            file.handle,
+            std.posix.F.SETFL,
+            nonblocking_flags,
+        );
+        switch (std.posix.errno(rc)) {
             .SUCCESS => break,
             .INTR => continue,
             else => return error.AppServerWriteFailed,
@@ -1301,7 +1483,9 @@ fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !vo
 }
 
 fn validateTransportOptions(opts: ClientOptions) !void {
-    if (opts.transport != null and opts.websocket_url != null) return error.ConflictingTransportOptions;
+    if (opts.transport != null and opts.websocket_url != null) {
+        return error.ConflictingTransportOptions;
+    }
     if (opts.code_mode_host == null) return;
     if (opts.websocket_url != null) return error.CodeModeHostRequiresManagedLaunch;
     if (opts.transport) |transport| switch (transport) {
@@ -1342,7 +1526,9 @@ fn initializePayloadAlloc(
     try writer.writeAll("},\"capabilities\":");
     try writer.writeAll(capabilities_json);
     try writer.writeAll("}}");
-    if (output.written().len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
+    if (output.written().len > websocket_transport.max_message_bytes) {
+        return error.AppServerMessageTooLarge;
+    }
     return output.toOwnedSlice();
 }
 
@@ -1361,7 +1547,10 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
         return error.ConflictingElicitationResponsePolicies;
     }
     try validateChoice(opts.exec_approval, &.{ "accept", "acceptForSession", "decline", "cancel" });
-    try validateChoice(opts.file_approval, &.{ "auto", "accept", "acceptForSession", "decline", "cancel" });
+    try validateChoice(
+        opts.file_approval,
+        &.{ "auto", "accept", "acceptForSession", "decline", "cancel" },
+    );
     try validateChoice(opts.permissions_approval, &.{ "grant-turn", "grant-session", "deny" });
     try validateChoice(opts.elicitation_action, &.{ "accept", "decline", "cancel" });
 
@@ -1383,12 +1572,15 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
                 .object => |value| value,
                 else => return error.InvalidRequestUserInputResponse,
             };
-            const answer_values = answer_object.get("answers") orelse return error.InvalidRequestUserInputResponse;
+            const answer_values = answer_object.get("answers") orelse
+                return error.InvalidRequestUserInputResponse;
             const answer_array = switch (answer_values) {
                 .array => |value| value.items,
                 else => return error.InvalidRequestUserInputResponse,
             };
-            for (answer_array) |answer| if (answer != .string) return error.InvalidRequestUserInputResponse;
+            for (answer_array) |answer| {
+                if (answer != .string) return error.InvalidRequestUserInputResponse;
+            }
         }
     }
     if (opts.elicitation_content_json) |raw| {
@@ -1408,14 +1600,19 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
             .object => |value| value,
             else => return error.InvalidElicitationResponse,
         };
-        const action = core_json.stringField(object, "action") orelse return error.InvalidElicitationResponse;
+        const action = core_json.stringField(object, "action") orelse
+            return error.InvalidElicitationResponse;
         const accepts = std.mem.eql(u8, action, "accept");
         const declines = std.mem.eql(u8, action, "decline");
         const cancels = std.mem.eql(u8, action, "cancel");
         if (!accepts and !declines and !cancels) return error.InvalidElicitationResponse;
         const content = object.get("content");
-        if (accepts and (content == null or content.? == .null)) return error.InvalidElicitationResponse;
-        if (!accepts and content != null and content.? != .null) return error.InvalidElicitationResponse;
+        if (accepts and (content == null or content.? == .null)) {
+            return error.InvalidElicitationResponse;
+        }
+        if (!accepts and content != null and content.? != .null) {
+            return error.InvalidElicitationResponse;
+        }
         // `_meta` is intentionally unconstrained by the 0.146 schema and is
         // preserved byte-for-byte by the full response carrier.
     }
@@ -1426,7 +1623,8 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
             .object => |value| value,
             else => return error.InvalidDynamicToolResponse,
         };
-        const content_items = object.get("contentItems") orelse return error.InvalidDynamicToolResponse;
+        const content_items = object.get("contentItems") orelse
+            return error.InvalidDynamicToolResponse;
         const success = object.get("success") orelse return error.InvalidDynamicToolResponse;
         const items = switch (content_items) {
             .array => |value| value.items,
@@ -1438,7 +1636,8 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
                 .object => |value| value,
                 else => return error.InvalidDynamicToolResponse,
             };
-            const item_type = core_json.stringField(item_object, "type") orelse return error.InvalidDynamicToolResponse;
+            const item_type = core_json.stringField(item_object, "type") orelse
+                return error.InvalidDynamicToolResponse;
             const required_field = if (std.mem.eql(u8, item_type, "inputText"))
                 "text"
             else if (std.mem.eql(u8, item_type, "inputImage"))
@@ -1447,7 +1646,8 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
                 "audioUrl"
             else
                 return error.InvalidDynamicToolResponse;
-            const required_value = item_object.get(required_field) orelse return error.InvalidDynamicToolResponse;
+            const required_value = item_object.get(required_field) orelse
+                return error.InvalidDynamicToolResponse;
             if (required_value != .string) return error.InvalidDynamicToolResponse;
         }
     }
@@ -1458,8 +1658,10 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
             .object => |value| value,
             else => return error.InvalidAuthRefreshResponse,
         };
-        const access_token = core_json.stringField(object, "accessToken") orelse return error.InvalidAuthRefreshResponse;
-        const account_id = core_json.stringField(object, "chatgptAccountId") orelse return error.InvalidAuthRefreshResponse;
+        const access_token = core_json.stringField(object, "accessToken") orelse
+            return error.InvalidAuthRefreshResponse;
+        const account_id = core_json.stringField(object, "chatgptAccountId") orelse
+            return error.InvalidAuthRefreshResponse;
         if (access_token.len == 0 or account_id.len == 0) return error.InvalidAuthRefreshResponse;
         if (object.get("chatgptPlanType")) |plan| switch (plan) {
             .null, .string => {},
@@ -1473,7 +1675,8 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
             .object => |value| value,
             else => return error.InvalidAttestationResponse,
         };
-        const token = core_json.stringField(object, "token") orelse return error.InvalidAttestationResponse;
+        const token = core_json.stringField(object, "token") orelse
+            return error.InvalidAttestationResponse;
         if (token.len == 0) return error.InvalidAttestationResponse;
     }
 }
@@ -1486,7 +1689,10 @@ fn validateChoice(value: ?[]const u8, allowed: []const []const u8) !void {
     return error.InvalidServerRequestPolicy;
 }
 
-fn parseExactCarrier(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(std.json.Value) {
+fn parseExactCarrier(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !std.json.Parsed(std.json.Value) {
     if (raw.len > Client.max_exact_response_bytes) return error.ServerRequestCarrierTooLarge;
     return std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
         return error.InvalidServerRequestCarrierJson;
@@ -1580,11 +1786,19 @@ fn serverRequestTestClient() Client {
 test "server reply payload preserves integer and string request ids" {
     const result = Client.ServerReply{ .result_json = try std.testing.allocator.dupe(u8, "{}") };
     defer std.testing.allocator.free(result.result_json);
-    const integer_payload = try Client.serverReplyPayloadAlloc(std.testing.allocator, .{ .integer = 42 }, result);
+    const integer_payload = try Client.serverReplyPayloadAlloc(
+        std.testing.allocator,
+        .{ .integer = 42 },
+        result,
+    );
     defer std.testing.allocator.free(integer_payload);
     try std.testing.expectEqualStrings("{\"id\":42,\"result\":{}}", integer_payload);
 
-    const string_payload = try Client.serverReplyPayloadAlloc(std.testing.allocator, .{ .string = "req-7" }, result);
+    const string_payload = try Client.serverReplyPayloadAlloc(
+        std.testing.allocator,
+        .{ .string = "req-7" },
+        result,
+    );
     defer std.testing.allocator.free(string_payload);
     try std.testing.expectEqualStrings("{\"id\":\"req-7\",\"result\":{}}", string_payload);
 }
@@ -1619,7 +1833,11 @@ test "all codex 0.146 server request methods and unknown have one typed reply" {
         defer parsed.deinit();
         var reply = try client.prepareServerReply(case[1], parsed.value.object);
         defer reply.deinit(std.testing.allocator);
-        const payload = try Client.serverReplyPayloadAlloc(std.testing.allocator, .{ .integer = 1 }, reply);
+        const payload = try Client.serverReplyPayloadAlloc(
+            std.testing.allocator,
+            .{ .integer = 1 },
+            reply,
+        );
         defer std.testing.allocator.free(payload);
         try std.testing.expect(std.mem.startsWith(u8, payload, "{\"id\":1,"));
         try std.testing.expect(std.mem.endsWith(u8, payload, "}"));
@@ -1632,7 +1850,8 @@ test "server request defaults never invent approval or user input" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"params\":{\"availableDecisions\":[\"acceptForSession\",{\"acceptWithExecpolicyAmendment\":{\"profile\":\"unsafe\"}}],\"questions\":[{\"id\":\"q\",\"options\":[{\"label\":\"invented\"}]}]}}",
+        \\{"params":{"availableDecisions":["acceptForSession",{"acceptWithExecpolicyAmendment":{"profile":"unsafe"}}],"questions":[{"id":"q","options":[{"label":"invented"}]}]}}
+    ,
         .{},
     );
     defer parsed.deinit();
@@ -1652,20 +1871,35 @@ test "mcp elicitation is mode aware and url never accepts" {
     client.elicitation_action = "accept";
     client.elicitation_content_json = "{\"answer\":\"exact\"}";
 
-    var form = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"openai/form\"}}", .{});
+    var form = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"openai/form\"}}",
+        .{},
+    );
     defer form.deinit();
     const form_result = try client.prepareMcpElicitationResult(form.value.object);
     defer std.testing.allocator.free(form_result);
     try std.testing.expect(std.mem.indexOf(u8, form_result, "\"action\":\"accept\"") != null);
 
-    var url = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"url\",\"url\":\"https://secret.example/token\"}}", .{});
+    var url = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"url\",\"url\":\"https://secret.example/token\"}}",
+        .{},
+    );
     defer url.deinit();
     const url_result = try client.prepareMcpElicitationResult(url.value.object);
     defer std.testing.allocator.free(url_result);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "\"action\":\"decline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "secret.example") == null);
 
-    var future = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"future/mode\"}}", .{});
+    var future = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"future/mode\"}}",
+        .{},
+    );
     defer future.deinit();
     const future_result = try client.prepareMcpElicitationResult(future.value.object);
     defer std.testing.allocator.free(future_result);
@@ -1676,12 +1910,21 @@ test "mcp elicitation is mode aware and url never accepts" {
 test "auth and attestation failures do not echo secret request data" {
     var client = serverRequestTestClient();
     defer client.line_buf.deinit(std.testing.allocator);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"token\":\"SECRET_SENTINEL\"}}", .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"token\":\"SECRET_SENTINEL\"}}",
+        .{},
+    );
     defer parsed.deinit();
     for ([_]Client.ServerRequestMethod{ .auth_tokens_refresh, .attestation_generate }) |method| {
         var reply = try client.prepareServerReply(method, parsed.value.object);
         defer reply.deinit(std.testing.allocator);
-        const payload = try Client.serverReplyPayloadAlloc(std.testing.allocator, .{ .string = "secret-test" }, reply);
+        const payload = try Client.serverReplyPayloadAlloc(
+            std.testing.allocator,
+            .{ .string = "secret-test" },
+            reply,
+        );
         defer std.testing.allocator.free(payload);
         try std.testing.expect(std.mem.indexOf(u8, payload, "SECRET_SENTINEL") == null);
         try std.testing.expect(std.mem.indexOf(u8, payload, "\"code\":-32603") != null);
@@ -1702,7 +1945,8 @@ test "provider failures reply once then terminate the affected route" {
     var auth = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"id\":1,\"method\":\"account/chatgptAuthTokens/refresh\",\"params\":{\"token\":\"SECRET\"}}",
+        \\{"id":1,"method":"account/chatgptAuthTokens/refresh","params":{"token":"SECRET"}}
+    ,
         .{},
     );
     defer auth.deinit();
@@ -1740,7 +1984,12 @@ test "stdio handshake failure reaps the spawned app-server" {
     defer allocator.free(pid_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" > '{s}'\nprintf '%s\\n' '{{\"id\":\"boot-1\",\"method\":\"future/serverRequest\",\"params\":{{}}}}'\nwhile IFS= read -r _; do :; done\n",
+        "#!/bin/sh\n" ++
+            "set -eu\n" ++
+            "printf '%s' \"$$\" > '{s}'\n" ++
+            "printf '%s\\n' '{{\"id\":\"boot-1\",\"method\":" ++
+            "\"future/serverRequest\",\"params\":{{}}}}'\n" ++
+            "while IFS= read -r _; do :; done\n",
         .{pid_path},
     );
     defer allocator.free(script);
@@ -1779,12 +2028,20 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
     defer allocator.free(pid_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" > '{s}'\nwhile IFS= read -r _; do sleep 600; done\n",
+        "#!/bin/sh\n" ++
+            "set -eu\n" ++
+            "printf '%s' \"$$\" > '{s}'\n" ++
+            "while IFS= read -r _; do sleep 600; done\n",
         .{pid_path},
     );
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "silent-codex", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        executable,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 
     const started_ms = monotonicMillis();
     try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
@@ -1821,7 +2078,12 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
     );
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "blocked-codex", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        executable,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 
     const large_title = try allocator.alloc(u8, 1024 * 1024);
     defer allocator.free(large_title);
@@ -1860,8 +2122,14 @@ test "unknown server request replies then records exact method and terminates" {
         .{},
     );
     defer parsed.deinit();
-    try std.testing.expectError(error.UnsupportedServerRequest, client.autoHandleServerRequest(parsed.value.object));
-    try std.testing.expectEqualStrings("future/serverRequest", client.lastUnsupportedServerRequest().?);
+    try std.testing.expectError(
+        error.UnsupportedServerRequest,
+        client.autoHandleServerRequest(parsed.value.object),
+    );
+    try std.testing.expectEqualStrings(
+        "future/serverRequest",
+        client.lastUnsupportedServerRequest().?,
+    );
 }
 
 test "known server request with missing or invalid id terminates instead of deadlocking" {
@@ -1875,7 +2143,10 @@ test "known server request with missing or invalid id terminates instead of dead
         .{},
     );
     defer missing.deinit();
-    try std.testing.expectError(error.MalformedServerRequest, client.autoHandleServerRequest(missing.value.object));
+    try std.testing.expectError(
+        error.MalformedServerRequest,
+        client.autoHandleServerRequest(missing.value.object),
+    );
 
     var invalid = try std.json.parseFromSlice(
         std.json.Value,
@@ -1884,7 +2155,10 @@ test "known server request with missing or invalid id terminates instead of dead
         .{},
     );
     defer invalid.deinit();
-    try std.testing.expectError(error.MalformedServerRequest, client.autoHandleServerRequest(invalid.value.object));
+    try std.testing.expectError(
+        error.MalformedServerRequest,
+        client.autoHandleServerRequest(invalid.value.object),
+    );
 }
 
 test "current time reply is whole unix seconds" {
@@ -1892,13 +2166,25 @@ test "current time reply is whole unix seconds" {
     defer client.line_buf.deinit(std.testing.allocator);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
     defer parsed.deinit();
-    const before = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(client.io).nanoseconds, 1_000_000_000)));
+    const before = @as(i64, @intCast(@divFloor(
+        std.Io.Clock.real.now(client.io).nanoseconds,
+        1_000_000_000,
+    )));
     var reply = try client.prepareServerReply(.current_time_read, parsed.value.object);
     defer reply.deinit(std.testing.allocator);
-    const after = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(client.io).nanoseconds, 1_000_000_000)));
-    var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reply.result_json, .{});
+    const after = @as(i64, @intCast(@divFloor(
+        std.Io.Clock.real.now(client.io).nanoseconds,
+        1_000_000_000,
+    )));
+    var value = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        reply.result_json,
+        .{},
+    );
     defer value.deinit();
-    const observed = core_json.intField(value.value.object, "currentTimeAt") orelse return error.TestExpectedEqual;
+    const observed = core_json.intField(value.value.object, "currentTimeAt") orelse
+        return error.TestExpectedEqual;
     try std.testing.expect(observed >= before and observed <= after);
 }
 
@@ -1910,18 +2196,31 @@ test "deprecated approval methods return schema-valid denial results" {
     for ([_]Client.ServerRequestMethod{ .apply_patch_approval, .exec_command_approval }) |method| {
         var reply = try client.prepareServerReply(method, parsed.value.object);
         defer reply.deinit(std.testing.allocator);
-        var result = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reply.result_json, .{});
+        var result = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            reply.result_json,
+            .{},
+        );
         defer result.deinit();
-        const decision = core_json.objectField(result.value.object, "decision") orelse return error.TestExpectedEqual;
-        const denied = core_json.objectField(decision, "denied") orelse return error.TestExpectedEqual;
+        const decision = core_json.objectField(result.value.object, "decision") orelse
+            return error.TestExpectedEqual;
+        const denied = core_json.objectField(decision, "denied") orelse
+            return error.TestExpectedEqual;
         try std.testing.expect(core_json.stringField(denied, "rejection") != null);
     }
 }
 
 test "openai form capability requires an exact configured response policy" {
     try std.testing.expect(!hasExactOpenaiFormPolicy(.{ .cwd = "." }));
-    try std.testing.expect(hasExactOpenaiFormPolicy(.{ .cwd = ".", .elicitation_action = "decline" }));
-    try std.testing.expect(!hasExactOpenaiFormPolicy(.{ .cwd = ".", .elicitation_action = "accept" }));
+    try std.testing.expect(hasExactOpenaiFormPolicy(.{
+        .cwd = ".",
+        .elicitation_action = "decline",
+    }));
+    try std.testing.expect(!hasExactOpenaiFormPolicy(.{
+        .cwd = ".",
+        .elicitation_action = "accept",
+    }));
     try std.testing.expect(hasExactOpenaiFormPolicy(.{
         .cwd = ".",
         .elicitation_action = "accept",
@@ -1949,16 +2248,23 @@ test "initialize capability builder has one typed owner and preserves additive f
     try std.testing.expectEqual(false, object.get("experimentalApi").?.bool);
     try std.testing.expectEqual(true, object.get("mcpServerOpenaiFormElicitation").?.bool);
     try std.testing.expectEqual(true, object.get("requestAttestation").?.bool);
-    try std.testing.expectEqual(@as(usize, 2), object.get("optOutNotificationMethods").?.array.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        object.get("optOutNotificationMethods").?.array.items.len,
+    );
     try std.testing.expect(object.get("futureCapability") != null);
 
     try std.testing.expectError(
         error.DuplicateInitializeCapabilityOwner,
-        (InitializeCapabilityBuilder{ .additional_json = "{\"requestAttestation\":false}" }).validate(std.testing.allocator),
+        (InitializeCapabilityBuilder{
+            .additional_json = "{\"requestAttestation\":false}",
+        }).validate(std.testing.allocator),
     );
     try std.testing.expectError(
         error.InvalidInitializeCapabilities,
-        (InitializeCapabilityBuilder{ .additional_json = "{\"future\":1,\"future\":2}" }).validate(std.testing.allocator),
+        (InitializeCapabilityBuilder{
+            .additional_json = "{\"future\":1,\"future\":2}",
+        }).validate(std.testing.allocator),
     );
     try std.testing.expect(!initializeCapabilities(.{ .cwd = "." }).request_attestation);
     try std.testing.expect(initializeCapabilities(.{
@@ -1973,18 +2279,29 @@ test "initialize payload carries the single capability object" {
         .request_attestation = true,
     }).buildAlloc(std.testing.allocator);
     defer std.testing.allocator.free(capabilities);
-    const payload = try initializePayloadAlloc(std.testing.allocator, -1, "cas-test", "CAS Test", "0.4.0", capabilities);
+    const payload = try initializePayloadAlloc(
+        std.testing.allocator,
+        -1,
+        "cas-test",
+        "CAS Test",
+        "0.4.0",
+        capabilities,
+    );
     defer std.testing.allocator.free(payload);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
-    const params = core_json.objectField(parsed.value.object, "params") orelse return error.TestExpectedEqual;
-    const actual = core_json.objectField(params, "capabilities") orelse return error.TestExpectedEqual;
+    const params = core_json.objectField(parsed.value.object, "params") orelse
+        return error.TestExpectedEqual;
+    const actual = core_json.objectField(params, "capabilities") orelse
+        return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 4), actual.count());
     try std.testing.expectEqual(true, actual.get("requestAttestation").?.bool);
 }
 
 test "auth refresh and attestation providers return only exact validated carriers" {
-    const auth = "{ \"accessToken\":\"SECRET_ACCESS\", \"chatgptAccountId\":\"acct\", \"chatgptPlanType\":\"ent26\", \"future\":true }";
+    const auth =
+        "{ \"accessToken\":\"SECRET_ACCESS\", \"chatgptAccountId\":\"acct\", " ++
+        "\"chatgptPlanType\":\"ent26\", \"future\":true }";
     const attestation = "{ \"token\":\"SECRET_ATTESTATION\", \"future\":1 }";
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
@@ -2000,17 +2317,26 @@ test "auth refresh and attestation providers return only exact validated carrier
     var auth_reply = try client.prepareServerReply(.auth_tokens_refresh, parsed.value.object);
     defer auth_reply.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(auth, auth_reply.result_json);
-    var attestation_reply = try client.prepareServerReply(.attestation_generate, parsed.value.object);
+    var attestation_reply = try client.prepareServerReply(
+        .attestation_generate,
+        parsed.value.object,
+    );
     defer attestation_reply.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(attestation, attestation_reply.result_json);
 
     try std.testing.expectError(
         error.InvalidAuthRefreshResponse,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .auth_refresh_response_json = "{\"accessToken\":\"x\"}" }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .auth_refresh_response_json = "{\"accessToken\":\"x\"}",
+        }),
     );
     try std.testing.expectError(
         error.InvalidAttestationResponse,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .attestation_response_json = "{\"token\":\"\"}" }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .attestation_response_json = "{\"token\":\"\"}",
+        }),
     );
 }
 
@@ -2033,22 +2359,34 @@ test "server request reply write failure poisons the client" {
         .{},
     );
     defer parsed.deinit();
-    try std.testing.expectError(error.ServerRequestReplyFailed, client.autoHandleServerRequest(parsed.value.object));
+    try std.testing.expectError(
+        error.ServerRequestReplyFailed,
+        client.autoHandleServerRequest(parsed.value.object),
+    );
     try std.testing.expectEqualStrings("server request reply write failed", client.lastError().?);
 }
 
 test "exact response carriers are bounded and shape checked before launch" {
     try std.testing.expectError(
         error.InvalidServerRequestPolicy,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .exec_approval = "auto" }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .exec_approval = "auto",
+        }),
     );
     try std.testing.expectError(
         error.InvalidServerRequestCarrierJson,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .request_user_input_response_json = "{" }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .request_user_input_response_json = "{",
+        }),
     );
     try std.testing.expectError(
         error.InvalidRequestUserInputResponse,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .request_user_input_response_json = "{\"answers\":[]}" }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .request_user_input_response_json = "{\"answers\":[]}",
+        }),
     );
     try std.testing.expectError(
         error.InvalidRequestUserInputResponse,
@@ -2063,41 +2401,60 @@ test "exact response carriers are bounded and shape checked before launch" {
     });
     try std.testing.expectError(
         error.InvalidDynamicToolResponse,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .dynamic_tool_response_json = "{\"success\":true}" }),
-    );
-    try std.testing.expectError(
-        error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
-            .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"futureItem\",\"text\":\"x\"}],\"success\":true}",
+            .dynamic_tool_response_json = "{\"success\":true}",
         }),
     );
     try std.testing.expectError(
         error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
-            .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"inputImage\",\"imageUrl\":1}],\"success\":true}",
+            .dynamic_tool_response_json = "{\"contentItems\":[" ++
+                "{\"type\":\"futureItem\",\"text\":\"x\"}]," ++
+                "\"success\":true}",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidDynamicToolResponse,
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .dynamic_tool_response_json = "{\"contentItems\":[" ++
+                "{\"type\":\"inputImage\",\"imageUrl\":1}]," ++
+                "\"success\":true}",
         }),
     );
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
-        .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"t\"},{\"type\":\"inputImage\",\"imageUrl\":\"file:///i\"},{\"type\":\"inputAudio\",\"audioUrl\":\"file:///a\"}],\"success\":true}",
+        .dynamic_tool_response_json = "{\"contentItems\":[" ++
+            "{\"type\":\"inputText\",\"text\":\"t\"}," ++
+            "{\"type\":\"inputImage\",\"imageUrl\":\"file:///i\"}," ++
+            "{\"type\":\"inputAudio\",\"audioUrl\":\"file:///a\"}]," ++
+            "\"success\":true}",
     });
     const oversized = try std.testing.allocator.alloc(u8, Client.max_exact_response_bytes + 1);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
     try std.testing.expectError(
         error.ServerRequestCarrierTooLarge,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .elicitation_content_json = oversized }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .elicitation_content_json = oversized,
+        }),
     );
     try std.testing.expectError(
         error.UnsupportedServerRequestTimeout,
-        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .server_request_timeout_ms = 1 }),
+        validateServerRequestOptions(std.testing.allocator, .{
+            .cwd = ".",
+            .server_request_timeout_ms = 1,
+        }),
     );
 }
 
 test "full MCP response carrier preserves opaque meta and never crosses url or future modes" {
-    const exact = "{ \"action\": \"accept\", \"content\": {\"answer\":42}, \"_meta\": {\"opaque\":[1,2]} }";
+    const exact =
+        "{ \"action\": \"accept\", \"content\": {\"answer\":42}, " ++
+        "\"_meta\": {\"opaque\":[1,2]} }";
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
         .elicitation_response_json = exact,
@@ -2106,20 +2463,35 @@ test "full MCP response carrier preserves opaque meta and never crosses url or f
     defer client.line_buf.deinit(std.testing.allocator);
     client.elicitation_response_json = exact;
 
-    var form = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"form\"}}", .{});
+    var form = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"form\"}}",
+        .{},
+    );
     defer form.deinit();
     const form_result = try client.prepareMcpElicitationResult(form.value.object);
     defer std.testing.allocator.free(form_result);
     try std.testing.expectEqualStrings(exact, form_result);
 
-    var url = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"url\"}}", .{});
+    var url = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"url\"}}",
+        .{},
+    );
     defer url.deinit();
     const url_result = try client.prepareMcpElicitationResult(url.value.object);
     defer std.testing.allocator.free(url_result);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "\"action\":\"decline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "opaque") == null);
 
-    var future = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"params\":{\"mode\":\"future/form\"}}", .{});
+    var future = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"params\":{\"mode\":\"future/form\"}}",
+        .{},
+    );
     defer future.deinit();
     const future_result = try client.prepareMcpElicitationResult(future.value.object);
     defer std.testing.allocator.free(future_result);
@@ -2137,7 +2509,10 @@ test "full MCP response carrier rejects malformed actions content and policy con
     for (invalid) |raw| {
         try std.testing.expectError(
             error.InvalidElicitationResponse,
-            validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .elicitation_response_json = raw }),
+            validateServerRequestOptions(std.testing.allocator, .{
+                .cwd = ".",
+                .elicitation_response_json = raw,
+            }),
         );
     }
     try std.testing.expectError(
@@ -2265,7 +2640,12 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
     const script = try retryFakeCodexScriptAlloc(allocator, mode, request_log_path);
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "retry-codex", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        executable,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 
     const policy = OverloadRetryPolicy{
         .max_retries = if (std.mem.eql(u8, mode, "exhaust")) 2 else 4,
@@ -2312,7 +2692,10 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
         try std.testing.expectEqual(@as(usize, 2), notifications.items.len);
         try std.testing.expect(client.lastError() == null);
     } else if (std.mem.eql(u8, mode, "failure_then_success")) {
-        try std.testing.expectError(error.RequestFailed, client.requestJson("test/retry", "{\"value\":7}"));
+        try std.testing.expectError(
+            error.RequestFailed,
+            client.requestJson("test/retry", "{\"value\":7}"),
+        );
         try std.testing.expect(client.lastError() != null);
         const result = try client.requestJson("test/retry", "{\"value\":7}");
         defer allocator.free(result);
@@ -2341,7 +2724,12 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
         try std.testing.expectEqual(@as(usize, 1), observer.calls);
     }
 
-    const requests = try tmp.dir.readFileAlloc(io, "requests.jsonl", allocator, .limited(64 * 1024));
+    const requests = try tmp.dir.readFileAlloc(
+        io,
+        "requests.jsonl",
+        allocator,
+        .limited(64 * 1024),
+    );
     defer allocator.free(requests);
     var lines = std.mem.tokenizeScalar(u8, requests, '\n');
     var index: usize = 0;
@@ -2352,7 +2740,10 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
         defer allocator.free(expected_id);
         try std.testing.expect(std.mem.indexOf(u8, line, expected_id) != null);
     }
-    const expected_requests: usize = if (std.mem.eql(u8, mode, "failure_then_success")) 2 else telemetry.wire_attempts;
+    const expected_requests: usize = if (std.mem.eql(u8, mode, "failure_then_success"))
+        2
+    else
+        telemetry.wire_attempts;
     try std.testing.expectEqual(expected_requests, index);
 }
 
@@ -2365,27 +2756,55 @@ test "production retry owns structured overload classification deadlines and tel
 
 test "overload retry policy validation and deterministic jitter are bounded" {
     try validateOverloadRetryPolicy(.{});
-    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .max_retries = max_overload_retries + 1 }));
-    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .base_delay_ms = 0 }));
-    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .max_delay_ms = max_overload_delay_ms + 1 }));
-    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .jitter_percent = max_overload_jitter_percent + 1 }));
+    try std.testing.expectError(
+        error.InvalidOverloadRetryPolicy,
+        validateOverloadRetryPolicy(.{ .max_retries = max_overload_retries + 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidOverloadRetryPolicy,
+        validateOverloadRetryPolicy(.{ .base_delay_ms = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidOverloadRetryPolicy,
+        validateOverloadRetryPolicy(.{
+            .max_delay_ms = max_overload_delay_ms + 1,
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidOverloadRetryPolicy,
+        validateOverloadRetryPolicy(.{
+            .jitter_percent = max_overload_jitter_percent + 1,
+        }),
+    );
     const policy = OverloadRetryPolicy{};
     const delay = overloadRetryDelayMs(policy, 0, 42);
     try std.testing.expectEqual(delay, overloadRetryDelayMs(policy, 0, 42));
     try std.testing.expect(delay >= policy.base_delay_ms);
     try std.testing.expect(delay <= policy.base_delay_ms + policy.base_delay_ms / 4);
 
-    var direct = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"code\":-32001}", .{});
+    var direct = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"code\":-32001}",
+        .{},
+    );
     defer direct.deinit();
     try std.testing.expect(isStructuredOverloadError(direct.value));
-    var nested = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"error\":{\"code\":-32001}}", .{});
+    var nested = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"error\":{\"code\":-32001}}",
+        .{},
+    );
     defer nested.deinit();
     try std.testing.expect(!isStructuredOverloadError(nested.value));
 
     const first_default = try resolveOverloadRetrySeed(null, std.testing.io);
     var saw_distinct_default = false;
     for (0..8) |_| {
-        if (try resolveOverloadRetrySeed(null, std.testing.io) != first_default) saw_distinct_default = true;
+        if (try resolveOverloadRetrySeed(null, std.testing.io) != first_default) {
+            saw_distinct_default = true;
+        }
     }
     try std.testing.expect(saw_distinct_default);
     try std.testing.expectEqual(@as(u64, 42), try resolveOverloadRetrySeed(42, std.testing.io));
@@ -2470,19 +2889,34 @@ test "request send ownership survives deadline expiry after durable observer" {
 }
 
 test "code mode host cannot be silently ignored by existing endpoint transports" {
-    var host = try app_server_launch.CodeModeHost.init(std.testing.allocator, "ws://127.0.0.1:9911");
+    var host = try app_server_launch.CodeModeHost.init(
+        std.testing.allocator,
+        "ws://127.0.0.1:9911",
+    );
     defer host.deinit();
     try std.testing.expectError(
         error.CodeModeHostRequiresManagedLaunch,
-        validateTransportOptions(.{ .cwd = ".", .code_mode_host = &host, .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" } }),
+        validateTransportOptions(.{
+            .cwd = ".",
+            .code_mode_host = &host,
+            .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
+        }),
     );
     try std.testing.expectError(
         error.CodeModeHostRequiresManagedLaunch,
-        validateTransportOptions(.{ .cwd = ".", .code_mode_host = &host, .transport = .{ .unix_socket = null } }),
+        validateTransportOptions(.{
+            .cwd = ".",
+            .code_mode_host = &host,
+            .transport = .{ .unix_socket = null },
+        }),
     );
     try std.testing.expectError(
         error.ConflictingTransportOptions,
-        validateTransportOptions(.{ .cwd = ".", .websocket_url = "ws://127.0.0.1:1", .transport = .stdio }),
+        validateTransportOptions(.{
+            .cwd = ".",
+            .websocket_url = "ws://127.0.0.1:1",
+            .transport = .stdio,
+        }),
     );
 }
 
@@ -2491,7 +2925,11 @@ test "diagnostic Codex feature arguments are bounded and stdio-only" {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, "codex");
-    try appendCodexEnableFeatureArgs(allocator, &argv, &.{ "deferred_executor", "executor_capability_discovery" });
+    try appendCodexEnableFeatureArgs(
+        allocator,
+        &argv,
+        &.{ "deferred_executor", "executor_capability_discovery" },
+    );
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "codex", "--enable", "deferred_executor", "--enable", "executor_capability_discovery" },
@@ -2506,11 +2944,14 @@ test "diagnostic Codex feature arguments are bounded and stdio-only" {
         .cwd = ".",
         .codex_enable_features = &.{"../feature"},
     }));
-    try std.testing.expectError(error.CodexEnableFeaturesRequireStdio, validateClientOptions(allocator, .{
-        .cwd = ".",
-        .codex_enable_features = &.{"deferred_executor"},
-        .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
-    }));
+    try std.testing.expectError(
+        error.CodexEnableFeaturesRequireStdio,
+        validateClientOptions(allocator, .{
+            .cwd = ".",
+            .codex_enable_features = &.{"deferred_executor"},
+            .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
+        }),
+    );
 }
 
 test "notification capture has an aggregate byte bound" {

@@ -49,7 +49,8 @@ const Scenario = enum {
 
     fn parse(raw: []const u8) ?Scenario {
         if (std.mem.eql(u8, raw, "overload_backoff") or std.mem.eql(u8, raw, "overload-backoff")) return .overload_backoff;
-        if (std.mem.eql(u8, raw, "app_server_features") or std.mem.eql(u8, raw, "app-server-features")) return .app_server_features;
+        if (std.mem.eql(u8, raw, "app_server_features") or
+            std.mem.eql(u8, raw, "app-server-features")) return .app_server_features;
         return null;
     }
 
@@ -156,7 +157,11 @@ pub fn main(init: std.process.Init) !void {
     const ctx = Context{
         .cwd = cwd,
         .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
-        .preflight_binary = try resolveExecutable(allocator, parsed.preflight_binary, "cas_app_server_preflight"),
+        .preflight_binary = try resolveExecutable(
+            allocator,
+            parsed.preflight_binary,
+            "cas_app_server_preflight",
+        ),
         .codex_path = parsed.codex_path,
         .hook_policy = parsed.hook_policy,
         .backoff_base_ms = parsed.backoff_base_ms,
@@ -555,7 +560,9 @@ fn scenarioAppServerFeatures(allocator: std.mem.Allocator, ctx: Context) !Scenar
         "stdio",
         "--json",
     });
-    if (ctx.codex_path) |codex_path| try argv.appendSlice(allocator, &.{ "--codex-path", codex_path });
+    if (ctx.codex_path) |codex_path| {
+        try argv.appendSlice(allocator, &.{ "--codex-path", codex_path });
+    }
     const capture = try runCommandCapture(allocator, null, argv.items);
     const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout_trimmed, .{}) catch
@@ -565,9 +572,14 @@ fn scenarioAppServerFeatures(allocator: std.mem.Allocator, ctx: Context) !Scenar
         .object => |value| value,
         else => return error.InvalidAppServerPreflightJson,
     };
-    if (!std.mem.eql(u8, core_json.stringField(root, "schema") orelse return error.InvalidAppServerPreflightJson, "cas-app-server-preflight/v1"))
+    if (!std.mem.eql(
+        u8,
+        core_json.stringField(root, "schema") orelse return error.InvalidAppServerPreflightJson,
+        "cas-app-server-preflight/v1",
+    ))
         return error.InvalidAppServerPreflightJson;
-    const probes_value = root.get("behavioralProbes") orelse return error.InvalidAppServerPreflightJson;
+    const probes_value = root.get("behavioralProbes") orelse
+        return error.InvalidAppServerPreflightJson;
     const probe_rows = switch (probes_value) {
         .array => |value| value,
         else => return error.InvalidAppServerPreflightJson,
@@ -606,7 +618,11 @@ fn summarizeAppServerFeatureProbes(rows: []const std.json.Value) FeatureProbeSum
             const id = core_json.stringField(row, "id") orelse continue;
             if (!std.mem.eql(u8, id, expected_id)) continue;
             found = true;
-            if (std.mem.eql(u8, core_json.stringField(row, "status") orelse "", "passed")) summary.passed += 1;
+            if (std.mem.eql(
+                u8,
+                core_json.stringField(row, "status") orelse "",
+                "passed",
+            )) summary.passed += 1;
             break;
         }
         if (!found) summary.missing += 1;
@@ -624,7 +640,12 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
 
     const temp_root = try makeTempRoot(allocator, "cas-overload-conformance");
     defer {
-        deleteTreeAbsolute(temp_root) catch {};
+        deleteTreeAbsolute(temp_root) catch |err| {
+            std.log.warn(
+                "failed to delete temporary conformance root {s}: {s}",
+                .{ temp_root, @errorName(err) },
+            );
+        };
         allocator.free(temp_root);
     }
     const success = try runProductionRetryCase(allocator, temp_root, "success", success_policy);
@@ -634,17 +655,40 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         .max_delay_ms = 4,
         .jitter_percent = 25,
     };
-    const nonoverload = try runProductionRetryCase(allocator, temp_root, "nonoverload", tiny_policy);
+    const nonoverload = try runProductionRetryCase(
+        allocator,
+        temp_root,
+        "nonoverload",
+        tiny_policy,
+    );
     const exhaustion = try runProductionRetryCase(allocator, temp_root, "exhaust", tiny_policy);
-    if (success.wire_attempts != 3 or success.retries != 2 or success.notifications != 2 or success.observer_calls != 1) return error.InvalidSuccessRetryProof;
-    if (nonoverload.wire_attempts != 1 or nonoverload.retries != 0 or nonoverload.observer_calls != 1) return error.InvalidNonOverloadProof;
-    if (exhaustion.wire_attempts != tiny_policy.max_retries + 1 or exhaustion.retries != tiny_policy.max_retries or !exhaustion.exhausted or exhaustion.observer_calls != 1) return error.InvalidExhaustionProof;
+    if (success.wire_attempts != 3 or
+        success.retries != 2 or
+        success.notifications != 2 or
+        success.observer_calls != 1)
+    {
+        return error.InvalidSuccessRetryProof;
+    }
+    if (nonoverload.wire_attempts != 1 or
+        nonoverload.retries != 0 or
+        nonoverload.observer_calls != 1)
+    {
+        return error.InvalidNonOverloadProof;
+    }
+    if (exhaustion.wire_attempts != tiny_policy.max_retries + 1 or
+        exhaustion.retries != tiny_policy.max_retries or
+        !exhaustion.exhausted or
+        exhaustion.observer_calls != 1)
+    {
+        return error.InvalidExhaustionProof;
+    }
     const delays = try allocator.dupe(u32, success.delays_ms[0..success.delay_count]);
     return .{
         .name = Scenario.overload_backoff.asString(),
         .mode = Scenario.overload_backoff.mode(),
         .ok = true,
-        .detail = "production proxy retry loop passed success, non-overload, and exhaustion fixtures",
+        .detail = "production proxy retry loop passed success, non-overload, " ++
+            "and exhaustion fixtures",
         .attempts = success.wire_attempts,
         .retries = success.retries,
         .delays_ms = delays,
@@ -670,10 +714,17 @@ const ConformanceSendObserver = struct {
     }
 };
 
-fn retryFixtureScriptAlloc(allocator: std.mem.Allocator, mode: []const u8, log_path: []const u8) ![]u8 {
+fn retryFixtureScriptAlloc(
+    allocator: std.mem.Allocator,
+    mode: []const u8,
+    log_path: []const u8,
+) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
-    try writer.writer.print("#!/bin/sh\nset -eu\nmode='{s}'\nlog_path='{s}'\n", .{ mode, log_path });
+    try writer.writer.print(
+        "#!/bin/sh\nset -eu\nmode='{s}'\nlog_path='{s}'\n",
+        .{ mode, log_path },
+    );
     try writer.writer.writeAll(
         \\attempt=0
         \\while IFS= read -r line; do
@@ -715,10 +766,17 @@ fn runProductionRetryCase(
     var script_file = try std.Io.Dir.createFileAbsolute(io, executable, .{ .truncate = true });
     defer script_file.close(io);
     try script_file.writeStreamingAll(io, script);
-    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        executable,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 
     var telemetry: cas_proxy_client.OverloadRetryTelemetry = .{};
-    const deadline_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) + 30_000);
+    const deadline_ms: i64 = @intCast(
+        @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) + 30_000,
+    );
     var client = try cas_proxy_client.Client.start(allocator, .{
         .cwd = root,
         .io = io,
@@ -746,7 +804,9 @@ fn runProductionRetryCase(
             .{ .context = &observer, .before_send = ConformanceSendObserver.count },
         );
         defer allocator.free(result);
-        if (!std.mem.eql(u8, result, "{\"ok\":true}") or client.lastError() != null) return error.InvalidSuccessRetryProof;
+        if (!std.mem.eql(u8, result, "{\"ok\":true}") or client.lastError() != null) {
+            return error.InvalidSuccessRetryProof;
+        }
     } else {
         const result = client.requestJsonWithSendObserver(
             "conformance/retry",
@@ -763,7 +823,13 @@ fn runProductionRetryCase(
         if (delay > policy.max_delay_ms) return error.RetryDelayOutOfBounds;
     }
 
-    const requests = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, log_path, allocator, .limited(64 * 1024));
+    const requests = try std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        io,
+        log_path,
+        allocator,
+        .limited(64 * 1024),
+    );
     defer allocator.free(requests);
     var lines = std.mem.tokenizeScalar(u8, requests, '\n');
     var index: i64 = 1;
@@ -775,8 +841,13 @@ fn runProductionRetryCase(
             else => return error.InvalidRetryRequest,
         };
         if (core_json.intField(object, "id") != index) return error.NonFreshRetryRequestId;
-        if (!std.mem.eql(u8, core_json.stringField(object, "method") orelse return error.InvalidRetryRequest, "conformance/retry")) return error.InvalidRetryRequest;
-        const params = core_json.objectField(object, "params") orelse return error.InvalidRetryRequest;
+        if (!std.mem.eql(
+            u8,
+            core_json.stringField(object, "method") orelse return error.InvalidRetryRequest,
+            "conformance/retry",
+        )) return error.InvalidRetryRequest;
+        const params = core_json.objectField(object, "params") orelse
+            return error.InvalidRetryRequest;
         if (core_json.intField(params, "value") != 7) return error.InvalidRetryRequest;
     }
     if (index - 1 != telemetry.wire_attempts) return error.RetryAttemptCountMismatch;
@@ -887,7 +958,10 @@ test "feature probe summary consumes exact live preflight rows" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "[{\"id\":\"thread-pinning-round-trip\",\"status\":\"passed\"},{\"id\":\"paginated-fork\",\"status\":\"passed\"},{\"id\":\"ephemeral-fork\",\"status\":\"failed\"},{\"id\":\"external-import-history\",\"status\":\"passed\"}]",
+        "[{\"id\":\"thread-pinning-round-trip\",\"status\":\"passed\"}," ++
+            "{\"id\":\"paginated-fork\",\"status\":\"passed\"}," ++
+            "{\"id\":\"ephemeral-fork\",\"status\":\"failed\"}," ++
+            "{\"id\":\"external-import-history\",\"status\":\"passed\"}]",
         .{},
     );
     defer parsed.deinit();
@@ -925,9 +999,17 @@ test "overload classification delegates to structured proxy policy" {
         .{ .raw = "\"server overloaded -32001\"", .expected = false },
     };
     for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.raw, .{});
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.raw,
+            .{},
+        );
         defer parsed.deinit();
-        try std.testing.expectEqual(case.expected, cas_proxy_client.isStructuredOverloadError(parsed.value));
+        try std.testing.expectEqual(
+            case.expected,
+            cas_proxy_client.isStructuredOverloadError(parsed.value),
+        );
     }
 }
 
