@@ -19,6 +19,13 @@ const CapabilitiesText =
     \\cas_review_scoped_instructions_v1=true
     \\cas_app_server_contract_0146_v1=true
     \\cas_app_server_schema_probe_v1=true
+    \\cas_app_server_thread_pinning_v1=true
+    \\cas_app_server_paginated_fork_v1=true
+    \\cas_app_server_ephemeral_paginated_fork_v1=true
+    \\cas_app_server_remote_code_mode_host_v1=true
+    \\cas_app_server_executor_skill_resources_v1=true
+    \\cas_app_server_external_import_history_v1=true
+    \\cas_codex_0146_structured_review_v1=true
     \\cas_automation_v1=true
 ;
 
@@ -40,11 +47,28 @@ const CapabilitiesJson =
     \\      "cas_review_scoped_instructions_v1": true,
     \\      "cas_app_server_contract_0146_v1": true,
     \\      "cas_app_server_schema_probe_v1": true,
+    \\      "cas_app_server_thread_pinning_v1": true,
+    \\      "cas_app_server_paginated_fork_v1": true,
+    \\      "cas_app_server_ephemeral_paginated_fork_v1": true,
+    \\      "cas_app_server_remote_code_mode_host_v1": true,
+    \\      "cas_app_server_executor_skill_resources_v1": true,
+    \\      "cas_app_server_external_import_history_v1": true,
+    \\      "cas_codex_0146_structured_review_v1": true,
     \\      "cas_automation_v1": true
     \\    }
     \\  }
     \\}
 ;
+
+const CurrentContractCapabilities = [_][]const u8{
+    "cas_app_server_thread_pinning_v1",
+    "cas_app_server_paginated_fork_v1",
+    "cas_app_server_ephemeral_paginated_fork_v1",
+    "cas_app_server_remote_code_mode_host_v1",
+    "cas_app_server_executor_skill_resources_v1",
+    "cas_app_server_external_import_history_v1",
+    "cas_codex_0146_structured_review_v1",
+};
 
 const UsageText =
     \\cas
@@ -411,4 +435,31 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);
     try std.testing.expect(features.get("cas_review_history_v2") == null);
     try std.testing.expect(features.get("dcp_v2").?.bool);
+}
+
+test "capabilities publish current 0.146 runtime features" {
+    var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer text_output.deinit();
+    try writeCapabilities(&text_output.writer, false);
+
+    var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer json_output.deinit();
+    try writeCapabilities(&json_output.writer, true);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const features = parsed.value.object.get("cas_capabilities").?.object
+        .get("features").?.object;
+    for (CurrentContractCapabilities) |capability| {
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            text_output.written(),
+            capability,
+        ) != null);
+        try std.testing.expect(features.get(capability).?.bool);
+    }
 }
