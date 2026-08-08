@@ -146,14 +146,14 @@ const ProbeState = struct {
         if (self.endpoint_runtime) |*identity| identity.deinit(allocator);
     }
 
-    fn setIsolated(self: *ProbeState, isolated: IsolatedFullWitnesses) void {
-        self.thread_pinning = isolated.thread_pinning;
-        self.paginated_fork = isolated.paginated_fork;
-        self.ephemeral_fork = isolated.ephemeral_fork;
-        self.paginated_session_inquiry = isolated.paginated_session_inquiry;
-        self.executor_skill_resources = isolated.executor_skill_resources;
-        self.structured_review = isolated.structured_review;
-        self.external_import_history = isolated.external_import_history;
+    fn setFeatures(self: *ProbeState, witnesses: FeatureWitnesses) void {
+        self.thread_pinning = witnesses.thread_pinning;
+        self.paginated_fork = witnesses.paginated_fork;
+        self.ephemeral_fork = witnesses.ephemeral_fork;
+        self.paginated_session_inquiry = witnesses.paginated_session_inquiry;
+        self.executor_skill_resources = witnesses.executor_skill_resources;
+        self.structured_review = witnesses.structured_review;
+        self.external_import_history = witnesses.external_import_history;
     }
 };
 
@@ -248,13 +248,6 @@ fn externalEndpointTransport(transport: contract.ProbeTransport) bool {
     return transport == .explicit_websocket or transport == .unix_websocket;
 }
 
-fn externalEndpointBehaviorUnbound(
-    profile: contract.Profile,
-    transport: contract.ProbeTransport,
-) bool {
-    return profile != .core and externalEndpointTransport(transport);
-}
-
 fn runInspected(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -346,23 +339,19 @@ fn collectProbeState(
             schemas,
         );
     }
-    if (options.action == .preflight and state.lifecycle_passed and
-        externalEndpointBehaviorUnbound(options.profile, state.selected_transport))
-    {
-        state.lifecycle_passed = false;
-        state.lifecycle_failure_code = "endpoint_behavior_unbound";
-        state.lifecycle_failure_hint =
-            "non-core probes cannot be credited to an externally managed endpoint";
-    }
     if (options.action == .preflight and options.profile != .core and state.lifecycle_passed) {
-        state.setIsolated(runIsolatedFullProbes(
-            allocator,
-            io,
-            environment,
-            cache_root,
-            cwd,
-            schemas.executable.resolved_path,
-        ) catch |err| isolatedFailures(err));
+        if (externalEndpointTransport(state.selected_transport)) {
+            state.setFeatures(externalEndpointUnboundWitnesses());
+        } else {
+            state.setFeatures(runIsolatedFullProbes(
+                allocator,
+                io,
+                environment,
+                cache_root,
+                cwd,
+                schemas.executable.resolved_path,
+            ) catch |err| isolatedFailures(err));
+        }
     }
     return state;
 }
@@ -427,7 +416,7 @@ fn collectLifecycle(
     state.lifecycle_passed = state.lifecycle_failure_code == null;
 }
 
-fn isolatedFailures(err: anyerror) IsolatedFullWitnesses {
+fn isolatedFailures(err: anyerror) FeatureWitnesses {
     const error_name = @errorName(err);
     return .{
         .thread_pinning = probes.LiveWitness.failed(
@@ -457,6 +446,41 @@ fn isolatedFailures(err: anyerror) IsolatedFullWitnesses {
         .external_import_history = probes.LiveWitness.failed(
             "isolated_import_probe_setup_failed",
             error_name,
+        ),
+    };
+}
+
+fn externalEndpointUnboundWitnesses() FeatureWitnesses {
+    const hint = "required behavior cannot be credited without a CAS-owned " ++
+        "isolated endpoint";
+    return .{
+        .thread_pinning = probes.LiveWitness.failed(
+            "endpoint_thread_pinning_unbound",
+            hint,
+        ),
+        .paginated_fork = probes.LiveWitness.failed(
+            "endpoint_paginated_fork_unbound",
+            hint,
+        ),
+        .ephemeral_fork = probes.LiveWitness.failed(
+            "endpoint_ephemeral_fork_unbound",
+            hint,
+        ),
+        .paginated_session_inquiry = probes.LiveWitness.failed(
+            "endpoint_paginated_session_inquiry_unbound",
+            hint,
+        ),
+        .executor_skill_resources = probes.LiveWitness.failed(
+            "endpoint_executor_skill_resources_unbound",
+            hint,
+        ),
+        .structured_review = probes.LiveWitness.failed(
+            "endpoint_structured_review_unbound",
+            hint,
+        ),
+        .external_import_history = probes.LiveWitness.failed(
+            "endpoint_external_import_history_unbound",
+            hint,
         ),
     };
 }
@@ -794,7 +818,7 @@ fn connectManagedLifecycle(
     };
 }
 
-const IsolatedFullWitnesses = struct {
+const FeatureWitnesses = struct {
     thread_pinning: probes.LiveWitness,
     paginated_fork: probes.LiveWitness,
     ephemeral_fork: probes.LiveWitness,
@@ -811,7 +835,7 @@ fn runIsolatedFullProbes(
     cache_root: []const u8,
     cwd: []const u8,
     codex_path: []const u8,
-) !IsolatedFullWitnesses {
+) !FeatureWitnesses {
     const nonce: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
     const requested_codex_home = try std.fmt.allocPrint(
         allocator,
@@ -876,7 +900,7 @@ fn runIsolatedWitnessClient(
     executor_root: []const u8,
     executor_manifest: []const u8,
     executor_resource: []const u8,
-) !IsolatedFullWitnesses {
+) !FeatureWitnesses {
     var client = try proxy.Client.start(allocator, .{
         .cwd = cwd,
         .io = io,
@@ -1324,11 +1348,70 @@ test "endpoint runtime identity requires typed fields and a versioned user agent
     );
 }
 
-test "external endpoint behavior cannot borrow local isolated probes" {
-    try std.testing.expect(externalEndpointBehaviorUnbound(.full, .explicit_websocket));
-    try std.testing.expect(externalEndpointBehaviorUnbound(.review, .unix_websocket));
-    try std.testing.expect(!externalEndpointBehaviorUnbound(.core, .explicit_websocket));
-    try std.testing.expect(!externalEndpointBehaviorUnbound(.full, .managed_websocket));
+test "external endpoint keeps transport proof separate from unbound feature proof" {
+    const feature = externalEndpointUnboundWitnesses();
+    const witnesses = probes.Witnesses{
+        .lifecycle_passed = true,
+        .handler_coverage_passed = true,
+        .retry_passed = true,
+        .thread_pinning = feature.thread_pinning,
+        .paginated_fork = feature.paginated_fork,
+        .ephemeral_fork = feature.ephemeral_fork,
+        .paginated_session_inquiry = feature.paginated_session_inquiry,
+        .executor_skill_resources = feature.executor_skill_resources,
+        .structured_review = feature.structured_review,
+        .external_import_history = feature.external_import_history,
+    };
+    const report = probes.buildReport(
+        .review,
+        .{ .transport = .explicit_websocket },
+        witnesses,
+    );
+    try expectProbeRow(&report, "initialize-lifecycle", "passed", null);
+    try expectProbeRow(&report, "explicit-websocket-transport", "passed", null);
+    try expectProbeRow(
+        &report,
+        "structured-review",
+        "failed",
+        "endpoint_structured_review_unbound",
+    );
+    try std.testing.expect(!report.compatible);
+    const failure = firstFailure(true, .preflight, &report.rows);
+    try std.testing.expectEqualStrings("endpoint_structured_review_unbound", failure.code.?);
+
+    const inquiry = probes.buildReport(
+        .session_inquiry,
+        .{ .transport = .unix_websocket },
+        witnesses,
+    );
+    try expectProbeRow(&inquiry, "initialize-lifecycle", "passed", null);
+    try expectProbeRow(&inquiry, "unix-websocket-transport", "passed", null);
+    try expectProbeRow(
+        &inquiry,
+        "paginated-fork",
+        "failed",
+        "endpoint_paginated_fork_unbound",
+    );
+    try std.testing.expect(!inquiry.compatible);
+}
+
+fn expectProbeRow(
+    report: *const probes.ProbeReport,
+    id: []const u8,
+    status: []const u8,
+    failure_code: ?[]const u8,
+) !void {
+    for (report.rows) |probe_row| {
+        if (!std.mem.eql(u8, probe_row.id, id)) continue;
+        try std.testing.expectEqualStrings(status, probe_row.status);
+        if (failure_code) |expected| {
+            try std.testing.expectEqualStrings(expected, probe_row.failureCode.?);
+        } else {
+            try std.testing.expect(probe_row.failureCode == null);
+        }
+        return;
+    }
+    return error.ProbeRowNotFound;
 }
 
 fn writeOutput(io: std.Io, output: Output) !void {
