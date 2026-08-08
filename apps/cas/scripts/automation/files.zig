@@ -213,18 +213,7 @@ pub fn writeMemorySummary(
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{folder});
     defer allocator.free(memory_path);
 
-    const existing = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        memory_path,
-        allocator,
-        .limited(10 * 1024 * 1024),
-    ) catch |err| switch (err) {
-        error.FileNotFound => try allocator.dupe(u8, ""),
-        else => return userErrorFmt(
-            "failed reading memory file ({s}): {s}",
-            .{ memory_path, @errorName(err) },
-        ),
-    };
+    const existing = try readExistingMemory(allocator, memory_path);
     defer allocator.free(existing);
 
     const date = try dateStringUtc(allocator, started_ms);
@@ -250,6 +239,36 @@ pub fn writeMemorySummary(
     defer allocator.free(merged);
 
     try output.writeFileAtomic(allocator, memory_path, merged);
+}
+
+fn readExistingMemory(allocator: std.mem.Allocator, memory_path: []const u8) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const stat = std.Io.Dir.cwd().statFile(
+        io,
+        memory_path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return allocator.dupe(u8, ""),
+        else => return userErrorFmt(
+            "failed inspecting memory file ({s}): {s}",
+            .{ memory_path, @errorName(err) },
+        ),
+    };
+    if (stat.kind != .file) {
+        return userErrorFmt(
+            "refusing non-regular memory file ({s})",
+            .{memory_path},
+        );
+    }
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        memory_path,
+        allocator,
+        .limited(10 * 1024 * 1024),
+    ) catch |err| return userErrorFmt(
+        "failed reading memory file ({s}): {s}",
+        .{ memory_path, @errorName(err) },
+    );
 }
 
 const CivilDate = struct { year: i64, month: u8, day: u8 };
@@ -357,4 +376,42 @@ test "memory creation never follows a dangling symlink" {
     );
     defer allocator.free(existing);
     try std.testing.expectEqualStrings("preserve\n", existing);
+}
+
+test "memory summary rejects symlink and non-file memory targets" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "automations", .default_dir);
+    try tmp.dir.createDir(io, "automations/row", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.md", .data = "outside\n" });
+    try tmp.dir.symLink(io, "../../outside.md", "automations/row/memory.md", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const automation_root = try std.fs.path.join(allocator, &.{ root, "automations" });
+    defer allocator.free(automation_root);
+    setAutomationRootOverride(automation_root);
+    defer setAutomationRootOverride(null);
+
+    try std.testing.expectError(
+        error.UserInput,
+        writeMemorySummary(allocator, "row", "must not escape", 0),
+    );
+    const outside = try tmp.dir.readFileAlloc(io, "outside.md", allocator, .limited(64));
+    defer allocator.free(outside);
+    try std.testing.expectEqualStrings("outside\n", outside);
+    const link = try tmp.dir.statFile(
+        io,
+        "automations/row/memory.md",
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link.kind);
+
+    try tmp.dir.deleteFile(io, "automations/row/memory.md");
+    try tmp.dir.createDir(io, "automations/row/memory.md", .default_dir);
+    try std.testing.expectError(
+        error.UserInput,
+        writeMemorySummary(allocator, "row", "must stay a file", 0),
+    );
 }

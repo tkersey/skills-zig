@@ -213,7 +213,7 @@ pub fn schedulerArgumentsMatchCas(arguments: []const []u8, cas_path: []const u8)
 }
 
 pub fn classifySchedulerSurface(arguments: []const []u8) []const u8 {
-    if (arguments.len >= 3 and
+    if (arguments.len == 3 and
         std.mem.eql(u8, std.fs.path.basename(arguments[0]), "cas") and
         std.mem.eql(u8, arguments[1], "automation") and
         std.mem.eql(u8, arguments[2], "run-due"))
@@ -865,6 +865,7 @@ pub fn cmdSchedulerUninstall(
     const existed = try uninstallSchedulerAtPath(
         allocator,
         io,
+        args.label,
         plist,
         target,
         system_command_runner,
@@ -883,13 +884,21 @@ pub fn cmdSchedulerUninstall(
 fn uninstallSchedulerAtPath(
     allocator: std.mem.Allocator,
     io: std.Io,
+    label: []const u8,
     plist_path: []const u8,
     target: []const u8,
     runner: CommandRunner,
 ) !bool {
-    var initial = try queryLaunchctl(allocator, io, runner, target);
-    defer initial.deinit(allocator);
-    switch (initial.observation) {
+    var status = try readSchedulerStatusAtPath(
+        allocator,
+        io,
+        label,
+        plist_path,
+        target,
+        runner,
+    );
+    defer status.deinit(allocator);
+    switch (status.launchctl_observation) {
         .loaded => {
             try runCommandChecked(
                 allocator,
@@ -902,7 +911,7 @@ fn uninstallSchedulerAtPath(
         .not_queried, .spawn_failed, .command_failed, .invalid_output => {
             return userErrorFmt(
                 "refusing scheduler uninstall because launchd state is {s}",
-                .{launchctlObservationName(initial.observation)},
+                .{launchctlObservationName(status.launchctl_observation)},
             );
         },
     }
@@ -1175,6 +1184,10 @@ const TestCronPlistJson =
     "{\"Label\":\"com.example.scheduler\",\"ProgramArguments\":" ++
     "[\"/opt/homebrew/bin/cron\",\"run-due\"]}";
 
+const TestCasPlistJson =
+    "{\"Label\":\"com.example.scheduler\",\"ProgramArguments\":" ++
+    "[\"/opt/cas/bin/cas\",\"automation\",\"run-due\"]}";
+
 const TestCasExtraArgumentJson =
     "{\"Label\":\"com.example.scheduler\",\"ProgramArguments\":" ++
     "[\"/opt/cas/bin/cas\",\"automation\",\"run-due\",\"--extra\"]}";
@@ -1255,6 +1268,22 @@ fn runTestSchedulerInstall(
         script.commandRunner(),
     );
     try script.expectComplete();
+}
+
+test "scheduler surface requires the exact CAS argument tuple" {
+    var exact = [_][]u8{
+        @constCast("/opt/cas/bin/cas"),
+        @constCast("automation"),
+        @constCast("run-due"),
+    };
+    var extra = [_][]u8{
+        @constCast("/opt/cas/bin/cas"),
+        @constCast("automation"),
+        @constCast("run-due"),
+        @constCast("--extra"),
+    };
+    try std.testing.expectEqualStrings("cas-automation", classifySchedulerSurface(&exact));
+    try std.testing.expectEqualStrings("unknown", classifySchedulerSurface(&extra));
 }
 
 test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
@@ -1570,6 +1599,7 @@ test "uninstall removes the plist only after verified launchd absence" {
         "Could not find service \"com.example.scheduler\" " ++
         "in domain for user gui: 501\n";
     var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .stdout = TestCronPlistJson },
         .{ .verb = "print", .stdout = TestCronLoadedState },
         .{ .verb = "bootout" },
         .{ .verb = "print", .exit_code = 113, .stderr = not_found },
@@ -1578,6 +1608,7 @@ test "uninstall removes the plist only after verified launchd absence" {
     try std.testing.expect(try uninstallSchedulerAtPath(
         allocator,
         io,
+        "com.example.scheduler",
         plist_path,
         "gui/501/com.example.scheduler",
         script.commandRunner(),
@@ -1587,6 +1618,32 @@ test "uninstall removes the plist only after verified launchd absence" {
         error.FileNotFound,
         tmp.dir.access(io, "scheduler.plist", .{}),
     );
+}
+
+test "uninstall rejects a persisted plist with the wrong label before effects" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const plist_path = try testPlistPath(allocator, io, &tmp);
+    defer allocator.free(plist_path);
+    var script = ScriptedRunner{ .steps = &.{.{
+        .verb = "-convert",
+        .stdout = "{\"Label\":\"other.label\",\"ProgramArguments\":[\"/bin/false\"]}",
+    }} };
+    try std.testing.expectError(
+        error.SchedulerLabelMismatch,
+        uninstallSchedulerAtPath(
+            allocator,
+            io,
+            "com.example.scheduler",
+            plist_path,
+            "gui/501/com.example.scheduler",
+            script.commandRunner(),
+        ),
+    );
+    try script.expectComplete();
+    try expectPlistPreserved(io, &tmp);
 }
 
 test "scheduler install succeeds after uninstall disabled the same label" {
@@ -1606,6 +1663,7 @@ test "scheduler install succeeds after uninstall disabled the same label" {
     try runTestSchedulerInstall(allocator, io, root, log_dir, plist_path, &first_install);
 
     var uninstall_script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .stdout = TestCasPlistJson },
         .{ .verb = "print", .stdout = TestCasLoadedState },
         .{ .verb = "bootout" },
         .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
@@ -1614,6 +1672,7 @@ test "scheduler install succeeds after uninstall disabled the same label" {
     try std.testing.expect(try uninstallSchedulerAtPath(
         allocator,
         io,
+        "com.example.scheduler",
         plist_path,
         target,
         uninstall_script.commandRunner(),
@@ -1633,6 +1692,7 @@ test "uninstall verification failure preserves the scheduler plist" {
     const plist_path = try testPlistPath(allocator, io, &tmp);
     defer allocator.free(plist_path);
     var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .stdout = TestCronPlistJson },
         .{ .verb = "print", .stdout = TestCronLoadedState },
         .{ .verb = "bootout" },
         .{ .verb = "print", .exit_code = 64, .stderr = "Not privileged\n" },
@@ -1642,6 +1702,7 @@ test "uninstall verification failure preserves the scheduler plist" {
         uninstallSchedulerAtPath(
             allocator,
             io,
+            "com.example.scheduler",
             plist_path,
             "gui/501/com.example.scheduler",
             script.commandRunner(),

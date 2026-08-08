@@ -922,6 +922,14 @@ fn inspectAutomationFiles(
     if (!try inspectAutomationDirectory(allocator, target_dir, diagnostics)) return;
     const toml_path = try std.fs.path.join(allocator, &.{ target_dir, "automation.toml" });
     defer allocator.free(toml_path);
+    const toml_regular = try inspectRequiredRegularFile(
+        allocator,
+        toml_path,
+        "missing-automation-file",
+        "unsafe-automation-file",
+        diagnostics,
+    );
+    if (!toml_regular) return inspectMemoryFile(allocator, target_dir, diagnostics);
     const actual = std.Io.Dir.cwd().readFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         toml_path,
@@ -960,21 +968,55 @@ fn inspectAutomationFiles(
             .{toml_path},
         );
     }
+    try inspectMemoryFile(allocator, target_dir, diagnostics);
+}
+
+fn inspectMemoryFile(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    diagnostics: *DoctorDiagnostics,
+) !void {
     const memory_path = try std.fs.path.join(allocator, &.{ target_dir, "memory.md" });
     defer allocator.free(memory_path);
-    std.Io.Dir.cwd().access(
-        std.Io.Threaded.global_single_threaded.io(),
+    _ = try inspectRequiredRegularFile(
+        allocator,
         memory_path,
-        .{},
-    ) catch {
+        "missing-memory-file",
+        "unsafe-memory-file",
+        diagnostics,
+    );
+}
+
+fn inspectRequiredRegularFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    missing_code: []const u8,
+    unsafe_code: []const u8,
+    diagnostics: *DoctorDiagnostics,
+) !bool {
+    const stat = std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| {
         try diagnostics.append(
             allocator,
-            "missing-memory-file",
+            missing_code,
             "error",
-            "{s} is absent",
-            .{memory_path},
+            "{s} is absent or unreadable: {s}",
+            .{ path, @errorName(err) },
         );
+        return false;
     };
+    if (stat.kind == .file) return true;
+    try diagnostics.append(
+        allocator,
+        unsafe_code,
+        "error",
+        "{s} is not a regular file",
+        .{path},
+    );
+    return false;
 }
 
 fn inspectAutomationDirectory(
@@ -1144,6 +1186,10 @@ fn inspectSchedulerStatus(
         .spawn_failed, .command_failed, .invalid_output => true,
         .not_queried, .loaded, .not_found => false,
     };
+    const has_standalone_cron = (scheduler_status.installed and
+        std.mem.eql(u8, scheduler_status.persisted_surface, "standalone-cron")) or
+        (scheduler_status.loaded and
+            std.mem.eql(u8, scheduler_status.loaded_surface, "standalone-cron"));
     if (query_failed) {
         try diagnostics.append(
             allocator,
@@ -1160,7 +1206,7 @@ fn inspectSchedulerStatus(
             "persisted and loaded scheduler program arguments disagree",
             .{},
         );
-    } else if (scheduler_status.migration_required) {
+    } else if (scheduler_status.migration_required and has_standalone_cron) {
         try diagnostics.append(
             allocator,
             "scheduler-migration",
@@ -1177,6 +1223,15 @@ fn inspectSchedulerStatus(
             "scheduler-surface",
             "error",
             "same-label scheduler has unexpected program arguments",
+            .{},
+        );
+    }
+    if (scheduler_status.installed != scheduler_status.loaded) {
+        try diagnostics.append(
+            allocator,
+            "scheduler-install-load-mismatch",
+            "error",
+            "scheduler persisted and loaded presence do not match",
             .{},
         );
     }
@@ -1956,6 +2011,7 @@ test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
         .label = try allocator.dupe(u8, "com.example.custom-cron"),
         .plist_path = try allocator.dupe(u8, "/tmp/com.example.custom-cron.plist"),
         .surface = "standalone-cron",
+        .persisted_surface = "standalone-cron",
         .migration_required = true,
     };
     defer status.deinit(allocator);
@@ -1996,6 +2052,44 @@ test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
     );
     const diagnostic = parsed.value.object.get("diagnostics").?.array.items[0].object;
     try std.testing.expectEqualStrings("scheduler-migration", diagnostic.get("code").?.string);
+}
+
+test "doctor blocks persisted and loaded scheduler presence mismatch" {
+    const allocator = std.testing.allocator;
+    var status: scheduler.SchedulerStatus = .{
+        .installed = true,
+        .loaded = false,
+        .label = try allocator.dupe(u8, "com.example.scheduler"),
+        .plist_path = try allocator.dupe(u8, "/tmp/scheduler.plist"),
+        .surface = "cas-automation",
+        .persisted_surface = "cas-automation",
+        .launchctl_observation = .not_found,
+    };
+    defer status.deinit(allocator);
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+    try inspectSchedulerStatus(allocator, status, &diagnostics);
+    try std.testing.expect(diagnostics.hasError());
+    try std.testing.expectEqualStrings(
+        "scheduler-install-load-mismatch",
+        diagnostics.rows.items[0].code,
+    );
+
+    var encoded = std.Io.Writer.Allocating.init(allocator);
+    defer encoded.deinit();
+    try writeDoctorJson(
+        &encoded.writer,
+        "/tmp/codex-dev.db",
+        "/tmp/automations",
+        "/opt/homebrew/bin/codex",
+        &status,
+        &diagnostics,
+    );
+    const report = try encoded.toOwnedSlice();
+    defer allocator.free(report);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, report, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("safeToMutate").?.bool);
 }
 
 test "doctor fails closed when persisted plist conversion is unavailable" {
@@ -2060,5 +2154,42 @@ test "doctor rejects a symlinked automation row directory" {
         "unsafe-automation-directory",
         diagnostics.rows.items[0].code,
     );
+    try std.testing.expect(diagnostics.hasError());
+}
+
+test "doctor rejects symlinked and non-file automation artifacts" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.toml", .data = "outside" });
+    try tmp.dir.symLink(io, "outside.toml", "automation.toml", .{});
+    try tmp.dir.createDir(io, "memory.md", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const toml_path = try std.fs.path.join(allocator, &.{ root, "automation.toml" });
+    defer allocator.free(toml_path);
+    const memory_path = try std.fs.path.join(allocator, &.{ root, "memory.md" });
+    defer allocator.free(memory_path);
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expect(!try inspectRequiredRegularFile(
+        allocator,
+        toml_path,
+        "missing-automation-file",
+        "unsafe-automation-file",
+        &diagnostics,
+    ));
+    try std.testing.expect(!try inspectRequiredRegularFile(
+        allocator,
+        memory_path,
+        "missing-memory-file",
+        "unsafe-memory-file",
+        &diagnostics,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.rows.items.len);
+    try std.testing.expectEqualStrings("unsafe-automation-file", diagnostics.rows.items[0].code);
+    try std.testing.expectEqualStrings("unsafe-memory-file", diagnostics.rows.items[1].code);
     try std.testing.expect(diagnostics.hasError());
 }
