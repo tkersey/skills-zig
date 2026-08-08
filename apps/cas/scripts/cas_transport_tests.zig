@@ -93,7 +93,10 @@ fn serveCodeModeProtocol(
     var execute_seen = false;
 
     for (0..8) |_| {
-        const raw = try readCodeModeClientJsonAlloc(allocator, io, stream);
+        const raw = readCodeModeClientJsonAlloc(allocator, io, stream) catch |err| {
+            if (execute_seen and err == error.EndOfStream) return;
+            return err;
+        };
         defer allocator.free(raw);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
@@ -158,7 +161,7 @@ fn handleCodeModeMessage(
     }
     if (std.mem.eql(u8, method, "session/execute")) {
         try handleCodeModeExecute(state, id, request_object);
-        return true;
+        return false;
     }
     if (std.mem.eql(u8, method, "session/shutdown")) {
         try handleCodeModeShutdown(state, id, request_session_id);
