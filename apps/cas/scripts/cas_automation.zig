@@ -1535,7 +1535,7 @@ fn directoryPermissionBlocks(
     directory_path: []const u8,
     expected_code: []const u8,
 ) !bool {
-    var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{});
+    var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{ .iterate = true });
     defer directory.close(io);
     try directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
     defer ignoreError(directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)));

@@ -533,7 +533,7 @@ fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenari
         .name = scenario.asString(),
         .mode = scenario.mode(),
         .ok = false,
-        .detail = try std.fmt.allocPrint(allocator, "unexpected error: {s}", .{@errorName(err)}),
+        .detail = @errorName(err),
     };
 
     return result;
@@ -898,7 +898,11 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
             "{s}/{s}-{d}-{d}",
             .{ base, prefix, @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000), attempt },
         );
-        std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), candidate) catch |err| switch (err) {
+        std.Io.Dir.createDirAbsolute(
+            std.Io.Threaded.global_single_threaded.io(),
+            candidate,
+            @enumFromInt(0o700),
+        ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(candidate);
                 continue;
@@ -952,6 +956,17 @@ test "parseArgs accepts scenarios and retry knobs" {
     try std.testing.expectEqual(cas_hooks.HookPolicy.off, parsed.hook_policy);
     try std.testing.expectEqual(@as(u32, 500), parsed.backoff_base_ms);
     try std.testing.expectEqual(@as(u32, 7), parsed.max_retries);
+}
+
+test "makeTempRoot never aliases an existing same-second root" {
+    const first = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
+    defer std.testing.allocator.free(first);
+    defer deleteTreeAbsolute(first) catch {};
+    const second = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
+    defer std.testing.allocator.free(second);
+    defer deleteTreeAbsolute(second) catch {};
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 test "feature probe summary consumes exact live preflight rows" {
