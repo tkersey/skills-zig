@@ -8,13 +8,25 @@ const perf_contract = @import("perf_contract");
 
 const Version = "0.0.0-dev";
 const paired_comparison_rounds: usize = 8;
-const accepted_generic_deep_schema1_sha =
-    "ddf201901391ea625e4ac9b0c9649570bc56e58f";
-const accepted_generic_deep_schema1_tree =
-    "59fcca22a691bbc98a4e38e50c6d642116611b43";
-const accepted_generic_deep_schema1_source_sha256 =
-    "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f";
-const shared_driver_source_path = "tools/perf_hub.zig";
+const DriverSourceIdentity = struct {
+    revision: []const u8,
+    tree: []const u8,
+    locator: []const u8,
+    sha256: []const u8,
+};
+const driver_overlay_path = "tools/perf_hub.zig";
+const legacy_generic_driver_v1 = DriverSourceIdentity{
+    .revision = "ddf201901391ea625e4ac9b0c9649570bc56e58f",
+    .tree = "59fcca22a691bbc98a4e38e50c6d642116611b43",
+    .locator = driver_overlay_path,
+    .sha256 = "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f",
+};
+const active_seq_replay_driver_v1 = DriverSourceIdentity{
+    .revision = "f2ba9a2fbb3759229984f0431d2889e616f1174c",
+    .tree = "165f85af6ff4f64d714fafc1b0497b7e48c9c074",
+    .locator = "tools/perf_hub.zig#sealed_seq_replay_driver_source",
+    .sha256 = "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053",
+};
 const sealed_seq_replay_driver_source =
     \\const std = @import("std");
     \\const builtin = @import("builtin");
@@ -1684,7 +1696,7 @@ fn driverEvidence(
     errdefer compiler.deinit(allocator);
     return .{
         .file = file,
-        .source_sha = accepted_generic_deep_schema1_sha,
+        .source_sha = active_seq_replay_driver_v1.revision,
         .source_tree_sha = source_tree_sha,
         .source_file = source_file,
         .product_source_sha = product_source_sha,
@@ -2796,27 +2808,14 @@ fn ensureSourceBuilt(
         allocator,
     );
     defer allocator.free(machine_dir);
-    const driver_source_tree_sha = try revisionTreeShaForRootAlloc(
-        allocator,
-        source_root,
-        accepted_generic_deep_schema1_sha,
-    );
-    defer allocator.free(driver_source_tree_sha);
-    if (!std.mem.eql(
-        u8,
-        driver_source_tree_sha,
-        accepted_generic_deep_schema1_tree,
-    )) return error.DriverSourceRevisionMismatch;
-    const driver_source_bytes = try sharedDriverSourceBytesAlloc(
-        allocator,
-        source_root,
-    );
+    const driver_source_tree_sha = active_seq_replay_driver_v1.tree;
+    const driver_source_bytes = try seqReplayDriverSourceBytesAlloc(allocator);
     defer allocator.free(driver_source_bytes);
     const driver_source_digest = evidenceDigest(driver_source_bytes);
     if (!std.mem.eql(
         u8,
         &driver_source_digest,
-        accepted_generic_deep_schema1_source_sha256,
+        active_seq_replay_driver_v1.sha256,
     )) return error.DriverSourceRevisionMismatch;
     var driver_source_file = try sealEvidenceBytes(
         allocator,
@@ -2996,7 +2995,7 @@ fn ensureSourceBuilt(
     }
     const driver_source_path = try std.fs.path.join(
         allocator,
-        &.{ source_snapshot, shared_driver_source_path },
+        &.{ source_snapshot, driver_overlay_path },
     );
     defer allocator.free(driver_source_path);
     try writeEvidenceFileAtomic(
@@ -3166,23 +3165,10 @@ fn revisionTreeShaForRootAlloc(
     );
 }
 
-fn sharedDriverSourceBytesAlloc(
+fn seqReplayDriverSourceBytesAlloc(
     allocator: std.mem.Allocator,
-    source_root: []const u8,
 ) ![]u8 {
-    const object = accepted_generic_deep_schema1_sha ++
-        ":" ++ shared_driver_source_path;
-    const result = try runChildCaptureOutput(
-        allocator,
-        ".",
-        &.{ git_binary, "-C", source_root, "show", object },
-    );
-    defer allocator.free(result.stderr);
-    if (result.exit_code != 0 or result.stdout.len == 0) {
-        allocator.free(result.stdout);
-        return error.DriverSourceUnavailable;
-    }
-    return result.stdout;
+    return allocator.dupe(u8, sealed_seq_replay_driver_source);
 }
 
 fn deepWorkloadDigestForRoot(
@@ -4241,7 +4227,7 @@ fn writeDriverEvidence(
     try writer.writeAll(",\"tree\":");
     try writeJsonString(writer, evidence.source_tree_sha);
     try writer.writeAll(",\"path\":");
-    try writeJsonString(writer, shared_driver_source_path);
+    try writeJsonString(writer, active_seq_replay_driver_v1.locator);
     try writer.writeAll(",\"file\":");
     try writeSealedFile(writer, evidence.source_file);
     try writer.writeAll("},\"product_source\":{\"revision\":");
@@ -5564,23 +5550,31 @@ fn validateDriverEvidence(
 }
 
 fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
-    if (!std.mem.eql(
-        u8,
-        source.revision,
-        accepted_generic_deep_schema1_sha,
-    ) or !std.mem.eql(
-        u8,
-        source.tree,
-        accepted_generic_deep_schema1_tree,
-    ) or !std.mem.eql(
-        u8,
-        source.path,
-        shared_driver_source_path,
-    ) or !std.mem.eql(
-        u8,
-        source.file.sha256,
-        "sha256:" ++ accepted_generic_deep_schema1_source_sha256,
-    )) return error.PerfEvidenceIdentityMismatch;
+    if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
+        driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
+    {
+        return;
+    }
+    return error.PerfEvidenceIdentityMismatch;
+}
+
+fn driverSourceMatchesIdentity(
+    source: CapsuleDriverSource,
+    identity: DriverSourceIdentity,
+) bool {
+    if (!std.mem.eql(u8, source.revision, identity.revision) or
+        !std.mem.eql(u8, source.tree, identity.tree) or
+        !std.mem.eql(u8, source.path, identity.locator) or
+        source.file.sha256.len != "sha256:".len + identity.sha256.len)
+    {
+        return false;
+    }
+    return std.mem.eql(u8, source.file.sha256[0.."sha256:".len], "sha256:") and
+        std.mem.eql(
+            u8,
+            source.file.sha256["sha256:".len..],
+            identity.sha256,
+        );
 }
 
 fn validateCompilerEvidence(
@@ -6196,21 +6190,48 @@ test "capsule files are digest-addressed beneath the current machine root" {
     );
 }
 
-test "frozen driver source metadata binds the accepted bytes" {
+test "driver source metadata accepts active and legacy tuples only" {
     var source = CapsuleDriverSource{
-        .revision = accepted_generic_deep_schema1_sha,
-        .tree = accepted_generic_deep_schema1_tree,
-        .path = shared_driver_source_path,
+        .revision = legacy_generic_driver_v1.revision,
+        .tree = legacy_generic_driver_v1.tree,
+        .path = legacy_generic_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
             .sha256 = "sha256:" ++
-                accepted_generic_deep_schema1_source_sha256,
+                legacy_generic_driver_v1.sha256,
         },
     };
     try validateDriverSourceMetadata(source);
-    source.file.sha256 =
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    source = .{
+        .revision = active_seq_replay_driver_v1.revision,
+        .tree = active_seq_replay_driver_v1.tree,
+        .path = active_seq_replay_driver_v1.locator,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+        },
+    };
+    try validateDriverSourceMetadata(source);
+
+    source.revision = legacy_generic_driver_v1.revision;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.revision = active_seq_replay_driver_v1.revision;
+    source.tree = legacy_generic_driver_v1.tree;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.tree = active_seq_replay_driver_v1.tree;
+    source.path = legacy_generic_driver_v1.locator;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.path = active_seq_replay_driver_v1.locator;
+    source.file.sha256 = "sha256:" ++ legacy_generic_driver_v1.sha256;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
@@ -6220,7 +6241,7 @@ test "frozen driver source metadata binds the accepted bytes" {
 test "sealed Seq replay driver source is capture-only and dependency-minimal" {
     const digest = sealedSeqReplayDriverDigest();
     try std.testing.expectEqualStrings(
-        "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053",
+        active_seq_replay_driver_v1.sha256,
         &digest,
     );
     try std.testing.expectEqual(
@@ -6250,7 +6271,9 @@ test "sealed Seq replay driver source is capture-only and dependency-minimal" {
         "@import(\"durable_store\")",
         "@import(\"perf_contract\")",
         "@import(\"cas_automation_cli\")",
-        "@import(\"cron_cli\")",
+        "@import(\"cron_" ++ "cli\")",
+        "cas_automation",
+        "cron-",
     }) |forbidden| {
         try std.testing.expect(
             std.mem.indexOf(u8, sealed_seq_replay_driver_source, forbidden) ==

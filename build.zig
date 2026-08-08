@@ -417,9 +417,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "perf_contract", .module = core_perf_contract },
             .{ .name = "cas_automation_cli", .module = cas_automation_root },
-            // The sealed generic perf driver is intentionally pinned to a pre-cutover
-            // source revision that imports this historical module key.
-            .{ .name = "cron_cli", .module = cas_automation_root },
             .{ .name = "seq_v1_core", .module = seq_v1_core },
         },
     });
