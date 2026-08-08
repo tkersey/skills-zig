@@ -357,6 +357,7 @@ pub const Client = struct {
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     transport_kind: TransportKind,
     child: ?std.process.Child,
+    process_group_id: ?u64 = null,
     stdin_file: ?std.Io.File,
     stdout_file: ?std.Io.File,
     websocket: ?websocket_transport.Connection,
@@ -450,14 +451,23 @@ pub const Client = struct {
         );
 
         const io = opts.io;
-        const child = try std.process.spawn(io, .{
+        var child = try std.process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = opts.cwd },
             .environ_map = opts.child_environment,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
+            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
         });
+        const process_group_id: ?u64 = switch (builtin.os.tag) {
+            .windows, .wasi => null,
+            else => @intCast(child.id.?),
+        };
+        var child_owned = true;
+        errdefer if (child_owned) {
+            retireStdioChild(io, &child, process_group_id);
+        };
 
         const stdin_file = child.stdin orelse return error.ChildMissingStdin;
         const stdout_file = child.stdout orelse return error.ChildMissingStdout;
@@ -467,6 +477,7 @@ pub const Client = struct {
             .io = io,
             .transport_kind = .stdio,
             .child = child,
+            .process_group_id = process_group_id,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
             .websocket = null,
@@ -491,6 +502,7 @@ pub const Client = struct {
             .overload_retry_seed = overload_retry_seed,
             .overload_retry_telemetry = opts.overload_retry_telemetry,
         };
+        child_owned = false;
         errdefer {
             client.close();
             client.deinit();
@@ -606,8 +618,16 @@ pub const Client = struct {
 
     pub fn close(self: *Client) void {
         if (self.websocket) |*websocket| websocket.close();
+        const process_group_id = self.process_group_id;
+        self.process_group_id = null;
         if (self.child) |*child| {
-            child.kill(self.io);
+            retireStdioChild(self.io, child, process_group_id);
+        } else if (process_group_id) |group_id| {
+            websocket_transport.forceKillProcessGroup(group_id);
+            _ = websocket_transport.waitForProcessGroupExit(
+                group_id,
+                websocket_transport.owner_watchdog_shutdown_grace_ms,
+            );
         }
     }
 
@@ -1364,6 +1384,21 @@ pub const Client = struct {
     }
 };
 
+fn retireStdioChild(
+    io: std.Io,
+    child: *std.process.Child,
+    process_group_id: ?u64,
+) void {
+    if (process_group_id) |group_id| websocket_transport.forceKillProcessGroup(group_id);
+    child.kill(io);
+    if (process_group_id) |group_id| {
+        _ = websocket_transport.waitForProcessGroupExit(
+            group_id,
+            websocket_transport.owner_watchdog_shutdown_grace_ms,
+        );
+    }
+}
+
 pub fn validateClientOptions(allocator: std.mem.Allocator, opts: ClientOptions) !void {
     try validateServerRequestOptions(allocator, opts);
     try initializeCapabilities(opts).validate(allocator);
@@ -2035,8 +2070,10 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
         allocator,
         "#!/bin/sh\n" ++
             "set -eu\n" ++
-            "printf '%s' \"$$\" > '{s}'\n" ++
-            "while IFS= read -r _; do sleep 600; done\n",
+            "sleep 600 &\n" ++
+            "sleep_pid=$!\n" ++
+            "printf '%s %s\\n' \"$$\" \"$sleep_pid\" > '{s}'\n" ++
+            "while IFS= read -r _; do wait \"$sleep_pid\"; done\n",
         .{pid_path},
     );
     defer allocator.free(script);
@@ -2059,8 +2096,19 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
 
     const pid_bytes = try tmp.dir.readFileAlloc(io, "silent.pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
-    const process_id = try std.fmt.parseInt(u64, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
-    try std.testing.expect(!websocket_transport.processAlive(process_id));
+    var pid_fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
+    const shell_process_id = try std.fmt.parseInt(
+        u64,
+        pid_fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
+    const sleep_process_id = try std.fmt.parseInt(
+        u64,
+        pid_fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
+    try std.testing.expect(!websocket_transport.processAlive(shell_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(sleep_process_id));
 }
 
 test "stdio request deadline bounds a blocked write and reaps the app-server" {
@@ -2078,7 +2126,12 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
     defer allocator.free(pid_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" > '{s}'\nsleep 600\n",
+        "#!/bin/sh\n" ++
+            "set -eu\n" ++
+            "sleep 600 &\n" ++
+            "sleep_pid=$!\n" ++
+            "printf '%s %s\\n' \"$$\" \"$sleep_pid\" > '{s}'\n" ++
+            "wait \"$sleep_pid\"\n",
         .{pid_path},
     );
     defer allocator.free(script);
@@ -2105,8 +2158,19 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
 
     const pid_bytes = try tmp.dir.readFileAlloc(io, "blocked.pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
-    const process_id = try std.fmt.parseInt(u64, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
-    try std.testing.expect(!websocket_transport.processAlive(process_id));
+    var pid_fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
+    const shell_process_id = try std.fmt.parseInt(
+        u64,
+        pid_fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
+    const sleep_process_id = try std.fmt.parseInt(
+        u64,
+        pid_fields.next() orelse return error.InvalidPidFixture,
+        10,
+    );
+    try std.testing.expect(!websocket_transport.processAlive(shell_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(sleep_process_id));
 }
 
 test "unknown server request replies then records exact method and terminates" {

@@ -726,15 +726,7 @@ pub fn paginatedSessionInquiryProbe(
         "the inquiry source history could not be read through bounded pagination",
     );
     defer source_history.deinit(allocator);
-    if (!probeHistoryMatches(
-        source_history,
-        &.{
-            PaginatedForkFixture.first_turn_id,
-            PaginatedForkFixture.second_turn_id,
-            PaginatedForkFixture.active_turn_id,
-        },
-        &.{ true, true, false },
-    )) return LiveWitness.failed(
+    if (!paginatedInquirySourceMatches(source_history)) return LiveWitness.failed(
         "paginated_session_inquiry_source_shape_failed",
         "the paginated source did not preserve the exact completed and active boundaries",
     );
@@ -756,7 +748,6 @@ pub fn paginatedSessionInquiryProbe(
             "the inquiry anchor did not select the exact inclusive source boundary",
         );
     }
-
     const expected_digest = probeHistoryDigestAlloc(
         allocator,
         source_history,
@@ -770,7 +761,36 @@ pub fn paginatedSessionInquiryProbe(
         .count = keep_count,
         .digest = expected_digest,
     };
+    return paginatedInquiryForkProbe(
+        allocator,
+        client,
+        source_thread_id,
+        boundary,
+        expected_anchor,
+        keep_count,
+    );
+}
 
+fn paginatedInquirySourceMatches(source_history: ProbeHistory) bool {
+    return probeHistoryMatches(
+        source_history,
+        &.{
+            PaginatedForkFixture.first_turn_id,
+            PaginatedForkFixture.second_turn_id,
+            PaginatedForkFixture.active_turn_id,
+        },
+        &.{ true, true, false },
+    );
+}
+
+fn paginatedInquiryForkProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    source_thread_id: []const u8,
+    boundary: inquiry_anchor.Boundary,
+    expected_anchor: inquiry_anchor.AnchorIdentity,
+    keep_count: u64,
+) LiveWitness {
     const fork_params = switch (boundary.kind) {
         .before_turn_id => stringifyAnyAlloc(allocator, .{
             .threadId = source_thread_id,
@@ -808,7 +828,22 @@ pub fn paginatedSessionInquiryProbe(
             "the inquiry witness fork was not the exact unhydrated child of the source",
         );
     }
+    return paginatedInquiryForkAnchorProbe(
+        allocator,
+        client,
+        fork_id,
+        expected_anchor,
+        keep_count,
+    );
+}
 
+fn paginatedInquiryForkAnchorProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    fork_id: []const u8,
+    expected_anchor: inquiry_anchor.AnchorIdentity,
+    keep_count: u64,
+) LiveWitness {
     const observed_history = readProbeHistoryAlloc(
         allocator,
         client,
@@ -856,7 +891,6 @@ pub fn paginatedSessionInquiryProbe(
         "paginated_session_inquiry_anchor_verifier_failed",
         "the inquiry anchor verifier accepted an inexact count or digest",
     );
-
     return LiveWitness.passed();
 }
 
@@ -1278,107 +1312,139 @@ fn readProbeHistoryAlloc(
 
     var page_index: usize = 0;
     while (page_index < 4) : (page_index += 1) {
-        const params = if (cursor) |value|
-            try stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id,
-                .cursor = value,
-                .limit = @as(u32, 1),
-                .sortDirection = "asc",
-                .itemsView = "full",
-            })
-        else
-            try stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id,
-                .limit = @as(u32, 1),
-                .sortDirection = "asc",
-                .itemsView = "full",
-            });
-        defer allocator.free(params);
-        const raw = client.requestJson("thread/turns/list", params) catch |request_err| retry: {
-            if (resume_attempted or
-                !clientLastErrorIsThreadNotLoaded(allocator, client, thread_id))
-            {
-                return request_err;
-            }
-            resume_attempted = true;
-            try resumePaginatedThreadForTurnsList(allocator, client, thread_id);
-            break :retry try client.requestJson("thread/turns/list", params);
-        };
+        const raw = try requestProbeHistoryPageAlloc(
+            allocator,
+            client,
+            thread_id,
+            cursor,
+            &resume_attempted,
+        );
         defer allocator.free(raw);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-        defer parsed.deinit();
-        const root = switch (parsed.value) {
+        const next_cursor = try appendProbeHistoryPageAlloc(
+            allocator,
+            raw,
+            max_turns,
+            cursor,
+            &turn_ids,
+            &completed_boundaries,
+        );
+        if (next_cursor) |next| {
+            if (cursor) |old| allocator.free(old);
+            cursor = next;
+            continue;
+        }
+        const ids_owned = try turn_ids.toOwnedSlice(allocator);
+        errdefer {
+            for (ids_owned) |turn_id| allocator.free(turn_id);
+            allocator.free(ids_owned);
+        }
+        const completed_owned = try completed_boundaries.toOwnedSlice(allocator);
+        return .{
+            .turn_ids = ids_owned,
+            .completed_boundaries = completed_owned,
+        };
+    }
+    return error.InvalidResponse;
+}
+
+fn requestProbeHistoryPageAlloc(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    cursor: ?[]const u8,
+    resume_attempted: *bool,
+) ![]u8 {
+    const params = if (cursor) |value|
+        try stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .cursor = value,
+            .limit = @as(u32, 1),
+            .sortDirection = "asc",
+            .itemsView = "full",
+        })
+    else
+        try stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .limit = @as(u32, 1),
+            .sortDirection = "asc",
+            .itemsView = "full",
+        });
+    defer allocator.free(params);
+    return client.requestJson("thread/turns/list", params) catch |request_err| retry: {
+        if (resume_attempted.* or
+            !clientLastErrorIsThreadNotLoaded(allocator, client, thread_id))
+        {
+            return request_err;
+        }
+        resume_attempted.* = true;
+        try resumePaginatedThreadForTurnsList(allocator, client, thread_id);
+        break :retry try client.requestJson("thread/turns/list", params);
+    };
+}
+
+fn appendProbeHistoryPageAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    max_turns: usize,
+    cursor: ?[]const u8,
+    turn_ids: *std.ArrayList([]const u8),
+    completed_boundaries: *std.ArrayList(bool),
+) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const data_value = root.get("data") orelse return error.InvalidResponse;
+    const data = switch (data_value) {
+        .array => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (turn_ids.items.len + data.items.len > max_turns) return error.InvalidResponse;
+    for (data.items) |item_value| {
+        const item = switch (item_value) {
             .object => |value| value,
             else => return error.InvalidResponse,
         };
-        const data_value = root.get("data") orelse return error.InvalidResponse;
-        const data = switch (data_value) {
-            .array => |value| value,
+        const id_value = item.get("id") orelse return error.InvalidResponse;
+        const id = switch (id_value) {
+            .string => |value| value,
             else => return error.InvalidResponse,
         };
-        if (turn_ids.items.len + data.items.len > max_turns) {
-            return error.InvalidResponse;
+        for (turn_ids.items) |existing| {
+            if (std.mem.eql(u8, existing, id)) return error.InvalidResponse;
         }
-        for (data.items) |item_value| {
-            const item = switch (item_value) {
-                .object => |value| value,
-                else => return error.InvalidResponse,
-            };
-            const id_value = item.get("id") orelse return error.InvalidResponse;
-            const id = switch (id_value) {
-                .string => |value| value,
-                else => return error.InvalidResponse,
-            };
-            for (turn_ids.items) |existing| {
-                if (std.mem.eql(u8, existing, id)) return error.InvalidResponse;
-            }
-            const status_value = item.get("status") orelse return error.InvalidResponse;
-            const status = switch (status_value) {
-                .string => |value| value,
-                else => return error.InvalidResponse,
-            };
-            if (!std.mem.eql(u8, status, "completed") and
-                !std.mem.eql(u8, status, "interrupted") and
-                !std.mem.eql(u8, status, "failed") and
-                !std.mem.eql(u8, status, "inProgress"))
-            {
-                return error.InvalidResponse;
-            }
-            try turn_ids.append(allocator, try allocator.dupe(u8, id));
-            try completed_boundaries.append(
-                allocator,
-                std.mem.eql(u8, status, "completed"),
-            );
-        }
-
-        const next_cursor = if (root.get("nextCursor")) |value| switch (value) {
-            .null => null,
-            .string => |text| text,
+        const status_value = item.get("status") orelse return error.InvalidResponse;
+        const status = switch (status_value) {
+            .string => |value| value,
             else => return error.InvalidResponse,
-        } else null;
-        if (next_cursor == null) {
-            const ids_owned = try turn_ids.toOwnedSlice(allocator);
-            errdefer {
-                for (ids_owned) |turn_id| allocator.free(turn_id);
-                allocator.free(ids_owned);
-            }
-            const completed_owned = try completed_boundaries.toOwnedSlice(allocator);
-            return .{
-                .turn_ids = ids_owned,
-                .completed_boundaries = completed_owned,
-            };
-        }
-        if (data.items.len == 0 or next_cursor.?.len == 0) {
+        };
+        if (!std.mem.eql(u8, status, "completed") and
+            !std.mem.eql(u8, status, "interrupted") and
+            !std.mem.eql(u8, status, "failed") and
+            !std.mem.eql(u8, status, "inProgress"))
+        {
             return error.InvalidResponse;
         }
-        if (cursor) |current| {
-            if (std.mem.eql(u8, current, next_cursor.?)) return error.InvalidResponse;
-        }
-        const next_owned = try allocator.dupe(u8, next_cursor.?);
-        if (cursor) |old| allocator.free(old);
-        cursor = next_owned;
+        try turn_ids.append(allocator, try allocator.dupe(u8, id));
+        try completed_boundaries.append(
+            allocator,
+            std.mem.eql(u8, status, "completed"),
+        );
     }
-    return error.InvalidResponse;
+
+    const next_cursor = if (root.get("nextCursor")) |value| switch (value) {
+        .null => null,
+        .string => |text| text,
+        else => return error.InvalidResponse,
+    } else null;
+    if (next_cursor == null) return null;
+    if (data.items.len == 0 or next_cursor.?.len == 0) return error.InvalidResponse;
+    if (cursor) |current| {
+        if (std.mem.eql(u8, current, next_cursor.?)) return error.InvalidResponse;
+    }
+    return try allocator.dupe(u8, next_cursor.?);
 }
 
 fn resumePaginatedThreadForTurnsList(

@@ -6486,11 +6486,23 @@ test "shared session inquiry probe gate rejects failed or duplicate witnesses" {
 }
 
 test "resolveExecutablePathAlloc uses standard fallback paths" {
-    if (!fileExists("/opt/homebrew/bin/codex")) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const path = try resolveExecutablePathAlloc(allocator, "codex", "");
+    const path = try resolveExecutablePathAlloc(allocator, "sh", "");
     defer allocator.free(path);
-    try std.testing.expectEqualStrings("/opt/homebrew/bin/codex", path);
+
+    try std.testing.expect(fileExists(path));
+    const fallback_dirs = [_][]const u8{
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    };
+    const resolved_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var uses_declared_fallback_dir = false;
+    for (fallback_dirs) |dir| {
+        if (std.mem.eql(u8, resolved_dir, dir)) uses_declared_fallback_dir = true;
+    }
+    try std.testing.expect(uses_declared_fallback_dir);
 }
 
 test "parseFiaAnswerAlloc accepts exact FIA JSON" {

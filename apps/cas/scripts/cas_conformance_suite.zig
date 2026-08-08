@@ -763,9 +763,11 @@ fn runProductionRetryCase(
     defer allocator.free(log_path);
     const script = try retryFixtureScriptAlloc(allocator, mode, log_path);
     defer allocator.free(script);
-    var script_file = try std.Io.Dir.createFileAbsolute(io, executable, .{ .truncate = true });
-    defer script_file.close(io);
-    try script_file.writeStreamingAll(io, script);
+    {
+        var script_file = try std.Io.Dir.createFileAbsolute(io, executable, .{ .truncate = true });
+        defer script_file.close(io);
+        try script_file.writeStreamingAll(io, script);
+    }
     try std.Io.Dir.cwd().setFilePermissions(
         io,
         executable,

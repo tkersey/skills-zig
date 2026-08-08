@@ -1168,7 +1168,7 @@ fn retireProcessGroup(process_group_id: u64) void {
     }
 }
 
-fn forceKillProcessGroup(process_group_id: u64) void {
+pub fn forceKillProcessGroup(process_group_id: u64) void {
     switch (builtin.os.tag) {
         .windows, .wasi => return,
         else => {
