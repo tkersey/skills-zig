@@ -131,6 +131,34 @@ pub fn parsePlistProgramArguments(
     }
 }
 
+fn parseSchedulerPlistJson(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    expected_label: []const u8,
+    result: *std.ArrayList([]u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
+        return error.InvalidSchedulerPlist;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSchedulerPlist;
+    const label = parsed.value.object.get("Label") orelse return error.InvalidSchedulerPlist;
+    if (label != .string) return error.InvalidSchedulerPlist;
+    if (!std.mem.eql(u8, label.string, expected_label)) return error.SchedulerLabelMismatch;
+    const arguments = parsed.value.object.get("ProgramArguments") orelse
+        return error.InvalidSchedulerPlist;
+    if (arguments != .array or arguments.array.items.len > 32) {
+        return error.InvalidSchedulerPlist;
+    }
+    for (arguments.array.items) |argument| {
+        if (argument != .string) return error.InvalidSchedulerPlist;
+        const owned = try allocator.dupe(u8, argument.string);
+        result.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+}
+
 pub fn parseLaunchctlProgramArguments(
     allocator: std.mem.Allocator,
     loaded_state: []const u8,
@@ -450,10 +478,19 @@ fn readSchedulerStatusAtPath(
     const plist = try readSchedulerPlist(allocator, plist_path);
     defer if (plist) |bytes| allocator.free(bytes);
     status.installed = plist != null;
-    if (plist) |bytes| {
-        try parsePlistProgramArguments(
+    if (plist != null) {
+        const converted = try runner.run(
             allocator,
-            bytes,
+            io,
+            &.{ "plutil", "-convert", "json", "-o", "-", plist_path },
+            true,
+        );
+        defer allocator.free(converted.stdout);
+        defer allocator.free(converted.stderr);
+        try parseSchedulerPlistJson(
+            allocator,
+            converted.stdout,
+            label,
             &status.persisted_program_arguments,
         );
     }
@@ -483,7 +520,11 @@ fn readSchedulerStatusAtPath(
     return status;
 }
 
-fn requireTrustedInstallState(status: SchedulerStatus, replace: bool) !void {
+fn requireTrustedInstallState(
+    status: SchedulerStatus,
+    cas_path: []const u8,
+    replace: bool,
+) !void {
     switch (status.launchctl_observation) {
         .loaded, .not_found => {},
         .not_queried, .spawn_failed, .command_failed, .invalid_output => {
@@ -500,18 +541,20 @@ fn requireTrustedInstallState(status: SchedulerStatus, replace: bool) !void {
             .{},
         );
     }
-    if (status.installed and !std.mem.eql(u8, status.persisted_surface, "cas-automation")) {
+    if (status.installed and
+        !schedulerArgumentsMatchCas(status.persisted_program_arguments.items, cas_path))
+    {
         return userErrorFmt(
-            "refusing to replace {s} persisted scheduler without --replace",
-            .{status.persisted_surface},
+            "refusing to replace non-matching persisted scheduler without --replace",
+            .{},
         );
     }
     if (status.launchctl_observation == .loaded and
-        !std.mem.eql(u8, status.loaded_surface, "cas-automation"))
+        !schedulerArgumentsMatchCas(status.loaded_program_arguments.items, cas_path))
     {
         return userErrorFmt(
-            "refusing to replace {s} loaded scheduler without --replace",
-            .{status.loaded_surface},
+            "refusing to replace non-matching loaded scheduler without --replace",
+            .{},
         );
     }
 }
@@ -606,7 +649,7 @@ fn installSchedulerAtPaths(
         runner,
     );
     defer status.deinit(allocator);
-    try requireTrustedInstallState(status, args.replace);
+    try requireTrustedInstallState(status, cas_path, args.replace);
     try ensureSchedulerAbsent(
         allocator,
         io,
@@ -773,13 +816,13 @@ fn activateScheduler(
     runner: CommandRunner,
 ) !void {
     try runCommandChecked(allocator, io, runner, &.{ "plutil", "-lint", plist_path });
+    try runCommandChecked(allocator, io, runner, &.{ "launchctl", "enable", target });
     try runCommandChecked(
         allocator,
         io,
         runner,
         &.{ "launchctl", "bootstrap", domain, plist_path },
     );
-    try runCommandChecked(allocator, io, runner, &.{ "launchctl", "enable", target });
     try runCommandChecked(
         allocator,
         io,
@@ -1091,10 +1134,60 @@ const TestCronLoadedState =
     \\}
 ;
 
+const TestCasExtraLoadedState =
+    \\gui/501/com.example.scheduler = {
+    \\    arguments = {
+    \\        /opt/cas/bin/cas
+    \\        automation
+    \\        run-due
+    \\        --extra
+    \\    }
+    \\}
+;
+
+const TestSchedulerNotFound =
+    "Could not find service \"com.example.scheduler\" " ++
+    "in domain for user gui: 501\n";
+
 const TestCronPlist =
-    "<dict><key>ProgramArguments</key><array>" ++
+    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>" ++
+    "<key>Label</key><string>com.example.scheduler</string>" ++
+    "<key>ProgramArguments</key><array>" ++
     "<string>/opt/homebrew/bin/cron</string><string>run-due</string>" ++
-    "</array></dict>";
+    "</array></dict></plist>";
+
+const TestCasPlist =
+    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>" ++
+    "<key>Label</key><string>com.example.scheduler</string>" ++
+    "<key>ProgramArguments</key><array>" ++
+    "<string>/opt/cas/bin/cas</string><string>automation</string>" ++
+    "<string>run-due</string></array></dict></plist>";
+
+const TestCasExtraArgumentPlist =
+    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>" ++
+    "<key>Label</key><string>com.example.scheduler</string>" ++
+    "<key>ProgramArguments</key><array>" ++
+    "<string>/opt/cas/bin/cas</string><string>automation</string>" ++
+    "<string>run-due</string><string>--extra</string>" ++
+    "</array></dict></plist>";
+
+const TestCronPlistJson =
+    "{\"Label\":\"com.example.scheduler\",\"ProgramArguments\":" ++
+    "[\"/opt/homebrew/bin/cron\",\"run-due\"]}";
+
+const TestCasExtraArgumentJson =
+    "{\"Label\":\"com.example.scheduler\",\"ProgramArguments\":" ++
+    "[\"/opt/cas/bin/cas\",\"automation\",\"run-due\",\"--extra\"]}";
+
+const TestInstallSteps = [_]ScriptStep{
+    .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
+    .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
+    .{ .verb = "-lint" },
+    .{ .verb = "enable" },
+    .{ .verb = "bootstrap" },
+    .{ .verb = "kickstart" },
+    .{ .verb = "print", .stdout = TestCasLoadedState },
+};
 
 fn testPlistPath(
     allocator: std.mem.Allocator,
@@ -1118,6 +1211,52 @@ fn expectPlistPreserved(io: std.Io, tmp: *std.testing.TmpDir) !void {
     try std.testing.expectEqualStrings(TestCronPlist, contents);
 }
 
+fn expectPlistPreservedAtPath(
+    io: std.Io,
+    plist_path: []const u8,
+    expected: []const u8,
+) !void {
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        plist_path,
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings(expected, contents);
+}
+
+fn runTestSchedulerInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    log_dir: []const u8,
+    plist_path: []const u8,
+    script: *ScriptedRunner,
+) !void {
+    const args: SchedulerInstallArgs = .{
+        .label = "com.example.scheduler",
+        .interval_seconds = 300,
+        .path_value = "/usr/bin",
+        .codex_bin = "codex",
+        .replace = false,
+    };
+    try installSchedulerAtPaths(
+        allocator,
+        io,
+        args,
+        root,
+        log_dir,
+        plist_path,
+        "gui/501",
+        "gui/501/com.example.scheduler",
+        "/opt/cas/bin/cas",
+        TestCasPlist,
+        script.commandRunner(),
+    );
+    try script.expectComplete();
+}
+
 test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1126,10 +1265,10 @@ test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
     const plist_path = try testPlistPath(allocator, io, &tmp);
     defer allocator.free(plist_path);
 
-    var script = ScriptedRunner{ .steps = &.{.{
-        .verb = "print",
-        .stdout = TestCasLoadedState,
-    }} };
+    var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .stdout = TestCronPlistJson },
+        .{ .verb = "print", .stdout = TestCasLoadedState },
+    } };
     var status = try readSchedulerStatusAtPath(
         allocator,
         io,
@@ -1171,6 +1310,104 @@ test "scheduler status JSON preserves absent sources as null" {
     try std.testing.expect(object.get("loadedProgramArguments").? == .null);
     try std.testing.expect(object.get("persistedSurface").? == .null);
     try std.testing.expect(object.get("loadedSurface").? == .null);
+}
+
+test "persisted scheduler plist requires well formed XML and exact label" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "scheduler.plist" });
+    defer allocator.free(plist_path);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scheduler.plist",
+        .data = "<plist><dict><key>Label</key><string>com.example.scheduler</dict></plist>",
+    });
+    var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .exit_code = 1, .stderr = "invalid plist" },
+        .{
+            .verb = "-convert",
+            .stdout = "{\"Label\":\"other.label\",\"ProgramArguments\":[\"/bin/false\"]}",
+        },
+    } };
+    try std.testing.expectError(
+        error.ScriptedNonZero,
+        readSchedulerStatusAtPath(
+            allocator,
+            io,
+            "com.example.scheduler",
+            plist_path,
+            null,
+            script.commandRunner(),
+        ),
+    );
+    const wrong_label =
+        "<plist><dict><key>Label</key><string>other.label</string>" ++
+        "<key>ProgramArguments</key><array><string>/bin/false</string>" ++
+        "</array></dict></plist>";
+    try tmp.dir.writeFile(io, .{ .sub_path = "scheduler.plist", .data = wrong_label });
+    try std.testing.expectError(
+        error.SchedulerLabelMismatch,
+        readSchedulerStatusAtPath(
+            allocator,
+            io,
+            "com.example.scheduler",
+            plist_path,
+            null,
+            script.commandRunner(),
+        ),
+    );
+    try script.expectComplete();
+}
+
+test "install rejects extra persisted arguments before effects" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scheduler.plist",
+        .data = TestCasExtraArgumentPlist,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "scheduler.plist" });
+    defer allocator.free(plist_path);
+    const launch_agents = try std.fs.path.join(allocator, &.{ root, "LaunchAgents" });
+    defer allocator.free(launch_agents);
+    const log_dir = try std.fs.path.join(allocator, &.{ root, "Logs" });
+    defer allocator.free(log_dir);
+    var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .stdout = TestCasExtraArgumentJson },
+        .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
+    } };
+    const args: SchedulerInstallArgs = .{
+        .label = "com.example.scheduler",
+        .interval_seconds = 300,
+        .path_value = "/usr/bin",
+        .codex_bin = "codex",
+        .replace = false,
+    };
+    try std.testing.expectError(error.UserInput, installSchedulerAtPaths(
+        allocator,
+        io,
+        args,
+        launch_agents,
+        log_dir,
+        plist_path,
+        "gui/501",
+        "gui/501/com.example.scheduler",
+        "/opt/cas/bin/cas",
+        TestCasPlist,
+        script.commandRunner(),
+    ));
+    try script.expectComplete();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "LaunchAgents", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "Logs", .{}));
+    try expectPlistPreservedAtPath(io, plist_path, TestCasExtraArgumentPlist);
 }
 
 test "launchctl query distinguishes exact absence from query failures" {
@@ -1233,7 +1470,7 @@ test "scheduler status propagates launchctl query failure" {
     try script.expectComplete();
 }
 
-test "loaded standalone Cron requires explicit scheduler replacement" {
+test "loaded CAS with extra arguments requires explicit replacement" {
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -1248,7 +1485,7 @@ test "loaded standalone Cron requires explicit scheduler replacement" {
     defer allocator.free(plist_path);
     var script = ScriptedRunner{ .steps = &.{.{
         .verb = "print",
-        .stdout = TestCronLoadedState,
+        .stdout = TestCasExtraLoadedState,
     }} };
     const args: SchedulerInstallArgs = .{
         .label = "com.example.scheduler",
@@ -1350,6 +1587,42 @@ test "uninstall removes the plist only after verified launchd absence" {
         error.FileNotFound,
         tmp.dir.access(io, "scheduler.plist", .{}),
     );
+}
+
+test "scheduler install succeeds after uninstall disabled the same label" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "scheduler.plist" });
+    defer allocator.free(plist_path);
+    const log_dir = try std.fs.path.join(allocator, &.{ root, "Logs" });
+    defer allocator.free(log_dir);
+    const target = "gui/501/com.example.scheduler";
+
+    var first_install = ScriptedRunner{ .steps = &TestInstallSteps };
+    try runTestSchedulerInstall(allocator, io, root, log_dir, plist_path, &first_install);
+
+    var uninstall_script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "print", .stdout = TestCasLoadedState },
+        .{ .verb = "bootout" },
+        .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
+        .{ .verb = "disable" },
+    } };
+    try std.testing.expect(try uninstallSchedulerAtPath(
+        allocator,
+        io,
+        plist_path,
+        target,
+        uninstall_script.commandRunner(),
+    ));
+    try uninstall_script.expectComplete();
+
+    var second_install = ScriptedRunner{ .steps = &TestInstallSteps };
+    try runTestSchedulerInstall(allocator, io, root, log_dir, plist_path, &second_install);
+    try expectPlistPreservedAtPath(io, plist_path, TestCasPlist);
 }
 
 test "uninstall verification failure preserves the scheduler plist" {

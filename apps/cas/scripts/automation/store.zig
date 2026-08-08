@@ -1189,18 +1189,26 @@ fn inspectDoctorScheduler(
         return null;
     };
     var status = scheduler.readSchedulerStatus(allocator, io, label) catch |err| {
-        try diagnostics.append(
-            allocator,
-            "scheduler-status",
-            "error",
-            "scheduler state is unavailable: {s}",
-            .{@errorName(err)},
-        );
+        try appendSchedulerReadFailure(allocator, diagnostics, err);
         return null;
     };
     errdefer status.deinit(allocator);
     try inspectSchedulerStatus(allocator, status, diagnostics);
     return status;
+}
+
+fn appendSchedulerReadFailure(
+    allocator: std.mem.Allocator,
+    diagnostics: *DoctorDiagnostics,
+    err: anyerror,
+) !void {
+    try diagnostics.append(
+        allocator,
+        "scheduler-status",
+        "error",
+        "scheduler state is unavailable: {s}",
+        .{@errorName(err)},
+    );
 }
 
 fn appendDoctorInspectionError(
@@ -1959,17 +1967,11 @@ test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
     try std.testing.expectEqualStrings("scheduler-migration", diagnostic.get("code").?.string);
 }
 
-test "doctor fails closed when scheduler status is unavailable" {
+test "doctor fails closed when persisted plist conversion is unavailable" {
     const allocator = std.testing.allocator;
     var unavailable: DoctorDiagnostics = .{};
     defer unavailable.deinit(allocator);
-    try unavailable.append(
-        allocator,
-        "scheduler-status",
-        "error",
-        "scheduler state is unavailable: {s}",
-        .{"AccessDenied"},
-    );
+    try appendSchedulerReadFailure(allocator, &unavailable, error.ScriptedNonZero);
     var unavailable_encoded = std.Io.Writer.Allocating.init(allocator);
     defer unavailable_encoded.deinit();
     try writeDoctorJson(
@@ -1996,4 +1998,9 @@ test "doctor fails closed when scheduler status is unavailable" {
         "scheduler-status",
         diagnostic.get("code").?.string,
     );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diagnostic.get("detail").?.string,
+        "ScriptedNonZero",
+    ) != null);
 }
