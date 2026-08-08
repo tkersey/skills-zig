@@ -1,6 +1,7 @@
 const std = @import("std");
 const contract = @import("cas_app_server_contract");
 const proxy = @import("cas_proxy_client");
+const inquiry_anchor = @import("cas_session_inquiry_anchor");
 
 pub const ProbeStatus = enum { passed, failed, unavailable, not_applicable };
 
@@ -47,6 +48,7 @@ pub const Witnesses = struct {
     lifecycle_failure_hint: ?[]const u8 = null,
     handler_coverage_passed: bool = false,
     retry_passed: bool = false,
+    remote_code_mode_host: LiveWitness = .{},
     thread_pinning: LiveWitness = .{},
     paginated_fork: LiveWitness = .{},
     ephemeral_fork: LiveWitness = .{},
@@ -81,6 +83,17 @@ const ForkCleanup = struct {
             deleteThread(cleanup.allocator, cleanup.client, id);
             cleanup.allocator.free(id);
         }
+    }
+};
+
+const ProbeHistory = struct {
+    turn_ids: []const []const u8,
+    completed_boundaries: []const bool,
+
+    fn deinit(self: ProbeHistory, allocator: std.mem.Allocator) void {
+        for (self.turn_ids) |turn_id| allocator.free(turn_id);
+        allocator.free(self.turn_ids);
+        allocator.free(self.completed_boundaries);
     }
 };
 
@@ -123,6 +136,9 @@ pub fn buildReport(
 }
 
 fn liveWitness(id: []const u8, witnesses: Witnesses) ?LiveWitness {
+    if (std.mem.eql(u8, id, "remote-code-mode-host")) {
+        return witnesses.remote_code_mode_host;
+    }
     if (std.mem.eql(u8, id, "thread-pinning-round-trip")) return witnesses.thread_pinning;
     if (std.mem.eql(u8, id, "paginated-fork")) return witnesses.paginated_fork;
     if (std.mem.eql(u8, id, "ephemeral-fork")) return witnesses.ephemeral_fork;
@@ -198,7 +214,7 @@ fn failureHint(
 
 fn isLifecycleProbe(descriptor: contract.BehavioralProbeDescriptor) bool {
     return std.mem.eql(u8, descriptor.id, "initialize-lifecycle") or
-        descriptor.transport != null or descriptor.code_mode_host;
+        descriptor.transport != null;
 }
 
 pub fn retryKernelProbe(allocator: std.mem.Allocator) bool {
@@ -689,6 +705,161 @@ pub fn paginatedForkProbe(
     return paginatedForkExcludedTurnsProbe(allocator, client, &cleanup);
 }
 
+pub fn paginatedSessionInquiryProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+) LiveWitness {
+    const source_thread_id = PaginatedForkFixture.thread_id;
+    if (!threadHistoryModeMatches(allocator, client, source_thread_id, "paginated")) {
+        return LiveWitness.failed(
+            "paginated_session_inquiry_source_mode_failed",
+            "the inquiry source did not report paginated history",
+        );
+    }
+    const source_history = readProbeHistoryAlloc(
+        allocator,
+        client,
+        source_thread_id,
+        3,
+    ) catch return LiveWitness.failed(
+        "paginated_session_inquiry_source_read_failed",
+        "the inquiry source history could not be read through bounded pagination",
+    );
+    defer source_history.deinit(allocator);
+    if (!probeHistoryMatches(
+        source_history,
+        &.{
+            PaginatedForkFixture.first_turn_id,
+            PaginatedForkFixture.second_turn_id,
+            PaginatedForkFixture.active_turn_id,
+        },
+        &.{ true, true, false },
+    )) return LiveWitness.failed(
+        "paginated_session_inquiry_source_shape_failed",
+        "the paginated source did not preserve the exact completed and active boundaries",
+    );
+
+    const keep_count: u64 = 1;
+    const boundary = inquiry_anchor.selectBoundary(
+        source_history.turn_ids,
+        source_history.completed_boundaries,
+        keep_count,
+    ) catch return LiveWitness.failed(
+        "paginated_session_inquiry_boundary_failed",
+        "the inquiry anchor did not select an admissible completed boundary",
+    );
+    if (boundary.kind != .last_turn_id or
+        !std.mem.eql(u8, boundary.turn_id, PaginatedForkFixture.first_turn_id))
+    {
+        return LiveWitness.failed(
+            "paginated_session_inquiry_boundary_identity_failed",
+            "the inquiry anchor did not select the exact inclusive source boundary",
+        );
+    }
+
+    const expected_digest = probeHistoryDigestAlloc(
+        allocator,
+        source_history,
+        keep_count,
+    ) catch return LiveWitness.failed(
+        "paginated_session_inquiry_anchor_encode_failed",
+        "the expected inquiry anchor identity could not be encoded",
+    );
+    defer allocator.free(expected_digest);
+    const expected_anchor = inquiry_anchor.AnchorIdentity{
+        .count = keep_count,
+        .digest = expected_digest,
+    };
+
+    const fork_params = switch (boundary.kind) {
+        .before_turn_id => stringifyAnyAlloc(allocator, .{
+            .threadId = source_thread_id,
+            .beforeTurnId = boundary.turn_id,
+            .excludeTurns = true,
+        }),
+        .last_turn_id => stringifyAnyAlloc(allocator, .{
+            .threadId = source_thread_id,
+            .lastTurnId = boundary.turn_id,
+            .excludeTurns = true,
+        }),
+    } catch return LiveWitness.failed(
+        "paginated_session_inquiry_fork_encode_failed",
+        "the exact inquiry fork boundary could not be encoded",
+    );
+    defer allocator.free(fork_params);
+    const fork_json = client.requestJson("thread/fork", fork_params) catch
+        return LiveWitness.failed(
+            "paginated_session_inquiry_fork_failed",
+            "the exact excludeTurns inquiry witness fork was rejected",
+        );
+    defer allocator.free(fork_json);
+    const fork_id = forkThreadIdAlloc(allocator, fork_json) catch
+        return LiveWitness.failed(
+            "paginated_session_inquiry_fork_shape_failed",
+            "the inquiry fork response did not contain a thread id",
+        );
+    defer {
+        deleteThread(allocator, client, fork_id);
+        allocator.free(fork_id);
+    }
+    if (!forkResponseMatches(fork_json, source_thread_id, false, false, &.{})) {
+        return LiveWitness.failed(
+            "paginated_session_inquiry_fork_identity_failed",
+            "the inquiry witness fork was not the exact unhydrated child of the source",
+        );
+    }
+
+    const observed_history = readProbeHistoryAlloc(
+        allocator,
+        client,
+        fork_id,
+        keep_count,
+    ) catch return LiveWitness.failed(
+        "paginated_session_inquiry_anchor_read_failed",
+        "the forked inquiry anchor could not be read through thread/turns/list",
+    );
+    defer observed_history.deinit(allocator);
+    if (!probeHistoryMatches(
+        observed_history,
+        &.{PaginatedForkFixture.first_turn_id},
+        &.{true},
+    )) return LiveWitness.failed(
+        "paginated_session_inquiry_anchor_prefix_failed",
+        "the forked inquiry history did not preserve the exact selected prefix",
+    );
+    const observed_digest = probeHistoryDigestAlloc(
+        allocator,
+        observed_history,
+        keep_count,
+    ) catch return LiveWitness.failed(
+        "paginated_session_inquiry_anchor_encode_failed",
+        "the observed inquiry anchor identity could not be encoded",
+    );
+    defer allocator.free(observed_digest);
+    const observed_anchor = inquiry_anchor.AnchorIdentity{
+        .count = observed_history.turn_ids.len,
+        .digest = observed_digest,
+    };
+    if (!inquiry_anchor.exactAnchorMatches(expected_anchor, observed_anchor)) {
+        return LiveWitness.failed(
+            "paginated_session_inquiry_anchor_mismatch",
+            "the forked inquiry anchor count or opaque digest did not match the source",
+        );
+    }
+    if (inquiry_anchor.exactAnchorMatches(expected_anchor, .{
+        .count = expected_anchor.count + 1,
+        .digest = expected_anchor.digest,
+    }) or inquiry_anchor.exactAnchorMatches(expected_anchor, .{
+        .count = expected_anchor.count,
+        .digest = "sha256:deliberate-mismatch",
+    })) return LiveWitness.failed(
+        "paginated_session_inquiry_anchor_verifier_failed",
+        "the inquiry anchor verifier accepted an inexact count or digest",
+    );
+
+    return LiveWitness.passed();
+}
+
 fn paginatedForkBoundaryProbe(
     allocator: std.mem.Allocator,
     client: *proxy.Client,
@@ -1056,6 +1227,263 @@ fn ephemeralForkSuccessProbe(
     );
 
     return LiveWitness.passed();
+}
+
+fn threadHistoryModeMatches(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    expected_mode: []const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .includeTurns = false,
+    }) catch return false;
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/read", params) catch return false;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const thread_value = root.get("thread") orelse return false;
+    const thread = switch (thread_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    return objectStringEquals(thread, "historyMode", expected_mode);
+}
+
+fn readProbeHistoryAlloc(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    max_turns_raw: u64,
+) !ProbeHistory {
+    const max_turns = std.math.cast(usize, max_turns_raw) orelse
+        return error.InvalidResponse;
+    var turn_ids: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (turn_ids.items) |turn_id| allocator.free(turn_id);
+        turn_ids.deinit(allocator);
+    }
+    var completed_boundaries: std.ArrayList(bool) = .empty;
+    errdefer completed_boundaries.deinit(allocator);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| allocator.free(value);
+    var resume_attempted = false;
+
+    var page_index: usize = 0;
+    while (page_index < 4) : (page_index += 1) {
+        const params = if (cursor) |value|
+            try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id,
+                .cursor = value,
+                .limit = @as(u32, 1),
+                .sortDirection = "asc",
+                .itemsView = "full",
+            })
+        else
+            try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id,
+                .limit = @as(u32, 1),
+                .sortDirection = "asc",
+                .itemsView = "full",
+            });
+        defer allocator.free(params);
+        const raw = client.requestJson("thread/turns/list", params) catch |request_err| retry: {
+            if (resume_attempted or
+                !clientLastErrorIsThreadNotLoaded(allocator, client, thread_id))
+            {
+                return request_err;
+            }
+            resume_attempted = true;
+            try resumePaginatedThreadForTurnsList(allocator, client, thread_id);
+            break :retry try client.requestJson("thread/turns/list", params);
+        };
+        defer allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidResponse,
+        };
+        const data_value = root.get("data") orelse return error.InvalidResponse;
+        const data = switch (data_value) {
+            .array => |value| value,
+            else => return error.InvalidResponse,
+        };
+        if (turn_ids.items.len + data.items.len > max_turns) {
+            return error.InvalidResponse;
+        }
+        for (data.items) |item_value| {
+            const item = switch (item_value) {
+                .object => |value| value,
+                else => return error.InvalidResponse,
+            };
+            const id_value = item.get("id") orelse return error.InvalidResponse;
+            const id = switch (id_value) {
+                .string => |value| value,
+                else => return error.InvalidResponse,
+            };
+            for (turn_ids.items) |existing| {
+                if (std.mem.eql(u8, existing, id)) return error.InvalidResponse;
+            }
+            const status_value = item.get("status") orelse return error.InvalidResponse;
+            const status = switch (status_value) {
+                .string => |value| value,
+                else => return error.InvalidResponse,
+            };
+            if (!std.mem.eql(u8, status, "completed") and
+                !std.mem.eql(u8, status, "interrupted") and
+                !std.mem.eql(u8, status, "failed") and
+                !std.mem.eql(u8, status, "inProgress"))
+            {
+                return error.InvalidResponse;
+            }
+            try turn_ids.append(allocator, try allocator.dupe(u8, id));
+            try completed_boundaries.append(
+                allocator,
+                std.mem.eql(u8, status, "completed"),
+            );
+        }
+
+        const next_cursor = if (root.get("nextCursor")) |value| switch (value) {
+            .null => null,
+            .string => |text| text,
+            else => return error.InvalidResponse,
+        } else null;
+        if (next_cursor == null) {
+            const ids_owned = try turn_ids.toOwnedSlice(allocator);
+            errdefer {
+                for (ids_owned) |turn_id| allocator.free(turn_id);
+                allocator.free(ids_owned);
+            }
+            const completed_owned = try completed_boundaries.toOwnedSlice(allocator);
+            return .{
+                .turn_ids = ids_owned,
+                .completed_boundaries = completed_owned,
+            };
+        }
+        if (data.items.len == 0 or next_cursor.?.len == 0) {
+            return error.InvalidResponse;
+        }
+        if (cursor) |current| {
+            if (std.mem.eql(u8, current, next_cursor.?)) return error.InvalidResponse;
+        }
+        const next_owned = try allocator.dupe(u8, next_cursor.?);
+        if (cursor) |old| allocator.free(old);
+        cursor = next_owned;
+    }
+    return error.InvalidResponse;
+}
+
+fn resumePaginatedThreadForTurnsList(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+) !void {
+    const params = try stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .excludeTurns = true,
+    });
+    defer allocator.free(params);
+    const raw = try client.requestJson("thread/resume", params);
+    defer allocator.free(raw);
+    if (!paginatedResumeResponseMatches(allocator, raw, thread_id)) {
+        return error.InvalidResponse;
+    }
+}
+
+fn clientLastErrorIsThreadNotLoaded(
+    allocator: std.mem.Allocator,
+    client: *const proxy.Client,
+    thread_id: []const u8,
+) bool {
+    const raw = client.lastError() orelse return false;
+    const expected = std.fmt.allocPrint(
+        allocator,
+        "thread not loaded: {s}",
+        .{thread_id},
+    ) catch return false;
+    defer allocator.free(expected);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    return objectStringEquals(object, "message", expected);
+}
+
+fn paginatedResumeResponseMatches(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    expected_thread_id: []const u8,
+) bool {
+    const parsed_thread = responseThreadObject(allocator, raw) catch return false;
+    defer parsed_thread.parsed.deinit();
+    if (!objectStringEquals(parsed_thread.object, "id", expected_thread_id) or
+        !objectStringEquals(parsed_thread.object, "historyMode", "paginated"))
+    {
+        return false;
+    }
+    const turns_value = parsed_thread.object.get("turns") orelse return false;
+    const turns = switch (turns_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    return turns.items.len == 0;
+}
+
+fn probeHistoryMatches(
+    observed: ProbeHistory,
+    expected_turn_ids: []const []const u8,
+    expected_completed: []const bool,
+) bool {
+    if (observed.turn_ids.len != expected_turn_ids.len or
+        observed.completed_boundaries.len != expected_completed.len)
+    {
+        return false;
+    }
+    for (observed.turn_ids, expected_turn_ids) |actual, expected| {
+        if (!std.mem.eql(u8, actual, expected)) return false;
+    }
+    return std.mem.eql(bool, observed.completed_boundaries, expected_completed);
+}
+
+fn probeHistoryDigestAlloc(
+    allocator: std.mem.Allocator,
+    history: ProbeHistory,
+    keep_count_raw: u64,
+) ![]u8 {
+    const keep_count = std.math.cast(usize, keep_count_raw) orelse
+        return error.InvalidResponse;
+    if (history.turn_ids.len != history.completed_boundaries.len or
+        keep_count > history.turn_ids.len)
+    {
+        return error.InvalidResponse;
+    }
+    var canonical: std.Io.Writer.Allocating = .init(allocator);
+    defer canonical.deinit();
+    try canonical.writer.print("cas-session-inquiry-anchor/v1\ncount:{d}\n", .{keep_count});
+    for (
+        history.turn_ids[0..keep_count],
+        history.completed_boundaries[0..keep_count],
+    ) |turn_id, completed| {
+        try canonical.writer.print(
+            "{s}|{s}\n",
+            .{ turn_id, if (completed) "completed" else "inProgress" },
+        );
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical.written(), &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
 }
 
 fn requestFailsWithMessage(
@@ -1611,6 +2039,34 @@ test "unimplemented required profile probe fails closed" {
     try std.testing.expectEqualStrings("probe_unavailable", report.rows[13].failureCode.?);
 }
 
+test "remote code mode host requires its own live witness" {
+    const unproven = buildReport(.core, .{
+        .transport = .managed_websocket,
+        .code_mode_host = true,
+    }, .{
+        .lifecycle_passed = true,
+        .handler_coverage_passed = true,
+        .retry_passed = true,
+    });
+    try std.testing.expect(!unproven.compatible);
+    try std.testing.expectEqualStrings("passed", unproven.rows[0].status);
+    try std.testing.expectEqualStrings("remote-code-mode-host", unproven.rows[5].id);
+    try std.testing.expectEqualStrings("unavailable", unproven.rows[5].status);
+    try std.testing.expectEqualStrings("probe_unavailable", unproven.rows[5].failureCode.?);
+
+    const proven = buildReport(.core, .{
+        .transport = .managed_websocket,
+        .code_mode_host = true,
+    }, .{
+        .lifecycle_passed = true,
+        .handler_coverage_passed = true,
+        .retry_passed = true,
+        .remote_code_mode_host = LiveWitness.passed(),
+    });
+    try std.testing.expect(proven.compatible);
+    try std.testing.expectEqualStrings("passed", proven.rows[5].status);
+}
+
 test "retry kernel witness is deterministic and bounded" {
     try std.testing.expect(retryKernelProbe(std.testing.allocator));
 }
@@ -1652,6 +2108,55 @@ test "complete live witness set closes the full profile" {
         try std.testing.expectEqualStrings("passed", probe_row.status);
 }
 
+test "generic paginated fork cannot satisfy the session inquiry witness" {
+    const report = buildReport(.session_inquiry, .{ .transport = .stdio }, .{
+        .lifecycle_passed = true,
+        .handler_coverage_passed = true,
+        .retry_passed = true,
+        .paginated_fork = LiveWitness.passed(),
+        .ephemeral_fork = LiveWitness.passed(),
+        .paginated_session_inquiry = LiveWitness.failed(
+            "paginated_session_inquiry_anchor_mismatch",
+            "the exact inquiry anchor was not established",
+        ),
+    });
+    try std.testing.expect(!report.compatible);
+    try std.testing.expectEqualStrings("passed", report.rows[8].status);
+    try std.testing.expectEqualStrings("failed", report.rows[14].status);
+    try std.testing.expectEqualStrings(
+        "paginated_session_inquiry_anchor_mismatch",
+        report.rows[14].failureCode.?,
+    );
+}
+
+test "probe anchor digest binds prefix count order and completion" {
+    const allocator = std.testing.allocator;
+    const turn_ids = [_][]const u8{ "turn-1", "turn-2" };
+    const completed = [_]bool{ true, true };
+    const history = ProbeHistory{
+        .turn_ids = &turn_ids,
+        .completed_boundaries = &completed,
+    };
+    const first = try probeHistoryDigestAlloc(allocator, history, 1);
+    defer allocator.free(first);
+    const both = try probeHistoryDigestAlloc(allocator, history, 2);
+    defer allocator.free(both);
+    try std.testing.expect(!std.mem.eql(u8, first, both));
+
+    const active = [_]bool{ true, false };
+    const active_history = ProbeHistory{
+        .turn_ids = &turn_ids,
+        .completed_boundaries = &active,
+    };
+    const active_digest = try probeHistoryDigestAlloc(allocator, active_history, 2);
+    defer allocator.free(active_digest);
+    try std.testing.expect(!std.mem.eql(u8, both, active_digest));
+    try std.testing.expectError(
+        error.InvalidResponse,
+        probeHistoryDigestAlloc(allocator, history, 3),
+    );
+}
+
 test "probe response helpers require exact fields and types" {
     const allocator = std.testing.allocator;
     const id = try threadIdAlloc(allocator, "{\"thread\":{\"id\":\"thread-1\",\"isPinned\":true}}");
@@ -1675,6 +2180,22 @@ test "probe response helpers require exact fields and types" {
     const import_id = try stringFieldAlloc(allocator, "{\"importId\":\"import-1\"}", "importId");
     defer allocator.free(import_id);
     try std.testing.expectEqualStrings("import-1", import_id);
+
+    try std.testing.expect(paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-other\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[{}]}}",
+        "thread-paginated",
+    ));
 }
 
 test "pin list parsing distinguishes absence from the opposite state" {

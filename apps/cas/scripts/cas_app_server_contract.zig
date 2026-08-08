@@ -1845,8 +1845,7 @@ fn inspectShapes(
             try appendUnique(allocator, failures, id);
             continue;
         };
-        if (!schemaHasKind(node.*, expected_kind) or
-            schemaIsNullable(node.*) != expected_nullable or
+        if (!schemaKindIsCompatible(node.*, expected_kind, expected_nullable) or
             !requiredNamesPresent(shape, node.*) or !enumValuesPresent(shape, node.*))
         {
             try appendUnique(allocator, failures, id);
@@ -1944,6 +1943,99 @@ fn schemaHasKind(value: std.json.Value, expected: []const u8) bool {
     };
     return unionHasKind(object.get("anyOf"), expected) or
         unionHasKind(object.get("oneOf"), expected);
+}
+
+fn schemaKindIsCompatible(
+    value: std.json.Value,
+    expected: []const u8,
+    nullable: bool,
+) bool {
+    if (!schemaHasKind(value, expected) or schemaIsNullable(value) != nullable) return false;
+    if (!isScalarKind(expected)) return true;
+
+    const object = switch (value) {
+        .object => |item| item,
+        else => return false,
+    };
+    if (object.get("type")) |type_value| {
+        return typeHasOnlyExpectedScalarKind(type_value, expected, nullable);
+    }
+
+    var saw_union = false;
+    for ([_][]const u8{ "anyOf", "oneOf" }) |union_name| {
+        const union_value = object.get(union_name) orelse continue;
+        saw_union = true;
+        if (!unionHasOnlyExpectedScalarKind(union_value, expected, nullable)) return false;
+    }
+    return saw_union;
+}
+
+fn isScalarKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "boolean") or
+        std.mem.eql(u8, kind, "integer") or
+        std.mem.eql(u8, kind, "number") or
+        std.mem.eql(u8, kind, "string");
+}
+
+fn typeHasOnlyExpectedScalarKind(
+    type_value: std.json.Value,
+    expected: []const u8,
+    nullable: bool,
+) bool {
+    return switch (type_value) {
+        .string => |kind| std.mem.eql(u8, kind, expected) and !nullable,
+        .array => |kinds| blk: {
+            var saw_expected = false;
+            var saw_null = false;
+            for (kinds.items) |kind_value| {
+                const kind = switch (kind_value) {
+                    .string => |text| text,
+                    else => break :blk false,
+                };
+                if (std.mem.eql(u8, kind, expected)) {
+                    saw_expected = true;
+                } else if (std.mem.eql(u8, kind, "null")) {
+                    saw_null = true;
+                } else {
+                    break :blk false;
+                }
+            }
+            break :blk saw_expected and saw_null == nullable;
+        },
+        else => false,
+    };
+}
+
+fn unionHasOnlyExpectedScalarKind(
+    value: std.json.Value,
+    expected: []const u8,
+    nullable: bool,
+) bool {
+    const variants = switch (value) {
+        .array => |items| items,
+        else => return false,
+    };
+    var saw_expected = false;
+    var saw_null = false;
+    for (variants.items) |variant| {
+        const object = switch (variant) {
+            .object => |item| item,
+            else => return false,
+        };
+        const type_value = object.get("type") orelse return false;
+        const kind = switch (type_value) {
+            .string => |text| text,
+            else => return false,
+        };
+        if (std.mem.eql(u8, kind, expected)) {
+            saw_expected = true;
+        } else if (std.mem.eql(u8, kind, "null")) {
+            saw_null = true;
+        } else {
+            return false;
+        }
+    }
+    return saw_expected and saw_null == nullable;
 }
 
 fn unionHasRef(value: ?std.json.Value) bool {
@@ -2608,6 +2700,32 @@ test "required shape kind and nullability drift are incompatible" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
     try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
+}
+
+test "required scalar shape rejects an additive union kind" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+    var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+    defer bundles.deinit(std.testing.allocator);
+    const widened = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        stable_shapes,
+        "\"isPinned\":{\"type\":\"boolean\",\"future\":true}",
+        "\"isPinned\":{\"type\":[\"boolean\",\"string\"],\"future\":true}",
+    );
+    defer std.testing.allocator.free(widened);
+    var report = try inspectTestBundles(
+        std.testing.allocator,
+        &baseline.value,
+        &bundles,
+        widened,
+        experimental_shapes,
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Status.incompatible, report.status);
+    try std.testing.expectEqual(@as(usize, 1), report.shape_failures.items.len);
+    try std.testing.expectEqualStrings("thread-is-pinned", report.shape_failures.items[0]);
 }
 
 test "review target branch and commit identity remain strings" {

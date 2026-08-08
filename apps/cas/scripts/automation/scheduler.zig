@@ -874,11 +874,22 @@ pub fn cmdSchedulerUninstall(
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    if (existed) {
+    if (args.json) {
+        try writeSchedulerUninstallJson(stdout, args.label, existed);
+        try stdout.writeByte('\n');
+    } else if (existed) {
         try stdout.print("stopped and removed: {s}\n", .{args.label});
     } else {
         try stdout.print("already absent: {s}\n", .{args.label});
     }
+}
+
+fn writeSchedulerUninstallJson(writer: anytype, label: []const u8, removed: bool) !void {
+    try writer.writeAll("{\"schema\":\"cas-automation-scheduler-uninstall/v1\",\"label\":");
+    try output.jsonWriteString(writer, label);
+    try writer.writeAll(",\"removed\":");
+    try writer.writeAll(if (removed) "true" else "false");
+    try writer.writeByte('}');
 }
 
 fn uninstallSchedulerAtPath(
@@ -931,18 +942,18 @@ fn uninstallSchedulerAtPath(
         &.{ "launchctl", "disable", target },
     );
 
-    var existed = true;
+    const removed = status.installed or status.loaded;
     std.Io.Dir.cwd().deleteFile(
         std.Io.Threaded.global_single_threaded.io(),
         plist_path,
     ) catch |err| switch (err) {
-        error.FileNotFound => existed = false,
+        error.FileNotFound => {},
         else => return userErrorFmt(
             "failed to remove plist ({s}): {s}",
             .{ plist_path, @errorName(err) },
         ),
     };
-    return existed;
+    return removed;
 }
 
 pub fn cmdSchedulerStatus(
@@ -1078,6 +1089,7 @@ fn envString(key: [:0]const u8) ?[]const u8 {
 
 const ScriptStep = struct {
     verb: []const u8,
+    argv: ?[]const []const u8 = null,
     exit_code: u8 = 0,
     stdout: []const u8 = "",
     stderr: []const u8 = "",
@@ -1108,6 +1120,14 @@ const ScriptedRunner = struct {
         const step = self.steps[self.next_step];
         self.next_step += 1;
         if (!std.mem.eql(u8, argv[1], step.verb)) return error.UnexpectedScriptCommand;
+        if (step.argv) |expected| {
+            if (argv.len != expected.len) return error.UnexpectedScriptCommand;
+            for (argv, expected) |actual_arg, expected_arg| {
+                if (!std.mem.eql(u8, actual_arg, expected_arg)) {
+                    return error.UnexpectedScriptCommand;
+                }
+            }
+        }
         if (step.spawn_error) |err| return err;
         if (fail_on_nonzero and step.exit_code != 0) return error.ScriptedNonZero;
         const stdout = try allocator.dupe(u8, step.stdout);
@@ -1341,6 +1361,22 @@ test "scheduler status JSON preserves absent sources as null" {
     try std.testing.expect(object.get("loadedSurface").? == .null);
 }
 
+test "scheduler uninstall JSON reports its exact result contract" {
+    const allocator = std.testing.allocator;
+    var encoded = std.Io.Writer.Allocating.init(allocator);
+    defer encoded.deinit();
+    try writeSchedulerUninstallJson(
+        &encoded.writer,
+        "com.example.scheduler",
+        true,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"cas-automation-scheduler-uninstall/v1\"," ++
+            "\"label\":\"com.example.scheduler\",\"removed\":true}",
+        encoded.written(),
+    );
+}
+
 test "persisted scheduler plist requires well formed XML and exact label" {
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1544,6 +1580,77 @@ test "loaded CAS with extra arguments requires explicit replacement" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "Logs", .{}));
 }
 
+test "replace adopts the exact same-label standalone Cron scheduler" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "scheduler.plist" });
+    defer allocator.free(plist_path);
+    const log_dir = try std.fs.path.join(allocator, &.{ root, "Logs" });
+    defer allocator.free(log_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "scheduler.plist", .data = TestCronPlist });
+
+    const target = "gui/501/com.example.scheduler";
+    const domain = "gui/501";
+    const convert_argv = [_][]const u8{
+        "plutil",
+        "-convert",
+        "json",
+        "-o",
+        "-",
+        plist_path,
+    };
+    const initial_print_argv = [_][]const u8{ "launchctl", "print", target };
+    const bootout_argv = [_][]const u8{ "launchctl", "bootout", target };
+    const verify_absent_argv = [_][]const u8{ "launchctl", "print", target };
+    const lint_argv = [_][]const u8{ "plutil", "-lint", plist_path };
+    const enable_argv = [_][]const u8{ "launchctl", "enable", target };
+    const bootstrap_argv = [_][]const u8{ "launchctl", "bootstrap", domain, plist_path };
+    const kickstart_argv = [_][]const u8{ "launchctl", "kickstart", "-k", target };
+    const final_print_argv = [_][]const u8{ "launchctl", "print", target };
+    var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "-convert", .argv = &convert_argv, .stdout = TestCronPlistJson },
+        .{ .verb = "print", .argv = &initial_print_argv, .stdout = TestCronLoadedState },
+        .{ .verb = "bootout", .argv = &bootout_argv },
+        .{
+            .verb = "print",
+            .argv = &verify_absent_argv,
+            .exit_code = 113,
+            .stderr = TestSchedulerNotFound,
+        },
+        .{ .verb = "-lint", .argv = &lint_argv },
+        .{ .verb = "enable", .argv = &enable_argv },
+        .{ .verb = "bootstrap", .argv = &bootstrap_argv },
+        .{ .verb = "kickstart", .argv = &kickstart_argv },
+        .{ .verb = "print", .argv = &final_print_argv, .stdout = TestCasLoadedState },
+    } };
+    const args: SchedulerInstallArgs = .{
+        .label = "com.example.scheduler",
+        .interval_seconds = 300,
+        .path_value = "/usr/bin",
+        .codex_bin = "codex",
+        .replace = true,
+    };
+    try installSchedulerAtPaths(
+        allocator,
+        io,
+        args,
+        root,
+        log_dir,
+        plist_path,
+        domain,
+        target,
+        "/opt/cas/bin/cas",
+        TestCasPlist,
+        script.commandRunner(),
+    );
+    try script.expectComplete();
+    try expectPlistPreservedAtPath(io, plist_path, TestCasPlist);
+}
+
 test "failed or unverified bootout preserves the scheduler plist" {
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1618,6 +1725,32 @@ test "uninstall removes the plist only after verified launchd absence" {
         error.FileNotFound,
         tmp.dir.access(io, "scheduler.plist", .{}),
     );
+}
+
+test "uninstall reports a loaded-only scheduler as removed" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "missing.plist" });
+    defer allocator.free(plist_path);
+    var script = ScriptedRunner{ .steps = &.{
+        .{ .verb = "print", .stdout = TestCasLoadedState },
+        .{ .verb = "bootout" },
+        .{ .verb = "print", .exit_code = 113, .stderr = TestSchedulerNotFound },
+        .{ .verb = "disable" },
+    } };
+    try std.testing.expect(try uninstallSchedulerAtPath(
+        allocator,
+        io,
+        "com.example.scheduler",
+        plist_path,
+        "gui/501/com.example.scheduler",
+        script.commandRunner(),
+    ));
+    try script.expectComplete();
 }
 
 test "uninstall rejects a persisted plist with the wrong label before effects" {

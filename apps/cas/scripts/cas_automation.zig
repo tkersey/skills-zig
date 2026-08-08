@@ -1709,6 +1709,64 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
     try std.testing.expect(saw_skipped);
 }
 
+test "doctor emits blocked JSON when the automation root is a regular file" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "automations", .data = "not a directory\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
+    defer alloc.free(db_path);
+    const automation_root = try std.fs.path.join(alloc, &.{ root, "automations" });
+    defer alloc.free(automation_root);
+    const report_path = try std.fs.path.join(alloc, &.{ root, "doctor.json" });
+    defer alloc.free(report_path);
+
+    {
+        var db = try Db.open(alloc, db_path);
+        defer db.close();
+        try createTestSchema(alloc, &db);
+    }
+
+    automation_files.setAutomationRootOverride(automation_root);
+    defer automation_files.setAutomationRootOverride(null);
+    {
+        const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
+        if (saved_fd < 0) return error.SystemResources;
+        var report_file = try std.Io.Dir.cwd().createFile(io, report_path, .{});
+        defer {
+            _ = std.c.dup2(saved_fd, std.posix.STDOUT_FILENO);
+            _ = std.c.close(saved_fd);
+            report_file.close(io);
+        }
+        if (std.c.dup2(report_file.handle, std.posix.STDOUT_FILENO) < 0) {
+            return error.SystemResources;
+        }
+        try cmdDoctor(alloc, io, db_path, .{ .json = true });
+    }
+
+    const report = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        report_path,
+        alloc,
+        .limited(2 * 1024 * 1024),
+    );
+    defer alloc.free(report);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, report, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("safeToMutate").?.bool);
+    var saw_root_diagnostic = false;
+    for (parsed.value.object.get("diagnostics").?.array.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.object.get("code").?.string, "automation-root")) {
+            saw_root_diagnostic = true;
+        }
+    }
+    try std.testing.expect(saw_root_diagnostic);
+}
+
 test "transaction rollback preserves the pre-mutation row" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1963,6 +2021,16 @@ test "parseSchedulerCommand recognizes exported scheduler actions" {
         try std.testing.expectEqual(def.command, parseSchedulerCommand(def.name));
     }
     try std.testing.expectEqual(SchedulerCommand.unknown, parseSchedulerCommand("bogus"));
+}
+
+test "scheduler label parser retains JSON output selection" {
+    const parsed = try parseSchedulerLabelArgs(&.{
+        "--label",
+        "com.example.scheduler",
+        "--json",
+    });
+    try std.testing.expectEqualStrings("com.example.scheduler", parsed.label);
+    try std.testing.expect(parsed.json);
 }
 
 test "doctor CLI keeps scheduler identity environment-only" {

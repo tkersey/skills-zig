@@ -24,6 +24,14 @@ const Usage =
 const Action = enum { schema, preflight };
 
 const pinning_probe_thread_id = "019dd901-0000-7000-8000-000000000146";
+const internal_model_fixture_marker = "CAS_INTERNAL_CODE_MODE_MODEL_FIXTURE";
+const internal_model_fixture_marker_value = "owner-probe-v1";
+const internal_model_fixture_ready_path = "CAS_INTERNAL_CODE_MODE_MODEL_READY_PATH";
+const internal_model_fixture_evidence_path = "CAS_INTERNAL_CODE_MODE_MODEL_EVIDENCE_PATH";
+const internal_model_fixture_nonce = "CAS_INTERNAL_CODE_MODE_MODEL_NONCE";
+const code_mode_probe_timeout_ms: i64 = 15_000;
+const max_model_request_bytes: usize = 8 * 1024 * 1024;
+const max_model_fixture_requests: usize = 8;
 
 const Options = struct {
     action: Action,
@@ -50,8 +58,69 @@ const Seen = struct {
     json: bool = false,
 };
 
+const InternalModelFixtureOptions = struct {
+    ready_path: []const u8,
+    evidence_path: []const u8,
+    nonce: []const u8,
+};
+
+fn internalModelFixtureOptions(
+    argv: []const []const u8,
+    environment: *const std.process.Environ.Map,
+) !?InternalModelFixtureOptions {
+    if (argv.len != 1) return null;
+    const marker = environment.get(internal_model_fixture_marker) orelse return null;
+    if (!std.mem.eql(u8, marker, internal_model_fixture_marker_value)) {
+        return error.InvalidInternalFixtureEnvironment;
+    }
+    const ready_path = environment.get(internal_model_fixture_ready_path) orelse
+        return error.InvalidInternalFixtureEnvironment;
+    const evidence_path = environment.get(internal_model_fixture_evidence_path) orelse
+        return error.InvalidInternalFixtureEnvironment;
+    const nonce = environment.get(internal_model_fixture_nonce) orelse
+        return error.InvalidInternalFixtureEnvironment;
+    if (!validInternalFixturePath(ready_path) or
+        !validInternalFixturePath(evidence_path) or
+        !validCodeModeProbeNonce(nonce))
+    {
+        return error.InvalidInternalFixtureEnvironment;
+    }
+    return .{
+        .ready_path = ready_path,
+        .evidence_path = evidence_path,
+        .nonce = nonce,
+    };
+}
+
+fn validInternalFixturePath(path: []const u8) bool {
+    return path.len > 0 and path.len <= std.fs.max_path_bytes;
+}
+
+fn validCodeModeProbeNonce(nonce: []const u8) bool {
+    const prefix = "CAS_CODE_MODE_PROBE_";
+    if (nonce.len <= prefix.len or nonce.len > 64 or
+        !std.mem.startsWith(u8, nonce, prefix))
+    {
+        return false;
+    }
+    for (nonce[prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
 pub fn main(init: std.process.Init) void {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch |err| fatal(err, false);
+    const fixture = internalModelFixtureOptions(argv, init.environ_map) catch |err|
+        fatal(err, false);
+    if (fixture) |options| {
+        serveInternalModelFixture(
+            init.gpa,
+            init.io,
+            options.ready_path,
+            options.evidence_path,
+            options.nonce,
+        ) catch |err| fatal(err, false);
+        return;
+    }
     const options = parseArgs(argv[1..]) catch |err| fatal(err, jsonRequested(argv[1..]));
     const compatible = run(init.gpa, init.io, init.environ_map, options) catch |err|
         fatal(err, options.json);
@@ -131,6 +200,7 @@ const ProbeState = struct {
     lifecycle_passed: bool = false,
     lifecycle_failure_code: ?[]const u8 = null,
     lifecycle_failure_hint: ?[]const u8 = null,
+    remote_code_mode_host: probes.LiveWitness = .{},
     endpoint_identity: ?[]u8 = null,
     endpoint_runtime: ?EndpointRuntimeIdentity = null,
     thread_pinning: probes.LiveWitness = .{},
@@ -303,6 +373,7 @@ fn probeInputs(
         .lifecycle_failure_hint = state.lifecycle_failure_hint,
         .handler_coverage_passed = handler_coverage_passed,
         .retry_passed = probes.retryKernelProbe(allocator),
+        .remote_code_mode_host = state.remote_code_mode_host,
         .thread_pinning = state.thread_pinning,
         .paginated_fork = state.paginated_fork,
         .ephemeral_fork = state.ephemeral_fork,
@@ -338,6 +409,23 @@ fn collectProbeState(
             validated_transport,
             schemas,
         );
+        if (code_mode_host) |host| {
+            state.remote_code_mode_host = if (state.lifecycle_passed)
+                codeModeHostOwnerProbe(
+                    allocator,
+                    io,
+                    environment,
+                    cache_root,
+                    cwd,
+                    schemas.executable.resolved_path,
+                    host,
+                )
+            else
+                probes.LiveWitness.failed(
+                    "code_mode_host_lifecycle_failed",
+                    "the exact Codex child did not complete app-server initialization",
+                );
+        }
     }
     if (options.action == .preflight and options.profile != .core and state.lifecycle_passed) {
         if (externalEndpointTransport(state.selected_transport)) {
@@ -354,6 +442,716 @@ fn collectProbeState(
         }
     }
     return state;
+}
+
+fn codeModeHostOwnerProbe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    cache_root: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+    host: *const proxy.app_server_launch.CodeModeHost,
+) probes.LiveWitness {
+    const observed = codeModeHostOwnerProbeFallible(
+        allocator,
+        io,
+        parent_environment,
+        cache_root,
+        cwd,
+        codex_path,
+        host,
+    ) catch |err| return switch (err) {
+        error.ModelFixtureTimedOut, error.ConnectionTimedOut => probes.LiveWitness.failed(
+            "code_mode_host_connection_failed",
+            "the exact Codex child did not complete the nonce-bound Code Mode " ++
+                "exchange before the bounded deadline",
+        ),
+        else => probes.LiveWitness.failed(
+            "code_mode_host_probe_failed",
+            @errorName(err),
+        ),
+    };
+    if (!observed) return probes.LiveWitness.failed(
+        "code_mode_host_connection_failed",
+        "the exact Codex child did not return the nonce through the selected " ++
+            "Code Mode host with local fallback disabled",
+    );
+    return probes.LiveWitness.passed();
+}
+
+fn codeModeHostOwnerProbeFallible(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    cache_root: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+    host: *const proxy.app_server_launch.CodeModeHost,
+) !bool {
+    const now: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    var nonce_buffer: [64]u8 = undefined;
+    const nonce = try std.fmt.bufPrint(
+        &nonce_buffer,
+        "CAS_CODE_MODE_PROBE_{x}",
+        .{now},
+    );
+    const probe_root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/code-mode-owner-{x}",
+        .{ cache_root, now },
+    );
+    defer allocator.free(probe_root);
+    try std.Io.Dir.cwd().createDir(io, probe_root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, probe_root) catch |err| ignoreError(err);
+
+    return codeModeHostOwnerProbeInRoot(
+        allocator,
+        io,
+        parent_environment,
+        probe_root,
+        cwd,
+        codex_path,
+        host,
+        nonce,
+    );
+}
+
+fn codeModeHostOwnerProbeInRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    probe_root: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+    host: *const proxy.app_server_launch.CodeModeHost,
+    nonce: []const u8,
+) !bool {
+    const ready_path = try std.fs.path.join(allocator, &.{ probe_root, "model.ready" });
+    defer allocator.free(ready_path);
+    const evidence_path = try std.fs.path.join(allocator, &.{ probe_root, "model.evidence.json" });
+    defer allocator.free(evidence_path);
+    const codex_home = try std.fs.path.join(allocator, &.{ probe_root, "codex-home" });
+    defer allocator.free(codex_home);
+    try std.Io.Dir.cwd().createDir(io, codex_home, .default_dir);
+    const missing_host = try std.fs.path.join(
+        allocator,
+        &.{ probe_root, "selected-host-flag-was-not-forwarded" },
+    );
+    defer allocator.free(missing_host);
+
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_path);
+    var model_fixture = try spawnInternalModelFixture(
+        allocator,
+        io,
+        parent_environment,
+        self_path,
+        cwd,
+        ready_path,
+        evidence_path,
+        nonce,
+    );
+    var model_fixture_running = true;
+    defer if (model_fixture_running) model_fixture.kill(io);
+
+    try configureCodeModeOwnerProbe(allocator, io, ready_path, codex_home);
+
+    var child_environment = try codeModeProbeEnvironment(
+        allocator,
+        parent_environment,
+        codex_home,
+        missing_host,
+    );
+    defer child_environment.deinit();
+    const observed = try runCodeModeOwnerTurn(
+        allocator,
+        io,
+        cwd,
+        codex_path,
+        host,
+        &child_environment,
+        evidence_path,
+    );
+    const term = try model_fixture.wait(io);
+    model_fixture_running = false;
+    if (term != .exited or term.exited != 0) return error.ModelFixtureFailed;
+    return observed;
+}
+
+fn configureCodeModeOwnerProbe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ready_path: []const u8,
+    codex_home: []const u8,
+) !void {
+    const model_base_url = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        ready_path,
+        1024,
+        5_000,
+    );
+    defer allocator.free(model_base_url);
+    try createCodeModeOwnerProbeConfig(
+        allocator,
+        io,
+        codex_home,
+        std.mem.trim(u8, model_base_url, " \t\r\n"),
+    );
+}
+
+fn spawnInternalModelFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    self_path: []const u8,
+    cwd: []const u8,
+    ready_path: []const u8,
+    evidence_path: []const u8,
+    nonce: []const u8,
+) !std.process.Child {
+    var environment = try parent_environment.clone(allocator);
+    defer environment.deinit();
+    try environment.put(
+        internal_model_fixture_marker,
+        internal_model_fixture_marker_value,
+    );
+    try environment.put(internal_model_fixture_ready_path, ready_path);
+    try environment.put(internal_model_fixture_evidence_path, evidence_path);
+    try environment.put(internal_model_fixture_nonce, nonce);
+    return std.process.spawn(io, .{
+        .argv = &.{self_path},
+        .cwd = .{ .path = cwd },
+        .environ_map = &environment,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+}
+
+fn codeModeProbeEnvironment(
+    allocator: std.mem.Allocator,
+    parent_environment: *const std.process.Environ.Map,
+    codex_home: []const u8,
+    missing_host: []const u8,
+) !std.process.Environ.Map {
+    var environment = try parent_environment.clone(allocator);
+    errdefer environment.deinit();
+    try environment.put("CODEX_HOME", codex_home);
+    try environment.put("CODEX_CODE_MODE_HOST_PATH", missing_host);
+    _ = environment.swapRemove("OPENAI_API_KEY");
+    _ = environment.swapRemove("CODEX_API_KEY");
+    _ = environment.swapRemove("OPENAI_ACCESS_TOKEN");
+    _ = environment.swapRemove("OPENAI_ORG_ID");
+    _ = environment.swapRemove("OPENAI_PROJECT_ID");
+    return environment;
+}
+
+fn runCodeModeOwnerTurn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    codex_path: []const u8,
+    host: *const proxy.app_server_launch.CodeModeHost,
+    child_environment: *const std.process.Environ.Map,
+    evidence_path: []const u8,
+) !bool {
+    var client = try proxy.Client.start(allocator, .{
+        .cwd = cwd,
+        .io = io,
+        .codex_path = codex_path,
+        .client_name = "cas-code-mode-host-probe",
+        .client_title = "CAS Code Mode Host Probe",
+        .client_version = app_meta.version,
+        .transport = .stdio,
+        .code_mode_host = host,
+        .read_only = true,
+        .child_environment = child_environment,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+    const thread_params = try stringifyJsonAlloc(allocator, .{
+        .cwd = cwd,
+        .experimentalRawEvents = false,
+        .ephemeral = true,
+        .approvalPolicy = "never",
+        .sandbox = "read-only",
+        .runtimeWorkspaceRoots = &[_][]const u8{},
+    });
+    defer allocator.free(thread_params);
+    const thread_json = try client.requestJson("thread/start", thread_params);
+    defer allocator.free(thread_json);
+    const thread_id = try responseThreadIdAlloc(allocator, thread_json);
+    defer allocator.free(thread_id);
+    const turn_params = try stringifyJsonAlloc(allocator, .{
+        .threadId = thread_id,
+        .input = [_]struct { type: []const u8, text: []const u8 }{.{
+            .type = "text",
+            .text = "Run the single available Code Mode exec probe now.",
+        }},
+        .approvalPolicy = "never",
+        .sandbox = "read-only",
+        .model = "gpt-5.4",
+        .runtimeWorkspaceRoots = &[_][]const u8{},
+    });
+    defer allocator.free(turn_params);
+    const turn_json = try client.requestJson("turn/start", turn_params);
+    defer allocator.free(turn_json);
+    const evidence = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        evidence_path,
+        4096,
+        code_mode_probe_timeout_ms,
+    );
+    defer allocator.free(evidence);
+    return modelEvidencePassed(allocator, evidence);
+}
+
+fn createCodeModeOwnerProbeConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    codex_home: []const u8,
+    model_base_url: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ codex_home, "config.toml" });
+    defer allocator.free(path);
+    const contents = try std.fmt.allocPrint(
+        allocator,
+        "model = \"gpt-5.4\"\n" ++
+            "model_provider = \"cas_code_mode_probe\"\n" ++
+            "\n" ++
+            "[features]\n" ++
+            "code_mode = true\n" ++
+            "code_mode_only = true\n" ++
+            "\n" ++
+            "[features.code_mode_host]\n" ++
+            "enabled = true\n" ++
+            "disable_in_process_fallback = true\n" ++
+            "\n" ++
+            "[model_providers.cas_code_mode_probe]\n" ++
+            "name = \"CAS Code Mode Probe\"\n" ++
+            "base_url = \"{s}\"\n" ++
+            "wire_api = \"responses\"\n" ++
+            "requires_openai_auth = false\n" ++
+            "request_max_retries = 0\n" ++
+            "stream_max_retries = 0\n",
+        .{model_base_url},
+    );
+    defer allocator.free(contents);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+}
+
+fn stringifyJsonAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try std.json.Stringify.value(value, .{}, &output.writer);
+    return output.toOwnedSlice();
+}
+
+fn responseThreadIdAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidThreadStartResponse,
+    };
+    const thread_value = root.get("thread") orelse return error.InvalidThreadStartResponse;
+    const thread = switch (thread_value) {
+        .object => |value| value,
+        else => return error.InvalidThreadStartResponse,
+    };
+    const id_value = thread.get("id") orelse return error.InvalidThreadStartResponse;
+    return switch (id_value) {
+        .string => |value| allocator.dupe(u8, value),
+        else => error.InvalidThreadStartResponse,
+    };
+}
+
+fn waitForBoundedFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    max_bytes: usize,
+    timeout_ms: i64,
+) ![]u8 {
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    while (true) { // tiger: event-loop -- bounded by timeout_ms.
+        if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
+            return std.Io.Dir.cwd().readFileAlloc(
+                io,
+                path,
+                allocator,
+                .limited(max_bytes),
+            );
+        } else |_| {}
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+        if (now_ms - started_ms >= timeout_ms) return error.ModelFixtureTimedOut;
+        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+    }
+}
+
+fn modelEvidencePassed(allocator: std.mem.Allocator, raw: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidModelFixtureEvidence,
+    };
+    const status_value = root.get("status") orelse return error.InvalidModelFixtureEvidence;
+    return switch (status_value) {
+        .string => |value| std.mem.eql(u8, value, "passed"),
+        else => error.InvalidModelFixtureEvidence,
+    };
+}
+
+const RawHttpRequest = struct {
+    bytes: []u8,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+
+    fn deinit(self: *RawHttpRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+fn serveInternalModelFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ready_path: []const u8,
+    evidence_path: []const u8,
+    nonce: []const u8,
+) !void {
+    var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const base_url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/v1",
+        .{listener.socket.address.getPort()},
+    );
+    defer allocator.free(base_url);
+    try writeAtomicFileAlloc(allocator, io, ready_path, base_url);
+
+    var responses_seen: usize = 0;
+    for (0..max_model_fixture_requests) |_| {
+        var stream = try listener.accept(io);
+        defer stream.close(io);
+        var request = try readHttpRequestAlloc(allocator, io, &stream);
+        defer request.deinit(allocator);
+
+        const complete = try handleInternalModelRequest(
+            allocator,
+            io,
+            &stream,
+            &request,
+            evidence_path,
+            nonce,
+            &responses_seen,
+        );
+        if (complete) return;
+    }
+    return error.ModelFixtureRequestLimitExceeded;
+}
+
+fn handleInternalModelRequest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    request: *const RawHttpRequest,
+    evidence_path: []const u8,
+    nonce: []const u8,
+    responses_seen: *usize,
+) !bool {
+    if (std.mem.eql(u8, request.method, "GET") and
+        std.mem.startsWith(u8, request.path, "/v1/models"))
+    {
+        try writeHttpResponse(
+            allocator,
+            io,
+            stream,
+            "application/json",
+            "{\"models\":[]}",
+        );
+        return false;
+    }
+    if (!std.mem.eql(u8, request.method, "POST") or
+        !std.mem.startsWith(u8, request.path, "/v1/responses"))
+    {
+        try writeHttpResponse(
+            allocator,
+            io,
+            stream,
+            "application/json",
+            "{\"error\":{\"message\":\"unsupported fixture route\"}}",
+        );
+        return false;
+    }
+    if (responses_seen.* == 0) {
+        const body = try firstModelSseAlloc(allocator, nonce);
+        defer allocator.free(body);
+        try writeHttpResponse(allocator, io, stream, "text/event-stream", body);
+        responses_seen.* += 1;
+        return false;
+    }
+    const passed = customToolOutputContainsNonce(
+        allocator,
+        request.body,
+        nonce,
+    ) catch false;
+    const body = try finalModelSseAlloc(allocator);
+    defer allocator.free(body);
+    try writeHttpResponse(allocator, io, stream, "text/event-stream", body);
+    const evidence = if (passed)
+        "{\"schema\":\"cas-code-mode-model-evidence/v1\",\"status\":\"passed\"}"
+    else
+        "{\"schema\":\"cas-code-mode-model-evidence/v1\",\"status\":\"failed\"}";
+    try writeAtomicFileAlloc(allocator, io, evidence_path, evidence);
+    return true;
+}
+
+fn readHttpRequestAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+) !RawHttpRequest {
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(allocator);
+    var scratch: [16 * 1024]u8 = undefined;
+    var expected_bytes: ?usize = null;
+    var header_end: ?usize = null;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = std.Io.Duration.fromMilliseconds(10_000),
+        .clock = .awake,
+    });
+    while (expected_bytes == null or collected.items.len < expected_bytes.?) {
+        const incoming = try stream.socket.receiveTimeout(
+            io,
+            &scratch,
+            .{ .deadline = deadline },
+        );
+        if (incoming.data.len == 0) return error.EndOfStream;
+        if (collected.items.len + incoming.data.len > max_model_request_bytes) {
+            return error.ModelRequestTooLarge;
+        }
+        try collected.appendSlice(allocator, incoming.data);
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, collected.items, "\r\n\r\n")) |index| {
+                header_end = index + 4;
+                const raw_content_length = fixtureHeader(
+                    collected.items[0..index],
+                    "content-length",
+                ) orelse "0";
+                const content_length = try std.fmt.parseInt(
+                    usize,
+                    raw_content_length,
+                    10,
+                );
+                if (content_length > max_model_request_bytes - header_end.?) {
+                    return error.ModelRequestTooLarge;
+                }
+                expected_bytes = header_end.? + content_length;
+            }
+        }
+    }
+    const bytes = try collected.toOwnedSlice(allocator);
+    errdefer allocator.free(bytes);
+    const first_line_end = std.mem.indexOf(u8, bytes, "\r\n") orelse
+        return error.InvalidHttpRequest;
+    var first_line = std.mem.splitScalar(u8, bytes[0..first_line_end], ' ');
+    const method = first_line.next() orelse return error.InvalidHttpRequest;
+    const path = first_line.next() orelse return error.InvalidHttpRequest;
+    const body_start = header_end orelse return error.InvalidHttpRequest;
+    return .{
+        .bytes = bytes,
+        .method = method,
+        .path = path,
+        .body = bytes[body_start..expected_bytes.?],
+    };
+}
+
+fn fixtureHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+fn writeHttpResponse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    content_type: []const u8,
+    body: []const u8,
+) !void {
+    const headers = try std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n",
+        .{ content_type, body.len },
+    );
+    defer allocator.free(headers);
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll(headers);
+    try writer.interface.writeAll(body);
+    try writer.interface.flush();
+}
+
+fn firstModelSseAlloc(allocator: std.mem.Allocator, nonce: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    try writer.writeAll(
+        "event: response.created\n" ++
+            "data: {\"type\":\"response.created\"," ++
+            "\"response\":{\"id\":\"cas-code-mode-1\"}}\n\n" ++
+            "event: response.output_item.done\n" ++
+            "data: {\"type\":\"response.output_item.done\"," ++
+            "\"item\":{\"type\":\"custom_tool_call\"," ++
+            "\"call_id\":\"cas-code-mode-call\",\"name\":\"exec\",\"input\":",
+    );
+    const source = try std.fmt.allocPrint(allocator, "text(\"{s}\");", .{nonce});
+    defer allocator.free(source);
+    try std.json.Stringify.value(source, .{}, writer);
+    try writer.writeAll(
+        "}}\n\n" ++
+            "event: response.completed\n" ++
+            "data: {\"type\":\"response.completed\"," ++
+            "\"response\":{\"id\":\"cas-code-mode-1\",\"usage\":" ++
+            "{\"input_tokens\":0,\"input_tokens_details\":null," ++
+            "\"output_tokens\":0,\"output_tokens_details\":null," ++
+            "\"total_tokens\":0}}}\n\n",
+    );
+    return output.toOwnedSlice();
+}
+
+fn finalModelSseAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(
+        u8,
+        "event: response.output_item.done\n" ++
+            "data: {\"type\":\"response.output_item.done\"," ++
+            "\"item\":{\"type\":\"message\",\"role\":\"assistant\"," ++
+            "\"id\":\"cas-code-mode-message\",\"content\":[" ++
+            "{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\n" ++
+            "event: response.completed\n" ++
+            "data: {\"type\":\"response.completed\"," ++
+            "\"response\":{\"id\":\"cas-code-mode-2\",\"usage\":" ++
+            "{\"input_tokens\":0,\"input_tokens_details\":null," ++
+            "\"output_tokens\":0,\"output_tokens_details\":null," ++
+            "\"total_tokens\":0}}}\n\n",
+    );
+}
+
+fn customToolOutputContainsNonce(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    nonce: []const u8,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    return customToolOutputValueContainsNonce(parsed.value, nonce);
+}
+
+const max_model_json_values: usize = 1024;
+
+fn customToolOutputValueContainsNonce(value: std.json.Value, nonce: []const u8) !bool {
+    var pending: [max_model_json_values]std.json.Value = undefined;
+    var pending_len: usize = 1;
+    var visited: usize = 0;
+    pending[0] = value;
+    while (pending_len > 0) {
+        pending_len -= 1;
+        const current = pending[pending_len];
+        visited += 1;
+        if (visited > max_model_json_values) return error.ModelFixtureJsonTooComplex;
+        if (current == .object) {
+            const object = current.object;
+            if (object.get("type")) |type_value| switch (type_value) {
+                .string => |kind| if (std.mem.eql(u8, kind, "custom_tool_call_output")) {
+                    const output = object.get("output") orelse continue;
+                    if (try jsonValueContainsNonce(output, nonce)) return true;
+                    continue;
+                },
+                else => {},
+            };
+        }
+        try pushJsonChildren(&pending, &pending_len, current);
+    }
+    return false;
+}
+
+fn jsonValueContainsNonce(value: std.json.Value, nonce: []const u8) !bool {
+    var pending: [max_model_json_values]std.json.Value = undefined;
+    var pending_len: usize = 1;
+    var visited: usize = 0;
+    pending[0] = value;
+    while (pending_len > 0) {
+        pending_len -= 1;
+        const current = pending[pending_len];
+        visited += 1;
+        if (visited > max_model_json_values) return error.ModelFixtureJsonTooComplex;
+        if (current == .string and std.mem.indexOf(u8, current.string, nonce) != null) {
+            return true;
+        }
+        try pushJsonChildren(&pending, &pending_len, current);
+    }
+    return false;
+}
+
+fn pushJsonChildren(
+    pending: *[max_model_json_values]std.json.Value,
+    pending_len: *usize,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .array => |array| for (array.items) |item| {
+            try pushJsonValue(pending, pending_len, item);
+        },
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                try pushJsonValue(pending, pending_len, entry.value_ptr.*);
+            }
+        },
+        else => {},
+    }
+}
+
+fn pushJsonValue(
+    pending: *[max_model_json_values]std.json.Value,
+    pending_len: *usize,
+    value: std.json.Value,
+) !void {
+    if (pending_len.* == pending.len) return error.ModelFixtureJsonTooComplex;
+    pending[pending_len.*] = value;
+    pending_len.* += 1;
+}
+
+fn writeAtomicFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    bytes: []const u8,
+) !void {
+    const staging = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(staging);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = bytes });
+    try std.Io.Dir.renameAbsolute(staging, path, io);
 }
 
 fn collectLifecycle(
@@ -917,7 +1715,6 @@ fn runIsolatedWitnessClient(
         client.close();
         client.deinit();
     }
-    const paginated_fork = probes.paginatedForkProbe(allocator, &client);
     return .{
         .thread_pinning = probes.threadPinningProbe(
             allocator,
@@ -925,16 +1722,12 @@ fn runIsolatedWitnessClient(
             cwd,
             pinning_probe_thread_id,
         ),
-        .paginated_fork = paginated_fork,
+        .paginated_fork = probes.paginatedForkProbe(allocator, &client),
         .ephemeral_fork = probes.ephemeralForkProbe(allocator, &client),
-        .paginated_session_inquiry = if (paginated_fork.status == .passed)
-            probes.LiveWitness.passed()
-        else
-            probes.LiveWitness.failed(
-                "paginated_session_inquiry_transport_failed",
-                "the exact excludeTurns fork and thread/turns/list prefix " ++
-                    "required by session inquiry was not established",
-            ),
+        .paginated_session_inquiry = probes.paginatedSessionInquiryProbe(
+            allocator,
+            &client,
+        ),
         .executor_skill_resources = probes.executorSkillResourcesProbe(
             allocator,
             &client,
@@ -1421,6 +2214,27 @@ fn writeOutput(io: std.Io, output: Output) !void {
     try stdout_writer.interface.flush();
 }
 
+test "Code Mode owner evidence requires nonce in custom tool output" {
+    const nonce = "CAS_CODE_MODE_PROBE_1234";
+    const passed =
+        \\{"input":[{"type":"custom_tool_call","input":"text('CAS_CODE_MODE_PROBE_1234')"},{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"CAS_CODE_MODE_PROBE_1234"}]}]}
+    ;
+    try std.testing.expect(try customToolOutputContainsNonce(
+        std.testing.allocator,
+        passed,
+        nonce,
+    ));
+
+    const source_only =
+        \\{"input":[{"type":"custom_tool_call","input":"text('CAS_CODE_MODE_PROBE_1234')"},{"type":"custom_tool_call_output","output":"remote host unavailable"}]}
+    ;
+    try std.testing.expect(!try customToolOutputContainsNonce(
+        std.testing.allocator,
+        source_only,
+        nonce,
+    ));
+}
+
 fn parseArgs(args: []const []const u8) !Options {
     if (args.len == 0) return error.MissingAction;
     exitForRootRequest(args);
@@ -1655,6 +2469,13 @@ test "parser rejects duplicate unknown and transport endpoint mismatch" {
             "--app-server-endpoint",
             "ws://127.0.0.1:1234",
         }),
+    );
+}
+
+test "internal model fixture name remains an unknown public action" {
+    try std.testing.expectError(
+        error.UnknownAction,
+        parseArgs(&.{"__cas_internal_code_mode_model_fixture"}),
     );
 }
 

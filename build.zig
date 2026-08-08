@@ -263,6 +263,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
+    const cas_session_inquiry_anchor_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_session_inquiry_anchor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const cas_session_inquiry_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_session_inquiry.zig"),
         .target = target,
@@ -275,6 +280,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
+            .{
+                .name = "cas_session_inquiry_anchor",
+                .module = cas_session_inquiry_anchor_root,
+            },
         },
     });
     const cas_conformance_root = b.createModule(.{
@@ -315,6 +324,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
     });
     const cas_app_server_contract_data = b.addOptions();
@@ -343,6 +353,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "cas_app_server_contract", .module = cas_app_server_contract_root },
             .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
+            .{
+                .name = "cas_session_inquiry_anchor",
+                .module = cas_session_inquiry_anchor_root,
+            },
         },
     });
     const cas_app_server_preflight_root = b.createModule(.{
@@ -452,6 +466,12 @@ pub fn build(b: *std.Build) void {
         cas_app_server_preflight_root,
     );
     cas_app_server_preflight.root_module.linkSystemLibrary("c", .{});
+    const cas_code_mode_host_fixture = addExecutable(
+        b,
+        "cas_code_mode_host_fixture",
+        cas_transport_tests_root,
+    );
+    cas_code_mode_host_fixture.root_module.linkSystemLibrary("c", .{});
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
@@ -475,6 +495,15 @@ pub fn build(b: *std.Build) void {
     const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_account_install = addInstallStep(b, cas_account);
     const cas_app_server_preflight_install = addInstallStep(b, cas_app_server_preflight);
+    const cas_code_mode_host_fixture_install = addInstallStep(
+        b,
+        cas_code_mode_host_fixture,
+    );
+    const build_cas_code_mode_host_fixture = b.step(
+        "build-cas-code-mode-host-fixture",
+        "Build the deterministic CAS Code Mode host fixture",
+    );
+    build_cas_code_mode_host_fixture.dependOn(&cas_code_mode_host_fixture_install.step);
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cas_automation_install = addInstallStep(b, cas_automation);
@@ -587,6 +616,12 @@ pub fn build(b: *std.Build) void {
         "Run cas_session_inquiry tests",
         .{ .link_libc = true },
     );
+    const run_cas_session_inquiry_anchor_tests = addTestStep(
+        b,
+        cas_session_inquiry_anchor_root,
+        "test-cas-session-inquiry-anchor",
+        "Run CAS session inquiry anchor kernel tests",
+    );
     const run_cas_conformance_tests = addTestStep(
         b,
         cas_conformance_root,
@@ -664,6 +699,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_review_session_tests.step);
     test_cas.dependOn(&run_cas_session_inquiry_tests.step);
+    test_cas.dependOn(&run_cas_session_inquiry_anchor_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);

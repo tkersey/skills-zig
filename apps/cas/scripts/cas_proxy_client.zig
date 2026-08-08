@@ -249,10 +249,15 @@ pub fn isStructuredOverloadError(error_value: std.json.Value) bool {
 pub const TransportKind = enum {
     stdio,
     websocket,
+    unix_socket,
 
-    // Compatibility value until downstream receipt switches can add an
-    // exhaustive tag without widening this operation's allowed files.
-    pub const unix_socket = TransportKind.websocket;
+    pub fn text(self: TransportKind) []const u8 {
+        return switch (self) {
+            .stdio => "stdio",
+            .websocket => "websocket",
+            .unix_socket => "unix_socket",
+        };
+    }
 };
 
 pub const MultiAgentMode = enum {
@@ -513,7 +518,6 @@ pub const Client = struct {
             overload_retry_seed,
             websocket,
             kind,
-            "websocket",
         );
     }
 
@@ -534,7 +538,6 @@ pub const Client = struct {
             overload_retry_seed,
             websocket,
             .unix_socket,
-            "unix_socket",
         );
     }
 
@@ -544,7 +547,6 @@ pub const Client = struct {
         overload_retry_seed: u64,
         websocket: websocket_transport.Connection,
         kind: TransportKind,
-        identity: []const u8,
     ) !Client {
         var client = Client{
             .allocator = allocator,
@@ -570,7 +572,7 @@ pub const Client = struct {
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
-            .transport_identity = identity,
+            .transport_identity = kind.text(),
             .overload_retry_policy = opts.overload_retry_policy,
             .overload_retry_seed = overload_retry_seed,
             .overload_retry_telemetry = opts.overload_retry_telemetry,
@@ -967,7 +969,7 @@ pub const Client = struct {
                     return err;
                 };
             },
-            .websocket => try self.sendWebSocket(payload, send_observer),
+            .websocket, .unix_socket => try self.sendWebSocket(payload, send_observer),
         }
     }
 
@@ -1055,7 +1057,7 @@ pub const Client = struct {
                 try writeFileAllUntil(self.stdin_file.?, payload, deadline_ms);
                 try writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms);
             },
-            .websocket => try self.sendWebSocket(payload, null),
+            .websocket, .unix_socket => try self.sendWebSocket(payload, null),
         }
     }
 
@@ -1313,17 +1315,20 @@ pub const Client = struct {
     }
 
     fn readLineAlloc(self: *Client) !?[]u8 {
-        if (self.transport_kind == .websocket) {
-            const deadline_ms = self.request_deadline_ms orelse
-                return try self.websocket.?.readTextAlloc();
-            const remaining_ms = deadline_ms - monotonicMillis();
-            if (remaining_ms <= 0) return error.ConnectionTimedOut;
-            return self.websocket.?.readTextAllocTimeout(
-                @intCast(remaining_ms),
-            ) catch |err| switch (err) {
-                error.Timeout => return error.ConnectionTimedOut,
-                else => err,
-            };
+        switch (self.transport_kind) {
+            .websocket, .unix_socket => {
+                const deadline_ms = self.request_deadline_ms orelse
+                    return try self.websocket.?.readTextAlloc();
+                const remaining_ms = deadline_ms - monotonicMillis();
+                if (remaining_ms <= 0) return error.ConnectionTimedOut;
+                return self.websocket.?.readTextAllocTimeout(
+                    @intCast(remaining_ms),
+                ) catch |err| switch (err) {
+                    error.Timeout => return error.ConnectionTimedOut,
+                    else => err,
+                };
+            },
+            .stdio => {},
         }
 
         while (true) {
@@ -2817,6 +2822,45 @@ test "transport acquisition helpers require an already resolved retry seed" {
     try std.testing.expect(stdio_info.params[2].type.? == u64);
     try std.testing.expect(websocket_info.params[2].type.? == u64);
     try std.testing.expect(unix_info.params[2].type.? == u64);
+}
+
+test "transport kinds preserve unix identity and frame behavior" {
+    try std.testing.expect(TransportKind.websocket != TransportKind.unix_socket);
+    try std.testing.expectEqualStrings("websocket", @tagName(TransportKind.websocket));
+    try std.testing.expectEqualStrings("unix_socket", @tagName(TransportKind.unix_socket));
+    inline for (.{ TransportKind.websocket, TransportKind.unix_socket }) |kind| {
+        var client = Client{
+            .allocator = std.testing.allocator,
+            .transport_kind = kind,
+            .child = null,
+            .stdin_file = null,
+            .stdout_file = null,
+            .websocket = null,
+            .line_buf = .empty,
+            .next_request_id = 1,
+            .last_error = null,
+            .exec_approval = null,
+            .file_approval = null,
+            .permissions_approval = null,
+            .request_user_input_response_json = null,
+            .elicitation_action = null,
+            .elicitation_content_json = null,
+            .dynamic_tool_response_json = null,
+            .read_only = true,
+            .request_deadline_ms = monotonicMillis() - 1,
+        };
+        defer client.line_buf.deinit(std.testing.allocator);
+        try std.testing.expectError(error.ConnectionTimedOut, client.readLineAlloc());
+        try std.testing.expectError(error.ConnectionTimedOut, client.sendPayload("{}", null));
+        try std.testing.expectError(
+            error.ConnectionTimedOut,
+            client.emitServerReply(.{ .integer = 1 }, .{
+                .server_error = .{ .code = -32601, .message = "unsupported" },
+            }),
+        );
+    }
+    try std.testing.expectEqualStrings("websocket", TransportKind.websocket.text());
+    try std.testing.expectEqualStrings("unix_socket", TransportKind.unix_socket.text());
 }
 
 test "request send observer runs before transport send attribution" {

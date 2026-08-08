@@ -1380,6 +1380,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         workflow_deadline_ms,
     ) catch |err| {
         managed_server.kill();
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "websocket_bootstrap_failed",
+            .hint = "CAS started the managed websocket app-server but could not " ++
+                "complete the websocket client handshake",
+        };
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -1387,10 +1392,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             @errorName(err),
             cwd,
             output_receipt,
-            .{
-                .code = "websocket_bootstrap_failed",
-                .hint = "CAS started the managed websocket app-server but could not complete the websocket client handshake",
-            },
+            failure,
         );
     };
     defer {
@@ -1509,6 +1511,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         managed_server.kill();
         output_receipt.error_review_attempt_phase = "pre_review_start";
         output_receipt.error_review_attempt_exists = false;
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "pre_review_start_failed",
+            .hint = "CAS could not bind the owner-lived review tuple before " ++
+                "review/start; no review attempt was created",
+        };
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -1516,11 +1523,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             @errorName(err),
             cwd,
             output_receipt,
-            .{
-                .code = "pre_review_start_failed",
-                .hint = "CAS could not bind the owner-lived review tuple " ++
-                    "before review/start; no review attempt was created",
-            },
+            failure,
         );
     };
     defer review_tuple.deinit(allocator);
@@ -1554,12 +1557,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             existing_parent_event_log_path,
             codex_version,
         ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "the owner-lived review could not resume its selected " ++
+                    "parent before review/start; no review attempt was created",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1576,12 +1584,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     @errorName(err),
                     cwd,
                     output_receipt,
-                    .{
-                        .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not resume its " ++
-                            "selected parent before review/start; no review " ++
-                            "attempt was created",
-                    },
+                    failure,
                 );
             }
             return err;
@@ -1596,12 +1599,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             codex_version,
             .all,
         ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "the owner-lived review could not validate its selected " ++
+                    "parent before review/start; no review attempt was created",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1618,12 +1626,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     @errorName(err),
                     cwd,
                     output_receipt,
-                    .{
-                        .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not validate its " ++
-                            "selected parent before review/start; no review " ++
-                            "attempt was created",
-                    },
+                    failure,
                 );
             }
             return err;
@@ -1650,12 +1653,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         session_dir,
         parsed.custom_instructions,
     ) catch |err| {
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "pre_review_start_failed",
+            .hint = "the owner-lived review failed before review/start; the exact " ++
+                "request may start one fresh attempt",
+        };
         updateReviewTupleLockBestEffort(
             allocator,
             tuple_lock_bundle.path,
             tuple_lock_bundle.lock,
             "pre_review_start_failed",
-            "pre_review_start_failed",
+            failure.code,
             null,
             null,
             null,
@@ -1672,11 +1680,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 @errorName(err),
                 cwd,
                 output_receipt,
-                .{
-                    .code = "pre_review_start_failed",
-                    .hint = "the owner-lived review failed before review/start; " ++
-                        "the exact request may start one fresh attempt",
-                },
+                failure,
             );
         }
         return err;
@@ -1706,13 +1710,18 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.timeout_ms,
             parsed.poll_interval_ms,
             codex_version,
-        ) catch {
+        ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "auto parent-mode could not bootstrap a materialized " ++
+                    "parent thread for this Codex runtime",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1723,15 +1732,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 parsed.json,
                 "start",
                 "review/start",
-                "fresh detached review parent could not be materialized before detached review launch",
+                failure.hint,
                 cwd,
                 output_receipt,
-                .{
-                    .code = "pre_review_start_failed",
-                    .hint = "auto parent-mode could not bootstrap a materialized " ++
-                        "parent thread for this codex runtime; upgrade codex or " ++
-                        "pass a clean materialized --parent-thread-id",
-                },
+                failure,
             );
         };
         appendLogRecord(allocator, parent_event_log_path, "review/start", "note", "{\"compatibility\":\"pre-materialized-fresh-parent\"}") catch {};
@@ -1755,7 +1759,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     ) catch |err| blk: {
         const request_send_started = client.lastRequestSendStarted();
         const raw_message = client.lastError() orelse @errorName(err);
-        const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
+        const failure = failureInfoForReviewStart(err, raw_message, created_parent_thread);
         if (workflow_binding != null and request_send_started and
             failure != null and
             std.mem.eql(u8, failure.?.code, "account_resource_exhausted"))
@@ -1805,7 +1809,9 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 timeout_failure,
             );
         }
-        if (created_parent_thread and failure != null and !pre_materialize_parent) {
+        if (created_parent_thread and failure != null and
+            serverRequestProviderFailure(err) == null and !pre_materialize_parent)
+        {
             materializeParentThreadTurn(
                 allocator,
                 &client,
@@ -1853,7 +1859,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             ) catch |retry_err| {
                 const retry_send_started = client.lastRequestSendStarted();
                 const retry_message = client.lastError() orelse @errorName(retry_err);
-                const retry_failure = failureInfoForReviewStart(retry_message, created_parent_thread);
+                const retry_failure = failureInfoForReviewStart(
+                    retry_err,
+                    retry_message,
+                    created_parent_thread,
+                );
                 if (workflow_binding != null and retry_send_started and
                     retry_failure != null and
                     std.mem.eql(u8, retry_failure.?.code, "account_resource_exhausted"))
@@ -2861,6 +2871,37 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             loaded.record_path,
             current_identity,
         );
+        if (serverRequestProviderFailure(err)) |failure| {
+            if (!try transitionActiveReviewTupleLockForRecord(
+                allocator,
+                record,
+                loaded.record_path,
+                "terminal",
+                failure.code,
+            )) {
+                try replayTerminalRecordAndExit(
+                    allocator,
+                    parsed.json,
+                    record,
+                    loaded.record_path,
+                    current_identity,
+                );
+                return error.InvalidReviewTupleLockBinding;
+            }
+            if (parsed.json) {
+                try printRecordedReviewFailureJson(
+                    allocator,
+                    .wait,
+                    record,
+                    loaded.record_path,
+                    stored_identity_opt,
+                    null,
+                    failure,
+                );
+                std.process.exit(1);
+            }
+            return err;
+        }
         if (isTransportLossError(err)) {
             var exact_lock = try loadExactReviewTupleLockForRecord(
                 allocator,
@@ -2918,7 +2959,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     }
     const previous_wait_deadline = client.swapRequestDeadlineMs(wait_deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_wait_deadline);
-    var current_tuple = try reviewTupleIdentityAlloc(
+    var current_tuple = reviewTupleIdentityAlloc(
         allocator,
         record.cwd,
         current_identity,
@@ -2926,7 +2967,32 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         current_codex_version,
         &client,
         record.workflowBinding,
-    );
+    ) catch |err| {
+        if (serverRequestProviderFailure(err)) |failure| {
+            try transitionReviewTupleLockForRecordOrReplay(
+                allocator,
+                parsed.json,
+                record,
+                loaded.record_path,
+                "terminal",
+                failure.code,
+                current_identity,
+            );
+            if (parsed.json) {
+                try printRecordedReviewFailureJson(
+                    allocator,
+                    .wait,
+                    record,
+                    loaded.record_path,
+                    stored_identity_opt,
+                    null,
+                    failure,
+                );
+                std.process.exit(1);
+            }
+        }
+        return err;
+    };
     defer current_tuple.deinit(allocator);
     current_tuple.codex_binary_digest = runtime_gate.binary_digest;
     current_tuple.app_server_contract_id = app_server_contract_id;
@@ -3035,6 +3101,30 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             std.process.exit(1);
         },
         else => {
+            if (serverRequestProviderFailure(err)) |failure| {
+                try transitionReviewTupleLockForRecordOrReplay(
+                    allocator,
+                    parsed.json,
+                    record,
+                    loaded.record_path,
+                    "terminal",
+                    failure.code,
+                    current_identity,
+                );
+                if (parsed.json) {
+                    try printRecordedReviewFailureJson(
+                        allocator,
+                        .wait,
+                        record,
+                        loaded.record_path,
+                        stored_identity_opt,
+                        null,
+                        failure,
+                    );
+                    std.process.exit(1);
+                }
+                return err;
+            }
             if (isTransportLossError(err)) {
                 try transitionReviewTupleLockForRecordOrReplay(
                     allocator,
@@ -4548,11 +4638,17 @@ fn maybeResumeMaterializedThread(
     );
     defer allocator.free(params_json);
 
-    const resume_result_json = client.requestJson("thread/resume", params_json) catch return false;
+    const resume_result_json = client.requestJson("thread/resume", params_json) catch |err|
+        return materializedThreadResumeFailure(err);
     defer allocator.free(resume_result_json);
     try appendLogRecord(allocator, event_log_path, "thread/resume", "request", params_json);
     try appendLogRecord(allocator, event_log_path, "thread/resume", "response", resume_result_json);
     return true;
+}
+
+fn materializedThreadResumeFailure(err: anyerror) anyerror!bool {
+    if (serverRequestProviderFailure(err) != null) return err;
+    return false;
 }
 
 fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
@@ -5211,8 +5307,37 @@ fn terminalReviewTransportFailure(code: []const u8) ?FailureInfo {
     return null;
 }
 
+fn serverRequestProviderFailure(err: anyerror) ?FailureInfo {
+    return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable => .{
+            .code = "auth_refresh_provider_unavailable",
+            .hint = "Codex requested ChatGPT auth-token refresh, but this review " ++
+                "route has no exact credential provider",
+        },
+        error.AttestationProviderUnavailable => .{
+            .code = "attestation_provider_unavailable",
+            .hint = "Codex requested attestation generation, but this review route " ++
+                "has no exact attestation provider",
+        },
+        else => null,
+    };
+}
+
+fn serverRequestProviderFailureForCode(code: []const u8) ?FailureInfo {
+    if (std.mem.eql(u8, code, "auth_refresh_provider_unavailable")) {
+        return serverRequestProviderFailure(
+            error.ChatGptAuthTokensRefreshProviderUnavailable,
+        );
+    }
+    if (std.mem.eql(u8, code, "attestation_provider_unavailable")) {
+        return serverRequestProviderFailure(error.AttestationProviderUnavailable);
+    }
+    return null;
+}
+
 fn terminalReviewOwnerFailure(code: []const u8) ?FailureInfo {
     if (terminalReviewTransportFailure(code)) |failure| return failure;
+    if (serverRequestProviderFailureForCode(code)) |failure| return failure;
     if (std.mem.eql(u8, code, "review_owner_failed")) return .{
         .code = "review_owner_failed",
         .hint = "the owner-lived review process terminated after launch; " ++
@@ -5250,6 +5375,7 @@ fn workflowDeadOwnerFailureInfo(lock: ReviewTupleLock) FailureInfo {
 }
 
 fn workflowOwnedPostStartFailure(err: anyerror) FailureInfo {
+    if (serverRequestProviderFailure(err)) |failure| return failure;
     if (err == error.ConnectionTimedOut or err == error.WaitTimedOut) {
         return terminalReviewTransportFailure("review_transport_timeout").?;
     }
@@ -6337,7 +6463,11 @@ fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: [
 }
 
 fn readAccountPrincipalAlloc(allocator: std.mem.Allocator, client: *cas.Client) !AccountPrincipalEvidence {
-    const account_json = client.requestJson("account/read", "{\"refreshToken\":false}") catch {
+    const account_json = client.requestJson(
+        "account/read",
+        "{\"refreshToken\":false}",
+    ) catch |err| {
+        if (serverRequestProviderFailure(err) != null) return err;
         return .{
             .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
             .reduced_protection = true,
@@ -9657,7 +9787,12 @@ fn hookSummaryFromEventLog(
     return summary;
 }
 
-fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: bool) ?FailureInfo {
+fn failureInfoForReviewStart(
+    err: anyerror,
+    raw_message: []const u8,
+    created_parent_thread: bool,
+) ?FailureInfo {
+    if (serverRequestProviderFailure(err)) |failure| return failure;
     if (detectAccountResourceExhaustion(raw_message)) return accountResourceExhaustedFailureInfo();
     if (created_parent_thread and std.mem.indexOf(u8, raw_message, "no rollout found for thread id") != null) {
         return .{
@@ -11973,6 +12108,9 @@ fn accountResourceExhaustedFailureInfo() FailureInfo {
 fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
     const value = code orelse return null;
     if (failureCodeIsAccountResourceExhausted(value)) return "account_resource";
+    if (serverRequestProviderFailureForCode(value) != null) {
+        return "server_request_provider";
+    }
     if (std.mem.eql(u8, value, "review_transport_lost")) return "transport_review_attempt";
     if (std.mem.indexOf(u8, value, "transport") != null) return "transport_review_attempt";
     if (std.mem.eql(u8, value, "review_owner_failed")) return "owner_review_attempt";
@@ -11994,6 +12132,7 @@ fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
 fn retryableSameTupleNowForCode(code: ?[]const u8) ?bool {
     const value = code orelse return null;
     if (failureCodeIsAccountResourceExhausted(value)) return false;
+    if (serverRequestProviderFailureForCode(value) != null) return false;
     if (std.mem.eql(u8, value, "review_transport_lost")) return true;
     if (std.mem.eql(u8, value, "review_transport_timeout")) return true;
     if (std.mem.eql(u8, value, "review_owner_failed")) return true;
@@ -12534,6 +12673,43 @@ test "workflow-bound wait timeout is one terminal owner failure" {
         "codex-cli 0.144.0",
         &grace_status,
     ));
+}
+
+test "server request provider failures retain terminal review identity" {
+    const cases = [_]struct {
+        err: anyerror,
+        code: []const u8,
+    }{
+        .{
+            .err = error.ChatGptAuthTokensRefreshProviderUnavailable,
+            .code = "auth_refresh_provider_unavailable",
+        },
+        .{
+            .err = error.AttestationProviderUnavailable,
+            .code = "attestation_provider_unavailable",
+        },
+    };
+    for (cases) |case| {
+        const failure = workflowOwnedPostStartFailure(case.err);
+        try std.testing.expectEqualStrings(case.code, failure.code);
+        try std.testing.expectEqualStrings(
+            "server_request_provider",
+            failureClassForCode(failure.code).?,
+        );
+        try std.testing.expectEqual(false, retryableSameTupleNowForCode(failure.code).?);
+        const replay = terminalReviewOwnerFailure(failure.code).?;
+        try std.testing.expectEqualStrings(failure.code, replay.code);
+        const pre_start = failureInfoForReviewStart(case.err, "opaque", false).?;
+        try std.testing.expectEqualStrings(failure.code, pre_start.code);
+        try std.testing.expectError(
+            case.err,
+            materializedThreadResumeFailure(case.err),
+        );
+    }
+    try std.testing.expectEqual(
+        false,
+        try materializedThreadResumeFailure(error.RequestFailed),
+    );
 }
 
 test "terminal-only thread reads omit polling snapshots and retain terminal evidence" {
@@ -15432,7 +15608,11 @@ test "account resource exhaustion detector accepts required signals" {
 }
 
 test "account resource exhaustion maps start and terminal status failures" {
-    const start_failure = failureInfoForReviewStart("review/start failed: usageLimitExceeded", false).?;
+    const start_failure = failureInfoForReviewStart(
+        error.RequestFailed,
+        "review/start failed: usageLimitExceeded",
+        false,
+    ).?;
     try std.testing.expectEqualStrings("account_resource_exhausted", start_failure.code);
 
     var status = ReviewStatus{
@@ -16324,7 +16504,11 @@ test "terminalLockFailureForStatus maps malformed structured verdict to invalid 
 }
 
 test "failureInfoForReviewStart maps detached parent rollout error" {
-    const failure = failureInfoForReviewStart("no rollout found for thread id thr_123", true).?;
+    const failure = failureInfoForReviewStart(
+        error.RequestFailed,
+        "no rollout found for thread id thr_123",
+        true,
+    ).?;
     try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
 }
 

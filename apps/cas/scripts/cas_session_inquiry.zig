@@ -5,6 +5,7 @@ const core_path = @import("core_path");
 const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
+const inquiry_anchor = @import("cas_session_inquiry_anchor");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
 const canonical_trace = trace_core;
@@ -111,6 +112,8 @@ const FailureCode = enum {
     receipt_invalid,
     budget_exhausted,
     inquiry_transport_lost,
+    auth_refresh_provider_unavailable,
+    attestation_provider_unavailable,
     cleanup_failed,
     codex_incompatible,
     schema_unavailable,
@@ -502,11 +505,13 @@ const ThreadHistoryMode = enum {
 const ThreadHistorySnapshot = struct {
     mode: ThreadHistoryMode,
     digest: TurnDigest,
+    retained_digest: ?TurnDigest = null,
     turn_ids: []const []const u8,
     completed_boundaries: []const bool,
 
     fn deinit(self: ThreadHistorySnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.digest.digest);
+        if (self.retained_digest) |digest| allocator.free(digest.digest);
         for (self.turn_ids) |turn_id| allocator.free(turn_id);
         allocator.free(self.turn_ids);
         allocator.free(self.completed_boundaries);
@@ -2331,6 +2336,8 @@ fn gateFailureForLineageError(err: anyerror) GateResult {
 
 fn failureCodeForError(err: anyerror) FailureCode {
     return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable => .auth_refresh_provider_unavailable,
+        error.AttestationProviderUnavailable => .attestation_provider_unavailable,
         error.SourceNotFound => .source_not_found,
         error.SourceStale => .source_stale,
         error.SourceDigestMismatch => .source_turn_digest_mismatch,
@@ -2345,6 +2352,15 @@ fn failureCodeForError(err: anyerror) FailureCode {
         error.AnswerParseFailed => .answer_parse_failed,
         error.InquiryTransportLost => .inquiry_transport_lost,
         else => .receipt_invalid,
+    };
+}
+
+fn preserveServerRequestProviderError(err: anyerror, fallback: anyerror) anyerror {
+    return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+        error.AttestationProviderUnavailable,
+        => err,
+        else => fallback,
     };
 }
 
@@ -2886,7 +2902,12 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
         const handle = try loadLaneHandleAlloc(allocator, lane_path);
         const params = try stringifyAnyAlloc(allocator, .{ .threadId = handle.fork_thread_id, .turnId = handle.turn_id });
         defer allocator.free(params);
-        const result = client.requestJson("turn/interrupt", params) catch continue;
+        const result = client.requestJson("turn/interrupt", params) catch |err| {
+            if (preserveServerRequestProviderError(err, error.InterruptFailed) == err) {
+                return err;
+            }
+            continue;
+        };
         defer allocator.free(result);
         try appendLine(handle.lane_events, result);
         try writeLaneHandle(allocator, handle, @tagName(InquiryState.interrupted));
@@ -2976,6 +2997,7 @@ fn verifySourceThread(
         client,
         source_thread_id,
         dcp.total_turns,
+        null,
         events_path,
     );
     defer source.deinit(allocator);
@@ -3290,6 +3312,7 @@ fn startLaneFork(
         client,
         source_thread_id,
         dcp.total_turns,
+        anchor.keep_through_turn_index,
         lane_events,
     );
     defer source_history.deinit(allocator);
@@ -3307,17 +3330,35 @@ fn startLaneFork(
         );
         return error.SourceStale;
     }
-    const keep_count: usize = @intCast(anchor.keep_through_turn_index);
-    if (keep_count > source_history.turn_ids.len) return error.SourceStale;
-    const boundary_kind: []const u8 = if (keep_count == 0) "beforeTurnId" else "lastTurnId";
-    const boundary_turn_id = if (keep_count == 0)
-        source_history.turn_ids[0]
-    else blk: {
-        if (!source_history.completed_boundaries[keep_count - 1]) {
-            return error.DecisionAnchorUnavailable;
-        }
-        break :blk source_history.turn_ids[keep_count - 1];
+    const anchored_digest = source_history.retained_digest orelse
+        return error.AnchorDigestMismatch;
+    if (!inquiry_anchor.exactAnchorMatches(
+        .{
+            .count = anchor.keep_through_turn_index,
+            .digest = anchor.anchor_digest orelse "",
+        },
+        .{ .count = anchored_digest.count, .digest = anchored_digest.digest },
+    )) {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            lane_events,
+            anchored_digest,
+            anchor.keep_through_turn_index,
+            anchor.anchor_digest orelse "",
+            "anchor_digest_mismatch",
+        );
+        return error.AnchorDigestMismatch;
+    }
+    const boundary = try inquiry_anchor.selectBoundary(
+        source_history.turn_ids,
+        source_history.completed_boundaries,
+        anchor.keep_through_turn_index,
+    );
+    const boundary_kind: []const u8 = switch (boundary.kind) {
+        .before_turn_id => "beforeTurnId",
+        .last_turn_id => "lastTurnId",
     };
+    const boundary_turn_id = boundary.turn_id;
     const boundary_event = try stringifyAnyAlloc(allocator, .{
         .event = "thread/fork/boundary_selected",
         .source_thread_id = source_thread_id,
@@ -3330,7 +3371,7 @@ fn startLaneFork(
     defer allocator.free(boundary_event);
     try appendLine(lane_events, boundary_event);
 
-    const fork_params = if (keep_count == 0)
+    const fork_params = if (boundary.kind == .before_turn_id)
         try stringifyAnyAlloc(allocator, .{
             .threadId = source_thread_id,
             .beforeTurnId = boundary_turn_id,
@@ -3365,9 +3406,9 @@ fn startLaneFork(
             .threadSource = "retrace",
         });
     defer allocator.free(fork_params);
-    const fork_json = client.requestJson("thread/fork", fork_params) catch {
+    const fork_json = client.requestJson("thread/fork", fork_params) catch |err| {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
-        return error.ForkFailed;
+        return preserveServerRequestProviderError(err, error.ForkFailed);
     };
     defer allocator.free(fork_json);
     const fork_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/fork", .lane_id = lane.lane_id, .ordinal = ordinal + 1 });
@@ -3382,22 +3423,6 @@ fn startLaneFork(
         try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, before_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
         return error.LineageMismatch;
     }
-    const anchored_history = try readThreadHistorySnapshot(
-        allocator,
-        client,
-        fork_thread_id,
-        anchor.keep_through_turn_index,
-        lane_events,
-    );
-    defer anchored_history.deinit(allocator);
-    const anchored_digest = anchored_history.digest;
-    const anchor_valid = anchored_digest.count == anchor.keep_through_turn_index and
-        std.mem.eql(u8, anchored_digest.digest, anchor.anchor_digest orelse "");
-    if (!anchor_valid) {
-        try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, anchored_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
-        return error.AnchorDigestMismatch;
-    }
-
     const client_msg_id = try std.fmt.allocPrint(allocator, "cas-{s}-{s}-{d}", .{ rip.inquiry_id, lane.lane_id, ordinal + 1 });
     const turn_text = try buildInquiryPromptAlloc(allocator, rip, lane);
     defer allocator.free(turn_text);
@@ -3418,10 +3443,14 @@ fn startLaneFork(
         for (notifications.items) |line| allocator.free(line);
         notifications.deinit(allocator);
     }
-    const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
+    const turn_json = client.requestJsonCaptureNotifications(
+        "turn/start",
+        turn_params,
+        &notifications,
+    ) catch |err| {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
         _ = cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/delete") or cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/archive");
-        return error.TurnStartFailed;
+        return preserveServerRequestProviderError(err, error.TurnStartFailed);
     };
     defer allocator.free(turn_json);
     try appendLine(lane_events, turn_json);
@@ -3470,7 +3499,12 @@ fn startRolloutTranscriptLane(
         for (start_notifications.items) |line| allocator.free(line);
         start_notifications.deinit(allocator);
     }
-    const start_json = client.requestJsonCaptureNotifications("thread/start", start_params, &start_notifications) catch return error.ForkFailed;
+    const start_json = client.requestJsonCaptureNotifications(
+        "thread/start",
+        start_params,
+        &start_notifications,
+    ) catch |err|
+        return preserveServerRequestProviderError(err, error.ForkFailed);
     defer allocator.free(start_json);
     const start_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/start", .lane_id = lane.lane_id, .ordinal = ordinal + 1, .lineage_mode = "rollout_transcript" });
     defer allocator.free(start_event);
@@ -3499,9 +3533,13 @@ fn startRolloutTranscriptLane(
         for (notifications.items) |line| allocator.free(line);
         notifications.deinit(allocator);
     }
-    const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
+    const turn_json = client.requestJsonCaptureNotifications(
+        "turn/start",
+        turn_params,
+        &notifications,
+    ) catch |err| {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
-        return error.TurnStartFailed;
+        return preserveServerRequestProviderError(err, error.TurnStartFailed);
     };
     defer allocator.free(turn_json);
     try appendLine(lane_events, turn_json);
@@ -4465,7 +4503,7 @@ fn turnIdFromStartResponse(allocator: std.mem.Allocator, raw: []const u8) ![]con
 }
 
 fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !TurnDigest {
-    const snapshot = try threadHistorySnapshotFromThreadRead(allocator, raw);
+    const snapshot = try threadHistorySnapshotFromThreadRead(allocator, raw, null);
     defer {
         for (snapshot.turn_ids) |turn_id| allocator.free(turn_id);
         allocator.free(snapshot.turn_ids);
@@ -4477,6 +4515,7 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
 fn threadHistorySnapshotFromThreadRead(
     allocator: std.mem.Allocator,
     raw: []const u8,
+    retained_turns: ?u64,
 ) !ThreadHistorySnapshot {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -4521,9 +4560,25 @@ fn threadHistorySnapshotFromThreadRead(
         trace,
         @intCast(turns.items.len),
     );
+    errdefer allocator.free(digest);
+    const retained_digest = if (retained_turns) |count| retained: {
+        const retained_count = std.math.cast(usize, count) orelse
+            return error.SourceStale;
+        if (retained_count > turns.items.len) return error.SourceStale;
+        break :retained TurnDigest{
+            .count = count,
+            .digest = try trace_core.retainedTraceDigest(
+                allocator,
+                trace,
+                @intCast(retained_count),
+            ),
+        };
+    } else null;
+    errdefer if (retained_digest) |value| allocator.free(value.digest);
     return .{
         .mode = mode,
         .digest = .{ .count = turns.items.len, .digest = digest },
+        .retained_digest = retained_digest,
         .turn_ids = try turn_ids.toOwnedSlice(allocator),
         .completed_boundaries = try completed_boundaries.toOwnedSlice(allocator),
     };
@@ -4534,6 +4589,7 @@ fn readThreadHistorySnapshot(
     client: *cas_client.Client,
     thread_id: []const u8,
     expected_turns: u64,
+    retained_turns: ?u64,
     events_path: []const u8,
 ) !ThreadHistorySnapshot {
     if (expected_turns > MaxThreadHistoryPages * ThreadHistoryPageLimit) return error.SourceStale;
@@ -4542,8 +4598,8 @@ fn readThreadHistorySnapshot(
         .includeTurns = false,
     });
     defer allocator.free(metadata_params);
-    const metadata_json = client.requestJson("thread/read", metadata_params) catch
-        return error.SourceNotFound;
+    const metadata_json = client.requestJson("thread/read", metadata_params) catch |err|
+        return preserveServerRequestProviderError(err, error.SourceNotFound);
     defer allocator.free(metadata_json);
     const mode = try threadHistoryModeFromRead(allocator, metadata_json);
     try appendHistoryReadEvent(allocator, events_path, thread_id, mode, false, 0, false);
@@ -4553,10 +4609,14 @@ fn readThreadHistorySnapshot(
             .includeTurns = true,
         });
         defer allocator.free(read_params);
-        const read_json = client.requestJson("thread/read", read_params) catch
-            return error.SourceNotFound;
+        const read_json = client.requestJson("thread/read", read_params) catch |err|
+            return preserveServerRequestProviderError(err, error.SourceNotFound);
         defer allocator.free(read_json);
-        const snapshot = try threadHistorySnapshotFromThreadRead(allocator, read_json);
+        const snapshot = try threadHistorySnapshotFromThreadRead(
+            allocator,
+            read_json,
+            retained_turns,
+        );
         try appendHistoryReadEvent(
             allocator,
             events_path,
@@ -4602,6 +4662,7 @@ fn readThreadHistorySnapshot(
     errdefer completed_boundaries.deinit(allocator);
     var cursor: ?[]u8 = null;
     defer if (cursor) |value| allocator.free(value);
+    var resume_attempted = false;
     var page_index: usize = 0;
     while (page_index < MaxThreadHistoryPages) : (page_index += 1) {
         const params = if (cursor) |value|
@@ -4620,8 +4681,31 @@ fn readThreadHistorySnapshot(
                 .itemsView = "full",
             });
         defer allocator.free(params);
-        const page_json = client.requestJson("thread/turns/list", params) catch
-            return error.SourceNotFound;
+        const page_json = client.requestJson(
+            "thread/turns/list",
+            params,
+        ) catch |request_err| retry: {
+            if (resume_attempted or
+                !clientLastErrorIsThreadNotLoaded(allocator, client, thread_id))
+            {
+                return preserveServerRequestProviderError(
+                    request_err,
+                    error.SourceNotFound,
+                );
+            }
+            resume_attempted = true;
+            try resumePaginatedThreadForTurnsList(
+                allocator,
+                client,
+                thread_id,
+                events_path,
+            );
+            break :retry client.requestJson("thread/turns/list", params) catch |retry_err|
+                return preserveServerRequestProviderError(
+                    retry_err,
+                    error.SourceNotFound,
+                );
+        };
         defer allocator.free(page_json);
         var page = try std.json.parseFromSlice(std.json.Value, allocator, page_json, .{});
         defer page.deinit();
@@ -4657,9 +4741,25 @@ fn readThreadHistorySnapshot(
                 trace,
                 @intCast(turn_ids.items.len),
             );
+            errdefer allocator.free(digest);
+            const retained_digest = if (retained_turns) |count| retained: {
+                const retained_count = std.math.cast(usize, count) orelse
+                    return error.SourceStale;
+                if (retained_count > turn_ids.items.len) return error.SourceStale;
+                break :retained TurnDigest{
+                    .count = count,
+                    .digest = try trace_core.retainedTraceDigest(
+                        allocator,
+                        trace,
+                        @intCast(retained_count),
+                    ),
+                };
+            } else null;
+            errdefer if (retained_digest) |value| allocator.free(value.digest);
             return .{
                 .mode = mode,
                 .digest = .{ .count = turn_ids.items.len, .digest = digest },
+                .retained_digest = retained_digest,
                 .turn_ids = try turn_ids.toOwnedSlice(allocator),
                 .completed_boundaries = try completed_boundaries.toOwnedSlice(allocator),
             };
@@ -4672,6 +4772,90 @@ fn readThreadHistorySnapshot(
         cursor = next_owned;
     }
     return error.SourceStale;
+}
+
+fn resumePaginatedThreadForTurnsList(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    thread_id: []const u8,
+    events_path: []const u8,
+) !void {
+    const params = try paginatedThreadResumeParamsAlloc(allocator, thread_id);
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/resume", params) catch |err|
+        return preserveServerRequestProviderError(err, error.SourceNotFound);
+    defer allocator.free(raw);
+    if (!paginatedResumeResponseMatches(allocator, raw, thread_id)) {
+        return error.SourceStale;
+    }
+    const event = try stringifyAnyAlloc(allocator, .{
+        .event = "thread/resume",
+        .thread_id = thread_id,
+        .history_mode = "paginated",
+        .exclude_turns = true,
+    });
+    defer allocator.free(event);
+    try appendLine(events_path, event);
+}
+
+fn clientLastErrorIsThreadNotLoaded(
+    allocator: std.mem.Allocator,
+    client: *const cas_client.Client,
+    thread_id: []const u8,
+) bool {
+    const raw = client.lastError() orelse return false;
+    const expected = std.fmt.allocPrint(
+        allocator,
+        "thread not loaded: {s}",
+        .{thread_id},
+    ) catch return false;
+    defer allocator.free(expected);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return std.mem.eql(
+        u8,
+        core_json.stringField(root, "message") orelse return false,
+        expected,
+    );
+}
+
+fn paginatedThreadResumeParamsAlloc(
+    allocator: std.mem.Allocator,
+    thread_id: []const u8,
+) ![]u8 {
+    return stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .excludeTurns = true,
+    });
+}
+
+fn paginatedResumeResponseMatches(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    expected_thread_id: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const thread = core_json.objectField(root, "thread") orelse return false;
+    const thread_id = core_json.stringField(thread, "id") orelse return false;
+    const history_mode = core_json.stringField(thread, "historyMode") orelse return false;
+    const turns = switch (thread.get("turns") orelse return false) {
+        .array => |array| array,
+        else => return false,
+    };
+    return std.mem.eql(u8, thread_id, expected_thread_id) and
+        std.mem.eql(u8, history_mode, "paginated") and
+        turns.items.len == 0;
 }
 
 fn appendThreadTurnToSnapshot(
@@ -6629,6 +6813,74 @@ test "thread-backed inquiry accepts paginated history and rejects unknown modes"
     try std.testing.expectEqual(
         FailureCode.thread_history_mode_unsupported,
         failureCodeForError(error.ThreadHistoryModeUnsupported),
+    );
+
+    const resume_params = try paginatedThreadResumeParamsAlloc(
+        allocator,
+        "thread-paginated",
+    );
+    defer allocator.free(resume_params);
+    var parsed_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        resume_params,
+        .{},
+    );
+    defer parsed_params.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_params.value.object.count());
+    try std.testing.expectEqualStrings(
+        "thread-paginated",
+        core_json.stringField(parsed_params.value.object, "threadId").?,
+    );
+    try std.testing.expectEqual(
+        true,
+        boolField(parsed_params.value.object, "excludeTurns").?,
+    );
+    try std.testing.expect(paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-other\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[{}]}}",
+        "thread-paginated",
+    ));
+}
+
+test "server request provider failures retain terminal inquiry identity" {
+    try std.testing.expectEqual(
+        FailureCode.auth_refresh_provider_unavailable,
+        failureCodeForError(error.ChatGptAuthTokensRefreshProviderUnavailable),
+    );
+    try std.testing.expectEqual(
+        FailureCode.attestation_provider_unavailable,
+        failureCodeForError(error.AttestationProviderUnavailable),
+    );
+    try std.testing.expect(!isRetryableLaneError(
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+    ));
+    try std.testing.expect(!isRetryableLaneError(
+        error.AttestationProviderUnavailable,
+    ));
+    try std.testing.expectEqual(
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+        preserveServerRequestProviderError(
+            error.ChatGptAuthTokensRefreshProviderUnavailable,
+            error.ForkFailed,
+        ),
+    );
+    try std.testing.expectEqual(
+        error.AttestationProviderUnavailable,
+        preserveServerRequestProviderError(
+            error.AttestationProviderUnavailable,
+            error.TurnStartFailed,
+        ),
     );
 }
 

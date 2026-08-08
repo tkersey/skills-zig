@@ -1160,20 +1160,30 @@ fn automationRootAccessible(
     automation_root: []const u8,
     diagnostics: *DoctorDiagnostics,
 ) !bool {
-    std.Io.Dir.cwd().access(
+    const stat = std.Io.Dir.cwd().statFile(
         std.Io.Threaded.global_single_threaded.io(),
         automation_root,
-        .{},
-    ) catch {
+        .{ .follow_symlinks = false },
+    ) catch |err| {
         try diagnostics.append(
             allocator,
             "automation-root",
             "error",
-            "automation root is not accessible: {s}",
-            .{automation_root},
+            "automation root is not accessible: {s} ({s})",
+            .{ automation_root, @errorName(err) },
         );
         return false;
     };
+    if (stat.kind != .directory) {
+        try diagnostics.append(
+            allocator,
+            "automation-root",
+            "error",
+            "automation root is not a real directory: {s}",
+            .{automation_root},
+        );
+        return false;
+    }
     return true;
 }
 
