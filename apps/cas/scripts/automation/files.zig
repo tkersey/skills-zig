@@ -155,19 +155,23 @@ pub fn writeAutomationFilesForRow(allocator: std.mem.Allocator, row: anytype) !v
 
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
     defer allocator.free(memory_path);
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
-        var file = std.Io.Dir.cwd().createFile(
-            std.Io.Threaded.global_single_threaded.io(),
-            memory_path,
-            .{},
-        ) catch |err| {
-            return userErrorFmt(
-                "unable to create memory.md ({s}): {s}",
-                .{ memory_path, @errorName(err) },
-            );
-        };
-        file.close(std.Io.Threaded.global_single_threaded.io());
+    try createMemoryFileIfMissing(memory_path);
+}
+
+fn createMemoryFileIfMissing(memory_path: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.cwd().createFile(
+        io,
+        memory_path,
+        .{ .exclusive = true },
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return userErrorFmt(
+            "unable to create memory.md ({s}): {s}",
+            .{ memory_path, @errorName(err) },
+        ),
     };
+    file.close(io);
 }
 
 pub fn deleteAutomationFiles(allocator: std.mem.Allocator, automation_id: []const u8) !void {
@@ -311,4 +315,46 @@ fn envString(key: [:0]const u8) ?[]const u8 {
 
 fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
     return output.userErrorFmt(fmt, args);
+}
+
+test "memory creation never follows a dangling symlink" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "automation", .default_dir);
+    try tmp.dir.symLink(io, "../outside.md", "automation/memory.md", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const memory_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "automation", "memory.md" },
+    );
+    defer allocator.free(memory_path);
+
+    try createMemoryFileIfMissing(memory_path);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "outside.md", .{}));
+    const link = try tmp.dir.statFile(
+        io,
+        "automation/memory.md",
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link.kind);
+
+    try tmp.dir.createDir(io, "regular", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "regular/memory.md", .data = "preserve\n" });
+    const regular_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "regular", "memory.md" },
+    );
+    defer allocator.free(regular_path);
+    try createMemoryFileIfMissing(regular_path);
+    const existing = try tmp.dir.readFileAlloc(
+        io,
+        "regular/memory.md",
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(existing);
+    try std.testing.expectEqualStrings("preserve\n", existing);
 }

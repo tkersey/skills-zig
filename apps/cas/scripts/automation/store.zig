@@ -919,6 +919,7 @@ fn inspectAutomationFiles(
 ) !void {
     const target_dir = try std.fs.path.join(allocator, &.{ automation_root, row.id });
     defer allocator.free(target_dir);
+    if (!try inspectAutomationDirectory(allocator, target_dir, diagnostics)) return;
     const toml_path = try std.fs.path.join(allocator, &.{ target_dir, "automation.toml" });
     defer allocator.free(toml_path);
     const actual = std.Io.Dir.cwd().readFileAlloc(
@@ -974,6 +975,36 @@ fn inspectAutomationFiles(
             .{memory_path},
         );
     };
+}
+
+fn inspectAutomationDirectory(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    diagnostics: *DoctorDiagnostics,
+) !bool {
+    const stat = std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        target_dir,
+        .{ .follow_symlinks = false },
+    ) catch |err| {
+        try diagnostics.append(
+            allocator,
+            "automation-directory",
+            "error",
+            "{s} is absent or unreadable: {s}",
+            .{ target_dir, @errorName(err) },
+        );
+        return false;
+    };
+    if (stat.kind == .directory) return true;
+    try diagnostics.append(
+        allocator,
+        "unsafe-automation-directory",
+        "error",
+        "{s} is not a real directory",
+        .{target_dir},
+    );
+    return false;
 }
 
 fn inspectAutomationRow(
@@ -2003,4 +2034,31 @@ test "doctor fails closed when persisted plist conversion is unavailable" {
         diagnostic.get("detail").?.string,
         "ScriptedNonZero",
     ) != null);
+}
+
+test "doctor rejects a symlinked automation row directory" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "outside", .default_dir);
+    try tmp.dir.createDir(io, "automations", .default_dir);
+    try tmp.dir.symLink(io, "../outside", "automations/row", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const row_path = try std.fs.path.join(allocator, &.{ root, "automations", "row" });
+    defer allocator.free(row_path);
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+    try std.testing.expect(!try inspectAutomationDirectory(
+        allocator,
+        row_path,
+        &diagnostics,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.rows.items.len);
+    try std.testing.expectEqualStrings(
+        "unsafe-automation-directory",
+        diagnostics.rows.items[0].code,
+    );
+    try std.testing.expect(diagnostics.hasError());
 }
