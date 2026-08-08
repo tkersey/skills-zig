@@ -132,6 +132,7 @@ const ProbeState = struct {
     lifecycle_failure_code: ?[]const u8 = null,
     lifecycle_failure_hint: ?[]const u8 = null,
     endpoint_identity: ?[]u8 = null,
+    endpoint_runtime: ?EndpointRuntimeIdentity = null,
     thread_pinning: probes.LiveWitness = .{},
     paginated_fork: probes.LiveWitness = .{},
     ephemeral_fork: probes.LiveWitness = .{},
@@ -142,6 +143,7 @@ const ProbeState = struct {
 
     fn deinit(self: *ProbeState, allocator: std.mem.Allocator) void {
         if (self.endpoint_identity) |owned| allocator.free(owned);
+        if (self.endpoint_runtime) |*identity| identity.deinit(allocator);
     }
 
     fn setIsolated(self: *ProbeState, isolated: IsolatedFullWitnesses) void {
@@ -154,6 +156,104 @@ const ProbeState = struct {
         self.external_import_history = isolated.external_import_history;
     }
 };
+
+const EndpointRuntimeIdentity = struct {
+    user_agent: []u8,
+    version: []u8,
+    codex_home: []u8,
+    platform_family: []u8,
+    platform_os: []u8,
+
+    fn deinit(self: *EndpointRuntimeIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.user_agent);
+        allocator.free(self.version);
+        allocator.free(self.codex_home);
+        allocator.free(self.platform_family);
+        allocator.free(self.platform_os);
+        self.* = undefined;
+    }
+};
+
+fn parseEndpointRuntimeIdentityAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !EndpointRuntimeIdentity {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return error.InvalidEndpointRuntimeIdentity;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidEndpointRuntimeIdentity,
+    };
+    const user_agent_value = object.get("userAgent") orelse
+        return error.InvalidEndpointRuntimeIdentity;
+    const user_agent = switch (user_agent_value) {
+        .string => |value| try allocator.dupe(u8, value),
+        else => return error.InvalidEndpointRuntimeIdentity,
+    };
+    errdefer allocator.free(user_agent);
+    const version = try endpointVersionFromUserAgentAlloc(allocator, user_agent);
+    errdefer allocator.free(version);
+    const codex_home = try endpointIdentityStringAlloc(allocator, object, "codexHome");
+    errdefer allocator.free(codex_home);
+    const platform_family = try endpointIdentityStringAlloc(
+        allocator,
+        object,
+        "platformFamily",
+    );
+    errdefer allocator.free(platform_family);
+    const platform_os = try endpointIdentityStringAlloc(allocator, object, "platformOs");
+    return .{
+        .user_agent = user_agent,
+        .version = version,
+        .codex_home = codex_home,
+        .platform_family = platform_family,
+        .platform_os = platform_os,
+    };
+}
+
+fn endpointIdentityStringAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) ![]u8 {
+    const value = object.get(key) orelse return error.InvalidEndpointRuntimeIdentity;
+    return switch (value) {
+        .string => |text| if (text.len == 0)
+            error.InvalidEndpointRuntimeIdentity
+        else
+            allocator.dupe(u8, text),
+        else => error.InvalidEndpointRuntimeIdentity,
+    };
+}
+
+fn endpointVersionFromUserAgentAlloc(
+    allocator: std.mem.Allocator,
+    user_agent: []const u8,
+) ![]u8 {
+    const slash = std.mem.indexOfScalar(u8, user_agent, '/') orelse
+        return error.InvalidEndpointRuntimeIdentity;
+    const suffix = user_agent[slash + 1 ..];
+    var end: usize = 0;
+    while (end < suffix.len and suffix[end] != ' ' and suffix[end] != '\t' and
+        suffix[end] != '(')
+    {
+        end += 1;
+    }
+    if (end == 0) return error.InvalidEndpointRuntimeIdentity;
+    return allocator.dupe(u8, suffix[0..end]);
+}
+
+fn externalEndpointTransport(transport: contract.ProbeTransport) bool {
+    return transport == .explicit_websocket or transport == .unix_websocket;
+}
+
+fn externalEndpointBehaviorUnbound(
+    profile: contract.Profile,
+    transport: contract.ProbeTransport,
+) bool {
+    return profile != .core and externalEndpointTransport(transport);
+}
 
 fn runInspected(
     allocator: std.mem.Allocator,
@@ -246,6 +346,14 @@ fn collectProbeState(
             schemas,
         );
     }
+    if (options.action == .preflight and state.lifecycle_passed and
+        externalEndpointBehaviorUnbound(options.profile, state.selected_transport))
+    {
+        state.lifecycle_passed = false;
+        state.lifecycle_failure_code = "endpoint_behavior_unbound";
+        state.lifecycle_failure_hint =
+            "non-core probes cannot be credited to an externally managed endpoint";
+    }
     if (options.action == .preflight and options.profile != .core and state.lifecycle_passed) {
         state.setIsolated(runIsolatedFullProbes(
             allocator,
@@ -285,10 +393,33 @@ fn collectLifecycle(
         state.lifecycle_failure_hint = @errorName(err);
         return;
     };
+    defer acquired.deinit(allocator);
     state.selected_transport_name = requestedTransportName(acquired.selected_transport);
     state.selected_transport = probeTransport(acquired.selected_transport);
     state.endpoint_identity = try allocator.dupe(u8, acquired.endpoint_identity);
-    acquired.deinit(allocator);
+    const initialize_response = acquired.client.initializeResponseJson() orelse {
+        state.lifecycle_failure_code = "endpoint_runtime_identity_invalid";
+        state.lifecycle_failure_hint = "initialize response was not retained";
+        return;
+    };
+    state.endpoint_runtime = parseEndpointRuntimeIdentityAlloc(
+        allocator,
+        initialize_response,
+    ) catch |err| {
+        state.lifecycle_failure_code = "endpoint_runtime_identity_invalid";
+        state.lifecycle_failure_hint = @errorName(err);
+        return;
+    };
+    if (!std.mem.eql(
+        u8,
+        state.endpoint_runtime.?.version,
+        schemas.version.text,
+    )) {
+        state.lifecycle_failure_code = "endpoint_runtime_version_mismatch";
+        state.lifecycle_failure_hint =
+            "initialize userAgent version does not match the schema source";
+        return;
+    }
     contract.verifyExecutableIdentity(allocator, io, &schemas.executable) catch |err| {
         state.lifecycle_failure_code = "codex_executable_changed";
         state.lifecycle_failure_hint = @errorName(err);
@@ -367,6 +498,7 @@ fn emitResult(
             .selected = state.selected_transport_name,
             .endpointConfigured = options.app_server_endpoint != null,
             .endpointIdentity = state.endpoint_identity,
+            .endpointRuntime = endpointRuntimeReport(state),
             .codeModeHost = code_mode_identity,
         },
         .failureCode = failure.code,
@@ -380,8 +512,26 @@ fn codexIdentity(schemas: *const contract.CachedSchemas) CodexIdentity {
         .path = schemas.executable.resolved_path,
         .version = schemas.version.text,
         .prerelease = schemas.version.prerelease(),
+        .identityRole = "schema-source",
         .pathFingerprint = schemas.executable.path_fingerprint,
         .binaryDigest = schemas.executable.binary_digest,
+    };
+}
+
+fn endpointRuntimeReport(state: ProbeState) ?EndpointRuntimeReport {
+    const identity = state.endpoint_runtime orelse return null;
+    const external = externalEndpointTransport(state.selected_transport);
+    return .{
+        .userAgent = identity.user_agent,
+        .version = identity.version,
+        .codexHome = identity.codex_home,
+        .platformFamily = identity.platform_family,
+        .platformOs = identity.platform_os,
+        .binding = if (external)
+            "initialize-user-agent-claim"
+        else
+            "cas-launched-executable",
+        .binaryDigestBound = !external,
     };
 }
 
@@ -1050,6 +1200,7 @@ const CodexIdentity = struct {
     path: []const u8,
     version: []const u8,
     prerelease: bool,
+    identityRole: []const u8,
     pathFingerprint: []const u8,
     binaryDigest: []const u8,
 };
@@ -1088,11 +1239,22 @@ const CodeModeIdentity = struct {
     sha256: []const u8,
 };
 
+const EndpointRuntimeReport = struct {
+    userAgent: []const u8,
+    version: []const u8,
+    codexHome: []const u8,
+    platformFamily: []const u8,
+    platformOs: []const u8,
+    binding: []const u8,
+    binaryDigestBound: bool,
+};
+
 const TransportReport = struct {
     requested: []const u8,
     selected: []const u8,
     endpointConfigured: bool,
     endpointIdentity: ?[]const u8,
+    endpointRuntime: ?EndpointRuntimeReport,
     codeModeHost: ?CodeModeIdentity,
 };
 
@@ -1132,6 +1294,41 @@ fn firstFailure(
         .hint = probe_row.failureHint,
     };
     return .{ .code = null, .hint = null };
+}
+
+test "endpoint runtime identity requires typed fields and a versioned user agent" {
+    const allocator = std.testing.allocator;
+    var identity = try parseEndpointRuntimeIdentityAlloc(
+        allocator,
+        "{\"userAgent\":\"codex_cli_rs/0.146.0 (macOS 15.0; arm64)\"," ++
+            "\"codexHome\":\"/tmp/codex-home\",\"platformFamily\":\"unix\"," ++
+            "\"platformOs\":\"macos\",\"additive\":true}",
+    );
+    defer identity.deinit(allocator);
+    try std.testing.expectEqualStrings("0.146.0", identity.version);
+    try std.testing.expectEqualStrings("/tmp/codex-home", identity.codex_home);
+    try std.testing.expectEqualStrings("unix", identity.platform_family);
+    try std.testing.expectEqualStrings("macos", identity.platform_os);
+
+    try std.testing.expectError(
+        error.InvalidEndpointRuntimeIdentity,
+        parseEndpointRuntimeIdentityAlloc(allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidEndpointRuntimeIdentity,
+        parseEndpointRuntimeIdentityAlloc(
+            allocator,
+            "{\"userAgent\":\"codex_cli_rs\",\"codexHome\":\"/tmp/codex-home\"," ++
+                "\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}",
+        ),
+    );
+}
+
+test "external endpoint behavior cannot borrow local isolated probes" {
+    try std.testing.expect(externalEndpointBehaviorUnbound(.full, .explicit_websocket));
+    try std.testing.expect(externalEndpointBehaviorUnbound(.review, .unix_websocket));
+    try std.testing.expect(!externalEndpointBehaviorUnbound(.core, .explicit_websocket));
+    try std.testing.expect(!externalEndpointBehaviorUnbound(.full, .managed_websocket));
 }
 
 fn writeOutput(io: std.Io, output: Output) !void {
