@@ -21,11 +21,15 @@ const legacy_generic_driver_v1 = DriverSourceIdentity{
     .locator = driver_overlay_path,
     .sha256 = "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f",
 };
+const sealed_seq_replay_driver_locator =
+    "tools/perf_hub.zig#sealed_seq_replay_driver_source";
+const sealed_seq_replay_driver_sha256 =
+    "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053";
 const active_seq_replay_driver_v1 = DriverSourceIdentity{
-    .revision = "f2ba9a2fbb3759229984f0431d2889e616f1174c",
-    .tree = "165f85af6ff4f64d714fafc1b0497b7e48c9c074",
-    .locator = "tools/perf_hub.zig#sealed_seq_replay_driver_source",
-    .sha256 = "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053",
+    .revision = sealed_seq_replay_driver_sha256,
+    .tree = "118e358ab6c6b74bded7dc77d3932c9b8b289a83904604e82e8221109458fe9b",
+    .locator = sealed_seq_replay_driver_locator,
+    .sha256 = sealed_seq_replay_driver_sha256,
 };
 const sealed_seq_replay_driver_source =
     \\const std = @import("std");
@@ -263,6 +267,18 @@ const sealed_seq_replay_driver_source =
 
 fn sealedSeqReplayDriverDigest() [64]u8 {
     return evidenceDigest(sealed_seq_replay_driver_source);
+}
+
+fn sealedSeqReplayDriverTreeDigest() [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("cas-sealed-seq-replay-driver-tree/v1");
+    hasher.update(&.{0});
+    hasher.update(sealed_seq_replay_driver_locator);
+    hasher.update(&.{0});
+    hasher.update(sealed_seq_replay_driver_sha256);
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    return std.fmt.bytesToHex(raw, .lower);
 }
 const deep_measurement_schema = "perf-deep-measurement/v1";
 const deep_comparison_method = "balanced-round-median-ratio/v1";
@@ -6359,6 +6375,15 @@ test "sealed Seq replay driver source is capture-only and dependency-minimal" {
     try std.testing.expectEqualStrings(
         active_seq_replay_driver_v1.sha256,
         &digest,
+    );
+    try std.testing.expectEqualStrings(
+        active_seq_replay_driver_v1.revision,
+        active_seq_replay_driver_v1.sha256,
+    );
+    const tree_digest = sealedSeqReplayDriverTreeDigest();
+    try std.testing.expectEqualStrings(
+        active_seq_replay_driver_v1.tree,
+        &tree_digest,
     );
     try std.testing.expectEqual(
         @as(usize, 5),
