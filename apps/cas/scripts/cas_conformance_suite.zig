@@ -922,6 +922,12 @@ fn deleteTreeAbsolute(path: []const u8) !void {
     try dir.deleteTree(std.Io.Threaded.global_single_threaded.io(), base);
 }
 
+fn cleanupTempRoot(path: []const u8) void {
+    deleteTreeAbsolute(path) catch |err| {
+        std.debug.print("failed to clean temporary root {s}: {s}\n", .{ path, @errorName(err) });
+    };
+}
+
 test "parseArgs accepts scenarios and retry knobs" {
     const argv = [_][]const u8{
         "cas_conformance_suite",
@@ -961,10 +967,10 @@ test "parseArgs accepts scenarios and retry knobs" {
 test "makeTempRoot never aliases an existing same-second root" {
     const first = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
     defer std.testing.allocator.free(first);
-    defer deleteTreeAbsolute(first) catch {};
+    defer cleanupTempRoot(first);
     const second = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
     defer std.testing.allocator.free(second);
-    defer deleteTreeAbsolute(second) catch {};
+    defer cleanupTempRoot(second);
 
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }

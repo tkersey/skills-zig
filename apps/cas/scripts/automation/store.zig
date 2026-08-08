@@ -1183,6 +1183,45 @@ fn inspectDoctorScheduler(
     return status;
 }
 
+fn appendDoctorInspectionError(
+    allocator: std.mem.Allocator,
+    diagnostics: *DoctorDiagnostics,
+    code: []const u8,
+    subject: []const u8,
+    err: anyerror,
+) !void {
+    try diagnostics.append(
+        allocator,
+        code,
+        "error",
+        "{s}: {s}",
+        .{ subject, @errorName(err) },
+    );
+}
+
+fn inspectDoctorStoreState(
+    allocator: std.mem.Allocator,
+    db: *Db,
+    db_path: []const u8,
+    automation_root: []const u8,
+    diagnostics: *DoctorDiagnostics,
+) !void {
+    const schema_diagnostics_start = diagnostics.rows.items.len;
+    try inspectStoreSchema(allocator, db, diagnostics);
+    const schema_compatible = !diagnostics.hasErrorSince(schema_diagnostics_start);
+    const root_accessible = try automationRootAccessible(allocator, automation_root, diagnostics);
+    try inspectMutationWritability(allocator, db_path, automation_root, diagnostics);
+    if (schema_compatible) {
+        try inspectCompatibleStore(
+            allocator,
+            db,
+            automation_root,
+            root_accessible,
+            diagnostics,
+        );
+    }
+}
+
 pub fn cmdDoctor(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1196,73 +1235,73 @@ pub fn cmdDoctor(
     defer if (scheduler_status) |*status| status.deinit(allocator);
 
     var db = Db.openReadOnly(allocator, db_path) catch |err| {
-        try diagnostics.append(
+        try appendDoctorInspectionError(
             allocator,
+            &diagnostics,
             "database-open",
-            "error",
-            "database is not safely readable: {s}",
-            .{@errorName(err)},
+            "database is not safely readable",
+            err,
         );
-        return renderDoctor(
+        return renderDoctorSnapshot(
             db_path,
             null,
             null,
-            if (scheduler_status) |*status| status else null,
+            &scheduler_status,
             &diagnostics,
             args.json,
         );
     };
     defer db.close();
-    const schema_diagnostics_start = diagnostics.rows.items.len;
-    try inspectStoreSchema(allocator, &db, &diagnostics);
-    const schema_compatible = !diagnostics.hasErrorSince(schema_diagnostics_start);
 
     const automation_root = files.defaultAutomationsDir(allocator) catch |err| {
-        try diagnostics.append(
+        try appendDoctorInspectionError(
             allocator,
+            &diagnostics,
             "automation-root",
-            "error",
-            "automation root is unavailable: {s}",
-            .{@errorName(err)},
+            "automation root is unavailable",
+            err,
         );
-        return renderDoctor(
+        return renderDoctorSnapshot(
             db_path,
             null,
             null,
-            if (scheduler_status) |*status| status else null,
+            &scheduler_status,
             &diagnostics,
             args.json,
         );
     };
     defer allocator.free(automation_root);
 
-    const root_accessible = try automationRootAccessible(
-        allocator,
-        automation_root,
-        &diagnostics,
-    );
-    try inspectMutationWritability(allocator, db_path, automation_root, &diagnostics);
-
-    if (schema_compatible) {
-        try inspectCompatibleStore(
-            allocator,
-            &db,
-            automation_root,
-            root_accessible,
-            &diagnostics,
-        );
-    }
+    try inspectDoctorStoreState(allocator, &db, db_path, automation_root, &diagnostics);
 
     const codex_path = try inspectDoctorRuntime(allocator, &diagnostics);
     defer if (codex_path) |value| allocator.free(value);
 
-    try renderDoctor(
+    try renderDoctorSnapshot(
         db_path,
         automation_root,
         codex_path,
-        if (scheduler_status) |*status| status else null,
+        &scheduler_status,
         &diagnostics,
         args.json,
+    );
+}
+
+fn renderDoctorSnapshot(
+    db_path: []const u8,
+    automation_root: ?[]const u8,
+    codex_path: ?[]const u8,
+    scheduler_status: *?scheduler.SchedulerStatus,
+    diagnostics: *const DoctorDiagnostics,
+    as_json: bool,
+) !void {
+    return renderDoctor(
+        db_path,
+        automation_root,
+        codex_path,
+        if (scheduler_status.*) |*status| status else null,
+        diagnostics,
+        as_json,
     );
 }
 
@@ -1898,7 +1937,10 @@ test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
     );
     const diagnostic = parsed.value.object.get("diagnostics").?.array.items[0].object;
     try std.testing.expectEqualStrings("scheduler-migration", diagnostic.get("code").?.string);
+}
 
+test "doctor fails closed when scheduler status is unavailable" {
+    const allocator = std.testing.allocator;
     var unavailable: DoctorDiagnostics = .{};
     defer unavailable.deinit(allocator);
     try unavailable.append(
@@ -1929,8 +1971,9 @@ test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
     defer unavailable_parsed.deinit();
     try std.testing.expect(!unavailable_parsed.value.object.get("safeToMutate").?.bool);
     try std.testing.expect(unavailable_parsed.value.object.get("scheduler").? == .null);
+    const diagnostic = unavailable_parsed.value.object.get("diagnostics").?.array.items[0].object;
     try std.testing.expectEqualStrings(
         "scheduler-status",
-        unavailable_parsed.value.object.get("diagnostics").?.array.items[0].object.get("code").?.string,
+        diagnostic.get("code").?.string,
     );
 }
