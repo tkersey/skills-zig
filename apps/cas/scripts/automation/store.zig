@@ -1109,7 +1109,27 @@ fn inspectSchedulerStatus(
     scheduler_status: anytype,
     diagnostics: *DoctorDiagnostics,
 ) !void {
-    if (scheduler_status.migration_required) {
+    const query_failed = switch (scheduler_status.launchctl_observation) {
+        .spawn_failed, .command_failed, .invalid_output => true,
+        .not_queried, .loaded, .not_found => false,
+    };
+    if (query_failed) {
+        try diagnostics.append(
+            allocator,
+            "scheduler-status",
+            "error",
+            "launchd scheduler state is unavailable: {s}",
+            .{scheduler.launchctlObservationName(scheduler_status.launchctl_observation)},
+        );
+    } else if (!scheduler_status.sources_agree) {
+        try diagnostics.append(
+            allocator,
+            "scheduler-state-disagreement",
+            "error",
+            "persisted and loaded scheduler program arguments disagree",
+            .{},
+        );
+    } else if (scheduler_status.migration_required) {
         try diagnostics.append(
             allocator,
             "scheduler-migration",
