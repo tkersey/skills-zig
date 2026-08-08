@@ -20,8 +20,11 @@ json_filter() {
   fi
 }
 
-fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/cas-preflight-0146.XXXXXX")"
-trap 'rm -rf "${fixture_root}"' EXIT
+fixture_storage="$(mktemp -d "${TMPDIR:-/tmp}/cas-preflight-0146.XXXXXX")"
+trap 'rm -rf "${fixture_storage}"' EXIT
+mkdir -p "${fixture_storage}/real"
+ln -s "${fixture_storage}/real" "${fixture_storage}/alias"
+fixture_root="${fixture_storage}/alias"
 mkdir -p "${fixture_root}/repo" "${fixture_root}/cache" "${fixture_root}/codex-home"
 git -C "${fixture_root}/repo" init -q
 
@@ -57,16 +60,17 @@ json_filter -e '
 ./zig-out/bin/cas app-server preflight \
   --cwd "${fixture_root}/repo" \
   --codex-path "${codex_bin}" \
-  --profile core \
+  --profile full \
   --app-server-transport stdio \
   --json >"${preflight_json}"
 
 json_filter -e '
   .schema == "cas-app-server-preflight/v1" and
   .action == "preflight" and
-  .profile == "core" and
+  .profile == "full" and
   .status == "compatible" and
   .schemas.cacheHit == true and
+  any(.behavioralProbes[]; .id == "executor-skill-resources" and .requirement == "required" and .status == "passed") and
   ([.behavioralProbes[] | select(.requirement == "required" and .status != "passed")] | length) == 0 and
   .failureCode == null
 ' "${preflight_json}" >/dev/null
@@ -77,4 +81,4 @@ json_filter -e '
   ([.cas_capabilities.features | keys[] | select(contains("0145"))] | length) == 0
 ' >/dev/null
 
-echo "CAS app-server 0.146 schema and core preflight: compatible"
+echo "CAS app-server 0.146 schema and full preflight: compatible"

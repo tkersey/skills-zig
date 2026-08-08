@@ -423,10 +423,12 @@ fn runIsolatedFullProbes(
     codex_path: []const u8,
 ) !IsolatedFullWitnesses {
     const nonce: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    const codex_home = try std.fmt.allocPrint(allocator, "{s}/probe-{x}", .{ cache_root, nonce });
+    const requested_codex_home = try std.fmt.allocPrint(allocator, "{s}/probe-{x}", .{ cache_root, nonce });
+    defer allocator.free(requested_codex_home);
+    try std.Io.Dir.cwd().createDir(io, requested_codex_home, .default_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(io, requested_codex_home) catch {};
+    const codex_home = try std.Io.Dir.cwd().realPathFileAlloc(io, requested_codex_home, allocator);
     defer allocator.free(codex_home);
-    try std.Io.Dir.cwd().createDir(io, codex_home, .default_dir);
-    errdefer std.Io.Dir.cwd().deleteTree(io, codex_home) catch {};
     try createIsolatedProbeConfig(allocator, io, codex_home);
 
     var child_environment = try parent_environment.clone(allocator);
