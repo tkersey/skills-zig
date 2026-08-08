@@ -518,7 +518,6 @@ fn readCodexVersion(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (!termSucceeded(result.term)) return error.CodexVersionFailed;
-    if (result.stderr.len != 0) return error.CodexVersionFailed;
     return parseCodexVersion(allocator, result.stdout);
 }
 
@@ -986,9 +985,8 @@ fn writeSyncedFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
 }
 
 fn syncDirectory(io: std.Io, path: []const u8) !void {
-    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
-    defer dir.close(io);
-    const file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = true });
+    defer file.close(io);
     try file.sync(io);
 }
 
@@ -2760,6 +2758,28 @@ test "exact codex version parsing distinguishes prerelease from build metadata" 
             parseCodexVersion(std.testing.allocator, raw),
         );
     }
+}
+
+test "codex version accepts bounded stderr diagnostics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(executable);
+    try writeAbsoluteTestFile(
+        io,
+        executable,
+        "#!/bin/sh\nprintf 'temporary-path warning\\n' >&2\n" ++
+            "printf 'codex-cli 0.146.0\\n'\n",
+    );
+    try makeTestExecutable(io, executable);
+
+    var version = try readCodexVersion(allocator, io, executable, .{});
+    defer version.deinit(allocator);
+    try std.testing.expectEqualStrings("0.146.0", version.text);
 }
 
 test "canonical bundle digest ignores object and creation order but binds path and content" {
