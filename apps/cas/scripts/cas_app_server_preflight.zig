@@ -800,16 +800,13 @@ fn writeOutput(io: std.Io, output: Output) !void {
 
 fn parseArgs(args: []const []const u8) !Options {
     if (args.len == 0) return error.MissingAction;
-    if (args.len == 1 and (std.mem.eql(u8, args[0], "--help") or
-        std.mem.eql(u8, args[0], "-h") or
-        std.mem.eql(u8, args[0], "help")))
-    {
+    if (isRootHelpRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         stdout_writer.interface.writeAll(Usage) catch {};
         stdout_writer.interface.flush() catch {};
         std.process.exit(0);
     }
-    if (args.len == 1 and (std.mem.eql(u8, args[0], "--version") or std.mem.eql(u8, args[0], "version"))) {
+    if (isRootVersionRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         stdout_writer.interface.print("{s}\n", .{app_meta.version}) catch {};
         stdout_writer.interface.flush() catch {};
@@ -858,6 +855,19 @@ fn parseArgs(args: []const []const u8) !Options {
     }
     _ = try proxy.app_server_launch.validateTransport(options.requested_transport, options.app_server_endpoint);
     return options;
+}
+
+fn isRootHelpRequest(args: []const []const u8) bool {
+    if (args.len != 1) return false;
+    return std.mem.eql(u8, args[0], "--help") or
+        std.mem.eql(u8, args[0], "-h") or
+        std.mem.eql(u8, args[0], "help");
+}
+
+fn isRootVersionRequest(args: []const []const u8) bool {
+    if (args.len != 1) return false;
+    return std.mem.eql(u8, args[0], "--version") or
+        std.mem.eql(u8, args[0], "version");
 }
 
 fn mark(seen: *bool) !void {
@@ -939,6 +949,19 @@ test "parser accepts exact profile transport and endpoint vocabulary" {
     try std.testing.expectEqual(contract.Profile.session_inquiry, options.profile);
     try std.testing.expectEqual(proxy.app_server_launch.RequestedTransport.explicit_websocket, options.requested_transport);
     try std.testing.expect(options.json);
+}
+
+test "root help and version requests accept the release command forms" {
+    for ([_][]const u8{ "--help", "-h", "help" }) |arg| {
+        try std.testing.expect(isRootHelpRequest(&.{arg}));
+        try std.testing.expect(!isRootVersionRequest(&.{arg}));
+    }
+    for ([_][]const u8{ "--version", "version" }) |arg| {
+        try std.testing.expect(isRootVersionRequest(&.{arg}));
+        try std.testing.expect(!isRootHelpRequest(&.{arg}));
+    }
+    try std.testing.expect(!isRootHelpRequest(&.{}));
+    try std.testing.expect(!isRootVersionRequest(&.{ "--version", "extra" }));
 }
 
 test "parser rejects duplicate unknown and transport endpoint mismatch" {

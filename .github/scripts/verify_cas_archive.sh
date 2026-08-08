@@ -30,6 +30,8 @@ LC_ALL=C tar -tzf "$archive" > "$members"
 expected_members=(
   cas
   cas_account
+  cas_app_server_preflight
+  cas_automation
   cas_smoke_check
   cas_instance_runner
   cas_review_session
@@ -101,8 +103,24 @@ for name in "${expected_members[@]}"; do
   fi
 done
 
+expected_version=0.4.0
+for name in "${expected_members[@]}"; do
+  payload="$payload_dir/$name"
+  if ! version="$("$payload" --version 2>&1)"; then
+    echo "CAS archive member failed its version probe: $name" >&2
+    printf '%s\n' "$version" >&2
+    exit 1
+  fi
+  if [[ "$version" != "$expected_version" ]]; then
+    echo "CAS archive member reported the wrong version: $name expected=$expected_version actual=$version" >&2
+    exit 1
+  fi
+done
+
 dispatch_cases=(
   account:cas_account
+  app-server:cas_app_server_preflight
+  automation:cas_automation
   conformance:cas_conformance_suite
   goal:cas_goal
   instance_runner:cas_instance_runner
@@ -115,9 +133,11 @@ for dispatch_case in "${dispatch_cases[@]}"; do
   subcommand="${dispatch_case%%:*}"
   marker="${dispatch_case#*:}"
   expected_marker="$marker"
-  if [[ "$subcommand" == "review" ]]; then
-    expected_marker="cas review"
-  fi
+  case "$subcommand" in
+    app-server) expected_marker="cas app-server" ;;
+    automation) expected_marker="cas automation" ;;
+    review) expected_marker="cas review" ;;
+  esac
   if ! output="$("$payload_dir/cas" "$subcommand" --help 2>&1)"; then
     echo "packaged CAS dispatcher failed to launch $marker for subcommand $subcommand" >&2
     printf '%s\n' "$output" >&2
@@ -129,10 +149,36 @@ for dispatch_case in "${dispatch_cases[@]}"; do
   fi
 done
 
-if "$payload_dir/cas" trial --help >/dev/null 2>&1; then
-  echo "packaged CAS dispatcher exposes a removed subcommand" >&2
-  exit 1
-fi
+for removed_subcommand in trial cron ledger review_session; do
+  if "$payload_dir/cas" "$removed_subcommand" --help >/dev/null 2>&1; then
+    echo "packaged CAS dispatcher exposes removed subcommand: $removed_subcommand" >&2
+    exit 1
+  fi
+done
 
-printf 'CAS archive verified: target=%s members=%s packaged_dispatch=pass\n' \
-  "$target" "${#expected_members[@]}"
+for help_arg in --help -h help; do
+  if ! output="$("$payload_dir/cas_app_server_preflight" "$help_arg" 2>&1)"; then
+    echo "packaged cas_app_server_preflight rejected root help form: $help_arg" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "cas app-server" <<<"$output"; then
+    echo "packaged cas_app_server_preflight help did not identify its command: $help_arg" >&2
+    exit 1
+  fi
+done
+
+for version_arg in --version version; do
+  if ! version="$("$payload_dir/cas_app_server_preflight" "$version_arg" 2>&1)"; then
+    echo "packaged cas_app_server_preflight rejected root version form: $version_arg" >&2
+    printf '%s\n' "$version" >&2
+    exit 1
+  fi
+  if [[ "$version" != "$expected_version" ]]; then
+    echo "packaged cas_app_server_preflight root version mismatch: form=$version_arg expected=$expected_version actual=$version" >&2
+    exit 1
+  fi
+done
+
+printf 'CAS archive verified: target=%s members=%s version=%s packaged_dispatch=pass\n' \
+  "$target" "${#expected_members[@]}" "$expected_version"

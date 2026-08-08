@@ -9,7 +9,6 @@ on:
       - "apps/seq/**"
       - "apps/lift/**"
       - "apps/cas/**"
-      - "apps/cron/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
       - "apps/img/**"
@@ -43,7 +42,6 @@ jobs:
       seq: ${{ steps.classify.outputs.seq }}
       lift: ${{ steps.classify.outputs.lift }}
       cas: ${{ steps.classify.outputs.cas }}
-      cron: ${{ steps.classify.outputs.cron }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
       img: ${{ steps.classify.outputs.img }}
@@ -71,13 +69,13 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas cron ledger memory-note img; do
+          for app in seq lift cas ledger memory-note img; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
 
           perf=${selected[seq]:-false}
-          if [[ "${selected[cron]:-false}" == true ]] ||
+          if [[ "${selected[cas]:-false}" == true ]] ||
              grep -Fxq 'build.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths"; then
@@ -349,6 +347,8 @@ jobs:
           mkdir -p "${package_dir}"
           cp zig-out/bin/cas "${package_dir}/cas"
           cp zig-out/bin/cas_account "${package_dir}/cas_account"
+          cp zig-out/bin/cas_app_server_preflight "${package_dir}/cas_app_server_preflight"
+          cp zig-out/bin/cas_automation "${package_dir}/cas_automation"
           cp zig-out/bin/cas_smoke_check "${package_dir}/cas_smoke_check"
           cp zig-out/bin/cas_smoke_check "${package_dir}/cas-smoke-check"
           cp zig-out/bin/cas_instance_runner "${package_dir}/cas_instance_runner"
@@ -397,20 +397,6 @@ jobs:
           version: 0.16.0
       - name: Test performance hub
         run: zig build test-perf-hub
-
-  cron:
-    needs: changes
-    if: needs.changes.outputs.cron == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build cron binaries
-        run: zig build build-cron -Doptimize=ReleaseFast
-      - name: Test cron
-        run: zig build test-cron
 
   ledger:
     needs: changes

@@ -6,20 +6,21 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 
 - `seq` (passive observation definitions over execution/session evidence)
 - `lift` (`bench_stats`, `perf_report`)
-- `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`)
-- `cron` (`cron`)
+- `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and Codex automation)
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
 - `img` (pure-Zig document and source-code PNG rendering)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
+Codex automation is owned by CAS 0.4 and is invoked through `cas automation`;
+it shares CAS's build, version, tag, release, and formula identity, with no
+separate compatibility alias.
 
 ## Layout
 
 - `apps/seq`
 - `apps/lift`
 - `apps/cas`
-- `apps/cron`
 - `apps/ledger`
 - `apps/memory-note`
 - `apps/img`
@@ -50,7 +51,6 @@ Targeted build steps:
 zig build build-seq -Doptimize=ReleaseFast
 zig build build-lift -Doptimize=ReleaseFast
 zig build build-cas -Doptimize=ReleaseFast
-zig build build-cron -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
 zig build build-img -Doptimize=ReleaseFast
@@ -63,6 +63,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/seq --help
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/cas_smoke_check --help
+./zig-out/bin/cas automation --help
 ./zig-out/bin/img --help
 ```
 
@@ -102,15 +103,14 @@ Per-app VERSION files are the source of truth:
 - `apps/seq/VERSION`
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
-- `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/img/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that
-app, and Ledger app changes also count for CAS because its archive ships
-Ledger; `build.zig` and `build.zig.zon` changes are classified by their
+app. Ledger stays independently classified because CAS neither bundles nor
+executes it. `build.zig` and `build.zig.zon` changes are classified by their
 affected app or shared-library context and fail closed to every shipped CLI
 when ownership is ambiguous; broad shared shipped surfaces such as
 `libs/core/**` count for every shipped CLI;
@@ -127,7 +127,6 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `seq-v*` -> `.github/workflows/release-seq.yml`
 - `lift-v*` -> `.github/workflows/release-lift.yml`
 - `cas-v*` -> `.github/workflows/release-cas.yml`
-- `cron-v*` -> `.github/workflows/release-cron.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
 - `img-v*` -> `.github/workflows/release-img.yml`
@@ -140,7 +139,6 @@ Required tag forms:
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
-- `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)

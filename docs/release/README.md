@@ -5,17 +5,19 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `seq`: `.github/workflows/release-seq.yml` on tag `seq-v*`
 - `lift`: `.github/workflows/release-lift.yml` on tag `lift-v*`
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
-- `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
 - `img`: `.github/workflows/release-img.yml` on tag `img-v*`
+
+Codex automation is part of CAS 0.4 and is invoked through `cas automation`.
+It uses the CAS build, version, tag, release archives, and tap formula; there is
+no standalone release identity or compatibility alias.
 
 Per-app VERSION files:
 
 - `apps/seq/VERSION`
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
-- `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/img/VERSION`
@@ -41,7 +43,6 @@ Release tags must match file versions:
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
-- `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
@@ -59,8 +60,6 @@ Examples:
 - `lift-v1.2.3-darwin-arm64.tar.gz`
 - `cas-v1.2.3-linux-x86_64.tar.gz`
 - `cas-v1.2.3-darwin-arm64.tar.gz`
-- `cron-v1.2.3-linux-x86_64.tar.gz`
-- `cron-v1.2.3-darwin-arm64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
