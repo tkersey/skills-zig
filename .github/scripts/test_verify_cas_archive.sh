@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 verifier="$repo_root/.github/scripts/verify_cas_archive.sh"
+cas_version="$(tr -d '[:space:]' < "$repo_root/apps/cas/VERSION")"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -19,7 +20,7 @@ expect_fail() {
 write_stub() {
   local path="$1"
   local marker="$2"
-  local version="${3:-0.4.0}"
+  local version="${3:-$cas_version}"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
@@ -41,7 +42,7 @@ write_dispatcher() {
     'self_dir="$(cd "$(dirname "$0")" && pwd)"' \
     'subcommand="${1:-}"' \
     'if [[ "$subcommand" == "--version" || "$subcommand" == "version" ]]; then' \
-    "  printf '%s\\n' '0.4.0'" \
+    "  printf '%s\\n' '$cas_version'" \
     '  exit 0' \
     'fi' \
     "if [[ -n '$broken_route' && \"\$subcommand\" == '$broken_route' ]]; then exit 1; fi" \
@@ -177,7 +178,7 @@ write_dispatcher "$tmp/broken-automation-dispatch" automation
 archive_dot "$tmp/broken-automation-dispatch" "$tmp/broken-automation-dispatch.tar.gz"
 
 clone_set "$tmp/base-linux" "$tmp/wrong-version"
-write_stub "$tmp/wrong-version/cas_goal" cas_goal 0.3.0
+write_stub "$tmp/wrong-version/cas_goal" cas_goal "${cas_version}-wrong"
 archive_dot "$tmp/wrong-version" "$tmp/wrong-version.tar.gz"
 
 "$verifier" darwin-arm64 "$tmp/darwin-dot.tar.gz" >/dev/null

@@ -6,6 +6,13 @@ if [[ $# -ne 2 ]]; then
   exit 2
 fi
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+expected_version="$(tr -d '[:space:]' < "$repo_root/apps/cas/VERSION")"
+if [[ -z "$expected_version" ]]; then
+  echo "apps/cas/VERSION must contain the CAS release version" >&2
+  exit 1
+fi
+
 target="$1"
 archive="$2"
 
@@ -103,7 +110,6 @@ for name in "${expected_members[@]}"; do
   fi
 done
 
-expected_version=0.4.0
 for name in "${expected_members[@]}"; do
   payload="$payload_dir/$name"
   if ! version="$("$payload" --version 2>&1)"; then
