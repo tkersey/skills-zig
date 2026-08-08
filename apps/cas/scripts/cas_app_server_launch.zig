@@ -18,6 +18,16 @@ pub const RequestedTransport = enum {
         if (std.mem.eql(u8, raw, "unix")) return .unix_socket;
         return null;
     }
+
+    pub fn asString(self: RequestedTransport) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .stdio => "stdio",
+            .managed_websocket => "managed-ws",
+            .explicit_websocket => "ws",
+            .unix_socket => "unix",
+        };
+    }
 };
 
 pub const ValidatedTransport = union(RequestedTransport) {
@@ -206,6 +216,9 @@ pub fn appendAppServerArgs(
     listen_url: ?[]const u8,
     code_mode_host: ?*const CodeModeHost,
 ) !void {
+    // Keep both app-server endpoints explicit in one argv builder. `--listen`
+    // is the inbound CAS transport; `--code-mode-host` is Codex's outbound
+    // connection and must never be substituted for the listener.
     try argv.append(allocator, "app-server");
     if (disable_hooks) try argv.appendSlice(allocator, &.{ "--disable", "codex_hooks" });
     if (listen_url) |value| try argv.appendSlice(allocator, &.{ "--listen", value });

@@ -25,9 +25,11 @@ const UsageText =
     \\  --cwd DIR                         Workspace for CAS smoke preflight.
     \\
     \\Options:
-    \\  --scenario NAME                   Repeatable: overload_backoff.
+    \\  --scenario NAME                   Repeatable: overload_backoff, app_server_features.
     \\  --skip-smoke-check                Skip live cas_smoke_check preflight.
     \\  --smoke-binary PATH               Override cas_smoke_check binary path.
+    \\  --preflight-binary PATH           Override cas_app_server_preflight binary path.
+    \\  --codex-path PATH                 Exact Codex binary for app-server feature probes.
     \\  --hooks MODE                      Hook policy for smoke preflight: inherit|off|require-observed (default: inherit).
     \\  --backoff-base-ms N               Base retry delay for overload policy checks (default: 250).
     \\  --max-retries N                   Max overload retries before failure (default: 4).
@@ -43,21 +45,25 @@ const DefaultMaxRetries: u32 = DefaultRetryPolicy.max_retries;
 
 const Scenario = enum {
     overload_backoff,
+    app_server_features,
 
     fn parse(raw: []const u8) ?Scenario {
         if (std.mem.eql(u8, raw, "overload_backoff") or std.mem.eql(u8, raw, "overload-backoff")) return .overload_backoff;
+        if (std.mem.eql(u8, raw, "app_server_features") or std.mem.eql(u8, raw, "app-server-features")) return .app_server_features;
         return null;
     }
 
     fn asString(self: Scenario) []const u8 {
         return switch (self) {
             .overload_backoff => "overload_backoff",
+            .app_server_features => "app_server_features",
         };
     }
 
     fn mode(self: Scenario) []const u8 {
         return switch (self) {
             .overload_backoff => "integration",
+            .app_server_features => "exact-runtime",
         };
     }
 };
@@ -71,6 +77,8 @@ const ParsedArgs = struct {
     scenarios: []const Scenario = &.{},
     skip_smoke_check: bool = false,
     smoke_binary: ?[]const u8 = null,
+    preflight_binary: ?[]const u8 = null,
+    codex_path: ?[]const u8 = null,
     hook_policy: cas_hooks.HookPolicy = .inherit,
     backoff_base_ms: u32 = DefaultBackoffBaseMs,
     max_retries: u32 = DefaultMaxRetries,
@@ -82,6 +90,8 @@ const ParsedArgs = struct {
 const Context = struct {
     cwd: []const u8,
     smoke_binary: []const u8,
+    preflight_binary: []const u8 = "cas_app_server_preflight",
+    codex_path: ?[]const u8 = null,
     hook_policy: cas_hooks.HookPolicy,
     backoff_base_ms: u32,
     max_retries: u32,
@@ -146,6 +156,8 @@ pub fn main(init: std.process.Init) !void {
     const ctx = Context{
         .cwd = cwd,
         .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
+        .preflight_binary = try resolveExecutable(allocator, parsed.preflight_binary, "cas_app_server_preflight"),
+        .codex_path = parsed.codex_path,
         .hook_policy = parsed.hook_policy,
         .backoff_base_ms = parsed.backoff_base_ms,
         .max_retries = parsed.max_retries,
@@ -265,6 +277,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--smoke-binary")) {
             out.smoke_binary = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--preflight-binary")) {
+            out.preflight_binary = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--codex-path")) {
+            out.codex_path = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--hooks")) {
@@ -503,6 +523,7 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
 fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenario) !ScenarioResult {
     const result = switch (scenario) {
         .overload_backoff => scenarioOverloadBackoff(allocator, ctx),
+        .app_server_features => scenarioAppServerFeatures(allocator, ctx),
     } catch |err| ScenarioResult{
         .name = scenario.asString(),
         .mode = scenario.mode(),
@@ -511,6 +532,86 @@ fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenari
     };
 
     return result;
+}
+
+const app_server_feature_probe_ids = [_][]const u8{
+    "thread-pinning-round-trip",
+    "paginated-fork",
+    "ephemeral-fork",
+    "external-import-history",
+};
+
+fn scenarioAppServerFeatures(allocator: std.mem.Allocator, ctx: Context) !ScenarioResult {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        ctx.preflight_binary,
+        "preflight",
+        "--cwd",
+        ctx.cwd,
+        "--profile",
+        "full",
+        "--app-server-transport",
+        "stdio",
+        "--json",
+    });
+    if (ctx.codex_path) |codex_path| try argv.appendSlice(allocator, &.{ "--codex-path", codex_path });
+    const capture = try runCommandCapture(allocator, null, argv.items);
+    const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout_trimmed, .{}) catch
+        return error.InvalidAppServerPreflightJson;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidAppServerPreflightJson,
+    };
+    if (!std.mem.eql(u8, core_json.stringField(root, "schema") orelse return error.InvalidAppServerPreflightJson, "cas-app-server-preflight/v1"))
+        return error.InvalidAppServerPreflightJson;
+    const probes_value = root.get("behavioralProbes") orelse return error.InvalidAppServerPreflightJson;
+    const probe_rows = switch (probes_value) {
+        .array => |value| value,
+        else => return error.InvalidAppServerPreflightJson,
+    };
+    const summary = summarizeAppServerFeatureProbes(probe_rows.items);
+    const full_status = core_json.stringField(root, "status") orelse "unknown";
+    return .{
+        .name = Scenario.app_server_features.asString(),
+        .mode = Scenario.app_server_features.mode(),
+        .ok = summary.passed == app_server_feature_probe_ids.len and summary.missing == 0,
+        .detail = try std.fmt.allocPrint(
+            allocator,
+            "live preflight feature probes {d}/{d} passed (full_status={s}, exit={d})",
+            .{ summary.passed, app_server_feature_probe_ids.len, full_status, capture.exit_code },
+        ),
+        .items_total = app_server_feature_probe_ids.len,
+        .items_ok = summary.passed,
+        .missing_rows = summary.missing,
+    };
+}
+
+const FeatureProbeSummary = struct {
+    passed: usize = 0,
+    missing: usize = 0,
+};
+
+fn summarizeAppServerFeatureProbes(rows: []const std.json.Value) FeatureProbeSummary {
+    var summary: FeatureProbeSummary = .{};
+    for (app_server_feature_probe_ids) |expected_id| {
+        var found = false;
+        for (rows) |row_value| {
+            const row = switch (row_value) {
+                .object => |value| value,
+                else => continue,
+            };
+            const id = core_json.stringField(row, "id") orelse continue;
+            if (!std.mem.eql(u8, id, expected_id)) continue;
+            found = true;
+            if (std.mem.eql(u8, core_json.stringField(row, "status") orelse "", "passed")) summary.passed += 1;
+            break;
+        }
+        if (!found) summary.missing += 1;
+    }
+    return summary;
 }
 
 fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !ScenarioResult {
@@ -753,6 +854,10 @@ test "parseArgs accepts scenarios and retry knobs" {
         "/tmp/repo",
         "--scenario",
         "overload_backoff",
+        "--preflight-binary",
+        "/tmp/cas_app_server_preflight",
+        "--codex-path",
+        "/tmp/codex-0.146.0",
         "--skip-smoke-check",
         "--backoff-base-ms",
         "500",
@@ -769,11 +874,26 @@ test "parseArgs accepts scenarios and retry knobs" {
     try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.scenarios.len);
     try std.testing.expectEqual(Scenario.overload_backoff, parsed.scenarios[0]);
+    try std.testing.expectEqualStrings("/tmp/cas_app_server_preflight", parsed.preflight_binary.?);
+    try std.testing.expectEqualStrings("/tmp/codex-0.146.0", parsed.codex_path.?);
     try std.testing.expect(parsed.skip_smoke_check);
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(cas_hooks.HookPolicy.off, parsed.hook_policy);
     try std.testing.expectEqual(@as(u32, 500), parsed.backoff_base_ms);
     try std.testing.expectEqual(@as(u32, 7), parsed.max_retries);
+}
+
+test "feature probe summary consumes exact live preflight rows" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"id\":\"thread-pinning-round-trip\",\"status\":\"passed\"},{\"id\":\"paginated-fork\",\"status\":\"passed\"},{\"id\":\"ephemeral-fork\",\"status\":\"failed\"},{\"id\":\"external-import-history\",\"status\":\"passed\"}]",
+        .{},
+    );
+    defer parsed.deinit();
+    const summary = summarizeAppServerFeatureProbes(parsed.value.array.items);
+    try std.testing.expectEqual(@as(usize, 3), summary.passed);
+    try std.testing.expectEqual(@as(usize, 0), summary.missing);
 }
 
 test "parseArgs rejects unknown scenario" {

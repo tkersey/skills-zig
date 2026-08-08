@@ -37,7 +37,16 @@ const UsageText =
     \\                                      Exact result payload for item/tool/requestUserInput.
     \\  --elicitation-action VALUE          decline|cancel|accept.
     \\  --elicitation-content-json JSON     Content payload when elicitation action is accept.
+    \\  --elicitation-response-json JSON    Exact full result for form/openai/form elicitation.
     \\  --dynamic-tool-response-json JSON   Exact result payload for item/tool/call.
+    \\  --auth-refresh-response-file PATH   Owner-only JSON file, or - for stdin; never logged.
+    \\  --attestation-response-file PATH    Owner-only JSON file, or - for stdin; never logged.
+    \\  --experimental-api BOOL             Initialize experimentalApi (default: true).
+    \\  --init-capabilities-json JSON       Bounded additive initialize capability object.
+    \\  --codex-path PATH                   Codex executable path or name (default: codex).
+    \\  --app-server-transport MODE         auto|stdio|managed-ws|ws|unix (default: auto).
+    \\  --app-server-endpoint ENDPOINT      Required by ws; optional unix:// path for unix.
+    \\  --code-mode-host URL                Outbound ws:// loopback or wss:// remote host.
     \\  --read-only                         Decline exec + file approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
     \\  --hooks MODE                        Hook policy: inherit|off|require-observed (default: inherit).
@@ -71,7 +80,16 @@ const ParsedArgs = struct {
     request_user_input_response_json: ?[]const u8 = null,
     elicitation_action: ?[]const u8 = null,
     elicitation_content_json: ?[]const u8 = null,
+    elicitation_response_json: ?[]const u8 = null,
     dynamic_tool_response_json: ?[]const u8 = null,
+    auth_refresh_response_source: ?[]const u8 = null,
+    attestation_response_source: ?[]const u8 = null,
+    experimental_api: bool = true,
+    additional_initialize_capabilities_json: ?[]const u8 = null,
+    codex_path: []const u8 = "codex",
+    requested_transport: cas.app_server_launch.RequestedTransport = .auto,
+    transport_endpoint: ?[]const u8 = null,
+    code_mode_host: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_methods: []const []const u8 = &.{},
     hook_policy: cas.hooks.HookPolicy = .inherit,
@@ -104,6 +122,156 @@ const InstanceSlot = struct {
     managed_server: ?cas_websocket.ManagedServer = null,
 };
 
+const CodeModeIdentity = struct {
+    endpoint: []const u8,
+    digest: []const u8,
+};
+
+fn clientOptions(
+    opts: ParsedArgs,
+    cwd: []const u8,
+    codex_path: []const u8,
+    client_name: []const u8,
+    state_file: ?[]const u8,
+    auth_refresh_response: ?[]const u8,
+    attestation_response: ?[]const u8,
+    code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
+) cas.ClientOptions {
+    return .{
+        .cwd = cwd,
+        .state_file = state_file,
+        .codex_path = codex_path,
+        .client_name = client_name,
+        .server_request_timeout_ms = opts.server_request_timeout_ms,
+        .exec_approval = opts.exec_approval,
+        .file_approval = opts.file_approval,
+        .permissions_approval = opts.permissions_approval,
+        .request_user_input_response_json = opts.request_user_input_response_json,
+        .elicitation_action = opts.elicitation_action,
+        .elicitation_content_json = opts.elicitation_content_json,
+        .elicitation_response_json = opts.elicitation_response_json,
+        .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+        .auth_refresh_response_json = auth_refresh_response,
+        .attestation_response_json = attestation_response,
+        .read_only = opts.read_only,
+        .experimental_api = opts.experimental_api,
+        .opt_out_notification_methods = opts.opt_out_methods,
+        .additional_initialize_capabilities_json = opts.additional_initialize_capabilities_json,
+        .hook_policy = opts.hook_policy,
+        .code_mode_host = code_mode_host,
+    };
+}
+
+fn startInstance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ParsedArgs,
+    cwd: []const u8,
+    codex_path: []const u8,
+    selected_transport: cas.app_server_launch.ValidatedTransport,
+    state_file: ?[]const u8,
+    client_name: []const u8,
+    auth_refresh_response: ?[]const u8,
+    attestation_response: ?[]const u8,
+    code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
+) !InstanceSlot {
+    switch (selected_transport) {
+        .auto => {
+            var server = startManagedServer(allocator, io, cwd, codex_path, opts.hook_policy, code_mode_host) catch |err| {
+                if (!cas.app_server_launch.autoMayFallback(.auto, .managed_websocket, .stdio, .before_first_rpc, true)) return err;
+                var direct = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, code_mode_host);
+                direct.io = io;
+                direct.transport = .stdio;
+                return .{ .client = try cas.Client.start(allocator, direct), .transport = "stdio" };
+            };
+            return finishManagedStart(allocator, io, opts, cwd, codex_path, state_file, client_name, auth_refresh_response, attestation_response, &server);
+        },
+        .managed_websocket => {
+            var server = try startManagedServer(allocator, io, cwd, codex_path, opts.hook_policy, code_mode_host);
+            return finishManagedStart(allocator, io, opts, cwd, codex_path, state_file, client_name, auth_refresh_response, attestation_response, &server);
+        },
+        .stdio, .explicit_websocket, .unix_socket => {
+            var direct = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, code_mode_host);
+            direct.io = io;
+            direct.transport = selected_transport;
+            const identity: []const u8 = switch (selected_transport) {
+                .stdio => "stdio",
+                .explicit_websocket => "websocket",
+                .unix_socket => "unix_socket",
+                else => unreachable,
+            };
+            return .{ .client = try cas.Client.start(allocator, direct), .transport = identity };
+        },
+    }
+}
+
+fn startManagedServer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    codex_path: []const u8,
+    hook_policy: cas.hooks.HookPolicy,
+    code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
+) !cas_websocket.ManagedServer {
+    if (code_mode_host) |host| {
+        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, codex_path, hook_policy, host, io);
+    }
+    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
+}
+
+fn finishManagedStart(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ParsedArgs,
+    cwd: []const u8,
+    codex_path: []const u8,
+    state_file: ?[]const u8,
+    client_name: []const u8,
+    auth_refresh_response: ?[]const u8,
+    attestation_response: ?[]const u8,
+    server: *cas_websocket.ManagedServer,
+) !InstanceSlot {
+    errdefer {
+        server.kill();
+        server.deinit(allocator);
+    }
+    var socket = clientOptions(opts, cwd, codex_path, client_name, state_file, auth_refresh_response, attestation_response, null);
+    socket.io = io;
+    socket.websocket_url = server.listen_url;
+    return .{
+        .client = try cas.Client.start(allocator, socket),
+        .transport = "managed_websocket",
+        .managed_server = server.*,
+    };
+}
+
+fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, source: []const u8) ![]u8 {
+    if (std.mem.eql(u8, source, "-")) {
+        var reader = std.Io.File.stdin().reader(io, &.{});
+        return reader.interface.allocRemaining(allocator, .limited(cas.max_server_request_carrier_bytes));
+    }
+    var file = if (std.fs.path.isAbsolute(source))
+        try std.Io.Dir.openFileAbsolute(io, source, .{ .follow_symlinks = false, .allow_directory = false })
+    else
+        try std.Io.Dir.cwd().openFile(io, source, .{ .follow_symlinks = false, .allow_directory = false });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.InvalidSecretCarrierFile;
+    if (comptime std.posix.mode_t != u0) {
+        const mode = stat.permissions.toMode();
+        if (mode & 0o400 == 0 or mode & 0o077 != 0) return error.InsecureSecretCarrierPermissions;
+    }
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(cas.max_server_request_carrier_bytes));
+}
+
+fn wipeSecretCarrier(allocator: std.mem.Allocator, carrier: ?[]u8) void {
+    if (carrier) |owned| {
+        @memset(owned, 0);
+        allocator.free(owned);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -130,6 +298,7 @@ pub fn main(init: std.process.Init) !void {
     const cwd = opts.cwd orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
+    defer allocator.free(opts.opt_out_methods);
 
     if (opts.instances > 1 and opts.state_file_dir == null) {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -139,8 +308,37 @@ pub fn main(init: std.process.Init) !void {
 
     const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
     defer allocator.free(params);
-    _ = opts.request_timeout_ms;
-    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch "codex";
+    const selected_transport = try cas.app_server_launch.validateTransport(opts.requested_transport, opts.transport_endpoint);
+    var code_mode_host: ?cas.app_server_launch.CodeModeHost = if (opts.code_mode_host) |raw|
+        try cas.app_server_launch.CodeModeHost.init(allocator, raw)
+    else
+        null;
+    defer if (code_mode_host) |*host| host.deinit();
+    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, opts.codex_path);
+    defer allocator.free(resolved_codex_path);
+    const auth_refresh_response = if (opts.auth_refresh_response_source) |source|
+        try loadSecretCarrierAlloc(allocator, init.io, source)
+    else
+        null;
+    defer wipeSecretCarrier(allocator, auth_refresh_response);
+    const attestation_response = if (opts.attestation_response_source) |source|
+        try loadSecretCarrierAlloc(allocator, init.io, source)
+    else
+        null;
+    defer wipeSecretCarrier(allocator, attestation_response);
+
+    var validation_options = clientOptions(
+        opts,
+        cwd,
+        resolved_codex_path,
+        "cas-instance-validation",
+        null,
+        auth_refresh_response,
+        attestation_response,
+        if (code_mode_host) |*host| host else null,
+    );
+    validation_options.transport = selected_transport;
+    try cas.validateClientOptions(allocator, validation_options);
     const hook_log_path = if (opts.hook_policy.shouldCaptureNotifications())
         try cas.hooks.defaultHookLogPathAlloc(allocator, "cas-instance-runner")
     else
@@ -178,108 +376,35 @@ pub fn main(init: std.process.Init) !void {
         const client_name = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ opts.client_prefix, instance_num });
         defer allocator.free(client_name);
 
-        var transport: []const u8 = "stdio";
-        var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(
+        slots[i] = startInstance(
             allocator,
+            init.io,
+            opts,
             cwd,
             resolved_codex_path,
-            opts.hook_policy,
-            init.io,
-        ) catch null;
-
-        const client = if (managed_server) |server|
-            cas.Client.start(allocator, .{
-                .cwd = cwd,
-                .io = init.io,
-                .state_file = state_file,
-                .client_name = client_name,
-                .server_request_timeout_ms = opts.server_request_timeout_ms,
-                .exec_approval = opts.exec_approval,
-                .file_approval = opts.file_approval,
-                .permissions_approval = opts.permissions_approval,
-                .request_user_input_response_json = opts.request_user_input_response_json,
-                .elicitation_action = opts.elicitation_action,
-                .elicitation_content_json = opts.elicitation_content_json,
-                .dynamic_tool_response_json = opts.dynamic_tool_response_json,
-                .read_only = opts.read_only,
-                .opt_out_notification_methods = opts.opt_out_methods,
-                .hook_policy = opts.hook_policy,
-                .websocket_url = server.listen_url,
-            }) catch blk: {
-                var owned_server = server;
-                owned_server.kill();
-                managed_server = null;
-                break :blk cas.Client.start(allocator, .{
-                    .cwd = cwd,
-                    .io = init.io,
-                    .state_file = state_file,
-                    .client_name = client_name,
-                    .server_request_timeout_ms = opts.server_request_timeout_ms,
-                    .exec_approval = opts.exec_approval,
-                    .file_approval = opts.file_approval,
-                    .permissions_approval = opts.permissions_approval,
-                    .request_user_input_response_json = opts.request_user_input_response_json,
-                    .elicitation_action = opts.elicitation_action,
-                    .elicitation_content_json = opts.elicitation_content_json,
-                    .dynamic_tool_response_json = opts.dynamic_tool_response_json,
-                    .read_only = opts.read_only,
-                    .opt_out_notification_methods = opts.opt_out_methods,
-                    .hook_policy = opts.hook_policy,
-                }) catch |err| {
-                    const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-                    try start_failures.append(allocator, .{
-                        .instance = instance_num,
-                        .@"error" = msg,
-                    });
-                    if (opts.verbose) {
-                        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                        const stderr = &stderr_writer.interface;
-                        try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
-                    }
-                    continue;
-                };
+            selected_transport,
+            state_file,
+            client_name,
+            auth_refresh_response,
+            attestation_response,
+            if (code_mode_host) |*host| host else null,
+        ) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+            try start_failures.append(allocator, .{
+                .instance = instance_num,
+                .@"error" = msg,
+            });
+            if (opts.verbose) {
+                var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+                const stderr = &stderr_writer.interface;
+                try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
             }
-        else
-            cas.Client.start(allocator, .{
-                .cwd = cwd,
-                .io = init.io,
-                .state_file = state_file,
-                .client_name = client_name,
-                .server_request_timeout_ms = opts.server_request_timeout_ms,
-                .exec_approval = opts.exec_approval,
-                .file_approval = opts.file_approval,
-                .permissions_approval = opts.permissions_approval,
-                .request_user_input_response_json = opts.request_user_input_response_json,
-                .elicitation_action = opts.elicitation_action,
-                .elicitation_content_json = opts.elicitation_content_json,
-                .dynamic_tool_response_json = opts.dynamic_tool_response_json,
-                .read_only = opts.read_only,
-                .opt_out_notification_methods = opts.opt_out_methods,
-                .hook_policy = opts.hook_policy,
-            }) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-                try start_failures.append(allocator, .{
-                    .instance = instance_num,
-                    .@"error" = msg,
-                });
-                if (opts.verbose) {
-                    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                    const stderr = &stderr_writer.interface;
-                    try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
-                }
-                continue;
-            };
-
-        if (managed_server != null) transport = "websocket";
-        slots[i] = .{
-            .client = client,
-            .transport = transport,
-            .managed_server = managed_server,
+            continue;
         };
         if (opts.verbose) {
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stderr = &stderr_writer.interface;
-            try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, transport });
+            try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, slots[i].?.transport });
         }
     }
     const after_start = monotonicMillis();
@@ -294,7 +419,10 @@ pub fn main(init: std.process.Init) !void {
         defer {
             client.close();
             client.deinit();
-            if (slot.managed_server) |*server| server.kill();
+            if (slot.managed_server) |*server| {
+                server.kill();
+                server.deinit(allocator);
+            }
             slots[i] = null;
         }
 
@@ -336,13 +464,20 @@ pub fn main(init: std.process.Init) !void {
 
     const requests_ok = countRequestSuccess(request_results.items);
     const requests_failed = request_results.items.len - requests_ok;
+    const managed_websocket_count = countTransport(request_results.items, "managed_websocket");
     const websocket_count = countTransport(request_results.items, "websocket");
+    const unix_socket_count = countTransport(request_results.items, "unix_socket");
     const stdio_count = countTransport(request_results.items, "stdio");
     const instances_started = request_results.items.len;
     const sample_results = request_results.items[0..@min(opts.sample, request_results.items.len)];
     var hook_accumulator = cas.hooks.HookAccumulator.init(opts.hook_policy, hook_log_path);
     try hook_accumulator.absorbLines(allocator, captured_notifications.items);
     const hook_summary = hook_accumulator.summary();
+    var code_mode_digest_buffer: [64]u8 = undefined;
+    const code_mode_identity: ?CodeModeIdentity = if (code_mode_host) |*host| .{
+        .endpoint = host.redacted_origin,
+        .digest = host.digestHex(&code_mode_digest_buffer),
+    } else null;
 
     const payload = .{
         .demo = "cas-instance-runner",
@@ -350,6 +485,8 @@ pub fn main(init: std.process.Init) !void {
         .state_file_dir = opts.state_file_dir,
         .method = opts.method,
         .params = params,
+        .requested_transport = transportName(opts.requested_transport),
+        .code_mode_host = code_mode_identity,
         .requestedMultiAgentMode = @as(?[]const u8, null),
         .effectiveMultiAgentMode = @as(?[]const u8, null),
         .multiAgentModeSupport = cas.MultiAgentModeSupport.not_requested.asString(),
@@ -360,7 +497,9 @@ pub fn main(init: std.process.Init) !void {
         .requests_ok = requests_ok,
         .requests_failed = requests_failed,
         .transport_counts = .{
+            .managed_websocket = managed_websocket_count,
             .websocket = websocket_count,
+            .unix_socket = unix_socket_count,
             .stdio = stdio_count,
         },
         .hookSummary = hook_summary,
@@ -387,7 +526,12 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("instances started:   {d}\n", .{instances_started});
         try stdout.print("requests ok:      {d}\n", .{requests_ok});
         try stdout.print("requests failed:  {d}\n", .{requests_failed});
-        try stdout.print("transport counts: websocket={d}, stdio={d}\n", .{ websocket_count, stdio_count });
+        try stdout.print("transport counts: managed_websocket={d}, websocket={d}, unix_socket={d}, stdio={d}\n", .{
+            managed_websocket_count,
+            websocket_count,
+            unix_socket_count,
+            stdio_count,
+        });
         try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
             hook_summary.policy,
             hook_summary.observed,
@@ -425,6 +569,7 @@ pub fn main(init: std.process.Init) !void {
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var methods: std.ArrayList([]const u8) = .empty;
+    errdefer methods.deinit(allocator);
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -528,10 +673,51 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.elicitation_content_json = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--elicitation-response-json")) {
+            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed_json.deinit();
+            out.elicitation_response_json = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--dynamic-tool-response-json")) {
             var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
             defer parsed_json.deinit();
             out.dynamic_tool_response_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--auth-refresh-response-file")) {
+            out.auth_refresh_response_source = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--attestation-response-file")) {
+            out.attestation_response_source = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--experimental-api")) {
+            out.experimental_api = parseBool(value) orelse return error.InvalidBoolean;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--init-capabilities-json")) {
+            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed_json.deinit();
+            if (parsed_json.value != .object) return error.InvalidInitializeCapabilities;
+            out.additional_initialize_capabilities_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--codex-path")) {
+            out.codex_path = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--app-server-transport")) {
+            out.requested_transport = cas.app_server_launch.RequestedTransport.parse(value) orelse return error.InvalidTransport;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
+            out.transport_endpoint = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--code-mode-host")) {
+            out.code_mode_host = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
@@ -557,8 +743,30 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 
     if (out.params_json != null and out.params_file != null) return error.DuplicateParamsSource;
     if (out.multi_agent_mode != null) return error.MultiAgentModeRemoved;
+    if (std.mem.eql(u8, out.auth_refresh_response_source orelse "", "-") and
+        std.mem.eql(u8, out.attestation_response_source orelse "", "-"))
+    {
+        return error.DuplicateSecretStdinSource;
+    }
+    _ = try cas.app_server_launch.validateTransport(out.requested_transport, out.transport_endpoint);
     out.opt_out_methods = try methods.toOwnedSlice(allocator);
     return out;
+}
+
+fn parseBool(raw: []const u8) ?bool {
+    if (std.mem.eql(u8, raw, "true")) return true;
+    if (std.mem.eql(u8, raw, "false")) return false;
+    return null;
+}
+
+fn transportName(transport: cas.app_server_launch.RequestedTransport) []const u8 {
+    return switch (transport) {
+        .auto => "auto",
+        .stdio => "stdio",
+        .managed_websocket => "managed-ws",
+        .explicit_websocket => "ws",
+        .unix_socket => "unix",
+    };
 }
 
 fn usageDetailForParseError(err: anyerror) ?[]const u8 {
@@ -791,6 +999,86 @@ test "parseArgs accepts extended server request controls" {
     try std.testing.expectEqual(@as(?[]const u8, "accept"), parsed.elicitation_action);
     try std.testing.expectEqual(@as(?[]const u8, "{\"confirmed\":true}"), parsed.elicitation_content_json);
     try std.testing.expectEqual(@as(?[]const u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}],\"success\":true}"), parsed.dynamic_tool_response_json);
+}
+
+test "parseArgs accepts typed transport initialization and secret sources" {
+    const argv = [_][]const u8{
+        "cas_instance_runner",
+        "--cwd",
+        "/tmp/repo",
+        "--codex-path",
+        "/opt/codex",
+        "--app-server-transport",
+        "unix",
+        "--app-server-endpoint",
+        "unix:///tmp/codex.sock",
+        "--code-mode-host",
+        "wss://code.example:443/path?credential=redacted-at-output",
+        "--experimental-api",
+        "false",
+        "--init-capabilities-json",
+        "{\"futureCapability\":true}",
+        "--elicitation-response-json",
+        "{\"action\":\"decline\"}",
+        "--auth-refresh-response-file",
+        "/secure/auth.json",
+        "--attestation-response-file",
+        "/secure/attestation.json",
+    };
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(parsed.opt_out_methods);
+    try std.testing.expectEqual(cas.app_server_launch.RequestedTransport.unix_socket, parsed.requested_transport);
+    try std.testing.expectEqualStrings("unix:///tmp/codex.sock", parsed.transport_endpoint.?);
+    try std.testing.expectEqualStrings("/opt/codex", parsed.codex_path);
+    try std.testing.expect(!parsed.experimental_api);
+    try std.testing.expectEqualStrings("{\"futureCapability\":true}", parsed.additional_initialize_capabilities_json.?);
+    try std.testing.expectEqualStrings("{\"action\":\"decline\"}", parsed.elicitation_response_json.?);
+    try std.testing.expectEqualStrings("/secure/auth.json", parsed.auth_refresh_response_source.?);
+    try std.testing.expectEqualStrings("/secure/attestation.json", parsed.attestation_response_source.?);
+}
+
+test "parseArgs rejects ambiguous stdin secrets and incomplete explicit transport" {
+    try std.testing.expectError(error.DuplicateSecretStdinSource, parseArgs(std.testing.allocator, &.{
+        "cas_instance_runner",
+        "--auth-refresh-response-file",
+        "-",
+        "--attestation-response-file",
+        "-",
+    }));
+    try std.testing.expectError(error.TransportEndpointRequired, parseArgs(std.testing.allocator, &.{
+        "cas_instance_runner",
+        "--app-server-transport",
+        "ws",
+    }));
+}
+
+test "secret carrier files must be regular and owner only" {
+    if (comptime std.posix.mode_t == u0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const secure_path = try std.fs.path.join(std.testing.allocator, &.{ root, "secure.json" });
+    defer std.testing.allocator.free(secure_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "secure.json", .data = "{\"token\":\"SECRET\"}" });
+    var secure_file = try tmp.dir.openFile(io, "secure.json", .{});
+    try secure_file.setPermissions(io, .fromMode(0o600));
+    secure_file.close(io);
+    const secure = try loadSecretCarrierAlloc(std.testing.allocator, io, secure_path);
+    defer wipeSecretCarrier(std.testing.allocator, secure);
+    try std.testing.expectEqualStrings("{\"token\":\"SECRET\"}", secure);
+
+    const insecure_path = try std.fs.path.join(std.testing.allocator, &.{ root, "insecure.json" });
+    defer std.testing.allocator.free(insecure_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "insecure.json", .data = "{}" });
+    var insecure_file = try tmp.dir.openFile(io, "insecure.json", .{});
+    try insecure_file.setPermissions(io, .fromMode(0o644));
+    insecure_file.close(io);
+    try std.testing.expectError(
+        error.InsecureSecretCarrierPermissions,
+        loadSecretCarrierAlloc(std.testing.allocator, io, insecure_path),
+    );
 }
 
 test "parseArgs rejects duplicate parameter sources" {

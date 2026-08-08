@@ -10,6 +10,7 @@
       {"id":"initialize-experimental-api","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/InitializeCapabilities/properties/experimentalApi","kind":"boolean","nullable":false},
       {"id":"initialize-notification-opt-out","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/InitializeCapabilities/properties/optOutNotificationMethods","kind":"array","nullable":true},
       {"id":"initialize-openai-form","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/InitializeCapabilities/properties/mcpServerOpenaiFormElicitation","kind":"boolean","nullable":false},
+      {"id":"initialize-request-attestation","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/InitializeCapabilities/properties/requestAttestation","kind":"boolean","nullable":false},
       {"id":"thread-is-pinned","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/Thread/properties/isPinned","kind":"boolean","nullable":false},
       {"id":"thread-metadata-pin","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadMetadataUpdateParams/properties/isPinned","kind":"boolean","nullable":true},
       {"id":"thread-list-pin","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadListParams/properties/isPinned","kind":"boolean","nullable":true},

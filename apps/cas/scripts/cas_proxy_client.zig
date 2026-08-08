@@ -3,13 +3,87 @@ pub const hooks = @import("cas_hook_policy.zig");
 pub const app_server_launch = @import("cas_app_server_launch.zig");
 const builtin = @import("builtin");
 const std = @import("std");
-const websocket_transport = @import("cas_websocket_transport.zig");
+pub const websocket_transport = @import("cas_websocket_transport.zig");
 
 const max_interleaved_messages: usize = 4096;
 const max_captured_notifications: usize = 1024;
 const max_captured_notification_bytes: usize = 16 * 1024 * 1024;
 const default_request_timeout_ms: i64 = 30_000;
 const handshake_timeout_ms: i64 = 10_000;
+pub const max_server_request_carrier_bytes: usize = 1024 * 1024;
+pub const max_initialize_capabilities_bytes: usize = 64 * 1024;
+pub const max_codex_enable_features: usize = 16;
+
+pub const InitializeCapabilityBuilder = struct {
+    experimental_api: bool = true,
+    opt_out_notification_methods: []const []const u8 = &.{},
+    mcp_server_openai_form_elicitation: bool = false,
+    request_attestation: bool = false,
+    additional_json: ?[]const u8 = null,
+
+    const max_additional_fields: usize = 64;
+    const max_notification_methods: usize = 256;
+    const max_method_bytes: usize = 1024;
+
+    pub fn validate(self: InitializeCapabilityBuilder, allocator: std.mem.Allocator) !void {
+        if (self.opt_out_notification_methods.len > max_notification_methods) return error.InitializeCapabilitiesTooLarge;
+        for (self.opt_out_notification_methods) |method| {
+            if (method.len == 0 or method.len > max_method_bytes) return error.InvalidInitializeCapabilities;
+        }
+        const raw = self.additional_json orelse return;
+        if (raw.len > max_initialize_capabilities_bytes) return error.InitializeCapabilitiesTooLarge;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+            return error.InvalidInitializeCapabilities;
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidInitializeCapabilities,
+        };
+        if (object.count() > max_additional_fields) return error.InitializeCapabilitiesTooLarge;
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.key_ptr.*.len == 0 or isTypedCapability(entry.key_ptr.*))
+                return error.DuplicateInitializeCapabilityOwner;
+        }
+    }
+
+    pub fn buildAlloc(self: InitializeCapabilityBuilder, allocator: std.mem.Allocator) ![]u8 {
+        try self.validate(allocator);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        const writer = &output.writer;
+        try writer.writeAll("{\"experimentalApi\":");
+        try std.json.Stringify.value(self.experimental_api, .{}, writer);
+        try writer.writeAll(",\"optOutNotificationMethods\":");
+        try std.json.Stringify.value(self.opt_out_notification_methods, .{}, writer);
+        try writer.writeAll(",\"mcpServerOpenaiFormElicitation\":");
+        try std.json.Stringify.value(self.mcp_server_openai_form_elicitation, .{}, writer);
+        try writer.writeAll(",\"requestAttestation\":");
+        try std.json.Stringify.value(self.request_attestation, .{}, writer);
+
+        if (self.additional_json) |raw| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+            defer parsed.deinit();
+            var iterator = parsed.value.object.iterator();
+            while (iterator.next()) |entry| {
+                try writer.writeByte(',');
+                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try writer.writeByte(':');
+                try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+            }
+        }
+        try writer.writeByte('}');
+        if (output.written().len > max_initialize_capabilities_bytes) return error.InitializeCapabilitiesTooLarge;
+        return output.toOwnedSlice();
+    }
+
+    fn isTypedCapability(key: []const u8) bool {
+        return std.mem.eql(u8, key, "experimentalApi") or
+            std.mem.eql(u8, key, "optOutNotificationMethods") or
+            std.mem.eql(u8, key, "mcpServerOpenaiFormElicitation") or
+            std.mem.eql(u8, key, "requestAttestation");
+    }
+};
 
 pub const ServerRequestHandlerKind = enum {
     command_execution_approval,
@@ -190,8 +264,12 @@ pub const ClientOptions = struct {
     elicitation_content_json: ?[]const u8 = null,
     elicitation_response_json: ?[]const u8 = null,
     dynamic_tool_response_json: ?[]const u8 = null,
+    auth_refresh_response_json: ?[]const u8 = null,
+    attestation_response_json: ?[]const u8 = null,
     read_only: bool = false,
+    experimental_api: bool = true,
     opt_out_notification_methods: []const []const u8 = &.{},
+    additional_initialize_capabilities_json: ?[]const u8 = null,
     hook_policy: hooks.HookPolicy = .inherit,
     websocket_url: ?[]const u8 = null,
     // Typed transport selection. websocket_url remains an internal
@@ -204,6 +282,10 @@ pub const ClientOptions = struct {
     overload_retry_seed: ?u64 = null,
     overload_retry_telemetry: ?*OverloadRetryTelemetry = null,
     child_environment: ?*const std.process.Environ.Map = null,
+    // Internal diagnostic launches may enable an exact bounded Codex feature
+    // set before the app-server subcommand. Socket transports point at an
+    // already launched server and therefore reject this carrier.
+    codex_enable_features: []const []const u8 = &.{},
 };
 
 pub const RequestSendObserver = struct {
@@ -231,7 +313,10 @@ pub const Client = struct {
     elicitation_content_json: ?[]const u8,
     elicitation_response_json: ?[]const u8 = null,
     dynamic_tool_response_json: ?[]const u8,
+    auth_refresh_response_json: ?[]const u8 = null,
+    attestation_response_json: ?[]const u8 = null,
     read_only: bool,
+    initialize_response_json: ?[]u8 = null,
     blocking_server_request_count: u64 = 0,
     request_deadline_ms: ?i64 = null,
     request_send_started: bool = false,
@@ -241,9 +326,7 @@ pub const Client = struct {
     overload_retry_telemetry: ?*OverloadRetryTelemetry = null,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
-        try validateServerRequestOptions(allocator, opts);
-        try validateTransportOptions(opts);
-        try validateOverloadRetryPolicy(opts.overload_retry_policy);
+        try validateClientOptions(allocator, opts);
         // Resolve every fallible launch-independent input before acquiring a
         // child process or socket. The helpers accept only the resolved value.
         const overload_retry_seed = try resolveOverloadRetrySeed(opts.overload_retry_seed, opts.io);
@@ -278,6 +361,7 @@ pub const Client = struct {
         try hooks.ensureLaunchSupportsPolicy(allocator, opts.io, resolved_codex_path, opts.cwd, opts.hook_policy);
 
         try argv.append(allocator, resolved_codex_path);
+        try appendCodexEnableFeatureArgs(allocator, &argv, opts.codex_enable_features);
         try app_server_launch.appendAppServerArgs(allocator, &argv, opts.hook_policy == .off, null, opts.code_mode_host);
 
         const io = opts.io;
@@ -312,6 +396,8 @@ pub const Client = struct {
             .elicitation_content_json = opts.elicitation_content_json,
             .elicitation_response_json = opts.elicitation_response_json,
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+            .auth_refresh_response_json = opts.auth_refresh_response_json,
+            .attestation_response_json = opts.attestation_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
@@ -359,6 +445,8 @@ pub const Client = struct {
             .elicitation_content_json = opts.elicitation_content_json,
             .elicitation_response_json = opts.elicitation_response_json,
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+            .auth_refresh_response_json = opts.auth_refresh_response_json,
+            .attestation_response_json = opts.attestation_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
@@ -380,12 +468,18 @@ pub const Client = struct {
         self.last_error = null;
         if (self.last_unsupported_server_request) |owned| self.allocator.free(owned);
         self.last_unsupported_server_request = null;
+        if (self.initialize_response_json) |owned| self.allocator.free(owned);
+        self.initialize_response_json = null;
         self.line_buf.deinit(self.allocator);
         if (self.websocket) |*websocket| websocket.deinit();
     }
 
     pub fn transportIdentity(self: *const Client) []const u8 {
         return self.transport_identity;
+    }
+
+    pub fn initializeResponseJson(self: *const Client) ?[]const u8 {
+        return self.initialize_response_json;
     }
 
     pub fn close(self: *Client) void {
@@ -609,128 +703,18 @@ pub const Client = struct {
         const client_name = opts.client_name orelse "cas-zig";
         const client_title = opts.client_title orelse "CAS Zig Client";
         const client_version = opts.client_version orelse "0.1.0";
-
-        if (hasExactOpenaiFormPolicy(opts)) {
-            if (opts.opt_out_notification_methods.len > 0) {
-                const InitOpenaiFormWithOptOut = struct {
-                    method: []const u8,
-                    id: i64,
-                    params: struct {
-                        clientInfo: struct {
-                            name: []const u8,
-                            title: []const u8,
-                            version: []const u8,
-                        },
-                        capabilities: struct {
-                            experimentalApi: bool,
-                            optOutNotificationMethods: []const []const u8,
-                            mcpServerOpenaiFormElicitation: bool,
-                        },
-                    },
-                };
-                try self.sendToServer(InitOpenaiFormWithOptOut{
-                    .method = "initialize",
-                    .id = handshake_id,
-                    .params = .{
-                        .clientInfo = .{ .name = client_name, .title = client_title, .version = client_version },
-                        .capabilities = .{
-                            .experimentalApi = true,
-                            .optOutNotificationMethods = opts.opt_out_notification_methods,
-                            .mcpServerOpenaiFormElicitation = true,
-                        },
-                    },
-                }, null);
-            } else {
-                const InitOpenaiForm = struct {
-                    method: []const u8,
-                    id: i64,
-                    params: struct {
-                        clientInfo: struct {
-                            name: []const u8,
-                            title: []const u8,
-                            version: []const u8,
-                        },
-                        capabilities: struct {
-                            experimentalApi: bool,
-                            mcpServerOpenaiFormElicitation: bool,
-                        },
-                    },
-                };
-                try self.sendToServer(InitOpenaiForm{
-                    .method = "initialize",
-                    .id = handshake_id,
-                    .params = .{
-                        .clientInfo = .{ .name = client_name, .title = client_title, .version = client_version },
-                        .capabilities = .{
-                            .experimentalApi = true,
-                            .mcpServerOpenaiFormElicitation = true,
-                        },
-                    },
-                }, null);
-            }
-        } else if (opts.opt_out_notification_methods.len > 0) {
-            const InitWithOptOut = struct {
-                method: []const u8,
-                id: i64,
-                params: struct {
-                    clientInfo: struct {
-                        name: []const u8,
-                        title: []const u8,
-                        version: []const u8,
-                    },
-                    capabilities: struct {
-                        experimentalApi: bool,
-                        optOutNotificationMethods: []const []const u8,
-                    },
-                },
-            };
-            const initialize = InitWithOptOut{
-                .method = "initialize",
-                .id = handshake_id,
-                .params = .{
-                    .clientInfo = .{
-                        .name = client_name,
-                        .title = client_title,
-                        .version = client_version,
-                    },
-                    .capabilities = .{
-                        .experimentalApi = true,
-                        .optOutNotificationMethods = opts.opt_out_notification_methods,
-                    },
-                },
-            };
-            try self.sendToServer(initialize, null);
-        } else {
-            const InitNoOptOut = struct {
-                method: []const u8,
-                id: i64,
-                params: struct {
-                    clientInfo: struct {
-                        name: []const u8,
-                        title: []const u8,
-                        version: []const u8,
-                    },
-                    capabilities: struct {
-                        experimentalApi: bool,
-                    },
-                },
-            };
-            const initialize = InitNoOptOut{
-                .method = "initialize",
-                .id = handshake_id,
-                .params = .{
-                    .clientInfo = .{
-                        .name = client_name,
-                        .title = client_title,
-                        .version = client_version,
-                    },
-                    .capabilities = .{
-                        .experimentalApi = true,
-                    },
-                },
-            };
-            try self.sendToServer(initialize, null);
-        }
+        const capabilities = try initializeCapabilities(opts).buildAlloc(self.allocator);
+        defer self.allocator.free(capabilities);
+        const initialize = try initializePayloadAlloc(
+            self.allocator,
+            handshake_id,
+            client_name,
+            client_title,
+            client_version,
+            capabilities,
+        );
+        defer self.allocator.free(initialize);
+        try self.sendPayload(initialize, null);
 
         while (monotonicMillis() < self.request_deadline_ms.?) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
@@ -756,6 +740,9 @@ pub const Client = struct {
                 self.setLastErrorOwned(err_json);
                 return error.HandshakeFailed;
             }
+            const result = msg_obj.get("result") orelse return error.InvalidAppServerResponse;
+            if (self.initialize_response_json) |owned| self.allocator.free(owned);
+            self.initialize_response_json = try core_json.stringifyAlloc(self.allocator, result);
 
             const Initialized = struct {
                 method: []const u8,
@@ -812,7 +799,14 @@ pub const Client = struct {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
-        const payload = payload_writer.written();
+        try self.sendPayload(payload_writer.written(), send_observer);
+    }
+
+    fn sendPayload(
+        self: *Client,
+        payload: []const u8,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         if (payload.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
         switch (self.transport_kind) {
             .stdio => {
@@ -832,7 +826,7 @@ pub const Client = struct {
         }
     }
 
-    const max_exact_response_bytes: usize = 1024 * 1024;
+    const max_exact_response_bytes: usize = max_server_request_carrier_bytes;
 
     const JsonRpcId = union(enum) {
         integer: i64,
@@ -888,8 +882,10 @@ pub const Client = struct {
             return error.ServerRequestReplyFailed;
         };
         switch (request_method) {
-            .auth_tokens_refresh => return error.ChatGptAuthTokensRefreshProviderUnavailable,
-            .attestation_generate => return error.AttestationProviderUnavailable,
+            .auth_tokens_refresh => if (self.auth_refresh_response_json == null)
+                return error.ChatGptAuthTokensRefreshProviderUnavailable,
+            .attestation_generate => if (self.attestation_response_json == null)
+                return error.AttestationProviderUnavailable,
             .unknown => {
                 if (self.last_unsupported_server_request) |owned| self.allocator.free(owned);
                 self.last_unsupported_server_request = try self.allocator.dupe(u8, method);
@@ -995,14 +991,20 @@ pub const Client = struct {
                     .code = -32603,
                     .message = "dynamic tool response provider unavailable",
                 } },
-            .auth_tokens_refresh => .{ .server_error = .{
-                .code = -32603,
-                .message = "chatgpt auth token refresh provider unavailable",
-            } },
-            .attestation_generate => .{ .server_error = .{
-                .code = -32603,
-                .message = "attestation provider unavailable",
-            } },
+            .auth_tokens_refresh => if (self.auth_refresh_response_json) |raw|
+                .{ .result_json = try self.allocator.dupe(u8, raw) }
+            else
+                .{ .server_error = .{
+                    .code = -32603,
+                    .message = "chatgpt auth token refresh provider unavailable",
+                } },
+            .attestation_generate => if (self.attestation_response_json) |raw|
+                .{ .result_json = try self.allocator.dupe(u8, raw) }
+            else
+                .{ .server_error = .{
+                    .code = -32603,
+                    .message = "attestation provider unavailable",
+                } },
             .current_time_read => .{ .result_json = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"currentTimeAt\":{d}}}",
@@ -1187,6 +1189,38 @@ pub const Client = struct {
     }
 };
 
+pub fn validateClientOptions(allocator: std.mem.Allocator, opts: ClientOptions) !void {
+    try validateServerRequestOptions(allocator, opts);
+    try initializeCapabilities(opts).validate(allocator);
+    try validateTransportOptions(opts);
+    try validateOverloadRetryPolicy(opts.overload_retry_policy);
+    try validateCodexEnableFeatures(opts);
+}
+
+fn validateCodexEnableFeatures(opts: ClientOptions) !void {
+    if (opts.codex_enable_features.len > max_codex_enable_features) return error.TooManyCodexEnableFeatures;
+    if (opts.codex_enable_features.len != 0) {
+        if (opts.websocket_url != null) return error.CodexEnableFeaturesRequireStdio;
+        if (opts.transport) |transport| if (transport != .stdio) return error.CodexEnableFeaturesRequireStdio;
+    }
+    for (opts.codex_enable_features) |feature| {
+        if (feature.len == 0 or feature.len > 128) return error.InvalidCodexEnableFeature;
+        for (feature) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-')
+            return error.InvalidCodexEnableFeature;
+    }
+}
+
+fn appendCodexEnableFeatureArgs(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    features: []const []const u8,
+) !void {
+    for (features) |feature| {
+        try argv.append(allocator, "--enable");
+        try argv.append(allocator, feature);
+    }
+}
+
 fn addCapturedNotificationBytes(current: usize, additional: usize) !usize {
     if (current > max_captured_notification_bytes or
         additional > max_captured_notification_bytes - current)
@@ -1274,6 +1308,42 @@ fn validateTransportOptions(opts: ClientOptions) !void {
         .explicit_websocket, .unix_socket => return error.CodeModeHostRequiresManagedLaunch,
         else => {},
     };
+}
+
+fn initializeCapabilities(opts: ClientOptions) InitializeCapabilityBuilder {
+    return .{
+        .experimental_api = opts.experimental_api,
+        .opt_out_notification_methods = opts.opt_out_notification_methods,
+        .mcp_server_openai_form_elicitation = hasExactOpenaiFormPolicy(opts),
+        .request_attestation = opts.attestation_response_json != null,
+        .additional_json = opts.additional_initialize_capabilities_json,
+    };
+}
+
+fn initializePayloadAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    client_name: []const u8,
+    client_title: []const u8,
+    client_version: []const u8,
+    capabilities_json: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    try writer.writeAll("{\"method\":\"initialize\",\"id\":");
+    try std.json.Stringify.value(id, .{}, writer);
+    try writer.writeAll(",\"params\":{\"clientInfo\":{\"name\":");
+    try std.json.Stringify.value(client_name, .{}, writer);
+    try writer.writeAll(",\"title\":");
+    try std.json.Stringify.value(client_title, .{}, writer);
+    try writer.writeAll(",\"version\":");
+    try std.json.Stringify.value(client_version, .{}, writer);
+    try writer.writeAll("},\"capabilities\":");
+    try writer.writeAll(capabilities_json);
+    try writer.writeAll("}}");
+    if (output.written().len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
+    return output.toOwnedSlice();
 }
 
 fn hasExactOpenaiFormPolicy(opts: ClientOptions) bool {
@@ -1380,6 +1450,31 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
             const required_value = item_object.get(required_field) orelse return error.InvalidDynamicToolResponse;
             if (required_value != .string) return error.InvalidDynamicToolResponse;
         }
+    }
+    if (opts.auth_refresh_response_json) |raw| {
+        var parsed = try parseExactCarrier(allocator, raw);
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidAuthRefreshResponse,
+        };
+        const access_token = core_json.stringField(object, "accessToken") orelse return error.InvalidAuthRefreshResponse;
+        const account_id = core_json.stringField(object, "chatgptAccountId") orelse return error.InvalidAuthRefreshResponse;
+        if (access_token.len == 0 or account_id.len == 0) return error.InvalidAuthRefreshResponse;
+        if (object.get("chatgptPlanType")) |plan| switch (plan) {
+            .null, .string => {},
+            else => return error.InvalidAuthRefreshResponse,
+        };
+    }
+    if (opts.attestation_response_json) |raw| {
+        var parsed = try parseExactCarrier(allocator, raw);
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidAttestationResponse,
+        };
+        const token = core_json.stringField(object, "token") orelse return error.InvalidAttestationResponse;
+        if (token.len == 0) return error.InvalidAttestationResponse;
     }
 }
 
@@ -1836,6 +1931,87 @@ test "openai form capability requires an exact configured response policy" {
         .cwd = ".",
         .elicitation_response_json = "{\"action\":\"decline\"}",
     }));
+}
+
+test "initialize capability builder has one typed owner and preserves additive fields" {
+    const builder = InitializeCapabilityBuilder{
+        .experimental_api = false,
+        .opt_out_notification_methods = &.{ "thread/started", "item/started" },
+        .mcp_server_openai_form_elicitation = true,
+        .request_attestation = true,
+        .additional_json = "{\"futureCapability\":{\"enabled\":true}}",
+    };
+    const raw = try builder.buildAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqual(false, object.get("experimentalApi").?.bool);
+    try std.testing.expectEqual(true, object.get("mcpServerOpenaiFormElicitation").?.bool);
+    try std.testing.expectEqual(true, object.get("requestAttestation").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), object.get("optOutNotificationMethods").?.array.items.len);
+    try std.testing.expect(object.get("futureCapability") != null);
+
+    try std.testing.expectError(
+        error.DuplicateInitializeCapabilityOwner,
+        (InitializeCapabilityBuilder{ .additional_json = "{\"requestAttestation\":false}" }).validate(std.testing.allocator),
+    );
+    try std.testing.expectError(
+        error.InvalidInitializeCapabilities,
+        (InitializeCapabilityBuilder{ .additional_json = "{\"future\":1,\"future\":2}" }).validate(std.testing.allocator),
+    );
+    try std.testing.expect(!initializeCapabilities(.{ .cwd = "." }).request_attestation);
+    try std.testing.expect(initializeCapabilities(.{
+        .cwd = ".",
+        .attestation_response_json = "{\"token\":\"exact\"}",
+    }).request_attestation);
+}
+
+test "initialize payload carries the single capability object" {
+    const capabilities = try (InitializeCapabilityBuilder{
+        .mcp_server_openai_form_elicitation = true,
+        .request_attestation = true,
+    }).buildAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(capabilities);
+    const payload = try initializePayloadAlloc(std.testing.allocator, -1, "cas-test", "CAS Test", "0.4.0", capabilities);
+    defer std.testing.allocator.free(payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const params = core_json.objectField(parsed.value.object, "params") orelse return error.TestExpectedEqual;
+    const actual = core_json.objectField(params, "capabilities") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 4), actual.count());
+    try std.testing.expectEqual(true, actual.get("requestAttestation").?.bool);
+}
+
+test "auth refresh and attestation providers return only exact validated carriers" {
+    const auth = "{ \"accessToken\":\"SECRET_ACCESS\", \"chatgptAccountId\":\"acct\", \"chatgptPlanType\":\"ent26\", \"future\":true }";
+    const attestation = "{ \"token\":\"SECRET_ATTESTATION\", \"future\":1 }";
+    try validateServerRequestOptions(std.testing.allocator, .{
+        .cwd = ".",
+        .auth_refresh_response_json = auth,
+        .attestation_response_json = attestation,
+    });
+    var client = serverRequestTestClient();
+    defer client.line_buf.deinit(std.testing.allocator);
+    client.auth_refresh_response_json = auth;
+    client.attestation_response_json = attestation;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer parsed.deinit();
+    var auth_reply = try client.prepareServerReply(.auth_tokens_refresh, parsed.value.object);
+    defer auth_reply.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(auth, auth_reply.result_json);
+    var attestation_reply = try client.prepareServerReply(.attestation_generate, parsed.value.object);
+    defer attestation_reply.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(attestation, attestation_reply.result_json);
+
+    try std.testing.expectError(
+        error.InvalidAuthRefreshResponse,
+        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .auth_refresh_response_json = "{\"accessToken\":\"x\"}" }),
+    );
+    try std.testing.expectError(
+        error.InvalidAttestationResponse,
+        validateServerRequestOptions(std.testing.allocator, .{ .cwd = ".", .attestation_response_json = "{\"token\":\"\"}" }),
+    );
 }
 
 test "server request reply write failure poisons the client" {
@@ -2308,6 +2484,33 @@ test "code mode host cannot be silently ignored by existing endpoint transports"
         error.ConflictingTransportOptions,
         validateTransportOptions(.{ .cwd = ".", .websocket_url = "ws://127.0.0.1:1", .transport = .stdio }),
     );
+}
+
+test "diagnostic Codex feature arguments are bounded and stdio-only" {
+    const allocator = std.testing.allocator;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "codex");
+    try appendCodexEnableFeatureArgs(allocator, &argv, &.{ "deferred_executor", "executor_capability_discovery" });
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "codex", "--enable", "deferred_executor", "--enable", "executor_capability_discovery" },
+        argv.items,
+    );
+    try validateClientOptions(allocator, .{
+        .cwd = ".",
+        .codex_enable_features = &.{ "deferred_executor", "executor_capability_discovery" },
+        .transport = .stdio,
+    });
+    try std.testing.expectError(error.InvalidCodexEnableFeature, validateClientOptions(allocator, .{
+        .cwd = ".",
+        .codex_enable_features = &.{"../feature"},
+    }));
+    try std.testing.expectError(error.CodexEnableFeaturesRequireStdio, validateClientOptions(allocator, .{
+        .cwd = ".",
+        .codex_enable_features = &.{"deferred_executor"},
+        .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
+    }));
 }
 
 test "notification capture has an aggregate byte bound" {

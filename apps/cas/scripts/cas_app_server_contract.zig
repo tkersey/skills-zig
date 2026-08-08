@@ -832,6 +832,20 @@ pub const SchemaBundle = struct {
     documents: []const Document,
 };
 
+/// A protocol PathUri is an opaque canonical `file:` URI. Parsing validates
+/// only the wire boundary; filesystem identity and native-path conversion are
+/// deliberately owned by later host-I/O boundaries.
+pub const PathUri = struct {
+    raw: []const u8,
+
+    pub fn parse(raw: []const u8) !PathUri {
+        if (!std.mem.startsWith(u8, raw, "file:") or raw.len == "file:".len)
+            return error.InvalidPathUri;
+        for (raw) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidPathUri;
+        return .{ .raw = raw };
+    }
+};
+
 pub const required_schema_documents = [_][]const u8{
     "ClientRequest.json",
     "ServerRequest.json",
@@ -1513,7 +1527,7 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const experimental_shapes =
@@ -1617,6 +1631,27 @@ test "baseline method-set cardinalities and exact compatible bundles" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.compatible, report.status);
     try std.testing.expectEqual(@as(usize, 0), report.additive_server_requests.items.len);
+}
+
+test "PathUri round trips opaquely without native path normalization" {
+    const fixtures = [_][]const u8{
+        "file:///tmp/a%2Fb%20c",
+        "file://server/share/Case%2FAlias",
+        "file:///C:/Users/Test/%E2%98%83",
+    };
+    for (fixtures) |raw| {
+        const uri = try PathUri.parse(raw);
+        try std.testing.expectEqualStrings(raw, uri.raw);
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(uri.raw, .{}, &output.writer);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(raw, parsed.value.string);
+    }
+    try std.testing.expectError(error.InvalidPathUri, PathUri.parse("/tmp/not-a-uri"));
+    try std.testing.expectError(error.InvalidPathUri, PathUri.parse("FILE:///tmp/not-canonical"));
+    try std.testing.expectError(error.InvalidPathUri, PathUri.parse("file:///tmp/raw space"));
 }
 
 test "profiles select only their experimental client and shape obligations" {

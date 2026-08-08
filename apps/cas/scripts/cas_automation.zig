@@ -18,6 +18,7 @@ fn envString(key: [:0]const u8) ?[]const u8 {
 }
 
 pub const Command = enum {
+    doctor,
     list,
     show,
     create,
@@ -51,6 +52,7 @@ pub const SchedulerCommandDef = struct {
 };
 
 const command_defs = [_]CommandDef{
+    .{ .name = "doctor", .command = .doctor, .summary = "Inspect store, files, Codex, and scheduler safety" },
     .{ .name = "list", .command = .list, .summary = "List automations" },
     .{ .name = "show", .command = .show, .summary = "Show one automation" },
     .{ .name = "create", .command = .create, .summary = "Create automation" },
@@ -162,8 +164,11 @@ const c = struct {
     pub const SQLITE_TEXT: c_int = 3;
     pub const SQLITE_BLOB: c_int = 4;
     pub const SQLITE_NULL: c_int = 5;
+    pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
+    pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
 
     extern fn sqlite3_open(filename: [*:0]const u8, ppDb: *?*sqlite3) c_int;
+    extern fn sqlite3_open_v2(filename: [*:0]const u8, ppDb: *?*sqlite3, flags: c_int, zVfs: ?[*:0]const u8) c_int;
     extern fn sqlite3_close(db: *sqlite3) c_int;
     extern fn sqlite3_errmsg(db: *sqlite3) [*:0]const u8;
     extern fn sqlite3_prepare_v2(db: *sqlite3, zSql: [*]const u8, nByte: c_int, ppStmt: *?*sqlite3_stmt, pzTail: ?*?[*:0]const u8) c_int;
@@ -189,6 +194,14 @@ const Db = struct {
     handle: *c.sqlite3,
 
     fn open(allocator: std.mem.Allocator, db_path: []const u8) !Db {
+        return openWithFlags(allocator, db_path, c.SQLITE_OPEN_READWRITE);
+    }
+
+    fn openReadOnly(allocator: std.mem.Allocator, db_path: []const u8) !Db {
+        return openWithFlags(allocator, db_path, c.SQLITE_OPEN_READONLY);
+    }
+
+    fn openWithFlags(allocator: std.mem.Allocator, db_path: []const u8, flags: c_int) !Db {
         std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), db_path, .{}) catch {
             return userErrorFmt("db not found: {s}", .{db_path});
         };
@@ -197,7 +210,9 @@ const Db = struct {
         defer allocator.free(path_z);
 
         var raw: ?*c.sqlite3 = null;
-        if (c.sqlite3_open(path_z, &raw) != c.SQLITE_OK or raw == null) {
+        const open_result = c.sqlite3_open_v2(path_z, &raw, flags, null);
+        if (open_result != c.SQLITE_OK or raw == null) {
+            if (raw) |handle| _ = c.sqlite3_close(handle);
             return userErrorFmt("failed to open db: {s}", .{db_path});
         }
         return .{ .handle = raw.? };
@@ -230,6 +245,18 @@ const Db = struct {
 
     fn changes(self: *Db) i64 {
         return c.sqlite3_changes(self.handle);
+    }
+
+    fn begin(self: *Db, allocator: std.mem.Allocator) !void {
+        try self.exec(allocator, "begin immediate", &.{});
+    }
+
+    fn commit(self: *Db, allocator: std.mem.Allocator) !void {
+        try self.exec(allocator, "commit", &.{});
+    }
+
+    fn rollback(self: *Db, allocator: std.mem.Allocator) void {
+        self.exec(allocator, "rollback", &.{}) catch {};
     }
 };
 
@@ -299,6 +326,173 @@ const Stmt = struct {
 };
 
 const StepResult = enum { done, row };
+
+const ColumnAffinity = enum { integer, text };
+
+const ColumnRequirement = struct {
+    name: []const u8,
+    affinity: ColumnAffinity,
+};
+
+const TableRequirement = struct {
+    name: []const u8,
+    columns: []const ColumnRequirement,
+};
+
+const automation_columns = [_]ColumnRequirement{
+    .{ .name = "id", .affinity = .text },
+    .{ .name = "name", .affinity = .text },
+    .{ .name = "prompt", .affinity = .text },
+    .{ .name = "status", .affinity = .text },
+    .{ .name = "next_run_at", .affinity = .integer },
+    .{ .name = "last_run_at", .affinity = .integer },
+    .{ .name = "cwds", .affinity = .text },
+    .{ .name = "rrule", .affinity = .text },
+    .{ .name = "created_at", .affinity = .integer },
+    .{ .name = "updated_at", .affinity = .integer },
+};
+
+const automation_run_columns = [_]ColumnRequirement{
+    .{ .name = "thread_id", .affinity = .text },
+    .{ .name = "automation_id", .affinity = .text },
+    .{ .name = "status", .affinity = .text },
+    .{ .name = "read_at", .affinity = .integer },
+    .{ .name = "thread_title", .affinity = .text },
+    .{ .name = "source_cwd", .affinity = .text },
+    .{ .name = "inbox_title", .affinity = .text },
+    .{ .name = "inbox_summary", .affinity = .text },
+    .{ .name = "created_at", .affinity = .integer },
+    .{ .name = "updated_at", .affinity = .integer },
+    .{ .name = "archived_user_message", .affinity = .text },
+    .{ .name = "archived_assistant_message", .affinity = .text },
+    .{ .name = "archived_reason", .affinity = .text },
+};
+
+const inbox_item_columns = [_]ColumnRequirement{
+    .{ .name = "id", .affinity = .text },
+    .{ .name = "title", .affinity = .text },
+    .{ .name = "description", .affinity = .text },
+    .{ .name = "thread_id", .affinity = .text },
+    .{ .name = "read_at", .affinity = .integer },
+    .{ .name = "created_at", .affinity = .integer },
+};
+
+const required_tables = [_]TableRequirement{
+    .{ .name = "automations", .columns = &automation_columns },
+    .{ .name = "automation_runs", .columns = &automation_run_columns },
+    .{ .name = "inbox_items", .columns = &inbox_item_columns },
+};
+
+const DoctorDiagnostic = struct {
+    code: []const u8,
+    severity: []const u8,
+    detail: []u8,
+};
+
+const DoctorDiagnostics = struct {
+    rows: std.ArrayList(DoctorDiagnostic) = .empty,
+
+    fn deinit(self: *DoctorDiagnostics, allocator: std.mem.Allocator) void {
+        for (self.rows.items) |row| allocator.free(row.detail);
+        self.rows.deinit(allocator);
+    }
+
+    fn append(self: *DoctorDiagnostics, allocator: std.mem.Allocator, code: []const u8, severity: []const u8, comptime fmt: []const u8, args: anytype) !void {
+        try self.rows.append(allocator, .{
+            .code = code,
+            .severity = severity,
+            .detail = try std.fmt.allocPrint(allocator, fmt, args),
+        });
+    }
+
+    fn hasError(self: *const DoctorDiagnostics) bool {
+        for (self.rows.items) |row| if (std.mem.eql(u8, row.severity, "error")) return true;
+        return false;
+    }
+};
+
+fn inspectMutationWritability(
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    automation_root: []const u8,
+    diagnostics: *DoctorDiagnostics,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().access(io, db_path, .{ .write = true }) catch |err| {
+        try diagnostics.append(allocator, "database-not-writable", "error", "database is not writable without changing it: {s} ({s})", .{ db_path, @errorName(err) });
+    };
+
+    const db_owner = std.fs.path.dirname(db_path) orelse ".";
+    std.Io.Dir.cwd().access(io, db_owner, .{ .write = true, .execute = true }) catch |err| {
+        try diagnostics.append(allocator, "database-owner-not-writable", "error", "database owner directory is not writable without changing it: {s} ({s})", .{ db_owner, @errorName(err) });
+    };
+
+    std.Io.Dir.cwd().access(io, automation_root, .{ .write = true, .execute = true }) catch |err| {
+        try diagnostics.append(allocator, "automation-root-not-writable", "error", "automation root is not writable without changing it: {s} ({s})", .{ automation_root, @errorName(err) });
+    };
+}
+
+fn declaredAffinity(raw: []const u8) ?ColumnAffinity {
+    if (containsIgnoreCase(raw, "INT")) return .integer;
+    if (containsIgnoreCase(raw, "CHAR") or containsIgnoreCase(raw, "CLOB") or containsIgnoreCase(raw, "TEXT")) return .text;
+    return null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |index| {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn inspectStoreSchema(allocator: std.mem.Allocator, db: *Db, diagnostics: *DoctorDiagnostics) !void {
+    for (required_tables) |table| {
+        const sql = try std.fmt.allocPrint(allocator, "pragma table_info('{s}')", .{table.name});
+        defer allocator.free(sql);
+        var stmt = try db.prepare(allocator, sql);
+        defer stmt.deinit();
+        var seen = try allocator.alloc(bool, table.columns.len);
+        defer allocator.free(seen);
+        @memset(seen, false);
+        var row_count: usize = 0;
+        while (try stmt.step() == .row) {
+            row_count += 1;
+            const name = stmt.textColumn(1);
+            const declared = stmt.textColumn(2);
+            var required_index: ?usize = null;
+            for (table.columns, 0..) |required, index| {
+                if (std.mem.eql(u8, name, required.name)) {
+                    required_index = index;
+                    break;
+                }
+            }
+            if (required_index) |index| {
+                seen[index] = true;
+                const actual = declaredAffinity(declared);
+                if (actual == null or actual.? != table.columns[index].affinity) {
+                    try diagnostics.append(allocator, "incompatible-column", "error", "{s}.{s} declares {s}; expected {s} affinity", .{ table.name, name, declared, @tagName(table.columns[index].affinity) });
+                }
+            } else {
+                try diagnostics.append(allocator, "additive-column", "info", "{s}.{s} is additive and admissible", .{ table.name, name });
+            }
+        }
+        if (row_count == 0) {
+            try diagnostics.append(allocator, "missing-table", "error", "required table {s} is absent", .{table.name});
+            continue;
+        }
+        for (table.columns, 0..) |required, index| if (!seen[index]) {
+            try diagnostics.append(allocator, "missing-column", "error", "required column {s}.{s} is absent", .{ table.name, required.name });
+        };
+    }
+}
+
+fn requireStoreSchema(allocator: std.mem.Allocator, db: *Db) !void {
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+    try inspectStoreSchema(allocator, db, &diagnostics);
+    if (diagnostics.hasError()) return userErrorFmt("automation store schema is incompatible; run `cas automation doctor --json`", .{});
+}
 
 pub const AutomationStatus = enum {
     ACTIVE,
@@ -476,10 +670,16 @@ const SchedulerInstallArgs = struct {
     interval_seconds: i64,
     path_value: []const u8,
     codex_bin: []const u8,
+    replace: bool,
 };
 
 const SchedulerLabelArgs = struct {
     label: []const u8,
+    json: bool = false,
+};
+
+const DoctorArgs = struct {
+    json: bool = false,
 };
 
 const RunResult = struct {
@@ -541,6 +741,11 @@ fn run(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !
     }
 
     switch (command) {
+        .doctor => {
+            const args = try parseDoctorArgs(global.args[1..]);
+            try cmdDoctor(allocator, io, global.db_path, args);
+            return;
+        },
         .list => {
             const args = try parseListArgs(global.args[1..]);
             try cmdList(allocator, global.db_path, args);
@@ -596,6 +801,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !
     }
 
     return userErrorFmt("unknown command: {s}", .{global.args[0]});
+}
+
+fn parseDoctorArgs(args: []const []const u8) !DoctorArgs {
+    var out: DoctorArgs = .{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            out.json = true;
+        } else {
+            return userErrorFmt("unknown doctor arg: {s}", .{arg});
+        }
+    }
+    return out;
 }
 
 fn printUsage() !void {
@@ -1036,6 +1253,7 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
     };
     var path_value: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_PATH") orelse envString("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin";
     var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
+    var replace = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1064,6 +1282,10 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
             i += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--replace")) {
+            replace = true;
+            continue;
+        }
         return userErrorFmt("unknown scheduler install arg: {s}", .{arg});
     }
 
@@ -1073,11 +1295,13 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
         .interval_seconds = interval_seconds,
         .path_value = path_value,
         .codex_bin = codex_bin,
+        .replace = replace,
     };
 }
 
 fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
     var label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var json = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1088,10 +1312,14 @@ fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
             i += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+            continue;
+        }
         return userErrorFmt("unknown scheduler arg: {s}", .{arg});
     }
 
-    return .{ .label = try validateSchedulerLabel(label) };
+    return .{ .label = try validateSchedulerLabel(label), .json = json };
 }
 
 fn validateResolveArgs(resolve: ResolveArgs) !void {
@@ -1401,6 +1629,16 @@ fn seedPerfDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
         \\  archived_reason text
         \\)
     , &.{});
+    try db.exec(allocator,
+        \\create table inbox_items (
+        \\  id text primary key,
+        \\  title text,
+        \\  description text,
+        \\  thread_id text,
+        \\  read_at integer,
+        \\  created_at integer
+        \\)
+    , &.{});
     try db.exec(
         allocator,
         "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1610,6 +1848,31 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
 
     std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| return userErrorFmt("unable to create automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
 
+    const toml_text = try renderAutomationTomlAlloc(allocator, row);
+    defer allocator.free(toml_text);
+
+    const automation_toml = try std.fmt.allocPrint(allocator, "{s}/automation.toml", .{target_dir});
+    defer allocator.free(automation_toml);
+    try writeFileAtomic(allocator, automation_toml, toml_text);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
+    defer allocator.free(memory_path);
+
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
+        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch |err| {
+            return userErrorFmt("unable to create memory.md ({s}): {s}", .{ memory_path, @errorName(err) });
+        };
+        file.close(std.Io.Threaded.global_single_threaded.io());
+    };
+}
+
+fn syncAutomationFilesAfterCommit(allocator: std.mem.Allocator, db: *Db, automation_id: []const u8) !void {
+    writeAutomationFiles(allocator, db, automation_id) catch |err| {
+        return userErrorFmt("database commit succeeded but file synchronization failed for {s} ({s}); run `cas automation doctor --json`", .{ automation_id, @errorName(err) });
+    };
+}
+
+fn renderAutomationTomlAlloc(allocator: std.mem.Allocator, row: AutomationRow) ![]u8 {
     const cwds = try parseCwdsJson(allocator, row.cwds_json);
     defer freeOwnedStrings(allocator, cwds);
 
@@ -1630,7 +1893,7 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
     const rrule_toml = try tomlQuoteAlloc(allocator, row.rrule);
     defer allocator.free(rrule_toml);
 
-    const toml_text = try std.fmt.allocPrint(
+    return std.fmt.allocPrint(
         allocator,
         "version = 1\n" ++
             "id = {s}\n" ++
@@ -1652,21 +1915,6 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
             row.updated_at,
         },
     );
-    defer allocator.free(toml_text);
-
-    const automation_toml = try std.fmt.allocPrint(allocator, "{s}/automation.toml", .{target_dir});
-    defer allocator.free(automation_toml);
-    try writeFileAtomic(allocator, automation_toml, toml_text);
-
-    const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
-    defer allocator.free(memory_path);
-
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
-        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch |err| {
-            return userErrorFmt("unable to create memory.md ({s}): {s}", .{ memory_path, @errorName(err) });
-        };
-        file.close(std.Io.Threaded.global_single_threaded.io());
-    };
 }
 
 fn deleteAutomationFiles(allocator: std.mem.Allocator, automation_id: []const u8) !void {
@@ -1681,6 +1929,181 @@ fn deleteAutomationFiles(allocator: std.mem.Allocator, automation_id: []const u8
     std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| {
         return userErrorFmt("unable to delete automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
     };
+}
+
+fn cmdDoctor(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, args: DoctorArgs) !void {
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+
+    var db = Db.openReadOnly(allocator, db_path) catch |err| {
+        try diagnostics.append(allocator, "database-open", "error", "database is not safely readable: {s}", .{@errorName(err)});
+        return renderDoctor(allocator, io, db_path, null, null, &diagnostics, args.json);
+    };
+    defer db.close();
+    try inspectStoreSchema(allocator, &db, &diagnostics);
+    const schema_compatible = !diagnostics.hasError();
+
+    const automation_root = defaultAutomationsDir(allocator) catch |err| {
+        try diagnostics.append(allocator, "automation-root", "error", "automation root is unavailable: {s}", .{@errorName(err)});
+        return renderDoctor(allocator, io, db_path, null, null, &diagnostics, args.json);
+    };
+    defer allocator.free(automation_root);
+
+    var root_accessible = true;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), automation_root, .{}) catch {
+        root_accessible = false;
+        try diagnostics.append(allocator, "automation-root", "error", "automation root is not accessible: {s}", .{automation_root});
+    };
+    try inspectMutationWritability(allocator, db_path, automation_root, &diagnostics);
+
+    if (schema_compatible) {
+        var duplicates = try db.prepare(allocator, "select name, count(*) from automations group by name having count(*) > 1");
+        defer duplicates.deinit();
+        while (try duplicates.step() == .row) {
+            try diagnostics.append(allocator, "duplicate-name", "error", "automation name {s} resolves to {d} rows", .{ duplicates.textColumn(0), duplicates.intColumn(1) });
+        }
+
+        var rows_stmt = try db.prepare(allocator, "select id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at from automations order by id");
+        defer rows_stmt.deinit();
+        while (try rows_stmt.step() == .row) {
+            var row = try readAutomationRow(allocator, &rows_stmt);
+            defer row.deinit(allocator);
+            if (!std.mem.eql(u8, row.status, "ACTIVE") and !std.mem.eql(u8, row.status, "PAUSED")) {
+                try diagnostics.append(allocator, "malformed-status", "error", "automation {s} has unsupported status {s}", .{ row.id, row.status });
+            }
+            var cwds_valid = false;
+            var parsed_cwds = std.json.parseFromSlice(std.json.Value, allocator, row.cwds_json, .{}) catch null;
+            if (parsed_cwds) |*parsed| {
+                defer parsed.deinit();
+                var valid = parsed.value == .array;
+                if (valid) for (parsed.value.array.items) |item| if (item != .string) {
+                    valid = false;
+                    break;
+                };
+                if (valid) {
+                    cwds_valid = true;
+                } else {
+                    try diagnostics.append(allocator, "malformed-cwds", "error", "automation {s} cwds is not a JSON string array", .{row.id});
+                }
+            } else {
+                try diagnostics.append(allocator, "malformed-cwds", "error", "automation {s} cwds is invalid JSON", .{row.id});
+            }
+            const canonical = parseAndCanonicalizeRrule(allocator, row.rrule) catch null;
+            if (canonical) |value| {
+                allocator.free(value);
+            } else {
+                try diagnostics.append(allocator, "malformed-rrule", "error", "automation {s} has a malformed RRULE", .{row.id});
+            }
+
+            if (root_accessible) {
+                const target_dir = try std.fs.path.join(allocator, &.{ automation_root, row.id });
+                defer allocator.free(target_dir);
+                const toml_path = try std.fs.path.join(allocator, &.{ target_dir, "automation.toml" });
+                defer allocator.free(toml_path);
+                const actual = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), toml_path, allocator, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => null,
+                };
+                if (actual) |bytes| {
+                    defer allocator.free(bytes);
+                    if (cwds_valid) {
+                        const expected = try renderAutomationTomlAlloc(allocator, row);
+                        defer allocator.free(expected);
+                        if (!std.mem.eql(u8, bytes, expected)) {
+                            try diagnostics.append(allocator, "stale-automation-file", "error", "{s} does not match its database row", .{toml_path});
+                        }
+                    } else {
+                        try diagnostics.append(allocator, "automation-file-comparison-skipped", "info", "{s} cannot be compared until automation {s} cwds is repaired", .{ toml_path, row.id });
+                    }
+                } else {
+                    try diagnostics.append(allocator, "missing-automation-file", "error", "{s} is absent or unreadable", .{toml_path});
+                }
+                const memory_path = try std.fs.path.join(allocator, &.{ target_dir, "memory.md" });
+                defer allocator.free(memory_path);
+                std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
+                    try diagnostics.append(allocator, "missing-memory-file", "error", "{s} is absent", .{memory_path});
+                };
+            }
+        }
+
+        if (root_accessible) {
+            var root = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), automation_root, .{ .iterate = true });
+            defer root.close(std.Io.Threaded.global_single_threaded.io());
+            var iterator = root.iterate();
+            while (try iterator.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+                if (entry.kind != .directory) continue;
+                var exists = try db.prepare(allocator, "select count(*) from automations where id = ?");
+                defer exists.deinit();
+                try exists.bindAll(&.{.{ .text = entry.name }});
+                if (try exists.step() == .row and exists.intColumn(0) == 0) {
+                    try diagnostics.append(allocator, "orphan-automation-files", "error", "automation directory {s} has no database row", .{entry.name});
+                }
+            }
+        }
+    }
+
+    const codex_path = try resolveExecutable(allocator, envString("CODEX_BIN") orelse DefaultCodexBin);
+    defer if (codex_path) |value| allocator.free(value);
+    if (codex_path == null) {
+        try diagnostics.append(allocator, "codex-executable", "error", "Codex executable is not resolvable", .{});
+    }
+
+    var scheduler = try readSchedulerStatus(allocator, io, DefaultLaunchdLabel);
+    defer scheduler.deinit(allocator);
+    if (scheduler.migration_required) {
+        try diagnostics.append(allocator, "scheduler-migration", "error", "same-label scheduler still invokes standalone cron; run scheduler install --replace", .{});
+    } else if ((scheduler.installed or scheduler.loaded) and std.mem.eql(u8, scheduler.surface, "unknown")) {
+        try diagnostics.append(allocator, "scheduler-surface", "error", "same-label scheduler has unexpected program arguments", .{});
+    }
+
+    try renderDoctor(allocator, io, db_path, automation_root, codex_path, &diagnostics, args.json);
+}
+
+fn renderDoctor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+    automation_root: ?[]const u8,
+    codex_path: ?[]const u8,
+    diagnostics: *const DoctorDiagnostics,
+    as_json: bool,
+) !void {
+    var scheduler = try readSchedulerStatus(allocator, io, DefaultLaunchdLabel);
+    defer scheduler.deinit(allocator);
+    const safe = !diagnostics.hasError();
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (!as_json) {
+        try stdout.print("automation doctor: {s}\n", .{if (safe) "safe" else "blocked"});
+        for (diagnostics.rows.items) |row| try stdout.print("{s}\t{s}\t{s}\n", .{ row.severity, row.code, row.detail });
+        return;
+    }
+    try stdout.writeAll("{\n  \"schema\": \"cas-automation-doctor/v1\",\n  \"status\": \"");
+    try stdout.writeAll(if (safe) "compatible" else "incompatible");
+    try stdout.writeAll("\",\n  \"database\": ");
+    try jsonWriteString(stdout, db_path);
+    try stdout.writeAll(",\n  \"automationRoot\": ");
+    if (automation_root) |value| try jsonWriteString(stdout, value) else try stdout.writeAll("null");
+    try stdout.writeAll(",\n  \"codexPath\": ");
+    if (codex_path) |value| try jsonWriteString(stdout, value) else try stdout.writeAll("null");
+    try stdout.writeAll(",\n  \"safeToMutate\": ");
+    try stdout.writeAll(if (safe) "true" else "false");
+    try stdout.writeAll(",\n  \"scheduler\": ");
+    try writeSchedulerStatusJson(stdout, scheduler);
+    try stdout.writeAll(",\n  \"diagnostics\": [");
+    for (diagnostics.rows.items, 0..) |row, index| {
+        if (index != 0) try stdout.writeByte(',');
+        try stdout.writeAll("\n    {\"code\":");
+        try jsonWriteString(stdout, row.code);
+        try stdout.writeAll(",\"severity\":");
+        try jsonWriteString(stdout, row.severity);
+        try stdout.writeAll(",\"detail\":");
+        try jsonWriteString(stdout, row.detail);
+        try stdout.writeByte('}');
+    }
+    if (diagnostics.rows.items.len != 0) try stdout.writeByte('\n');
+    try stdout.writeAll("  ]\n}\n");
 }
 
 fn cmdList(allocator: std.mem.Allocator, db_path: []const u8, args: ListArgs) !void {
@@ -1815,6 +2238,7 @@ fn cmdShowByIdPlain(allocator: std.mem.Allocator, db_path: []const u8, automatio
 fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs) !void {
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     const prompt = try readPrompt(allocator, if (args.prompt.len == 0) null else args.prompt, args.prompt_file);
     defer allocator.free(prompt);
@@ -1832,6 +2256,9 @@ fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs
     const automation_id = try generateUuidV4(allocator);
     defer allocator.free(automation_id);
 
+    try db.begin(allocator);
+    var transaction_open = true;
+    errdefer if (transaction_open) db.rollback(allocator);
     try db.exec(
         allocator,
         "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1848,8 +2275,10 @@ fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs
             .{ .int = created_at },
         },
     );
+    try db.commit(allocator);
+    transaction_open = false;
 
-    try writeAutomationFiles(allocator, &db, automation_id);
+    try syncAutomationFilesAfterCommit(allocator, &db, automation_id);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1860,6 +2289,7 @@ fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs
 fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs) !void {
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     var row = try getAutomationByResolve(allocator, &db, args.resolve);
     defer row.deinit(allocator);
@@ -1929,9 +2359,14 @@ fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs
     try w.writeAll(" where id = ?");
 
     try params.append(allocator, .{ .text = row.id });
+    try db.begin(allocator);
+    var transaction_open = true;
+    errdefer if (transaction_open) db.rollback(allocator);
     try db.exec(allocator, writer_alloc.written(), params.items);
+    try db.commit(allocator);
+    transaction_open = false;
 
-    try writeAutomationFiles(allocator, &db, row.id);
+    try syncAutomationFilesAfterCommit(allocator, &db, row.id);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1942,18 +2377,24 @@ fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs
 fn cmdEnableDisable(allocator: std.mem.Allocator, db_path: []const u8, resolve: ResolveArgs, status: AutomationStatus) !void {
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     var row = try getAutomationByResolve(allocator, &db, resolve);
     defer row.deinit(allocator);
 
     const ts = nowMs();
+    try db.begin(allocator);
+    var transaction_open = true;
+    errdefer if (transaction_open) db.rollback(allocator);
     try db.exec(
         allocator,
         "update automations set status = ?, updated_at = ? where id = ?",
         &.{ .{ .text = status.asText() }, .{ .int = ts }, .{ .text = row.id } },
     );
+    try db.commit(allocator);
+    transaction_open = false;
 
-    try writeAutomationFiles(allocator, &db, row.id);
+    try syncAutomationFilesAfterCommit(allocator, &db, row.id);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1964,18 +2405,24 @@ fn cmdEnableDisable(allocator: std.mem.Allocator, db_path: []const u8, resolve: 
 fn cmdRunNow(allocator: std.mem.Allocator, db_path: []const u8, resolve: ResolveArgs) !void {
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     var row = try getAutomationByResolve(allocator, &db, resolve);
     defer row.deinit(allocator);
 
     const ts = nowMs();
+    try db.begin(allocator);
+    var transaction_open = true;
+    errdefer if (transaction_open) db.rollback(allocator);
     try db.exec(
         allocator,
         "update automations set next_run_at = ?, updated_at = ? where id = ?",
         &.{ .{ .int = ts }, .{ .int = ts }, .{ .text = row.id } },
     );
+    try db.commit(allocator);
+    transaction_open = false;
 
-    try writeAutomationFiles(allocator, &db, row.id);
+    try syncAutomationFilesAfterCommit(allocator, &db, row.id);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1986,12 +2433,20 @@ fn cmdRunNow(allocator: std.mem.Allocator, db_path: []const u8, resolve: Resolve
 fn cmdDelete(allocator: std.mem.Allocator, db_path: []const u8, resolve: ResolveArgs) !void {
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     var row = try getAutomationByResolve(allocator, &db, resolve);
     defer row.deinit(allocator);
 
+    try db.begin(allocator);
+    var transaction_open = true;
+    errdefer if (transaction_open) db.rollback(allocator);
     try db.exec(allocator, "delete from automations where id = ?", &.{.{ .text = row.id }});
-    try deleteAutomationFiles(allocator, row.id);
+    try db.commit(allocator);
+    transaction_open = false;
+    deleteAutomationFiles(allocator, row.id) catch |err| {
+        return userErrorFmt("database delete committed but file cleanup failed for {s} ({s}); run `cas automation doctor --json`", .{ row.id, @errorName(err) });
+    };
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -2015,6 +2470,7 @@ fn cmdRunDue(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, args
 
     var db = try Db.open(allocator, db_path);
     defer db.close();
+    try requireStoreSchema(allocator, &db);
 
     const now = nowMs();
     var due = try selectDueAutomations(allocator, &db, now, args.limit, args.automation_id);
@@ -2022,6 +2478,8 @@ fn cmdRunDue(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, args
         for (due.items) |*row| row.deinit(allocator);
         due.deinit(allocator);
     }
+
+    try validateDueBatch(allocator, due.items, now);
 
     if (due.items.len == 0) {
         var stdout_file = std.Io.File.stdout();
@@ -2111,6 +2569,25 @@ fn selectDueAutomations(
     }
 
     return rows;
+}
+
+fn validateDueBatch(allocator: std.mem.Allocator, rows: []const AutomationRow, now: i64) !void {
+    for (rows) |*row| {
+        if (!std.mem.eql(u8, row.status, "ACTIVE")) {
+            return userErrorFmt("due automation {s} is not ACTIVE", .{row.id});
+        }
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, row.cwds_json, .{}) catch {
+            return userErrorFmt("due automation {s} has malformed cwds JSON", .{row.id});
+        };
+        defer parsed.deinit();
+        if (parsed.value != .array) return userErrorFmt("due automation {s} cwds is not an array", .{row.id});
+        for (parsed.value.array.items) |item| {
+            if (item != .string or std.mem.trim(u8, item.string, " \t\r\n").len == 0) {
+                return userErrorFmt("due automation {s} has an invalid cwd", .{row.id});
+            }
+        }
+        _ = try computeNextRunAt(allocator, row, now);
+    }
 }
 
 fn runDueAutomation(
@@ -2236,7 +2713,7 @@ fn runDueAutomation(
     }
 
     try updateAutomationTimes(allocator, db, row.id, started, next_run);
-    try writeAutomationFiles(allocator, db, row.id);
+    try syncAutomationFilesAfterCommit(allocator, db, row.id);
 
     const summary_text = if (failures.items.len == 0)
         try std.fmt.allocPrint(allocator, "Completed {d} run(s)", .{cwds.items.len})
@@ -2783,6 +3260,19 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
 
     if (std.mem.eql(u8, existing, plist)) changed = false;
 
+    if (existing.len != 0 and changed) {
+        var existing_args: std.ArrayList([]u8) = .empty;
+        defer {
+            for (existing_args.items) |arg| allocator.free(arg);
+            existing_args.deinit(allocator);
+        }
+        try parsePlistProgramArguments(allocator, existing, &existing_args);
+        const existing_surface = classifySchedulerSurface(existing_args.items);
+        if (!std.mem.eql(u8, existing_surface, "cas-automation") and !args.replace) {
+            return userErrorFmt("refusing to replace {s} scheduler at the same label without --replace", .{existing_surface});
+        }
+    }
+
     if (changed) {
         try writeFileAtomic(allocator, plist_path, plist);
     }
@@ -2799,7 +3289,15 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
     _ = try runCommandCapture(allocator, io, &.{ "launchctl", "bootstrap", domain, plist_path }, true);
     _ = runCommandCapture(allocator, io, &.{ "launchctl", "enable", target }, false) catch null;
     _ = try runCommandCapture(allocator, io, &.{ "launchctl", "kickstart", "-k", target }, true);
-    _ = try runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, true);
+    const loaded_state = try runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, true);
+    defer allocator.free(loaded_state.stdout);
+    defer allocator.free(loaded_state.stderr);
+    var loaded_arguments: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(allocator, loaded_arguments);
+    try parseLaunchctlProgramArguments(allocator, loaded_state.stdout, &loaded_arguments);
+    if (!schedulerArgumentsMatchCas(loaded_arguments.items, cas_path)) {
+        return userErrorFmt("scheduler replacement did not load cas automation program arguments", .{});
+    }
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -2855,24 +3353,177 @@ fn cmdSchedulerUninstall(allocator: std.mem.Allocator, io: std.Io, args: Schedul
 fn cmdSchedulerStatus(allocator: std.mem.Allocator, io: std.Io, args: SchedulerLabelArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
-    const uid = std.c.getuid();
-    const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
-    defer allocator.free(target);
-
-    const out = try runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, false);
-    defer {
-        allocator.free(out.stdout);
-        allocator.free(out.stderr);
-    }
-
-    if (out.exit_code != 0) {
-        return userErrorFmt("launchctl status unavailable for {s}: {s}", .{ args.label, std.mem.trim(u8, out.stderr, " \t\r\n") });
-    }
+    var status = try readSchedulerStatus(allocator, io, args.label);
+    defer status.deinit(allocator);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try stdout.writeAll(out.stdout);
+    if (args.json) {
+        try writeSchedulerStatusJson(stdout, status);
+        try stdout.writeByte('\n');
+    } else {
+        try stdout.print("installed: {}\nloaded: {}\nlabel: {s}\nplist: {s}\nsurface: {s}\nmigration required: {}\n", .{
+            status.installed,
+            status.loaded,
+            status.label,
+            status.plist_path,
+            status.surface,
+            status.migration_required,
+        });
+    }
+}
+
+const SchedulerStatus = struct {
+    installed: bool,
+    loaded: bool,
+    label: []u8,
+    plist_path: []u8,
+    program_arguments: std.ArrayList([]u8) = .empty,
+    surface: []const u8,
+    migration_required: bool,
+
+    fn deinit(self: *SchedulerStatus, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.plist_path);
+        for (self.program_arguments.items) |arg| allocator.free(arg);
+        self.program_arguments.deinit(allocator);
+    }
+};
+
+fn readSchedulerStatus(allocator: std.mem.Allocator, io: std.Io, label: []const u8) !SchedulerStatus {
+    const home = envString("HOME") orelse "";
+    const plist_path = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents/{s}.plist", .{ home, label });
+    errdefer allocator.free(plist_path);
+    var arguments: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (arguments.items) |arg| allocator.free(arg);
+        arguments.deinit(allocator);
+    }
+    const plist = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), plist_path, allocator, .limited(2 * 1024 * 1024)) catch null;
+    defer if (plist) |bytes| allocator.free(bytes);
+    if (plist) |bytes| try parsePlistProgramArguments(allocator, bytes, &arguments);
+
+    var loaded = false;
+    if (builtin.os.tag == .macos) {
+        const uid = std.c.getuid();
+        const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, label });
+        defer allocator.free(target);
+        const out = runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, false) catch null;
+        if (out) |result| {
+            loaded = result.exit_code == 0;
+            if (loaded) _ = try projectLoadedProgramArguments(allocator, result.stdout, &arguments);
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+    }
+
+    const surface = classifySchedulerSurface(arguments.items);
+    return .{
+        .installed = plist != null,
+        .loaded = loaded,
+        .label = try allocator.dupe(u8, label),
+        .plist_path = plist_path,
+        .program_arguments = arguments,
+        .surface = surface,
+        .migration_required = std.mem.eql(u8, surface, "standalone-cron"),
+    };
+}
+
+fn parsePlistProgramArguments(allocator: std.mem.Allocator, plist: []const u8, output: *std.ArrayList([]u8)) !void {
+    const key = "<key>ProgramArguments</key>";
+    const key_index = std.mem.indexOf(u8, plist, key) orelse return;
+    const array_start_rel = std.mem.indexOf(u8, plist[key_index + key.len ..], "<array>") orelse return;
+    const array_start = key_index + key.len + array_start_rel + "<array>".len;
+    const array_end_rel = std.mem.indexOf(u8, plist[array_start..], "</array>") orelse return;
+    const body = plist[array_start .. array_start + array_end_rel];
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, "<string>")) |start_tag| {
+        const start = start_tag + "<string>".len;
+        const end_rel = std.mem.indexOf(u8, body[start..], "</string>") orelse break;
+        if (output.items.len >= 32) return error.TooManyProgramArguments;
+        try output.append(allocator, try allocator.dupe(u8, body[start .. start + end_rel]));
+        cursor = start + end_rel + "</string>".len;
+    }
+}
+
+fn parseLaunchctlProgramArguments(allocator: std.mem.Allocator, loaded_state: []const u8, output: *std.ArrayList([]u8)) !void {
+    if (loaded_state.len > MaxCommandOutputBytes) return error.LaunchctlOutputTooLarge;
+
+    var lines = std.mem.splitScalar(u8, loaded_state, '\n');
+    var in_arguments = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!in_arguments) {
+            if (std.mem.eql(u8, trimmed, "arguments = {")) in_arguments = true;
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "}")) return;
+        if (trimmed.len == 0) continue;
+        if (trimmed.len > 4096) return error.ProgramArgumentTooLong;
+        if (output.items.len >= 32) return error.TooManyProgramArguments;
+
+        const value = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+            trimmed[1 .. trimmed.len - 1]
+        else
+            trimmed;
+        try output.append(allocator, try allocator.dupe(u8, value));
+    }
+    if (in_arguments) return error.UnterminatedProgramArguments;
+}
+
+fn projectLoadedProgramArguments(allocator: std.mem.Allocator, loaded_state: []const u8, output: *std.ArrayList([]u8)) !bool {
+    var loaded_arguments: std.ArrayList([]u8) = .empty;
+    parseLaunchctlProgramArguments(allocator, loaded_state, &loaded_arguments) catch |err| {
+        if (err == error.OutOfMemory) {
+            freeOwnedStrings(allocator, loaded_arguments);
+            return err;
+        }
+        freeOwnedStrings(allocator, loaded_arguments);
+        freeOwnedStrings(allocator, output.*);
+        output.* = .empty;
+        return false;
+    };
+
+    freeOwnedStrings(allocator, output.*);
+    output.* = loaded_arguments;
+    return true;
+}
+
+fn schedulerArgumentsMatchCas(arguments: []const []u8, cas_path: []const u8) bool {
+    return arguments.len == 3 and
+        std.mem.eql(u8, arguments[0], cas_path) and
+        std.mem.eql(u8, arguments[1], "automation") and
+        std.mem.eql(u8, arguments[2], "run-due");
+}
+
+fn classifySchedulerSurface(arguments: []const []u8) []const u8 {
+    if (arguments.len >= 3 and std.mem.eql(u8, std.fs.path.basename(arguments[0]), "cas") and
+        std.mem.eql(u8, arguments[1], "automation") and std.mem.eql(u8, arguments[2], "run-due")) return "cas-automation";
+    if (arguments.len >= 2 and std.mem.eql(u8, std.fs.path.basename(arguments[0]), "cron") and
+        std.mem.eql(u8, arguments[1], "run-due")) return "standalone-cron";
+    return "unknown";
+}
+
+fn writeSchedulerStatusJson(writer: anytype, status: SchedulerStatus) !void {
+    try writer.writeAll("{\"schema\":\"cas-automation-scheduler-status/v1\",\"installed\":");
+    try writer.writeAll(if (status.installed) "true" else "false");
+    try writer.writeAll(",\"loaded\":");
+    try writer.writeAll(if (status.loaded) "true" else "false");
+    try writer.writeAll(",\"label\":");
+    try jsonWriteString(writer, status.label);
+    try writer.writeAll(",\"plistPath\":");
+    try jsonWriteString(writer, status.plist_path);
+    try writer.writeAll(",\"programArguments\":[");
+    for (status.program_arguments.items, 0..) |arg, index| {
+        if (index != 0) try writer.writeByte(',');
+        try jsonWriteString(writer, arg);
+    }
+    try writer.writeAll("],\"surface\":");
+    try jsonWriteString(writer, status.surface);
+    try writer.writeAll(",\"migrationRequired\":");
+    try writer.writeAll(if (status.migration_required) "true" else "false");
+    try writer.writeByte('}');
 }
 
 const CommandCapture = struct {
@@ -3425,6 +4076,327 @@ test "launchd ProgramArguments invoke cas automation run-due" {
             "  </array>\n",
         rendered,
     );
+}
+
+test "scheduler surface distinguishes CAS adoption from standalone Cron" {
+    var cas_args = [_][]u8{
+        @constCast("/opt/cas/bin/cas"),
+        @constCast("automation"),
+        @constCast("run-due"),
+    };
+    try std.testing.expectEqualStrings("cas-automation", classifySchedulerSurface(&cas_args));
+    var cron_args = [_][]u8{
+        @constCast("/opt/homebrew/bin/cron"),
+        @constCast("run-due"),
+    };
+    try std.testing.expectEqualStrings("standalone-cron", classifySchedulerSurface(&cron_args));
+    var unknown_args = [_][]u8{@constCast("/bin/false")};
+    try std.testing.expectEqualStrings("unknown", classifySchedulerSurface(&unknown_args));
+}
+
+test "plist ProgramArguments parser is bounded to the selected array" {
+    const plist =
+        "<dict><key>ProgramArguments</key><array>" ++
+        "<string>/opt/cas/bin/cas</string><string>automation</string><string>run-due</string>" ++
+        "</array><key>Other</key><array><string>ignored</string></array></dict>";
+    var args: std.ArrayList([]u8) = .empty;
+    defer {
+        for (args.items) |arg| std.testing.allocator.free(arg);
+        args.deinit(std.testing.allocator);
+    }
+    try parsePlistProgramArguments(std.testing.allocator, plist, &args);
+    try std.testing.expectEqual(@as(usize, 3), args.items.len);
+    try std.testing.expectEqualStrings("cas-automation", classifySchedulerSurface(args.items));
+}
+
+test "launchctl ProgramArguments parser verifies the loaded same-label arguments" {
+    const loaded_state =
+        \\gui/501/com.openai.codex.automation-runner = {
+        \\    path = /Users/test/Library/LaunchAgents/com.openai.codex.automation-runner.plist
+        \\    program = /opt/cas/bin/cas
+        \\    arguments = {
+        \\        /opt/cas/bin/cas
+        \\        automation
+        \\        run-due
+        \\    }
+        \\}
+    ;
+    var loaded_args: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(std.testing.allocator, loaded_args);
+    try parseLaunchctlProgramArguments(std.testing.allocator, loaded_state, &loaded_args);
+    try std.testing.expect(schedulerArgumentsMatchCas(loaded_args.items, "/opt/cas/bin/cas"));
+    try std.testing.expect(!schedulerArgumentsMatchCas(loaded_args.items, "/different/cas"));
+}
+
+test "scheduler adoption does not trust a CAS plist when launchd loaded Cron" {
+    var status_args: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(std.testing.allocator, status_args);
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/opt/cas/bin/cas"));
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "automation"));
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "run-due"));
+    try std.testing.expectEqualStrings("cas-automation", classifySchedulerSurface(status_args.items));
+
+    const loaded_state =
+        \\gui/501/com.openai.codex.automation-runner = {
+        \\    program = /opt/homebrew/bin/cron
+        \\    arguments = {
+        \\        /opt/homebrew/bin/cron
+        \\        run-due
+        \\    }
+        \\}
+    ;
+    try std.testing.expect(try projectLoadedProgramArguments(std.testing.allocator, loaded_state, &status_args));
+    try std.testing.expectEqual(@as(usize, 2), status_args.items.len);
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/cron", status_args.items[0]);
+    try std.testing.expectEqualStrings("run-due", status_args.items[1]);
+    const surface = classifySchedulerSurface(status_args.items);
+    try std.testing.expectEqualStrings("standalone-cron", surface);
+    const migration_required = std.mem.eql(u8, surface, "standalone-cron");
+    try std.testing.expect(migration_required);
+    try std.testing.expect(!schedulerArgumentsMatchCas(status_args.items, "/opt/cas/bin/cas"));
+}
+
+test "loaded scheduler projection fails closed instead of retaining plist arguments" {
+    var status_args: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(std.testing.allocator, status_args);
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "/opt/cas/bin/cas"));
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "automation"));
+    try status_args.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "run-due"));
+
+    const malformed_loaded_state =
+        \\arguments = {
+        \\    /opt/homebrew/bin/cron
+        \\    run-due
+    ;
+    try std.testing.expect(!try projectLoadedProgramArguments(std.testing.allocator, malformed_loaded_state, &status_args));
+    try std.testing.expectEqual(@as(usize, 0), status_args.items.len);
+    try std.testing.expectEqualStrings("unknown", classifySchedulerSurface(status_args.items));
+}
+
+test "launchctl ProgramArguments parser rejects an unbounded argument list" {
+    var fixture = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer fixture.deinit();
+    try fixture.writer.writeAll("arguments = {\n");
+    for (0..33) |index| try fixture.writer.print("  arg-{d}\n", .{index});
+    try fixture.writer.writeAll("}\n");
+    const loaded_state = try fixture.toOwnedSlice();
+    defer std.testing.allocator.free(loaded_state);
+
+    var loaded_args: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(std.testing.allocator, loaded_args);
+    try std.testing.expectError(error.TooManyProgramArguments, parseLaunchctlProgramArguments(std.testing.allocator, loaded_state, &loaded_args));
+}
+
+test "store schema gate accepts additive columns and rejects missing required tables" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
+    defer alloc.free(db_path);
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try createTestSchema(alloc, &db);
+    try db.exec(alloc, "alter table automations add column future_metadata text", &.{});
+    var compatible: DoctorDiagnostics = .{};
+    defer compatible.deinit(alloc);
+    try inspectStoreSchema(alloc, &db, &compatible);
+    try std.testing.expect(!compatible.hasError());
+    var saw_additive = false;
+    for (compatible.rows.items) |row| {
+        if (std.mem.eql(u8, row.code, "additive-column")) saw_additive = true;
+    }
+    try std.testing.expect(saw_additive);
+
+    try db.exec(alloc, "drop table inbox_items", &.{});
+    var incompatible: DoctorDiagnostics = .{};
+    defer incompatible.deinit(alloc);
+    try inspectStoreSchema(alloc, &db, &incompatible);
+    try std.testing.expect(incompatible.hasError());
+}
+
+test "mutation writability inspection checks the database file owner and automation root without writes" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "store");
+    try tmp.dir.createDirPath(io, "automations");
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/codex-dev.db", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "store", "codex-dev.db" });
+    defer alloc.free(db_path);
+    const store_owner = try std.fs.path.join(alloc, &.{ root, "store" });
+    defer alloc.free(store_owner);
+    const automation_root = try std.fs.path.join(alloc, &.{ root, "automations" });
+    defer alloc.free(automation_root);
+
+    var writable: DoctorDiagnostics = .{};
+    defer writable.deinit(alloc);
+    try inspectMutationWritability(alloc, db_path, automation_root, &writable);
+    try std.testing.expect(!writable.hasError());
+
+    var permission_checks_exercised: usize = 0;
+    {
+        var db_file = try std.Io.Dir.cwd().openFile(io, db_path, .{ .mode = .read_write });
+        defer db_file.close(io);
+        try db_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o400));
+        defer db_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o600)) catch {};
+        if (std.Io.Dir.cwd().access(io, db_path, .{ .write = true })) |_| {} else |_| {
+            permission_checks_exercised += 1;
+            var blocked: DoctorDiagnostics = .{};
+            defer blocked.deinit(alloc);
+            try inspectMutationWritability(alloc, db_path, automation_root, &blocked);
+            var found = false;
+            for (blocked.rows.items) |row| if (std.mem.eql(u8, row.code, "database-not-writable")) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+        }
+    }
+    {
+        var owner_dir = try std.Io.Dir.cwd().openDir(io, store_owner, .{});
+        defer owner_dir.close(io);
+        try owner_dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+        defer owner_dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+        if (std.Io.Dir.cwd().access(io, store_owner, .{ .write = true, .execute = true })) |_| {} else |_| {
+            permission_checks_exercised += 1;
+            var blocked: DoctorDiagnostics = .{};
+            defer blocked.deinit(alloc);
+            try inspectMutationWritability(alloc, db_path, automation_root, &blocked);
+            var found = false;
+            for (blocked.rows.items) |row| if (std.mem.eql(u8, row.code, "database-owner-not-writable")) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+        }
+    }
+    {
+        var automations_dir = try std.Io.Dir.cwd().openDir(io, automation_root, .{});
+        defer automations_dir.close(io);
+        try automations_dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+        defer automations_dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+        if (std.Io.Dir.cwd().access(io, automation_root, .{ .write = true, .execute = true })) |_| {} else |_| {
+            permission_checks_exercised += 1;
+            var blocked: DoctorDiagnostics = .{};
+            defer blocked.deinit(alloc);
+            try inspectMutationWritability(alloc, db_path, automation_root, &blocked);
+            var found = false;
+            for (blocked.rows.items) |row| if (std.mem.eql(u8, row.code, "automation-root-not-writable")) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+        }
+    }
+
+    // Privileged test identities can retain write access despite mode bits.
+    if (permission_checks_exercised == 0) return error.SkipZigTest;
+}
+
+test "mutation writability inspection diagnoses missing owners without creating them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "missing-store", "codex-dev.db" });
+    defer alloc.free(db_path);
+    const automation_root = try std.fs.path.join(alloc, &.{ root, "missing-automations" });
+    defer alloc.free(automation_root);
+
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(alloc);
+    try inspectMutationWritability(alloc, db_path, automation_root, &diagnostics);
+    try std.testing.expect(diagnostics.hasError());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, automation_root, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, std.fs.path.dirname(db_path).?, .{}));
+}
+
+test "doctor emits complete JSON when an automation row has malformed cwds" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
+    try tmp.dir.createDirPath(io, "automations/malformed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "automations/malformed/automation.toml", .data = "stale = true\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "automations/malformed/memory.md", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
+    defer alloc.free(db_path);
+    const automation_root = try std.fs.path.join(alloc, &.{ root, "automations" });
+    defer alloc.free(automation_root);
+    const report_path = try std.fs.path.join(alloc, &.{ root, "doctor.json" });
+    defer alloc.free(report_path);
+
+    {
+        var db = try Db.open(alloc, db_path);
+        defer db.close();
+        try createTestSchema(alloc, &db);
+        try db.exec(alloc, "insert into automations (id,name,prompt,status,next_run_at,last_run_at,cwds,rrule,created_at,updated_at) values ('malformed','n','p','ACTIVE',null,null,'not-json','RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0',1,1)", &.{});
+    }
+
+    perf_automation_root_override = automation_root;
+    defer perf_automation_root_override = null;
+    {
+        const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
+        if (saved_fd < 0) return error.SystemResources;
+        var report_file = try std.Io.Dir.cwd().createFile(io, report_path, .{});
+        defer {
+            _ = std.c.dup2(saved_fd, std.posix.STDOUT_FILENO);
+            _ = std.c.close(saved_fd);
+            report_file.close(io);
+        }
+        if (std.c.dup2(report_file.handle, std.posix.STDOUT_FILENO) < 0) return error.SystemResources;
+        try cmdDoctor(alloc, io, db_path, .{ .json = true });
+    }
+
+    const report = try std.Io.Dir.cwd().readFileAlloc(io, report_path, alloc, .limited(2 * 1024 * 1024));
+    defer alloc.free(report);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("cas-automation-doctor/v1", parsed.value.object.get("schema").?.string);
+    try std.testing.expect(!parsed.value.object.get("safeToMutate").?.bool);
+    var saw_malformed = false;
+    var saw_skipped = false;
+    for (parsed.value.object.get("diagnostics").?.array.items) |diagnostic| {
+        const code = diagnostic.object.get("code").?.string;
+        if (std.mem.eql(u8, code, "malformed-cwds")) saw_malformed = true;
+        if (std.mem.eql(u8, code, "automation-file-comparison-skipped")) saw_skipped = true;
+    }
+    try std.testing.expect(saw_malformed);
+    try std.testing.expect(saw_skipped);
+}
+
+test "transaction rollback preserves the pre-mutation row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
+    defer alloc.free(db_path);
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try createTestSchema(alloc, &db);
+    try db.begin(alloc);
+    try db.exec(alloc, "insert into automations (id,name,prompt,status,next_run_at,last_run_at,cwds,rrule,created_at,updated_at) values ('rollback','n','p','ACTIVE',null,null,'[]','RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0',1,1)", &.{});
+    db.rollback(alloc);
+    var stmt = try db.prepare(alloc, "select count(*) from automations where id = 'rollback'");
+    defer stmt.deinit();
+    try std.testing.expectEqual(StepResult.row, try stmt.step());
+    try std.testing.expectEqual(@as(i64, 0), stmt.intColumn(0));
 }
 
 test "runDueAutomation dry-run is read-only" {

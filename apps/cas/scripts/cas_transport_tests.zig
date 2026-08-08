@@ -64,6 +64,7 @@ test "transport spellings and endpoint matrix are exact" {
     try std.testing.expectEqual(launch.RequestedTransport.explicit_websocket, launch.RequestedTransport.parse("ws").?);
     try std.testing.expectEqual(launch.RequestedTransport.unix_socket, launch.RequestedTransport.parse("unix").?);
     try std.testing.expect(launch.RequestedTransport.parse("websocket") == null);
+    try std.testing.expectEqualStrings("managed-ws", launch.RequestedTransport.managed_websocket.asString());
     _ = try launch.validateTransport(.stdio, null);
     _ = try launch.validateTransport(.managed_websocket, null);
     _ = try launch.validateTransport(.explicit_websocket, "ws://127.0.0.1:12/");

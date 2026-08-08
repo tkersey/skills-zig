@@ -4,6 +4,20 @@ const proxy = @import("cas_proxy_client");
 
 pub const ProbeStatus = enum { passed, failed, unavailable, not_applicable };
 
+pub const PaginatedForkFixture = struct {
+    pub const thread_id = "019dd902-0000-7000-8000-000000000146";
+    pub const first_turn_id = "turn-0146-completed-1";
+    pub const second_turn_id = "turn-0146-completed-2";
+    pub const active_turn_id = "turn-0146-active";
+};
+
+pub const ExecutorSkillFixture = struct {
+    pub const name = "cas-executor-probe";
+    pub const description = "Deterministic Codex 0.146 executor skill/resource probe.";
+    pub const resource_bytes = "codex-app-server-executor-skill-probe-0.146.0\n";
+    pub const resource_base64 = "Y29kZXgtYXBwLXNlcnZlci1leGVjdXRvci1za2lsbC1wcm9iZS0wLjE0Ni4wCg==";
+};
+
 pub const LiveWitness = struct {
     status: ProbeStatus = .unavailable,
     failure_code: ?[]const u8 = "probe_unavailable",
@@ -36,6 +50,9 @@ pub const Witnesses = struct {
     thread_pinning: LiveWitness = .{},
     paginated_fork: LiveWitness = .{},
     ephemeral_fork: LiveWitness = .{},
+    paginated_session_inquiry: LiveWitness = .{},
+    executor_skill_resources: LiveWitness = .{},
+    structured_review: LiveWitness = .{},
     external_import_history: LiveWitness = .{},
 };
 
@@ -68,6 +85,12 @@ pub fn buildReport(
             witnesses.paginated_fork
         else if (std.mem.eql(u8, descriptor.id, "ephemeral-fork"))
             witnesses.ephemeral_fork
+        else if (std.mem.eql(u8, descriptor.id, "paginated-session-inquiry"))
+            witnesses.paginated_session_inquiry
+        else if (std.mem.eql(u8, descriptor.id, "executor-skill-resources"))
+            witnesses.executor_skill_resources
+        else if (std.mem.eql(u8, descriptor.id, "structured-review"))
+            witnesses.structured_review
         else if (std.mem.eql(u8, descriptor.id, "external-import-history"))
             witnesses.external_import_history
         else
@@ -207,6 +230,402 @@ pub fn externalImportHistoryProbe(allocator: std.mem.Allocator, client: *proxy.C
     return LiveWitness.passed();
 }
 
+pub fn structuredReviewProbe(allocator: std.mem.Allocator, client: *proxy.Client, cwd: []const u8) LiveWitness {
+    const thread_params = stringifyAnyAlloc(allocator, .{
+        .cwd = cwd,
+        .experimentalRawEvents = false,
+        .ephemeral = true,
+        .approvalPolicy = "never",
+        .sandbox = "read-only",
+        .runtimeWorkspaceRoots = &[_][]const u8{},
+    }) catch
+        return LiveWitness.failed("structured_review_thread_encode_failed", "ephemeral thread/start parameters could not be encoded");
+    defer allocator.free(thread_params);
+    const thread_json = client.requestJson("thread/start", thread_params) catch
+        return LiveWitness.failed("structured_review_thread_start_failed", "ephemeral thread/start failed before review dispatch");
+    defer allocator.free(thread_json);
+    const thread_id = threadIdAlloc(allocator, thread_json) catch
+        return LiveWitness.failed("structured_review_thread_shape_failed", "thread/start did not return a thread identity");
+    defer allocator.free(thread_id);
+
+    const instructions = "CAS structured-review dispatch conformance probe.";
+    const review_params = stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .delivery = "inline",
+        .target = .{ .type = "custom", .instructions = instructions },
+    }) catch return LiveWitness.failed("structured_review_request_encode_failed", "review/start parameters could not be encoded");
+    defer allocator.free(review_params);
+    const review_json = client.requestJson("review/start", review_params) catch
+        return LiveWitness.failed("structured_review_start_failed", "review/start did not enter the structured inline review path");
+    defer allocator.free(review_json);
+    const turn_id = structuredReviewTurnIdAlloc(allocator, review_json, thread_id, instructions) catch
+        return LiveWitness.failed("structured_review_response_shape_failed", "review/start did not return the exact structured inline review identity and in-progress turn");
+    defer allocator.free(turn_id);
+    interruptTurn(allocator, client, thread_id, turn_id);
+    return LiveWitness.passed();
+}
+
+pub fn executorSkillResourcesProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    cwd: []const u8,
+    extra_root: []const u8,
+    skill_manifest_path: []const u8,
+    resource_path: []const u8,
+) LiveWitness {
+    const root_params = stringifyAnyAlloc(allocator, .{ .extraRoots = &[_][]const u8{extra_root} }) catch
+        return LiveWitness.failed("executor_skill_root_encode_failed", "skills/extraRoots/set parameters could not be encoded");
+    defer allocator.free(root_params);
+    const root_json = client.requestJson("skills/extraRoots/set", root_params) catch
+        return LiveWitness.failed("executor_skill_root_set_failed", "skills/extraRoots/set rejected an isolated absolute root");
+    allocator.free(root_json);
+
+    const list_params = stringifyAnyAlloc(allocator, .{
+        .cwds = &[_][]const u8{cwd},
+        .forceReload = true,
+    }) catch return LiveWitness.failed("executor_skill_list_encode_failed", "skills/list parameters could not be encoded");
+    defer allocator.free(list_params);
+    const list_json = client.requestJson("skills/list", list_params) catch
+        return LiveWitness.failed("executor_skill_list_failed", "skills/list failed after exact extra-root replacement");
+    defer allocator.free(list_json);
+    if (!skillsListContainsExactFixture(list_json, cwd, skill_manifest_path))
+        return LiveWitness.failed("executor_skill_list_shape_failed", "skills/list did not preserve the exact skill identity, description, native path, scope, and enabled state");
+
+    const read_params = stringifyAnyAlloc(allocator, .{ .path = resource_path }) catch
+        return LiveWitness.failed("executor_resource_read_encode_failed", "fs/readFile parameters could not be encoded");
+    defer allocator.free(read_params);
+    const read_json = client.requestJson("fs/readFile", read_params) catch
+        return LiveWitness.failed("executor_resource_read_failed", "fs/readFile rejected the executor-root resource's native absolute path");
+    defer allocator.free(read_json);
+    if (!responseStringEquals(read_json, "dataBase64", ExecutorSkillFixture.resource_base64))
+        return LiveWitness.failed("executor_resource_readback_mismatch", "fs/readFile did not preserve the executor resource bytes exactly");
+
+    const selected_params = stringifyAnyAlloc(allocator, .{
+        .cwd = extra_root,
+        .ephemeral = true,
+        .approvalPolicy = "never",
+        .sandbox = "read-only",
+        .environments = &[_]struct { environmentId: []const u8, cwd: []const u8 }{
+            .{ .environmentId = "local", .cwd = extra_root },
+        },
+        .selectedCapabilityRoots = &[_]struct {
+            id: []const u8,
+            location: struct { type: []const u8, environmentId: []const u8, path: []const u8 },
+        }{
+            .{
+                .id = "cas-executor-probe@0.146.0",
+                .location = .{
+                    .type = "environment",
+                    .environmentId = "local",
+                    .path = extra_root,
+                },
+            },
+        },
+    }) catch return LiveWitness.failed("executor_capability_root_encode_failed", "selectedCapabilityRoots thread/start parameters could not be encoded");
+    defer allocator.free(selected_params);
+    const selected_json = client.requestJson("thread/start", selected_params) catch
+        return LiveWitness.failed("executor_capability_root_rejected", "thread/start rejected an environment-owned selected capability root");
+    defer allocator.free(selected_json);
+    if (!selectedCapabilityRootAccepted(selected_json, extra_root))
+        return LiveWitness.failed("executor_capability_root_response_failed", "thread/start did not return the exact ephemeral environment-root thread identity");
+    return LiveWitness.passed();
+}
+
+pub fn paginatedForkProbe(allocator: std.mem.Allocator, client: *proxy.Client) LiveWitness {
+    const source_thread_id = PaginatedForkFixture.thread_id;
+
+    const incompatible_boundaries = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.first_turn_id,
+        .beforeTurnId = PaginatedForkFixture.second_turn_id,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "fork boundary parameters could not be encoded");
+    defer allocator.free(incompatible_boundaries);
+    if (!requestFailsWithMessage(
+        allocator,
+        client,
+        "thread/fork",
+        incompatible_boundaries,
+        "`beforeTurnId` cannot be combined with `lastTurnId`",
+    )) return LiveWitness.failed("paginated_fork_boundary_exclusivity_failed", "thread/fork did not reject combined lastTurnId and beforeTurnId boundaries");
+
+    const active_boundary = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.active_turn_id,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "active boundary parameters could not be encoded");
+    defer allocator.free(active_boundary);
+    const expected_active_error = std.fmt.allocPrint(
+        allocator,
+        "lastTurnId '{s}' identifies an in-progress turn",
+        .{PaginatedForkFixture.active_turn_id},
+    ) catch return LiveWitness.failed("paginated_fork_error_encode_failed", "active-boundary error witness could not be encoded");
+    defer allocator.free(expected_active_error);
+    if (!requestFailsWithMessage(allocator, client, "thread/fork", active_boundary, expected_active_error))
+        return LiveWitness.failed("paginated_fork_active_boundary_accepted", "an in-progress lastTurnId was accepted as complete history");
+
+    const through_params = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.first_turn_id,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "lastTurnId parameters could not be encoded");
+    defer allocator.free(through_params);
+    const through_json = client.requestJson("thread/fork", through_params) catch
+        return LiveWitness.failed("paginated_fork_last_turn_failed", "thread/fork rejected an admissible completed lastTurnId");
+    defer allocator.free(through_json);
+    const through_id = forkThreadIdAlloc(allocator, through_json) catch
+        return LiveWitness.failed("paginated_fork_last_turn_shape_failed", "lastTurnId fork response did not contain a thread id");
+    defer allocator.free(through_id);
+    defer deleteThread(allocator, client, through_id);
+    if (!forkResponseMatches(through_json, source_thread_id, false, false, &.{PaginatedForkFixture.first_turn_id}))
+        return LiveWitness.failed("paginated_fork_last_turn_prefix_failed", "lastTurnId fork did not preserve exactly the inclusive completed prefix");
+
+    const before_params = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .beforeTurnId = PaginatedForkFixture.second_turn_id,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "beforeTurnId parameters could not be encoded");
+    defer allocator.free(before_params);
+    const before_json = client.requestJson("thread/fork", before_params) catch
+        return LiveWitness.failed("paginated_fork_before_turn_failed", "thread/fork rejected an admissible beforeTurnId");
+    defer allocator.free(before_json);
+    const before_id = forkThreadIdAlloc(allocator, before_json) catch
+        return LiveWitness.failed("paginated_fork_before_turn_shape_failed", "beforeTurnId fork response did not contain a thread id");
+    defer allocator.free(before_id);
+    defer deleteThread(allocator, client, before_id);
+    if (!forkResponseMatches(before_json, source_thread_id, false, false, &.{PaginatedForkFixture.first_turn_id}))
+        return LiveWitness.failed("paginated_fork_before_turn_prefix_failed", "beforeTurnId fork did not preserve exactly the exclusive completed prefix");
+
+    const before_active_params = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .beforeTurnId = PaginatedForkFixture.active_turn_id,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "active beforeTurnId parameters could not be encoded");
+    defer allocator.free(before_active_params);
+    const before_active_json = client.requestJson("thread/fork", before_active_params) catch
+        return LiveWitness.failed("paginated_fork_before_active_failed", "beforeTurnId did not admit an in-progress exclusive boundary");
+    defer allocator.free(before_active_json);
+    const before_active_id = forkThreadIdAlloc(allocator, before_active_json) catch
+        return LiveWitness.failed("paginated_fork_before_active_shape_failed", "active beforeTurnId fork response did not contain a thread id");
+    defer allocator.free(before_active_id);
+    defer deleteThread(allocator, client, before_active_id);
+    if (!forkResponseMatches(before_active_json, source_thread_id, false, false, &.{ PaginatedForkFixture.first_turn_id, PaginatedForkFixture.second_turn_id }))
+        return LiveWitness.failed("paginated_fork_before_active_prefix_failed", "beforeTurnId treated an active turn or its partial suffix as completed history");
+
+    const excluded_params = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.second_turn_id,
+        .excludeTurns = true,
+    }) catch return LiveWitness.failed("paginated_fork_request_encode_failed", "excludeTurns parameters could not be encoded");
+    defer allocator.free(excluded_params);
+    const excluded_json = client.requestJson("thread/fork", excluded_params) catch
+        return LiveWitness.failed("paginated_fork_exclude_turns_failed", "thread/fork rejected excludeTurns on a paginated source");
+    defer allocator.free(excluded_json);
+    const excluded_id = forkThreadIdAlloc(allocator, excluded_json) catch
+        return LiveWitness.failed("paginated_fork_exclude_turns_shape_failed", "excludeTurns fork response did not contain a thread id");
+    defer allocator.free(excluded_id);
+    defer deleteThread(allocator, client, excluded_id);
+    if (!forkResponseMatches(excluded_json, source_thread_id, false, false, &.{}))
+        return LiveWitness.failed("paginated_fork_exclude_turns_hydrated", "excludeTurns fork returned hydrated turns instead of metadata only");
+
+    const turns_params = stringifyAnyAlloc(allocator, .{
+        .threadId = excluded_id,
+        .limit = @as(u32, 10),
+        .sortDirection = "asc",
+        .itemsView = "summary",
+    }) catch return LiveWitness.failed("paginated_fork_turns_list_encode_failed", "thread/turns/list parameters could not be encoded");
+    defer allocator.free(turns_params);
+    const turns_json = client.requestJson("thread/turns/list", turns_params) catch
+        return LiveWitness.failed("paginated_fork_turns_list_failed", "excludeTurns fork was not suitable for thread/turns/list");
+    defer allocator.free(turns_json);
+    if (!turnListMatches(turns_json, &.{ PaginatedForkFixture.first_turn_id, PaginatedForkFixture.second_turn_id }))
+        return LiveWitness.failed("paginated_fork_turns_list_prefix_failed", "thread/turns/list did not recover the exact forked prefix");
+
+    return LiveWitness.passed();
+}
+
+pub fn ephemeralForkProbe(allocator: std.mem.Allocator, client: *proxy.Client) LiveWitness {
+    const source_thread_id = PaginatedForkFixture.thread_id;
+    const missing_exclude = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.second_turn_id,
+        .ephemeral = true,
+    }) catch return LiveWitness.failed("ephemeral_fork_request_encode_failed", "ephemeral fork parameters could not be encoded");
+    defer allocator.free(missing_exclude);
+    if (!requestFailsWithMessage(
+        allocator,
+        client,
+        "thread/fork",
+        missing_exclude,
+        "ephemeral paginated thread/fork requires `excludeTurns: true`",
+    )) return LiveWitness.failed("ephemeral_paginated_exclude_turns_not_required", "ephemeral paginated fork did not require excludeTurns");
+
+    const deferred_ephemeral = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .ephemeral = true,
+        .excludeTurns = true,
+        .deferGoalContinuation = true,
+    }) catch return LiveWitness.failed("ephemeral_fork_request_encode_failed", "deferred ephemeral parameters could not be encoded");
+    defer allocator.free(deferred_ephemeral);
+    if (!requestFailsWithMessage(
+        allocator,
+        client,
+        "thread/fork",
+        deferred_ephemeral,
+        "`deferGoalContinuation` cannot be combined with `ephemeral`",
+    )) return LiveWitness.failed("ephemeral_goal_deferral_accepted", "ephemeral fork accepted incompatible deferred goal continuation");
+
+    const params = stringifyAnyAlloc(allocator, .{
+        .threadId = source_thread_id,
+        .lastTurnId = PaginatedForkFixture.second_turn_id,
+        .ephemeral = true,
+        .excludeTurns = true,
+    }) catch return LiveWitness.failed("ephemeral_fork_request_encode_failed", "ephemeral excludeTurns parameters could not be encoded");
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/fork", params) catch
+        return LiveWitness.failed("ephemeral_fork_failed", "thread/fork rejected a valid ephemeral paginated fork");
+    defer allocator.free(raw);
+    const fork_id = forkThreadIdAlloc(allocator, raw) catch
+        return LiveWitness.failed("ephemeral_fork_shape_failed", "ephemeral fork response did not contain a thread id");
+    defer allocator.free(fork_id);
+    if (!forkResponseMatches(raw, source_thread_id, true, true, &.{}))
+        return LiveWitness.failed("ephemeral_fork_identity_failed", "ephemeral fork was not explicitly pathless with an unhydrated turn array");
+
+    const list_json = client.requestJson("thread/list", "{\"limit\":100,\"useStateDbOnly\":false}") catch
+        return LiveWitness.failed("ephemeral_fork_list_failed", "thread/list could not establish ephemeral invisibility");
+    defer allocator.free(list_json);
+    if (!threadListContains(list_json, source_thread_id))
+        return LiveWitness.failed("ephemeral_fork_source_list_missing", "persistent source was absent from the thread/list invisibility control");
+    if (threadListContains(list_json, fork_id))
+        return LiveWitness.failed("ephemeral_fork_listed", "ephemeral fork appeared in ordinary thread/list");
+
+    return LiveWitness.passed();
+}
+
+fn requestFailsWithMessage(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    method: []const u8,
+    params: []const u8,
+    expected_message: []const u8,
+) bool {
+    const result = client.requestJson(method, params);
+    if (result) |owned| {
+        allocator.free(owned);
+        return false;
+    } else |err| {
+        if (err != error.RequestFailed) return false;
+    }
+    const raw = client.lastError() orelse return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    return objectStringEquals(object, "message", expected_message);
+}
+
+fn forkThreadIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const thread = try responseThreadObject(allocator, raw);
+    defer thread.parsed.deinit();
+    const id_value = thread.object.get("id") orelse return error.InvalidResponse;
+    const id = switch (id_value) {
+        .string => |value| value,
+        else => return error.InvalidResponse,
+    };
+    return allocator.dupe(u8, id);
+}
+
+const ParsedThreadObject = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    object: std.json.ObjectMap,
+};
+
+fn responseThreadObject(allocator: std.mem.Allocator, raw: []const u8) !ParsedThreadObject {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    errdefer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const thread_value = root.get("thread") orelse return error.InvalidResponse;
+    const object = switch (thread_value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    return .{ .parsed = parsed, .object = object };
+}
+
+fn forkResponseMatches(
+    raw: []const u8,
+    source_thread_id: []const u8,
+    ephemeral: bool,
+    path_must_be_null: bool,
+    expected_turn_ids: []const []const u8,
+) bool {
+    var parsed = responseThreadObject(std.heap.page_allocator, raw) catch return false;
+    defer parsed.parsed.deinit();
+    if (!objectStringEquals(parsed.object, "forkedFromId", source_thread_id)) return false;
+    const ephemeral_value = parsed.object.get("ephemeral") orelse return false;
+    if (ephemeral_value != .bool or ephemeral_value.bool != ephemeral) return false;
+    const path_value = parsed.object.get("path") orelse return false;
+    if (path_must_be_null) {
+        if (path_value != .null) return false;
+    } else if (path_value != .string) return false;
+    const turns_value = parsed.object.get("turns") orelse return false;
+    const turns = switch (turns_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    return turnObjectsMatch(turns.items, expected_turn_ids);
+}
+
+fn turnListMatches(raw: []const u8, expected_turn_ids: []const []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const data_value = root.get("data") orelse return false;
+    const data = switch (data_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    return turnObjectsMatch(data.items, expected_turn_ids);
+}
+
+fn turnObjectsMatch(items: []const std.json.Value, expected_turn_ids: []const []const u8) bool {
+    if (items.len != expected_turn_ids.len) return false;
+    for (items, expected_turn_ids) |item, expected_id| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => return false,
+        };
+        if (!objectStringEquals(object, "id", expected_id)) return false;
+        if (!objectStringEquals(object, "status", "completed")) return false;
+    }
+    return true;
+}
+
+fn threadListContains(raw: []const u8, thread_id: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const data_value = root.get("data") orelse return false;
+    const data = switch (data_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    for (data.items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (objectStringEquals(object, "id", thread_id)) return true;
+    }
+    return false;
+}
+
 fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -232,6 +651,58 @@ fn threadIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         else => return error.InvalidResponse,
     };
     return allocator.dupe(u8, id);
+}
+
+fn structuredReviewTurnIdAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    expected_thread_id: []const u8,
+    expected_instructions: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (!objectStringEquals(root, "reviewThreadId", expected_thread_id)) return error.InvalidResponse;
+    const turn_value = root.get("turn") orelse return error.InvalidResponse;
+    const turn = switch (turn_value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (!objectStringEquals(turn, "status", "inProgress")) return error.InvalidResponse;
+    const turn_id_value = turn.get("id") orelse return error.InvalidResponse;
+    const turn_id = switch (turn_id_value) {
+        .string => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (turn_id.len == 0) return error.InvalidResponse;
+    const items_value = turn.get("items") orelse return error.InvalidResponse;
+    const items = switch (items_value) {
+        .array => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (items.items.len != 1) return error.InvalidResponse;
+    const item = switch (items.items[0]) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (!objectStringEquals(item, "type", "userMessage") or !objectStringEquals(item, "id", turn_id))
+        return error.InvalidResponse;
+    const content_value = item.get("content") orelse return error.InvalidResponse;
+    const content = switch (content_value) {
+        .array => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (content.items.len != 1) return error.InvalidResponse;
+    const text_item = switch (content.items[0]) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (!objectStringEquals(text_item, "type", "text") or !objectStringEquals(text_item, "text", expected_instructions))
+        return error.InvalidResponse;
+    return allocator.dupe(u8, turn_id);
 }
 
 fn responseThreadBool(raw: []const u8, field: []const u8, expected: bool) bool {
@@ -273,6 +744,85 @@ fn responseHasString(raw: []const u8, field: []const u8) bool {
     };
     const value = root.get(field) orelse return false;
     return value == .string;
+}
+
+fn responseStringEquals(raw: []const u8, field: []const u8, expected: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    return objectStringEquals(root, field, expected);
+}
+
+fn skillsListContainsExactFixture(raw: []const u8, cwd: []const u8, skill_manifest_path: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const data_value = root.get("data") orelse return false;
+    const data = switch (data_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    var matches: usize = 0;
+    for (data.items) |entry_value| {
+        const entry = switch (entry_value) {
+            .object => |value| value,
+            else => return false,
+        };
+        if (!objectStringEquals(entry, "cwd", cwd)) continue;
+        const errors_value = entry.get("errors") orelse return false;
+        const errors = switch (errors_value) {
+            .array => |value| value,
+            else => return false,
+        };
+        if (errors.items.len != 0) return false;
+        const skills_value = entry.get("skills") orelse return false;
+        const skills = switch (skills_value) {
+            .array => |value| value,
+            else => return false,
+        };
+        for (skills.items) |skill_value| {
+            const skill = switch (skill_value) {
+                .object => |value| value,
+                else => return false,
+            };
+            if (!objectStringEquals(skill, "name", ExecutorSkillFixture.name)) continue;
+            matches += 1;
+            if (!objectStringEquals(skill, "description", ExecutorSkillFixture.description) or
+                !objectStringEquals(skill, "path", skill_manifest_path) or
+                !objectStringEquals(skill, "scope", "user")) return false;
+            const enabled_value = skill.get("enabled") orelse return false;
+            if (enabled_value != .bool or !enabled_value.bool) return false;
+        }
+    }
+    return matches == 1;
+}
+
+fn selectedCapabilityRootAccepted(raw: []const u8, expected_cwd: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const thread_value = root.get("thread") orelse return false;
+    const thread = switch (thread_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const id_value = thread.get("id") orelse return false;
+    if (id_value != .string or id_value.string.len == 0) return false;
+    const ephemeral_value = thread.get("ephemeral") orelse return false;
+    if (ephemeral_value != .bool or !ephemeral_value.bool) return false;
+    const path_value = thread.get("path") orelse return false;
+    if (path_value != .null) return false;
+    return objectStringEquals(thread, "cwd", expected_cwd) and
+        objectStringEquals(root, "cwd", expected_cwd);
 }
 
 fn stringFieldAlloc(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]u8 {
@@ -405,6 +955,13 @@ fn deleteThread(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: 
     allocator.free(response);
 }
 
+fn interruptTurn(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: []const u8, turn_id: []const u8) void {
+    const params = stringifyAnyAlloc(allocator, .{ .threadId = thread_id, .turnId = turn_id }) catch return;
+    defer allocator.free(params);
+    const response = client.requestJson("turn/interrupt", params) catch return;
+    allocator.free(response);
+}
+
 fn row(
     id: []const u8,
     requirement: contract.ProbeRequirement,
@@ -480,6 +1037,24 @@ test "live witnesses replace only their exact fail-closed rows" {
     try std.testing.expect(!report.compatible);
 }
 
+test "complete live witness set closes the full profile" {
+    const report = buildReport(.full, .{ .transport = .stdio }, .{
+        .lifecycle_passed = true,
+        .handler_coverage_passed = true,
+        .retry_passed = true,
+        .thread_pinning = LiveWitness.passed(),
+        .paginated_fork = LiveWitness.passed(),
+        .ephemeral_fork = LiveWitness.passed(),
+        .paginated_session_inquiry = LiveWitness.passed(),
+        .executor_skill_resources = LiveWitness.passed(),
+        .structured_review = LiveWitness.passed(),
+        .external_import_history = LiveWitness.passed(),
+    });
+    try std.testing.expect(report.compatible);
+    for (report.rows) |probe_row| if (std.mem.eql(u8, probe_row.requirement, "required"))
+        try std.testing.expectEqualStrings("passed", probe_row.status);
+}
+
 test "probe response helpers require exact fields and types" {
     const allocator = std.testing.allocator;
     const id = try threadIdAlloc(allocator, "{\"thread\":{\"id\":\"thread-1\",\"isPinned\":true}}");
@@ -537,4 +1112,62 @@ test "pin list filter selects the isolated CLI fixture within a bounded page" {
     const source_kinds = root.get("sourceKinds").?.array;
     try std.testing.expectEqual(@as(usize, 1), source_kinds.items.len);
     try std.testing.expectEqualStrings("cli", source_kinds.items[0].string);
+}
+
+test "fork response helpers require exact lineage path and completed prefix" {
+    const persistent =
+        "{\"thread\":{\"id\":\"fork-1\",\"forkedFromId\":\"source-1\",\"ephemeral\":false,\"path\":\"/tmp/fork.jsonl\",\"turns\":[{\"id\":\"turn-1\",\"status\":\"completed\"},{\"id\":\"turn-2\",\"status\":\"completed\"}]}}";
+    try std.testing.expect(forkResponseMatches(persistent, "source-1", false, false, &.{ "turn-1", "turn-2" }));
+    try std.testing.expect(!forkResponseMatches(persistent, "source-1", false, false, &.{"turn-1"}));
+    try std.testing.expect(!forkResponseMatches(persistent, "source-2", false, false, &.{ "turn-1", "turn-2" }));
+    try std.testing.expect(forkResponseMatches(
+        "{\"thread\":{\"id\":\"fork-e\",\"forkedFromId\":\"source-1\",\"ephemeral\":true,\"path\":null,\"turns\":[]}}",
+        "source-1",
+        true,
+        true,
+        &.{},
+    ));
+}
+
+test "turn and thread list helpers reject partial or listed ephemeral witnesses" {
+    try std.testing.expect(turnListMatches(
+        "{\"data\":[{\"id\":\"turn-1\",\"status\":\"completed\"},{\"id\":\"turn-2\",\"status\":\"completed\"}]}",
+        &.{ "turn-1", "turn-2" },
+    ));
+    try std.testing.expect(!turnListMatches(
+        "{\"data\":[{\"id\":\"turn-1\",\"status\":\"inProgress\"}]}",
+        &.{"turn-1"},
+    ));
+    const listed = "{\"data\":[{\"id\":\"source-1\"},{\"id\":\"fork-e\"}]}";
+    try std.testing.expect(threadListContains(listed, "source-1"));
+    try std.testing.expect(threadListContains(listed, "fork-e"));
+    try std.testing.expect(!threadListContains(listed, "absent"));
+}
+
+test "structured review response requires exact inline identity and echoed item" {
+    const allocator = std.testing.allocator;
+    const valid =
+        "{\"reviewThreadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"inProgress\",\"items\":[{\"type\":\"userMessage\",\"id\":\"turn-1\",\"content\":[{\"type\":\"text\",\"text\":\"probe\"}]}]}}";
+    const turn_id = try structuredReviewTurnIdAlloc(allocator, valid, "thread-1", "probe");
+    defer allocator.free(turn_id);
+    try std.testing.expectEqualStrings("turn-1", turn_id);
+    try std.testing.expectError(
+        error.InvalidResponse,
+        structuredReviewTurnIdAlloc(allocator, valid, "thread-2", "probe"),
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        structuredReviewTurnIdAlloc(allocator, valid, "thread-1", "different"),
+    );
+}
+
+test "executor skill and selected root helpers preserve exact native identities" {
+    const list =
+        "{\"data\":[{\"cwd\":\"/probe\",\"skills\":[{\"name\":\"cas-executor-probe\",\"description\":\"Deterministic Codex 0.146 executor skill/resource probe.\",\"path\":\"/root/cas-executor-probe/SKILL.md\",\"scope\":\"user\",\"enabled\":true,\"future\":7}],\"errors\":[]}],\"future\":true}";
+    try std.testing.expect(skillsListContainsExactFixture(list, "/probe", "/root/cas-executor-probe/SKILL.md"));
+    try std.testing.expect(!skillsListContainsExactFixture(list, "/probe", "/other/SKILL.md"));
+    const selected =
+        "{\"thread\":{\"id\":\"thread-1\",\"ephemeral\":true,\"path\":null,\"cwd\":\"/root\",\"future\":{}},\"cwd\":\"/root\"}";
+    try std.testing.expect(selectedCapabilityRootAccepted(selected, "/root"));
+    try std.testing.expect(!selectedCapabilityRootAccepted(selected, "/other"));
 }

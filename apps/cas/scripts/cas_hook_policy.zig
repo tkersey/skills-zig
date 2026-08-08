@@ -175,8 +175,9 @@ pub fn appendAppServerArgs(
     argv: *std.ArrayList([]const u8),
     policy: HookPolicy,
     listen_url: ?[]const u8,
+    code_mode_host: ?*const app_server_launch.CodeModeHost,
 ) !void {
-    try app_server_launch.appendAppServerArgs(allocator, argv, policy == .off, listen_url, null);
+    try app_server_launch.appendAppServerArgs(allocator, argv, policy == .off, listen_url, code_mode_host);
 }
 
 pub fn ensureLaunchSupportsPolicy(
@@ -240,12 +241,16 @@ test "HookPolicy parses accepted values" {
 test "appendAppServerArgs disables hooks only for off policy" {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(std.testing.allocator);
-    try appendAppServerArgs(std.testing.allocator, &argv, .off, "ws://127.0.0.1:1");
-    try std.testing.expectEqual(@as(usize, 5), argv.items.len);
+    var code_mode_host = try app_server_launch.CodeModeHost.init(std.testing.allocator, "wss://example.com:443/code?token=secret");
+    defer code_mode_host.deinit();
+    try appendAppServerArgs(std.testing.allocator, &argv, .off, "ws://127.0.0.1:1", &code_mode_host);
+    try std.testing.expectEqual(@as(usize, 7), argv.items.len);
     try std.testing.expectEqualStrings("app-server", argv.items[0]);
     try std.testing.expectEqualStrings("--disable", argv.items[1]);
     try std.testing.expectEqualStrings("codex_hooks", argv.items[2]);
     try std.testing.expectEqualStrings("--listen", argv.items[3]);
+    try std.testing.expectEqualStrings("--code-mode-host", argv.items[5]);
+    try std.testing.expectEqualStrings(code_mode_host.raw, argv.items[6]);
 }
 
 test "HookAccumulator summarizes failure precedence" {

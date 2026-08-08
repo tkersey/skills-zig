@@ -462,6 +462,27 @@ pub fn startOwnerLivedLoopbackServer(
     );
 }
 
+pub fn startOwnerLivedLoopbackServerWithCodeModeHost(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    receipt_dir: []const u8,
+    codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    code_mode_host: *const launch.CodeModeHost,
+    io: std.Io,
+) !ManagedServer {
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        receipt_dir,
+        codex_path,
+        hook_policy,
+        true,
+        code_mode_host,
+        io,
+    );
+}
+
 fn startManagedLoopbackServerWithOwnership(
     allocator: std.mem.Allocator,
     cwd: []const u8,
