@@ -1964,3 +1964,12 @@ test "parseSchedulerCommand recognizes exported scheduler actions" {
     }
     try std.testing.expectEqual(SchedulerCommand.unknown, parseSchedulerCommand("bogus"));
 }
+
+test "doctor CLI keeps scheduler identity environment-only" {
+    const json = try parseDoctorArgs(&.{"--json"});
+    try std.testing.expect(json.json);
+    try std.testing.expectError(
+        error.UserInput,
+        parseDoctorArgs(&.{ "--label", "com.example.scheduler" }),
+    );
+}

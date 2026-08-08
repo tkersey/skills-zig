@@ -398,6 +398,13 @@ pub const DoctorDiagnostics = struct {
         for (self.rows.items) |row| if (std.mem.eql(u8, row.severity, "error")) return true;
         return false;
     }
+
+    fn hasErrorSince(self: *const DoctorDiagnostics, start: usize) bool {
+        for (self.rows.items[start..]) |row| {
+            if (std.mem.eql(u8, row.severity, "error")) return true;
+        }
+        return false;
+    }
 };
 
 pub fn inspectMutationWritability(
@@ -1126,7 +1133,6 @@ fn inspectSchedulerStatus(
 
 fn inspectDoctorRuntime(
     allocator: std.mem.Allocator,
-    io: std.Io,
     diagnostics: *DoctorDiagnostics,
 ) !?[]u8 {
     const codex_path = try resolveExecutable(
@@ -1143,14 +1149,38 @@ fn inspectDoctorRuntime(
         );
     }
 
-    var scheduler_status = try scheduler.readSchedulerStatus(
-        allocator,
-        io,
-        DefaultLaunchdLabel,
-    );
-    defer scheduler_status.deinit(allocator);
-    try inspectSchedulerStatus(allocator, scheduler_status, diagnostics);
     return codex_path;
+}
+
+fn inspectDoctorScheduler(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *DoctorDiagnostics,
+) !?scheduler.SchedulerStatus {
+    const raw_label = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    const label = scheduler.validateSchedulerLabel(raw_label) catch |err| {
+        try diagnostics.append(
+            allocator,
+            "scheduler-status",
+            "error",
+            "scheduler label is invalid: {s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    var status = scheduler.readSchedulerStatus(allocator, io, label) catch |err| {
+        try diagnostics.append(
+            allocator,
+            "scheduler-status",
+            "error",
+            "scheduler state is unavailable: {s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    errdefer status.deinit(allocator);
+    try inspectSchedulerStatus(allocator, status, diagnostics);
+    return status;
 }
 
 pub fn cmdDoctor(
@@ -1162,6 +1192,9 @@ pub fn cmdDoctor(
     var diagnostics: DoctorDiagnostics = .{};
     defer diagnostics.deinit(allocator);
 
+    var scheduler_status = try inspectDoctorScheduler(allocator, io, &diagnostics);
+    defer if (scheduler_status) |*status| status.deinit(allocator);
+
     var db = Db.openReadOnly(allocator, db_path) catch |err| {
         try diagnostics.append(
             allocator,
@@ -1170,11 +1203,19 @@ pub fn cmdDoctor(
             "database is not safely readable: {s}",
             .{@errorName(err)},
         );
-        return renderDoctor(allocator, io, db_path, null, null, &diagnostics, args.json);
+        return renderDoctor(
+            db_path,
+            null,
+            null,
+            if (scheduler_status) |*status| status else null,
+            &diagnostics,
+            args.json,
+        );
     };
     defer db.close();
+    const schema_diagnostics_start = diagnostics.rows.items.len;
     try inspectStoreSchema(allocator, &db, &diagnostics);
-    const schema_compatible = !diagnostics.hasError();
+    const schema_compatible = !diagnostics.hasErrorSince(schema_diagnostics_start);
 
     const automation_root = files.defaultAutomationsDir(allocator) catch |err| {
         try diagnostics.append(
@@ -1184,7 +1225,14 @@ pub fn cmdDoctor(
             "automation root is unavailable: {s}",
             .{@errorName(err)},
         );
-        return renderDoctor(allocator, io, db_path, null, null, &diagnostics, args.json);
+        return renderDoctor(
+            db_path,
+            null,
+            null,
+            if (scheduler_status) |*status| status else null,
+            &diagnostics,
+            args.json,
+        );
     };
     defer allocator.free(automation_root);
 
@@ -1205,35 +1253,27 @@ pub fn cmdDoctor(
         );
     }
 
-    const codex_path = try inspectDoctorRuntime(allocator, io, &diagnostics);
+    const codex_path = try inspectDoctorRuntime(allocator, &diagnostics);
     defer if (codex_path) |value| allocator.free(value);
 
     try renderDoctor(
-        allocator,
-        io,
         db_path,
         automation_root,
         codex_path,
+        if (scheduler_status) |*status| status else null,
         &diagnostics,
         args.json,
     );
 }
 
 pub fn renderDoctor(
-    allocator: std.mem.Allocator,
-    io: std.Io,
     db_path: []const u8,
     automation_root: ?[]const u8,
     codex_path: ?[]const u8,
+    scheduler_status: ?*const scheduler.SchedulerStatus,
     diagnostics: *const DoctorDiagnostics,
     as_json: bool,
 ) !void {
-    var scheduler_status = try scheduler.readSchedulerStatus(
-        allocator,
-        io,
-        DefaultLaunchdLabel,
-    );
-    defer scheduler_status.deinit(allocator);
     const safe = !diagnostics.hasError();
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1248,6 +1288,26 @@ pub fn renderDoctor(
         }
         return;
     }
+    try writeDoctorJson(
+        stdout,
+        db_path,
+        automation_root,
+        codex_path,
+        scheduler_status,
+        diagnostics,
+    );
+}
+
+fn writeDoctorJson(
+    writer: anytype,
+    db_path: []const u8,
+    automation_root: ?[]const u8,
+    codex_path: ?[]const u8,
+    scheduler_status: ?*const scheduler.SchedulerStatus,
+    diagnostics: *const DoctorDiagnostics,
+) !void {
+    const safe = !diagnostics.hasError();
+    var stdout = writer;
     try stdout.writeAll("{\n  \"schema\": \"cas-automation-doctor/v1\",\n  \"status\": \"");
     try stdout.writeAll(if (safe) "compatible" else "incompatible");
     try stdout.writeAll("\",\n  \"database\": ");
@@ -1267,7 +1327,11 @@ pub fn renderDoctor(
     try stdout.writeAll(",\n  \"safeToMutate\": ");
     try stdout.writeAll(if (safe) "true" else "false");
     try stdout.writeAll(",\n  \"scheduler\": ");
-    try scheduler.writeSchedulerStatusJson(stdout, scheduler_status);
+    if (scheduler_status) |status| {
+        try scheduler.writeSchedulerStatusJson(stdout, status.*);
+    } else {
+        try stdout.writeAll("null");
+    }
     try stdout.writeAll(",\n  \"diagnostics\": [");
     for (diagnostics.rows.items, 0..) |row, index| {
         if (index != 0) try stdout.writeByte(',');
@@ -1784,4 +1848,89 @@ pub fn createTestSchema(allocator: std.mem.Allocator, db: *Db) !void {
 fn envString(key: [:0]const u8) ?[]const u8 {
     const value = std.c.getenv(key) orelse return null;
     return std.mem.span(value);
+}
+
+test "doctor uses one custom-label scheduler snapshot for safety and JSON" {
+    const allocator = std.testing.allocator;
+    var status: scheduler.SchedulerStatus = .{
+        .installed = true,
+        .loaded = false,
+        .label = try allocator.dupe(u8, "com.example.custom-cron"),
+        .plist_path = try allocator.dupe(u8, "/tmp/com.example.custom-cron.plist"),
+        .surface = "standalone-cron",
+        .migration_required = true,
+    };
+    defer status.deinit(allocator);
+    try status.program_arguments.append(
+        allocator,
+        try allocator.dupe(u8, "/opt/homebrew/bin/cron"),
+    );
+    try status.program_arguments.append(allocator, try allocator.dupe(u8, "run-due"));
+
+    var diagnostics: DoctorDiagnostics = .{};
+    defer diagnostics.deinit(allocator);
+    try inspectSchedulerStatus(allocator, status, &diagnostics);
+
+    var encoded = std.Io.Writer.Allocating.init(allocator);
+    defer encoded.deinit();
+    try writeDoctorJson(
+        &encoded.writer,
+        "/tmp/codex-dev.db",
+        "/tmp/automations",
+        "/opt/homebrew/bin/codex",
+        &status,
+        &diagnostics,
+    );
+    const report = try encoded.toOwnedSlice();
+    defer allocator.free(report);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, report, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(!parsed.value.object.get("safeToMutate").?.bool);
+    const scheduler_json = parsed.value.object.get("scheduler").?.object;
+    try std.testing.expectEqualStrings(
+        "com.example.custom-cron",
+        scheduler_json.get("label").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "standalone-cron",
+        scheduler_json.get("surface").?.string,
+    );
+    const diagnostic = parsed.value.object.get("diagnostics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("scheduler-migration", diagnostic.get("code").?.string);
+
+    var unavailable: DoctorDiagnostics = .{};
+    defer unavailable.deinit(allocator);
+    try unavailable.append(
+        allocator,
+        "scheduler-status",
+        "error",
+        "scheduler state is unavailable: {s}",
+        .{"AccessDenied"},
+    );
+    var unavailable_encoded = std.Io.Writer.Allocating.init(allocator);
+    defer unavailable_encoded.deinit();
+    try writeDoctorJson(
+        &unavailable_encoded.writer,
+        "/tmp/codex-dev.db",
+        "/tmp/automations",
+        "/opt/homebrew/bin/codex",
+        null,
+        &unavailable,
+    );
+    const unavailable_report = try unavailable_encoded.toOwnedSlice();
+    defer allocator.free(unavailable_report);
+    var unavailable_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        unavailable_report,
+        .{},
+    );
+    defer unavailable_parsed.deinit();
+    try std.testing.expect(!unavailable_parsed.value.object.get("safeToMutate").?.bool);
+    try std.testing.expect(unavailable_parsed.value.object.get("scheduler").? == .null);
+    try std.testing.expectEqualStrings(
+        "scheduler-status",
+        unavailable_parsed.value.object.get("diagnostics").?.array.items[0].object.get("code").?.string,
+    );
 }

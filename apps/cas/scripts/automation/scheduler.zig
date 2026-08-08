@@ -492,24 +492,14 @@ pub fn readSchedulerStatus(
     io: std.Io,
     label: []const u8,
 ) !SchedulerStatus {
-    const home = envString("HOME") orelse "";
-    const plist_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/Library/LaunchAgents/{s}.plist",
-        .{ home, label },
-    );
+    const plist_path = try schedulerPlistPath(allocator, envString("HOME"), label);
     errdefer allocator.free(plist_path);
     var arguments: std.ArrayList([]u8) = .empty;
     errdefer {
         for (arguments.items) |arg| allocator.free(arg);
         arguments.deinit(allocator);
     }
-    const plist = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        plist_path,
-        allocator,
-        .limited(2 * 1024 * 1024),
-    ) catch null;
+    const plist = try readSchedulerPlist(allocator, plist_path);
     defer if (plist) |bytes| allocator.free(bytes);
     if (plist) |bytes| try parsePlistProgramArguments(allocator, bytes, &arguments);
 
@@ -541,6 +531,31 @@ pub fn readSchedulerStatus(
         .program_arguments = arguments,
         .surface = surface,
         .migration_required = std.mem.eql(u8, surface, "standalone-cron"),
+    };
+}
+
+fn schedulerPlistPath(
+    allocator: std.mem.Allocator,
+    home: ?[]const u8,
+    label: []const u8,
+) ![]u8 {
+    const value = home orelse return userErrorFmt("HOME is not set", .{});
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/Library/LaunchAgents/{s}.plist",
+        .{ value, label },
+    );
+}
+
+fn readSchedulerPlist(allocator: std.mem.Allocator, plist_path: []const u8) !?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        plist_path,
+        allocator,
+        .limited(2 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
     };
 }
 
@@ -586,4 +601,45 @@ pub fn runCommandCapture(
 fn envString(key: [:0]const u8) ?[]const u8 {
     const value = std.c.getenv(key) orelse return null;
     return std.mem.span(value);
+}
+
+fn expectSchedulerPlistReadFailure(
+    allocator: std.mem.Allocator,
+    plist_path: []const u8,
+) !void {
+    const unexpected = readSchedulerPlist(allocator, plist_path) catch |err| {
+        try std.testing.expect(err != error.FileNotFound);
+        return;
+    };
+    if (unexpected) |bytes| allocator.free(bytes);
+    return error.TestExpectedError;
+}
+
+test "scheduler plist inspection distinguishes absence from read failures" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try std.testing.expectError(
+        error.UserInput,
+        schedulerPlistPath(allocator, null, "com.example.scheduler"),
+    );
+
+    const missing_path = try std.fs.path.join(allocator, &.{ root, "missing.plist" });
+    defer allocator.free(missing_path);
+    const missing = try readSchedulerPlist(allocator, missing_path);
+    try std.testing.expect(missing == null);
+
+    try expectSchedulerPlistReadFailure(allocator, root);
+
+    const oversized_path = try std.fs.path.join(allocator, &.{ root, "oversized.plist" });
+    defer allocator.free(oversized_path);
+    const oversized = try allocator.alloc(u8, 2 * 1024 * 1024 + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "oversized.plist", .data = oversized });
+    try expectSchedulerPlistReadFailure(allocator, oversized_path);
 }
