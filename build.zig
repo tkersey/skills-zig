@@ -1,19 +1,11 @@
 const std = @import("std");
+const cas_build = @import("apps/cas/build_support.zig");
 pub fn build(b: *std.Build) void {
     enforceRepoLocalInstallOnly(b);
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const cas_sqlite_amalgamation = b.option(
-        []const u8,
-        "cas-sqlite-amalgamation",
-        "Compile CAS Automation with this pinned sqlite3.c instead of a system library",
-    );
-    const cas_static = b.option(
-        bool,
-        "cas-static",
-        "Statically link CAS executables for hermetic release archives",
-    ) orelse false;
+    const cas_release = cas_build.Options.init(b);
 
     const core_json = b.createModule(.{
         .root_source_file = b.path("libs/core/src/json_helpers.zig"),
@@ -485,40 +477,20 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
-    cas_automation.root_module.linkSystemLibrary("c", .{});
-    if (cas_sqlite_amalgamation) |sqlite3_c| {
-        cas_automation.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = sqlite3_c },
-            .flags = &.{
-                "-std=c99",
-                "-DSQLITE_THREADSAFE=1",
-                "-DSQLITE_OMIT_LOAD_EXTENSION=1",
-            },
-        });
-        if (target.result.os.tag == .linux) {
-            cas_automation.root_module.linkSystemLibrary("m", .{});
-            cas_automation.root_module.linkSystemLibrary("pthread", .{});
-        }
-    } else {
-        cas_automation.root_module.linkSystemLibrary("sqlite3", .{});
-    }
-    if (cas_static) {
-        for ([_]*std.Build.Step.Compile{
-            cas,
-            cas_account,
-            cas_app_server_preflight,
-            cas_automation,
-            cas_smoke_check,
-            cas_instance_runner,
-            cas_review_session,
-            cas_session_inquiry,
-            cas_conformance_suite,
-            cas_goal,
-            cas_budget_perf,
-        }) |executable| {
-            executable.linkage = .static;
-        }
-    }
+    cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
+    cas_release.configureExecutables(&.{
+        cas,
+        cas_account,
+        cas_app_server_preflight,
+        cas_automation,
+        cas_smoke_check,
+        cas_instance_runner,
+        cas_review_session,
+        cas_session_inquiry,
+        cas_conformance_suite,
+        cas_goal,
+        cas_budget_perf,
+    });
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
@@ -760,7 +732,7 @@ pub fn build(b: *std.Build) void {
         "Run cas automation tests",
         .{
             .link_libc = true,
-            .sqlite = cas_sqlite_amalgamation == null,
+            .sqlite = cas_release.usesSystemSqlite(),
         },
     );
     test_cas.dependOn(&run_cas_automation_tests.step);
