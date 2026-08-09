@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
-            zig_target: x86_64-linux
+            zig_target: x86_64-linux-gnu.2.39
             runs_on: ubuntu-latest
           - target: darwin-arm64
             zig_target: aarch64-macos
@@ -48,8 +48,34 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Configure SQLite link search
+        shell: bash
+        run: |
+          set -euo pipefail
+          sqlite_prefix="${RUNNER_TEMP}/cas-sqlite-prefix"
+          mkdir -p "${sqlite_prefix}/lib"
+          case "${RUNNER_OS}" in
+            Linux)
+              sqlite_lib="$(pkg-config --variable=libdir sqlite3)/libsqlite3.so"
+              ;;
+            macOS)
+              sqlite_lib="$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libsqlite3.tbd"
+              ;;
+            *)
+              echo "Unsupported runner OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          test -f "${sqlite_lib}"
+          ln -s "${sqlite_lib}" "${sqlite_prefix}/lib/$(basename "${sqlite_lib}")"
+          echo "CAS_SQLITE_SEARCH_PREFIX=${sqlite_prefix}" >> "${GITHUB_ENV}"
       - name: Build cas binaries
-        run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+        run: >-
+          zig build build-cas
+          -Dtarget=${{ matrix.zig_target }}
+          -Dcpu=baseline
+          -Doptimize=ReleaseFast
+          --search-prefix "${CAS_SQLITE_SEARCH_PREFIX}"
       - name: Verify removed CAS product stays absent
         shell: bash
         run: |
