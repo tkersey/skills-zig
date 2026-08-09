@@ -233,13 +233,15 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x86_64
-            zig_target: x86_64-linux-gnu.2.39
+            zig_target: x86_64-linux-musl
+            cas_static: true
             runner_arch: X64
             codex_asset: codex-x86_64-unknown-linux-musl.tar.gz
             codex_archive_sha256: 5ba3b9405543953081f661d0854d266f76e2abbe51d41349355a36de7673776a
           - os: macos-14
             platform: macos-aarch64
             zig_target: aarch64-macos
+            cas_static: false
             runner_arch: ARM64
             codex_asset: codex-aarch64-apple-darwin.tar.gz
             codex_archive_sha256: 2750132d300e64f1dbffb95e3d913fd9c9dc7812bc8e1bce5c61357248b7929e
@@ -336,34 +338,59 @@ jobs:
 
           echo "CODEX_BIN=${bin_dir}/codex" >> "${GITHUB_ENV}"
           echo "${bin_dir}" >> "${GITHUB_PATH}"
-      - name: Configure SQLite link search
+      - name: Fetch pinned SQLite amalgamation
         shell: bash
         run: |
           set -euo pipefail
-          sqlite_prefix="${RUNNER_TEMP}/cas-sqlite-prefix"
-          mkdir -p "${sqlite_prefix}/lib"
-          case "${RUNNER_OS}" in
-            Linux)
-              sqlite_lib="$(pkg-config --variable=libdir sqlite3)/libsqlite3.so"
-              ;;
-            macOS)
-              sqlite_lib="$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libsqlite3.tbd"
-              ;;
-            *)
-              echo "Unsupported runner OS: ${RUNNER_OS}" >&2
-              exit 1
-              ;;
-          esac
-          test -f "${sqlite_lib}"
-          ln -s "${sqlite_lib}" "${sqlite_prefix}/lib/$(basename "${sqlite_lib}")"
-          echo "CAS_SQLITE_SEARCH_PREFIX=${sqlite_prefix}" >> "${GITHUB_ENV}"
+          sqlite_version=3450100
+          sqlite_sha256=5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
+          sqlite_archive="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}.zip"
+          sqlite_root="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}"
+          curl --fail --location --retry 3 \
+            --output "${sqlite_archive}" \
+            "https://www.sqlite.org/2024/sqlite-amalgamation-${sqlite_version}.zip"
+          actual_sha256="$(shasum -a 256 "${sqlite_archive}" | awk '{print $1}')"
+          if [[ "${actual_sha256}" != "${sqlite_sha256}" ]]; then
+            echo "SQLite archive digest mismatch: ${actual_sha256}" >&2
+            exit 1
+          fi
+          unzip -q "${sqlite_archive}" -d "${RUNNER_TEMP}"
+          test -f "${sqlite_root}/sqlite3.c"
+          echo "CAS_SQLITE_AMALGAMATION=${sqlite_root}/sqlite3.c" >> "${GITHUB_ENV}"
       - name: Build cas binaries
         run: >-
           zig build build-cas
           -Dtarget=${{ matrix.zig_target }}
           -Dcpu=baseline
           -Doptimize=ReleaseFast
-          --search-prefix "${CAS_SQLITE_SEARCH_PREFIX}"
+          -Dcas-static=${{ matrix.cas_static }}
+          -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
+      - name: Verify pinned SQLite release boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              for binary in \
+                cas cas_account cas_app_server_preflight cas_automation \
+                cas_smoke_check cas_instance_runner cas_review_session \
+                cas_session_inquiry cas_conformance_suite cas_goal \
+                cas-perf-budget-governor; do
+                if objdump -p "zig-out/bin/${binary}" | grep -Fq NEEDED; then
+                  echo "CAS release binary is dynamically linked: ${binary}" >&2
+                  exit 1
+                fi
+              done
+              ;;
+            macOS)
+              if otool -L zig-out/bin/cas_automation | grep -Fq libsqlite3; then
+                echo "CAS Automation unexpectedly depends on system SQLite" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          apps/cas/testdata/automation/cron-0.2.13/verify.sh \
+            ./zig-out/bin/cas automation
       - name: Verify exact Codex 0.146.0 app-server contract
         run: .github/scripts/test_cas_app_server_preflight_0146.sh "${CODEX_BIN}"
       - name: Verify packaged Linux CAS dispatcher layout
