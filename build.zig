@@ -153,7 +153,6 @@ pub fn build(b: *std.Build) void {
     });
     const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
-    const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
     const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
@@ -224,6 +223,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = lift_meta },
         },
     });
+    const cas_proxy_client_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+        },
+    });
     const cas_smoke_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_smoke_check.zig"),
         .target = target,
@@ -256,6 +263,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
+    const cas_session_inquiry_anchor_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_session_inquiry_anchor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const cas_session_inquiry_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_session_inquiry.zig"),
         .target = target,
@@ -268,6 +280,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
+            .{
+                .name = "cas_session_inquiry_anchor",
+                .module = cas_session_inquiry_anchor_root,
+            },
         },
     });
     const cas_conformance_root = b.createModule(.{
@@ -278,6 +294,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
     });
     const cas_goal_root = b.createModule(.{
@@ -301,12 +318,56 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
-    const cas_proxy_client_root = b.createModule(.{
-        .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
+    const cas_transport_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_transport_tests.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
+        },
+    });
+    const cas_app_server_contract_data = b.addOptions();
+    cas_app_server_contract_data.addOption(
+        []const u8,
+        "json",
+        @embedFile("apps/cas/contracts/codex-app-server-0.146.0.json"),
+    );
+    const cas_app_server_contract_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_app_server_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{
+                .name = "cas_app_server_contract_data",
+                .module = cas_app_server_contract_data.createModule(),
+            },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
+        },
+    });
+    const cas_app_server_probes_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_app_server_probes.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "cas_app_server_contract", .module = cas_app_server_contract_root },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
+            .{
+                .name = "cas_session_inquiry_anchor",
+                .module = cas_session_inquiry_anchor_root,
+            },
+        },
+    });
+    const cas_app_server_preflight_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_app_server_preflight.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_app_server_contract", .module = cas_app_server_contract_root },
+            .{ .name = "cas_app_server_probes", .module = cas_app_server_probes_root },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
     });
     const cas_budget_governor_root = b.createModule(.{
@@ -342,14 +403,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
-    const cron_root = b.createModule(.{
-        .root_source_file = b.path("apps/cron/scripts/cron.zig"),
+    const cas_automation_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_automation.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = cron_meta },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const memory_note_root = b.createModule(.{
@@ -372,7 +433,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "perf_contract", .module = core_perf_contract },
-            .{ .name = "cron_cli", .module = cron_root },
+            .{ .name = "cas_automation_cli", .module = cas_automation_root },
             .{ .name = "seq_v1_core", .module = seq_v1_core },
         },
     });
@@ -399,11 +460,23 @@ pub fn build(b: *std.Build) void {
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
     const cas_goal = addExecutable(b, "cas_goal", cas_goal_root);
     const cas_account = addExecutable(b, "cas_account", cas_account_root);
+    const cas_app_server_preflight = addExecutable(
+        b,
+        "cas_app_server_preflight",
+        cas_app_server_preflight_root,
+    );
+    cas_app_server_preflight.root_module.linkSystemLibrary("c", .{});
+    const cas_code_mode_host_fixture = addExecutable(
+        b,
+        "cas_code_mode_host_fixture",
+        cas_transport_tests_root,
+    );
+    cas_code_mode_host_fixture.root_module.linkSystemLibrary("c", .{});
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
-    const cron = addExecutable(b, "cron", cron_root);
-    cron.root_module.linkSystemLibrary("c", .{});
-    cron.root_module.linkSystemLibrary("sqlite3", .{});
+    const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
+    cas_automation.root_module.linkSystemLibrary("c", .{});
+    cas_automation.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
@@ -421,9 +494,19 @@ pub fn build(b: *std.Build) void {
     const cas_conformance_suite_install = addInstallStep(b, cas_conformance_suite);
     const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_account_install = addInstallStep(b, cas_account);
+    const cas_app_server_preflight_install = addInstallStep(b, cas_app_server_preflight);
+    const cas_code_mode_host_fixture_install = addInstallStep(
+        b,
+        cas_code_mode_host_fixture,
+    );
+    const build_cas_code_mode_host_fixture = b.step(
+        "build-cas-code-mode-host-fixture",
+        "Build the deterministic CAS Code Mode host fixture",
+    );
+    build_cas_code_mode_host_fixture.dependOn(&cas_code_mode_host_fixture_install.step);
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
-    const cron_install = addInstallStep(b, cron);
+    const cas_automation_install = addInstallStep(b, cas_automation);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
@@ -441,9 +524,10 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_conformance_suite_install.step);
     install_all.dependOn(&cas_goal_install.step);
     install_all.dependOn(&cas_account_install.step);
+    install_all.dependOn(&cas_app_server_preflight_install.step);
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
-    install_all.dependOn(&cron_install.step);
+    install_all.dependOn(&cas_automation_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
     install_all.dependOn(&img_install.step);
@@ -532,6 +616,12 @@ pub fn build(b: *std.Build) void {
         "Run cas_session_inquiry tests",
         .{ .link_libc = true },
     );
+    const run_cas_session_inquiry_anchor_tests = addTestStep(
+        b,
+        cas_session_inquiry_anchor_root,
+        "test-cas-session-inquiry-anchor",
+        "Run CAS session inquiry anchor kernel tests",
+    );
     const run_cas_conformance_tests = addTestStep(
         b,
         cas_conformance_root,
@@ -555,6 +645,32 @@ pub fn build(b: *std.Build) void {
         cas_proxy_client_root,
         "test-cas-proxy-client",
         "Run cas_proxy_client tests",
+    );
+    const run_cas_transport_tests = addTestStepWithOptions(
+        b,
+        cas_transport_tests_root,
+        "test-cas-transport",
+        "Run CAS app-server transport kernel tests",
+        .{ .link_libc = true },
+    );
+    const run_cas_app_server_contract_tests = addTestStep(
+        b,
+        cas_app_server_contract_root,
+        "test-cas-app-server-contract",
+        "Run CAS app-server structural contract tests",
+    );
+    const run_cas_app_server_probes_tests = addTestStep(
+        b,
+        cas_app_server_probes_root,
+        "test-cas-app-server-probes",
+        "Run CAS app-server behavioral probe tests",
+    );
+    const run_cas_app_server_preflight_tests = addTestStepWithOptions(
+        b,
+        cas_app_server_preflight_root,
+        "test-cas-app-server-preflight",
+        "Run CAS app-server preflight CLI tests",
+        .{ .link_libc = true },
     );
     const run_cas_cli_tests = addTestStepWithOptions(
         b,
@@ -583,23 +699,38 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_review_session_tests.step);
     test_cas.dependOn(&run_cas_session_inquiry_tests.step);
+    test_cas.dependOn(&run_cas_session_inquiry_anchor_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
+    test_cas.dependOn(&run_cas_transport_tests.step);
+    test_cas.dependOn(&run_cas_app_server_contract_tests.step);
+    test_cas.dependOn(&run_cas_app_server_probes_tests.step);
+    test_cas.dependOn(&run_cas_app_server_preflight_tests.step);
     test_cas.dependOn(&run_cas_cli_tests.step);
     if (run_cas_dispatch_runtime_linux) |run| test_cas.dependOn(run);
 
-    const run_cron_tests = addTestStepWithOptions(
+    const run_cas_automation_tests = addTestStepWithOptions(
         b,
-        cron_root,
-        "test-cron",
-        "Run cron tests",
+        cas_automation_root,
+        "test-cas-automation",
+        "Run cas automation tests",
         .{
             .link_libc = true,
             .sqlite = true,
         },
     );
+    test_cas.dependOn(&run_cas_automation_tests.step);
+
+    const cas_automation_oracle = b.addSystemCommand(&.{"sh"});
+    cas_automation_oracle.addFileArg(b.path("apps/cas/testdata/automation/cron-0.2.13/verify.sh"));
+    cas_automation_oracle.addFileArg(b.path("zig-out/bin/cas"));
+    cas_automation_oracle.addArg("automation");
+    cas_automation_oracle.step.dependOn(&cas_install.step);
+    cas_automation_oracle.step.dependOn(&cas_automation_install.step);
+    cas_automation_oracle.expectStdOutMatch("cron-0.2.13 automation oracle: pass");
+    test_cas.dependOn(&cas_automation_oracle.step);
 
     const run_ledger_tests = addTestStep(
         b,
@@ -717,7 +848,19 @@ pub fn build(b: *std.Build) void {
     );
 
     const cas_build_deps: []const *std.Build.Step =
-        &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step };
+        &.{
+            &cas_smoke_check_install.step,
+            &cas_instance_runner_install.step,
+            &cas_review_session_install.step,
+            &cas_session_inquiry_install.step,
+            &cas_conformance_suite_install.step,
+            &cas_goal_install.step,
+            &cas_account_install.step,
+            &cas_app_server_preflight_install.step,
+            &cas_budget_perf_install.step,
+            &cas_install.step,
+            &cas_automation_install.step,
+        };
     const app_surfaces = [_]AppSurface{
         .{
             .path = b.path("apps/seq"),
@@ -739,13 +882,6 @@ pub fn build(b: *std.Build) void {
             .build_description = "Build cas binaries",
             .build_deps = cas_build_deps,
             .test_deps = &.{test_cas},
-        },
-        .{
-            .path = b.path("apps/cron"),
-            .build_step_name = "build-cron",
-            .build_description = "Build cron binaries",
-            .build_deps = &.{&cron_install.step},
-            .test_deps = &.{&run_cron_tests.step},
         },
         .{
             .path = b.path("apps/ledger"),

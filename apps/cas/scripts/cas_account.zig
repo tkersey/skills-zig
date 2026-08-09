@@ -502,10 +502,7 @@ fn findArrayLenByKey(value: std.json.Value, key: []const u8) ?usize {
 }
 
 fn transportText(kind: cas.TransportKind) []const u8 {
-    return switch (kind) {
-        .stdio => "stdio",
-        .websocket => "websocket",
-    };
+    return kind.text();
 }
 
 fn classifyFailure(err: anyerror) []const u8 {
@@ -574,6 +571,12 @@ test "parseArgs accepts status privacy flags" {
     try std.testing.expect(parsed.usage);
     try std.testing.expect(parsed.show_email);
     try std.testing.expectEqualStrings("codex-dev", parsed.codex_path);
+}
+
+test "account output preserves unix socket transport identity" {
+    try std.testing.expectEqualStrings("stdio", transportText(.stdio));
+    try std.testing.expectEqualStrings("websocket", transportText(.websocket));
+    try std.testing.expectEqualStrings("unix_socket", transportText(.unix_socket));
 }
 
 test "parseAccountRead redacts email by default" {

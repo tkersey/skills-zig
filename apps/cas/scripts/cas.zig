@@ -17,10 +17,16 @@ const CapabilitiesText =
     \\cas_rer_opaque_request_binding_v1=true
     \\cas_workflow_bound_owner_lived_review_v1=true
     \\cas_review_scoped_instructions_v1=true
-    \\cas_codex_0145_structured_review_v1=true
-    \\cas_codex_0145_structured_review_v2=true
-    \\cas_codex_0145_structured_review_v3=true
-    \\cas_codex_0145_structured_review_v4=true
+    \\cas_app_server_contract_0146_v1=true
+    \\cas_app_server_schema_probe_v1=true
+    \\cas_app_server_thread_pinning_v1=true
+    \\cas_app_server_paginated_fork_v1=true
+    \\cas_app_server_ephemeral_paginated_fork_v1=true
+    \\cas_app_server_remote_code_mode_host_v1=true
+    \\cas_app_server_executor_skill_resources_v1=true
+    \\cas_app_server_external_import_history_v1=true
+    \\cas_codex_0146_structured_review_v1=true
+    \\cas_automation_v1=true
 ;
 
 const CapabilitiesJson =
@@ -39,14 +45,30 @@ const CapabilitiesJson =
     \\      "cas_rer_opaque_request_binding_v1": true,
     \\      "cas_workflow_bound_owner_lived_review_v1": true,
     \\      "cas_review_scoped_instructions_v1": true,
-    \\      "cas_codex_0145_structured_review_v1": true,
-    \\      "cas_codex_0145_structured_review_v2": true,
-    \\      "cas_codex_0145_structured_review_v3": true,
-    \\      "cas_codex_0145_structured_review_v4": true
+    \\      "cas_app_server_contract_0146_v1": true,
+    \\      "cas_app_server_schema_probe_v1": true,
+    \\      "cas_app_server_thread_pinning_v1": true,
+    \\      "cas_app_server_paginated_fork_v1": true,
+    \\      "cas_app_server_ephemeral_paginated_fork_v1": true,
+    \\      "cas_app_server_remote_code_mode_host_v1": true,
+    \\      "cas_app_server_executor_skill_resources_v1": true,
+    \\      "cas_app_server_external_import_history_v1": true,
+    \\      "cas_codex_0146_structured_review_v1": true,
+    \\      "cas_automation_v1": true
     \\    }
     \\  }
     \\}
 ;
+
+const CurrentContractCapabilities = [_][]const u8{
+    "cas_app_server_thread_pinning_v1",
+    "cas_app_server_paginated_fork_v1",
+    "cas_app_server_ephemeral_paginated_fork_v1",
+    "cas_app_server_remote_code_mode_host_v1",
+    "cas_app_server_executor_skill_resources_v1",
+    "cas_app_server_external_import_history_v1",
+    "cas_codex_0146_structured_review_v1",
+};
 
 const UsageText =
     \\cas
@@ -58,6 +80,8 @@ const UsageText =
     \\
     \\Subcommands:
     \\  account                            Run cas_account.
+    \\  app-server                         Inspect or preflight the Codex app-server.
+    \\  automation                         Manage Codex automations.
     \\  capabilities                       Print compiled CAS feature flags.
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
@@ -67,8 +91,11 @@ const UsageText =
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
     \\Examples:
+    \\  cas automation --help
     \\  cas capabilities --json
     \\  cas account status --cwd /path/to/repo --json
+    \\  cas app-server schema --profile core --json
+    \\  cas app-server preflight --profile core --app-server-transport stdio --json
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
@@ -84,8 +111,9 @@ const UsageText =
 ;
 
 const InstalledBinarySet =
-    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
-    "cas_session_inquiry, cas_conformance_suite, cas_goal";
+    "cas, cas_account, cas_automation, cas_smoke_check, cas_instance_runner, " ++
+    "cas_review_session, cas_session_inquiry, cas_conformance_suite, cas_goal, " ++
+    "cas_app_server_preflight";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -215,6 +243,12 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "account")) {
         return "cas_account";
     }
+    if (std.mem.eql(u8, subcommand, "automation")) {
+        return "cas_automation";
+    }
+    if (std.mem.eql(u8, subcommand, "app-server")) {
+        return "cas_app_server_preflight";
+    }
     if (std.mem.eql(u8, subcommand, "conformance") or std.mem.eql(u8, subcommand, "conformance-suite") or std.mem.eql(u8, subcommand, "conformance_suite")) {
         return "cas_conformance_suite";
     }
@@ -268,6 +302,9 @@ fn writeCapabilities(writer: *std.Io.Writer, json: bool) !void {
 
 test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_account", resolveTarget("account").?);
+    try std.testing.expectEqualStrings("cas_automation", resolveTarget("automation").?);
+    try std.testing.expectEqualStrings("cas_app_server_preflight", resolveTarget("app-server").?);
+    try std.testing.expect(resolveTarget("cron") == null);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance").?);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance-suite").?);
     try std.testing.expectEqualStrings("cas_goal", resolveTarget("goal").?);
@@ -324,22 +361,18 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
-        "cas_codex_0145_structured_review_v1=true",
+        "cas_app_server_contract_0146_v1=true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
-        "cas_codex_0145_structured_review_v2=true",
+        "cas_app_server_schema_probe_v1=true",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_codex_0145_") == null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
-        "cas_codex_0145_structured_review_v3=true",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text_output.written(),
-        "cas_codex_0145_structured_review_v4=true",
+        "cas_automation_v1=true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -363,10 +396,22 @@ test "capabilities advertise only current review boundary features" {
         "\"cas_workflow_bound_owner_lived_review_v1\": true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v2\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v3\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v4\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_app_server_contract_0146_v1\": true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_app_server_schema_probe_v1\": true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "cas_codex_0145_") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_automation_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),
@@ -384,11 +429,37 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);
     try std.testing.expect(features.get("cas_workflow_bound_owner_lived_review_v1").?.bool);
     try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
-    try std.testing.expect(features.get("cas_codex_0145_structured_review_v1").?.bool);
-    try std.testing.expect(features.get("cas_codex_0145_structured_review_v2").?.bool);
-    try std.testing.expect(features.get("cas_codex_0145_structured_review_v3").?.bool);
-    try std.testing.expect(features.get("cas_codex_0145_structured_review_v4").?.bool);
+    try std.testing.expect(features.get("cas_app_server_contract_0146_v1").?.bool);
+    try std.testing.expect(features.get("cas_app_server_schema_probe_v1").?.bool);
+    try std.testing.expect(features.get("cas_automation_v1").?.bool);
     try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);
     try std.testing.expect(features.get("cas_review_history_v2") == null);
     try std.testing.expect(features.get("dcp_v2").?.bool);
+}
+
+test "capabilities publish current 0.146 runtime features" {
+    var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer text_output.deinit();
+    try writeCapabilities(&text_output.writer, false);
+
+    var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer json_output.deinit();
+    try writeCapabilities(&json_output.writer, true);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const features = parsed.value.object.get("cas_capabilities").?.object
+        .get("features").?.object;
+    for (CurrentContractCapabilities) |capability| {
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            text_output.written(),
+            capability,
+        ) != null);
+        try std.testing.expect(features.get(capability).?.bool);
+    }
 }

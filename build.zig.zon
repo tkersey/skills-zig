@@ -16,7 +16,6 @@
         "apps/ledger/src",
         "apps/lift/scripts",
         "apps/cas/scripts",
-        "apps/cron/scripts",
         "libs/core/src",
         "libs/jsonl_core/src",
         "libs/durable_store/src",

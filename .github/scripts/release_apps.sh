@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas cron ledger memory-note img)
+apps=(seq lift cas ledger memory-note img)
 
 resolve_ref() {
   local ref=$1
@@ -68,7 +68,7 @@ case "$mode" in
       local matched=1
       for app in "${apps[@]}"; do
         token=${app//-/_}
-        if grep -Eqi "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
+        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}_[A-Za-z0-9_]+|build-$app|test-$app|run-$app" <<<"$raw"; then
           if [[ "$app" == ledger ]]; then
             mark_ledger
           else
@@ -77,6 +77,12 @@ case "$mode" in
           matched=0
         fi
       done
+      # A dependency import is owned by the surrounding app-specific build
+      # hunk. Widening it to every consumer would make adding one CAS import
+      # spuriously require unrelated app releases.
+      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
+        return "$matched"
+      fi
       if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
         mark_definition_consumers
         matched=0
@@ -108,6 +114,10 @@ case "$mode" in
         mark_app seq
         matched=0
       fi
+      if grep -Eqi '(^|[^[:alnum:]_])cas([^[:alnum:]_]|$)|cas[_\.]' <<<"$raw"; then
+        mark_app cas
+        matched=0
+      fi
       if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
         mark_ledger
         matched=0
@@ -117,7 +127,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.\{ \.(link_libc|sqlite) = true \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
@@ -166,9 +176,6 @@ case "$mode" in
         .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
-        .github/workflows/release-cron.yml)
-          mark_app cron
-          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -211,14 +218,22 @@ case "$mode" in
         if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
           return
         fi
-        local raw
+        local change raw
         local changed_matched=0
         local context_matched=0
         local substantive_unknown=0
-        for raw in "${build_changed_lines[@]}"; do
+        local retired_app_deletion=0
+        local has_addition=0
+        for change in "${build_changed_lines[@]}"; do
+          raw=${change:1}
+          if [[ "${change:0:1}" == "+" ]]; then
+            has_addition=1
+          fi
           if classify_build_line "$raw"; then
             changed_matched=1
-          elif ! contextual_build_line "$raw"; then
+          elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
+            retired_app_deletion=1
+          elif [[ "${change:0:1}" == "+" ]] && ! contextual_build_line "$raw"; then
             substantive_unknown=1
           fi
         done
@@ -227,6 +242,9 @@ case "$mode" in
           return
         fi
         if [[ "$changed_matched" -eq 1 ]]; then
+          return
+        fi
+        if [[ "$retired_app_deletion" -eq 1 && "$has_addition" -eq 0 ]]; then
           return
         fi
         for raw in "${build_hunk[@]}"; do
@@ -251,7 +269,7 @@ case "$mode" in
           "+"*|"-"*)
             raw=${line:1}
             build_hunk+=("$raw")
-            build_changed_lines+=("$raw")
+            build_changed_lines+=("$line")
             ;;
           " "*)
             build_hunk+=("${line:1}")
@@ -286,7 +304,7 @@ case "$mode" in
                 matched=1
               fi
             done
-            if [[ "$matched" -eq 0 ]]; then
+            if [[ "$matched" -eq 0 && "${line:0:1}" == "+" ]]; then
               mark_all
             fi
             ;;

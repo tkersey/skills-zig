@@ -1,20 +1,285 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
-const cron_cli = @import("cron_cli");
+const cas_automation_cli = @import("cas_automation_cli");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const perf_contract = @import("perf_contract");
 
 const Version = "0.0.0-dev";
 const paired_comparison_rounds: usize = 8;
-const accepted_generic_deep_schema1_sha =
-    "ddf201901391ea625e4ac9b0c9649570bc56e58f";
-const accepted_generic_deep_schema1_tree =
-    "59fcca22a691bbc98a4e38e50c6d642116611b43";
-const accepted_generic_deep_schema1_source_sha256 =
-    "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f";
-const shared_driver_source_path = "tools/perf_hub.zig";
+const DriverSourceIdentity = struct {
+    revision: []const u8,
+    tree: []const u8,
+    locator: []const u8,
+    sha256: []const u8,
+};
+const driver_overlay_path = "tools/perf_hub.zig";
+const legacy_generic_driver_v1 = DriverSourceIdentity{
+    .revision = "ddf201901391ea625e4ac9b0c9649570bc56e58f",
+    .tree = "59fcca22a691bbc98a4e38e50c6d642116611b43",
+    .locator = driver_overlay_path,
+    .sha256 = "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f",
+};
+const sealed_seq_replay_driver_locator =
+    "tools/perf_hub.zig#sealed_seq_replay_driver_source";
+const sealed_seq_replay_driver_sha256 =
+    "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053";
+const active_seq_replay_driver_v1 = DriverSourceIdentity{
+    .revision = sealed_seq_replay_driver_sha256,
+    .tree = "118e358ab6c6b74bded7dc77d3932c9b8b289a83904604e82e8221109458fe9b",
+    .locator = sealed_seq_replay_driver_locator,
+    .sha256 = sealed_seq_replay_driver_sha256,
+};
+const sealed_seq_replay_driver_source =
+    \\const std = @import("std");
+    \\const builtin = @import("builtin");
+    \\const core_perf = @import("core_perf");
+    \\const definition_core = @import("definition_core");
+    \\const seq_v1 = @import("seq_v1_core");
+    \\
+    \\const case_id = "seq-observe-deep-batch8";
+    \\const binary = "seq";
+    \\const warmup_count: usize = 3;
+    \\const sample_count: usize = 30;
+    \\const batch_iterations: usize = 8;
+    \\
+    \\const Metrics = struct {
+    \\    samples_ns: [sample_count]u64,
+    \\    p50_ns: u64,
+    \\    p95_ns: u64,
+    \\    p50_alloc_calls: u64,
+    \\};
+    \\
+    \\pub fn main(init: std.process.Init) !void {
+    \\    const allocator = init.gpa;
+    \\    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    \\    try requireCaptureArgs(argv);
+    \\    const metrics = try measure(allocator);
+    \\    try writeArtifact(allocator, metrics);
+    \\
+    \\    var stdout_writer = std.Io.File.stdout().writer(
+    \\        std.Io.Threaded.global_single_threaded.io(),
+    \\        &.{},
+    \\    );
+    \\    try stdout_writer.interface.print(
+    \\        "PASS\t{s}\tcaptured\n",
+    \\        .{case_id},
+    \\    );
+    \\}
+    \\
+    \\fn requireCaptureArgs(argv: []const []const u8) !void {
+    \\    if (argv.len != 4 or
+    \\        !std.mem.eql(u8, argv[1], "capture") or
+    \\        !std.mem.eql(u8, argv[2], "--target") or
+    \\        !std.mem.eql(u8, argv[3], case_id))
+    \\    {
+    \\        return error.InvalidCommand;
+    \\    }
+    \\}
+    \\
+    \\fn measure(allocator: std.mem.Allocator) !Metrics {
+    \\    var warmup_index: usize = 0;
+    \\    while (warmup_index < warmup_count) : (warmup_index += 1) {
+    \\        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    \\        defer arena.deinit();
+    \\        var counting = core_perf.CountingAllocator.init(arena.allocator());
+    \\        try executeBatch(counting.allocator());
+    \\    }
+    \\
+    \\    var samples_ns: [sample_count]u64 = undefined;
+    \\    var allocation_calls: [sample_count]u64 = undefined;
+    \\    for (0..sample_count) |sample_index| {
+    \\        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    \\        defer arena.deinit();
+    \\        var counting = core_perf.CountingAllocator.init(arena.allocator());
+    \\        const start_ns = std.Io.Clock.awake.now(
+    \\            std.Io.Threaded.global_single_threaded.io(),
+    \\        ).nanoseconds;
+    \\        try executeBatch(counting.allocator());
+    \\        samples_ns[sample_index] = @intCast(@max(
+    \\            std.Io.Clock.awake.now(
+    \\                std.Io.Threaded.global_single_threaded.io(),
+    \\            ).nanoseconds - start_ns,
+    \\            1,
+    \\        ));
+    \\        allocation_calls[sample_index] = counting.stats.totalCalls();
+    \\    }
+    \\
+    \\    _ = allocator;
+    \\    return .{
+    \\        .samples_ns = samples_ns,
+    \\        .p50_ns = percentile(samples_ns, 50),
+    \\        .p95_ns = percentile(samples_ns, 95),
+    \\        .p50_alloc_calls = percentile(allocation_calls, 50),
+    \\    };
+    \\}
+    \\
+    \\fn percentile(values: [sample_count]u64, percent: usize) u64 {
+    \\    var sorted = values;
+    \\    std.mem.sort(u64, sorted[0..], {}, struct {
+    \\        fn less(_: void, left: u64, right: u64) bool {
+    \\            return left < right;
+    \\        }
+    \\    }.less);
+    \\    return sorted[((sorted.len - 1) * percent) / 100];
+    \\}
+    \\
+    \\fn executeBatch(allocator: std.mem.Allocator) !void {
+    \\    for (0..batch_iterations) |_| try executeSeqObserve(allocator);
+    \\}
+    \\
+    \\fn executeSeqObserve(allocator: std.mem.Allocator) !void {
+    \\    const cwd = try std.process.currentPathAlloc(
+    \\        std.Io.Threaded.global_single_threaded.io(),
+    \\        allocator,
+    \\    );
+    \\    defer allocator.free(cwd);
+    \\    const definition_root = try std.fs.path.join(
+    \\        allocator,
+    \\        &.{ cwd, "apps/seq/src/v1/fixtures" },
+    \\    );
+    \\    defer allocator.free(definition_root);
+    \\    const projection_names = [_][]const u8{"rows"};
+    \\    var plans = try seq_v1.compiled_plan.load(
+    \\        allocator,
+    \\        definition_root,
+    \\        "message-observation.json",
+    \\        .{ .projection_names = &projection_names },
+    \\        "1.0.0",
+    \\        "seq-source-adapter/v1",
+    \\        .{},
+    \\    );
+    \\    defer plans.deinit(allocator);
+    \\    const parameter_inputs = [_]definition_core.parameters.Input{.{
+    \\        .name = "needle",
+    \\        .raw_value = "failure",
+    \\    }};
+    \\    var parameters = try definition_core.parameters.bind(
+    \\        allocator,
+    \\        &plans.definition_plan.parameter_declarations,
+    \\        &parameter_inputs,
+    \\    );
+    \\    defer parameters.deinit(allocator);
+    \\    var program = try seq_v1.execution.compile(
+    \\        allocator,
+    \\        &plans.definition_plan,
+    \\        &plans.native_plan,
+    \\        &parameters,
+    \\        "rows",
+    \\    );
+    \\    defer program.deinit(allocator);
+    \\    const output_cells = try std.math.mul(
+    \\        usize,
+    \\        program.max_rows,
+    \\        program.output_field_indices.len,
+    \\    );
+    \\    const output = try allocator.alloc(seq_v1.execution.Value, output_cells);
+    \\    defer allocator.free(output);
+    \\    const trace_path = try std.fs.path.join(
+    \\        allocator,
+    \\        &.{ definition_root, "rollout.jsonl" },
+    \\    );
+    \\    defer allocator.free(trace_path);
+    \\    var observation = try seq_v1.trace_adapter.observeFile(
+    \\        allocator,
+    \\        &program,
+    \\        trace_path,
+    \\        .{
+    \\            .max_input_bytes = plans.definition_plan.bounds.max_input_bytes,
+    \\        },
+    \\        output,
+    \\    );
+    \\    defer observation.deinit(allocator);
+    \\    if (observation.result.row_count != 1 or
+    \\        observation.metrics.bytes_read == 0)
+    \\    {
+    \\        return error.InvalidPerfObservation;
+    \\    }
+    \\}
+    \\
+    \\fn writeArtifact(allocator: std.mem.Allocator, metrics: Metrics) !void {
+    \\    const machine_name = try currentMachineDirName(allocator);
+    \\    defer allocator.free(machine_name);
+    \\    const baseline_dir = try std.fs.path.join(
+    \\        allocator,
+    \\        &.{ ".perf-local", machine_name, "baselines", binary },
+    \\    );
+    \\    defer allocator.free(baseline_dir);
+    \\    try std.Io.Dir.cwd().createDirPath(
+    \\        std.Io.Threaded.global_single_threaded.io(),
+    \\        baseline_dir,
+    \\    );
+    \\    const artifact_name = case_id ++ ".json";
+    \\    const artifact_path = try std.fs.path.join(
+    \\        allocator,
+    \\        &.{ baseline_dir, artifact_name },
+    \\    );
+    \\    defer allocator.free(artifact_path);
+    \\
+    \\    var output: std.Io.Writer.Allocating = .init(allocator);
+    \\    defer output.deinit();
+    \\    const writer = &output.writer;
+    \\    try writer.print(
+    \\        "{{\"schema_version\":1,\"machine_id\":\"{s}\"," ++
+    \\            "\"git_sha\":\"unknown\",\"zig_version\":\"{s}\"," ++
+    \\            "\"binary\":\"{s}\",\"case_id\":\"{s}\"," ++
+    \\            "\"case_kind\":\"native\",\"tolerance_pct\":3.00," ++
+    \\            "\"metrics\":{{\"samples_ns\":[",
+    \\        .{ machine_name, builtin.zig_version_string, binary, case_id },
+    \\    );
+    \\    for (metrics.samples_ns, 0..) |sample, index| {
+    \\        if (index > 0) try writer.writeByte(',');
+    \\        try writer.print("{d}", .{sample});
+    \\    }
+    \\    try writer.print(
+    \\        "],\"p50_ns\":{d},\"p95_ns\":{d}," ++
+    \\            "\"p50_alloc_calls\":{d}}}," ++
+    \\            "\"compare_status\":\"capture\"," ++
+    \\            "\"compare_detail\":\"captured\"}}\n",
+    \\        .{ metrics.p50_ns, metrics.p95_ns, metrics.p50_alloc_calls },
+    \\    );
+    \\    try std.Io.Dir.cwd().writeFile(
+    \\        std.Io.Threaded.global_single_threaded.io(),
+    \\        .{ .sub_path = artifact_path, .data = output.written() },
+    \\    );
+    \\}
+    \\
+    \\fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
+    \\    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    \\    const host_full = try std.posix.gethostname(&host_buf);
+    \\    const host = host_full[0 .. std.mem.indexOfScalar(u8, host_full, '.') orelse
+    \\        host_full.len];
+    \\    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}-zig{s}", .{
+    \\        switch (builtin.target.os.tag) {
+    \\            .macos => "darwin",
+    \\            else => @tagName(builtin.target.os.tag),
+    \\        },
+    \\        switch (builtin.target.cpu.arch) {
+    \\            .aarch64 => "arm64",
+    \\            else => @tagName(builtin.target.cpu.arch),
+    \\        },
+    \\        host,
+    \\        builtin.zig_version_string,
+    \\    });
+    \\}
+;
+
+fn sealedSeqReplayDriverDigest() [64]u8 {
+    return evidenceDigest(sealed_seq_replay_driver_source);
+}
+
+fn sealedSeqReplayDriverTreeDigest() [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("cas-sealed-seq-replay-driver-tree/v1");
+    hasher.update(&.{0});
+    hasher.update(sealed_seq_replay_driver_locator);
+    hasher.update(&.{0});
+    hasher.update(sealed_seq_replay_driver_sha256);
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    return std.fmt.bytesToHex(raw, .lower);
+}
 const deep_measurement_schema = "perf-deep-measurement/v1";
 const deep_comparison_method = "balanced-round-median-ratio/v1";
 const ratio_scale: u64 = 1_000_000;
@@ -94,8 +359,8 @@ const CompatSetup = enum {
     cas_review_session_help,
     cas_review_session_version,
     cas_budget_governor_driver,
-    cron_help,
-    cron_list,
+    cas_automation_help,
+    cas_automation_list,
 };
 
 const CompatCase = struct {
@@ -112,14 +377,14 @@ const CompatCase = struct {
 
 const DeepSetup = enum {
     seq_observe,
-    cron_show,
-    cron_create,
-    cron_update,
-    cron_enable,
-    cron_disable,
-    cron_run_now,
-    cron_delete,
-    cron_run_due,
+    cas_automation_show,
+    cas_automation_create,
+    cas_automation_update,
+    cas_automation_enable,
+    cas_automation_disable,
+    cas_automation_run_now,
+    cas_automation_delete,
+    cas_automation_run_due,
 };
 
 const DeepCase = struct {
@@ -284,20 +549,82 @@ const LedgerCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("version", "command-surface gate"),
 };
 
-const CronCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "cron-help", .binary = "cron", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cron-list", .binary = "cron", .family = "list", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cron-show-deep", .binary = "cron", .family = "show", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-create-deep", .binary = "cron", .family = "create", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-update-deep", .binary = "cron", .family = "update", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-enable-deep", .binary = "cron", .family = "enable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-disable-deep", .binary = "cron", .family = "disable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-run-now-deep", .binary = "cron", .family = "run-now", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-delete-deep", .binary = "cron", .family = "delete", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-run-due-deep", .binary = "cron", .family = "run-due", .case_kind = .driver, .measurement_mode = .latency_alloc },
+const CasAutomationCases = [_]perf_contract.CaseDescriptor{
+    .{
+        .case_id = "cas-automation-help",
+        .binary = "cas",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-automation-list",
+        .binary = "cas",
+        .family = "list",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-automation-show-deep",
+        .binary = "cas",
+        .family = "show",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-create-deep",
+        .binary = "cas",
+        .family = "create",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-update-deep",
+        .binary = "cas",
+        .family = "update",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-enable-deep",
+        .binary = "cas",
+        .family = "enable",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-disable-deep",
+        .binary = "cas",
+        .family = "disable",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-run-now-deep",
+        .binary = "cas",
+        .family = "run-now",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-delete-deep",
+        .binary = "cas",
+        .family = "delete",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
+    .{
+        .case_id = "cas-automation-run-due-deep",
+        .binary = "cas",
+        .family = "run-due",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    },
 };
 
-const CronCoverages = buildCronCoverages();
+const CasAutomationCoverages = buildCasAutomationCoverages();
 
 const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "bench-stats-help", .binary = "bench_stats", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
@@ -370,8 +697,22 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_help, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_version, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
-    .{ .descriptor = CronCases[0], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[1], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_list, .tolerance_pct = 35.0 },
+    .{
+        .descriptor = CasAutomationCases[0],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas",
+        .setup = .cas_automation_help,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[1],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas",
+        .setup = .cas_automation_list,
+        .tolerance_pct = 35.0,
+    },
 };
 
 const DeepCases = [_]DeepCase{
@@ -383,19 +724,50 @@ const DeepCases = [_]DeepCase{
         .samples = 30,
         .batch_iterations = 8,
     },
-    .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
-    .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[5], .setup = .cron_enable, .tolerance_pct = 250.0 },
-    .{ .descriptor = CronCases[6], .setup = .cron_disable, .tolerance_pct = 100.0 },
-    .{ .descriptor = CronCases[7], .setup = .cron_run_now, .tolerance_pct = 70.0 },
-    .{ .descriptor = CronCases[8], .setup = .cron_delete, .tolerance_pct = 60.0 },
-    .{ .descriptor = CronCases[9], .setup = .cron_run_due, .tolerance_pct = 125.0 },
+    .{ .descriptor = CasAutomationCases[2], .setup = .cas_automation_show, .tolerance_pct = 200.0 },
+    .{
+        .descriptor = CasAutomationCases[3],
+        .setup = .cas_automation_create,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[4],
+        .setup = .cas_automation_update,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[5],
+        .setup = .cas_automation_enable,
+        .tolerance_pct = 250.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[6],
+        .setup = .cas_automation_disable,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[7],
+        .setup = .cas_automation_run_now,
+        .tolerance_pct = 70.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[8],
+        .setup = .cas_automation_delete,
+        .tolerance_pct = 60.0,
+    },
+    .{
+        .descriptor = CasAutomationCases[9],
+        .setup = .cas_automation_run_due,
+        .tolerance_pct = 125.0,
+    },
 };
 
-fn buildCronCoverages() [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage {
-    var out: [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
-    for (cron_cli.commandDefinitions(), 0..) |def, idx| {
+const CasAutomationCoverageArray =
+    [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage;
+
+fn buildCasAutomationCoverages() CasAutomationCoverageArray {
+    var out: [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
+    for (cas_automation_cli.commandDefinitions(), 0..) |def, idx| {
         const coverage, const reason = if (def.command == .list)
             .{ perf_contract.CoverageKind.shallow, "compat subprocess case exists" }
         else if (def.command == .scheduler)
@@ -411,7 +783,7 @@ fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
         .{ .binary = "seq", .coverages = &SeqCoverages, .datasets = &SeqDatasets, .cases = &SeqCases },
         .{ .binary = "ledger", .coverages = &LedgerCoverages, .cases = &LedgerCases },
-        .{ .binary = "cron", .coverages = &CronCoverages, .cases = &CronCases },
+        .{ .binary = "cas", .coverages = &CasAutomationCoverages, .cases = &CasAutomationCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
     };
 }
@@ -1447,7 +1819,7 @@ fn driverEvidence(
     errdefer compiler.deinit(allocator);
     return .{
         .file = file,
-        .source_sha = accepted_generic_deep_schema1_sha,
+        .source_sha = active_seq_replay_driver_v1.revision,
         .source_tree_sha = source_tree_sha,
         .source_file = source_file,
         .product_source_sha = product_source_sha,
@@ -2559,27 +2931,14 @@ fn ensureSourceBuilt(
         allocator,
     );
     defer allocator.free(machine_dir);
-    const driver_source_tree_sha = try revisionTreeShaForRootAlloc(
-        allocator,
-        source_root,
-        accepted_generic_deep_schema1_sha,
-    );
-    defer allocator.free(driver_source_tree_sha);
-    if (!std.mem.eql(
-        u8,
-        driver_source_tree_sha,
-        accepted_generic_deep_schema1_tree,
-    )) return error.DriverSourceRevisionMismatch;
-    const driver_source_bytes = try sharedDriverSourceBytesAlloc(
-        allocator,
-        source_root,
-    );
+    const driver_source_tree_sha = active_seq_replay_driver_v1.tree;
+    const driver_source_bytes = try seqReplayDriverSourceBytesAlloc(allocator);
     defer allocator.free(driver_source_bytes);
     const driver_source_digest = evidenceDigest(driver_source_bytes);
     if (!std.mem.eql(
         u8,
         &driver_source_digest,
-        accepted_generic_deep_schema1_source_sha256,
+        active_seq_replay_driver_v1.sha256,
     )) return error.DriverSourceRevisionMismatch;
     var driver_source_file = try sealEvidenceBytes(
         allocator,
@@ -2759,7 +3118,7 @@ fn ensureSourceBuilt(
     }
     const driver_source_path = try std.fs.path.join(
         allocator,
-        &.{ source_snapshot, shared_driver_source_path },
+        &.{ source_snapshot, driver_overlay_path },
     );
     defer allocator.free(driver_source_path);
     try writeEvidenceFileAtomic(
@@ -2929,23 +3288,10 @@ fn revisionTreeShaForRootAlloc(
     );
 }
 
-fn sharedDriverSourceBytesAlloc(
+fn seqReplayDriverSourceBytesAlloc(
     allocator: std.mem.Allocator,
-    source_root: []const u8,
 ) ![]u8 {
-    const object = accepted_generic_deep_schema1_sha ++
-        ":" ++ shared_driver_source_path;
-    const result = try runChildCaptureOutput(
-        allocator,
-        ".",
-        &.{ git_binary, "-C", source_root, "show", object },
-    );
-    defer allocator.free(result.stderr);
-    if (result.exit_code != 0 or result.stdout.len == 0) {
-        allocator.free(result.stdout);
-        return error.DriverSourceUnavailable;
-    }
-    return result.stdout;
+    return allocator.dupe(u8, sealed_seq_replay_driver_source);
 }
 
 fn deepWorkloadDigestForRoot(
@@ -4004,7 +4350,7 @@ fn writeDriverEvidence(
     try writer.writeAll(",\"tree\":");
     try writeJsonString(writer, evidence.source_tree_sha);
     try writer.writeAll(",\"path\":");
-    try writeJsonString(writer, shared_driver_source_path);
+    try writeJsonString(writer, active_seq_replay_driver_v1.locator);
     try writer.writeAll(",\"file\":");
     try writeSealedFile(writer, evidence.source_file);
     try writer.writeAll("},\"product_source\":{\"revision\":");
@@ -4502,8 +4848,11 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
         .cas_smoke_check_help,
         .cas_instance_runner_help,
         .cas_review_session_help,
-        .cron_help,
         => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .cas_automation_help => try args.appendSlice(
+            allocator,
+            &.{ binary_path, "automation", "--help" },
+        ),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -4526,11 +4875,14 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             try makeExecutable(stub_path);
             return .{ .cwd = cwd, .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }) };
         },
-        .cron_list => {
+        .cas_automation_list => {
             const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)});
             const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
-            try seedCronDb(allocator, db_path);
-            try args.appendSlice(allocator, &.{ binary_path, "--db", db_path, "list" });
+            try seedCasAutomationDb(allocator, db_path);
+            try args.appendSlice(
+                allocator,
+                &.{ binary_path, "automation", "--db", db_path, "list" },
+            );
         },
         else => return error.InvalidCommand,
     }
@@ -4748,7 +5100,7 @@ fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
 
-fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
+fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
     const db_path_z = try allocator.dupeZ(u8, db_path);
     defer allocator.free(db_path_z);
     var db_opt: ?*Sqlite.sqlite3 = null;
@@ -4791,7 +5143,10 @@ fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
     if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
         if (err_msg) |msg| {
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stderr_writer.interface.print("seedCronDb sqlite error: {s}\n", .{std.mem.sliceTo(msg, 0)});
+            try stderr_writer.interface.print(
+                "seedCasAutomationDb sqlite error: {s}\n",
+                .{std.mem.sliceTo(msg, 0)},
+            );
         }
         return error.InvalidData;
     }
@@ -5327,23 +5682,31 @@ fn validateDriverEvidence(
 }
 
 fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
-    if (!std.mem.eql(
-        u8,
-        source.revision,
-        accepted_generic_deep_schema1_sha,
-    ) or !std.mem.eql(
-        u8,
-        source.tree,
-        accepted_generic_deep_schema1_tree,
-    ) or !std.mem.eql(
-        u8,
-        source.path,
-        shared_driver_source_path,
-    ) or !std.mem.eql(
-        u8,
-        source.file.sha256,
-        "sha256:" ++ accepted_generic_deep_schema1_source_sha256,
-    )) return error.PerfEvidenceIdentityMismatch;
+    if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
+        driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
+    {
+        return;
+    }
+    return error.PerfEvidenceIdentityMismatch;
+}
+
+fn driverSourceMatchesIdentity(
+    source: CapsuleDriverSource,
+    identity: DriverSourceIdentity,
+) bool {
+    if (!std.mem.eql(u8, source.revision, identity.revision) or
+        !std.mem.eql(u8, source.tree, identity.tree) or
+        !std.mem.eql(u8, source.path, identity.locator) or
+        source.file.sha256.len != "sha256:".len + identity.sha256.len)
+    {
+        return false;
+    }
+    return std.mem.eql(u8, source.file.sha256[0.."sha256:".len], "sha256:") and
+        std.mem.eql(
+            u8,
+            source.file.sha256["sha256:".len..],
+            identity.sha256,
+        );
 }
 
 fn validateCompilerEvidence(
@@ -5678,7 +6041,7 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
 fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
     if (std.mem.startsWith(u8, case_id, "ledger-")) return "ledger";
-    if (std.mem.startsWith(u8, case_id, "cron-")) return "cron";
+    if (std.mem.startsWith(u8, case_id, "cas-automation-")) return "cas";
     if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "lift-bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "perf-report")) return "perf_report";
@@ -5959,25 +6322,105 @@ test "capsule files are digest-addressed beneath the current machine root" {
     );
 }
 
-test "frozen driver source metadata binds the accepted bytes" {
+test "driver source metadata accepts active and legacy tuples only" {
     var source = CapsuleDriverSource{
-        .revision = accepted_generic_deep_schema1_sha,
-        .tree = accepted_generic_deep_schema1_tree,
-        .path = shared_driver_source_path,
+        .revision = legacy_generic_driver_v1.revision,
+        .tree = legacy_generic_driver_v1.tree,
+        .path = legacy_generic_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
             .sha256 = "sha256:" ++
-                accepted_generic_deep_schema1_source_sha256,
+                legacy_generic_driver_v1.sha256,
         },
     };
     try validateDriverSourceMetadata(source);
-    source.file.sha256 =
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    source = .{
+        .revision = active_seq_replay_driver_v1.revision,
+        .tree = active_seq_replay_driver_v1.tree,
+        .path = active_seq_replay_driver_v1.locator,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+        },
+    };
+    try validateDriverSourceMetadata(source);
+
+    source.revision = legacy_generic_driver_v1.revision;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
+    source.revision = active_seq_replay_driver_v1.revision;
+    source.tree = legacy_generic_driver_v1.tree;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.tree = active_seq_replay_driver_v1.tree;
+    source.path = legacy_generic_driver_v1.locator;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.path = active_seq_replay_driver_v1.locator;
+    source.file.sha256 = "sha256:" ++ legacy_generic_driver_v1.sha256;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
+test "sealed Seq replay driver source is capture-only and dependency-minimal" {
+    const digest = sealedSeqReplayDriverDigest();
+    try std.testing.expectEqualStrings(
+        active_seq_replay_driver_v1.sha256,
+        &digest,
+    );
+    try std.testing.expectEqualStrings(
+        active_seq_replay_driver_v1.revision,
+        active_seq_replay_driver_v1.sha256,
+    );
+    const tree_digest = sealedSeqReplayDriverTreeDigest();
+    try std.testing.expectEqualStrings(
+        active_seq_replay_driver_v1.tree,
+        &tree_digest,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        std.mem.count(u8, sealed_seq_replay_driver_source, "@import("),
+    );
+    for ([_][]const u8{
+        "@import(\"std\")",
+        "@import(\"builtin\")",
+        "@import(\"core_perf\")",
+        "@import(\"definition_core\")",
+        "@import(\"seq_v1_core\")",
+        "const warmup_count: usize = 3;",
+        "const sample_count: usize = 30;",
+        "const batch_iterations: usize = 8;",
+        "\\\"schema_version\\\":1",
+        "\"PASS\\t{s}\\tcaptured\\n\"",
+        "&.{ \".perf-local\", machine_name, \"baselines\", binary }",
+    }) |required| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, sealed_seq_replay_driver_source, required) !=
+                null,
+        );
+    }
+    for ([_][]const u8{
+        "@import(\"core_cli\")",
+        "@import(\"durable_store\")",
+        "@import(\"perf_contract\")",
+        "@import(\"cas_automation_cli\")",
+        "@import(\"cron_" ++ "cli\")",
+        "cas_automation",
+        "cron-",
+    }) |forbidden| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, sealed_seq_replay_driver_source, forbidden) ==
+                null,
+        );
+    }
 }
 
 test "compiler digest check rejects mutation between builds" {

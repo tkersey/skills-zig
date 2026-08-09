@@ -72,6 +72,8 @@ jobs:
           mkdir -p dist/cas
           cp zig-out/bin/cas dist/cas/cas
           cp zig-out/bin/cas_account dist/cas/cas_account
+          cp zig-out/bin/cas_app_server_preflight dist/cas/cas_app_server_preflight
+          cp zig-out/bin/cas_automation dist/cas/cas_automation
           cp zig-out/bin/cas_smoke_check dist/cas/cas_smoke_check
           cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
           cp zig-out/bin/cas_instance_runner dist/cas/cas_instance_runner

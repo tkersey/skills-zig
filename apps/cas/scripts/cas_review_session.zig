@@ -16,6 +16,8 @@ const HelpSurface = core_cli.HelpSurface{
 
 const default_control_timeout_ms: u32 = 300_000;
 const default_review_timeout_ms: u32 = 2_700_000;
+const app_server_contract_id = "codex-app-server-0.146.0";
+const structured_review_capability = "cas_codex_0146_structured_review_v1";
 
 const UsageText =
     \\cas review
@@ -32,6 +34,8 @@ const UsageText =
     \\
     \\Run/start options:
     \\  --cwd DIR                        Workspace for the app-server.
+    \\  --codex-path PATH                Exact Codex executable for this attempt.
+    \\  --code-mode-host URL             Explicit outbound Code Mode WebSocket host.
     \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
     \\  --parent-mode MODE               Parent strategy: auto|fresh|reuse (default: auto).
     \\  --wait                           Keep the start process alive until the review turn reaches a terminal status;
@@ -143,6 +147,8 @@ const ParsedArgs = struct {
     executable_path: []const u8 = "cas_review_session",
     action: ?Action = null,
     cwd: ?[]const u8 = null,
+    codex_path: ?[]const u8 = null,
+    code_mode_host: ?[]const u8 = null,
     parent_thread_id: ?[]const u8 = null,
     parent_mode: ParentMode = .auto,
     multi_agent_mode: ?cas.MultiAgentMode = null,
@@ -205,9 +211,13 @@ const SessionRecord = struct {
     last_observed_status: []const u8,
     codex_version: []const u8,
     resolved_codex_path: ?[]const u8 = null,
+    codex_binary_digest: ?[]const u8 = null,
+    app_server_contract_id: ?[]const u8 = null,
     compatibility_verdict: ?[]const u8 = null,
     transport_kind: ?[]const u8 = null,
     transport_selection_reason: ?[]const u8 = null,
+    code_mode_host_redacted: ?[]const u8 = null,
+    code_mode_host_digest: ?[]const u8 = null,
     managed_server_pid: ?u64 = null,
     managed_server_listen_url: ?[]const u8 = null,
     managed_server_stderr_log_path: ?[]const u8 = null,
@@ -252,6 +262,10 @@ const ReviewTupleIdentity = struct {
     target_fingerprint: []const u8,
     resolved_codex_path: []const u8,
     resolved_codex_version: []const u8,
+    codex_binary_digest: []const u8 = "unbound",
+    app_server_contract_id: []const u8 = "unbound",
+    transport_kind: []const u8 = "websocket",
+    code_mode_host_digest: ?[]const u8 = null,
     account_fingerprint: []const u8,
     account_fingerprint_reduced_protection: bool,
     codex_thread_id: []const u8,
@@ -284,6 +298,10 @@ const ReviewTupleLock = struct {
     targetFingerprint: []const u8,
     resolvedCodexPath: []const u8,
     resolvedCodexVersion: []const u8,
+    codexBinaryDigest: []const u8 = "unbound",
+    appServerContractId: []const u8 = "unbound",
+    transportKind: []const u8 = "websocket",
+    codeModeHostDigest: ?[]const u8 = null,
     accountFingerprint: []const u8,
     accountFingerprintReducedProtection: bool,
     codexThreadId: ?[]const u8 = null,
@@ -360,9 +378,14 @@ const OutputReceipt = struct {
     surface_action: []const u8 = "start",
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
+    codex_binary_digest: ?[]const u8 = null,
+    app_server_contract_id: ?[]const u8 = null,
+    structured_review_capability: ?[]const u8 = null,
     compatibility_verdict: []const u8 = "not_checked",
     selected_transport: []const u8 = "stdio",
     selection_reason: []const u8 = "default_stdio",
+    code_mode_host_redacted: ?[]const u8 = null,
+    code_mode_host_digest: ?[]const u8 = null,
     managed_server_pid: ?u64 = null,
     managed_server_listen_url: ?[]const u8 = null,
     managed_server_stderr_log_path: ?[]const u8 = null,
@@ -413,6 +436,11 @@ fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) Outpu
     out.codex_thread_id = record.codex_thread_id;
     out.workflow_binding = record.workflowBinding;
     out.developer_instructions = record.developer_instructions;
+    out.codex_binary_digest = record.codex_binary_digest;
+    out.app_server_contract_id = record.app_server_contract_id;
+    out.structured_review_capability = structured_review_capability;
+    out.code_mode_host_redacted = record.code_mode_host_redacted;
+    out.code_mode_host_digest = record.code_mode_host_digest;
     return out;
 }
 
@@ -707,6 +735,16 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.cwd = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--codex-path")) {
+            if (value.len == 0) return error.InvalidCodexPath;
+            out.codex_path = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--code-mode-host")) {
+            if (value.len == 0) return error.InvalidCodeModeHost;
+            out.code_mode_host = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--parent-thread-id")) {
             out.parent_thread_id = value;
             continue;
@@ -862,6 +900,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             if (out.receipt_paths.len != 0) return error.SessionPathUnsupportedAction;
         },
         .wait => {
+            if (out.codex_path != null) return error.CodexPathUnsupportedAction;
+            if (out.code_mode_host != null) return error.CodeModeHostUnsupportedAction;
             if (out.target != null) return error.TargetUnsupportedAction;
             if (out.custom_instructions != null) return error.CustomInstructionsUnsupportedAction;
             if (out.wait_after_start) return error.WaitFlagUnsupportedAction;
@@ -987,6 +1027,182 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     try cmdStart(allocator, io, broker_parsed);
 }
 
+const ReviewRuntimeGate = struct {
+    resolved_path: []u8,
+    version: []u8,
+    binary_digest: []u8,
+    stable_schema_digest: []u8,
+    experimental_schema_digest: []u8,
+
+    fn deinit(self: *ReviewRuntimeGate, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolved_path);
+        allocator.free(self.version);
+        allocator.free(self.binary_digest);
+        allocator.free(self.stable_schema_digest);
+        allocator.free(self.experimental_schema_digest);
+        self.* = undefined;
+    }
+};
+
+fn reviewPreflightExecutableAlloc(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_path);
+    const parent = std.fs.path.dirname(self_path) orelse return error.InvalidExecutablePath;
+    return std.fs.path.join(allocator, &.{ parent, "cas_app_server_preflight" });
+}
+
+fn parseReviewRuntimeGateAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !ReviewRuntimeGate {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidReviewPreflightReceipt,
+    };
+    const schema = jsonStringField(root, "schema") orelse "";
+    if (!std.mem.eql(u8, schema, "cas-app-server-preflight/v1") or
+        !std.mem.eql(u8, jsonStringField(root, "action") orelse "", "preflight") or
+        !std.mem.eql(u8, jsonStringField(root, "profile") orelse "", "review") or
+        !std.mem.eql(u8, jsonStringField(root, "status") orelse "", "compatible") or
+        !std.mem.eql(u8, jsonStringField(root, "contractId") orelse "", app_server_contract_id))
+    {
+        return error.IncompatibleReviewRuntime;
+    }
+    const codex = core_json.objectField(root, "codex") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const schemas = core_json.objectField(root, "schemas") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const methods = core_json.objectField(root, "methods") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const handler_coverage = core_json.objectField(root, "handlerCoverage") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const shape_checks = core_json.objectField(root, "shapeChecks") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const transport = core_json.objectField(root, "transport") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const behavioral_probes = root.get("behavioralProbes") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const missing_required = methods.get("missingRequired") orelse
+        return error.InvalidReviewPreflightReceipt;
+    if (missing_required != .array or missing_required.array.items.len != 0 or
+        !std.mem.eql(u8, jsonStringField(handler_coverage, "status") orelse "", "passed") or
+        !std.mem.eql(u8, jsonStringField(shape_checks, "status") orelse "", "passed") or
+        !std.mem.eql(u8, jsonStringField(transport, "selected") orelse "", "managed-ws") or
+        !reviewBehavioralProbesPassed(behavioral_probes))
+    {
+        return error.IncompatibleReviewRuntime;
+    }
+    const path = jsonStringField(codex, "path") orelse return error.InvalidReviewPreflightReceipt;
+    const version = jsonStringField(codex, "version") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const binary_digest = jsonStringField(codex, "binaryDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const stable_digest = jsonStringField(schemas, "stableDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
+    const experimental_digest = jsonStringField(schemas, "experimentalDigest") orelse
+        return error.InvalidReviewPreflightReceipt;
+    if (path.len == 0 or version.len == 0 or
+        !std.mem.startsWith(u8, binary_digest, "sha256:") or
+        !std.mem.startsWith(u8, stable_digest, "sha256:") or
+        !std.mem.startsWith(u8, experimental_digest, "sha256:"))
+    {
+        return error.InvalidReviewPreflightReceipt;
+    }
+    const banner = try std.fmt.allocPrint(allocator, "codex-cli {s}", .{version});
+    errdefer allocator.free(banner);
+    return .{
+        .resolved_path = try allocator.dupe(u8, path),
+        .version = banner,
+        .binary_digest = try allocator.dupe(u8, binary_digest),
+        .stable_schema_digest = try allocator.dupe(u8, stable_digest),
+        .experimental_schema_digest = try allocator.dupe(u8, experimental_digest),
+    };
+}
+
+fn reviewBehavioralProbesPassed(value: std.json.Value) bool {
+    const rows = switch (value) {
+        .array => |items| items.items,
+        else => return false,
+    };
+    var initialize_passed = false;
+    var transport_passed = false;
+    var server_requests_passed = false;
+    var overload_passed = false;
+    var structured_review_passed = false;
+    for (rows) |row_value| {
+        const row = switch (row_value) {
+            .object => |item| item,
+            else => return false,
+        };
+        const requirement = jsonStringField(row, "requirement") orelse return false;
+        if (std.mem.eql(u8, requirement, "not_applicable")) continue;
+        if (!std.mem.eql(u8, requirement, "required") or
+            !std.mem.eql(u8, jsonStringField(row, "status") orelse "", "passed")) return false;
+        const id = jsonStringField(row, "id") orelse return false;
+        if (std.mem.eql(u8, id, "initialize-lifecycle")) {
+            if (initialize_passed) return false;
+            initialize_passed = true;
+        } else if (std.mem.eql(u8, id, "managed-websocket-transport")) {
+            if (transport_passed) return false;
+            transport_passed = true;
+        } else if (std.mem.eql(u8, id, "server-request-coverage")) {
+            if (server_requests_passed) return false;
+            server_requests_passed = true;
+        } else if (std.mem.eql(u8, id, "bounded-overload-retry")) {
+            if (overload_passed) return false;
+            overload_passed = true;
+        } else if (std.mem.eql(u8, id, "structured-review")) {
+            if (structured_review_passed) return false;
+            structured_review_passed = true;
+        }
+    }
+    return initialize_passed and transport_passed and server_requests_passed and
+        overload_passed and structured_review_passed;
+}
+
+fn runReviewRuntimeGate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    requested_codex_path: ?[]const u8,
+    code_mode_host: ?[]const u8,
+) !ReviewRuntimeGate {
+    const preflight_path = try reviewPreflightExecutableAlloc(allocator, io);
+    defer allocator.free(preflight_path);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        preflight_path,
+        "preflight",
+        "--cwd",
+        cwd,
+        "--codex-path",
+        requested_codex_path orelse "codex",
+        "--profile",
+        "review",
+        "--app-server-transport",
+        "managed-ws",
+    });
+    if (code_mode_host) |host| try argv.appendSlice(allocator, &.{ "--code-mode-host", host });
+    try argv.append(allocator, "--json");
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return error.IncompatibleReviewRuntime;
+    return parseReviewRuntimeGateAlloc(allocator, result.stdout);
+}
+
 fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const action_name = if (parsed.action != null and parsed.action.? == .run) "run" else "start";
     var loaded_workflow_binding = try loadWorkflowBindingAlloc(
@@ -1025,47 +1241,78 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             failure,
         );
     }
-    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
+    var runtime_gate = runReviewRuntimeGate(
+        allocator,
+        io,
+        cwd,
+        parsed.codex_path,
+        parsed.code_mode_host,
+    ) catch |err| {
         try renderErrorAndExit(
             parsed.json,
             "start",
-            "review/start",
-            "codex binary could not be resolved for CAS review",
+            "app-server/preflight",
+            @errorName(err),
             cwd,
-            .{},
             .{
-                .code = "missing_codex_binary",
-                .hint = "install or expose a compatible codex binary on PATH " ++
-                    "before running cas review",
+                .structured_review_capability = structured_review_capability,
+                .compatibility_verdict = "incompatible",
+            },
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "CAS review requires the compiled 0.146 structured-review capability " ++
+                    "and a compatible review schema profile for the exact resolved Codex binary",
             },
         );
     };
-    defer allocator.free(resolved_codex_path);
-    const codex_version = readCodexVersionAlloc(allocator, io, cwd, resolved_codex_path) catch {
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            "codex --version could not be read for CAS review",
-            cwd,
-            .{
-                .resolved_codex_path = resolved_codex_path,
-            },
-            .{
-                .code = "review_failed",
-                .hint = "verify the resolved codex binary is executable and " ++
-                    "supports app-server mode",
-            },
-        );
-    };
-    defer allocator.free(codex_version);
+    defer runtime_gate.deinit(allocator);
+    const resolved_codex_path = runtime_gate.resolved_path;
+    const codex_version = runtime_gate.version;
+    var code_mode_host: ?cas.app_server_launch.CodeModeHost = if (parsed.code_mode_host) |raw|
+        cas.app_server_launch.CodeModeHost.init(allocator, raw) catch |err| {
+            try renderErrorAndExit(
+                parsed.json,
+                "start",
+                "app-server/launch",
+                @errorName(err),
+                cwd,
+                .{
+                    .resolved_codex_path = resolved_codex_path,
+                    .resolved_codex_version = codex_version,
+                    .codex_binary_digest = runtime_gate.binary_digest,
+                    .app_server_contract_id = app_server_contract_id,
+                    .structured_review_capability = structured_review_capability,
+                    .compatibility_verdict = "compatible",
+                    .selected_transport = "websocket",
+                },
+                .{
+                    .code = "invalid_code_mode_host",
+                    .hint = "use ws:// only for a loopback Code Mode host and wss:// for every " ++
+                        "non-loopback host",
+                },
+            );
+        }
+    else
+        null;
+    defer if (code_mode_host) |*host| host.deinit();
+    var code_mode_digest_buffer: [64]u8 = undefined;
+    const code_mode_host_redacted = if (code_mode_host) |*host| host.redacted_origin else null;
+    const code_mode_host_digest = if (code_mode_host) |*host|
+        host.digestHex(&code_mode_digest_buffer)
+    else
+        null;
     var output_receipt = OutputReceipt{
         .surface_action = action_name,
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = codex_version,
+        .codex_binary_digest = runtime_gate.binary_digest,
+        .app_server_contract_id = app_server_contract_id,
+        .structured_review_capability = structured_review_capability,
         .compatibility_verdict = "compatible",
         .selected_transport = "websocket",
         .selection_reason = "detached_review_requires_cross_process_truth",
+        .code_mode_host_redacted = code_mode_host_redacted,
+        .code_mode_host_digest = code_mode_host_digest,
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
         .hook_policy = parsed.hook_policy,
         .fresh_attempt_required = parsed.fresh_attempt_reason != null,
@@ -1077,7 +1324,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.json,
             "start",
             "review/start",
-            "Codex 0.145 structured review attempts require a fresh CAS-owned thread",
+            "Codex 0.146 structured review attempts require a fresh CAS-owned thread",
             cwd,
             output_receipt,
             .{
@@ -1098,6 +1345,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         resolved_codex_path,
         parsed.hook_policy,
         workflow_binding != null,
+        if (code_mode_host) |*host| host else null,
         io,
     ) catch |err| {
         try renderErrorAndExit(
@@ -1132,31 +1380,62 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         workflow_deadline_ms,
     ) catch |err| {
         managed_server.kill();
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "websocket_bootstrap_failed",
+            .hint = "CAS started the managed websocket app-server but could not " ++
+                "complete the websocket client handshake",
+        };
         try renderErrorAndExit(
             parsed.json,
             "start",
             "review/start",
             @errorName(err),
             cwd,
-            .{
-                .resolved_codex_path = resolved_codex_path,
-                .resolved_codex_version = codex_version,
-                .compatibility_verdict = "compatible",
-                .selected_transport = "websocket",
-                .selection_reason = "detached_review_requires_cross_process_truth",
-                .managed_server_pid = managed_server_pid,
-                .managed_server_listen_url = managed_server_listen_url,
-                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-            },
-            .{
-                .code = "websocket_bootstrap_failed",
-                .hint = "CAS started the managed websocket app-server but could not complete the websocket client handshake",
-            },
+            output_receipt,
+            failure,
         );
     };
     defer {
         client.close();
         client.deinit();
+    }
+    const post_initialize_version = readCodexVersionAlloc(
+        allocator,
+        io,
+        cwd,
+        resolved_codex_path,
+    ) catch |err| {
+        managed_server.kill();
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "initialize",
+            @errorName(err),
+            cwd,
+            output_receipt,
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "the exact Codex runtime could not be revalidated after app-server " ++
+                    "initialization",
+            },
+        );
+    };
+    defer allocator.free(post_initialize_version);
+    if (!std.mem.eql(u8, post_initialize_version, codex_version)) {
+        managed_server.kill();
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "initialize",
+            "Codex runtime changed after review preflight",
+            cwd,
+            output_receipt,
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "retry after the exact resolved Codex executable is stable across " ++
+                    "preflight and initialization",
+            },
+        );
     }
     const previous_request_deadline = if (workflow_deadline_ms) |deadline_ms|
         client.swapRequestDeadlineMs(deadline_ms)
@@ -1232,6 +1511,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         managed_server.kill();
         output_receipt.error_review_attempt_phase = "pre_review_start";
         output_receipt.error_review_attempt_exists = false;
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "pre_review_start_failed",
+            .hint = "CAS could not bind the owner-lived review tuple before " ++
+                "review/start; no review attempt was created",
+        };
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -1239,14 +1523,14 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             @errorName(err),
             cwd,
             output_receipt,
-            .{
-                .code = "pre_review_start_failed",
-                .hint = "CAS could not bind the owner-lived review tuple " ++
-                    "before review/start; no review attempt was created",
-            },
+            failure,
         );
     };
     defer review_tuple.deinit(allocator);
+    review_tuple.codex_binary_digest = runtime_gate.binary_digest;
+    review_tuple.app_server_contract_id = app_server_contract_id;
+    review_tuple.transport_kind = "websocket";
+    review_tuple.code_mode_host_digest = code_mode_host_digest;
     output_receipt.account_fingerprint = review_tuple.account_fingerprint;
     output_receipt.account_fingerprint_reduced_protection = review_tuple.account_fingerprint_reduced_protection;
     output_receipt.codex_thread_id = review_tuple.codex_thread_id;
@@ -1273,12 +1557,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             existing_parent_event_log_path,
             codex_version,
         ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "the owner-lived review could not resume its selected " ++
+                    "parent before review/start; no review attempt was created",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1295,12 +1584,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     @errorName(err),
                     cwd,
                     output_receipt,
-                    .{
-                        .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not resume its " ++
-                            "selected parent before review/start; no review " ++
-                            "attempt was created",
-                    },
+                    failure,
                 );
             }
             return err;
@@ -1315,12 +1599,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             codex_version,
             .all,
         ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "the owner-lived review could not validate its selected " ++
+                    "parent before review/start; no review attempt was created",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1337,12 +1626,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     @errorName(err),
                     cwd,
                     output_receipt,
-                    .{
-                        .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not validate its " ++
-                            "selected parent before review/start; no review " ++
-                            "attempt was created",
-                    },
+                    failure,
                 );
             }
             return err;
@@ -1369,12 +1653,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         session_dir,
         parsed.custom_instructions,
     ) catch |err| {
+        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+            .code = "pre_review_start_failed",
+            .hint = "the owner-lived review failed before review/start; the exact " ++
+                "request may start one fresh attempt",
+        };
         updateReviewTupleLockBestEffort(
             allocator,
             tuple_lock_bundle.path,
             tuple_lock_bundle.lock,
             "pre_review_start_failed",
-            "pre_review_start_failed",
+            failure.code,
             null,
             null,
             null,
@@ -1391,11 +1680,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 @errorName(err),
                 cwd,
                 output_receipt,
-                .{
-                    .code = "pre_review_start_failed",
-                    .hint = "the owner-lived review failed before review/start; " ++
-                        "the exact request may start one fresh attempt",
-                },
+                failure,
             );
         }
         return err;
@@ -1425,13 +1710,18 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.timeout_ms,
             parsed.poll_interval_ms,
             codex_version,
-        ) catch {
+        ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "auto parent-mode could not bootstrap a materialized " ++
+                    "parent thread for this Codex runtime",
+            };
             updateReviewTupleLockBestEffort(
                 allocator,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
                 "pre_review_start_failed",
-                "pre_review_start_failed",
+                failure.code,
                 null,
                 null,
                 null,
@@ -1442,15 +1732,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 parsed.json,
                 "start",
                 "review/start",
-                "fresh detached review parent could not be materialized before detached review launch",
+                failure.hint,
                 cwd,
                 output_receipt,
-                .{
-                    .code = "pre_review_start_failed",
-                    .hint = "auto parent-mode could not bootstrap a materialized " ++
-                        "parent thread for this codex runtime; upgrade codex or " ++
-                        "pass a clean materialized --parent-thread-id",
-                },
+                failure,
             );
         };
         appendLogRecord(allocator, parent_event_log_path, "review/start", "note", "{\"compatibility\":\"pre-materialized-fresh-parent\"}") catch {};
@@ -1474,7 +1759,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     ) catch |err| blk: {
         const request_send_started = client.lastRequestSendStarted();
         const raw_message = client.lastError() orelse @errorName(err);
-        const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
+        const failure = failureInfoForReviewStart(err, raw_message, created_parent_thread);
         if (workflow_binding != null and request_send_started and
             failure != null and
             std.mem.eql(u8, failure.?.code, "account_resource_exhausted"))
@@ -1524,7 +1809,9 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 timeout_failure,
             );
         }
-        if (created_parent_thread and failure != null and !pre_materialize_parent) {
+        if (created_parent_thread and failure != null and
+            serverRequestProviderFailure(err) == null and !pre_materialize_parent)
+        {
             materializeParentThreadTurn(
                 allocator,
                 &client,
@@ -1572,7 +1859,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             ) catch |retry_err| {
                 const retry_send_started = client.lastRequestSendStarted();
                 const retry_message = client.lastError() orelse @errorName(retry_err);
-                const retry_failure = failureInfoForReviewStart(retry_message, created_parent_thread);
+                const retry_failure = failureInfoForReviewStart(
+                    retry_err,
+                    retry_message,
+                    created_parent_thread,
+                );
                 if (workflow_binding != null and retry_send_started and
                     retry_failure != null and
                     std.mem.eql(u8, retry_failure.?.code, "account_resource_exhausted"))
@@ -1770,9 +2061,13 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .last_observed_status = "inProgress",
         .codex_version = codex_version,
         .resolved_codex_path = resolved_codex_path,
+        .codex_binary_digest = runtime_gate.binary_digest,
+        .app_server_contract_id = app_server_contract_id,
         .compatibility_verdict = "compatible",
         .transport_kind = "websocket",
         .transport_selection_reason = "detached_review_requires_cross_process_truth",
+        .code_mode_host_redacted = code_mode_host_redacted,
+        .code_mode_host_digest = code_mode_host_digest,
         .managed_server_pid = managed_server_pid,
         .managed_server_listen_url = managed_server_listen_url,
         .managed_server_stderr_log_path = null,
@@ -2192,6 +2487,12 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             terminal_context_client_ptr,
             workflow_binding,
             terminal_status_from_grace,
+            resolved_codex_path,
+            codex_version,
+            runtime_gate.binary_digest,
+            app_server_contract_id,
+            "websocket",
+            code_mode_host_digest,
         );
         defer terminal_context.deinit(allocator);
         const terminal_binding_failure = try terminalReviewFailureAlloc(
@@ -2324,15 +2625,69 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         );
     }
 
-    const current_codex_path = try cas.resolveExecutableAlloc(allocator, "codex");
-    defer allocator.free(current_codex_path);
-    const current_codex_version = try readCodexVersionAlloc(
+    var runtime_gate = runReviewRuntimeGate(
         allocator,
         io,
         record.cwd,
-        current_codex_path,
-    );
-    defer allocator.free(current_codex_version);
+        record.resolved_codex_path,
+        null,
+    ) catch |err| {
+        try renderErrorAndExit(
+            parsed.json,
+            "wait",
+            "app-server/preflight",
+            @errorName(err),
+            record.cwd,
+            withRecordMultiAgentMode(.{
+                .surface_action = "wait",
+                .resolved_codex_path = record.resolved_codex_path,
+                .resolved_codex_version = record.codex_version,
+                .codex_binary_digest = record.codex_binary_digest,
+                .app_server_contract_id = record.app_server_contract_id,
+                .structured_review_capability = structured_review_capability,
+                .compatibility_verdict = "incompatible",
+                .selected_transport = record.transport_kind orelse "websocket",
+                .selection_reason = record.transport_selection_reason orelse
+                    "recorded_review_runtime",
+            }, record),
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "cas review wait requires the recorded exact Codex binary to continue " ++
+                    "satisfying the 0.146 review schema contract",
+            },
+        );
+    };
+    defer runtime_gate.deinit(allocator);
+    const current_codex_path = runtime_gate.resolved_path;
+    const current_codex_version = runtime_gate.version;
+    if (!std.mem.eql(u8, record.codex_binary_digest orelse "", runtime_gate.binary_digest) or
+        !std.mem.eql(u8, record.app_server_contract_id orelse "", app_server_contract_id))
+    {
+        try renderErrorAndExit(
+            parsed.json,
+            "wait",
+            "app-server/preflight",
+            "recorded Codex runtime identity no longer matches",
+            record.cwd,
+            withRecordMultiAgentMode(.{
+                .surface_action = "wait",
+                .resolved_codex_path = current_codex_path,
+                .resolved_codex_version = current_codex_version,
+                .codex_binary_digest = runtime_gate.binary_digest,
+                .app_server_contract_id = app_server_contract_id,
+                .structured_review_capability = structured_review_capability,
+                .compatibility_verdict = "incompatible",
+                .selected_transport = record.transport_kind orelse "websocket",
+                .selection_reason = record.transport_selection_reason orelse
+                    "recorded_review_runtime",
+            }, record),
+            .{
+                .code = "review_tuple_mismatch",
+                .hint = "the recorded review attempt is bound to a different Codex binary " ++
+                    "digest or app-server contract",
+            },
+        );
+    }
     var current_identity = try computeTargetIdentityAlloc(
         allocator,
         io,
@@ -2355,6 +2710,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 current_codex_path,
                 parsed.hook_policy,
                 true,
+                null,
                 io,
             );
             defer validation_server.deinit(allocator);
@@ -2389,6 +2745,10 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 record.workflowBinding,
             );
             defer current_tuple_for_replay.deinit(allocator);
+            current_tuple_for_replay.codex_binary_digest = runtime_gate.binary_digest;
+            current_tuple_for_replay.app_server_contract_id = app_server_contract_id;
+            current_tuple_for_replay.transport_kind = record.transport_kind orelse "websocket";
+            current_tuple_for_replay.code_mode_host_digest = record.code_mode_host_digest;
             break :validation try reviewTupleCurrentnessFailureAlloc(
                 allocator,
                 stored_tuple_for_replay,
@@ -2511,6 +2871,37 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             loaded.record_path,
             current_identity,
         );
+        if (serverRequestProviderFailure(err)) |failure| {
+            if (!try transitionActiveReviewTupleLockForRecord(
+                allocator,
+                record,
+                loaded.record_path,
+                "terminal",
+                failure.code,
+            )) {
+                try replayTerminalRecordAndExit(
+                    allocator,
+                    parsed.json,
+                    record,
+                    loaded.record_path,
+                    current_identity,
+                );
+                return error.InvalidReviewTupleLockBinding;
+            }
+            if (parsed.json) {
+                try printRecordedReviewFailureJson(
+                    allocator,
+                    .wait,
+                    record,
+                    loaded.record_path,
+                    stored_identity_opt,
+                    null,
+                    failure,
+                );
+                std.process.exit(1);
+            }
+            return err;
+        }
         if (isTransportLossError(err)) {
             var exact_lock = try loadExactReviewTupleLockForRecord(
                 allocator,
@@ -2568,7 +2959,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     }
     const previous_wait_deadline = client.swapRequestDeadlineMs(wait_deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_wait_deadline);
-    var current_tuple = try reviewTupleIdentityAlloc(
+    var current_tuple = reviewTupleIdentityAlloc(
         allocator,
         record.cwd,
         current_identity,
@@ -2576,8 +2967,37 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         current_codex_version,
         &client,
         record.workflowBinding,
-    );
+    ) catch |err| {
+        if (serverRequestProviderFailure(err)) |failure| {
+            try transitionReviewTupleLockForRecordOrReplay(
+                allocator,
+                parsed.json,
+                record,
+                loaded.record_path,
+                "terminal",
+                failure.code,
+                current_identity,
+            );
+            if (parsed.json) {
+                try printRecordedReviewFailureJson(
+                    allocator,
+                    .wait,
+                    record,
+                    loaded.record_path,
+                    stored_identity_opt,
+                    null,
+                    failure,
+                );
+                std.process.exit(1);
+            }
+        }
+        return err;
+    };
     defer current_tuple.deinit(allocator);
+    current_tuple.codex_binary_digest = runtime_gate.binary_digest;
+    current_tuple.app_server_contract_id = app_server_contract_id;
+    current_tuple.transport_kind = record.transport_kind orelse "websocket";
+    current_tuple.code_mode_host_digest = record.code_mode_host_digest;
     const attempt_codex_version = reviewAttemptRuntimeVersion(
         record.codex_version,
         current_codex_version,
@@ -2681,6 +3101,30 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             std.process.exit(1);
         },
         else => {
+            if (serverRequestProviderFailure(err)) |failure| {
+                try transitionReviewTupleLockForRecordOrReplay(
+                    allocator,
+                    parsed.json,
+                    record,
+                    loaded.record_path,
+                    "terminal",
+                    failure.code,
+                    current_identity,
+                );
+                if (parsed.json) {
+                    try printRecordedReviewFailureJson(
+                        allocator,
+                        .wait,
+                        record,
+                        loaded.record_path,
+                        stored_identity_opt,
+                        null,
+                        failure,
+                    );
+                    std.process.exit(1);
+                }
+                return err;
+            }
             if (isTransportLossError(err)) {
                 try transitionReviewTupleLockForRecordOrReplay(
                     allocator,
@@ -2798,6 +3242,12 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         terminal_context_client_ptr,
         record.workflowBinding,
         terminal_status_from_grace,
+        current_codex_path,
+        current_codex_version,
+        runtime_gate.binary_digest,
+        app_server_contract_id,
+        record.transport_kind orelse "websocket",
+        record.code_mode_host_digest,
     );
     defer terminal_context.deinit(allocator);
     const terminal_lock_failure = try terminalReviewFailureAlloc(
@@ -2876,6 +3326,11 @@ const NormalizedReceipt = struct {
     repo_realpath: ?[]const u8 = null,
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
+    codex_binary_digest: ?[]const u8 = null,
+    app_server_contract_id: ?[]const u8 = null,
+    selected_transport: ?[]const u8 = null,
+    code_mode_host_redacted: ?[]const u8 = null,
+    code_mode_host_digest: ?[]const u8 = null,
     codex_thread_id: ?[]const u8 = null,
     account_fingerprint: ?[]const u8 = null,
     review_thread_id: ?[]const u8,
@@ -2902,6 +3357,11 @@ const NormalizedReceipt = struct {
         if (self.repo_realpath) |value| allocator.free(value);
         if (self.resolved_codex_path) |value| allocator.free(value);
         if (self.resolved_codex_version) |value| allocator.free(value);
+        if (self.codex_binary_digest) |value| allocator.free(value);
+        if (self.app_server_contract_id) |value| allocator.free(value);
+        if (self.selected_transport) |value| allocator.free(value);
+        if (self.code_mode_host_redacted) |value| allocator.free(value);
+        if (self.code_mode_host_digest) |value| allocator.free(value);
         if (self.codex_thread_id) |value| allocator.free(value);
         if (self.account_fingerprint) |value| allocator.free(value);
         if (self.review_thread_id) |value| allocator.free(value);
@@ -3579,6 +4039,12 @@ fn captureTerminalReviewContext(
     client: *cas.Client,
     workflow_binding: ?WorkflowBinding,
     refresh_request_deadline: bool,
+    resolved_codex_path: []const u8,
+    resolved_codex_version: []const u8,
+    codex_binary_digest: []const u8,
+    contract_id: []const u8,
+    transport_kind: []const u8,
+    code_mode_host_digest: ?[]const u8,
 ) TerminalReviewContext {
     var context = TerminalReviewContext{};
     context.identity = computeTargetIdentityAlloc(
@@ -3588,10 +4054,8 @@ fn captureTerminalReviewContext(
         target,
         developer_instructions,
     ) catch null;
-    context.codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch null;
-    if (context.codex_path) |path| {
-        context.codex_version = readCodexVersionAlloc(allocator, io, cwd, path) catch null;
-    }
+    context.codex_path = allocator.dupe(u8, resolved_codex_path) catch null;
+    context.codex_version = allocator.dupe(u8, resolved_codex_version) catch null;
     if (context.identity) |identity| {
         if (context.codex_path) |path| {
             if (context.codex_version) |version| {
@@ -3611,6 +4075,12 @@ fn captureTerminalReviewContext(
                     client,
                     workflow_binding,
                 ) catch null;
+                if (context.tuple) |*tuple| {
+                    tuple.codex_binary_digest = codex_binary_digest;
+                    tuple.app_server_contract_id = contract_id;
+                    tuple.transport_kind = transport_kind;
+                    tuple.code_mode_host_digest = code_mode_host_digest;
+                }
             }
         }
     }
@@ -4168,11 +4638,17 @@ fn maybeResumeMaterializedThread(
     );
     defer allocator.free(params_json);
 
-    const resume_result_json = client.requestJson("thread/resume", params_json) catch return false;
+    const resume_result_json = client.requestJson("thread/resume", params_json) catch |err|
+        return materializedThreadResumeFailure(err);
     defer allocator.free(resume_result_json);
     try appendLogRecord(allocator, event_log_path, "thread/resume", "request", params_json);
     try appendLogRecord(allocator, event_log_path, "thread/resume", "response", resume_result_json);
     return true;
+}
+
+fn materializedThreadResumeFailure(err: anyerror) anyerror!bool {
+    if (serverRequestProviderFailure(err) != null) return err;
+    return false;
 }
 
 fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
@@ -4831,8 +5307,37 @@ fn terminalReviewTransportFailure(code: []const u8) ?FailureInfo {
     return null;
 }
 
+fn serverRequestProviderFailure(err: anyerror) ?FailureInfo {
+    return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable => .{
+            .code = "auth_refresh_provider_unavailable",
+            .hint = "Codex requested ChatGPT auth-token refresh, but this review " ++
+                "route has no exact credential provider",
+        },
+        error.AttestationProviderUnavailable => .{
+            .code = "attestation_provider_unavailable",
+            .hint = "Codex requested attestation generation, but this review route " ++
+                "has no exact attestation provider",
+        },
+        else => null,
+    };
+}
+
+fn serverRequestProviderFailureForCode(code: []const u8) ?FailureInfo {
+    if (std.mem.eql(u8, code, "auth_refresh_provider_unavailable")) {
+        return serverRequestProviderFailure(
+            error.ChatGptAuthTokensRefreshProviderUnavailable,
+        );
+    }
+    if (std.mem.eql(u8, code, "attestation_provider_unavailable")) {
+        return serverRequestProviderFailure(error.AttestationProviderUnavailable);
+    }
+    return null;
+}
+
 fn terminalReviewOwnerFailure(code: []const u8) ?FailureInfo {
     if (terminalReviewTransportFailure(code)) |failure| return failure;
+    if (serverRequestProviderFailureForCode(code)) |failure| return failure;
     if (std.mem.eql(u8, code, "review_owner_failed")) return .{
         .code = "review_owner_failed",
         .hint = "the owner-lived review process terminated after launch; " ++
@@ -4870,6 +5375,7 @@ fn workflowDeadOwnerFailureInfo(lock: ReviewTupleLock) FailureInfo {
 }
 
 fn workflowOwnedPostStartFailure(err: anyerror) FailureInfo {
+    if (serverRequestProviderFailure(err)) |failure| return failure;
     if (err == error.ConnectionTimedOut or err == error.WaitTimedOut) {
         return terminalReviewTransportFailure("review_transport_timeout").?;
     }
@@ -5379,17 +5885,39 @@ fn startManagedWebsocketServer(
     codex_path: []const u8,
     hook_policy: cas.hooks.HookPolicy,
     owner_lived: bool,
+    code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
     io: std.Io,
 ) !cas_websocket.ManagedServer {
     if (owner_lived) {
         const receipt_dir = try ownerLivedReceiptDirAlloc(allocator);
         defer allocator.free(receipt_dir);
+        if (code_mode_host) |host| {
+            return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
+                allocator,
+                cwd,
+                receipt_dir,
+                codex_path,
+                hook_policy,
+                host,
+                io,
+            );
+        }
         return cas_websocket.startOwnerLivedLoopbackServer(
             allocator,
             cwd,
             receipt_dir,
             codex_path,
             hook_policy,
+            io,
+        );
+    }
+    if (code_mode_host) |host| {
+        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
+            allocator,
+            cwd,
+            codex_path,
+            hook_policy,
+            host,
             io,
         );
     }
@@ -5698,6 +6226,15 @@ fn validateCurrentSessionRecordAlloc(
         return error.InvalidSessionRecord;
     const terminal_failure_fields_present = record.terminal_failure_code != null or
         record.terminal_failure_hint != null or record.terminal_failure_at_unix_s != null;
+    const version = parseSemverTriplet(record.codex_version);
+    const requires_0146_runtime_identity = if (version) |value|
+        value.major > 0 or value.minor >= 146
+    else
+        true;
+    const code_mode_identity_complete = (record.code_mode_host_redacted == null and
+        record.code_mode_host_digest == null) or
+        (nonEmptyOptional(record.code_mode_host_redacted) != null and
+            nonEmptyOptional(record.code_mode_host_digest) != null);
     if (terminal_failure_fields_present) {
         const code = nonEmptyOptional(record.terminal_failure_code) orelse
             return error.InvalidSessionRecord;
@@ -5734,6 +6271,14 @@ fn validateCurrentSessionRecordAlloc(
         nonEmptyOptional(record.review_turn_id) == null or
         nonEmptyOptional(record.event_log_path) == null or
         nonEmptyOptional(record.codex_version) == null or
+        (requires_0146_runtime_identity and
+            (nonEmptyOptional(record.codex_binary_digest) == null or
+                !std.mem.eql(
+                    u8,
+                    record.app_server_contract_id orelse "",
+                    app_server_contract_id,
+                ))) or
+        !code_mode_identity_complete or
         nonEmptyOptional(record.compatibility_verdict) == null or
         nonEmptyOptional(record.base_sha) == null or
         nonEmptyOptional(record.head_sha) == null or
@@ -5918,7 +6463,11 @@ fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: [
 }
 
 fn readAccountPrincipalAlloc(allocator: std.mem.Allocator, client: *cas.Client) !AccountPrincipalEvidence {
-    const account_json = client.requestJson("account/read", "{\"refreshToken\":false}") catch {
+    const account_json = client.requestJson(
+        "account/read",
+        "{\"refreshToken\":false}",
+    ) catch |err| {
+        if (serverRequestProviderFailure(err) != null) return err;
         return .{
             .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
             .reduced_protection = true,
@@ -5976,6 +6525,8 @@ fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewT
         allocator,
         "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\n" ++
             "resolved_codex_path={s}\nresolved_codex_version={s}\n" ++
+            "codex_binary_digest={s}\napp_server_contract_id={s}\n" ++
+            "transport_kind={s}\ncode_mode_host_digest={s}\n" ++
             "account_fingerprint={s}\naccount_fingerprint_reduced_protection={}\n" ++
             "codex_thread_id={s}\n",
         .{
@@ -5985,6 +6536,10 @@ fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewT
             tuple.target_fingerprint,
             tuple.resolved_codex_path,
             tuple.resolved_codex_version,
+            tuple.codex_binary_digest,
+            tuple.app_server_contract_id,
+            tuple.transport_kind,
+            tuple.code_mode_host_digest orelse "",
             tuple.account_fingerprint,
             tuple.account_fingerprint_reduced_protection,
             tuple.codex_thread_id,
@@ -6044,6 +6599,10 @@ fn storedReviewTupleIdentityAlloc(
         .target_fingerprint = target_fingerprint,
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = record.codex_version,
+        .codex_binary_digest = record.codex_binary_digest orelse "unbound",
+        .app_server_contract_id = record.app_server_contract_id orelse "unbound",
+        .transport_kind = record.transport_kind orelse "websocket",
+        .code_mode_host_digest = record.code_mode_host_digest,
         .account_fingerprint = account_copy,
         .account_fingerprint_reduced_protection = record.accountFingerprintReducedProtection,
         .codex_thread_id = codex_thread_copy,
@@ -6635,6 +7194,10 @@ fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: 
         .target_fingerprint = lock.targetFingerprint,
         .resolved_codex_path = lock.resolvedCodexPath,
         .resolved_codex_version = lock.resolvedCodexVersion,
+        .codex_binary_digest = lock.codexBinaryDigest,
+        .app_server_contract_id = lock.appServerContractId,
+        .transport_kind = lock.transportKind,
+        .code_mode_host_digest = lock.codeModeHostDigest,
         .account_fingerprint = lock.accountFingerprint,
         .account_fingerprint_reduced_protection = lock.accountFingerprintReducedProtection,
         .codex_thread_id = codex_thread_id,
@@ -6701,6 +7264,10 @@ fn makeReviewTupleLock(
         .targetFingerprint = tuple.target_fingerprint,
         .resolvedCodexPath = tuple.resolved_codex_path,
         .resolvedCodexVersion = tuple.resolved_codex_version,
+        .codexBinaryDigest = tuple.codex_binary_digest,
+        .appServerContractId = tuple.app_server_contract_id,
+        .transportKind = tuple.transport_kind,
+        .codeModeHostDigest = tuple.code_mode_host_digest,
         .accountFingerprint = tuple.account_fingerprint,
         .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
         .codexThreadId = tuple.codex_thread_id,
@@ -8183,7 +8750,19 @@ fn renderErrorAndExit(
             .cwd = cwd,
             .resolvedCodexPath = receipt.resolved_codex_path,
             .resolvedCodexVersion = receipt.resolved_codex_version,
+            .codexBinaryDigest = receipt.codex_binary_digest,
+            .appServerContractId = receipt.app_server_contract_id,
+            .structuredReviewCapability = receipt.structured_review_capability,
             .compatibilityVerdict = receipt.compatibility_verdict,
+            .selectedTransport = receipt.selected_transport,
+            .codeModeHost = if (receipt.code_mode_host_redacted != null or
+                receipt.code_mode_host_digest != null)
+                .{
+                    .origin = receipt.code_mode_host_redacted,
+                    .sha256 = receipt.code_mode_host_digest,
+                }
+            else
+                null,
             .requestedMultiAgentMode = if (receipt.requested_multi_agent_mode) |mode|
                 mode.configValue()
             else
@@ -8397,6 +8976,26 @@ fn printStatusJson(
     const review_text_json = if (status.review_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
+        receipt.code_mode_host_digest != null)
+        try stringifyAnyAlloc(allocator, .{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        })
+    else
+        "null";
     const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
     const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
     const managed_server_pid_json = if (receipt.managed_server_pid) |value|
@@ -8513,6 +9112,8 @@ fn printStatusJson(
             "\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s}," ++
             "\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s}," ++
             "\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s}," ++
+            "\"codexBinaryDigest\":{s},\"appServerContractId\":{s}," ++
+            "\"structuredReviewCapability\":{s},\"codeModeHost\":{s}," ++
             "\"compatibilityVerdict\":{s},\"selectedTransport\":{s}," ++
             "\"selectionReason\":{s},\"managedServerPid\":{s}," ++
             "\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s}," ++
@@ -8537,6 +9138,10 @@ fn printStatusJson(
             base_sha_json,
             resolved_codex_path_json,
             resolved_codex_version_json,
+            codex_binary_digest_json,
+            app_server_contract_id_json,
+            structured_review_capability_json,
+            code_mode_host_json,
             try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
             selected_transport_json,
             selection_reason_json,
@@ -8718,6 +9323,28 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writer.writeByte(':');
     try writeNullableJsonString(writer, receipt.resolved_codex_version);
     try writer.writeByte(',');
+    try writeJsonString(writer, "codexBinaryDigest");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_binary_digest);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "appServerContractId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.app_server_contract_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "selectedTransport");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.selected_transport);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "codeModeHost");
+    try writer.writeAll(":{");
+    try writeJsonString(writer, "origin");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.code_mode_host_redacted);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "sha256");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.code_mode_host_digest);
+    try writer.writeAll("},");
     try writeJsonString(writer, "accountFingerprint");
     try writer.writeByte(':');
     try writeNullableJsonString(writer, receipt.account_fingerprint);
@@ -8786,6 +9413,13 @@ fn startShadowReceiptPayloadJsonAlloc(
         .targetFingerprint = identity.fingerprint,
         .resolvedCodexPath = receipt.resolved_codex_path,
         .resolvedCodexVersion = receipt.resolved_codex_version,
+        .codexBinaryDigest = receipt.codex_binary_digest,
+        .appServerContractId = receipt.app_server_contract_id,
+        .selectedTransport = receipt.selected_transport,
+        .codeModeHost = .{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        },
         .codexThreadId = receipt.codex_thread_id,
         .recordPath = record_path,
         .eventLogPath = event_log_path,
@@ -8846,6 +9480,26 @@ fn printStartJson(
     const review_result_json = if (status) |value| value.review_result_json orelse "null" else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
+        try quoteJsonStringAlloc(allocator, value)
+    else
+        "null";
+    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
+        receipt.code_mode_host_digest != null)
+        try stringifyAnyAlloc(allocator, .{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        })
+    else
+        "null";
     const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
     const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
     const managed_server_pid_json = if (receipt.managed_server_pid) |value|
@@ -9027,7 +9681,9 @@ fn printStartJson(
     try stdout.print(
         ",\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s}," ++
             "\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s}," ++
-            "\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s}," ++
+            "\"resolvedCodexVersion\":{s},\"codexBinaryDigest\":{s}," ++
+            "\"appServerContractId\":{s},\"structuredReviewCapability\":{s}," ++
+            "\"codeModeHost\":{s},\"compatibilityVerdict\":{s}," ++
             "\"selectedTransport\":{s},\"selectionReason\":{s}," ++
             "\"managedServerPid\":{s},\"managedServerListenUrl\":{s}," ++
             "\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}," ++
@@ -9041,6 +9697,10 @@ fn printStartJson(
             try quoteJsonStringAlloc(allocator, receipt.resolved_codex_version orelse ""),
             resolved_codex_path_json,
             resolved_codex_version_json,
+            codex_binary_digest_json,
+            app_server_contract_id_json,
+            structured_review_capability_json,
+            code_mode_host_json,
             try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
             selected_transport_json,
             selection_reason_json,
@@ -9127,7 +9787,12 @@ fn hookSummaryFromEventLog(
     return summary;
 }
 
-fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: bool) ?FailureInfo {
+fn failureInfoForReviewStart(
+    err: anyerror,
+    raw_message: []const u8,
+    created_parent_thread: bool,
+) ?FailureInfo {
+    if (serverRequestProviderFailure(err)) |failure| return failure;
     if (detectAccountResourceExhaustion(raw_message)) return accountResourceExhaustedFailureInfo();
     if (created_parent_thread and std.mem.indexOf(u8, raw_message, "no rollout found for thread id") != null) {
         return .{
@@ -9773,6 +10438,15 @@ fn receiptResolvedCodexVersion(root: std.json.ObjectMap) ?[]const u8 {
         jsonStringField(root, "codex_version");
 }
 
+fn receiptCodeModeHostField(root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = root.get("codeModeHost") orelse root.get("code_mode_host") orelse return null;
+    const object = switch (value) {
+        .object => |item| item,
+        else => return null,
+    };
+    return jsonStringField(object, key);
+}
+
 fn receiptCodexThreadId(root: std.json.ObjectMap) ?[]const u8 {
     return optionalStringFromRootKeys(root, "codexThreadId", "codex_thread_id");
 }
@@ -10102,6 +10776,26 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(verdict, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10167,6 +10861,26 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10272,6 +10986,26 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
@@ -10456,6 +11190,26 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_binary_digest = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        ),
+        .app_server_contract_id = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        ),
+        .selected_transport = try dupOptional(
+            allocator,
+            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
+        ),
+        .code_mode_host_redacted = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "origin"),
+        ),
+        .code_mode_host_digest = try dupOptional(
+            allocator,
+            receiptCodeModeHostField(root, "sha256"),
+        ),
         .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try allocator.dupe(u8, review_thread_id),
@@ -10610,6 +11364,10 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
         "repo_realpath={s}\n" ++
             "resolved_codex_path={s}\n" ++
             "resolved_codex_version={s}\n" ++
+            "codex_binary_digest={s}\n" ++
+            "app_server_contract_id={s}\n" ++
+            "selected_transport={s}\n" ++
+            "code_mode_host_digest={s}\n" ++
             "account_fingerprint={s}\n" ++
             "codex_thread_id={s}\n" ++
             "backend_class={s}\n" ++
@@ -10635,6 +11393,10 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
             receipt.repo_realpath orelse "",
             receipt.resolved_codex_path orelse "",
             receipt.resolved_codex_version orelse "",
+            receipt.codex_binary_digest orelse "",
+            receipt.app_server_contract_id orelse "",
+            receipt.selected_transport orelse "",
+            receipt.code_mode_host_digest orelse "",
             receipt.account_fingerprint orelse "",
             receipt.codex_thread_id orelse "",
             receipt.backend_class,
@@ -10740,6 +11502,28 @@ fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !v
     try writer.writeByte(':');
     try writeNullableJsonString(writer, receipt.resolved_codex_version);
     try writer.writeByte(',');
+    try writeJsonString(writer, "codexBinaryDigest");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_binary_digest);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "appServerContractId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.app_server_contract_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "selectedTransport");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.selected_transport);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "codeModeHost");
+    try writer.writeAll(":{");
+    try writeJsonString(writer, "origin");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.code_mode_host_redacted);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "sha256");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.code_mode_host_digest);
+    try writer.writeAll("},");
     try writeJsonString(writer, "codexThreadId");
     try writer.writeByte(':');
     try writeNullableJsonString(writer, receipt.codex_thread_id);
@@ -11324,6 +12108,9 @@ fn accountResourceExhaustedFailureInfo() FailureInfo {
 fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
     const value = code orelse return null;
     if (failureCodeIsAccountResourceExhausted(value)) return "account_resource";
+    if (serverRequestProviderFailureForCode(value) != null) {
+        return "server_request_provider";
+    }
     if (std.mem.eql(u8, value, "review_transport_lost")) return "transport_review_attempt";
     if (std.mem.indexOf(u8, value, "transport") != null) return "transport_review_attempt";
     if (std.mem.eql(u8, value, "review_owner_failed")) return "owner_review_attempt";
@@ -11345,6 +12132,7 @@ fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
 fn retryableSameTupleNowForCode(code: ?[]const u8) ?bool {
     const value = code orelse return null;
     if (failureCodeIsAccountResourceExhausted(value)) return false;
+    if (serverRequestProviderFailureForCode(value) != null) return false;
     if (std.mem.eql(u8, value, "review_transport_lost")) return true;
     if (std.mem.eql(u8, value, "review_transport_timeout")) return true;
     if (std.mem.eql(u8, value, "review_owner_failed")) return true;
@@ -11887,6 +12675,43 @@ test "workflow-bound wait timeout is one terminal owner failure" {
     ));
 }
 
+test "server request provider failures retain terminal review identity" {
+    const cases = [_]struct {
+        err: anyerror,
+        code: []const u8,
+    }{
+        .{
+            .err = error.ChatGptAuthTokensRefreshProviderUnavailable,
+            .code = "auth_refresh_provider_unavailable",
+        },
+        .{
+            .err = error.AttestationProviderUnavailable,
+            .code = "attestation_provider_unavailable",
+        },
+    };
+    for (cases) |case| {
+        const failure = workflowOwnedPostStartFailure(case.err);
+        try std.testing.expectEqualStrings(case.code, failure.code);
+        try std.testing.expectEqualStrings(
+            "server_request_provider",
+            failureClassForCode(failure.code).?,
+        );
+        try std.testing.expectEqual(false, retryableSameTupleNowForCode(failure.code).?);
+        const replay = terminalReviewOwnerFailure(failure.code).?;
+        try std.testing.expectEqualStrings(failure.code, replay.code);
+        const pre_start = failureInfoForReviewStart(case.err, "opaque", false).?;
+        try std.testing.expectEqualStrings(failure.code, pre_start.code);
+        try std.testing.expectError(
+            case.err,
+            materializedThreadResumeFailure(case.err),
+        );
+    }
+    try std.testing.expectEqual(
+        false,
+        try materializedThreadResumeFailure(error.RequestFailed),
+    );
+}
+
 test "terminal-only thread reads omit polling snapshots and retain terminal evidence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12121,7 +12946,9 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
             "\"transport_kind\":\"websocket\",\"transport_selection_reason\":" ++
             "\"detached_review_requires_cross_process_truth\",\"event_log_path\":\"{s}\"," ++
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
-            "\"codex_version\":\"codex-cli test\",\"resolved_codex_path\":\"/bin/codex\"," ++
+            "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
+            "\"codex_binary_digest\":\"sha256:test\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\"," ++
@@ -12167,7 +12994,9 @@ test "session record owns and validates workflow binding across reload" {
             "\"transport_kind\":\"websocket\",\"transport_selection_reason\":" ++
             "\"detached_review_requires_cross_process_truth\",\"event_log_path\":\"{s}\"," ++
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
-            "\"codex_version\":\"codex-cli test\",\"resolved_codex_path\":\"/bin/codex\"," ++
+            "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
+            "\"codex_binary_digest\":\"sha256:test\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\",\"accountFingerprintReducedProtection\":false," ++
@@ -12243,8 +13072,10 @@ test "current session record rejects relocation and incomplete custody" {
         .event_log_path = "/repo/.ledger/cas/review_sessions/thr.events.ndjson",
         .created_at_unix_s = 1,
         .last_observed_status = "inProgress",
-        .codex_version = "codex-cli test",
+        .codex_version = "codex-cli 0.146.0",
         .resolved_codex_path = "/bin/codex",
+        .codex_binary_digest = "sha256:test",
+        .app_server_contract_id = app_server_contract_id,
         .compatibility_verdict = "compatible",
         .transport_kind = "websocket",
         .transport_selection_reason = "detached_review_requires_cross_process_truth",
@@ -14777,7 +15608,11 @@ test "account resource exhaustion detector accepts required signals" {
 }
 
 test "account resource exhaustion maps start and terminal status failures" {
-    const start_failure = failureInfoForReviewStart("review/start failed: usageLimitExceeded", false).?;
+    const start_failure = failureInfoForReviewStart(
+        error.RequestFailed,
+        "review/start failed: usageLimitExceeded",
+        false,
+    ).?;
     try std.testing.expectEqualStrings("account_resource_exhausted", start_failure.code);
 
     var status = ReviewStatus{
@@ -15669,7 +16504,11 @@ test "terminalLockFailureForStatus maps malformed structured verdict to invalid 
 }
 
 test "failureInfoForReviewStart maps detached parent rollout error" {
-    const failure = failureInfoForReviewStart("no rollout found for thread id thr_123", true).?;
+    const failure = failureInfoForReviewStart(
+        error.RequestFailed,
+        "no rollout found for thread id thr_123",
+        true,
+    ).?;
     try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
 }
 
@@ -15972,7 +16811,7 @@ test "review tuple hash is stable and account-bound" {
     defer std.testing.allocator.free(hash_b);
 
     try std.testing.expectEqualStrings(
-        "sha256:4b29e5034fbfe5a15e7abb9898bc9bc317b83c15c0b93106fc53a874710d5fbd",
+        "sha256:c66dd7a40b9685685c7ae5bad41339208e92239f763bde715e664c7886a1de0d",
         hash_a,
     );
     try std.testing.expectEqualStrings(hash_a, hash_a_again);
@@ -17420,4 +18259,56 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
     try std.testing.expect(durable_store.fileExists(claim_path));
     lease.deinit(std.testing.allocator);
     try std.testing.expect(!durable_store.fileExists(claim_path));
+}
+
+test "review runtime gate requires live managed structured-review preflight" {
+    const allocator = std.testing.allocator;
+    const valid =
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
+    ;
+    var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
+    defer gate.deinit(allocator);
+    try std.testing.expectEqualStrings("/tmp/codex", gate.resolved_path);
+    try std.testing.expectEqualStrings("codex-cli 0.146.0", gate.version);
+
+    const schema_only =
+        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
+    ;
+    try std.testing.expectError(
+        error.IncompatibleReviewRuntime,
+        parseReviewRuntimeGateAlloc(allocator, schema_only),
+    );
+}
+
+test "review behavioral gate rejects missing failed or duplicate required probes" {
+    var passed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"id\":\"initialize-lifecycle\",\"requirement\":\"required\",\"status\":\"passed\"}," ++
+            "{\"id\":\"managed-websocket-transport\",\"requirement\":\"required\"," ++
+            "\"status\":\"passed\"},{\"id\":\"server-request-coverage\"," ++
+            "\"requirement\":\"required\",\"status\":\"passed\"}," ++
+            "{\"id\":\"bounded-overload-retry\",\"requirement\":\"required\"," ++
+            "\"status\":\"passed\"},{\"id\":\"structured-review\"," ++
+            "\"requirement\":\"required\",\"status\":\"passed\"}]",
+        .{},
+    );
+    defer passed.deinit();
+    try std.testing.expect(reviewBehavioralProbesPassed(passed.value));
+    var missing = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"id\":\"structured-review\",\"requirement\":\"required\",\"status\":\"passed\"}]",
+        .{},
+    );
+    defer missing.deinit();
+    try std.testing.expect(!reviewBehavioralProbesPassed(missing.value));
+    var failed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"id\":\"initialize-lifecycle\",\"requirement\":\"required\",\"status\":\"failed\"}]",
+        .{},
+    );
+    defer failed.deinit();
+    try std.testing.expect(!reviewBehavioralProbesPassed(failed.value));
 }

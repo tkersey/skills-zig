@@ -97,7 +97,7 @@ for token in \
   '"libs/definition_compat/**"' \
   '"tools/perf_contract.zig"' \
   'perf=${selected[seq]:-false}' \
-  '${selected[cron]:-false}' \
+  '${selected[cas]:-false}' \
   "grep -Fxq 'build.zig'" \
   "grep -Fxq 'tools/perf_contract.zig'" \
   "if: needs.changes.outputs.perf == 'true'" \
@@ -107,5 +107,11 @@ for token in \
     exit 1
   fi
 done
+
+
+if grep -Fq -- '${selected[cron]:-false}' "$workflow"; then
+  echo "Performance CI still routes through retired Cron release identity" >&2
+  exit 1
+fi
 
 echo "Seq CI proof matrix is valid."

@@ -1,11 +1,11 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
 const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
+const inquiry_anchor = @import("cas_session_inquiry_anchor");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
 const canonical_trace = trace_core;
@@ -17,6 +17,9 @@ const MaxInquiryForks: u64 = 4;
 const MaxInquiryLanes: usize = 16;
 const MaxInquiryTokens: u64 = 1_000_000;
 const MaxInquiryTimeoutMs: u64 = 2_700_000;
+const MaxThreadHistoryPages: usize = 1024;
+const ThreadHistoryPageLimit: u32 = 100;
+const AppServerContractId = "codex-app-server-0.146.0";
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas_session_inquiry",
@@ -29,7 +32,7 @@ const UsageText =
     \\Safe Codex app-server experiment controller for historical decision replay.
     \\
     \\Usage:
-    \\  cas_session_inquiry preflight [--cwd PATH] [--transport auto|stdio|websocket] [--json]
+    \\  cas_session_inquiry preflight [--cwd PATH] [--transport auto|managed-ws] [--codex-path PATH] [--code-mode-host URL] [--json]
     \\  cas_session_inquiry run --capsule FILE --capsule-definition FILE --capsule-validation FILE --plan FILE --plan-definition FILE --plan-validation FILE --receipt-dir PATH [--json]
     \\  cas_session_inquiry start --capsule FILE --capsule-definition FILE --capsule-validation FILE --plan FILE --plan-definition FILE --plan-validation FILE --receipt-dir PATH [--json]
     \\  cas_session_inquiry status --inquiry-id ID [--json]
@@ -56,7 +59,9 @@ const UsageText =
     \\  --hooks inherit|off|require-observed
     \\  --timeout-ms N
     \\  --max-total-tokens N
-    \\  --transport auto|stdio|websocket
+    \\  --transport auto|managed-ws
+    \\  --codex-path PATH
+    \\  --code-mode-host ws://LOOPBACK|wss://HOST
     \\  --store-root DIR
     \\  --json
     \\  --verdict-only
@@ -107,6 +112,8 @@ const FailureCode = enum {
     receipt_invalid,
     budget_exhausted,
     inquiry_transport_lost,
+    auth_refresh_provider_unavailable,
+    attestation_provider_unavailable,
     cleanup_failed,
     codex_incompatible,
     schema_unavailable,
@@ -158,6 +165,7 @@ const Options = struct {
     receipt_format: []const u8 = "table",
     receipt_summary: bool = false,
     codex_path: []const u8 = "codex",
+    code_mode_host: ?[]const u8 = null,
     store_root: ?[]const u8 = null,
     home: []const u8 = "",
     path_env: []const u8 = "",
@@ -253,13 +261,32 @@ const SchemaCapabilities = struct {
     fork_permissions_field: bool,
     fork_sandbox_field: bool,
     fork_path_field: bool,
+    fork_last_turn_id_field: bool,
+    fork_before_turn_id_field: bool,
+    fork_exclude_turns_field: bool,
+    fork_lineage_field: bool,
     rollback_num_turns: bool,
+    turns_list_cursor_field: bool,
+    turns_list_limit_field: bool,
+    turns_list_sort_direction_field: bool,
+    turns_list_items_view_field: bool,
+    turns_list_data_field: bool,
+    turns_list_next_cursor_field: bool,
     shell_command_present: bool,
 
     fn exactAnchorSupported(self: SchemaCapabilities) bool {
-        return self.thread_fork and self.thread_rollback and
+        return self.paginatedAnchorSupported() and
             (self.thread_read or self.thread_turns_list) and
-            self.ephemeral_fork_field and self.rollback_num_turns;
+            self.ephemeral_fork_field;
+    }
+
+    fn paginatedAnchorSupported(self: SchemaCapabilities) bool {
+        return self.thread_fork and self.thread_read and self.thread_turns_list and
+            self.fork_last_turn_id_field and self.fork_before_turn_id_field and
+            self.fork_exclude_turns_field and self.fork_lineage_field and
+            self.turns_list_cursor_field and self.turns_list_limit_field and
+            self.turns_list_sort_direction_field and self.turns_list_items_view_field and
+            self.turns_list_data_field and self.turns_list_next_cursor_field;
     }
 
     fn rolloutTranscriptSupported(self: SchemaCapabilities) bool {
@@ -282,7 +309,17 @@ fn zeroCapabilities() SchemaCapabilities {
         .fork_permissions_field = false,
         .fork_sandbox_field = false,
         .fork_path_field = false,
+        .fork_last_turn_id_field = false,
+        .fork_before_turn_id_field = false,
+        .fork_exclude_turns_field = false,
+        .fork_lineage_field = false,
         .rollback_num_turns = false,
+        .turns_list_cursor_field = false,
+        .turns_list_limit_field = false,
+        .turns_list_sort_direction_field = false,
+        .turns_list_items_view_field = false,
+        .turns_list_data_field = false,
+        .turns_list_next_cursor_field = false,
         .shell_command_present = false,
     };
 }
@@ -296,9 +333,42 @@ const PreflightResult = struct {
     selected_transport: []const u8,
     capabilities: SchemaCapabilities,
     thread_fork_replay: bool,
+    paginated_thread_fork: bool,
     rollout_transcript_replay: bool,
+    code_mode_host_redacted: ?[]const u8,
+    code_mode_host_digest: ?[]const u8,
     missing: []const []const u8,
     inquiry_allowed: bool,
+};
+
+const SharedSessionInquiryPreflight = struct {
+    overall_compatible: bool,
+    route_neutral_compatible: bool,
+    codex_path: []u8,
+    codex_version: []u8,
+    experimental_path: []u8,
+    cache_dir: []u8,
+    stable_schema_digest: []u8,
+    experimental_schema_digest: []u8,
+    selected_transport: []u8,
+    paginated_fork_passed: bool,
+    ephemeral_fork_passed: bool,
+    paginated_inquiry_passed: bool,
+    code_mode_host_redacted: ?[]u8,
+    code_mode_host_digest: ?[]u8,
+
+    fn deinit(self: *SharedSessionInquiryPreflight, allocator: std.mem.Allocator) void {
+        allocator.free(self.codex_path);
+        allocator.free(self.codex_version);
+        allocator.free(self.experimental_path);
+        allocator.free(self.cache_dir);
+        allocator.free(self.stable_schema_digest);
+        allocator.free(self.experimental_schema_digest);
+        allocator.free(self.selected_transport);
+        if (self.code_mode_host_redacted) |value| allocator.free(value);
+        if (self.code_mode_host_digest) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 const GateResult = struct {
@@ -421,8 +491,31 @@ const DetachedRecord = struct {
     managed_server_pid: u64,
     codex_version: []const u8,
     schema_fingerprint: []const u8,
+    code_mode_host_redacted: []const u8,
+    code_mode_host_digest: []const u8,
     failure_code: []const u8,
     failure_hint: []const u8,
+};
+
+const ThreadHistoryMode = enum {
+    legacy,
+    paginated,
+};
+
+const ThreadHistorySnapshot = struct {
+    mode: ThreadHistoryMode,
+    digest: TurnDigest,
+    retained_digest: ?TurnDigest = null,
+    turn_ids: []const []const u8,
+    completed_boundaries: []const bool,
+
+    fn deinit(self: ThreadHistorySnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.digest.digest);
+        if (self.retained_digest) |digest| allocator.free(digest.digest);
+        for (self.turn_ids) |turn_id| allocator.free(turn_id);
+        allocator.free(self.turn_ids);
+        allocator.free(self.completed_boundaries);
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -438,9 +531,9 @@ pub fn main(init: std.process.Init) !void {
     configured_store_cwd = options.cwd;
 
     switch (options.command) {
-        .preflight => try cmdPreflight(allocator, options),
-        .run => try cmdRun(allocator, options, false),
-        .start => try cmdRun(allocator, options, true),
+        .preflight => try cmdPreflight(allocator, init.io, options),
+        .run => try cmdRun(allocator, init.io, options, false),
+        .start => try cmdRun(allocator, init.io, options, true),
         .status => try cmdStatus(allocator, options),
         .wait => try cmdWait(allocator, options),
         .interrupt => try cmdInterrupt(allocator, options),
@@ -502,7 +595,7 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.max_total_tokens = try parsePositiveU64(try takeValue(argv, &i, arg));
         } else if (std.mem.eql(u8, arg, "--transport")) {
             const value = try takeValue(argv, &i, arg);
-            if (!isOneOf(value, &.{ "auto", "stdio", "websocket" })) return error.InvalidTransport;
+            if (!isOneOf(value, &.{ "auto", "managed-ws" })) return error.InvalidTransport;
             options.transport = value;
         } else if (std.mem.eql(u8, arg, "--glob")) {
             options.receipt_glob = try takeValue(argv, &i, arg);
@@ -512,6 +605,8 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.receipt_format = value;
         } else if (std.mem.eql(u8, arg, "--codex-path")) {
             options.codex_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--code-mode-host")) {
+            options.code_mode_host = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--store-root")) {
             const value = try takeValue(argv, &i, arg);
             if (value.len == 0) return error.InvalidStoreRoot;
@@ -558,8 +653,8 @@ fn isSafePathComponent(value: []const u8) bool {
     return true;
 }
 
-fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
-    const result = runPreflight(allocator, options) catch |err| {
+fn cmdPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+    const result = runPreflight(allocator, io, options) catch |err| {
         try printPreflightFailure(allocator, options, err);
         std.process.exit(1);
     };
@@ -568,7 +663,7 @@ fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
     if (!result.inquiry_allowed) std.process.exit(2);
 }
 
-fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void {
+fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: bool) !void {
     const capsule_path = options.capsule_path orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--capsule");
     };
@@ -698,7 +793,7 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     }
 
     const preflight_allocator = std.heap.page_allocator;
-    const preflight = runPreflight(preflight_allocator, bound_options) catch |err| {
+    const preflight = runPreflight(preflight_allocator, io, bound_options) catch |err| {
         const failed = GateResult{
             .valid = false,
             .failure_code = .codex_incompatible,
@@ -717,12 +812,20 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         std.process.exit(1);
     };
     defer deinitPreflightResult(preflight_allocator, preflight);
-    if (!preflight.inquiry_allowed) {
+    const selected_lineage_supported = if (dcp.source_thread_id != null)
+        preflight.thread_fork_replay
+    else
+        preflight.rollout_transcript_replay;
+    if (!preflight.inquiry_allowed or !selected_lineage_supported) {
         const failed = GateResult{
             .valid = false,
             .failure_code = .codex_incompatible,
-            .hint = "installed Codex app-server lacks required " ++
-                "fork/rollback/read/turn capabilities",
+            .hint = if (dcp.source_thread_id != null)
+                "exact Codex app-server preflight did not prove the required " ++
+                    "paginated thread-fork inquiry behavior"
+            else
+                "exact Codex app-server preflight did not prove the required " ++
+                    "rollout-transcript inquiry behavior",
         };
         try persistInvalidRunArtifacts(
             allocator,
@@ -1053,25 +1156,24 @@ fn cmdReceipt(allocator: std.mem.Allocator, options: Options) !void {
     if (invalid > 0) std.process.exit(2);
 }
 
-fn runPreflight(allocator: std.mem.Allocator, options: Options) !PreflightResult {
-    const codex_path = resolveExecutablePathAlloc(allocator, options.codex_path, options.path_env) catch |err| switch (err) {
-        error.CodexUnavailable => allocator.dupe(u8, options.codex_path) catch return error.CodexPathAllocFailed,
-        else => return err,
-    };
-    const version = codexVersionAlloc(allocator, codex_path, options.cwd, options.path_env) catch return error.CodexVersionUnavailable;
-    const cache_dir = schemaCacheDirAlloc(allocator, options.home, version) catch return error.SchemaCacheDirFailed;
-    ensureDir(cache_dir) catch return error.SchemaCacheDirFailed;
-    const schema_path = std.fmt.allocPrint(allocator, "{s}/codex_app_server_protocol.v2.schemas.json", .{cache_dir}) catch return error.SchemaPathFailed;
-    defer allocator.free(schema_path);
-    generateSchema(allocator, codex_path, options.cwd, cache_dir) catch |err| {
-        if (!fileExists(schema_path)) return err;
-    };
-    const schema_text = readFileAlloc(allocator, schema_path, MaxSchemaBytes) catch return error.SchemaReadFailed;
-    defer allocator.free(schema_text);
-    const fingerprint = sha256HexAlloc(allocator, schema_text) catch return error.SchemaFingerprintFailed;
-    const caps = deriveCapabilities(schema_text);
+fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !PreflightResult {
+    var shared = try runSharedSessionInquiryPreflight(allocator, io, options);
+    defer shared.deinit(allocator);
+    const fingerprint_source = try std.fmt.allocPrint(
+        allocator,
+        "cas-session-inquiry-schema-fingerprint/v1\x00{s}\x00{s}",
+        .{ shared.stable_schema_digest, shared.experimental_schema_digest },
+    );
+    defer allocator.free(fingerprint_source);
+    const fingerprint = sha256HexAlloc(allocator, fingerprint_source) catch
+        return error.SchemaFingerprintFailed;
+    errdefer allocator.free(fingerprint);
+    const caps = try deriveCapabilitiesFromCache(allocator, shared.experimental_path);
     var missing: std.ArrayList([]const u8) = .empty;
     defer missing.deinit(allocator);
+    if (!shared.route_neutral_compatible) {
+        try missing.append(allocator, "codex-app-server/session-inquiry-profile");
+    }
     if (!caps.thread_fork) try missing.append(allocator, "thread/fork");
     if (!caps.thread_rollback) try missing.append(allocator, "thread/rollback");
     if (!caps.thread_start) try missing.append(allocator, "thread/start");
@@ -1081,25 +1183,335 @@ fn runPreflight(allocator: std.mem.Allocator, options: Options) !PreflightResult
     if (!caps.thread_archive and !caps.thread_delete) try missing.append(allocator, "thread/archive-or-thread/delete");
     if (!caps.ephemeral_fork_field) try missing.append(allocator, "thread/fork.ephemeral");
     if (!caps.fork_permissions_field and !caps.fork_sandbox_field) try missing.append(allocator, "thread/fork.read-only-permissions");
-    if (!caps.rollback_num_turns) try missing.append(allocator, "thread/rollback.numTurns");
+    if (!caps.fork_last_turn_id_field) try missing.append(allocator, "thread/fork.lastTurnId");
+    if (!caps.fork_before_turn_id_field) try missing.append(allocator, "thread/fork.beforeTurnId");
+    if (!caps.fork_exclude_turns_field) try missing.append(allocator, "thread/fork.excludeTurns");
+    if (!caps.fork_lineage_field) {
+        try missing.append(allocator, "thread/fork.response.thread.forkedFromId");
+    }
+    if (!caps.turns_list_cursor_field or
+        !caps.turns_list_limit_field or
+        !caps.turns_list_sort_direction_field or
+        !caps.turns_list_items_view_field or
+        !caps.turns_list_data_field or
+        !caps.turns_list_next_cursor_field)
+    {
+        try missing.append(allocator, "thread/turns/list.pagination-shape");
+    }
+    if (!shared.paginated_fork_passed) {
+        try missing.append(allocator, "thread/fork.paginated-behavior");
+    }
+    if (!shared.ephemeral_fork_passed) {
+        try missing.append(allocator, "thread/fork.ephemeral-behavior");
+    }
+    if (!shared.paginated_inquiry_passed) {
+        try missing.append(allocator, "session-inquiry.paginated-behavior");
+    }
 
     const missing_owned = try allocator.dupe([]const u8, missing.items);
-    const thread_fork_replay = caps.exactAnchorSupported() and caps.turn_start and caps.turn_interrupt and (caps.thread_archive or caps.thread_delete) and (caps.fork_permissions_field or caps.fork_sandbox_field);
-    const rollout_transcript_replay = caps.rolloutTranscriptSupported();
+    errdefer allocator.free(missing_owned);
+    const thread_fork_replay = shared.route_neutral_compatible and shared.paginated_fork_passed and
+        shared.ephemeral_fork_passed and shared.paginated_inquiry_passed and
+        caps.exactAnchorSupported() and caps.turn_start and caps.turn_interrupt and
+        (caps.thread_archive or caps.thread_delete) and
+        (caps.fork_permissions_field or caps.fork_sandbox_field);
+    const rollout_transcript_replay =
+        shared.route_neutral_compatible and caps.rolloutTranscriptSupported();
     const allowed = thread_fork_replay or rollout_transcript_replay;
+    const codex_path = try allocator.dupe(u8, shared.codex_path);
+    errdefer allocator.free(codex_path);
+    const codex_version = try allocator.dupe(u8, shared.codex_version);
+    errdefer allocator.free(codex_version);
+    const cache_dir = try allocator.dupe(u8, shared.cache_dir);
+    errdefer allocator.free(cache_dir);
+    const code_mode_host_redacted = try dupeOptionalString(
+        allocator,
+        shared.code_mode_host_redacted,
+    );
+    errdefer if (code_mode_host_redacted) |value| allocator.free(value);
+    const code_mode_host_digest = try dupeOptionalString(allocator, shared.code_mode_host_digest);
+    errdefer if (code_mode_host_digest) |value| allocator.free(value);
     return .{
         .compatibility_verdict = if (allowed) "compatible" else "incompatible",
         .codex_path = codex_path,
-        .codex_version = version,
+        .codex_version = codex_version,
         .schema_fingerprint = fingerprint,
         .cache_dir = cache_dir,
-        .selected_transport = if (std.mem.eql(u8, options.transport, "auto")) "stdio" else options.transport,
+        .selected_transport = "managed-ws",
         .capabilities = caps,
         .thread_fork_replay = thread_fork_replay,
+        .paginated_thread_fork = thread_fork_replay and caps.paginatedAnchorSupported(),
         .rollout_transcript_replay = rollout_transcript_replay,
+        .code_mode_host_redacted = code_mode_host_redacted,
+        .code_mode_host_digest = code_mode_host_digest,
         .missing = missing_owned,
         .inquiry_allowed = allowed,
     };
+}
+
+fn runSharedSessionInquiryPreflight(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+) !SharedSessionInquiryPreflight {
+    const self_path = std.process.executablePathAlloc(io, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.PreflightExecutablePathOutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(self_path);
+    const executable_dir = std.fs.path.dirname(self_path) orelse return error.InvalidExecutablePath;
+    const preflight_path = std.fs.path.join(
+        allocator,
+        &.{ executable_dir, "cas_app_server_preflight" },
+    ) catch
+        return error.PreflightPathOutOfMemory;
+    defer allocator.free(preflight_path);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    argv.appendSlice(allocator, &.{
+        preflight_path,
+        "preflight",
+        "--cwd",
+        options.cwd,
+        "--codex-path",
+        options.codex_path,
+        "--profile",
+        "session-inquiry",
+        "--app-server-transport",
+        "managed-ws",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.PreflightArgumentsOutOfMemory,
+    };
+    if (options.code_mode_host) |host| {
+        argv.appendSlice(allocator, &.{ "--code-mode-host", host }) catch
+            return error.PreflightArgumentsOutOfMemory;
+    }
+    argv.append(allocator, "--json") catch return error.PreflightArgumentsOutOfMemory;
+
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = if (std.mem.eql(u8, options.cwd, ".")) .inherit else .{ .path = options.cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.PreflightProcessOutOfMemory,
+        else => return err,
+    };
+    defer child.kill(io);
+    const stdout_file = child.stdout orelse return error.PreflightMissingStdout;
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_reader = stdout_file.reader(io, &stdout_buffer);
+    const stdout = stdout_reader.interface.allocRemaining(
+        allocator,
+        .limited(2 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return error.PreflightOutputTooLarge,
+        error.OutOfMemory => return error.PreflightOutputOutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(stdout);
+    const term = try child.wait(io);
+    const exit_code: u8 = switch (term) {
+        .exited => |code| code,
+        else => return error.AppServerPreflightFailed,
+    };
+    if (exit_code > 1) return error.AppServerPreflightFailed;
+    var receipt = parseSharedSessionInquiryPreflightAlloc(
+        allocator,
+        stdout,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.PreflightReceiptOutOfMemory,
+        else => return err,
+    };
+    errdefer receipt.deinit(allocator);
+    if ((exit_code == 0) != receipt.overall_compatible) {
+        return error.AppServerPreflightStatusMismatch;
+    }
+    const host_identity_present = receipt.code_mode_host_redacted != null and
+        receipt.code_mode_host_digest != null;
+    if ((options.code_mode_host != null) != host_identity_present) {
+        return error.AppServerPreflightHostIdentityMismatch;
+    }
+    return receipt;
+}
+
+fn parseSharedSessionInquiryPreflightAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !SharedSessionInquiryPreflight {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidAppServerPreflightReceipt,
+    };
+    if (!std.mem.eql(u8, try requiredString(root, "schema"), "cas-app-server-preflight/v1") or
+        !std.mem.eql(u8, try requiredString(root, "action"), "preflight") or
+        !std.mem.eql(u8, try requiredString(root, "profile"), "session-inquiry") or
+        !std.mem.eql(u8, try requiredString(root, "contractId"), AppServerContractId))
+    {
+        return error.InvalidAppServerPreflightReceipt;
+    }
+    const status = try requiredString(root, "status");
+    if (!std.mem.eql(u8, status, "compatible") and !std.mem.eql(u8, status, "incompatible"))
+        return error.InvalidAppServerPreflightReceipt;
+    const codex = rootObject(root, "codex") orelse return error.InvalidAppServerPreflightReceipt;
+    const schemas = rootObject(root, "schemas") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const methods = rootObject(root, "methods") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const handler_coverage = rootObject(root, "handlerCoverage") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const shape_checks = rootObject(root, "shapeChecks") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const transport = rootObject(root, "transport") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const probes_value = root.get("behavioralProbes") orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const experimental_path = try requiredString(schemas, "experimentalPath");
+    const cache_dir_slice = std.fs.path.dirname(experimental_path) orelse
+        return error.InvalidAppServerPreflightReceipt;
+    const stable_schema_digest_raw = try requiredString(schemas, "stableDigest");
+    const experimental_schema_digest_raw = try requiredString(schemas, "experimentalDigest");
+    if (!isSha256Digest(stable_schema_digest_raw) or
+        !isSha256Digest(experimental_schema_digest_raw))
+        return error.InvalidAppServerPreflightReceipt;
+    const selected_transport = try requiredString(transport, "selected");
+    if (!std.mem.eql(u8, selected_transport, "managed-ws")) {
+        return error.InvalidAppServerPreflightReceipt;
+    }
+    const structural_compatible = try requiredListLen(methods, "missingRequired") == 0 and
+        std.mem.eql(u8, try requiredString(handler_coverage, "status"), "passed") and
+        try requiredListLen(handler_coverage, "failures") == 0 and
+        std.mem.eql(u8, try requiredString(shape_checks, "status"), "passed") and
+        try requiredListLen(shape_checks, "failures") == 0;
+    const route_neutral_probes_passed = routeNeutralBehavioralProbesPassed(probes_value);
+    const route_neutral_compatible = structural_compatible and route_neutral_probes_passed;
+    const full_profile_probes_passed = route_neutral_probes_passed and
+        requiredBehavioralProbePassed(probes_value, "paginated-fork") and
+        requiredBehavioralProbePassed(probes_value, "ephemeral-fork") and
+        requiredBehavioralProbePassed(probes_value, "paginated-session-inquiry");
+    const overall_compatible = std.mem.eql(u8, status, "compatible") and
+        structural_compatible and full_profile_probes_passed;
+
+    var code_mode_host_redacted: ?[]u8 = null;
+    errdefer if (code_mode_host_redacted) |value| allocator.free(value);
+    var code_mode_host_digest: ?[]u8 = null;
+    errdefer if (code_mode_host_digest) |value| allocator.free(value);
+    if (transport.get("codeModeHost")) |identity_value| switch (identity_value) {
+        .null => {},
+        .object => |identity| {
+            code_mode_host_redacted = try allocator.dupe(
+                u8,
+                try requiredString(identity, "origin"),
+            );
+            const digest = try requiredString(identity, "sha256");
+            if (!isLowerSha256Hex(digest)) return error.InvalidAppServerPreflightReceipt;
+            code_mode_host_digest = try std.fmt.allocPrint(allocator, "sha256:{s}", .{digest});
+        },
+        else => return error.InvalidAppServerPreflightReceipt,
+    };
+
+    const version = try requiredString(codex, "version");
+    const version_banner = if (std.mem.startsWith(u8, version, "codex-cli "))
+        try allocator.dupe(u8, version)
+    else
+        try std.fmt.allocPrint(allocator, "codex-cli {s}", .{version});
+    errdefer allocator.free(version_banner);
+    const codex_path = try allocator.dupe(u8, try requiredString(codex, "path"));
+    errdefer allocator.free(codex_path);
+    const experimental_path_owned = try allocator.dupe(u8, experimental_path);
+    errdefer allocator.free(experimental_path_owned);
+    const cache_dir = try allocator.dupe(u8, cache_dir_slice);
+    errdefer allocator.free(cache_dir);
+    const stable_schema_digest = try allocator.dupe(u8, stable_schema_digest_raw);
+    errdefer allocator.free(stable_schema_digest);
+    const experimental_schema_digest = try allocator.dupe(u8, experimental_schema_digest_raw);
+    errdefer allocator.free(experimental_schema_digest);
+    const selected_transport_owned = try allocator.dupe(u8, selected_transport);
+    errdefer allocator.free(selected_transport_owned);
+    return .{
+        .overall_compatible = overall_compatible,
+        .route_neutral_compatible = route_neutral_compatible,
+        .codex_path = codex_path,
+        .codex_version = version_banner,
+        .experimental_path = experimental_path_owned,
+        .cache_dir = cache_dir,
+        .stable_schema_digest = stable_schema_digest,
+        .experimental_schema_digest = experimental_schema_digest,
+        .selected_transport = selected_transport_owned,
+        .paginated_fork_passed = requiredBehavioralProbePassed(probes_value, "paginated-fork"),
+        .ephemeral_fork_passed = requiredBehavioralProbePassed(probes_value, "ephemeral-fork"),
+        .paginated_inquiry_passed = requiredBehavioralProbePassed(
+            probes_value,
+            "paginated-session-inquiry",
+        ),
+        .code_mode_host_redacted = code_mode_host_redacted,
+        .code_mode_host_digest = code_mode_host_digest,
+    };
+}
+
+fn requiredBehavioralProbePassed(value: std.json.Value, id: []const u8) bool {
+    const rows = switch (value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    var found = false;
+    for (rows) |row_value| {
+        const row = switch (row_value) {
+            .object => |object| object,
+            else => return false,
+        };
+        const row_id = optionalString(row, "id") orelse return false;
+        if (!std.mem.eql(u8, row_id, id)) continue;
+        if (found) return false;
+        found = true;
+        if (!std.mem.eql(u8, optionalString(row, "requirement") orelse "", "required") or
+            !std.mem.eql(u8, optionalString(row, "status") orelse "", "passed")) return false;
+    }
+    return found;
+}
+
+fn routeNeutralBehavioralProbesPassed(value: std.json.Value) bool {
+    if (!requiredBehavioralProbePassed(value, "initialize-lifecycle") or
+        !requiredBehavioralProbePassed(value, "managed-websocket-transport") or
+        !requiredBehavioralProbePassed(value, "server-request-coverage") or
+        !requiredBehavioralProbePassed(value, "bounded-overload-retry")) return false;
+
+    const rows = switch (value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    for (rows) |row_value| {
+        const row = switch (row_value) {
+            .object => |object| object,
+            else => return false,
+        };
+        const requirement = optionalString(row, "requirement") orelse return false;
+        if (!std.mem.eql(u8, requirement, "required")) continue;
+        const id = optionalString(row, "id") orelse return false;
+        if (std.mem.eql(u8, id, "paginated-fork") or
+            std.mem.eql(u8, id, "ephemeral-fork") or
+            std.mem.eql(u8, id, "paginated-session-inquiry")) continue;
+        if (!std.mem.eql(u8, optionalString(row, "status") orelse "", "passed")) return false;
+    }
+    return true;
+}
+
+fn isSha256Digest(value: []const u8) bool {
+    return value.len == "sha256:".len + 64 and
+        std.mem.startsWith(u8, value, "sha256:") and
+        isLowerSha256Hex(value["sha256:".len..]);
+}
+
+fn isLowerSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
 }
 
 fn deinitPreflightResult(allocator: std.mem.Allocator, result: PreflightResult) void {
@@ -1108,134 +1520,14 @@ fn deinitPreflightResult(allocator: std.mem.Allocator, result: PreflightResult) 
     allocator.free(result.schema_fingerprint);
     allocator.free(result.cache_dir);
     allocator.free(result.missing);
+    if (result.code_mode_host_redacted) |value| allocator.free(value);
+    if (result.code_mode_host_digest) |value| allocator.free(value);
 }
 
 fn deinitRunOutput(allocator: std.mem.Allocator, result: RunOutput) void {
     allocator.free(result.state_ref);
     allocator.free(result.events_ref);
     allocator.free(result.summary_ref);
-}
-
-fn generateSchema(allocator: std.mem.Allocator, codex_path: []const u8, cwd: []const u8, out_dir: []const u8) !void {
-    const argv = [_][]const u8{ codex_path, "app-server", "generate-json-schema", "--experimental", "--out", out_dir };
-    const io = std.Io.Threaded.global_single_threaded.io();
-    spawnAndWaitOk(allocator, io, cwd, &argv) catch {
-        const quoted_codex = try shellQuoteAlloc(allocator, codex_path);
-        defer allocator.free(quoted_codex);
-        const quoted_out = try shellQuoteAlloc(allocator, out_dir);
-        defer allocator.free(quoted_out);
-        const command = try std.fmt.allocPrint(allocator, "{s} app-server generate-json-schema --experimental --out {s}", .{ quoted_codex, quoted_out });
-        defer allocator.free(command);
-        const shell_argv = [_][]const u8{ "/bin/sh", "-lc", command };
-        spawnAndWaitOk(allocator, io, cwd, &shell_argv) catch return error.SchemaShellUnavailable;
-    };
-}
-
-fn spawnAndWaitOk(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []const []const u8) !void {
-    if (builtin.os.tag == .macos) return spawnAndWaitOkPosix(allocator, cwd, argv);
-
-    var child = try std.process.spawn(io, .{
-        .argv = argv,
-        .cwd = if (std.mem.eql(u8, cwd, ".")) .inherit else .{ .path = cwd },
-        .expand_arg0 = if (std.mem.indexOfScalar(u8, argv[0], '/') == null) .expand else .no_expand,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    const term = try child.wait(io);
-    const ok = switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!ok) return error.SchemaUnavailable;
-}
-
-fn spawnAndWaitOkPosix(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !void {
-    if (argv.len == 0) return error.FileNotFound;
-
-    var actions: std.c.posix_spawn_file_actions_t = undefined;
-    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
-    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
-    const write_null = @as(c_int, @bitCast(std.posix.O{
-        .ACCMODE = .WRONLY,
-    }));
-    if (std.c.posix_spawn_file_actions_addopen(
-        &actions,
-        std.posix.STDOUT_FILENO,
-        "/dev/null",
-        write_null,
-        0,
-    ) != 0) return error.SpawnFileActionsFailed;
-    if (std.c.posix_spawn_file_actions_addopen(
-        &actions,
-        std.posix.STDERR_FILENO,
-        "/dev/null",
-        write_null,
-        0,
-    ) != 0) return error.SpawnFileActionsFailed;
-
-    var cwd_storage: ?[:0]u8 = null;
-    defer if (cwd_storage) |path| allocator.free(path);
-    if (!std.mem.eql(u8, cwd, ".")) {
-        cwd_storage = try allocator.dupeZ(u8, cwd);
-        if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.?.ptr) != 0) return error.SpawnFileActionsFailed;
-    }
-
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer allocator.free(argv_buf);
-    var arg_storage = try allocator.alloc([:0]u8, argv.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-    for (argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
-        arg_count += 1;
-        argv_buf[i] = arg_storage[i].ptr;
-    }
-
-    var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
-        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
-    else
-        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
-
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
-    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS => break,
-        .INTR => continue,
-        .CHILD => return error.NoChildProcess,
-        else => return error.WaitFailed,
-    };
-    if (statusToExitCode(@bitCast(status)) != 0) return error.SchemaUnavailable;
-}
-
-fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
-    return switch (err) {
-        .NOMEM, .@"2BIG" => error.SystemResources,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .ACCES => error.AccessDenied,
-        .PERM => error.PermissionDenied,
-        .NOEXEC => error.InvalidExe,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDir,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.SpawnFailed,
-    };
-}
-
-fn statusToExitCode(status: u32) u8 {
-    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
-        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
-    }
-    return 1;
 }
 
 fn validateLedgerInput(
@@ -1264,43 +1556,207 @@ fn validateLedgerInput(
     };
 }
 
-fn shellQuoteAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '\'');
-    for (raw) |ch| {
-        if (ch == '\'') {
-            try out.appendSlice(allocator, "'\\''");
-        } else {
-            try out.append(allocator, ch);
-        }
-    }
-    try out.append(allocator, '\'');
-    return out.toOwnedSlice(allocator);
+fn deriveCapabilitiesFromCache(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+) !SchemaCapabilities {
+    const client_request_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "ClientRequest.json" },
+    );
+    defer allocator.free(client_request_path);
+    const fork_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadForkParams.json" },
+    );
+    defer allocator.free(fork_params_path);
+    const fork_response_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadForkResponse.json" },
+    );
+    defer allocator.free(fork_response_path);
+    const rollback_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadRollbackParams.json" },
+    );
+    defer allocator.free(rollback_params_path);
+    const turns_list_params_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadTurnsListParams.json" },
+    );
+    defer allocator.free(turns_list_params_path);
+    const turns_list_response_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, "v2", "ThreadTurnsListResponse.json" },
+    );
+    defer allocator.free(turns_list_response_path);
+
+    const client_request_raw = try readFileAlloc(allocator, client_request_path, MaxSchemaBytes);
+    defer allocator.free(client_request_raw);
+    const fork_params_raw = try readFileAlloc(allocator, fork_params_path, MaxSchemaBytes);
+    defer allocator.free(fork_params_raw);
+    const fork_response_raw = try readFileAlloc(allocator, fork_response_path, MaxSchemaBytes);
+    defer allocator.free(fork_response_raw);
+    const rollback_params_raw = try readFileAlloc(allocator, rollback_params_path, MaxSchemaBytes);
+    defer allocator.free(rollback_params_raw);
+    const turns_list_params_raw = try readFileAlloc(
+        allocator,
+        turns_list_params_path,
+        MaxSchemaBytes,
+    );
+    defer allocator.free(turns_list_params_raw);
+    const turns_list_response_raw = try readFileAlloc(
+        allocator,
+        turns_list_response_path,
+        MaxSchemaBytes,
+    );
+    defer allocator.free(turns_list_response_raw);
+
+    var client_request = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        client_request_raw,
+        .{},
+    );
+    defer client_request.deinit();
+    var fork_params = try std.json.parseFromSlice(std.json.Value, allocator, fork_params_raw, .{});
+    defer fork_params.deinit();
+    var fork_response = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        fork_response_raw,
+        .{},
+    );
+    defer fork_response.deinit();
+    var rollback_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        rollback_params_raw,
+        .{},
+    );
+    defer rollback_params.deinit();
+    var turns_list_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        turns_list_params_raw,
+        .{},
+    );
+    defer turns_list_params.deinit();
+    var turns_list_response = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        turns_list_response_raw,
+        .{},
+    );
+    defer turns_list_response.deinit();
+
+    return deriveCapabilitiesFromSchemas(
+        client_request.value,
+        fork_params.value,
+        fork_response.value,
+        rollback_params.value,
+        turns_list_params.value,
+        turns_list_response.value,
+    );
 }
 
-fn deriveCapabilities(schema_text: []const u8) SchemaCapabilities {
+fn deriveCapabilitiesFromSchemas(
+    client_request: std.json.Value,
+    fork_params: std.json.Value,
+    fork_response: std.json.Value,
+    rollback_params: std.json.Value,
+    turns_list_params: std.json.Value,
+    turns_list_response: std.json.Value,
+) SchemaCapabilities {
     return .{
-        .thread_fork = contains(schema_text, "\"thread/fork\""),
-        .thread_rollback = contains(schema_text, "\"thread/rollback\""),
-        .thread_start = contains(schema_text, "\"thread/start\""),
-        .thread_read = contains(schema_text, "\"thread/read\""),
-        .thread_turns_list = contains(schema_text, "\"thread/turns/list\""),
-        .turn_start = contains(schema_text, "\"turn/start\""),
-        .turn_interrupt = contains(schema_text, "\"turn/interrupt\""),
-        .thread_archive = contains(schema_text, "\"thread/archive\""),
-        .thread_delete = contains(schema_text, "\"thread/delete\""),
-        .ephemeral_fork_field = contains(schema_text, "\"ephemeral\""),
-        .fork_permissions_field = contains(schema_text, "\"permissions\""),
-        .fork_sandbox_field = contains(schema_text, "\"sandbox\""),
-        .fork_path_field = contains(schema_text, "\"path\""),
-        .rollback_num_turns = contains(schema_text, "\"numTurns\""),
-        .shell_command_present = contains(schema_text, "\"thread/shellCommand\""),
+        .thread_fork = clientRequestMethodPresent(client_request, "thread/fork"),
+        .thread_rollback = clientRequestMethodPresent(client_request, "thread/rollback"),
+        .thread_start = clientRequestMethodPresent(client_request, "thread/start"),
+        .thread_read = clientRequestMethodPresent(client_request, "thread/read"),
+        .thread_turns_list = clientRequestMethodPresent(client_request, "thread/turns/list"),
+        .turn_start = clientRequestMethodPresent(client_request, "turn/start"),
+        .turn_interrupt = clientRequestMethodPresent(client_request, "turn/interrupt"),
+        .thread_archive = clientRequestMethodPresent(client_request, "thread/archive"),
+        .thread_delete = clientRequestMethodPresent(client_request, "thread/delete"),
+        .ephemeral_fork_field = schemaTopPropertyPresent(fork_params, "ephemeral"),
+        .fork_permissions_field = schemaTopPropertyPresent(fork_params, "permissions"),
+        .fork_sandbox_field = schemaTopPropertyPresent(fork_params, "sandbox"),
+        .fork_path_field = schemaTopPropertyPresent(fork_params, "path"),
+        .fork_last_turn_id_field = schemaTopPropertyPresent(fork_params, "lastTurnId"),
+        .fork_before_turn_id_field = schemaTopPropertyPresent(fork_params, "beforeTurnId"),
+        .fork_exclude_turns_field = schemaTopPropertyPresent(fork_params, "excludeTurns"),
+        .fork_lineage_field = schemaDefinitionPropertyPresent(
+            fork_response,
+            "Thread",
+            "forkedFromId",
+        ),
+        .rollback_num_turns = schemaTopPropertyPresent(rollback_params, "numTurns"),
+        .turns_list_cursor_field = schemaTopPropertyPresent(turns_list_params, "cursor"),
+        .turns_list_limit_field = schemaTopPropertyPresent(turns_list_params, "limit"),
+        .turns_list_sort_direction_field = schemaTopPropertyPresent(
+            turns_list_params,
+            "sortDirection",
+        ),
+        .turns_list_items_view_field = schemaTopPropertyPresent(turns_list_params, "itemsView"),
+        .turns_list_data_field = schemaTopPropertyPresent(turns_list_response, "data"),
+        .turns_list_next_cursor_field = schemaTopPropertyPresent(turns_list_response, "nextCursor"),
+        .shell_command_present = clientRequestMethodPresent(client_request, "thread/shellCommand"),
     };
 }
 
-fn contains(haystack: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, haystack, needle) != null;
+fn clientRequestMethodPresent(schema: std.json.Value, expected: []const u8) bool {
+    const root = switch (schema) {
+        .object => |object| object,
+        else => return false,
+    };
+    const variants = switch (root.get("oneOf") orelse return false) {
+        .array => |array| array,
+        else => return false,
+    };
+    for (variants.items) |variant_value| {
+        const variant = switch (variant_value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const properties = core_json.objectField(variant, "properties") orelse continue;
+        const method = core_json.objectField(properties, "method") orelse continue;
+        if (core_json.stringField(method, "const")) |value| {
+            if (std.mem.eql(u8, value, expected)) return true;
+        }
+        const enum_values = switch (method.get("enum") orelse continue) {
+            .array => |array| array,
+            else => continue,
+        };
+        for (enum_values.items) |value| switch (value) {
+            .string => |text| if (std.mem.eql(u8, text, expected)) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+fn schemaTopPropertyPresent(schema: std.json.Value, property: []const u8) bool {
+    const root = switch (schema) {
+        .object => |object| object,
+        else => return false,
+    };
+    const properties = core_json.objectField(root, "properties") orelse return false;
+    return properties.get(property) != null;
+}
+
+fn schemaDefinitionPropertyPresent(
+    schema: std.json.Value,
+    definition: []const u8,
+    property: []const u8,
+) bool {
+    const root = switch (schema) {
+        .object => |object| object,
+        else => return false,
+    };
+    const definitions = core_json.objectField(root, "definitions") orelse return false;
+    const target = core_json.objectField(definitions, definition) orelse return false;
+    const properties = core_json.objectField(target, "properties") orelse return false;
+    return properties.get(property) != null;
 }
 
 fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
@@ -1880,6 +2336,8 @@ fn gateFailureForLineageError(err: anyerror) GateResult {
 
 fn failureCodeForError(err: anyerror) FailureCode {
     return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable => .auth_refresh_provider_unavailable,
+        error.AttestationProviderUnavailable => .attestation_provider_unavailable,
         error.SourceNotFound => .source_not_found,
         error.SourceStale => .source_stale,
         error.SourceDigestMismatch => .source_turn_digest_mismatch,
@@ -1894,6 +2352,15 @@ fn failureCodeForError(err: anyerror) FailureCode {
         error.AnswerParseFailed => .answer_parse_failed,
         error.InquiryTransportLost => .inquiry_transport_lost,
         else => .receipt_invalid,
+    };
+}
+
+fn preserveServerRequestProviderError(err: anyerror, fallback: anyerror) anyerror {
+    return switch (err) {
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+        error.AttestationProviderUnavailable,
+        => err,
+        else => fallback,
     };
 }
 
@@ -1927,11 +2394,13 @@ fn executeLiveInquiry(
     try appendSimpleEvent(allocator, events_path, "run_initialized");
 
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
-    var managed_server = try cas_websocket.startManagedLoopbackServer(
+    var managed_server = try startInquiryManagedServer(
         allocator,
         inquiry_cwd,
+        null,
         preflight.codex_path,
         hook_policy,
+        options.code_mode_host,
         std.Io.Threaded.global_single_threaded.io(),
     );
     defer managed_server.kill();
@@ -2006,8 +2475,10 @@ fn executeLiveInquiry(
             .source_artifact_reconstructability = dcp.reconstructability,
             .lineage_mode = lineageMode(dcp).asString(),
             .managed_transport = .{
-                .selected_transport = "websocket",
+                .selected_transport = "managed-ws",
                 .detached = detached,
+                .code_mode_host_redacted = preflight.code_mode_host_redacted,
+                .code_mode_host_digest = preflight.code_mode_host_digest,
             },
             .lane_states = [_][]const u8{},
             .budgets = .{
@@ -2063,16 +2534,17 @@ fn startDetachedInquiry(
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
 
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
-    var managed_server = try cas_websocket.startManagedLoopbackServer(
+    var managed_server = try startInquiryManagedServer(
         allocator,
         inquiry_cwd,
+        receipt_root,
         preflight.codex_path,
         hook_policy,
+        options.code_mode_host,
         std.Io.Threaded.global_single_threaded.io(),
     );
     var keep_server = false;
-    defer if (!keep_server) managed_server.kill();
-    defer managed_server.deinit(allocator);
+    defer if (!keep_server) managed_server.deinit(allocator);
 
     var client = try cas_client.Client.start(allocator, .{
         .cwd = inquiry_cwd,
@@ -2117,7 +2589,7 @@ fn startDetachedInquiry(
     defer allocator.free(transport_path);
     try writeJsonFile(allocator, transport_path, .{
         .managed_transport = .{
-            .selected_transport = "websocket",
+            .selected_transport = "managed-ws",
             .detached = true,
             .managed_server_pid = managed_server.processId(),
             .listen_url = managed_server.listen_url,
@@ -2126,6 +2598,8 @@ fn startDetachedInquiry(
             .cwd = inquiry_cwd,
             .receipt_dir = receipt_root,
             .schema_fingerprint = preflight.schema_fingerprint,
+            .code_mode_host_redacted = preflight.code_mode_host_redacted,
+            .code_mode_host_digest = preflight.code_mode_host_digest,
         },
     });
 
@@ -2164,6 +2638,52 @@ fn startDetachedInquiry(
         .failure_code = "",
         .failure_hint = "",
     };
+}
+
+fn startInquiryManagedServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    owner_receipt_dir: ?[]const u8,
+    codex_path: []const u8,
+    hook_policy: cas_client.hooks.HookPolicy,
+    code_mode_host_raw: ?[]const u8,
+    io: std.Io,
+) !cas_websocket.ManagedServer {
+    var code_mode_host: ?cas_client.app_server_launch.CodeModeHost = if (code_mode_host_raw) |raw|
+        try cas_client.app_server_launch.CodeModeHost.init(allocator, raw)
+    else
+        null;
+    defer if (code_mode_host) |*host| host.deinit();
+    if (owner_receipt_dir) |receipt_dir| {
+        if (code_mode_host) |*host| {
+            return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
+                allocator,
+                cwd,
+                receipt_dir,
+                codex_path,
+                hook_policy,
+                host,
+                io,
+            );
+        }
+        return cas_websocket.startOwnerLivedLoopbackServer(
+            allocator,
+            cwd,
+            receipt_dir,
+            codex_path,
+            hook_policy,
+            io,
+        );
+    }
+    if (code_mode_host) |*host| return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        host,
+        io,
+    );
+    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
 }
 
 fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inquiry_id: []const u8, timeout_ms: u64, store_root: []const u8) !void {
@@ -2265,22 +2785,8 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
     defer deinitRip(allocator, rip);
 
     const managed_runtime_alive = cas_websocket.processAlive(record.managed_server_pid);
+    if (!managed_runtime_alive) return error.InquiryTransportLost;
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
-    var recovery_server: ?cas_websocket.ManagedServer = null;
-    defer if (recovery_server) |*server| {
-        server.kill();
-        server.deinit(allocator);
-    };
-    const websocket_url = if (managed_runtime_alive) record.listen_url else blk: {
-        recovery_server = try cas_websocket.startManagedLoopbackServer(
-            allocator,
-            record.cwd,
-            record.codex_path,
-            hook_policy,
-            std.Io.Threaded.global_single_threaded.io(),
-        );
-        break :blk recovery_server.?.listen_url;
-    };
 
     var client = try cas_client.Client.start(allocator, .{
         .cwd = record.cwd,
@@ -2295,7 +2801,7 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
         .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"Dynamic tools are disabled for CAS session inquiry\"}],\"success\":false}",
         .read_only = true,
         .hook_policy = hook_policy,
-        .websocket_url = websocket_url,
+        .websocket_url = record.listen_url,
     });
     defer {
         client.close();
@@ -2307,24 +2813,10 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
     const lane_files = try expandSimpleGlobAlloc(allocator, lane_glob);
     var valid_count: u64 = 0;
     var invalid_count: u64 = 0;
-    var launched: u64 = lane_files.len;
     for (lane_files) |lane_path| {
         const handle = try loadLaneHandleAlloc(allocator, lane_path);
-        const lane = laneById(rip, handle.lane_id) orelse return error.InvalidLaneRecord;
-        const receipt_valid = try executeLaneForkWithRetries(allocator, &client, options, record.cwd, dcp, rip, lane, handle.ordinal - 1, record.receipt_dir, record.events_ref, .{
-            .compatibility_verdict = "compatible",
-            .codex_path = record.codex_path,
-            .codex_version = record.codex_version,
-            .schema_fingerprint = record.schema_fingerprint,
-            .cache_dir = "",
-            .selected_transport = "websocket",
-            .capabilities = zeroCapabilities(),
-            .thread_fork_replay = false,
-            .rollout_transcript_replay = false,
-            .missing = &.{},
-            .inquiry_allowed = true,
-        }, &launched, handle);
-        if (receipt_valid) valid_count += 1 else invalid_count += 1;
+        const result = try collectLaneFork(allocator, &client, options, dcp, handle);
+        if (result.receipt_valid) valid_count += 1 else invalid_count += 1;
     }
 
     const terminal_state = if (invalid_count == 0) @tagName(InquiryState.completed) else if (valid_count > 0) @tagName(InquiryState.partially_completed) else @tagName(InquiryState.failed);
@@ -2347,10 +2839,19 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
             .codex_version = record.codex_version,
             .schema_fingerprint = record.schema_fingerprint,
             .cache_dir = "",
-            .selected_transport = "websocket",
+            .selected_transport = "managed-ws",
             .capabilities = zeroCapabilities(),
             .thread_fork_replay = false,
+            .paginated_thread_fork = false,
             .rollout_transcript_replay = false,
+            .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0)
+                record.code_mode_host_redacted
+            else
+                null,
+            .code_mode_host_digest = if (record.code_mode_host_digest.len > 0)
+                record.code_mode_host_digest
+            else
+                null,
             .missing = &.{},
             .inquiry_allowed = true,
         },
@@ -2401,7 +2902,12 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
         const handle = try loadLaneHandleAlloc(allocator, lane_path);
         const params = try stringifyAnyAlloc(allocator, .{ .threadId = handle.fork_thread_id, .turnId = handle.turn_id });
         defer allocator.free(params);
-        const result = client.requestJson("turn/interrupt", params) catch continue;
+        const result = client.requestJson("turn/interrupt", params) catch |err| {
+            if (preserveServerRequestProviderError(err, error.InterruptFailed) == err) {
+                return err;
+            }
+            continue;
+        };
         defer allocator.free(result);
         try appendLine(handle.lane_events, result);
         try writeLaneHandle(allocator, handle, @tagName(InquiryState.interrupted));
@@ -2443,10 +2949,19 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
                 .codex_version = record.codex_version,
                 .schema_fingerprint = record.schema_fingerprint,
                 .cache_dir = "",
-                .selected_transport = "websocket",
+                .selected_transport = "managed-ws",
                 .capabilities = zeroCapabilities(),
                 .thread_fork_replay = false,
+                .paginated_thread_fork = false,
                 .rollout_transcript_replay = false,
+                .code_mode_host_redacted = if (record.code_mode_host_redacted.len > 0)
+                    record.code_mode_host_redacted
+                else
+                    null,
+                .code_mode_host_digest = if (record.code_mode_host_digest.len > 0)
+                    record.code_mode_host_digest
+                else
+                    null,
                 .missing = &.{},
                 .inquiry_allowed = true,
             },
@@ -2477,42 +2992,40 @@ fn verifySourceThread(
     dcp: Dcp,
     events_path: []const u8,
 ) !void {
-    const source_metadata_params = try stringifyAnyAlloc(allocator, .{ .threadId = source_thread_id, .includeTurns = false });
-    defer allocator.free(source_metadata_params);
-    const source_metadata_json = client.requestJson("thread/read", source_metadata_params) catch return error.SourceNotFound;
-    defer allocator.free(source_metadata_json);
-    try verifyForkableThreadHistory(allocator, source_metadata_json);
-    const metadata_event = try stringifyAnyAlloc(allocator, .{
-        .event = "thread/read",
-        .thread_id = source_thread_id,
-        .include_turns = false,
-    });
-    defer allocator.free(metadata_event);
-    try appendLine(events_path, metadata_event);
-
-    const source_read_params = try stringifyAnyAlloc(allocator, .{ .threadId = source_thread_id, .includeTurns = true });
-    defer allocator.free(source_read_params);
-    const source_json = client.requestJson("thread/read", source_read_params) catch return error.SourceNotFound;
-    defer allocator.free(source_json);
-    const read_event = try stringifyAnyAlloc(allocator, .{
-        .event = "thread/read",
-        .thread_id = source_thread_id,
-        .include_turns = true,
-    });
-    defer allocator.free(read_event);
-    try appendLine(events_path, read_event);
-    const source_digest = try turnDigestFromThreadRead(allocator, source_json);
-    if (source_digest.count != dcp.total_turns) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source_digest, dcp.total_turns, dcp.source_turn_digest, "source_stale");
+    const source = try readThreadHistorySnapshot(
+        allocator,
+        client,
+        source_thread_id,
+        dcp.total_turns,
+        null,
+        events_path,
+    );
+    defer source.deinit(allocator);
+    if (source.digest.count != dcp.total_turns) {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            events_path,
+            source.digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_stale",
+        );
         return error.SourceStale;
     }
-    if (!std.mem.eql(u8, source_digest.digest, dcp.source_turn_digest)) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source_digest, dcp.total_turns, dcp.source_turn_digest, "source_turn_digest_mismatch");
+    if (!std.mem.eql(u8, source.digest.digest, dcp.source_turn_digest)) {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            events_path,
+            source.digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_turn_digest_mismatch",
+        );
         return error.SourceDigestMismatch;
     }
 }
 
-fn verifyForkableThreadHistory(allocator: std.mem.Allocator, raw: []const u8) !void {
+fn threadHistoryModeFromRead(allocator: std.mem.Allocator, raw: []const u8) !ThreadHistoryMode {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -2520,10 +3033,10 @@ fn verifyForkableThreadHistory(allocator: std.mem.Allocator, raw: []const u8) !v
         else => return error.SourceStale,
     };
     const thread = core_json.objectField(root, "thread") orelse return error.SourceStale;
-    const history_mode = core_json.stringField(thread, "historyMode") orelse return;
-    if (!std.mem.eql(u8, history_mode, "legacy")) {
-        return error.ThreadHistoryModeUnsupported;
-    }
+    const history_mode = core_json.stringField(thread, "historyMode") orelse "legacy";
+    if (std.mem.eql(u8, history_mode, "legacy")) return .legacy;
+    if (std.mem.eql(u8, history_mode, "paginated")) return .paginated;
+    return error.ThreadHistoryModeUnsupported;
 }
 
 fn writeSummary(
@@ -2586,7 +3099,7 @@ fn writeInquiryState(
             .receipt_dir = receipt_dir,
             .events_ref = events_path,
             .managed_transport = .{
-                .selected_transport = "websocket",
+                .selected_transport = "managed-ws",
                 .detached = detached,
                 .managed_server_pid = managed_server_pid,
                 .listen_url = listen_url,
@@ -2594,6 +3107,8 @@ fn writeInquiryState(
                 .codex_version = preflight.codex_version,
                 .cwd = cwd,
                 .schema_fingerprint = preflight.schema_fingerprint,
+                .code_mode_host_redacted = preflight.code_mode_host_redacted,
+                .code_mode_host_digest = preflight.code_mode_host_digest,
             },
             .lane_states = [_][]const u8{},
             .budgets = .{
@@ -2638,6 +3153,14 @@ fn loadDetachedRecordAlloc(allocator: std.mem.Allocator, home: []const u8, inqui
         .managed_server_pid = try requiredU64(transport, "managed_server_pid"),
         .codex_version = try allocator.dupe(u8, try requiredString(transport, "codex_version")),
         .schema_fingerprint = try allocator.dupe(u8, try requiredString(transport, "schema_fingerprint")),
+        .code_mode_host_redacted = try allocator.dupe(
+            u8,
+            optionalString(transport, "code_mode_host_redacted") orelse "",
+        ),
+        .code_mode_host_digest = try allocator.dupe(
+            u8,
+            optionalString(transport, "code_mode_host_digest") orelse "",
+        ),
         .failure_code = try allocator.dupe(u8, optionalString(record, "failure_code") orelse ""),
         .failure_hint = try allocator.dupe(u8, optionalString(record, "failure_hint") orelse ""),
     };
@@ -2783,67 +3306,123 @@ fn startLaneFork(
     const lane_state_leaf = try std.fmt.allocPrint(allocator, "lanes/{s}.json", .{lane_stem});
     defer allocator.free(lane_state_leaf);
     const lane_state_ref = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, lane_state_leaf);
-    const fork_ephemeral = false;
-
-    const fork_params = try stringifyAnyAlloc(allocator, .{
-        .threadId = source_thread_id,
-        .path = dcp.source_rollout_path,
-        .ephemeral = fork_ephemeral,
-        .excludeTurns = false,
-        .cwd = inquiry_cwd,
-        .model = options.model,
-        .modelProvider = options.model_provider,
-        .serviceTier = options.service_tier,
-        .sandbox = options.sandbox,
-        .approvalPolicy = "never",
-        .baseInstructions = baseInquiryInstructions,
-        .developerInstructions = lane.prompt_template,
-        .runtimeWorkspaceRoots = [_][]const u8{},
-        .threadSource = "retrace",
+    if (!preflight.capabilities.paginatedAnchorSupported()) return error.ForkUnsupported;
+    const source_history = try readThreadHistorySnapshot(
+        allocator,
+        client,
+        source_thread_id,
+        dcp.total_turns,
+        anchor.keep_through_turn_index,
+        lane_events,
+    );
+    defer source_history.deinit(allocator);
+    const before_digest = source_history.digest;
+    if (before_digest.count != dcp.total_turns or
+        !std.mem.eql(u8, before_digest.digest, dcp.source_turn_digest))
+    {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            lane_events,
+            before_digest,
+            dcp.total_turns,
+            dcp.source_turn_digest,
+            "source_stale",
+        );
+        return error.SourceStale;
+    }
+    const anchored_digest = source_history.retained_digest orelse
+        return error.AnchorDigestMismatch;
+    if (!inquiry_anchor.exactAnchorMatches(
+        .{
+            .count = anchor.keep_through_turn_index,
+            .digest = anchor.anchor_digest orelse "",
+        },
+        .{ .count = anchored_digest.count, .digest = anchored_digest.digest },
+    )) {
+        try appendSourceDigestMismatchEvent(
+            allocator,
+            lane_events,
+            anchored_digest,
+            anchor.keep_through_turn_index,
+            anchor.anchor_digest orelse "",
+            "anchor_digest_mismatch",
+        );
+        return error.AnchorDigestMismatch;
+    }
+    const boundary = try inquiry_anchor.selectBoundary(
+        source_history.turn_ids,
+        source_history.completed_boundaries,
+        anchor.keep_through_turn_index,
+    );
+    const boundary_kind: []const u8 = switch (boundary.kind) {
+        .before_turn_id => "beforeTurnId",
+        .last_turn_id => "lastTurnId",
+    };
+    const boundary_turn_id = boundary.turn_id;
+    const boundary_event = try stringifyAnyAlloc(allocator, .{
+        .event = "thread/fork/boundary_selected",
+        .source_thread_id = source_thread_id,
+        .history_mode = @tagName(source_history.mode),
+        .boundary_kind = boundary_kind,
+        .boundary_turn_id = boundary_turn_id,
+        .keep_through_turn_index = anchor.keep_through_turn_index,
+        .expected_anchor_digest = anchor.anchor_digest orelse "",
     });
+    defer allocator.free(boundary_event);
+    try appendLine(lane_events, boundary_event);
+
+    const fork_params = if (boundary.kind == .before_turn_id)
+        try stringifyAnyAlloc(allocator, .{
+            .threadId = source_thread_id,
+            .beforeTurnId = boundary_turn_id,
+            .ephemeral = true,
+            .excludeTurns = true,
+            .cwd = inquiry_cwd,
+            .model = options.model,
+            .modelProvider = options.model_provider,
+            .serviceTier = options.service_tier,
+            .sandbox = options.sandbox,
+            .approvalPolicy = "never",
+            .baseInstructions = baseInquiryInstructions,
+            .developerInstructions = lane.prompt_template,
+            .runtimeWorkspaceRoots = [_][]const u8{},
+            .threadSource = "retrace",
+        })
+    else
+        try stringifyAnyAlloc(allocator, .{
+            .threadId = source_thread_id,
+            .lastTurnId = boundary_turn_id,
+            .ephemeral = true,
+            .excludeTurns = true,
+            .cwd = inquiry_cwd,
+            .model = options.model,
+            .modelProvider = options.model_provider,
+            .serviceTier = options.service_tier,
+            .sandbox = options.sandbox,
+            .approvalPolicy = "never",
+            .baseInstructions = baseInquiryInstructions,
+            .developerInstructions = lane.prompt_template,
+            .runtimeWorkspaceRoots = [_][]const u8{},
+            .threadSource = "retrace",
+        });
     defer allocator.free(fork_params);
-    const fork_json = client.requestJson("thread/fork", fork_params) catch return error.ForkFailed;
+    const fork_json = client.requestJson("thread/fork", fork_params) catch |err| {
+        if (client.lastError()) |detail| try appendLine(lane_events, detail);
+        return preserveServerRequestProviderError(err, error.ForkFailed);
+    };
     defer allocator.free(fork_json);
     const fork_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/fork", .lane_id = lane.lane_id, .ordinal = ordinal + 1 });
     defer allocator.free(fork_event);
     try appendLine(events_path, fork_event);
     try appendLine(lane_events, fork_json);
     const fork_thread_id = try threadIdFromResponse(allocator, fork_json);
-    const forked_from = forkedFromIdFromResponse(allocator, fork_json) catch null;
+    const forked_from = try forkedFromIdFromResponse(allocator, fork_json);
+    defer if (forked_from) |value| allocator.free(value);
     const fork_policy = try forkPolicyProofFromResponse(allocator, fork_json, options.permissions);
-    const before_digest = try turnDigestFromThreadRead(allocator, fork_json);
-    if (forked_from) |value| {
-        if (!std.mem.eql(u8, value, source_thread_id)) {
-            try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, before_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
-            return error.LineageMismatch;
-        }
-    }
-
-    if (before_digest.count != dcp.total_turns) {
+    if (forked_from == null or !std.mem.eql(u8, forked_from.?, source_thread_id)) {
         try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, before_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
-        return error.SourceStale;
+        return error.LineageMismatch;
     }
-
-    var anchored_digest: TurnDigest = before_digest;
-    if (anchor.drop_last_n_turns > 0) {
-        const rollback_params = try stringifyAnyAlloc(allocator, .{ .threadId = fork_thread_id, .numTurns = anchor.drop_last_n_turns });
-        defer allocator.free(rollback_params);
-        const rollback_json = client.requestJson("thread/rollback", rollback_params) catch {
-            if (client.lastError()) |detail| try appendLine(lane_events, detail);
-            try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, anchored_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
-            return error.RollbackFailed;
-        };
-        defer allocator.free(rollback_json);
-        try appendLine(lane_events, rollback_json);
-        anchored_digest = try turnDigestFromThreadRead(allocator, rollback_json);
-    }
-
-    const anchor_valid = std.mem.eql(u8, anchored_digest.digest, anchor.anchor_digest orelse "");
-    if (!anchor_valid) {
-        try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, anchored_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
-        return error.AnchorDigestMismatch;
-    }
-
     const client_msg_id = try std.fmt.allocPrint(allocator, "cas-{s}-{s}-{d}", .{ rip.inquiry_id, lane.lane_id, ordinal + 1 });
     const turn_text = try buildInquiryPromptAlloc(allocator, rip, lane);
     defer allocator.free(turn_text);
@@ -2864,10 +3443,14 @@ fn startLaneFork(
         for (notifications.items) |line| allocator.free(line);
         notifications.deinit(allocator);
     }
-    const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
+    const turn_json = client.requestJsonCaptureNotifications(
+        "turn/start",
+        turn_params,
+        &notifications,
+    ) catch |err| {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
         _ = cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/delete") or cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/archive");
-        return error.TurnStartFailed;
+        return preserveServerRequestProviderError(err, error.TurnStartFailed);
     };
     defer allocator.free(turn_json);
     try appendLine(lane_events, turn_json);
@@ -2916,7 +3499,12 @@ fn startRolloutTranscriptLane(
         for (start_notifications.items) |line| allocator.free(line);
         start_notifications.deinit(allocator);
     }
-    const start_json = client.requestJsonCaptureNotifications("thread/start", start_params, &start_notifications) catch return error.ForkFailed;
+    const start_json = client.requestJsonCaptureNotifications(
+        "thread/start",
+        start_params,
+        &start_notifications,
+    ) catch |err|
+        return preserveServerRequestProviderError(err, error.ForkFailed);
     defer allocator.free(start_json);
     const start_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/start", .lane_id = lane.lane_id, .ordinal = ordinal + 1, .lineage_mode = "rollout_transcript" });
     defer allocator.free(start_event);
@@ -2945,9 +3533,13 @@ fn startRolloutTranscriptLane(
         for (notifications.items) |line| allocator.free(line);
         notifications.deinit(allocator);
     }
-    const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
+    const turn_json = client.requestJsonCaptureNotifications(
+        "turn/start",
+        turn_params,
+        &notifications,
+    ) catch |err| {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
-        return error.TurnStartFailed;
+        return preserveServerRequestProviderError(err, error.TurnStartFailed);
     };
     defer allocator.free(turn_json);
     try appendLine(lane_events, turn_json);
@@ -3911,6 +4503,20 @@ fn turnIdFromStartResponse(allocator: std.mem.Allocator, raw: []const u8) ![]con
 }
 
 fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !TurnDigest {
+    const snapshot = try threadHistorySnapshotFromThreadRead(allocator, raw, null);
+    defer {
+        for (snapshot.turn_ids) |turn_id| allocator.free(turn_id);
+        allocator.free(snapshot.turn_ids);
+        allocator.free(snapshot.completed_boundaries);
+    }
+    return snapshot.digest;
+}
+
+fn threadHistorySnapshotFromThreadRead(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    retained_turns: ?u64,
+) !ThreadHistorySnapshot {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -3923,37 +4529,390 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
         .array => |arr| arr,
         else => return error.SourceStale,
     };
+    const mode_text = core_json.stringField(thread, "historyMode") orelse "legacy";
+    const mode: ThreadHistoryMode = if (std.mem.eql(u8, mode_text, "legacy"))
+        .legacy
+    else if (std.mem.eql(u8, mode_text, "paginated"))
+        .paginated
+    else
+        return error.ThreadHistoryModeUnsupported;
     var trace = canonical_trace.CanonicalSessionTrace{
         .session = try canonical_trace.SessionRecord.init(allocator, core_json.stringField(thread, "path") orelse ""),
     };
     defer trace.deinit(allocator);
     if (core_json.stringField(thread, "id")) |id| trace.session.session_id = try allocator.dupe(u8, id);
-    for (turns.items, 0..) |turn_value, index| {
-        const turn = switch (turn_value) {
-            .object => |obj| obj,
-            else => return error.SourceStale,
-        };
-        var record = canonical_trace.TurnRecord{
-            .path = try allocator.dupe(u8, trace.session.path),
-            .turn_id = try allocator.dupe(u8, core_json.stringField(turn, "id") orelse return error.SourceStale),
-            .turn_index = @intCast(index + 1),
-            .status = mapThreadReadTurnStatus(core_json.stringField(turn, "status") orelse ""),
-            .user_message = try messageTextFromThreadItems(allocator, turn, "userMessage"),
-            .final_answer = try messageTextFromThreadItems(allocator, turn, "agentMessage"),
-        };
-        errdefer record.deinit(allocator);
-        try trace.turns.append(allocator, record);
-        try appendToolRecordsFromThreadItems(allocator, &trace, turn, @intCast(index + 1));
+    var turn_ids: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (turn_ids.items) |turn_id| allocator.free(turn_id);
+        turn_ids.deinit(allocator);
     }
+    var completed_boundaries: std.ArrayList(bool) = .empty;
+    errdefer completed_boundaries.deinit(allocator);
+    for (turns.items) |turn_value| try appendThreadTurnToSnapshot(
+        allocator,
+        &trace,
+        &turn_ids,
+        &completed_boundaries,
+        turn_value,
+    );
     const digest = try trace_core.retainedTraceDigest(
         allocator,
         trace,
         @intCast(turns.items.len),
     );
+    errdefer allocator.free(digest);
+    const retained_digest = if (retained_turns) |count| retained: {
+        const retained_count = std.math.cast(usize, count) orelse
+            return error.SourceStale;
+        if (retained_count > turns.items.len) return error.SourceStale;
+        break :retained TurnDigest{
+            .count = count,
+            .digest = try trace_core.retainedTraceDigest(
+                allocator,
+                trace,
+                @intCast(retained_count),
+            ),
+        };
+    } else null;
+    errdefer if (retained_digest) |value| allocator.free(value.digest);
     return .{
-        .count = turns.items.len,
-        .digest = digest,
+        .mode = mode,
+        .digest = .{ .count = turns.items.len, .digest = digest },
+        .retained_digest = retained_digest,
+        .turn_ids = try turn_ids.toOwnedSlice(allocator),
+        .completed_boundaries = try completed_boundaries.toOwnedSlice(allocator),
     };
+}
+
+fn readThreadHistorySnapshot(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    thread_id: []const u8,
+    expected_turns: u64,
+    retained_turns: ?u64,
+    events_path: []const u8,
+) !ThreadHistorySnapshot {
+    if (expected_turns > MaxThreadHistoryPages * ThreadHistoryPageLimit) return error.SourceStale;
+    const metadata_params = try stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .includeTurns = false,
+    });
+    defer allocator.free(metadata_params);
+    const metadata_json = client.requestJson("thread/read", metadata_params) catch |err|
+        return preserveServerRequestProviderError(err, error.SourceNotFound);
+    defer allocator.free(metadata_json);
+    const mode = try threadHistoryModeFromRead(allocator, metadata_json);
+    try appendHistoryReadEvent(allocator, events_path, thread_id, mode, false, 0, false);
+    if (mode == .legacy) {
+        const read_params = try stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .includeTurns = true,
+        });
+        defer allocator.free(read_params);
+        const read_json = client.requestJson("thread/read", read_params) catch |err|
+            return preserveServerRequestProviderError(err, error.SourceNotFound);
+        defer allocator.free(read_json);
+        const snapshot = try threadHistorySnapshotFromThreadRead(
+            allocator,
+            read_json,
+            retained_turns,
+        );
+        try appendHistoryReadEvent(
+            allocator,
+            events_path,
+            thread_id,
+            mode,
+            true,
+            snapshot.turn_ids.len,
+            false,
+        );
+        return snapshot;
+    }
+
+    var metadata_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        metadata_json,
+        .{},
+    );
+    defer metadata_parsed.deinit();
+    const metadata_root = switch (metadata_parsed.value) {
+        .object => |object| object,
+        else => return error.SourceStale,
+    };
+    const metadata_thread = core_json.objectField(metadata_root, "thread") orelse
+        return error.SourceStale;
+    var trace = canonical_trace.CanonicalSessionTrace{
+        .session = try canonical_trace.SessionRecord.init(
+            allocator,
+            core_json.stringField(metadata_thread, "path") orelse "",
+        ),
+    };
+    defer trace.deinit(allocator);
+    trace.session.session_id = try allocator.dupe(
+        u8,
+        core_json.stringField(metadata_thread, "id") orelse thread_id,
+    );
+    var turn_ids: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (turn_ids.items) |turn_id| allocator.free(turn_id);
+        turn_ids.deinit(allocator);
+    }
+    var completed_boundaries: std.ArrayList(bool) = .empty;
+    errdefer completed_boundaries.deinit(allocator);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| allocator.free(value);
+    var resume_attempted = false;
+    var page_index: usize = 0;
+    while (page_index < MaxThreadHistoryPages) : (page_index += 1) {
+        const params = if (cursor) |value|
+            try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id,
+                .cursor = value,
+                .limit = ThreadHistoryPageLimit,
+                .sortDirection = "asc",
+                .itemsView = "full",
+            })
+        else
+            try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id,
+                .limit = ThreadHistoryPageLimit,
+                .sortDirection = "asc",
+                .itemsView = "full",
+            });
+        defer allocator.free(params);
+        const page_json = client.requestJson(
+            "thread/turns/list",
+            params,
+        ) catch |request_err| retry: {
+            if (resume_attempted or
+                !clientLastErrorIsThreadNotLoaded(allocator, client, thread_id))
+            {
+                return preserveServerRequestProviderError(
+                    request_err,
+                    error.SourceNotFound,
+                );
+            }
+            resume_attempted = true;
+            try resumePaginatedThreadForTurnsList(
+                allocator,
+                client,
+                thread_id,
+                events_path,
+            );
+            break :retry client.requestJson("thread/turns/list", params) catch |retry_err|
+                return preserveServerRequestProviderError(
+                    retry_err,
+                    error.SourceNotFound,
+                );
+        };
+        defer allocator.free(page_json);
+        var page = try std.json.parseFromSlice(std.json.Value, allocator, page_json, .{});
+        defer page.deinit();
+        const page_root = switch (page.value) {
+            .object => |object| object,
+            else => return error.SourceStale,
+        };
+        const data = switch (page_root.get("data") orelse return error.SourceStale) {
+            .array => |array| array,
+            else => return error.SourceStale,
+        };
+        if (turn_ids.items.len + data.items.len > expected_turns) return error.SourceStale;
+        for (data.items) |turn_value| try appendThreadTurnToSnapshot(
+            allocator,
+            &trace,
+            &turn_ids,
+            &completed_boundaries,
+            turn_value,
+        );
+        const next_cursor_text = optionalString(page_root, "nextCursor");
+        try appendHistoryReadEvent(
+            allocator,
+            events_path,
+            thread_id,
+            mode,
+            true,
+            data.items.len,
+            next_cursor_text != null,
+        );
+        if (next_cursor_text == null) {
+            const digest = try trace_core.retainedTraceDigest(
+                allocator,
+                trace,
+                @intCast(turn_ids.items.len),
+            );
+            errdefer allocator.free(digest);
+            const retained_digest = if (retained_turns) |count| retained: {
+                const retained_count = std.math.cast(usize, count) orelse
+                    return error.SourceStale;
+                if (retained_count > turn_ids.items.len) return error.SourceStale;
+                break :retained TurnDigest{
+                    .count = count,
+                    .digest = try trace_core.retainedTraceDigest(
+                        allocator,
+                        trace,
+                        @intCast(retained_count),
+                    ),
+                };
+            } else null;
+            errdefer if (retained_digest) |value| allocator.free(value.digest);
+            return .{
+                .mode = mode,
+                .digest = .{ .count = turn_ids.items.len, .digest = digest },
+                .retained_digest = retained_digest,
+                .turn_ids = try turn_ids.toOwnedSlice(allocator),
+                .completed_boundaries = try completed_boundaries.toOwnedSlice(allocator),
+            };
+        }
+        if (data.items.len == 0) return error.SourceStale;
+        const next_cursor = next_cursor_text.?;
+        if (cursor) |current| if (std.mem.eql(u8, current, next_cursor)) return error.SourceStale;
+        const next_owned = try allocator.dupe(u8, next_cursor);
+        if (cursor) |old| allocator.free(old);
+        cursor = next_owned;
+    }
+    return error.SourceStale;
+}
+
+fn resumePaginatedThreadForTurnsList(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    thread_id: []const u8,
+    events_path: []const u8,
+) !void {
+    const params = try paginatedThreadResumeParamsAlloc(allocator, thread_id);
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/resume", params) catch |err|
+        return preserveServerRequestProviderError(err, error.SourceNotFound);
+    defer allocator.free(raw);
+    if (!paginatedResumeResponseMatches(allocator, raw, thread_id)) {
+        return error.SourceStale;
+    }
+    const event = try stringifyAnyAlloc(allocator, .{
+        .event = "thread/resume",
+        .thread_id = thread_id,
+        .history_mode = "paginated",
+        .exclude_turns = true,
+    });
+    defer allocator.free(event);
+    try appendLine(events_path, event);
+}
+
+fn clientLastErrorIsThreadNotLoaded(
+    allocator: std.mem.Allocator,
+    client: *const cas_client.Client,
+    thread_id: []const u8,
+) bool {
+    const raw = client.lastError() orelse return false;
+    const expected = std.fmt.allocPrint(
+        allocator,
+        "thread not loaded: {s}",
+        .{thread_id},
+    ) catch return false;
+    defer allocator.free(expected);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return std.mem.eql(
+        u8,
+        core_json.stringField(root, "message") orelse return false,
+        expected,
+    );
+}
+
+fn paginatedThreadResumeParamsAlloc(
+    allocator: std.mem.Allocator,
+    thread_id: []const u8,
+) ![]u8 {
+    return stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .excludeTurns = true,
+    });
+}
+
+fn paginatedResumeResponseMatches(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    expected_thread_id: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const thread = core_json.objectField(root, "thread") orelse return false;
+    const thread_id = core_json.stringField(thread, "id") orelse return false;
+    const history_mode = core_json.stringField(thread, "historyMode") orelse return false;
+    const turns = switch (thread.get("turns") orelse return false) {
+        .array => |array| array,
+        else => return false,
+    };
+    return std.mem.eql(u8, thread_id, expected_thread_id) and
+        std.mem.eql(u8, history_mode, "paginated") and
+        turns.items.len == 0;
+}
+
+fn appendThreadTurnToSnapshot(
+    allocator: std.mem.Allocator,
+    trace: *canonical_trace.CanonicalSessionTrace,
+    turn_ids: *std.ArrayList([]const u8),
+    completed_boundaries: *std.ArrayList(bool),
+    turn_value: std.json.Value,
+) !void {
+    const turn = switch (turn_value) {
+        .object => |object| object,
+        else => return error.SourceStale,
+    };
+    const turn_id = core_json.stringField(turn, "id") orelse return error.SourceStale;
+    if (turn_ids.items.len > 0 and
+        std.mem.eql(u8, turn_ids.items[turn_ids.items.len - 1], turn_id))
+    {
+        return error.SourceStale;
+    }
+    const turn_index: i64 = @intCast(turn_ids.items.len + 1);
+    var record = canonical_trace.TurnRecord{
+        .path = try allocator.dupe(u8, trace.session.path),
+        .turn_id = try allocator.dupe(u8, turn_id),
+        .turn_index = turn_index,
+        .status = mapThreadReadTurnStatus(core_json.stringField(turn, "status") orelse ""),
+        .user_message = try messageTextFromThreadItems(allocator, turn, "userMessage"),
+        .final_answer = try messageTextFromThreadItems(allocator, turn, "agentMessage"),
+    };
+    errdefer record.deinit(allocator);
+    try trace.turns.append(allocator, record);
+    try appendToolRecordsFromThreadItems(allocator, trace, turn, turn_index);
+    try turn_ids.append(allocator, try allocator.dupe(u8, turn_id));
+    try completed_boundaries.append(
+        allocator,
+        std.mem.eql(u8, core_json.stringField(turn, "status") orelse "", "completed"),
+    );
+}
+
+fn appendHistoryReadEvent(
+    allocator: std.mem.Allocator,
+    events_path: []const u8,
+    thread_id: []const u8,
+    mode: ThreadHistoryMode,
+    include_turns: bool,
+    returned_turns: usize,
+    has_next: bool,
+) !void {
+    const event = try stringifyAnyAlloc(allocator, .{
+        .event = if (mode == .paginated and include_turns) "thread/turns/list" else "thread/read",
+        .thread_id = thread_id,
+        .history_mode = @tagName(mode),
+        .include_turns = include_turns,
+        .returned_turns = returned_turns,
+        .has_next = has_next,
+    });
+    defer allocator.free(event);
+    try appendLine(events_path, event);
 }
 
 fn appendToolRecordsFromThreadItems(
@@ -4430,64 +5389,6 @@ fn requiredListLen(obj: std.json.ObjectMap, key: []const u8) !usize {
     };
 }
 
-fn codexVersionAlloc(allocator: std.mem.Allocator, codex_path: []const u8, cwd: []const u8, path_env: []const u8) ![]const u8 {
-    return codexVersionFromProcessAlloc(allocator, codex_path, cwd) catch
-        codexVersionFromInstallPathAlloc(allocator, codex_path, path_env);
-}
-
-fn codexVersionFromProcessAlloc(allocator: std.mem.Allocator, codex_path: []const u8, cwd: []const u8) ![]const u8 {
-    const temp_path = try std.fmt.allocPrint(allocator, "/tmp/cas-codex-version-{d}.txt", .{nowMillis()});
-    defer {
-        std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path) catch {};
-        allocator.free(temp_path);
-    }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var out_file = try std.Io.Dir.createFileAbsolute(io, temp_path, .{ .truncate = true });
-    var out_file_open = true;
-    defer if (out_file_open) out_file.close(io);
-    const argv = [_][]const u8{ codex_path, "--version" };
-    var child = try std.process.spawn(io, .{
-        .argv = &argv,
-        .cwd = if (std.mem.eql(u8, cwd, ".")) .inherit else .{ .path = cwd },
-        .expand_arg0 = if (std.mem.indexOfScalar(u8, codex_path, '/') == null) .expand else .no_expand,
-        .stdin = .ignore,
-        .stdout = .{ .file = out_file },
-        .stderr = .ignore,
-    });
-    const term = try child.wait(io);
-    const ok = switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!ok) return error.CodexUnavailable;
-    out_file.close(io);
-    out_file_open = false;
-    const stdout = try readFileAlloc(allocator, temp_path, 4096);
-    defer allocator.free(stdout);
-    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.CodexUnavailable;
-    return allocator.dupe(u8, trimmed);
-}
-
-fn codexVersionFromInstallPathAlloc(allocator: std.mem.Allocator, codex_path: []const u8, path_env: []const u8) ![]const u8 {
-    const resolved = try resolveExecutablePathAlloc(allocator, codex_path, path_env);
-    defer allocator.free(resolved);
-
-    var link_buffer: [4096]u8 = undefined;
-    const target = if (std.fs.path.isAbsolute(resolved)) blk: {
-        const n = std.Io.Dir.readLinkAbsolute(std.Io.Threaded.global_single_threaded.io(), resolved, &link_buffer) catch break :blk resolved;
-        break :blk link_buffer[0..n];
-    } else resolved;
-
-    const marker = "/Caskroom/codex/";
-    const start = std.mem.indexOf(u8, target, marker) orelse return error.CodexUnavailable;
-    const version_start = start + marker.len;
-    const rest = target[version_start..];
-    const version_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    if (version_end == 0) return error.CodexUnavailable;
-    return std.fmt.allocPrint(allocator, "codex-cli {s}", .{rest[0..version_end]});
-}
-
 fn resolveExecutablePathAlloc(allocator: std.mem.Allocator, codex_path: []const u8, path_env: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, codex_path, '/') != null) return allocator.dupe(u8, codex_path);
     var it = std.mem.splitScalar(u8, path_env, ':');
@@ -4503,21 +5404,6 @@ fn resolveExecutablePathAlloc(allocator: std.mem.Allocator, codex_path: []const 
         allocator.free(candidate);
     }
     return error.CodexUnavailable;
-}
-
-fn schemaCacheDirAlloc(allocator: std.mem.Allocator, home: []const u8, codex_version: []const u8) ![]const u8 {
-    const sanitized = try sanitizePathComponentAlloc(allocator, codex_version);
-    defer allocator.free(sanitized);
-    if (home.len == 0) return std.fmt.allocPrint(allocator, ".cache/cas/app-server-schema/{s}", .{sanitized});
-    return std.fmt.allocPrint(allocator, "{s}/.cache/cas/app-server-schema/{s}", .{ home, sanitized });
-}
-
-fn sanitizePathComponentAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out = try allocator.alloc(u8, raw.len);
-    for (raw, 0..) |ch, i| {
-        out[i] = if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '_' or ch == '-') ch else '_';
-    }
-    return out;
 }
 
 var configured_store_root_override: ?[]const u8 = null;
@@ -4837,19 +5723,31 @@ fn printFailureJson(allocator: std.mem.Allocator, code: FailureCode, hint: []con
 }
 
 fn printPreflightFailure(allocator: std.mem.Allocator, options: Options, err: anyerror) !void {
+    const failure_code: FailureCode = switch (err) {
+        error.AppServerPreflightFailed,
+        error.AppServerPreflightStatusMismatch,
+        error.AppServerPreflightHostIdentityMismatch,
+        error.InvalidAppServerPreflightReceipt,
+        => .codex_incompatible,
+        else => .schema_unavailable,
+    };
     try printJsonValue(allocator, .{
         .session_inquiry_preflight = .{
             .compatibility_verdict = "incompatible",
             .codex_path = options.codex_path,
             .codex_version = "",
             .schema_fingerprint = "",
+            .cache_dir = "",
             .capabilities = zeroCapabilities(),
             .thread_fork_replay = false,
+            .paginated_thread_fork = false,
             .rollout_transcript_replay = false,
             .selected_transport = options.transport,
-            .missing = [_][]const u8{"schema"},
+            .code_mode_host_redacted = @as(?[]const u8, null),
+            .code_mode_host_digest = @as(?[]const u8, null),
+            .missing = [_][]const u8{"app-server/session-inquiry-preflight"},
             .inquiry_allowed = false,
-            .failure_code = FailureCode.schema_unavailable.asString(),
+            .failure_code = failure_code.asString(),
             .failure_hint = @errorName(err),
         },
     });
@@ -4878,7 +5776,7 @@ test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
         "--sandbox",
         "read-only",
         "--transport",
-        "stdio",
+        "managed-ws",
         "--json",
     };
     const options = try parseArgs(&argv);
@@ -4916,12 +5814,40 @@ test "casStoreRootAlloc falls back to cwd ledger outside git" {
     try std.testing.expectEqualStrings(expected, store_root);
 }
 
-test "deriveCapabilities recognizes schema method and field surface" {
-    const text =
-        \\"thread/fork" "thread/rollback" "thread/start" "thread/read" "turn/start" "turn/interrupt"
-        \\"thread/archive" "ephemeral" "permissions" "sandbox" "numTurns"
-    ;
-    const caps = deriveCapabilities(text);
+test "deriveCapabilities recognizes exact schema method and local field surface" {
+    const allocator = std.testing.allocator;
+    var requests = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"oneOf":[{"properties":{"method":{"enum":["thread/fork"]}}},{"properties":{"method":{"enum":["thread/rollback"]}}},{"properties":{"method":{"enum":["thread/start"]}}},{"properties":{"method":{"enum":["thread/read"]}}},{"properties":{"method":{"enum":["thread/turns/list"]}}},{"properties":{"method":{"enum":["turn/start"]}}},{"properties":{"method":{"enum":["turn/interrupt"]}}},{"properties":{"method":{"enum":["thread/archive"]}}}]}
+    , .{});
+    defer requests.deinit();
+    var fork_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"properties":{"ephemeral":{},"permissions":{},"sandbox":{},"path":{},"lastTurnId":{},"beforeTurnId":{},"excludeTurns":{}}}
+    , .{});
+    defer fork_params.deinit();
+    var fork_response = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"definitions":{"Thread":{"properties":{"forkedFromId":{}}}}}
+    , .{});
+    defer fork_response.deinit();
+    var rollback_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"properties":{"numTurns":{}}}
+    , .{});
+    defer rollback_params.deinit();
+    var turns_list_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"properties":{"cursor":{},"limit":{},"sortDirection":{},"itemsView":{}}}
+    , .{});
+    defer turns_list_params.deinit();
+    var turns_list_response = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"properties":{"data":{},"nextCursor":{}}}
+    , .{});
+    defer turns_list_response.deinit();
+    const caps = deriveCapabilitiesFromSchemas(
+        requests.value,
+        fork_params.value,
+        fork_response.value,
+        rollback_params.value,
+        turns_list_params.value,
+        turns_list_response.value,
+    );
     try std.testing.expect(caps.thread_fork);
     try std.testing.expect(caps.thread_rollback);
     try std.testing.expect(caps.thread_start);
@@ -5453,19 +6379,130 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
     );
 }
 
-test "codexVersionFromInstallPathAlloc reads Homebrew cask version" {
+test "shared session inquiry preflight parser preserves exact profile evidence" {
     const allocator = std.testing.allocator;
-    const version = try codexVersionFromInstallPathAlloc(allocator, "/opt/homebrew/Caskroom/codex/1.2.3/codex-aarch64-apple-darwin", "");
-    defer allocator.free(version);
-    try std.testing.expectEqualStrings("codex-cli 1.2.3", version);
+    const raw =
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"compatible","contractId":"codex-app-server-0.146.0",
+        \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
+        \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
+        \\ "methods":{"missingRequired":[]},
+        \\ "handlerCoverage":{"status":"passed","failures":[]},
+        \\ "shapeChecks":{"status":"passed","failures":[]},
+        \\ "transport":{"selected":"managed-ws","codeModeHost":{"origin":"wss://example.test","sha256":"3333333333333333333333333333333333333333333333333333333333333333"}},
+        \\ "behavioralProbes":[
+        \\  {"id":"initialize-lifecycle","requirement":"required","status":"passed"},
+        \\  {"id":"managed-websocket-transport","requirement":"required","status":"passed"},
+        \\  {"id":"server-request-coverage","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-fork","requirement":"required","status":"passed"},
+        \\  {"id":"ephemeral-fork","requirement":"required","status":"passed"},
+        \\  {"id":"bounded-overload-retry","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-session-inquiry","requirement":"required","status":"passed"}
+        \\ ]}
+    ;
+    var receipt = try parseSharedSessionInquiryPreflightAlloc(allocator, raw);
+    defer receipt.deinit(allocator);
+    try std.testing.expect(receipt.overall_compatible);
+    try std.testing.expect(receipt.route_neutral_compatible);
+    try std.testing.expect(receipt.paginated_fork_passed);
+    try std.testing.expect(receipt.ephemeral_fork_passed);
+    try std.testing.expect(receipt.paginated_inquiry_passed);
+    try std.testing.expectEqualStrings("/tmp/codex-0.146.0", receipt.codex_path);
+    try std.testing.expectEqualStrings("codex-cli 0.146.0", receipt.codex_version);
+    try std.testing.expectEqualStrings("/tmp/cache/0.146.0", receipt.cache_dir);
+    try std.testing.expectEqualStrings(
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        receipt.code_mode_host_digest.?,
+    );
+}
+
+test "failed fork witnesses preserve route neutral transcript compatibility" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-0.146.0",
+        \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
+        \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
+        \\ "methods":{"missingRequired":[]},
+        \\ "handlerCoverage":{"status":"passed","failures":[]},
+        \\ "shapeChecks":{"status":"passed","failures":[]},
+        \\ "transport":{"selected":"managed-ws","codeModeHost":null},
+        \\ "behavioralProbes":[
+        \\  {"id":"initialize-lifecycle","requirement":"required","status":"passed"},
+        \\  {"id":"managed-websocket-transport","requirement":"required","status":"passed"},
+        \\  {"id":"server-request-coverage","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-fork","requirement":"required","status":"failed"},
+        \\  {"id":"ephemeral-fork","requirement":"required","status":"passed"},
+        \\  {"id":"bounded-overload-retry","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-session-inquiry","requirement":"required","status":"failed"}
+        \\ ]}
+    ;
+    var receipt = try parseSharedSessionInquiryPreflightAlloc(allocator, raw);
+    defer receipt.deinit(allocator);
+    try std.testing.expect(!receipt.overall_compatible);
+    try std.testing.expect(receipt.route_neutral_compatible);
+    try std.testing.expect(!receipt.paginated_fork_passed);
+    try std.testing.expect(receipt.ephemeral_fork_passed);
+    try std.testing.expect(!receipt.paginated_inquiry_passed);
+}
+
+test "structural incompatibility blocks route neutral transcript compatibility" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-0.146.0",
+        \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
+        \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
+        \\ "methods":{"missingRequired":["thread/start"]},
+        \\ "handlerCoverage":{"status":"passed","failures":[]},
+        \\ "shapeChecks":{"status":"passed","failures":[]},
+        \\ "transport":{"selected":"managed-ws","codeModeHost":null},
+        \\ "behavioralProbes":[
+        \\  {"id":"initialize-lifecycle","requirement":"required","status":"passed"},
+        \\  {"id":"managed-websocket-transport","requirement":"required","status":"passed"},
+        \\  {"id":"server-request-coverage","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-fork","requirement":"required","status":"failed"},
+        \\  {"id":"ephemeral-fork","requirement":"required","status":"failed"},
+        \\  {"id":"bounded-overload-retry","requirement":"required","status":"passed"},
+        \\  {"id":"paginated-session-inquiry","requirement":"required","status":"failed"}
+        \\ ]}
+    ;
+    var receipt = try parseSharedSessionInquiryPreflightAlloc(allocator, raw);
+    defer receipt.deinit(allocator);
+    try std.testing.expect(!receipt.overall_compatible);
+    try std.testing.expect(!receipt.route_neutral_compatible);
+}
+
+test "shared session inquiry probe gate rejects failed or duplicate witnesses" {
+    const allocator = std.testing.allocator;
+    var failed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"id":"paginated-fork","requirement":"required","status":"failed"}]
+    , .{});
+    defer failed.deinit();
+    try std.testing.expect(!requiredBehavioralProbePassed(failed.value, "paginated-fork"));
+
+    var duplicate = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"id":"paginated-fork","requirement":"required","status":"passed"},{"id":"paginated-fork","requirement":"required","status":"passed"}]
+    , .{});
+    defer duplicate.deinit();
+    try std.testing.expect(!requiredBehavioralProbePassed(duplicate.value, "paginated-fork"));
 }
 
 test "resolveExecutablePathAlloc uses standard fallback paths" {
-    if (!fileExists("/opt/homebrew/bin/codex")) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const path = try resolveExecutablePathAlloc(allocator, "codex", "");
+    const path = try resolveExecutablePathAlloc(allocator, "sh", "");
     defer allocator.free(path);
-    try std.testing.expectEqualStrings("/opt/homebrew/bin/codex", path);
+
+    try std.testing.expect(fileExists(path));
+    const fallback_dirs = [_][]const u8{
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    };
+    const resolved_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var uses_declared_fallback_dir = false;
+    for (fallback_dirs) |dir| {
+        if (std.mem.eql(u8, resolved_dir, dir)) uses_declared_fallback_dir = true;
+    }
+    try std.testing.expect(uses_declared_fallback_dir);
 }
 
 test "parseFiaAnswerAlloc accepts exact FIA JSON" {
@@ -5767,26 +6804,95 @@ test "turnDigestFromThreadRead includes live function call records" {
     try std.testing.expectEqualStrings(expected, observed.digest);
 }
 
-test "thread-backed inquiry rejects paginated history before fork" {
+test "thread-backed inquiry accepts paginated history and rejects unknown modes" {
     const allocator = std.testing.allocator;
-    try verifyForkableThreadHistory(
+    try std.testing.expectEqual(ThreadHistoryMode.legacy, try threadHistoryModeFromRead(
         allocator,
         "{\"thread\":{\"id\":\"thread-legacy\",\"historyMode\":\"legacy\",\"turns\":[]}}",
-    );
-    try verifyForkableThreadHistory(
+    ));
+    try std.testing.expectEqual(ThreadHistoryMode.legacy, try threadHistoryModeFromRead(
         allocator,
         "{\"thread\":{\"id\":\"thread-compatible\",\"turns\":[]}}",
-    );
-    try std.testing.expectError(
-        error.ThreadHistoryModeUnsupported,
-        verifyForkableThreadHistory(
-            allocator,
-            "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
-        ),
-    );
+    ));
+    try std.testing.expectEqual(ThreadHistoryMode.paginated, try threadHistoryModeFromRead(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+    ));
+    try std.testing.expectError(error.ThreadHistoryModeUnsupported, threadHistoryModeFromRead(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-unknown\",\"historyMode\":\"future\",\"turns\":[]}}",
+    ));
     try std.testing.expectEqual(
         FailureCode.thread_history_mode_unsupported,
         failureCodeForError(error.ThreadHistoryModeUnsupported),
+    );
+
+    const resume_params = try paginatedThreadResumeParamsAlloc(
+        allocator,
+        "thread-paginated",
+    );
+    defer allocator.free(resume_params);
+    var parsed_params = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        resume_params,
+        .{},
+    );
+    defer parsed_params.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_params.value.object.count());
+    try std.testing.expectEqualStrings(
+        "thread-paginated",
+        core_json.stringField(parsed_params.value.object, "threadId").?,
+    );
+    try std.testing.expectEqual(
+        true,
+        boolField(parsed_params.value.object, "excludeTurns").?,
+    );
+    try std.testing.expect(paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-other\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        "thread-paginated",
+    ));
+    try std.testing.expect(!paginatedResumeResponseMatches(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[{}]}}",
+        "thread-paginated",
+    ));
+}
+
+test "server request provider failures retain terminal inquiry identity" {
+    try std.testing.expectEqual(
+        FailureCode.auth_refresh_provider_unavailable,
+        failureCodeForError(error.ChatGptAuthTokensRefreshProviderUnavailable),
+    );
+    try std.testing.expectEqual(
+        FailureCode.attestation_provider_unavailable,
+        failureCodeForError(error.AttestationProviderUnavailable),
+    );
+    try std.testing.expect(!isRetryableLaneError(
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+    ));
+    try std.testing.expect(!isRetryableLaneError(
+        error.AttestationProviderUnavailable,
+    ));
+    try std.testing.expectEqual(
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+        preserveServerRequestProviderError(
+            error.ChatGptAuthTokensRefreshProviderUnavailable,
+            error.ForkFailed,
+        ),
+    );
+    try std.testing.expectEqual(
+        error.AttestationProviderUnavailable,
+        preserveServerRequestProviderError(
+            error.AttestationProviderUnavailable,
+            error.TurnStartFailed,
+        ),
     );
 }
 
@@ -5830,6 +6936,8 @@ fn freeDetachedRecord(allocator: std.mem.Allocator, record: DetachedRecord) void
     allocator.free(record.codex_path);
     allocator.free(record.codex_version);
     allocator.free(record.schema_fingerprint);
+    allocator.free(record.code_mode_host_redacted);
+    allocator.free(record.code_mode_host_digest);
     allocator.free(record.listen_url);
     allocator.free(record.cwd);
     allocator.free(record.failure_code);
