@@ -28,10 +28,12 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
-            zig_target: x86_64-linux
+            zig_target: x86_64-linux-musl
+            cas_static: true
             runs_on: ubuntu-latest
           - target: darwin-arm64
             zig_target: aarch64-macos
+            cas_static: false
             runs_on: macos-14
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -48,8 +50,59 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Fetch pinned SQLite amalgamation
+        shell: bash
+        run: |
+          set -euo pipefail
+          sqlite_version=3450100
+          sqlite_sha256=5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
+          sqlite_archive="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}.zip"
+          sqlite_root="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}"
+          curl --fail --location --retry 3 \
+            --output "${sqlite_archive}" \
+            "https://www.sqlite.org/2024/sqlite-amalgamation-${sqlite_version}.zip"
+          actual_sha256="$(shasum -a 256 "${sqlite_archive}" | awk '{print $1}')"
+          if [[ "${actual_sha256}" != "${sqlite_sha256}" ]]; then
+            echo "SQLite archive digest mismatch: ${actual_sha256}" >&2
+            exit 1
+          fi
+          unzip -q "${sqlite_archive}" -d "${RUNNER_TEMP}"
+          test -f "${sqlite_root}/sqlite3.c"
+          echo "CAS_SQLITE_AMALGAMATION=${sqlite_root}/sqlite3.c" >> "${GITHUB_ENV}"
       - name: Build cas binaries
-        run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+        run: >-
+          zig build build-cas
+          -Dtarget=${{ matrix.zig_target }}
+          -Dcpu=baseline
+          -Doptimize=ReleaseFast
+          -Dcas-static=${{ matrix.cas_static }}
+          -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
+      - name: Verify pinned SQLite release boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              for binary in \
+                cas cas_account cas_app_server_preflight cas_automation \
+                cas_smoke_check cas_instance_runner cas_review_session \
+                cas_session_inquiry cas_conformance_suite cas_goal \
+                cas-perf-budget-governor; do
+                if objdump -p "zig-out/bin/${binary}" | grep -Fq NEEDED; then
+                  echo "CAS release binary is dynamically linked: ${binary}" >&2
+                  exit 1
+                fi
+              done
+              ;;
+            macOS)
+              if otool -L zig-out/bin/cas_automation | grep -Fq libsqlite3; then
+                echo "CAS Automation unexpectedly depends on system SQLite" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          apps/cas/testdata/automation/cron-0.2.13/verify.sh \
+            ./zig-out/bin/cas automation
       - name: Verify removed CAS product stays absent
         shell: bash
         run: |
@@ -64,7 +117,14 @@ jobs:
           fi
       - name: Verify Linux dispatcher can launch its sibling executable
         if: matrix.target == 'linux-x86_64'
-        run: zig build test-cas-dispatch-runtime-linux -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast --summary all
+        run: >-
+          zig build test-cas-dispatch-runtime-linux
+          -Dtarget=${{ matrix.zig_target }}
+          -Dcpu=baseline
+          -Doptimize=ReleaseFast
+          -Dcas-static=${{ matrix.cas_static }}
+          -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
+          --summary all
       - name: Package cas artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"

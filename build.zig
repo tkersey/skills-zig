@@ -1,9 +1,11 @@
 const std = @import("std");
+const cas_build = @import("apps/cas/build_support.zig");
 pub fn build(b: *std.Build) void {
     enforceRepoLocalInstallOnly(b);
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const cas_release = cas_build.Options.init(b);
 
     const core_json = b.createModule(.{
         .root_source_file = b.path("libs/core/src/json_helpers.zig"),
@@ -475,8 +477,20 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
-    cas_automation.root_module.linkSystemLibrary("c", .{});
-    cas_automation.root_module.linkSystemLibrary("sqlite3", .{});
+    cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
+    cas_release.configureExecutables(&.{
+        cas,
+        cas_account,
+        cas_app_server_preflight,
+        cas_automation,
+        cas_smoke_check,
+        cas_instance_runner,
+        cas_review_session,
+        cas_session_inquiry,
+        cas_conformance_suite,
+        cas_goal,
+        cas_budget_perf,
+    });
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
@@ -718,7 +732,7 @@ pub fn build(b: *std.Build) void {
         "Run cas automation tests",
         .{
             .link_libc = true,
-            .sqlite = true,
+            .sqlite = cas_release.usesSystemSqlite(),
         },
     );
     test_cas.dependOn(&run_cas_automation_tests.step);
