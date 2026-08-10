@@ -12,6 +12,225 @@ pub const mark_viewed_mutation =
     "mutation SynopticMarkFileViewed($input:MarkFileAsViewedInput!){markFileAsViewed(input:$input){pullRequest{id}}}";
 pub const add_inline_comment_mutation =
     "mutation SynopticAddInlineComment($input:AddPullRequestReviewInput!){addPullRequestReview(input:$input){pullRequestReview{id url}}}";
+pub const reply_thread_mutation =
+    "mutation SynopticReply($input:AddPullRequestReviewThreadReplyInput!){addPullRequestReviewThreadReply(input:$input){comment{id body url}}}";
+pub const resolve_thread_mutation =
+    "mutation SynopticResolveThread($input:ResolveReviewThreadInput!){resolveReviewThread(input:$input){thread{id isResolved}}}";
+pub const unresolve_thread_mutation =
+    "mutation SynopticUnresolveThread($input:UnresolveReviewThreadInput!){unresolveReviewThread(input:$input){thread{id isResolved}}}";
+pub const update_comment_mutation =
+    "mutation SynopticUpdateComment($input:UpdatePullRequestReviewCommentInput!){updatePullRequestReviewComment(input:$input){pullRequestReviewComment{id body url}}}";
+pub const delete_comment_mutation =
+    "mutation SynopticDeleteComment($input:DeletePullRequestReviewCommentInput!){deletePullRequestReviewComment(input:$input){clientMutationId}}";
+pub const unmark_viewed_mutation =
+    "mutation SynopticUnmarkFileViewed($input:UnmarkFileAsViewedInput!){unmarkFileAsViewed(input:$input){pullRequest{id}}}";
+pub const action_authority_query =
+    "query SynopticActionAuthority($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$after){nodes{id path viewerCanReply viewerCanResolve viewerCanUnresolve comments(first:100){nodes{id body viewerDidAuthor}}}pageInfo{hasNextPage endCursor}}}}}";
+pub const reconcile_query =
+    "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$after){nodes{id path line isResolved comments(first:100){nodes{id body createdAt viewerDidAuthor}}}pageInfo{hasNextPage endCursor}}}}}";
+
+pub const TransparentLimits = struct {
+    pub const document_bytes: usize = 32 * 1024;
+    pub const variables_bytes: usize = 64 * 1024;
+};
+
+/// Transparent mutations deliberately remain GraphQL rather than becoming a
+/// second browser API. This small validator owns the authority boundary: one
+/// named mutation, one unaliased root effect, and no syntax that can obscure
+/// the effect shown on the immutable card.
+pub fn validateTransparent(document: []const u8, expected_operation: []const u8, variables_json: []const u8, pull_request_id: []const u8) !void {
+    if (document.len == 0 or document.len > TransparentLimits.document_bytes or variables_json.len > TransparentLimits.variables_bytes) return error.GraphqlActionTooLarge;
+    if (!validName(expected_operation)) return error.InvalidGraphqlOperationName;
+    if (std.mem.indexOf(u8, document, "...") != null or std.mem.indexOfScalar(u8, document, '@') != null) return error.GraphqlSyntaxForbidden;
+
+    var tokens = try tokenize(std.heap.page_allocator, document);
+    defer tokens.deinit(std.heap.page_allocator);
+    if (tokens.items.len < 4 or !std.mem.eql(u8, tokens.items[0].text, "mutation") or !std.mem.eql(u8, tokens.items[1].text, expected_operation)) return error.InvalidGraphqlOperationName;
+    for (tokens.items) |token| if (token.kind == .name and std.mem.eql(u8, token.text, "fragment")) return error.GraphqlSyntaxForbidden;
+
+    var selection: ?usize = null;
+    var parens: usize = 0;
+    for (tokens.items[2..], 2..) |token, index| switch (token.kind) {
+        .l_paren => parens += 1,
+        .r_paren => {
+            if (parens == 0) return error.InvalidGraphqlDocument;
+            parens -= 1;
+        },
+        .l_brace => if (parens == 0) {
+            selection = index;
+            break;
+        },
+        else => {},
+    };
+    const start = selection orelse return error.InvalidGraphqlDocument;
+    if (containsSelectionAlias(tokens.items, start)) return error.GraphqlAliasForbidden;
+    var depth: usize = 0;
+    var root_count: usize = 0;
+    var root_name: ?[]const u8 = null;
+    var index = start;
+    while (index < tokens.items.len) : (index += 1) {
+        const token = tokens.items[index];
+        switch (token.kind) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                if (depth == 0) return error.InvalidGraphqlDocument;
+                depth -= 1;
+                if (depth == 0) {
+                    if (index + 1 != tokens.items.len) return error.InvalidGraphqlDocument;
+                    break;
+                }
+            },
+            .name => if (depth == 1) {
+                // At selection depth one, a name preceded by a completed root
+                // selection is another root. A colon immediately following is
+                // an alias and is forbidden.
+                if (index + 1 < tokens.items.len and tokens.items[index + 1].kind == .colon) return error.GraphqlAliasForbidden;
+                root_count += 1;
+                root_name = token.text;
+                index = skipSelection(tokens.items, index + 1) catch return error.InvalidGraphqlDocument;
+                if (index > 0) index -= 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0 or root_count != 1) return error.GraphqlRootCountInvalid;
+    _ = root_name orelse return error.GraphqlRootCountInvalid;
+
+    var variables = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, variables_json, .{ .max_value_len = TransparentLimits.variables_bytes });
+    defer variables.deinit();
+    if (variables.value != .object) return error.InvalidGraphqlVariables;
+    var saw_target = false;
+    try validateVariables(variables.value, pull_request_id, &saw_target);
+    if (!saw_target) return error.GraphqlPullRequestTargetMissing;
+}
+
+const TokenKind = enum { name, l_brace, r_brace, l_paren, r_paren, colon, dollar, bang, bracket, string, other };
+const Token = struct { kind: TokenKind, text: []const u8 };
+
+fn tokenize(allocator: std.mem.Allocator, document: []const u8) !std.ArrayList(Token) {
+    var result: std.ArrayList(Token) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < document.len) {
+        const c = document[i];
+        if (std.ascii.isWhitespace(c) or c == ',') {
+            i += 1;
+            continue;
+        }
+        if (c == '#') {
+            while (i < document.len and document[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '"') {
+            const begin = i;
+            i += 1;
+            var escaped = false;
+            while (i < document.len) : (i += 1) {
+                if (!escaped and document[i] == '"') {
+                    i += 1;
+                    break;
+                }
+                escaped = !escaped and document[i] == '\\';
+                if (document[i] != '\\') escaped = false;
+            }
+            if (i > document.len or document[i - 1] != '"') return error.InvalidGraphqlDocument;
+            try result.append(allocator, .{ .kind = .string, .text = document[begin..i] });
+            continue;
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const begin = i;
+            i += 1;
+            while (i < document.len and (std.ascii.isAlphanumeric(document[i]) or document[i] == '_')) i += 1;
+            try result.append(allocator, .{ .kind = .name, .text = document[begin..i] });
+            continue;
+        }
+        const kind: TokenKind = switch (c) {
+            '{' => .l_brace,
+            '}' => .r_brace,
+            '(' => .l_paren,
+            ')' => .r_paren,
+            ':' => .colon,
+            '$' => .dollar,
+            '!' => .bang,
+            '[', ']' => .bracket,
+            else => .other,
+        };
+        try result.append(allocator, .{ .kind = kind, .text = document[i .. i + 1] });
+        i += 1;
+    }
+    return result;
+}
+
+fn skipSelection(tokens: []const Token, start: usize) !usize {
+    var i = start;
+    var parens: usize = 0;
+    while (i < tokens.len) : (i += 1) switch (tokens[i].kind) {
+        .l_paren => parens += 1,
+        .r_paren => {
+            if (parens == 0) return error.InvalidGraphqlDocument;
+            parens -= 1;
+        },
+        .l_brace => if (parens == 0) {
+            var depth: usize = 1;
+            i += 1;
+            while (i < tokens.len and depth > 0) : (i += 1) switch (tokens[i].kind) {
+                .l_brace => depth += 1,
+                .r_brace => depth -= 1,
+                else => {},
+            };
+            if (depth != 0) return error.InvalidGraphqlDocument;
+            return i;
+        },
+        .r_brace => if (parens == 0) return i,
+        else => {},
+    };
+    return error.InvalidGraphqlDocument;
+}
+
+fn validName(value: []const u8) bool {
+    if (value.len == 0 or !(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) return false;
+    for (value[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    return true;
+}
+
+fn containsSelectionAlias(tokens: []const Token, start: usize) bool {
+    var braces: usize = 0;
+    var parens: usize = 0;
+    var i = start;
+    while (i < tokens.len) : (i += 1) switch (tokens[i].kind) {
+        .l_brace => if (parens == 0) {
+            braces += 1;
+        },
+        .r_brace => if (parens == 0 and braces > 0) {
+            braces -= 1;
+        },
+        .l_paren => parens += 1,
+        .r_paren => if (parens > 0) {
+            parens -= 1;
+        },
+        .name => if (braces > 0 and parens == 0 and i + 1 < tokens.len and tokens[i + 1].kind == .colon) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn validateVariables(value: std.json.Value, pull_request_id: []const u8, saw_target: *bool) !void {
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.eql(u8, key, "pullRequestId") or std.mem.eql(u8, key, "subjectId") or std.mem.eql(u8, key, "labelableId")) {
+                    if (entry.value_ptr.* != .string or !std.mem.eql(u8, entry.value_ptr.string, pull_request_id)) return error.GraphqlPullRequestTargetMismatch;
+                    saw_target.* = true;
+                }
+                try validateVariables(entry.value_ptr.*, pull_request_id, saw_target);
+            }
+        },
+        .array => |array| for (array.items) |item| try validateVariables(item, pull_request_id, saw_target),
+        else => {},
+    }
+}
 
 pub fn operationName(document: []const u8) ?[]const u8 {
     const open = std.mem.indexOfScalar(u8, document, '(') orelse return null;
@@ -52,4 +271,14 @@ test "GraphQL request owns document and variables" {
 
 test "operation identity remains inspectable in fake gh stdin" {
     try std.testing.expectEqualStrings("SynopticMarkFileViewed", operationName(mark_viewed_mutation).?);
+}
+
+test "transparent GraphQL admits broad exact PR mutations and rejects obscured or mismatched effects" {
+    const safe = "mutation AddReviewNote($input:AddCommentInput!){addComment(input:$input){clientMutationId}}";
+    try validateTransparent(safe, "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_1\",\"body\":\"note\"}}", "PR_1");
+    try std.testing.expectError(error.GraphqlAliasForbidden, validateTransparent("mutation AddReviewNote($input:AddCommentInput!){hidden:addComment(input:$input){clientMutationId}}", "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_1\"}}", "PR_1"));
+    try std.testing.expectError(error.GraphqlSyntaxForbidden, validateTransparent("mutation AddReviewNote($input:AddCommentInput!){addComment(input:$input){...Fields}} fragment Fields on AddCommentPayload{clientMutationId}", "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_1\"}}", "PR_1"));
+    try std.testing.expectError(error.GraphqlRootCountInvalid, validateTransparent("mutation AddReviewNote($input:AddCommentInput!){addComment(input:$input){clientMutationId} deleteIssue(input:$input){clientMutationId}}", "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_1\"}}", "PR_1"));
+    try validateTransparent("mutation ChangePr($input:UpdatePullRequestInput!){updatePullRequest(input:$input){clientMutationId}}", "ChangePr", "{\"input\":{\"pullRequestId\":\"PR_1\",\"state\":\"CLOSED\",\"projectIds\":[\"P_1\"]}}", "PR_1");
+    try std.testing.expectError(error.GraphqlPullRequestTargetMismatch, validateTransparent(safe, "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_OTHER\"}}", "PR_1"));
 }

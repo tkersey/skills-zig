@@ -151,12 +151,12 @@ pub const Server = struct {
                 defer input.deinit(self.allocator);
                 const identity = try runtime.registry.sessionIdentity(session_id);
                 defer identity.deinit();
-                if (!std.mem.eql(u8, input.path, identity.path)) return error.ActionTargetsAnotherSession;
-                const session_slot = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session_id, input.slot });
-                defer self.allocator.free(session_slot);
-                const superseded = if (runtime.app.action_store.pendingIdForSlot(session_slot)) |id| try self.allocator.dupe(u8, id) else null;
+                try tools.validateAgainstSession(input, identity.path);
+                const superseded = if (runtime.app.action_store.pendingIdForSlot(session_id, input.slot)) |id| try self.allocator.dupe(u8, id) else null;
                 defer if (superseded) |id| self.allocator.free(id);
-                const card = try runtime.app.prepareModelAction(session_id, input.slot, input.path, input.line, input.body);
+                const repository = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ runtime.owner, runtime.name });
+                defer self.allocator.free(repository);
+                const card = try runtime.app.prepareModelAction(session_id, identity.turn_id, input, repository, runtime.number, runtime.pull_request_id, identity.path);
                 if (superseded) |id| {
                     const superseded_payload = try std.fmt.allocPrint(self.allocator, "{{\"sessionId\":{f},\"id\":{f}}}", .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(id, .{}) });
                     defer self.allocator.free(superseded_payload);
@@ -164,7 +164,7 @@ pub const Server = struct {
                     defer self.allocator.free(superseded_envelope);
                     try writeServerText(self.io, stream, superseded_envelope);
                 }
-                const card_payload = try std.fmt.allocPrint(self.allocator, "{{\"sessionId\":{f},\"id\":{f},\"slot\":{f},\"path\":{f},\"line\":{d},\"body\":{f},\"status\":\"pending\"}}", .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(card.id, .{}), std.json.fmt(card.slot, .{}), std.json.fmt(card.path, .{}), card.line, std.json.fmt(card.body, .{}) });
+                const card_payload = try tools.cardJsonAlloc(self.allocator, card);
                 defer self.allocator.free(card_payload);
                 const card_envelope = try runtime.app.nextEnvelope("action.prepared", card_payload);
                 defer self.allocator.free(card_envelope);
@@ -255,14 +255,35 @@ pub const Server = struct {
             return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
         }
         if (std.mem.eql(u8, command, "action.confirm")) {
+            if (payload.count() != 1) return error.InvalidUiCommand;
             const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
             const card = (try runtime.app.action_store.pendingById(card_id)).*;
-            try runtime.broker.validateCurrentPath(runtime.owner, runtime.name, runtime.number, runtime.app.generation.head_oid, card.path);
-            const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, card.path);
-            defer self.allocator.free(diff);
-            if (!github.validateRightLine(diff, card.line)) return error.StaleCommentAnchor;
-            try runtime.app.confirmInline(runtime.broker, runtime.pull_request_id, runtime.app.generation.head_oid, card_id);
-            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"succeeded\"}}", .{std.json.fmt(card_id, .{})});
+            runtime.broker.validateAction(runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, card) catch |err| {
+                try runtime.app.action_store.invalidate(card_id);
+                const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}", .{ std.json.fmt(card_id, .{}), std.json.fmt(@errorName(err), .{}) });
+                defer self.allocator.free(status);
+                return runtime.app.nextEnvelope("action.status", status);
+            };
+            if (card.kind == .add_inline_comment) {
+                const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, card.target.path.?);
+                defer self.allocator.free(diff);
+                if (!github.validateDiffAnchor(diff, card.target.line.?, card.target.start_line, card.target.side orelse "RIGHT")) {
+                    try runtime.app.action_store.invalidate(card_id);
+                    const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":\"StaleCommentAnchor\"}}", .{std.json.fmt(card_id, .{})});
+                    defer self.allocator.free(status);
+                    return runtime.app.nextEnvelope("action.status", status);
+                }
+            }
+            const terminal = try runtime.app.confirmAction(runtime.broker, runtime.owner, runtime.name, runtime.number, card_id);
+            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":{f},\"stateFresh\":{}}}", .{ std.json.fmt(card_id, .{}), std.json.fmt(tools.actionStatusName(terminal), .{}), runtime.app.action_state_fresh });
+            defer self.allocator.free(status);
+            return runtime.app.nextEnvelope("action.status", status);
+        }
+        if (std.mem.eql(u8, command, "action.reject")) {
+            if (payload.count() != 1) return error.InvalidUiCommand;
+            const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
+            try runtime.app.rejectAction(card_id);
+            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"rejected\"}}", .{std.json.fmt(card_id, .{})});
             defer self.allocator.free(status);
             return runtime.app.nextEnvelope("action.status", status);
         }

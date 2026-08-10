@@ -3,6 +3,19 @@ const std = @import("std");
 pub const ViewedState = enum { viewed, unviewed, dismissed };
 pub const SessionStatus = enum { current, stale_origin, completed, closed };
 
+/// Stable server-owned identity injected into action cards. Model payloads may
+/// describe an effect, but cannot choose a different repository or PR.
+pub const PullRequestTarget = struct {
+    repository: []const u8,
+    number: u64,
+    id: []const u8,
+    head_oid: []const u8,
+
+    pub fn matches(self: PullRequestTarget, repository: []const u8, number: u64, id: []const u8, head_oid: []const u8) bool {
+        return self.number == number and std.mem.eql(u8, self.repository, repository) and std.mem.eql(u8, self.id, id) and std.mem.eql(u8, self.head_oid, head_oid);
+    }
+};
+
 pub const ReviewThread = struct { id: []const u8, path: []const u8, line: ?u32 = null, outdated: bool = false };
 pub const Tab = struct { id: []const u8, path: []const u8, revision: []const u8, status: SessionStatus = .current };
 
@@ -67,8 +80,12 @@ pub const PrGeneration = struct {
     }
 
     pub fn markViewed(self: *PrGeneration, path: []const u8) !void {
+        return self.setViewed(path, .viewed);
+    }
+
+    pub fn setViewed(self: *PrGeneration, path: []const u8, state: ViewedState) !void {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
-            file.viewed = .viewed;
+            file.viewed = state;
             return;
         };
         return error.UnknownFile;

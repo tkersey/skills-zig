@@ -22,7 +22,8 @@ test "vertical state path gates primary, streams session, and retains completed 
     defer std.testing.allocator.free(event);
     try std.testing.expect(std.mem.indexOf(u8, event, "session.opened") != null);
     state.initial_review_active = false;
-    try state.prepareInline("src/a.zig", 12, "Could this fail?", true);
+    const input = tools.PreparedActionInput{ .slot = @constCast("finding-1"), .kind = .add_inline_comment, .effect_summary = @constCast("Add a comment"), .payload_json = @constCast("{}"), .path = @constCast("src/a.zig"), .line = 12, .body = @constCast("Could this fail?") };
+    _ = try state.prepareModelAction("s", "t", input, "o/r", 1, "PR_1", "src/a.zig");
     try std.testing.expectEqual(tools.ActionStatus.pending, state.pending.?.status);
     state.close();
     try std.testing.expect(state.generation.queued("src/a.zig"));
@@ -38,7 +39,7 @@ test "falsifier action tool is rejected during initial review" {
     state.primary_ready = true;
     const event = try state.openFile("a");
     defer std.testing.allocator.free(event);
-    try std.testing.expectError(error.InitialReviewActionForbidden, state.prepareInline("a", 1, "body", true));
+    try std.testing.expectError(error.InitialReviewActionForbidden, tools.authorizeTool(.initial_review, true));
 }
 test "falsifier token is not optional" {
     try std.testing.expect(!http.pathConfined("/tmp/ui", "/tmp/ui2/index.html"));
@@ -54,7 +55,7 @@ test "App owns one monotonic UI sequence across event classes" {
     try std.testing.expect(std.mem.indexOf(u8, two, "\"seq\":2") != null);
 }
 test "model prepared payload is decoded into owned immutable action input" {
-    const raw = "{\"params\":{\"threadId\":\"file-1\",\"arguments\":{\"slot\":\"finding-1\",\"path\":\"a.zig\",\"line\":7,\"body\":\"Could this fail?\"}}}";
+    const raw = "{\"params\":{\"threadId\":\"file-1\",\"arguments\":{\"slot\":\"finding-1\",\"kind\":\"add_inline_comment\",\"effectSummary\":\"Add an inline comment on a.zig line 7\",\"payload\":{\"path\":\"a.zig\",\"line\":7,\"side\":\"RIGHT\",\"body\":\"Could this fail?\"}}}}";
     const input = try tools.decodePreparedAction(std.testing.allocator, raw);
     defer input.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("finding-1", input.slot);
@@ -62,8 +63,21 @@ test "model prepared payload is decoded into owned immutable action input" {
 }
 test "browser protocol exposes action confirmation but not preparation or completion bypasses" {
     try std.testing.expect(ui.commandAllowed("action.confirm"));
+    try std.testing.expect(ui.commandAllowed("action.reject"));
     try std.testing.expect(!ui.commandAllowed("action.prepare"));
     try std.testing.expect(!ui.commandAllowed("file.complete"));
+}
+test "action cards serialize exact effect target payload and rejection terminality" {
+    var store = tools.ActionStore{ .allocator = std.testing.allocator };
+    defer store.deinit();
+    const input = tools.PreparedActionInput{ .slot = @constCast("reply"), .kind = .reply_thread, .effect_summary = @constCast("Reply to thread T_1"), .payload_json = @constCast("{\"threadId\":\"T_1\",\"body\":\"reply\"}"), .thread_id = @constCast("T_1"), .body = @constCast("reply") };
+    const card = try store.prepare("ses-9", "turn-4", input, .{ .repository = "o/r", .pull_request = 2, .pull_request_id = "PR_2", .head_oid = "head", .session_path = "a.zig" });
+    const encoded = try tools.cardJsonAlloc(std.testing.allocator, card.*);
+    defer std.testing.allocator.free(encoded);
+    inline for (.{ "synoptic-github-action/v1", "Reply to thread T_1", "T_1", "ses-9", "turn-4", "\"payload\":{\"threadId\":\"T_1\"" }) |needle| try std.testing.expect(std.mem.indexOf(u8, encoded, needle) != null);
+    try store.reject(card.id);
+    try std.testing.expectEqual(tools.ActionStatus.rejected, store.cards.items[0].status);
+    try std.testing.expectError(error.ActionNotPending, store.beginExecute(card.id));
 }
 test "e2e domain lifecycle preserves queue tabs supersession and changed revision" {
     var state = try app.App.init(std.testing.allocator, "h1");
@@ -75,8 +89,10 @@ test "e2e domain lifecycle preserves queue tabs supersession and changed revisio
     const opened = try state.openFile("a");
     defer std.testing.allocator.free(opened);
     state.initial_review_active = false;
-    try state.prepareInline("a", 1, "first", true);
-    try state.prepareInline("a", 2, "replacement", true);
+    const first_action = tools.PreparedActionInput{ .slot = @constCast("finding-1"), .kind = .add_inline_comment, .effect_summary = @constCast("First"), .payload_json = @constCast("{}"), .path = @constCast("a"), .line = 1, .body = @constCast("first") };
+    const replacement_action = tools.PreparedActionInput{ .slot = @constCast("finding-1"), .kind = .add_inline_comment, .effect_summary = @constCast("Replacement"), .payload_json = @constCast("{}"), .path = @constCast("a"), .line = 2, .body = @constCast("replacement") };
+    _ = try state.prepareModelAction("s", "t1", first_action, "o/r", 1, "PR_1", "a");
+    _ = try state.prepareModelAction("s", "t2", replacement_action, "o/r", 1, "PR_1", "a");
     try std.testing.expectEqual(tools.ActionStatus.superseded, state.action_store.cards.items[0].status);
     const second = try state.openFile("b");
     defer std.testing.allocator.free(second);
@@ -180,7 +196,7 @@ fn fakeCodexScript() []const u8 {
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
     \\        printf '{"id":%s,"result":{"turn":{"id":"file-turn"}}}\n' "$id"
     \\        if printf '%s' "$line" | grep -q 'prepare the comment'; then
-    \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"slot":"finding-1","path":"a.zig","line":1,"body":"Could this fail?"}}}\n' "$thread_id"
+    \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"slot":"finding-1","kind":"add_inline_comment","effectSummary":"Add an inline comment on a.zig line 1","payload":{"path":"a.zig","line":1,"side":"RIGHT","body":"Could this fail?"}}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'complete this file'; then
     \\          printf '{"id":"tool-complete","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.complete_file_review","arguments":{}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'close this session'; then
@@ -214,6 +230,182 @@ fn fakeGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8, state_p
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     , .{ log_path, state_path, head, head });
+}
+
+fn fakeActionGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8) ![]u8 {
+    const template =
+        \\#!/bin/sh
+        \\set -eu
+        \\log='__LOG__'
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\printf 'ARGV:%s\nSTDIN:' "$*" >> "$log"; cat "$input" >> "$log"; printf '\n' >> "$log"
+        \\if grep -q 'SynopticActionAuthority' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[{"id":"C_1","body":"old","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticAnchor' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticFileState' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig","viewerViewedState":"UNVIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\printf '%s\n' '{"data":{"ok":{"clientMutationId":"accepted"}}}'
+        \\
+    ;
+    return std.mem.replaceOwned(u8, allocator, template, "__LOG__", log_path);
+}
+
+fn fakeAmbiguousGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8) ![]u8 {
+    const template =
+        \\#!/bin/sh
+        \\set -eu
+        \\log='__LOG__'
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\cat "$input" >> "$log"; printf '\n' >> "$log"
+        \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticReconcile' "$input"; then now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
+        \\if grep -q 'SynopticAddInlineComment' "$input"; then exit 1; fi
+        \\printf '%s\n' '{"data":{}}'
+        \\
+    ;
+    return std.mem.replaceOwned(u8, allocator, template, "__LOG__", log_path);
+}
+
+test "action broker typed and transparent matrix uses fixed argv and exact stdin" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-actions" });
+    defer allocator.free(gh_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "actions.log" });
+    defer allocator.free(log_path);
+    const script = try fakeActionGhScriptAlloc(allocator, log_path);
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-actions", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    const authoritative = tools.AuthoritativeTarget{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a.zig" };
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const inputs = [_]tools.PreparedActionInput{
+        .{ .slot = @constCast("reply"), .kind = .reply_thread, .effect_summary = @constCast("Reply to thread T_1"), .payload_json = @constCast("{}"), .thread_id = @constCast("T_1"), .body = @constCast("reply") },
+        .{ .slot = @constCast("resolve"), .kind = .resolve_thread, .effect_summary = @constCast("Resolve thread T_1"), .payload_json = @constCast("{}"), .thread_id = @constCast("T_1") },
+        .{ .slot = @constCast("unresolve"), .kind = .unresolve_thread, .effect_summary = @constCast("Unresolve thread T_1"), .payload_json = @constCast("{}"), .thread_id = @constCast("T_1") },
+        .{ .slot = @constCast("update"), .kind = .update_comment, .effect_summary = @constCast("Update comment C_1"), .payload_json = @constCast("{}"), .comment_id = @constCast("C_1"), .body = @constCast("updated") },
+        .{ .slot = @constCast("delete"), .kind = .delete_comment, .effect_summary = @constCast("Delete comment C_1"), .payload_json = @constCast("{}"), .comment_id = @constCast("C_1") },
+        .{ .slot = @constCast("unmark"), .kind = .unmark_viewed, .effect_summary = @constCast("Return a.zig to the unviewed queue"), .payload_json = @constCast("{}"), .path = @constCast("a.zig") },
+        .{ .slot = @constCast("transparent"), .kind = .graphql, .effect_summary = @constCast("Add a PR note"), .payload_json = @constCast("{}"), .operation_name = @constCast("AddReviewNote"), .document = @constCast("mutation AddReviewNote($input:AddCommentInput!){addComment(input:$input){clientMutationId}}"), .variables = @constCast("{\"input\":{\"subjectId\":\"PR_1\",\"body\":\"note\"}}") },
+    };
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    for (inputs, 0..) |input, i| {
+        const source = try std.fmt.allocPrint(allocator, "turn-{d}", .{i});
+        defer allocator.free(source);
+        const card = try store.prepare("ses-1", source, input, authoritative);
+        try broker.validateAction("o", "r", 1, "PR_1", card.*);
+        try broker.executeAction(card.*);
+        if (card.kind == .unmark_viewed) try std.testing.expect(try broker.viewedStateAfterMutation("o", "r", 1, "h", "a.zig", false));
+    }
+    var tampered = store.cards.items[store.cards.items.len - 1];
+    var tampered_graphql = tampered.graphql.?;
+    tampered_graphql.document = "mutation AddReviewNote($input:AddCommentInput!){hidden:addComment(input:$input){clientMutationId}}";
+    tampered.graphql = tampered_graphql;
+    try std.testing.expectError(error.GraphqlAliasForbidden, broker.executeAction(tampered));
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expectEqual(std.mem.count(u8, log, "ARGV:api graphql --hostname github.com --input -"), std.mem.count(u8, log, "ARGV:"));
+    inline for (.{ "SynopticReply", "SynopticResolveThread", "SynopticUnresolveThread", "SynopticUpdateComment", "SynopticDeleteComment", "SynopticUnmarkFileViewed", "mutation AddReviewNote" }) |needle| try std.testing.expect(std.mem.indexOf(u8, log, needle) != null);
+    inline for (.{ "\"pullRequestReviewThreadId\":\"T_1\"", "\"pullRequestReviewCommentId\":\"C_1\"", "\"subjectId\":\"PR_1\"", "\"path\":\"a.zig\"" }) |needle| try std.testing.expect(std.mem.indexOf(u8, log, needle) != null);
+
+    var state = try app.App.init(allocator, "h");
+    defer state.deinit();
+    try state.generation.addFile(.{ .path = "a.zig", .viewed = .viewed, .revision_key = "r" });
+    const unmark = inputs[5];
+    const unmark_card = try state.action_store.prepare("ses-unmark", "turn-unmark", unmark, authoritative);
+    try broker.validateAction("o", "r", 1, "PR_1", unmark_card.*);
+    try std.testing.expectEqual(tools.ActionStatus.succeeded, try state.confirmAction(broker, "o", "r", 1, unmark_card.id));
+    try std.testing.expect(state.generation.queued("a.zig"));
+}
+
+test "action broker reconciles an ambiguous mutation once without retry" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-ambiguous" });
+    defer allocator.free(gh_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "ambiguous.log" });
+    defer allocator.free(log_path);
+    const script = try fakeAmbiguousGhScriptAlloc(allocator, log_path);
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-ambiguous", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    var state = try app.App.init(allocator, "h");
+    defer state.deinit();
+    try state.generation.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r" });
+    const input = tools.PreparedActionInput{ .slot = @constCast("finding"), .kind = .add_inline_comment, .effect_summary = @constCast("Add the inline comment"), .payload_json = @constCast("{}"), .path = @constCast("a.zig"), .line = 1, .side = @constCast("RIGHT"), .body = @constCast("body") };
+    const card = try state.action_store.prepare("ses-1", "turn-2", input, .{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a.zig" });
+    try broker.validateAction("o", "r", 1, "PR_1", card.*);
+    try std.testing.expectEqual(tools.ActionStatus.succeeded, try state.confirmAction(broker, "o", "r", 1, card.id));
+    const unmatched_input = tools.PreparedActionInput{ .slot = @constCast("finding-2"), .kind = .add_inline_comment, .effect_summary = @constCast("Add the other inline comment"), .payload_json = @constCast("{}"), .path = @constCast("a.zig"), .line = 1, .side = @constCast("RIGHT"), .body = @constCast("different body") };
+    const unmatched = try state.action_store.prepare("ses-1", "turn-3", unmatched_input, .{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a.zig" });
+    try broker.validateAction("o", "r", 1, "PR_1", unmatched.*);
+    try std.testing.expectEqual(tools.ActionStatus.outcome_unknown, try state.confirmAction(broker, "o", "r", 1, unmatched.id));
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticAddInlineComment"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticReconcile"));
+}
+
+test "updated comment reconciliation matches identity author and body regardless of creation age" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-update-reconcile" });
+    defer allocator.free(gh_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "update-reconcile.log" });
+    defer allocator.free(log_path);
+    const script = try fakeAmbiguousGhScriptAlloc(allocator, log_path);
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-update-reconcile", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses-update", "turn-update", .{
+        .slot = @constCast("update"),
+        .kind = .update_comment,
+        .effect_summary = @constCast("Update comment C_new"),
+        .payload_json = @constCast("{}"),
+        .comment_id = @constCast("C_new"),
+        .body = @constCast("body"),
+    }, .{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a.zig" });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    // The fixture's createdAt is current, while the mutation start is far in
+    // the future. Updates reconcile from immutable identity and final state,
+    // not from the comment's original creation timestamp.
+    try std.testing.expect(try broker.reconcileAction("o", "r", 1, card.*, 4_102_444_800));
+
+    const wrong_body = try store.prepare("ses-update", "turn-update-2", .{
+        .slot = @constCast("update-other"),
+        .kind = .update_comment,
+        .effect_summary = @constCast("Update comment C_new differently"),
+        .payload_json = @constCast("{}"),
+        .comment_id = @constCast("C_new"),
+        .body = @constCast("other body"),
+    }, .{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a.zig" });
+    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, wrong_body.*, 0));
 }
 
 fn runGit(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []const []const u8) ![]u8 {

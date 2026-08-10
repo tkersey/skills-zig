@@ -18,12 +18,17 @@ File and review-thread connections are paginated independently. A file becomes
 locally complete only after the mark-viewed mutation and an independent VIEWED
 read-back at the same PR head.
 
-The current capability receipt remains `preview`. Browser connections now drain
-normalized model events autonomously from a single writer loop, and every
+Browser connections drain normalized model events autonomously from a single writer loop, and every
 message, interrupt, close, prepare, and completion request is bound to the
 originating session. Model preparation is rejected during the initial review;
 same-slot cards supersede immutably; completion requires mark-viewed plus an
 independent `VIEWED` read-back; close stays local.
+
+The action broker uses one immutable `synoptic-github-action/v1` carrier for
+typed review actions and bounded transparent GraphQL. Confirmation accepts only
+the card ID, revalidates the current PR target and viewer authority, and never
+retries an ambiguous mutation. Transparent documents are limited to one named,
+unaliased mutation root and cannot change branches, PR state, or projects.
 
 The native capability flags are enabled. The real loopback fixture uses masked
 WebSocket clients plus spawned fake Codex and fake `gh` processes to prove the

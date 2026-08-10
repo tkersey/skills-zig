@@ -1,7 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const github = @import("github.zig");
-const graphql = @import("graphql.zig");
 const pr = @import("pr.zig");
 const sessions = @import("sessions.zig");
 const tools = @import("tools.zig");
@@ -21,6 +20,7 @@ pub const App = struct {
     tabs: std.ArrayList(domain.Tab) = .empty,
     action_store: tools.ActionStore,
     round: u64 = 1,
+    action_state_fresh: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{ .allocator = allocator, .generation = try .init(allocator, head), .action_store = .{ .allocator = allocator } };
@@ -73,39 +73,62 @@ pub const App = struct {
         return ui.envelopeAlloc(self.allocator, "session.opened", self.seq, payload);
     }
 
-    pub fn prepareInline(self: *App, path: []const u8, line: u32, body: []const u8, human_directed: bool) !void {
-        try tools.authorizeTool(if (self.initial_review_active) .initial_review else .conversation, human_directed);
-        const proposed = tools.ActionCard{ .id = "pending", .slot = "finding-1", .path = path, .line = line, .body = body };
-        try tools.validateInline(proposed, self.open_path orelse return error.NoOpenSession);
-        const card = try self.action_store.prepare("finding-1", path, line, body);
-        self.pending = card.*;
-    }
-    pub fn prepareModelAction(self: *App, session_id: []const u8, slot: []const u8, path: []const u8, line: u32, body: []const u8) !tools.ActionCard {
-        const session_slot = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session_id, slot });
-        defer self.allocator.free(session_slot);
-        const card = try self.action_store.prepare(session_slot, path, line, body);
+    pub fn prepareModelAction(self: *App, session_id: []const u8, source_turn_id: []const u8, input: tools.PreparedActionInput, repository: []const u8, pull_request: u64, pull_request_id: []const u8, session_path: []const u8) !tools.ActionCard {
+        const card = try self.action_store.prepare(session_id, source_turn_id, input, .{ .repository = repository, .pull_request = pull_request, .pull_request_id = pull_request_id, .head_oid = self.generation.head_oid, .session_path = session_path });
         self.pending = card.*;
         return card.*;
     }
 
-    pub fn confirmInline(self: *App, broker: github.Broker, pull_request_id: []const u8, head_oid: []const u8, card_id: []const u8) !void {
+    pub fn confirmAction(self: *App, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, card_id: []const u8) !tools.ActionStatus {
         var card = (try self.action_store.pendingById(card_id)).*;
-        try tools.validateInline(card, card.path);
+        self.action_state_fresh = true;
+        const started_unix_s: i64 = @intCast(@divFloor(std.Io.Clock.real.now(broker.io).nanoseconds, std.time.ns_per_s));
         _ = try self.action_store.beginExecute(card.id);
         card.status = .executing;
         self.pending = card;
-        const vars = try std.fmt.allocPrint(self.allocator, "{{\"input\":{{\"pullRequestId\":{f},\"commitOID\":{f},\"event\":\"COMMENT\",\"threads\":[{{\"path\":{f},\"line\":{d},\"side\":\"RIGHT\",\"body\":{f}}}]}}}}", .{ std.json.fmt(pull_request_id, .{}), std.json.fmt(head_oid, .{}), std.json.fmt(card.path, .{}), card.line, std.json.fmt(card.body, .{}) });
-        defer self.allocator.free(vars);
-        const response = broker.call(graphql.add_inline_comment_mutation, vars) catch |err| {
-            card.status = if (err == error.GitHubTransportAmbiguous) .outcome_unknown else .failed;
+        broker.executeAction(card) catch |err| {
+            if (err == error.GitHubTransportAmbiguous) {
+                const reconciled = broker.reconcileAction(owner, name, number, card, started_unix_s) catch false;
+                card.status = if (reconciled) .succeeded else .outcome_unknown;
+            } else card.status = .failed;
             self.action_store.setTerminal(card.id, card.status) catch {};
             self.pending = card;
-            return err;
+            self.action_state_fresh = card.status == .succeeded;
+            return card.status;
         };
-        broker.allocator.free(response);
+        if (card.kind == .mark_viewed or card.kind == .unmark_viewed) {
+            const expected_viewed = card.kind == .mark_viewed;
+            const synchronized = broker.viewedStateAfterMutation(owner, name, number, card.target.head_oid, card.target.path.?, expected_viewed) catch {
+                self.action_state_fresh = false;
+                card.status = .outcome_unknown;
+                try self.action_store.setTerminal(card.id, .outcome_unknown);
+                self.pending = card;
+                return .outcome_unknown;
+            };
+            if (!synchronized) {
+                self.action_state_fresh = false;
+                card.status = .failed;
+                try self.action_store.setTerminal(card.id, .failed);
+                self.pending = card;
+                return .failed;
+            }
+            try self.generation.setViewed(card.target.path.?, if (expected_viewed) .viewed else .unviewed);
+        }
+        broker.refreshRelevantState(owner, name, number, card) catch {
+            self.action_state_fresh = false;
+        };
         card.status = .succeeded;
         try self.action_store.setTerminal(card.id, .succeeded);
         self.pending = card;
+        return .succeeded;
+    }
+
+    pub fn rejectAction(self: *App, card_id: []const u8) !void {
+        try self.action_store.reject(card_id);
+        for (self.action_store.cards.items) |card| if (std.mem.eql(u8, card.id, card_id)) {
+            self.pending = card;
+            return;
+        };
     }
 
     pub fn complete(self: *App, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, path: []const u8, human_directed: bool) !void {
@@ -178,9 +201,11 @@ pub const App = struct {
         try out.writer.writeAll("],\"actions\":[");
         for (self.action_store.cards.items, 0..) |card, i| {
             if (i > 0) try out.writer.writeByte(',');
-            try out.writer.print("{{\"id\":{f},\"slot\":{f},\"path\":{f},\"line\":{d},\"body\":{f},\"status\":{f}}}", .{ std.json.fmt(card.id, .{}), std.json.fmt(card.slot, .{}), std.json.fmt(card.path, .{}), card.line, std.json.fmt(card.body, .{}), std.json.fmt(@tagName(card.status), .{}) });
+            const encoded = try tools.cardJsonAlloc(self.allocator, card);
+            defer self.allocator.free(encoded);
+            try out.writer.writeAll(encoded);
         }
-        try out.writer.print("],\"completedTabOpen\":{},\"seq\":{d},\"round\":{d}}}", .{ self.completed_tab_open, self.seq, self.round });
+        try out.writer.print("],\"completedTabOpen\":{},\"actionStateFresh\":{},\"seq\":{d},\"round\":{d}}}", .{ self.completed_tab_open, self.action_state_fresh, self.seq, self.round });
         return out.toOwnedSlice();
     }
 };

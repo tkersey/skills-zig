@@ -1,8 +1,10 @@
 const std = @import("std");
 const cas_runtime = @import("cas_runtime");
+const action_tools = @import("tools.zig");
 
 pub const max_visible_events: usize = 1024;
 pub const SessionStatus = enum { current, stale_origin, completed, closed };
+pub const HumanAuthority = enum { github_any, add_inline_comment, reply_thread, resolve_thread, unresolve_thread, update_comment, delete_comment, mark_viewed, unmark_viewed, graphql, complete, close };
 pub const Session = struct {
     id: []u8,
     thread_id: []u8,
@@ -11,7 +13,7 @@ pub const Session = struct {
     revision: []u8,
     status: SessionStatus = .current,
     initial_turn_active: bool = true,
-    human_action_authorized: bool = false,
+    human_authority: ?HumanAuthority = null,
     fn deinit(self: Session, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.thread_id);
@@ -31,10 +33,13 @@ pub const OpenResult = struct {
 pub const SessionIdentity = struct {
     path: []u8,
     revision: []u8,
+    turn_id: []u8,
+    status: SessionStatus,
     allocator: std.mem.Allocator,
     pub fn deinit(self: SessionIdentity) void {
         self.allocator.free(self.path);
         self.allocator.free(self.revision);
+        self.allocator.free(self.turn_id);
     }
 };
 pub const VisibleEvent = struct {
@@ -134,7 +139,7 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
-            session.human_action_authorized = explicitActionInstruction(text);
+            session.human_authority = classifyHumanInstruction(text);
             return;
         };
         return error.UnknownSession;
@@ -151,7 +156,7 @@ pub const Registry = struct {
     pub fn sessionIdentity(self: *Registry, session_id: []const u8) !SessionIdentity {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id)) return .{ .path = try self.allocator.dupe(u8, session.path), .revision = try self.allocator.dupe(u8, session.revision), .allocator = self.allocator };
+        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id)) return .{ .path = try self.allocator.dupe(u8, session.path), .revision = try self.allocator.dupe(u8, session.revision), .turn_id = try self.allocator.dupe(u8, session.turn_id), .status = session.status, .allocator = self.allocator };
         return error.UnknownSession;
     }
     pub fn markCompleted(self: *Registry, session_id: []const u8) !void {
@@ -369,8 +374,10 @@ pub const Registry = struct {
                 defer self.allocator.free(origin_thread);
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                for (self.sessions.items) |*session| if (std.mem.eql(u8, session.thread_id, origin_thread) and session.status == .current and !session.initial_turn_active and session.human_action_authorized) {
-                    session.human_action_authorized = false;
+                const requested = requestedAuthority(self.allocator, event_kind, request.raw_json) orelse return allocator.dupe(u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"unsupported action kind\"}],\"success\":false}");
+                for (self.sessions.items) |*session| if (std.mem.eql(u8, session.thread_id, origin_thread) and session.status != .closed and !session.initial_turn_active and authorityCovers(session.human_authority, requested)) {
+                    if (std.mem.eql(u8, event_kind, "file.complete.requested") and session.status != .current) return allocator.dupe(u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"only the official current-revision session can complete the file\"}],\"success\":false}");
+                    session.human_authority = null;
                     if (self.visible_events.items.len < max_visible_events) try self.visible_events.append(self.allocator, .{ .session_id = try self.allocator.dupe(u8, session.id), .method = try self.allocator.dupe(u8, event_kind), .raw_json = try self.allocator.dupe(u8, request.raw_json) });
                     return allocator.dupe(u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"accepted for Synoptic domain handling\"}],\"success\":true}");
                 };
@@ -398,8 +405,44 @@ pub const Registry = struct {
 fn visibleMethod(method: []const u8) bool {
     return std.mem.startsWith(u8, method, "turn/") or std.mem.startsWith(u8, method, "item/") or std.mem.indexOf(u8, method, "delta") != null;
 }
-fn explicitActionInstruction(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "comment") != null or std.mem.indexOf(u8, text, "complete") != null or std.mem.indexOf(u8, text, "close") != null or std.mem.indexOf(u8, text, "mark") != null;
+fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
+    if (containsIgnoreCase(text, "do not") or containsIgnoreCase(text, "don't") or containsIgnoreCase(text, "without taking") or containsIgnoreCase(text, "not prepare")) return null;
+    const informational = containsIgnoreCase(text, "how do") or containsIgnoreCase(text, "how can") or containsIgnoreCase(text, "how would") or containsIgnoreCase(text, "tell me how") or containsIgnoreCase(text, "explain how") or containsIgnoreCase(text, "what ") or containsIgnoreCase(text, "which ") or containsIgnoreCase(text, "why ") or containsIgnoreCase(text, "when ") or containsIgnoreCase(text, "where ");
+    if (informational) return null;
+    if (containsIgnoreCase(text, "complete this file") or containsIgnoreCase(text, "complete the file review") or containsIgnoreCase(text, "mark this file reviewed") or containsIgnoreCase(text, "mark the file reviewed")) return .complete;
+    if (containsIgnoreCase(text, "close this session") or containsIgnoreCase(text, "close the session") or containsIgnoreCase(text, "close session") or containsIgnoreCase(text, "close this tab") or containsIgnoreCase(text, "close the tab")) return .close;
+    if (containsIgnoreCase(text, "take the action") or containsIgnoreCase(text, "prepare the action")) return .github_any;
+    const action_verb = containsIgnoreCase(text, "add") or containsIgnoreCase(text, "remove") or containsIgnoreCase(text, "set") or containsIgnoreCase(text, "request") or containsIgnoreCase(text, "submit") or containsIgnoreCase(text, "dismiss") or containsIgnoreCase(text, "change") or containsIgnoreCase(text, "execute") or containsIgnoreCase(text, "update") or containsIgnoreCase(text, "close") or containsIgnoreCase(text, "reopen") or containsIgnoreCase(text, "merge") or containsIgnoreCase(text, "resolve") or containsIgnoreCase(text, "reply") or containsIgnoreCase(text, "delete") or containsIgnoreCase(text, "unmark") or containsIgnoreCase(text, "mark") or containsIgnoreCase(text, "post") or containsIgnoreCase(text, "publish") or containsIgnoreCase(text, "prepare");
+    const github_target = containsIgnoreCase(text, "label") or containsIgnoreCase(text, "reviewer") or containsIgnoreCase(text, "assignee") or containsIgnoreCase(text, "milestone") or containsIgnoreCase(text, "pull request") or containsIgnoreCase(text, "this pr") or containsIgnoreCase(text, "the pr") or containsIgnoreCase(text, " pr #") or containsIgnoreCase(text, "comment") or containsIgnoreCase(text, "thread") or containsIgnoreCase(text, "github review") or containsIgnoreCase(text, "mark viewed") or containsIgnoreCase(text, "graphql");
+    if (action_verb and github_target) return .github_any;
+    return null;
+}
+fn requestedAuthority(allocator: std.mem.Allocator, event_kind: []const u8, raw: []const u8) ?HumanAuthority {
+    if (std.mem.eql(u8, event_kind, "file.complete.requested")) return .complete;
+    if (std.mem.eql(u8, event_kind, "session.close.requested")) return .close;
+    if (!std.mem.eql(u8, event_kind, "action.prepared")) return null;
+    const decoded = action_tools.decodePreparedAction(allocator, raw) catch return null;
+    defer decoded.deinit(allocator);
+    return switch (decoded.kind) {
+        .add_inline_comment => .add_inline_comment,
+        .reply_thread => .reply_thread,
+        .resolve_thread => .resolve_thread,
+        .unresolve_thread => .unresolve_thread,
+        .update_comment => .update_comment,
+        .delete_comment => .delete_comment,
+        .mark_viewed => .mark_viewed,
+        .unmark_viewed => .unmark_viewed,
+        .graphql => .graphql,
+    };
+}
+fn authorityCovers(granted: ?HumanAuthority, requested: HumanAuthority) bool {
+    const value = granted orelse return false;
+    return value == requested or (value == .github_any and requested != .complete and requested != .close);
+}
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    return false;
 }
 
 test "file selection remains gated without completed primary" {
@@ -417,7 +460,16 @@ test "session authority is immediately governing and close is local" {
     defer registry.deinit();
     try registry.sessions.append(std.testing.allocator, .{ .id = try std.testing.allocator.dupe(u8, "s"), .thread_id = try std.testing.allocator.dupe(u8, "t"), .turn_id = try std.testing.allocator.dupe(u8, "u"), .path = try std.testing.allocator.dupe(u8, "a"), .revision = try std.testing.allocator.dupe(u8, "r") });
     try registry.markHumanInstruction("s", "please prepare the comment");
-    try std.testing.expect(registry.sessions.items[0].human_action_authorized);
+    try std.testing.expectEqual(HumanAuthority.github_any, registry.sessions.items[0].human_authority.?);
     try registry.closeSession("s");
     try std.testing.expectEqual(SessionStatus.closed, registry.sessions.items[0].status);
+}
+
+test "explicit broad GitHub operation grants generic action authority without ordinary questions" {
+    try std.testing.expectEqual(HumanAuthority.github_any, classifyHumanInstruction("please add the release label to this pull request").?);
+    try std.testing.expectEqual(HumanAuthority.github_any, classifyHumanInstruction("close this pull request").?);
+    try std.testing.expectEqual(HumanAuthority.github_any, classifyHumanInstruction("update the pull request title").?);
+    try std.testing.expectEqual(HumanAuthority.close, classifyHumanInstruction("close this session").?);
+    try std.testing.expect(classifyHumanInstruction("which labels are already on this pull request?") == null);
+    try std.testing.expect(classifyHumanInstruction("tell me how to add a label to the pull request") == null);
 }

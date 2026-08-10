@@ -837,14 +837,24 @@ pub fn build(b: *std.Build) void {
         "Run the bounded Synoptic lifecycle fixture",
         .{ .link_libc = true, .filters = &.{"e2e"} },
     );
+    const run_synoptic_action_broker = addTestStepWithOptions(
+        b,
+        synoptic_tests_root,
+        "test-synoptic-action-broker-only",
+        "Run Synoptic typed and transparent GitHub action broker tests",
+        .{ .link_libc = true, .filters = &.{"action broker"} },
+    );
     const test_synoptic = b.step("test-synoptic", "Run Synoptic generation, session, product, and falsifier tests");
     test_synoptic.dependOn(&run_synoptic_tests.step);
     test_synoptic.dependOn(&run_synoptic_falsifiers.step);
     test_synoptic.dependOn(&run_synoptic_e2e.step);
+    test_synoptic.dependOn(&run_synoptic_action_broker.step);
     const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
     test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
     const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the real masked-WebSocket fake-Codex/fake-GitHub product fixture");
     test_synoptic_e2e.dependOn(&run_synoptic_e2e.step);
+    const test_synoptic_action_broker = b.step("test-synoptic-action-broker", "Run typed action and bounded transparent GraphQL fixtures");
+    test_synoptic_action_broker.dependOn(&run_synoptic_action_broker.step);
     const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
     build_synoptic.dependOn(&synoptic_install.step);
     const release_synoptic_safe = b.step("release-synoptic-safe", "Build Synoptic with ReleaseSafe optimization");
