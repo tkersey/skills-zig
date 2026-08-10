@@ -19,7 +19,7 @@ const MaxInquiryTokens: u64 = 1_000_000;
 const MaxInquiryTimeoutMs: u64 = 2_700_000;
 const MaxThreadHistoryPages: usize = 1024;
 const ThreadHistoryPageLimit: u32 = 100;
-const AppServerContractId = "codex-app-server-0.146.0";
+const AppServerContractId = "codex-app-server-capabilities-v1";
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas_session_inquiry",
@@ -6382,7 +6382,7 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
 test "shared session inquiry preflight parser preserves exact profile evidence" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"compatible","contractId":"codex-app-server-0.146.0",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"compatible","contractId":"codex-app-server-capabilities-v1",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":[]},
@@ -6418,7 +6418,7 @@ test "shared session inquiry preflight parser preserves exact profile evidence" 
 test "failed fork witnesses preserve route neutral transcript compatibility" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-0.146.0",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v1",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":[]},
@@ -6447,7 +6447,7 @@ test "failed fork witnesses preserve route neutral transcript compatibility" {
 test "structural incompatibility blocks route neutral transcript compatibility" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-0.146.0",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v1",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":["thread/start"]},

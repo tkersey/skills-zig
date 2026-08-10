@@ -16,8 +16,8 @@ const HelpSurface = core_cli.HelpSurface{
 
 const default_control_timeout_ms: u32 = 300_000;
 const default_review_timeout_ms: u32 = 2_700_000;
-const app_server_contract_id = "codex-app-server-0.146.0";
-const structured_review_capability = "cas_codex_0146_structured_review_v1";
+const app_server_contract_id = "codex-app-server-capabilities-v1";
+const structured_review_capability = "cas_structured_review_v1";
 
 const UsageText =
     \\cas review
@@ -1178,8 +1178,11 @@ fn runReviewRuntimeGate(
         "preflight",
         "--cwd",
         cwd,
-        "--codex-path",
-        requested_codex_path orelse "codex",
+    });
+    if (requested_codex_path) |path| {
+        try argv.appendSlice(allocator, &.{ "--codex-path", path });
+    }
+    try argv.appendSlice(allocator, &.{
         "--profile",
         "review",
         "--app-server-transport",
@@ -1260,8 +1263,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "CAS review requires the compiled 0.146 structured-review capability " ++
-                    "and a compatible review schema profile for the exact resolved Codex binary",
+                .hint = "CAS review requires the compiled structured-review capability and a " ++
+                    "compatible review profile for the exact resolved Codex binary",
             },
         );
     };
@@ -1324,7 +1327,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.json,
             "start",
             "review/start",
-            "Codex 0.146 structured review attempts require a fresh CAS-owned thread",
+            "Structured review attempts require a fresh CAS-owned thread",
             cwd,
             output_receipt,
             .{
@@ -12948,7 +12951,7 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\"," ++
@@ -12996,7 +12999,7 @@ test "session record owns and validates workflow binding across reload" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\",\"accountFingerprintReducedProtection\":false," ++
@@ -18264,7 +18267,7 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
 test "review runtime gate requires live managed structured-review preflight" {
     const allocator = std.testing.allocator;
     const valid =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
     var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
     defer gate.deinit(allocator);
@@ -18272,7 +18275,7 @@ test "review runtime gate requires live managed structured-review preflight" {
     try std.testing.expectEqualStrings("codex-cli 0.146.0", gate.version);
 
     const schema_only =
-        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
     ;
     try std.testing.expectError(
         error.IncompatibleReviewRuntime,

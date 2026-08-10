@@ -10,7 +10,7 @@ const max_documents = 64;
 const max_document_bytes = 8 * 1024 * 1024;
 
 const cache_schema = "cas-app-server-schema-cache/v1";
-const default_contract_id = "codex-app-server-0.146.0";
+pub const app_server_contract_id = "codex-app-server-capabilities-v1";
 const max_cache_documents: usize = 768;
 const max_cache_file_bytes: u64 = 8 * 1024 * 1024;
 const max_cache_total_bytes: u64 = 64 * 1024 * 1024;
@@ -95,9 +95,8 @@ pub const CachedSchemas = struct {
 pub const CacheOptions = struct {
     cache_root: []const u8,
     codex_path: ?[]const u8 = null,
-    contract_id: []const u8 = default_contract_id,
+    contract_id: []const u8 = app_server_contract_id,
     refresh: bool = false,
-    allow_prerelease: bool = false,
 };
 
 const CacheLimits = struct {
@@ -232,8 +231,6 @@ fn ensureSchemaCacheWithLimits(
     errdefer identity.deinit(allocator);
     var version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
     errdefer version.deinit(allocator);
-    if (version.prerelease() and !options.allow_prerelease) return error.PrereleaseCodex;
-    if (!versionAtLeast(version, 0, 146, 0)) return error.CodexVersionTooOld;
     try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
 
     const path_hex = identity.path_fingerprint["sha256:".len..];
@@ -413,12 +410,6 @@ fn stageSchemaCache(
     try syncDirectory(io, staging.experimental);
     try syncDirectory(io, staging.root);
     return .{ .stable = stable, .experimental = experimental };
-}
-
-pub fn versionAtLeast(version: CodexVersion, major: u64, minor: u64, patch: u64) bool {
-    if (version.major != major) return version.major > major;
-    if (version.minor != minor) return version.minor > minor;
-    return version.patch >= patch;
 }
 
 pub fn defaultCacheRootAlloc(
@@ -1267,7 +1258,6 @@ fn validateBaselineHeader(root: std.json.Value) !void {
     const keys = [_][]const u8{
         "schema",
         "contractId",
-        "minimumCodexVersion",
         "stable",
         "experimental",
         "serverRequestPolicies",
@@ -1283,12 +1273,7 @@ fn validateBaselineHeader(root: std.json.Value) !void {
     if (!std.mem.eql(
         u8,
         try stringField(root, "contractId"),
-        "codex-app-server-0.146.0",
-    )) return error.InvalidContract;
-    if (!std.mem.eql(
-        u8,
-        try stringField(root, "minimumCodexVersion"),
-        "0.146.0",
+        app_server_contract_id,
     )) return error.InvalidContract;
 }
 
@@ -1318,6 +1303,30 @@ fn validateBaselineMethodSets(
     try validateStringArray(try arrayField(stable, "requiredServerRequests"));
     try validateStringArray(try arrayField(stable, "requiredNotifications"));
     try validateStringArray(try arrayField(experimental, "requiredClientMethods"));
+    try validateShapeProfiles(try arrayField(stable, "requiredShapes"));
+    try validateShapeProfiles(try arrayField(experimental, "requiredShapes"));
+}
+
+fn validateShapeProfiles(shapes: std.json.Array) !void {
+    for (shapes.items) |shape| {
+        const object = switch (shape) {
+            .object => |value| value,
+            else => return error.InvalidContract,
+        };
+        const profiles_value = object.get("profiles") orelse continue;
+        const profiles = switch (profiles_value) {
+            .array => |value| value,
+            else => return error.InvalidContract,
+        };
+        if (profiles.items.len == 0) return error.InvalidContract;
+        for (profiles.items) |profile_value| {
+            const name = switch (profile_value) {
+                .string => |value| value,
+                else => return error.InvalidContract,
+            };
+            if (profileFromName(name) == null) return error.InvalidContract;
+        }
+    }
 }
 
 fn validateBaselinePolicies(stable: std.json.Value, policies: std.json.Value) !void {
@@ -1575,6 +1584,7 @@ fn inspectShapesForProfile(
         allocator,
         stable,
         try arrayField(stable_contract, "requiredShapes"),
+        profile,
         &report.shape_failures,
     );
     switch (profile) {
@@ -1583,6 +1593,7 @@ fn inspectShapesForProfile(
             allocator,
             experimental,
             try arrayField(experimental_contract, "requiredShapes"),
+            profile,
             &report.shape_failures,
         ),
     }
@@ -1821,12 +1832,14 @@ fn inspectShapes(
     allocator: std.mem.Allocator,
     bundle: SchemaBundle,
     shapes: std.json.Array,
+    profile: Profile,
     failures: *std.ArrayList([]u8),
 ) !void {
     if (bundle.documents.len > max_documents or shapes.items.len > max_shapes) {
         return error.SchemaTooLarge;
     }
     for (shapes.items) |shape| {
+        if (!shapeAppliesToProfile(shape, profile)) continue;
         const id = try stringField(shape, "id");
         const document = try stringField(shape, "document");
         const pointer = try stringField(shape, "pointer");
@@ -1851,6 +1864,34 @@ fn inspectShapes(
             try appendUnique(allocator, failures, id);
         }
     }
+}
+
+fn shapeAppliesToProfile(shape: std.json.Value, profile: Profile) bool {
+    const object = switch (shape) {
+        .object => |value| value,
+        else => return false,
+    };
+    const profiles_value = object.get("profiles") orelse return true;
+    const profiles = switch (profiles_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    for (profiles.items) |profile_value| {
+        const name = switch (profile_value) {
+            .string => |value| value,
+            else => continue,
+        };
+        if (profileFromName(name) == profile) return true;
+    }
+    return false;
+}
+
+fn profileFromName(name: []const u8) ?Profile {
+    if (std.mem.eql(u8, name, "core")) return .core;
+    if (std.mem.eql(u8, name, "review")) return .review;
+    if (std.mem.eql(u8, name, "session-inquiry")) return .session_inquiry;
+    if (std.mem.eql(u8, name, "full")) return .full;
+    return null;
 }
 
 fn resolveShapeNode(
@@ -2472,7 +2513,7 @@ fn containsProfile(profiles: []const Profile, expected: Profile) bool {
     return false;
 }
 
-test "stable method server notification shape and handler drift fail every profile" {
+test "stable obligations remain fail closed within their selected profiles" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
     try expectMethodDriftAllProfiles(
@@ -2482,7 +2523,13 @@ test "stable method server notification shape and handler drift fail every profi
     );
     try expectMethodDriftAllProfiles(&baseline.value, .experimental_server, "currentTime/read");
     try expectMethodDriftAllProfiles(&baseline.value, .stable_notification, "error");
-    try expectShapeDriftAllProfiles(&baseline.value);
+    try expectStableShapeProfiles(
+        &baseline.value,
+        "experimentalApi",
+        &.{ .core, .review, .session_inquiry, .full },
+    );
+    try expectStableShapeProfiles(&baseline.value, "isPinned", &.{.full});
+    try expectStableShapeProfiles(&baseline.value, "ReviewStartParams", &.{ .review, .full });
     try expectPolicyDriftAllProfiles(&baseline.value);
 }
 
@@ -2517,13 +2564,16 @@ fn expectMethodDriftAllProfiles(
     }
 }
 
-fn expectShapeDriftAllProfiles(baseline: *const std.json.Value) !void {
+fn expectStableShapeProfiles(
+    baseline: *const std.json.Value,
+    needle: []const u8,
+    required_profiles: []const Profile,
+) !void {
     for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
         var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
         defer bundles.deinit(std.testing.allocator);
         const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
         defer std.testing.allocator.free(drifted);
-        const needle = "isPinned";
         const offset = std.mem.indexOf(u8, drifted, needle) orelse
             return error.TestExpectedEqual;
         drifted[offset + needle.len - 1] = 'x';
@@ -2536,7 +2586,11 @@ fn expectShapeDriftAllProfiles(baseline: *const std.json.Value) !void {
             profile,
         );
         defer report.deinit(std.testing.allocator);
-        try std.testing.expectEqual(Status.incompatible, report.status);
+        const expected: Status = if (containsProfile(required_profiles, profile))
+            .incompatible
+        else
+            .compatible;
+        try std.testing.expectEqual(expected, report.status);
     }
 }
 
@@ -2900,6 +2954,40 @@ test "codex version accepts bounded stderr diagnostics" {
     try std.testing.expectEqualStrings("0.146.0", version.text);
 }
 
+test "schema cache admission is independent of Codex version and release channel" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5" }, 0..) |version_text, index| {
+        const executable = try std.fmt.allocPrint(allocator, "{s}/fake-codex-{d}", .{ root, index });
+        defer allocator.free(executable);
+        const log_path = try std.fmt.allocPrint(allocator, "{s}/log-{d}", .{ root, index });
+        defer allocator.free(log_path);
+        const cache_root = try std.fmt.allocPrint(allocator, "{s}/cache-{d}", .{ root, index });
+        defer allocator.free(cache_root);
+        const script = try fakeCodexScriptVersionAlloc(
+            allocator,
+            log_path,
+            false,
+            false,
+            version_text,
+        );
+        defer allocator.free(script);
+        try writeAbsoluteTestFile(io, executable, script);
+        try makeTestExecutable(io, executable);
+
+        var schemas = try ensureSchemaCache(allocator, io, .{
+            .cache_root = cache_root,
+            .codex_path = executable,
+        });
+        defer schemas.deinit(allocator);
+        try std.testing.expectEqualStrings(version_text, schemas.version.text);
+    }
+}
+
 test "canonical bundle digest ignores object and creation order but binds path and content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3243,11 +3331,21 @@ fn fakeCodexScriptAlloc(
     slow: bool,
     noisy: bool,
 ) ![]u8 {
+    return fakeCodexScriptVersionAlloc(allocator, log_path, slow, noisy, "0.146.0");
+}
+
+fn fakeCodexScriptVersionAlloc(
+    allocator: std.mem.Allocator,
+    log_path: []const u8,
+    slow: bool,
+    noisy: bool,
+    version: []const u8,
+) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{s}'\n" ++
             "if [ \"$1\" = \"--version\" ]; then\n  {s}\n  {s}\n" ++
-            "  printf 'codex-cli 0.146.0\\n'\n  exit 0\nfi\n" ++
+            "  printf 'codex-cli {s}\\n'\n  exit 0\nfi\n" ++
             "out=''\nprofile='stable'\nwhile [ \"$#\" -gt 0 ]; do\n" ++
             "  case \"$1\" in\n    --experimental) profile='experimental' ;;\n" ++
             "    --out) shift; out=\"$1\" ;;\n  esac\n  shift\ndone\n" ++
@@ -3260,6 +3358,7 @@ fn fakeCodexScriptAlloc(
                 "printf '0123456789012345678901234567890123456789'"
             else
                 ":",
+            version,
         },
     );
 }

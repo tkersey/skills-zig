@@ -14,7 +14,7 @@ const Usage =
     \\  --profile core|review|session-inquiry|full
     \\  --refresh
     \\  --refresh-schema
-    \\  --allow-prerelease
+    \\  --allow-prerelease             Compatibility no-op; version channels are diagnostic.
     \\  --code-mode-host URL
     \\  --app-server-transport auto|stdio|managed-ws|ws|unix
     \\  --app-server-endpoint ENDPOINT
@@ -39,7 +39,6 @@ const Options = struct {
     codex_path: ?[]const u8 = null,
     profile: contract.Profile = .core,
     refresh_schema: bool = false,
-    allow_prerelease: bool = false,
     code_mode_host: ?[]const u8 = null,
     requested_transport: proxy.app_server_launch.RequestedTransport = .stdio,
     app_server_endpoint: ?[]const u8 = null,
@@ -51,7 +50,7 @@ const Seen = struct {
     codex_path: bool = false,
     profile: bool = false,
     refresh_schema: bool = false,
-    allow_prerelease: bool = false,
+    allow_prerelease_compat: bool = false,
     code_mode_host: bool = false,
     transport: bool = false,
     endpoint: bool = false,
@@ -153,7 +152,6 @@ fn run(
         .cache_root = cache_root,
         .codex_path = options.codex_path,
         .refresh = options.refresh_schema,
-        .allow_prerelease = options.allow_prerelease,
     });
     defer schemas.deinit(allocator);
 
@@ -1305,7 +1303,7 @@ fn emitResult(
     try writeOutput(io, .{
         .schema = "cas-app-server-preflight/v1",
         .action = actionName(options.action),
-        .contractId = "codex-app-server-0.146.0",
+        .contractId = contract.app_server_contract_id,
         .profile = profileName(options.profile),
         .status = if (compatible) "compatible" else "incompatible",
         .casVersion = app_meta.version,
@@ -2264,8 +2262,7 @@ fn parseArgs(args: []const []const u8) !Options {
             try mark(&seen.refresh_schema);
             options.refresh_schema = true;
         } else if (std.mem.eql(u8, arg, "--allow-prerelease")) {
-            try mark(&seen.allow_prerelease);
-            options.allow_prerelease = true;
+            try mark(&seen.allow_prerelease_compat);
         } else if (std.mem.eql(u8, arg, "--code-mode-host")) {
             try mark(&seen.code_mode_host);
             options.code_mode_host = try valueAfter(args, &index);
@@ -2426,6 +2423,7 @@ test "parser accepts exact profile transport and endpoint vocabulary" {
         "ws",
         "--app-server-endpoint",
         "ws://127.0.0.1:1234",
+        "--allow-prerelease",
         "--json",
     });
     try std.testing.expectEqual(Action.preflight, options.action);
@@ -2454,6 +2452,10 @@ test "parser rejects duplicate unknown and transport endpoint mismatch" {
     try std.testing.expectError(
         error.DuplicateOption,
         parseArgs(&.{ "schema", "--json", "--json" }),
+    );
+    try std.testing.expectError(
+        error.DuplicateOption,
+        parseArgs(&.{ "schema", "--allow-prerelease", "--allow-prerelease" }),
     );
     try std.testing.expectError(error.UnknownFlag, parseArgs(&.{ "schema", "--future" }));
     try std.testing.expectError(
