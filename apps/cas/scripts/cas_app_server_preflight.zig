@@ -1324,6 +1324,7 @@ fn codexIdentity(schemas: *const contract.CachedSchemas) CodexIdentity {
     return .{
         .path = schemas.executable.resolved_path,
         .version = schemas.version.text,
+        .banner = schemas.version.banner,
         .prerelease = schemas.version.prerelease(),
         .identityRole = "schema-source",
         .pathFingerprint = schemas.executable.path_fingerprint,
@@ -2007,6 +2008,7 @@ fn stringifyProbeJsonAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 const CodexIdentity = struct {
     path: []const u8,
     version: []const u8,
+    banner: []const u8,
     prerelease: bool,
     identityRole: []const u8,
     pathFingerprint: []const u8,

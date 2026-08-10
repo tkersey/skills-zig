@@ -2097,6 +2097,12 @@ fn interruptedReviewTurnObserved(raw: []const u8, expected_turn_id: []const u8) 
         .object => |value| value,
         else => return false,
     };
+    const path_value = thread.get("path") orelse return false;
+    const path = switch (path_value) {
+        .string => |value| value,
+        else => return false,
+    };
+    if (path.len == 0) return false;
     const turns_value = thread.get("turns") orelse return false;
     const turns = switch (turns_value) {
         .array => |value| value,
@@ -2458,11 +2464,17 @@ test "structured review response requires exact inline identity and echoed item"
 
 test "structured review terminal read binds the exact interrupted turn" {
     const valid =
-        "{\"thread\":{\"turns\":[{\"id\":\"turn-other\",\"status\":\"completed\"}," ++
+        "{\"thread\":{\"path\":\"/tmp/review.jsonl\",\"turns\":[{" ++
+        "\"id\":\"turn-other\",\"status\":\"completed\"}," ++
         "{\"id\":\"turn-review\",\"status\":\"interrupted\"}]}}";
     try std.testing.expect(interruptedReviewTurnObserved(valid, "turn-review"));
     try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-other"));
     try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-missing"));
+    try std.testing.expect(!interruptedReviewTurnObserved(
+        "{\"thread\":{\"path\":null,\"turns\":[{\"id\":\"turn-review\"," ++
+            "\"status\":\"interrupted\"}]}}",
+        "turn-review",
+    ));
 }
 
 test "executor skill and selected root helpers preserve exact native identities" {

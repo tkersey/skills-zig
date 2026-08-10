@@ -1089,24 +1089,24 @@ fn parseReviewRuntimeGateAlloc(
     const path = jsonStringField(codex, "path") orelse return error.InvalidReviewPreflightReceipt;
     const version = jsonStringField(codex, "version") orelse
         return error.InvalidReviewPreflightReceipt;
+    const banner = jsonStringField(codex, "banner") orelse
+        return error.InvalidReviewPreflightReceipt;
     const binary_digest = jsonStringField(codex, "binaryDigest") orelse
         return error.InvalidReviewPreflightReceipt;
     const stable_digest = jsonStringField(schemas, "stableDigest") orelse
         return error.InvalidReviewPreflightReceipt;
     const experimental_digest = jsonStringField(schemas, "experimentalDigest") orelse
         return error.InvalidReviewPreflightReceipt;
-    if (path.len == 0 or version.len == 0 or
+    if (path.len == 0 or version.len == 0 or banner.len == 0 or
         !std.mem.startsWith(u8, binary_digest, "sha256:") or
         !std.mem.startsWith(u8, stable_digest, "sha256:") or
         !std.mem.startsWith(u8, experimental_digest, "sha256:"))
     {
         return error.InvalidReviewPreflightReceipt;
     }
-    const banner = try std.fmt.allocPrint(allocator, "codex-cli {s}", .{version});
-    errdefer allocator.free(banner);
     return .{
         .resolved_path = try allocator.dupe(u8, path),
-        .version = banner,
+        .version = try allocator.dupe(u8, banner),
         .binary_digest = try allocator.dupe(u8, binary_digest),
         .stable_schema_digest = try allocator.dupe(u8, stable_digest),
         .experimental_schema_digest = try allocator.dupe(u8, experimental_digest),
@@ -17725,15 +17725,15 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
 test "review runtime gate requires live managed structured-review preflight" {
     const allocator = std.testing.allocator;
     const valid =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
     var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
     defer gate.deinit(allocator);
     try std.testing.expectEqualStrings("/tmp/codex", gate.resolved_path);
-    try std.testing.expectEqualStrings("codex-cli 0.146.0", gate.version);
+    try std.testing.expectEqualStrings("custom Codex development build", gate.version);
 
     const schema_only =
-        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","banner":"codex-cli 0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
     ;
     try std.testing.expectError(
         error.IncompatibleReviewRuntime,

@@ -19,7 +19,7 @@
       {"id":"thread-is-pinned","profiles":["full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/Thread/properties/isPinned","kind":"boolean","nullable":false},
       {"id":"thread-metadata-pin","profiles":["full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadMetadataUpdateParams/properties/isPinned","kind":"boolean","nullable":true},
       {"id":"thread-list-pin","profiles":["full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadListParams/properties/isPinned","kind":"boolean","nullable":true},
-      {"id":"thread-path","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/Thread/properties/path","kind":"string","nullable":true},
+      {"id":"thread-path","profiles":["review","session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/Thread/properties/path","kind":"string","nullable":true},
       {"id":"fork-last-turn","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadForkParams/properties/lastTurnId","kind":"string","nullable":true},
       {"id":"fork-ephemeral-stable","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadForkParams/properties/ephemeral","kind":"boolean","nullable":false},
       {"id":"review-start-shape","profiles":["review","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ReviewStartParams","kind":"object","nullable":false,"required":["threadId","target"]},
