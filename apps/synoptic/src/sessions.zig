@@ -122,6 +122,7 @@ pub const Registry = struct {
     latest_primary_turn_id: ?[]u8 = null,
     primary_start_turn_id: ?[]u8 = null,
     primary_turn_active: bool = false,
+    primary_failure_reported: bool = false,
     evidence: ?domain.PrGeneration = null,
     notification_count: u64 = 0,
     mutex: RegistryMutex = .{},
@@ -282,12 +283,23 @@ pub const Registry = struct {
         return self.latest_primary_turn_id != null;
     }
 
+    pub fn takePrimaryFailure(self: *Registry) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.primary_failure_reported) return null;
+        const actor = if (self.actor) |*value| value else return null;
+        const terminal = actor.terminalState();
+        if (terminal == .running) return null;
+        self.primary_failure_reported = true;
+        return @tagName(terminal);
+    }
+
     pub fn sessionCount(self: *Registry) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.sessions.items.len;
     }
-    pub fn markHumanInstruction(self: *Registry, session_id: []const u8, text: []const u8) !void {
+    fn markHumanInstruction(self: *Registry, session_id: []const u8, text: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
@@ -305,6 +317,10 @@ pub const Registry = struct {
             return;
         };
         return error.UnknownSession;
+    }
+
+    pub fn discardOpenedSession(self: *Registry, session_id: []const u8) void {
+        self.removeSession(session_id);
     }
     pub fn sessionIdentity(self: *Registry, session_id: []const u8) !SessionIdentity {
         self.mutex.lock();
@@ -385,9 +401,6 @@ pub const Registry = struct {
             self.mutex.unlock();
             return .{ .reused = true, .session_id = id, .allocator = self.allocator };
         };
-        for (self.sessions.items) |*session| {
-            if (session.status == .current and std.mem.eql(u8, session.path, path)) session.status = .stale_origin;
-        }
         const primary_thread = self.allocator.dupe(u8, self.primary_thread_id orelse {
             self.mutex.unlock();
             return error.PrimaryNotReady;
@@ -422,39 +435,96 @@ pub const Registry = struct {
         defer self.allocator.free(untrusted);
         const prompt = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}\n\n{s}\n\nAssigned path: {s}\nRevision: {s}\nBase: {s}\nHead: {s}\nServer-computed canonical diff:\n{s}\nComplete unresolved assigned-file thread evidence:\n{s}\nPerform the review now; report findings, risk, proposed inline comments, and suspicions. Do not invoke a GitHub action tool during this initial review. Do not mark viewed or edit source. Wait for the human.", .{ file_role, actions, untrusted, path, revision, base_oid, head_oid, diff, threads_json });
         defer self.allocator.free(prompt);
-        var file_turn_id = try self.allocator.dupe(u8, "");
-        defer self.allocator.free(file_turn_id);
+        var session_fields_transferred = false;
+        const session_id = try std.fmt.allocPrint(
+            self.allocator,
+            "ses-{d}",
+            .{self.next_session_id},
+        );
+        errdefer if (!session_fields_transferred) self.allocator.free(session_id);
+        const thread_id = try self.allocator.dupe(u8, file_thread_id);
+        errdefer if (!session_fields_transferred) self.allocator.free(thread_id);
+        const turn_id = try self.allocator.dupe(u8, "");
+        errdefer if (!session_fields_transferred) self.allocator.free(turn_id);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer if (!session_fields_transferred) self.allocator.free(owned_path);
+        const owned_revision = try self.allocator.dupe(u8, revision);
+        errdefer if (!session_fields_transferred) self.allocator.free(owned_revision);
+        const pending_prompt = if (start_immediately)
+            null
+        else
+            try self.allocator.dupe(u8, prompt);
+        errdefer if (!session_fields_transferred) if (pending_prompt) |value| {
+            self.allocator.free(value);
+        };
+        const pending_skill = if (start_immediately)
+            null
+        else
+            try self.allocator.dupe(u8, skill_path);
+        errdefer if (!session_fields_transferred) if (pending_skill) |value| {
+            self.allocator.free(value);
+        };
+        self.mutex.lock();
+        self.next_session_id += 1;
+        self.sessions.append(self.allocator, .{
+            .id = session_id,
+            .thread_id = thread_id,
+            .turn_id = turn_id,
+            .path = owned_path,
+            .revision = owned_revision,
+            .initial_turn_active = start_immediately,
+            .turn_active = start_immediately,
+            .pending_initial_prompt = pending_prompt,
+            .pending_skill_path = pending_skill,
+        }) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        session_fields_transferred = true;
+        for (self.sessions.items[0 .. self.sessions.items.len - 1]) |*session| {
+            if (session.status == .current and std.mem.eql(u8, session.path, path)) {
+                session.status = .stale_origin;
+            }
+        }
+        self.mutex.unlock();
+        var registered = true;
+        errdefer if (registered) self.removeSession(session_id);
         if (start_immediately) {
             const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"cwd\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(file_thread_id, .{}), std.json.fmt(cwd, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
             defer self.allocator.free(turn_params);
             const turn = try actor.requestJson("turn/start", turn_params, null);
             defer self.allocator.free(turn);
-            self.allocator.free(file_turn_id);
-            file_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+            const file_turn_id = try extractString(
+                self.allocator,
+                turn,
+                &.{ "turn", "id" },
+            );
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.sessions.items) |*session| {
+                if (!std.mem.eql(u8, session.id, session_id)) continue;
+                self.allocator.free(session.turn_id);
+                session.turn_id = file_turn_id;
+                const completed = self.turnCompletedLocked(file_turn_id);
+                session.initial_turn_active = !completed;
+                session.turn_active = !completed;
+                break;
+            }
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const session_id = try std.fmt.allocPrint(self.allocator, "ses-{d}", .{self.next_session_id});
-        errdefer self.allocator.free(session_id);
-        self.next_session_id += 1;
-        const already_completed = start_immediately and self.turnCompletedLocked(file_turn_id);
-        const thread_id = try self.allocator.dupe(u8, file_thread_id);
-        errdefer self.allocator.free(thread_id);
-        const turn_id = try self.allocator.dupe(u8, file_turn_id);
-        errdefer self.allocator.free(turn_id);
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        const owned_revision = try self.allocator.dupe(u8, revision);
-        errdefer self.allocator.free(owned_revision);
-        const pending_prompt = if (start_immediately) null else try self.allocator.dupe(u8, prompt);
-        errdefer if (pending_prompt) |value| self.allocator.free(value);
-        const pending_skill = if (start_immediately) null else try self.allocator.dupe(u8, skill_path);
-        errdefer if (pending_skill) |value| self.allocator.free(value);
-        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = thread_id, .turn_id = turn_id, .path = owned_path, .revision = owned_revision, .initial_turn_active = start_immediately and !already_completed, .turn_active = start_immediately and !already_completed, .pending_initial_prompt = pending_prompt, .pending_skill_path = pending_skill });
-        return .{ .reused = false, .session_id = try self.allocator.dupe(u8, session_id), .allocator = self.allocator };
+        const result_id = try self.allocator.dupe(u8, session_id);
+        registered = false;
+        return .{
+            .reused = false,
+            .session_id = result_id,
+            .allocator = self.allocator,
+        };
     }
 
-    pub fn message(self: *Registry, session_id: []const u8, text: []const u8, active: bool) !void {
+    pub fn message(
+        self: *Registry,
+        session_id: []const u8,
+        text: []const u8,
+    ) !void {
         self.mutex.lock();
         var locked = true;
         errdefer if (locked) self.mutex.unlock();
@@ -467,11 +537,13 @@ pub const Registry = struct {
         var turn_id: ?[]u8 = null;
         var initial_prompt: ?[]u8 = null;
         var skill_path: ?[]u8 = null;
+        var active = false;
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id) and session.status != .closed) {
             thread_id = try self.allocator.dupe(u8, session.thread_id);
             turn_id = try self.allocator.dupe(u8, session.turn_id);
             initial_prompt = if (session.pending_initial_prompt) |value| try self.allocator.dupe(u8, value) else null;
             skill_path = if (session.pending_skill_path) |value| try self.allocator.dupe(u8, value) else null;
+            active = session.turn_active;
             if (session.pending_initial_prompt != null) {
                 session.initial_turn_active = true;
                 session.human_authority = null;
@@ -496,6 +568,7 @@ pub const Registry = struct {
         defer self.allocator.free(params);
         const response = try actor.requestJson(method, params, null);
         defer self.allocator.free(response);
+        const authority = classifyHumanInstruction(text);
         if (!active or first_turn) {
             const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
             self.mutex.lock();
@@ -509,11 +582,32 @@ pub const Registry = struct {
                     if (session.pending_skill_path) |value| self.allocator.free(value);
                     session.pending_initial_prompt = null;
                     session.pending_skill_path = null;
+                    session.human_authority = authority;
                     return;
                 }
             }
             self.allocator.free(next_turn);
             return error.UnknownSession;
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| {
+            if (std.mem.eql(u8, session.id, session_id)) {
+                session.human_authority = authority;
+                return;
+            }
+        }
+        return error.UnknownSession;
+    }
+
+    fn removeSession(self: *Registry, session_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items, 0..) |session, index| {
+            if (!std.mem.eql(u8, session.id, session_id)) continue;
+            var removed = self.sessions.orderedRemove(index);
+            removed.deinit(self.allocator);
+            return;
         }
     }
 
@@ -682,6 +776,11 @@ pub const Registry = struct {
 
     fn handleApprovalRequest(self: *Registry, request: cas_runtime.ServerRequest, allocator: std.mem.Allocator) ![]u8 {
         if (request.raw_json.len > max_approval_request_bytes) return allocator.dupe(u8, declineResult(request.method));
+        if (std.mem.eql(u8, request.method, "item/commandExecution/requestApproval") and
+            commandMayEditSource(request.raw_json))
+        {
+            return allocator.dupe(u8, declineResult(request.method));
+        }
         const io = self.io orelse return allocator.dupe(u8, declineResult(request.method));
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request.raw_json, .{}) catch return allocator.dupe(u8, declineResult(request.method));
         defer parsed.deinit();
@@ -782,6 +881,27 @@ pub const Registry = struct {
                 return allocator.dupe(u8, declineResult(request.method));
             }
         }
+    }
+
+    fn commandMayEditSource(raw: []const u8) bool {
+        const edit_markers = [_][]const u8{
+            "apply_patch",
+            "git apply",
+            "\"git\",\"apply\"",
+            "sed -i",
+            "perl -pi",
+            "truncate ",
+            "tee ",
+            "rm ",
+            "mv ",
+            "cp ",
+            " > ",
+            " >> ",
+        };
+        for (edit_markers) |marker| {
+            if (std.mem.indexOf(u8, raw, marker) != null) return true;
+        }
+        return false;
     }
 
     fn makeApprovalLocked(self: *Registry, session_id: ?[]const u8, thread_id: []const u8, method: []const u8, raw: []const u8, params: std.json.ObjectMap) !PendingApproval {
@@ -1063,7 +1183,10 @@ test "worktree integrity synchronization freezes new file and message work" {
     var registry = Registry{ .allocator = std.testing.allocator, .synchronizing = true };
     defer registry.deinit();
     try std.testing.expectError(error.WorktreeSynchronizationActive, registry.openFile(std.testing.io, "/repo", "a", "r", "b", "h", "", "[]", "/skill/SKILL.md", true));
-    try std.testing.expectError(error.WorktreeSynchronizationActive, registry.message("missing", "hello", false));
+    try std.testing.expectError(
+        error.WorktreeSynchronizationActive,
+        registry.message("missing", "hello"),
+    );
 }
 
 test "turn start response alone never opens primary gate" {
@@ -1213,10 +1336,37 @@ test "command approvals direct file change deprecated and unowned requests hard 
     const unowned = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 3 }, .method = "item/commandExecution/requestApproval", .raw_json = "{\"params\":{\"threadId\":\"primary\",\"availableDecisions\":[\"accept\",\"decline\"]}}" }, std.heap.page_allocator);
     defer std.heap.page_allocator.free(unowned);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", unowned);
+    try appendApprovalTestSession(&registry, "ses-edit", "file-edit");
+    const edit = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 4 },
+        .method = "item/commandExecution/requestApproval",
+        .raw_json = "{\"params\":{\"threadId\":\"file-edit\"," ++
+            "\"command\":\"sed -i s/a/b/ src/a.zig\"," ++
+            "\"availableDecisions\":[\"accept\",\"decline\"]}}",
+    }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(edit);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", edit);
     registry.primary_thread_id = try std.heap.page_allocator.dupe(u8, "shared");
     try appendApprovalTestSession(&registry, "ses-1", "shared");
-    const ambiguous = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 4 }, .method = "item/commandExecution/requestApproval", .raw_json = "{\"params\":{\"threadId\":\"shared\",\"availableDecisions\":[\"accept\",\"decline\"]}}" }, std.heap.page_allocator);
+    const ambiguous = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 5 },
+        .method = "item/commandExecution/requestApproval",
+        .raw_json = "{\"params\":{\"threadId\":\"shared\"," ++
+            "\"availableDecisions\":[\"accept\",\"decline\"]}}",
+    }, std.heap.page_allocator);
     defer std.heap.page_allocator.free(ambiguous);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", ambiguous);
     try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
+}
+
+test "source editing command approvals are never browser confirmable" {
+    try std.testing.expect(Registry.commandMayEditSource(
+        "{\"params\":{\"command\":\"sed -i s/old/new/ src/a.zig\"}}",
+    ));
+    try std.testing.expect(Registry.commandMayEditSource(
+        "{\"params\":{\"command\":[\"git\",\"apply\",\"change.patch\"]}}",
+    ));
+    try std.testing.expect(!Registry.commandMayEditSource(
+        "{\"params\":{\"command\":[\"zig\",\"build\",\"test\"]}}",
+    ));
 }

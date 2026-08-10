@@ -196,7 +196,8 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer allocator.free(pull_state);
     const is_draft = try snapshotBoolField(allocator, pages.files.items[0], "isDraft");
     var generation = try domain.PrGeneration.initFull(allocator, snapshot_base, snapshot_head);
-    errdefer generation.deinit();
+    var generation_owned = true;
+    errdefer if (generation_owned) generation.deinit();
     for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
     for (pages.threads.items) |page| try github.loadThreads(allocator, page, &generation);
 
@@ -205,11 +206,12 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     var custody = try worktree.select(allocator, io, options.cwd, head_ref, snapshot_head, managed_path, settings.worktree_prefer_current_pr_checkout);
     defer allocator.free(custody.path());
     const review_cwd = custody.path();
-    try hydrateRevisionKeys(allocator, io, review_cwd, snapshot_base, &generation);
+    try github.hydrateRevisionKeys(allocator, io, review_cwd, &generation);
     var worktree_baseline = try worktree.Baseline.capture(allocator, io, review_cwd);
     defer worktree_baseline.deinit();
     var state = try App.init(allocator, snapshot_head);
     state.replaceGeneration(generation);
+    generation_owned = false;
     const header_repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ identity.owner, identity.repository });
     defer allocator.free(header_repository);
     try state.setPullRequest(.{ .repository = header_repository, .number = identity.number, .title = title, .url = pull_url, .base_ref_name = base_ref, .base_ref_oid = snapshot_base, .head_ref_name = head_ref, .head_ref_oid = snapshot_head, .state = pull_state, .is_draft = is_draft });
@@ -246,9 +248,25 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     const ready_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "ready.json" });
     defer allocator.free(ready_path);
     try writeOperationalFile(allocator, io, ready_path, receipt);
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .baseline = &worktree_baseline, .settings = &settings, .launch_id = launch_id };
     const stop_request_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "stop.request" });
     defer allocator.free(stop_request_path);
+    var runtime = http.Runtime{
+        .app = &state,
+        .registry = &registry,
+        .broker = broker,
+        .owner = identity.owner,
+        .name = identity.repository,
+        .number = identity.number,
+        .pull_request_id = pull_request_id,
+        .cwd = review_cwd,
+        .skill_path = skill_path,
+        .repository_cwd = options.cwd,
+        .custody = custody,
+        .baseline = &worktree_baseline,
+        .settings = &settings,
+        .launch_id = launch_id,
+        .stop_request_path = stop_request_path,
+    };
     var terminal_error: ?anyerror = null;
     while (!runtime.stop_requested) {
         state.primary_ready = registry.primaryReady();
@@ -264,6 +282,7 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     try registry.beginSynchronization(io, sessions.safe_boundary_timeout_ms);
     defer registry.endSynchronization();
     try worktree.reconcileShutdown(allocator, io, custody, state.generation.head_oid, &worktree_baseline);
+    try worktree.retireManaged(allocator, io, custody, options.cwd);
     std.Io.Dir.cwd().deleteFile(io, stop_request_path) catch {};
     if (terminal_error) |err| return err;
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
@@ -541,29 +560,6 @@ fn requireGhAuthentication(allocator: std.mem.Allocator, io: std.Io, gh_path: []
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) return error.GitHubAuthenticationFailed;
-}
-fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, base_oid: []const u8, generation: *domain.PrGeneration) !void {
-    const fetch = try std.process.run(allocator, io, .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", base_oid }, .cwd = .{ .path = cwd } });
-    defer allocator.free(fetch.stdout);
-    defer allocator.free(fetch.stderr);
-    if (fetch.term != .exited or fetch.term.exited != 0) return error.BaseFetchFailed;
-    for (generation.files.items) |file| {
-        const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
-        defer allocator.free(spec);
-        const blob_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } });
-        defer allocator.free(blob_result.stdout);
-        defer allocator.free(blob_result.stderr);
-        const blob = if (blob_result.term == .exited and blob_result.term.exited == 0) std.mem.trim(u8, blob_result.stdout, "\r\n") else "DELETION";
-        const range = try std.fmt.allocPrint(allocator, "{s}..HEAD", .{base_oid});
-        defer allocator.free(range);
-        const diff_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "diff", "--no-ext-diff", "--no-color", range, "--", file.path }, .cwd = .{ .path = cwd } });
-        defer allocator.free(diff_result.stdout);
-        defer allocator.free(diff_result.stderr);
-        if (diff_result.term != .exited or diff_result.term.exited != 0) return error.FileDiffFailed;
-        const revision = try domain.revisionKey(allocator, file.path, file.change_type, blob, diff_result.stdout);
-        defer allocator.free(revision);
-        try generation.setRevision(file.path, revision);
-    }
 }
 fn usage() error{InvalidArguments} {
     return error.InvalidArguments;

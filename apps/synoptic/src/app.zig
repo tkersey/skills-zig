@@ -80,33 +80,52 @@ pub const App = struct {
     pub fn openFile(self: *App, path: []const u8) ![]u8 {
         if (!self.primary_ready) return error.PrimaryNotReady;
         if (!self.generation.queued(path)) return error.FileNotQueued;
-        if (self.open_path) |old| self.allocator.free(old);
-        self.open_path = try self.allocator.dupe(u8, path);
-        if (self.official_revision) |old| self.allocator.free(old);
-        for (self.generation.files.items) |file| if (std.mem.eql(u8, file.path, path)) {
-            self.official_revision = try self.allocator.dupe(u8, file.revision_key);
-            break;
-        };
-        self.initial_review_active = self.file_review_start_mode == .immediate;
+        const current_revision = domain.revisionFor(&self.generation, path) orelse
+            return error.MissingRevision;
+        const next_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(next_path);
+        const next_revision = try self.allocator.dupe(u8, current_revision);
+        errdefer self.allocator.free(next_revision);
         var existing = false;
+        var appended = false;
+        errdefer if (appended) {
+            const removed = self.tabs.pop().?;
+            self.allocator.free(removed.id);
+            self.allocator.free(removed.path);
+            self.allocator.free(removed.revision);
+            self.allocator.free(removed.diff);
+        };
         for (self.tabs.items) |tab| {
-            if (tab.status == .current and std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, self.official_revision.?)) existing = true;
+            if (tab.status == .current and std.mem.eql(u8, tab.path, path) and
+                std.mem.eql(u8, tab.revision, current_revision)) existing = true;
         }
         if (!existing) {
             const id = try std.fmt.allocPrint(self.allocator, "tab-{d}", .{self.tabs.items.len + 1});
             errdefer self.allocator.free(id);
             const tab_path = try self.allocator.dupe(u8, path);
             errdefer self.allocator.free(tab_path);
-            const revision = try self.allocator.dupe(u8, self.official_revision.?);
+            const revision = try self.allocator.dupe(u8, current_revision);
             errdefer self.allocator.free(revision);
             const diff = try self.allocator.dupe(u8, "");
             errdefer self.allocator.free(diff);
             try self.tabs.append(self.allocator, .{ .id = id, .path = tab_path, .revision = revision, .diff = diff });
+            appended = true;
         }
-        self.seq += 1;
         const payload = try std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"initialReview\":{}}}", .{ std.json.fmt(path, .{}), self.file_review_start_mode == .immediate });
         defer self.allocator.free(payload);
-        return ui.envelopeAlloc(self.allocator, "session.opened", self.seq, payload);
+        const envelope = try ui.envelopeAlloc(
+            self.allocator,
+            "session.opened",
+            self.seq + 1,
+            payload,
+        );
+        if (self.open_path) |old| self.allocator.free(old);
+        self.open_path = next_path;
+        if (self.official_revision) |old| self.allocator.free(old);
+        self.official_revision = next_revision;
+        self.initial_review_active = self.file_review_start_mode == .immediate;
+        self.seq += 1;
+        return envelope;
     }
 
     pub fn recordOpenedSession(self: *App, path: []const u8, revision: []const u8, session_id: []const u8, diff: []const u8, reused: bool, initial_review: bool) !void {
@@ -124,6 +143,32 @@ pub const App = struct {
             return;
         };
         return error.UnknownTab;
+    }
+
+    pub fn rollbackOpenedFile(
+        self: *App,
+        path: []const u8,
+        revision: []const u8,
+        reused: bool,
+    ) void {
+        if (!reused) {
+            for (self.tabs.items, 0..) |tab, index| {
+                if (!std.mem.eql(u8, tab.path, path) or
+                    !std.mem.eql(u8, tab.revision, revision) or
+                    tab.status != .current) continue;
+                const removed = self.tabs.orderedRemove(index);
+                self.allocator.free(removed.id);
+                self.allocator.free(removed.path);
+                self.allocator.free(removed.revision);
+                self.allocator.free(removed.diff);
+                break;
+            }
+        }
+        if (self.open_path) |value| self.allocator.free(value);
+        self.open_path = null;
+        if (self.official_revision) |value| self.allocator.free(value);
+        self.official_revision = null;
+        self.initial_review_active = false;
     }
 
     pub fn updateTabDiff(self: *App, path: []const u8, diff: ?[]const u8) !void {
@@ -205,6 +250,13 @@ pub const App = struct {
         if (self.open_path == null or !std.mem.eql(u8, self.open_path.?, path) or !self.generation.queued(path)) return error.NotOfficialCurrentSession;
         const revision = self.official_revision orelse return error.NotOfficialCurrentSession;
         for (self.generation.files.items) |file| if (std.mem.eql(u8, file.path, path) and !std.mem.eql(u8, file.revision_key, revision)) return error.StaleOriginSession;
+        try broker.validateCurrentPath(
+            owner,
+            name,
+            number,
+            self.generation.head_oid,
+            path,
+        );
         try broker.markViewed(pull_request_id, path);
         if (!try broker.viewedAfterMutation(owner, name, number, self.generation.head_oid, path)) return error.MarkViewedReadbackFailed;
         try self.generation.markViewed(path);
@@ -216,6 +268,13 @@ pub const App = struct {
     pub fn completeRevision(self: *App, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, path: []const u8, revision: []const u8) !void {
         const current = domain.revisionFor(&self.generation, path) orelse return error.FileNotQueued;
         if (!std.mem.eql(u8, current, revision)) return error.StaleOriginSession;
+        try broker.validateCurrentPath(
+            owner,
+            name,
+            number,
+            self.generation.head_oid,
+            path,
+        );
         try broker.markViewed(pull_request_id, path);
         if (!try broker.viewedAfterMutation(owner, name, number, self.generation.head_oid, path)) return error.MarkViewedReadbackFailed;
         try self.generation.markViewed(path);

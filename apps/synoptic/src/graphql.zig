@@ -1,9 +1,25 @@
 const std = @import("std");
 
 pub const snapshot_query =
-    "query SynopticPullRequest($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id number url title body baseRefName baseRefOid headRefName headRefOid files(first:100,after:$after){nodes{path additions deletions changeType viewerViewedState}pageInfo{hasNextPage endCursor}}}}}";
+    "query SynopticPullRequest($owner:String!,$name:String!,$number:Int!,$after:String){" ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){id number url title body " ++
+    "state isDraft baseRefName baseRefOid headRefName headRefOid files(first:100,after:$after){" ++
+    "nodes{path additions deletions changeType viewerViewedState}" ++
+    "pageInfo{hasNextPage endCursor}}}}}";
 pub const threads_query =
-    "query SynopticReviewThreads($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve comments(first:100){nodes{id body createdAt url author{login} viewerDidAuthor pullRequestReview{id state}}}}pageInfo{hasNextPage endCursor}}}}}";
+    "query SynopticReviewThreads($owner:String!,$name:String!,$number:Int!,$after:String){" ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide " ++
+    "subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve " ++
+    "comments(first:100){nodes{id body createdAt url author{login} viewerDidAuthor " ++
+    "pullRequestReview{id state}}pageInfo{hasNextPage endCursor}}}" ++
+    "pageInfo{hasNextPage endCursor}}}}}";
+pub const thread_comments_query =
+    "query SynopticThreadComments($threadId:ID!,$after:String){node(id:$threadId){" ++
+    "... on PullRequestReviewThread{id path line startLine diffSide startDiffSide subjectType " ++
+    "isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve " ++
+    "comments(first:100,after:$after){nodes{id body createdAt url author{login} " ++
+    "viewerDidAuthor pullRequestReview{id state}}pageInfo{hasNextPage endCursor}}}}}";
 pub const file_state_query =
     "query SynopticFileState($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid files(first:100,after:$after){nodes{path viewerViewedState}pageInfo{hasNextPage endCursor}}}}}";
 pub const anchor_query =
@@ -25,9 +41,17 @@ pub const delete_comment_mutation =
 pub const unmark_viewed_mutation =
     "mutation SynopticUnmarkFileViewed($input:UnmarkFileAsViewedInput!){unmarkFileAsViewed(input:$input){pullRequest{id}}}";
 pub const action_authority_query =
-    "query SynopticActionAuthority($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$after){nodes{id path viewerCanReply viewerCanResolve viewerCanUnresolve comments(first:100){nodes{id body viewerDidAuthor}}}pageInfo{hasNextPage endCursor}}}}}";
+    "query SynopticActionAuthority($owner:String!,$name:String!,$number:Int!,$after:String){" ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "reviewThreads(first:100,after:$after){nodes{id path viewerCanReply viewerCanResolve " ++
+    "viewerCanUnresolve comments(first:100){nodes{id body viewerDidAuthor}" ++
+    "pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}";
 pub const reconcile_query =
-    "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$after){nodes{id path line isResolved comments(first:100){nodes{id body createdAt viewerDidAuthor}}}pageInfo{hasNextPage endCursor}}}}}";
+    "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "reviewThreads(first:100,after:$after){nodes{id path line isResolved comments(first:100){" ++
+    "nodes{id body createdAt viewerDidAuthor}pageInfo{hasNextPage endCursor}}}" ++
+    "pageInfo{hasNextPage endCursor}}}}}";
 
 pub const TransparentLimits = struct {
     pub const document_bytes: usize = 32 * 1024;
@@ -66,7 +90,7 @@ pub fn validateTransparent(document: []const u8, expected_operation: []const u8,
     if (containsSelectionAlias(tokens.items, start)) return error.GraphqlAliasForbidden;
     var depth: usize = 0;
     var root_count: usize = 0;
-    var root_name: ?[]const u8 = null;
+    var root_index: ?usize = null;
     var index = start;
     while (index < tokens.items.len) : (index += 1) {
         const token = tokens.items[index];
@@ -86,7 +110,7 @@ pub fn validateTransparent(document: []const u8, expected_operation: []const u8,
                 // an alias and is forbidden.
                 if (index + 1 < tokens.items.len and tokens.items[index + 1].kind == .colon) return error.GraphqlAliasForbidden;
                 root_count += 1;
-                root_name = token.text;
+                root_index = index;
                 index = skipSelection(tokens.items, index + 1) catch return error.InvalidGraphqlDocument;
                 if (index > 0) index -= 1;
             },
@@ -94,14 +118,37 @@ pub fn validateTransparent(document: []const u8, expected_operation: []const u8,
         }
     }
     if (depth != 0 or root_count != 1) return error.GraphqlRootCountInvalid;
-    _ = root_name orelse return error.GraphqlRootCountInvalid;
+    const root = root_index orelse return error.GraphqlRootCountInvalid;
+    const input_variable = try rootInputVariable(tokens.items, root);
 
     var variables = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, variables_json, .{ .max_value_len = TransparentLimits.variables_bytes });
     defer variables.deinit();
     if (variables.value != .object) return error.InvalidGraphqlVariables;
+    const input = variables.value.object.get(input_variable) orelse
+        return error.InvalidGraphqlVariables;
     var saw_target = false;
-    try validateVariables(variables.value, pull_request_id, &saw_target);
+    try validateVariables(input, pull_request_id, &saw_target);
     if (!saw_target) return error.GraphqlPullRequestTargetMissing;
+}
+
+fn rootInputVariable(tokens: []const Token, root: usize) ![]const u8 {
+    var index = root + 1;
+    if (index >= tokens.len or tokens[index].kind != .l_paren) {
+        return error.GraphqlPullRequestTargetMissing;
+    }
+    index += 1;
+    while (index + 3 < tokens.len and tokens[index].kind != .r_paren) : (index += 1) {
+        if (tokens[index].kind != .name or
+            !std.mem.eql(u8, tokens[index].text, "input")) continue;
+        if (tokens[index + 1].kind != .colon or
+            tokens[index + 2].kind != .dollar or
+            tokens[index + 3].kind != .name)
+        {
+            return error.InvalidGraphqlDocument;
+        }
+        return tokens[index + 3].text;
+    }
+    return error.GraphqlPullRequestTargetMissing;
 }
 
 const TokenKind = enum { name, l_brace, r_brace, l_paren, r_paren, colon, dollar, bang, bracket, string, other };
@@ -281,4 +328,14 @@ test "transparent GraphQL admits broad exact PR mutations and rejects obscured o
     try std.testing.expectError(error.GraphqlRootCountInvalid, validateTransparent("mutation AddReviewNote($input:AddCommentInput!){addComment(input:$input){clientMutationId} deleteIssue(input:$input){clientMutationId}}", "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_1\"}}", "PR_1"));
     try validateTransparent("mutation ChangePr($input:UpdatePullRequestInput!){updatePullRequest(input:$input){clientMutationId}}", "ChangePr", "{\"input\":{\"pullRequestId\":\"PR_1\",\"state\":\"CLOSED\",\"projectIds\":[\"P_1\"]}}", "PR_1");
     try std.testing.expectError(error.GraphqlPullRequestTargetMismatch, validateTransparent(safe, "AddReviewNote", "{\"input\":{\"subjectId\":\"PR_OTHER\"}}", "PR_1"));
+    try std.testing.expectError(
+        error.GraphqlPullRequestTargetMismatch,
+        validateTransparent(
+            safe,
+            "AddReviewNote",
+            "{\"input\":{\"subjectId\":\"PR_OTHER\"}," ++
+                "\"decoy\":{\"subjectId\":\"PR_1\"}}",
+            "PR_1",
+        ),
+    );
 }

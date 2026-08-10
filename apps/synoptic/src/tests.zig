@@ -688,8 +688,7 @@ test "exclusions config immediate and idle sessions preserve canonical context" 
     var identity = try registry.sessionIdentity(idle.session_id);
     try std.testing.expectEqualStrings("", identity.turn_id);
     identity.deinit();
-    try registry.markHumanInstruction(idle.session_id, "post this comment");
-    try registry.message(idle.session_id, "review it", false);
+    try registry.message(idle.session_id, "review it");
     try std.testing.expect(registry.sessions.items[0].human_authority == null);
     identity = try registry.sessionIdentity(idle.session_id);
     try std.testing.expect(identity.turn_id.len > 0);
@@ -914,6 +913,14 @@ test "worktree integrity dirty launch selects managed custody" {
     const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
+    var baseline = try worktree.Baseline.capture(allocator, io, custody.path());
+    defer baseline.deinit();
+    try worktree.reconcileShutdown(allocator, io, custody, head, &baseline);
+    try worktree.retireManaged(allocator, io, custody, repo);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, managed, .{}),
+    );
 }
 
 fn fakeLifecycleGhScriptAlloc(allocator: std.mem.Allocator, base: []const u8, head: []const u8) ![]u8 {
@@ -928,11 +935,13 @@ fn fakeLifecycleGhScriptAlloc(allocator: std.mem.Allocator, base: []const u8, he
         \\  printf '%s\n' '{{"data":{{"repository":{{"id":"R_1","nameWithOwner":"o/r","pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"fixture","body":"body","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticReviewThreads' "$input"; then
-        \\  printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
+        \\  printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}",'
+        \\  printf '%s' '"reviewThreads":{{"nodes":[],"pageInfo":'
+        \\  printf '%s\n' '{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
         \\fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
-    , .{ base, head });
+    , .{ base, head, head });
 }
 
 fn runLifecycleCommand(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, argv: []const []const u8) ![]u8 {

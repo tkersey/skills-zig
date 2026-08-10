@@ -10,6 +10,11 @@ pub const Broker = struct {
     host: []const u8 = "github.com",
 
     pub fn call(self: Broker, document: []const u8, variables: []const u8) ![]u8 {
+        const mutation = std.mem.startsWith(u8, std.mem.trim(
+            u8,
+            document,
+            " \t\r\n",
+        ), "mutation");
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
         const argv = [_][]const u8{ self.gh_path, "api", "graphql", "--hostname", self.host, "--input", "-" };
@@ -39,7 +44,10 @@ pub const Broker = struct {
                 return error.InvalidGraphqlResponse;
             };
             defer parsed.deinit();
-            if (parsed.value == .object and parsed.value.object.get("errors") != null) return error.GitHubGraphqlRejected;
+            if (parsed.value == .object and parsed.value.object.get("errors") != null) {
+                if (mutation) return error.GitHubTransportAmbiguous;
+                return error.GitHubGraphqlRejected;
+            }
             if (parsed.value != .object) return error.InvalidGraphqlResponse;
         }
         if (term != .exited or term.exited != 0 or stdout.len == 0) return error.GitHubTransportAmbiguous;
@@ -51,7 +59,66 @@ pub const Broker = struct {
         errdefer freePages(self.allocator, &files);
         var threads = try self.callPages(graphql.threads_query, "reviewThreads", owner, name, number);
         errdefer freePages(self.allocator, &threads);
+        try self.appendNestedThreadPages(&threads);
+        try validateGenerationHeads(self.allocator, files.items, threads.items);
         return .{ .allocator = self.allocator, .files = files, .threads = threads };
+    }
+
+    fn appendNestedThreadPages(self: Broker, pages: *std.ArrayList([]u8)) !void {
+        const outer_count = pages.items.len;
+        for (pages.items[0..outer_count]) |page| {
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                page,
+                .{},
+            );
+            defer parsed.deinit();
+            const pull = try pullObject(parsed.value);
+            const nodes = pull.get("reviewThreads").?.object.get("nodes").?.array;
+            for (nodes.items) |node| {
+                const comments = node.object.get("comments").?.object;
+                const cursor = nextCursor(comments) orelse continue;
+                try self.appendThreadComments(
+                    pages,
+                    node.object.get("id").?.string,
+                    cursor,
+                );
+            }
+        }
+    }
+
+    fn appendThreadComments(
+        self: Broker,
+        pages: *std.ArrayList([]u8),
+        thread_id: []const u8,
+        first_cursor: []const u8,
+    ) !void {
+        var cursor = try self.allocator.dupe(u8, first_cursor);
+        defer self.allocator.free(cursor);
+        while (true) {
+            const vars = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"threadId\":{f},\"after\":{f}}}",
+                .{ std.json.fmt(thread_id, .{}), std.json.fmt(cursor, .{}) },
+            );
+            defer self.allocator.free(vars);
+            const page = try self.call(graphql.thread_comments_query, vars);
+            try pages.append(self.allocator, page);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                page,
+                .{},
+            );
+            defer parsed.deinit();
+            const node = parsed.value.object.get("data").?.object.get("node").?.object;
+            const info = node.get("comments").?.object.get("pageInfo").?.object;
+            if (!info.get("hasNextPage").?.bool) break;
+            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            self.allocator.free(cursor);
+            cursor = next;
+        }
     }
 
     pub fn readGeneration(self: Broker, owner: []const u8, name: []const u8, number: u64) !domain.PrGeneration {
@@ -148,6 +215,20 @@ pub const Broker = struct {
                     if (!comment.object.get("viewerDidAuthor").?.bool) return error.GitHubActionNotAuthorized;
                     found = true;
                 };
+                if (!found) if (card.target.comment_id) |comment_id| {
+                    const comments = thread.get("comments").?.object;
+                    const next = nextCursor(comments) orelse continue;
+                    if (try self.commentById(
+                        thread.get("id").?.string,
+                        comment_id,
+                        next,
+                    )) |comment| {
+                        if (!comment.viewer_did_author) {
+                            return error.GitHubActionNotAuthorized;
+                        }
+                        found = true;
+                    }
+                };
             }
         }
         if (!found) return error.GitHubActionTargetMissing;
@@ -170,25 +251,119 @@ pub const Broker = struct {
                 if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
                 if (card.target.path) |path| if (!std.mem.eql(u8, thread.object.get("path").?.string, path)) continue;
                 if (card.target.line) |line| if (thread.object.get("line").? != .null and thread.object.get("line").?.integer != line) continue;
-                for (thread.object.get("comments").?.object.get("nodes").?.array.items) |comment| {
-                    if (card.target.comment_id) |comment_id| {
-                        if (!std.mem.eql(u8, comment.object.get("id").?.string, comment_id)) continue;
-                        target_comment_found = true;
-                    }
-                    if (card.kind == .update_comment) {
-                        if (comment.object.get("viewerDidAuthor").?.bool and std.mem.eql(u8, comment.object.get("body").?.string, card.body.?)) return true;
-                        continue;
-                    }
-                    if (card.body) |body| if (comment.object.get("viewerDidAuthor").?.bool and std.mem.eql(u8, comment.object.get("body").?.string, body)) {
-                        const created = parseGithubTimestampSeconds(comment.object.get("createdAt").?.string) orelse continue;
-                        const now: i64 = @intCast(@divFloor(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-                        if (created >= started_unix_s - 5 and created <= now + 60) return true;
-                    };
-                }
+                const observed = try self.commentMutationObserved(
+                    thread.object,
+                    card,
+                    started_unix_s,
+                    &target_comment_found,
+                );
+                if (observed) return true;
             }
         }
         if (card.kind == .delete_comment) return !target_comment_found;
         return false;
+    }
+
+    const CommentSnapshot = struct {
+        viewer_did_author: bool,
+    };
+
+    fn commentById(
+        self: Broker,
+        thread_id: []const u8,
+        comment_id: []const u8,
+        first_cursor: []const u8,
+    ) !?CommentSnapshot {
+        var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
+        defer if (cursor) |value| self.allocator.free(value);
+        while (true) {
+            const page = try self.threadCommentPage(thread_id, cursor);
+            defer self.allocator.free(page);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                page,
+                .{},
+            );
+            defer parsed.deinit();
+            const comments = parsed.value.object.get("data").?.object
+                .get("node").?.object.get("comments").?.object;
+            for (comments.get("nodes").?.array.items) |value| {
+                const comment = value.object;
+                if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
+                    return .{
+                        .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
+                    };
+                }
+            }
+            const info = comments.get("pageInfo").?.object;
+            if (!info.get("hasNextPage").?.bool) return null;
+            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            if (cursor) |old| self.allocator.free(old);
+            cursor = next;
+        }
+    }
+
+    fn commentMutationObserved(
+        self: Broker,
+        thread: std.json.ObjectMap,
+        card: tools.ActionCard,
+        started_unix_s: i64,
+        target_found: *bool,
+    ) !bool {
+        const initial = thread.get("comments").?.object;
+        if (try commentsObserve(
+            self.io,
+            initial.get("nodes").?.array.items,
+            card,
+            started_unix_s,
+            target_found,
+        )) return true;
+        const first_cursor = nextCursor(initial) orelse return false;
+        var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
+        defer if (cursor) |value| self.allocator.free(value);
+        while (true) {
+            const page = try self.threadCommentPage(
+                thread.get("id").?.string,
+                cursor,
+            );
+            defer self.allocator.free(page);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                page,
+                .{},
+            );
+            defer parsed.deinit();
+            const comments = parsed.value.object.get("data").?.object
+                .get("node").?.object.get("comments").?.object;
+            if (try commentsObserve(
+                self.io,
+                comments.get("nodes").?.array.items,
+                card,
+                started_unix_s,
+                target_found,
+            )) return true;
+            const info = comments.get("pageInfo").?.object;
+            if (!info.get("hasNextPage").?.bool) return false;
+            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            if (cursor) |old| self.allocator.free(old);
+            cursor = next;
+        }
+    }
+
+    fn threadCommentPage(
+        self: Broker,
+        thread_id: []const u8,
+        cursor: ?[]const u8,
+    ) ![]u8 {
+        const vars = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"threadId\":{f},\"after\":{f}}}",
+            .{ std.json.fmt(thread_id, .{}), std.json.fmt(cursor, .{}) },
+        );
+        defer self.allocator.free(vars);
+        return self.call(graphql.thread_comments_query, vars);
     }
 
     pub fn refreshRelevantState(self: Broker, owner: []const u8, name: []const u8, number: u64, card: tools.ActionCard) !void {
@@ -269,6 +444,52 @@ pub const Broker = struct {
         if (!found) return error.CommentPathNotCurrent;
     }
 };
+
+fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
+    const info_value = comments.get("pageInfo") orelse return null;
+    if (info_value != .object) return null;
+    const info = info_value.object;
+    const has_next = info.get("hasNextPage") orelse return null;
+    if (has_next != .bool or !has_next.bool) return null;
+    const cursor = info.get("endCursor") orelse return null;
+    return if (cursor == .string) cursor.string else null;
+}
+
+fn commentsObserve(
+    io: std.Io,
+    values: []const std.json.Value,
+    card: tools.ActionCard,
+    started_unix_s: i64,
+    target_found: *bool,
+) !bool {
+    for (values) |value| {
+        const comment = value.object;
+        if (card.target.comment_id) |comment_id| {
+            if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
+            target_found.* = true;
+        }
+        if (card.kind == .update_comment) {
+            if (comment.get("viewerDidAuthor").?.bool and
+                std.mem.eql(u8, comment.get("body").?.string, card.body.?))
+            {
+                return true;
+            }
+            continue;
+        }
+        const body = card.body orelse continue;
+        if (!comment.get("viewerDidAuthor").?.bool or
+            !std.mem.eql(u8, comment.get("body").?.string, body)) continue;
+        const created = parseGithubTimestampSeconds(
+            comment.get("createdAt").?.string,
+        ) orelse continue;
+        const now: i64 = @intCast(@divFloor(
+            std.Io.Clock.real.now(io).nanoseconds,
+            std.time.ns_per_s,
+        ));
+        if (created >= started_unix_s - 5 and created <= now + 60) return true;
+    }
+    return false;
+}
 
 fn parseGithubTimestampSeconds(raw: []const u8) ?i64 {
     if (raw.len < 20 or raw[4] != '-' or raw[7] != '-' or raw[10] != 'T' or raw[13] != ':' or raw[16] != ':' or raw[19] != 'Z') return null;
@@ -352,8 +573,15 @@ fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: 
 pub fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-    for ((pull.get("reviewThreads") orelse return error.InvalidSnapshot).object.get("nodes").?.array.items) |node| {
+    const data = (parsed.value.object.get("data") orelse return error.InvalidSnapshot).object;
+    const nodes: []const std.json.Value = if (data.get("node")) |node|
+        &.{node}
+    else blk: {
+        const pull = try pullObject(parsed.value);
+        break :blk (pull.get("reviewThreads") orelse
+            return error.InvalidSnapshot).object.get("nodes").?.array.items;
+    };
+    for (nodes) |node| {
         const object = node.object;
         if (object.get("isResolved").?.bool) continue;
         var comments: std.ArrayList(domain.ReviewComment) = .empty;
@@ -361,7 +589,20 @@ pub fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *d
         for (object.get("comments").?.object.get("nodes").?.array.items) |value| {
             const comment = value.object;
             const review = comment.get("pullRequestReview").?.object;
-            try comments.append(allocator, .{ .id = comment.get("id").?.string, .body = comment.get("body").?.string, .created_at = comment.get("createdAt").?.string, .url = comment.get("url").?.string, .author = comment.get("author").?.object.get("login").?.string, .viewer_did_author = comment.get("viewerDidAuthor").?.bool, .review_id = review.get("id").?.string, .review_state = review.get("state").?.string });
+            const author = comment.get("author") orelse .null;
+            try comments.append(allocator, .{
+                .id = comment.get("id").?.string,
+                .body = comment.get("body").?.string,
+                .created_at = comment.get("createdAt").?.string,
+                .url = comment.get("url").?.string,
+                .author = if (author == .null)
+                    "[deleted]"
+                else
+                    author.object.get("login").?.string,
+                .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
+                .review_id = review.get("id").?.string,
+                .review_state = review.get("state").?.string,
+            });
         }
         try generation.addThread(.{ .id = object.get("id").?.string, .path = object.get("path").?.string, .line = optionalU32(object.get("line")), .start_line = optionalU32(object.get("startLine")), .diff_side = optionalString(object.get("diffSide")), .start_diff_side = optionalString(object.get("startDiffSide")), .subject_type = object.get("subjectType").?.string, .outdated = object.get("isOutdated").?.bool, .viewer_can_reply = object.get("viewerCanReply").?.bool, .viewer_can_resolve = object.get("viewerCanResolve").?.bool, .viewer_can_unresolve = object.get("viewerCanUnresolve").?.bool, .comments = comments.items });
     }
@@ -377,6 +618,7 @@ fn optionalString(value: ?std.json.Value) ?[]const u8 {
 }
 
 pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, generation: *domain.PrGeneration) !void {
+    try fetchObject(allocator, io, cwd, generation.base_oid);
     for (generation.files.items) |file| {
         const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
         defer allocator.free(spec);
@@ -393,13 +635,72 @@ pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []cons
 }
 
 pub fn canonicalDiffAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, base: []const u8, head: []const u8, path: []const u8) ![]u8 {
-    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ base, head });
+    const merge = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "merge-base", base, head },
+        .cwd = .{ .path = cwd },
+    });
+    defer allocator.free(merge.stdout);
+    defer allocator.free(merge.stderr);
+    if (merge.term != .exited or merge.term.exited != 0) return error.MergeBaseFailed;
+    const merge_base = std.mem.trim(u8, merge.stdout, "\r\n");
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
     const result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "diff", "--no-ext-diff", "--no-color", range, "--", path }, .cwd = .{ .path = cwd } });
     defer allocator.free(result.stderr);
     errdefer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.FileDiffFailed;
     return result.stdout;
+}
+
+fn fetchObject(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    oid: []const u8,
+) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "fetch", "--no-tags", "origin", oid },
+        .cwd = .{ .path = cwd },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.GitFetchFailed;
+    }
+}
+
+fn pullObject(value: std.json.Value) !std.json.ObjectMap {
+    const data = value.object.get("data") orelse return error.InvalidSnapshot;
+    const repository = data.object.get("repository") orelse
+        return error.InvalidSnapshot;
+    const pull = repository.object.get("pullRequest") orelse
+        return error.InvalidSnapshot;
+    return pull.object;
+}
+
+fn validateGenerationHeads(
+    allocator: std.mem.Allocator,
+    files: []const []const u8,
+    threads: []const []const u8,
+) !void {
+    if (files.len == 0) return error.InvalidSnapshot;
+    const expected = try snapshotField(allocator, files[0], "headRefOid");
+    defer allocator.free(expected);
+    for (files) |page| {
+        const head = try snapshotField(allocator, page, "headRefOid");
+        defer allocator.free(head);
+        if (!std.mem.eql(u8, expected, head)) return error.MixedGenerationPages;
+    }
+    for (threads) |page| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
+        defer parsed.deinit();
+        const data = parsed.value.object.get("data").?.object;
+        if (data.get("node") != null) continue;
+        const pull = try pullObject(parsed.value);
+        if (!std.mem.eql(u8, expected, pull.get("headRefOid").?.string)) {
+            return error.MixedGenerationPages;
+        }
+    }
 }
 pub fn validateRightLine(diff: []const u8, target: u32) bool {
     return validateLine(diff, target, "RIGHT");
@@ -438,6 +739,48 @@ fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
 pub fn hasFixedArgv(argv: []const []const u8) bool {
     return argv.len == 7 and std.mem.eql(u8, argv[1], "api") and std.mem.eql(u8, argv[2], "graphql") and
         std.mem.eql(u8, argv[3], "--hostname") and std.mem.eql(u8, argv[5], "--input") and std.mem.eql(u8, argv[6], "-");
+}
+
+test "generation pages reject mixed heads" {
+    const first =
+        "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"h1\"}}}}";
+    const second =
+        "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"h2\"}}}}";
+    try std.testing.expectError(
+        error.MixedGenerationPages,
+        validateGenerationHeads(
+            std.testing.allocator,
+            &.{ first, second },
+            &.{},
+        ),
+    );
+}
+
+test "thread evidence accepts deleted authors and nested comment pages" {
+    var generation = try domain.PrGeneration.initFull(
+        std.testing.allocator,
+        "base",
+        "head",
+    );
+    defer generation.deinit();
+    const raw =
+        "{\"data\":{\"node\":{\"id\":\"T1\",\"path\":\"a.zig\"," ++
+        "\"line\":1,\"startLine\":null,\"diffSide\":\"RIGHT\"," ++
+        "\"startDiffSide\":null,\"subjectType\":\"LINE\"," ++
+        "\"isResolved\":false,\"isOutdated\":false," ++
+        "\"viewerCanReply\":true,\"viewerCanResolve\":true," ++
+        "\"viewerCanUnresolve\":false,\"comments\":{\"nodes\":[{" ++
+        "\"id\":\"C101\",\"body\":\"later\"," ++
+        "\"createdAt\":\"2026-01-01T00:00:00Z\"," ++
+        "\"url\":\"https://example/C101\",\"author\":null," ++
+        "\"viewerDidAuthor\":false,\"pullRequestReview\":{" ++
+        "\"id\":\"R1\",\"state\":\"COMMENTED\"}}]}}}}";
+    try loadThreads(std.testing.allocator, raw, &generation);
+    try std.testing.expectEqual(@as(usize, 1), generation.threads.items.len);
+    try std.testing.expectEqualStrings(
+        "[deleted]",
+        generation.threads.items[0].comments[0].author,
+    );
 }
 
 test "GitHub transport is a fixed argv stdin broker" {

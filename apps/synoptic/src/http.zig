@@ -22,6 +22,7 @@ pub const Runtime = struct {
     baseline: ?*worktree.Baseline = null,
     settings: ?*const config.Settings = null,
     launch_id: []const u8 = "embedded-test",
+    stop_request_path: ?[]const u8 = null,
     stop_requested: bool = false,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
 };
@@ -129,9 +130,16 @@ pub const Server = struct {
             const message = readClientTextAllocTimeout(self.allocator, self.io, stream, config.visible_event_flush_ms) catch |err| switch (err) {
                 error.Timeout => {
                     try self.flushVisible(stream, runtime);
+                    if (runtime.stop_request_path) |path| {
+                        if (std.Io.Dir.cwd().access(self.io, path, .{})) |_| {
+                            runtime.stop_requested = true;
+                            return;
+                        } else |_| {}
+                    }
                     continue;
                 },
                 error.EndOfStream => return,
+                error.WebSocketClosed => return,
                 else => return err,
             };
             defer self.allocator.free(message);
@@ -144,6 +152,11 @@ pub const Server = struct {
             try writeServerText(self.io, stream, reply);
             try self.flushVisible(stream, runtime);
             if (runtime.stop_requested) return;
+            if (runtime.stop_request_path) |path| {
+                std.Io.Dir.cwd().access(self.io, path, .{}) catch continue;
+                runtime.stop_requested = true;
+                return;
+            }
         }
     }
 
@@ -152,6 +165,17 @@ pub const Server = struct {
         if (primary_ready and !runtime.app.primary_ready) {
             runtime.app.primary_ready = true;
             const envelope = try runtime.app.nextEnvelope("primary.status", "{\"status\":\"completed\"}");
+            defer self.allocator.free(envelope);
+            try writeServerText(self.io, stream, envelope);
+        }
+        if (runtime.registry.takePrimaryFailure()) |failure| {
+            const payload = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"status\":\"failed\",\"reason\":{f}}}",
+                .{std.json.fmt(failure, .{})},
+            );
+            defer self.allocator.free(payload);
+            const envelope = try runtime.app.nextEnvelope("primary.status", payload);
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
         }
@@ -197,7 +221,26 @@ pub const Server = struct {
                 const session_id = event.session_id orelse return error.MissingOriginSession;
                 const identity = try runtime.registry.sessionIdentity(session_id);
                 defer identity.deinit();
-                try runtime.app.completeRevision(runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, identity.path, identity.revision);
+                runtime.app.completeRevision(
+                    runtime.broker,
+                    runtime.owner,
+                    runtime.name,
+                    runtime.number,
+                    runtime.pull_request_id,
+                    identity.path,
+                    identity.revision,
+                ) catch |err| {
+                    const failed = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"status\":\"failed\",\"reason\":{f}}}",
+                        .{std.json.fmt(@errorName(err), .{})},
+                    );
+                    defer self.allocator.free(failed);
+                    const warning = try runtime.app.nextEnvelope("warning", failed);
+                    defer self.allocator.free(warning);
+                    try writeServerText(self.io, stream, warning);
+                    continue;
+                };
                 try runtime.registry.markCompleted(session_id);
                 const payload = try ui.visibleEventPayloadAlloc(self.allocator, session_id, event.method, "{\"status\":\"viewed\"}");
                 defer self.allocator.free(payload);
@@ -247,9 +290,12 @@ pub const Server = struct {
                 .string => |s| s,
                 else => return error.InvalidUiCommand,
             };
-            const event = try runtime.app.openFile(path);
-            self.allocator.free(event);
-            const revision = runtime.app.official_revision orelse return error.MissingRevision;
+            if (!runtime.app.primary_ready) return error.PrimaryNotReady;
+            if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
+            const revision = @import("domain.zig").revisionFor(
+                &runtime.app.generation,
+                path,
+            ) orelse return error.MissingRevision;
             const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, path);
             defer self.allocator.free(diff);
             const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(self.allocator, path, null, &.{}, false);
@@ -257,7 +303,27 @@ pub const Server = struct {
             const immediate = if (runtime.settings) |settings| settings.file_review_start_mode == .immediate else true;
             const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path, immediate);
             defer opened.deinit();
-            try runtime.app.recordOpenedSession(path, revision, opened.session_id, diff, opened.reused, immediate and !opened.reused);
+            const event = runtime.app.openFile(path) catch |err| {
+                if (!opened.reused) {
+                    runtime.registry.discardOpenedSession(opened.session_id);
+                }
+                return err;
+            };
+            self.allocator.free(event);
+            runtime.app.recordOpenedSession(
+                path,
+                revision,
+                opened.session_id,
+                diff,
+                opened.reused,
+                immediate and !opened.reused,
+            ) catch |err| {
+                if (!opened.reused) {
+                    runtime.registry.discardOpenedSession(opened.session_id);
+                }
+                runtime.app.rollbackOpenedFile(path, revision, opened.reused);
+                return err;
+            };
             const body = try runtime.app.sessionOpenedPayloadAlloc(path, revision);
             defer self.allocator.free(body);
             return runtime.app.nextEnvelope("session.opened", body);
@@ -274,8 +340,7 @@ pub const Server = struct {
             runtime.app.initial_review_active = false;
             const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
             const session_id = payloadString(payload, "sessionId") orelse return error.InvalidUiCommand;
-            try runtime.registry.markHumanInstruction(session_id, text);
-            try runtime.registry.message(session_id, text, payloadBool(payload, "active") orelse false);
+            try runtime.registry.message(session_id, text);
             return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
         }
         if (std.mem.eql(u8, command, "session.interrupt")) {
@@ -314,6 +379,20 @@ pub const Server = struct {
                 }
             }
             const terminal = try runtime.app.confirmAction(runtime.broker, runtime.owner, runtime.name, runtime.number, card_id);
+            if (terminal == .succeeded) {
+                if (runtime.broker.readGeneration(
+                    runtime.owner,
+                    runtime.name,
+                    runtime.number,
+                )) |generation_value| {
+                    var generation = generation_value;
+                    defer generation.deinit();
+                    try runtime.registry.setGenerationEvidence(&generation);
+                    runtime.app.action_state_fresh = true;
+                } else |_| {
+                    runtime.app.action_state_fresh = false;
+                }
+            }
             const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":{f},\"stateFresh\":{}}}", .{ std.json.fmt(card_id, .{}), std.json.fmt(tools.actionStatusName(terminal), .{}), runtime.app.action_state_fresh });
             defer self.allocator.free(status);
             return runtime.app.nextEnvelope("action.status", status);
@@ -356,7 +435,8 @@ pub const Server = struct {
         try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
         defer runtime.registry.endSynchronization();
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
-        errdefer next.deinit();
+        var next_owned = true;
+        errdefer if (next_owned) next.deinit();
         try worktree.synchronize(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid, runtime.baseline orelse return error.MissingWorktreeBaseline);
         try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
         for (runtime.app.tabs.items) |tab| {
@@ -373,7 +453,14 @@ pub const Server = struct {
             try runtime.app.updateTabDiff(tab.path, current_diff);
         }
         for (runtime.app.generation.files.items) |old_file| {
-            const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse continue;
+            const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse {
+                try runtime.registry.markPathChangedAndInject(
+                    old_file.path,
+                    "deleted",
+                    "This file was removed from the current pull request.",
+                );
+                continue;
+            };
             if (!std.mem.eql(u8, old_file.revision_key, next_revision)) {
                 const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, next.base_oid, next.head_oid, old_file.path);
                 defer self.allocator.free(diff);
@@ -382,6 +469,7 @@ pub const Server = struct {
         }
         try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
         runtime.app.replaceGeneration(next);
+        next_owned = false;
         if (runtime.settings) |settings| {
             var outcomes = try runtime.app.applyAutomaticExclusions(settings, runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, runtime.cwd);
             defer {
@@ -501,7 +589,12 @@ pub fn readClientTextAllocTimeout(allocator: std.mem.Allocator, io: std.Io, stre
             offset += received.data.len;
         }
     } else try readExact(io, stream, &head);
-    if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or (head[0] & 0x0f) != 1 or (head[1] & 0x80) == 0) return error.InvalidClientWebSocketFrame;
+    const opcode = head[0] & 0x0f;
+    if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or
+        (opcode != 1 and opcode != 8) or (head[1] & 0x80) == 0)
+    {
+        return error.InvalidClientWebSocketFrame;
+    }
     var len: u64 = head[1] & 0x7f;
     if (len == 126) {
         var b: [2]u8 = undefined;
@@ -521,6 +614,10 @@ pub fn readClientTextAllocTimeout(allocator: std.mem.Allocator, io: std.Io, stre
     errdefer allocator.free(payload);
     try readExact(io, stream, payload);
     for (payload, 0..) |*byte, i| byte.* ^= mask[i % 4];
+    if (opcode == 8) {
+        allocator.free(payload);
+        return error.WebSocketClosed;
+    }
     if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidClientWebSocketFrame;
     return payload;
 }

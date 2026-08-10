@@ -99,6 +99,24 @@ pub fn reconcileShutdown(allocator: std.mem.Allocator, io: std.Io, custody: Cust
     }
 }
 
+pub fn retireManaged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+) !void {
+    if (custody != .managed) return;
+    const remove = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "worktree", "remove", "--force", custody.path() },
+        .cwd = .{ .path = repository_cwd },
+    });
+    defer allocator.free(remove.stdout);
+    defer allocator.free(remove.stderr);
+    if (remove.term != .exited or remove.term.exited != 0) {
+        return error.ManagedWorktreeRetirementFailed;
+    }
+}
+
 pub fn synchronizeManaged(allocator: std.mem.Allocator, io: std.Io, custody: Custody, repository_cwd: []const u8, head_oid: []const u8, baseline: *Baseline) !void {
     try requireManagedRefresh(custody);
     try cleanManaged(allocator, io, custody.path(), baseline.head_oid, baseline);
