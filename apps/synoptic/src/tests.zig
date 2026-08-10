@@ -1233,10 +1233,7 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try std.testing.expect(!registry.primaryReady());
     try registry.setGenerationEvidence(&state.generation);
     try registry.createPrimary(io, root, fixture_skill, "{\"title\":\"fixture\"}");
-    var spins: usize = 0;
-    while (!registry.primaryReady() and spins < 100) : (spins += 1) std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
-    try std.testing.expect(registry.primaryReady());
-    state.primary_ready = true;
+    state.primary_ready = false;
     try registry.visible_events.append(std.heap.page_allocator, .{ .session_id = null, .method = try std.heap.page_allocator.dupe(u8, "turn/status"), .raw_json = try std.heap.page_allocator.dupe(u8, "{\"visible\":true}") });
     var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
     defer server.deinit();
@@ -1262,6 +1259,10 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     var handshake: [1024]u8 = undefined;
     const incoming = try stream.socket.receive(io, &handshake);
     try std.testing.expect(std.mem.indexOf(u8, incoming.data, "101 Switching Protocols") != null);
+    const primary_status = try readUntil(allocator, io, &stream, "\"type\":\"primary.status\"");
+    defer allocator.free(primary_status);
+    try std.testing.expect(std.mem.indexOf(u8, primary_status, "\"status\":\"completed\"") != null);
+    try std.testing.expect(state.primary_ready);
     const autonomous = try readUntil(allocator, io, &stream, "\\\"visible\\\":true");
     defer allocator.free(autonomous);
     try std.testing.expect(std.mem.indexOf(u8, autonomous, "session.item.delta") != null);

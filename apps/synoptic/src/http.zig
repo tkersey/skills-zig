@@ -148,6 +148,13 @@ pub const Server = struct {
     }
 
     fn flushVisible(self: *Server, stream: *std.Io.net.Stream, runtime: *Runtime) !void {
+        const primary_ready = runtime.registry.primaryReady();
+        if (primary_ready and !runtime.app.primary_ready) {
+            runtime.app.primary_ready = true;
+            const envelope = try runtime.app.nextEnvelope("primary.status", "{\"status\":\"completed\"}");
+            defer self.allocator.free(envelope);
+            try writeServerText(self.io, stream, envelope);
+        }
         var visible = try runtime.registry.drainVisible(self.allocator);
         defer {
             for (visible.items) |event| event.deinit(self.allocator);
