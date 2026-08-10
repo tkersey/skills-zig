@@ -2255,6 +2255,11 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
         .bool => |value| value,
         else => return false,
     };
+    var applicator_count: u8 = if (schema_object.get("$ref") != null) 1 else 0;
+    for ([_][]const u8{ "anyOf", "oneOf", "allOf" }) |union_name| {
+        if (schema_object.get(union_name) != null) applicator_count += 1;
+    }
+    if (applicator_count != 1) return false;
     if (schema_object.get("$ref")) |reference| {
         return !nullable and reference == .string and
             std.mem.eql(u8, reference.string, expected);
@@ -2265,6 +2270,7 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
             .array => |value| value,
             else => return false,
         };
+        if (std.mem.eql(u8, union_name, "allOf") and nullable) return false;
         var matched_reference = false;
         var matched_null = false;
         for (variants.items) |variant| {
@@ -2282,6 +2288,9 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
             if (matched_null or type_value != .string or
                 !std.mem.eql(u8, type_value.string, "null")) return false;
             matched_null = true;
+        }
+        if (std.mem.eql(u8, union_name, "allOf")) {
+            return matched_reference and !matched_null;
         }
         return matched_reference and matched_null == nullable;
     }
@@ -2310,9 +2319,17 @@ test "reference target matching rejects alternate union branches" {
         .{},
     );
     defer alternate.deinit();
+    var mixed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"$ref\":\"#/definitions/Expected\",\"oneOf\":[{\"$ref\":\"#/definitions/Expected\"}]}",
+        .{},
+    );
+    defer mixed.deinit();
 
     try std.testing.expect(referenceTargetMatches(selector.value, exact.value));
     try std.testing.expect(!referenceTargetMatches(selector.value, alternate.value));
+    try std.testing.expect(!referenceTargetMatches(selector.value, mixed.value));
 }
 
 fn documentBytes(bundle: SchemaBundle, name: []const u8) ![]const u8 {
@@ -2516,10 +2533,25 @@ fn inspectTestBundlesForProfile(
         stable_profile_shapes,
     );
     defer allocator.free(complete_stable_shapes);
+    const stable_client_with_shapes = try mergeDefinitionsIntoMethodSchema(
+        allocator,
+        bundles.stable_client,
+        complete_stable_shapes,
+    );
+    defer allocator.free(stable_client_with_shapes);
+    const stable_notification_with_shapes = try mergeDefinitionsIntoMethodSchema(
+        allocator,
+        bundles.stable_notification,
+        complete_stable_shapes,
+    );
+    defer allocator.free(stable_notification_with_shapes);
     const stable_docs = [_]Document{
-        .{ .name = "ClientRequest.json", .bytes = bundles.stable_client },
+        .{ .name = "ClientRequest.json", .bytes = stable_client_with_shapes },
         .{ .name = "ServerRequest.json", .bytes = bundles.stable_server },
-        .{ .name = "ServerNotification.json", .bytes = bundles.stable_notification },
+        .{
+            .name = "ServerNotification.json",
+            .bytes = stable_notification_with_shapes,
+        },
         .{
             .name = "codex_app_server_protocol.v2.schemas.json",
             .bytes = complete_stable_shapes,
@@ -2783,13 +2815,13 @@ fn expectStableShapeProfiles(
     required_profiles: []const Profile,
 ) !void {
     for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
-        var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
-        defer bundles.deinit(std.testing.allocator);
         const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
         defer std.testing.allocator.free(drifted);
         const offset = std.mem.indexOf(u8, drifted, needle) orelse
             return error.TestExpectedEqual;
         drifted[offset + needle.len - 1] = 'x';
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
+        defer bundles.deinit(std.testing.allocator);
         var report = try inspectTestBundlesForProfile(
             std.testing.allocator,
             baseline,
@@ -2998,8 +3030,6 @@ test "required scalar shape rejects an additive union kind" {
 test "review target branch and commit identity remain strings" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
-    var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
-    defer bundles.deinit(std.testing.allocator);
     const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
     defer std.testing.allocator.free(drifted);
     for ([_][]const u8{
@@ -3011,6 +3041,8 @@ test "review target branch and commit identity remain strings" {
         const kind_offset = offset + needle.len - "string\"}".len;
         @memcpy(drifted[kind_offset .. kind_offset + "string".len], "number");
     }
+    var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+    defer bundles.deinit(std.testing.allocator);
     var report = try inspectTestBundles(
         std.testing.allocator,
         &baseline.value,
