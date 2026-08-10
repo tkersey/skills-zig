@@ -524,6 +524,18 @@ pub fn structuredReviewProbe(
             "and in-progress turn",
     );
     defer allocator.free(turn_id);
+    const terminal = structuredReviewTerminalProbe(allocator, client, thread_id, turn_id);
+    if (terminal.status != .passed) return terminal;
+    deleteThread(allocator, client, thread_id);
+    return LiveWitness.passed();
+}
+
+fn structuredReviewTerminalProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    turn_id: []const u8,
+) LiveWitness {
     if (!interruptTurn(allocator, client, thread_id, turn_id)) return LiveWitness.failed(
         "structured_review_interrupt_failed",
         "the dispatched review turn could not be interrupted through the production envelope",
@@ -546,7 +558,6 @@ pub fn structuredReviewProbe(
         "structured_review_terminal_shape_failed",
         "thread/read did not preserve the exact review turn as terminal after interruption",
     );
-    deleteThread(allocator, client, thread_id);
     return LiveWitness.passed();
 }
 
