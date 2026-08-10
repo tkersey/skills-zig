@@ -2251,8 +2251,13 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
         .object => |value| value,
         else => return false,
     };
+    const nullable = switch (selector_object.get("nullable") orelse return false) {
+        .bool => |value| value,
+        else => return false,
+    };
     if (schema_object.get("$ref")) |reference| {
-        return reference == .string and std.mem.eql(u8, reference.string, expected);
+        return !nullable and reference == .string and
+            std.mem.eql(u8, reference.string, expected);
     }
     for ([_][]const u8{ "anyOf", "oneOf", "allOf" }) |union_name| {
         const union_value = schema_object.get(union_name) orelse continue;
@@ -2260,16 +2265,54 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
             .array => |value| value,
             else => return false,
         };
+        var matched_reference = false;
+        var matched_null = false;
         for (variants.items) |variant| {
             const object = switch (variant) {
                 .object => |value| value,
-                else => continue,
+                else => return false,
             };
-            const reference = object.get("$ref") orelse continue;
-            if (reference == .string and std.mem.eql(u8, reference.string, expected)) return true;
+            if (object.get("$ref")) |reference| {
+                if (matched_reference or reference != .string or
+                    !std.mem.eql(u8, reference.string, expected)) return false;
+                matched_reference = true;
+                continue;
+            }
+            const type_value = object.get("type") orelse return false;
+            if (matched_null or type_value != .string or
+                !std.mem.eql(u8, type_value.string, "null")) return false;
+            matched_null = true;
         }
+        return matched_reference and matched_null == nullable;
     }
     return false;
+}
+
+test "reference target matching rejects alternate union branches" {
+    var selector = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"refEquals\":\"#/definitions/Expected\",\"nullable\":false}",
+        .{},
+    );
+    defer selector.deinit();
+    var exact = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"allOf\":[{\"$ref\":\"#/definitions/Expected\"}]}",
+        .{},
+    );
+    defer exact.deinit();
+    var alternate = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"oneOf\":[{\"$ref\":\"#/definitions/Expected\"},{\"type\":\"string\"}]}",
+        .{},
+    );
+    defer alternate.deinit();
+
+    try std.testing.expect(referenceTargetMatches(selector.value, exact.value));
+    try std.testing.expect(!referenceTargetMatches(selector.value, alternate.value));
 }
 
 fn documentBytes(bundle: SchemaBundle, name: []const u8) ![]const u8 {
@@ -2347,7 +2390,7 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"type":"object","required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"TurnStatus":{"type":"string","enum":["completed","interrupted","failed","inProgress"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const stable_profile_shapes =
@@ -2382,12 +2425,23 @@ fn methodSchema(allocator: std.mem.Allocator, methods: std.json.Array) ![]u8 {
     try output.writer.writeAll("{\"oneOf\":[");
     for (methods.items, 0..) |method, index| {
         if (index != 0) try output.writer.writeByte(',');
-        try output.writer.writeAll("{\"properties\":{\"method\":{\"enum\":[");
-        try std.json.Stringify.value(switch (method) {
+        const method_name = switch (method) {
             .string => |value| value,
             else => return error.InvalidContract,
-        }, .{}, &output.writer);
-        try output.writer.writeAll("]}}}");
+        };
+        try output.writer.writeAll("{\"properties\":{\"method\":{\"enum\":[");
+        try std.json.Stringify.value(method_name, .{}, &output.writer);
+        try output.writer.writeAll("]}");
+        if (std.mem.eql(u8, method_name, "review/start")) {
+            try output.writer.writeAll(
+                ",\"params\":{\"$ref\":\"#/definitions/ReviewStartParams\"}",
+            );
+        } else if (std.mem.eql(u8, method_name, "turn/completed")) {
+            try output.writer.writeAll(
+                ",\"params\":{\"$ref\":\"#/definitions/TurnCompletedNotification\"}",
+            );
+        }
+        try output.writer.writeAll("}}");
     }
     try output.writer.writeAll("]}");
     return output.toOwnedSlice();
