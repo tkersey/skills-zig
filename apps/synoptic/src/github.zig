@@ -345,16 +345,31 @@ fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: 
     }
 }
 
-fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
+pub fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
     for ((pull.get("reviewThreads") orelse return error.InvalidSnapshot).object.get("nodes").?.array.items) |node| {
         const object = node.object;
         if (object.get("isResolved").?.bool) continue;
-        const line: ?u32 = if (object.get("line").? == .null) null else @intCast(object.get("line").?.integer);
-        try generation.addThread(.{ .id = object.get("id").?.string, .path = object.get("path").?.string, .line = line, .outdated = object.get("isOutdated").?.bool });
+        var comments: std.ArrayList(domain.ReviewComment) = .empty;
+        defer comments.deinit(allocator);
+        for (object.get("comments").?.object.get("nodes").?.array.items) |value| {
+            const comment = value.object;
+            const review = comment.get("pullRequestReview").?.object;
+            try comments.append(allocator, .{ .id = comment.get("id").?.string, .body = comment.get("body").?.string, .created_at = comment.get("createdAt").?.string, .url = comment.get("url").?.string, .author = comment.get("author").?.object.get("login").?.string, .viewer_did_author = comment.get("viewerDidAuthor").?.bool, .review_id = review.get("id").?.string, .review_state = review.get("state").?.string });
+        }
+        try generation.addThread(.{ .id = object.get("id").?.string, .path = object.get("path").?.string, .line = optionalU32(object.get("line")), .start_line = optionalU32(object.get("startLine")), .diff_side = optionalString(object.get("diffSide")), .start_diff_side = optionalString(object.get("startDiffSide")), .subject_type = object.get("subjectType").?.string, .outdated = object.get("isOutdated").?.bool, .viewer_can_reply = object.get("viewerCanReply").?.bool, .viewer_can_resolve = object.get("viewerCanResolve").?.bool, .viewer_can_unresolve = object.get("viewerCanUnresolve").?.bool, .comments = comments.items });
     }
+}
+
+fn optionalU32(value: ?std.json.Value) ?u32 {
+    const v = value orelse return null;
+    return if (v == .null) null else @intCast(v.integer);
+}
+fn optionalString(value: ?std.json.Value) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v == .null) null else v.string;
 }
 
 pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, generation: *domain.PrGeneration) !void {

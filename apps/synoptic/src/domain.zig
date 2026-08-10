@@ -16,7 +16,30 @@ pub const PullRequestTarget = struct {
     }
 };
 
-pub const ReviewThread = struct { id: []const u8, path: []const u8, line: ?u32 = null, outdated: bool = false };
+pub const ReviewComment = struct {
+    id: []const u8,
+    body: []const u8,
+    created_at: []const u8,
+    url: []const u8,
+    author: []const u8,
+    viewer_did_author: bool,
+    review_id: []const u8,
+    review_state: []const u8,
+};
+pub const ReviewThread = struct {
+    id: []const u8,
+    path: []const u8,
+    line: ?u32 = null,
+    start_line: ?u32 = null,
+    diff_side: ?[]const u8 = null,
+    start_diff_side: ?[]const u8 = null,
+    subject_type: []const u8 = "LINE",
+    outdated: bool = false,
+    viewer_can_reply: bool = false,
+    viewer_can_resolve: bool = false,
+    viewer_can_unresolve: bool = false,
+    comments: []const ReviewComment = &.{},
+};
 pub const Tab = struct { id: []const u8, path: []const u8, revision: []const u8, status: SessionStatus = .current };
 
 pub const File = struct {
@@ -50,8 +73,7 @@ pub const PrGeneration = struct {
         }
         self.files.deinit(self.allocator);
         for (self.threads.items) |thread| {
-            self.allocator.free(thread.id);
-            self.allocator.free(thread.path);
+            freeThread(self.allocator, thread);
         }
         self.threads.deinit(self.allocator);
         self.allocator.free(self.head_oid);
@@ -70,7 +92,50 @@ pub const PrGeneration = struct {
     }
 
     pub fn addThread(self: *PrGeneration, thread: ReviewThread) !void {
-        try self.threads.append(self.allocator, .{ .id = try self.allocator.dupe(u8, thread.id), .path = try self.allocator.dupe(u8, thread.path), .line = thread.line, .outdated = thread.outdated });
+        const owned = try dupeThread(self.allocator, thread);
+        errdefer freeThread(self.allocator, owned);
+        try self.threads.append(self.allocator, owned);
+    }
+
+    pub fn clone(self: *const PrGeneration, allocator: std.mem.Allocator) !PrGeneration {
+        var copy = try PrGeneration.initFull(allocator, self.base_oid, self.head_oid);
+        errdefer copy.deinit();
+        for (self.files.items) |file| try copy.addFile(file);
+        for (self.threads.items) |thread| try copy.addThread(thread);
+        return copy;
+    }
+
+    pub fn unresolvedThreadsJsonAlloc(self: *const PrGeneration, allocator: std.mem.Allocator, assigned_path: []const u8, query: ?[]const u8, paths: []const []const u8, whole_pr: bool) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try out.writer.writeByte('[');
+        var first = true;
+        for (0..2) |pass| for (self.threads.items) |thread| {
+            const assigned = std.mem.eql(u8, thread.path, assigned_path);
+            if ((pass == 0) != assigned) continue;
+            if (pass == 1 and !whole_pr) continue;
+            if (paths.len > 0) {
+                var matched = false;
+                for (paths) |path| if (std.mem.eql(u8, path, thread.path)) {
+                    matched = true;
+                    break;
+                };
+                if (!matched) continue;
+            }
+            if (query) |needle| if (needle.len > 0 and std.mem.indexOf(u8, thread.path, needle) == null) {
+                var matched = false;
+                for (thread.comments) |comment| if (std.mem.indexOf(u8, comment.body, needle) != null) {
+                    matched = true;
+                    break;
+                };
+                if (!matched) continue;
+            };
+            if (!first) try out.writer.writeByte(',');
+            first = false;
+            try std.json.Stringify.value(thread, .{}, &out.writer);
+        };
+        try out.writer.writeByte(']');
+        return out.toOwnedSlice();
     }
 
     pub fn queued(self: *const PrGeneration, path: []const u8) bool {
@@ -100,6 +165,64 @@ pub const PrGeneration = struct {
         return error.UnknownFile;
     }
 };
+
+fn dupeComment(allocator: std.mem.Allocator, comment: ReviewComment) !ReviewComment {
+    const id = try allocator.dupe(u8, comment.id);
+    errdefer allocator.free(id);
+    const body = try allocator.dupe(u8, comment.body);
+    errdefer allocator.free(body);
+    const created = try allocator.dupe(u8, comment.created_at);
+    errdefer allocator.free(created);
+    const url = try allocator.dupe(u8, comment.url);
+    errdefer allocator.free(url);
+    const author = try allocator.dupe(u8, comment.author);
+    errdefer allocator.free(author);
+    const review_id = try allocator.dupe(u8, comment.review_id);
+    errdefer allocator.free(review_id);
+    const state = try allocator.dupe(u8, comment.review_state);
+    return .{ .id = id, .body = body, .created_at = created, .url = url, .author = author, .viewer_did_author = comment.viewer_did_author, .review_id = review_id, .review_state = state };
+}
+fn freeComment(allocator: std.mem.Allocator, comment: ReviewComment) void {
+    allocator.free(comment.id);
+    allocator.free(comment.body);
+    allocator.free(comment.created_at);
+    allocator.free(comment.url);
+    allocator.free(comment.author);
+    allocator.free(comment.review_id);
+    allocator.free(comment.review_state);
+}
+fn dupeThread(allocator: std.mem.Allocator, thread: ReviewThread) !ReviewThread {
+    const id = try allocator.dupe(u8, thread.id);
+    errdefer allocator.free(id);
+    const path = try allocator.dupe(u8, thread.path);
+    errdefer allocator.free(path);
+    const diff_side = if (thread.diff_side) |v| try allocator.dupe(u8, v) else null;
+    errdefer if (diff_side) |v| allocator.free(v);
+    const start_diff_side = if (thread.start_diff_side) |v| try allocator.dupe(u8, v) else null;
+    errdefer if (start_diff_side) |v| allocator.free(v);
+    const subject = try allocator.dupe(u8, thread.subject_type);
+    errdefer allocator.free(subject);
+    const comments = try allocator.alloc(ReviewComment, thread.comments.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (comments[0..initialized]) |comment| freeComment(allocator, comment);
+        allocator.free(comments);
+    }
+    for (thread.comments, 0..) |comment, i| {
+        comments[i] = try dupeComment(allocator, comment);
+        initialized += 1;
+    }
+    return .{ .id = id, .path = path, .line = thread.line, .start_line = thread.start_line, .diff_side = diff_side, .start_diff_side = start_diff_side, .subject_type = subject, .outdated = thread.outdated, .viewer_can_reply = thread.viewer_can_reply, .viewer_can_resolve = thread.viewer_can_resolve, .viewer_can_unresolve = thread.viewer_can_unresolve, .comments = comments };
+}
+fn freeThread(allocator: std.mem.Allocator, thread: ReviewThread) void {
+    allocator.free(thread.id);
+    allocator.free(thread.path);
+    if (thread.diff_side) |v| allocator.free(v);
+    if (thread.start_diff_side) |v| allocator.free(v);
+    allocator.free(thread.subject_type);
+    for (thread.comments) |comment| freeComment(allocator, comment);
+    allocator.free(thread.comments);
+}
 
 pub fn revisionKey(allocator: std.mem.Allocator, path: []const u8, change_type: []const u8, blob: []const u8, diff: []const u8) ![]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

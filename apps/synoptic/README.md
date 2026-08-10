@@ -19,6 +19,13 @@ The current native slice serves the browser from the validated skill root. GitHu
 `gh api graphql --hostname HOST --input -` argv and JSON stdin; the browser has
 no shell or generic GitHub endpoint.
 
+Before binding the UI, Synoptic generates the installed Codex app-server schema
+and verifies the thread, turn, skill-input, notification, injection, and dynamic-tool
+surfaces it uses. The hidden primary and every file fork receive the explicit
+`synoptic` skill item and skill-owned role instructions. PR metadata, canonical
+diffs, and unresolved-thread evidence are always computed by the server; a
+browser `file.open` command supplies only the selected path.
+
 File and review-thread connections are paginated independently. A file becomes
 locally complete only after the mark-viewed mutation and an independent VIEWED
 read-back at the same PR head.

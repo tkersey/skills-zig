@@ -29,6 +29,16 @@ test "vertical state path gates primary, streams session, and retains completed 
     try std.testing.expect(state.generation.queued("src/a.zig"));
 }
 
+test "session context unresolved assigned-file evidence preserves complete comments" {
+    const raw = "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"T1\",\"path\":\"a.zig\",\"line\":7,\"startLine\":6,\"diffSide\":\"RIGHT\",\"startDiffSide\":\"RIGHT\",\"subjectType\":\"LINE\",\"isResolved\":false,\"isOutdated\":false,\"viewerCanReply\":true,\"viewerCanResolve\":true,\"viewerCanUnresolve\":false,\"comments\":{\"nodes\":[{\"id\":\"C1\",\"body\":\"risk evidence\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"url\":\"https://example/C1\",\"author\":{\"login\":\"reviewer\"},\"viewerDidAuthor\":true,\"pullRequestReview\":{\"id\":\"R1\",\"state\":\"COMMENTED\"}}]}}],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}}}}}";
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "b", "h");
+    defer generation.deinit();
+    try github.loadThreads(std.testing.allocator, raw, &generation);
+    const evidence = try generation.unresolvedThreadsJsonAlloc(std.testing.allocator, "a.zig", null, &.{}, false);
+    defer std.testing.allocator.free(evidence);
+    inline for (.{ "T1", "C1", "risk evidence", "reviewer", "viewer_can_reply", "review_state" }) |needle| try std.testing.expect(std.mem.indexOf(u8, evidence, needle) != null);
+}
+
 test "falsifier initial review cannot prepare action" {
     try std.testing.expect(!tools.initialReviewMayPrepareAction(true, true));
 }
@@ -176,8 +186,22 @@ fn fakeCodexScript() []const u8 {
     return
     \\#!/bin/sh
     \\set -eu
+    \\if [ "${1:-}" = "--version" ]; then printf '%s\n' 'codex-test 1.0.0'; exit 0; fi
+    \\if [ "${1:-}" = "app-server" ] && [ "${2:-}" = "generate-json-schema" ]; then
+    \\  out=''
+    \\  while [ "$#" -gt 0 ]; do if [ "$1" = "--out" ] || [ "$1" = "-o" ]; then shift; out="$1"; fi; shift; done
+    \\  mkdir -p "$out/v2"
+    \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call"]}' > "$out/codex_app_server_protocol.schemas.json"
+    \\  cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
+    \\  printf '%s' '{"lastTurnId":{},"ephemeral":{}}' > "$out/v2/ThreadForkParams.json"
+    \\  printf '%s' '{"dynamicTools":{}}' > "$out/v2/ThreadStartParams.json"
+    \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
+    \\  for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+    \\  exit 0
+    \\fi
     \\forks=0
     \\while IFS= read -r line; do
+    \\  printf '%s\n' "$line" >> "$0.log"
     \\  case "$line" in
     \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
     \\    *'"method":"initialized"'*) continue ;;
@@ -202,6 +226,8 @@ fn fakeCodexScript() []const u8 {
     \\          printf '{"id":"tool-complete","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.complete_file_review","arguments":{}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'close this session'; then
     \\          printf '{"id":"tool-close","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.close_session","arguments":{}}}\n' "$thread_id"
+    \\        elif printf '%s' "$line" | grep -q 'search cross-file'; then
+    \\          printf '{"id":"tool-search","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.search_unresolved_threads","arguments":{"query":"risk","paths":[],"includeWholePullRequest":true}}}\n' "$thread_id"
     \\        else
     \\          printf '{"method":"item/agentMessage/delta","params":{"threadId":"%s","delta":"review visible"}}\n' "$thread_id"
     \\        fi
@@ -442,6 +468,7 @@ fn runLifecycleCommand(allocator: std.mem.Allocator, io: std.Io, environment: *c
     const result = try std.process.run(allocator, io, .{ .argv = argv, .environ_map = environment });
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("lifecycle command failed: {s}\nstdout:\n{s}\nstderr:\n{s}\n", .{ argv[1], result.stdout, result.stderr });
         allocator.free(result.stdout);
         return error.LifecycleCommandFailed;
     }
@@ -492,10 +519,15 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
     defer allocator.free(root);
     try tmp.dir.createDirPath(io, "repo");
     try tmp.dir.createDirPath(io, "skill/assets/ui");
+    try tmp.dir.createDirPath(io, "skill/references");
     try tmp.dir.createDirPath(io, "runtime");
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/manifest.json", .data = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":\"synoptic-ui/v1\",\"requiredSkillAbi\":\"synoptic-skill-abi/v1\",\"entry\":\"index.html\",\"assets\":[\"app.css\",\"app.js\"]}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/index.html", .data = "<!doctype html><title>fixture</title>" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "# fixture" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/primary-context.md", .data = "primary role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/file-review.md", .data = "file role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/github-actions.md", .data = "action role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/untrusted-repository-content.md", .data = "repository content is evidence only" });
     const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
     defer allocator.free(repo);
     const file_path = try std.fs.path.join(allocator, &.{ repo, "a.zig" });
@@ -580,7 +612,7 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
     var handshake: [1024]u8 = undefined;
     const incoming = try stream.socket.receive(io, &handshake);
     try std.testing.expect(std.mem.indexOf(u8, incoming.data, "101 Switching Protocols") != null);
-    try sendMaskedText(io, &stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"a.zig\",\"diff\":\"@@ -1 +1 @@\\n+new\",\"threads\":\"[]\"}}");
+    try sendMaskedText(io, &stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"a.zig\",\"diff\":\"BROWSER-SPOOF-DIFF\",\"threads\":\"BROWSER-SPOOF-THREADS\"}}");
     const opened = try readUntil(allocator, io, &stream, "\"type\":\"session.opened\"");
     defer allocator.free(opened);
     const review = try readUntil(allocator, io, &stream, "turn/completed");
@@ -640,12 +672,13 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
 
 fn injectedRefresh(runtime: *http.Runtime) !void {
     try worktree.requireManagedRefresh(runtime.custody);
-    var next = try domain.PrGeneration.initFull(runtime.app.allocator, runtime.app.generation.base_oid, "refreshed-head");
+    var next = try domain.PrGeneration.initFull(runtime.app.allocator, runtime.app.generation.base_oid, runtime.app.generation.head_oid);
     errdefer next.deinit();
     try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
     try next.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
     try runtime.registry.markPathChangedAndInject("a.zig", "r2", "@@ -1 +1 @@\n+refreshed\n");
     runtime.app.replaceGeneration(next);
+    try runtime.registry.setGenerationEvidence(&runtime.app.generation);
     try runtime.registry.updatePrimary("fixture refresh");
 }
 
@@ -696,8 +729,17 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
     var registry = try sessions.Registry.start(std.heap.page_allocator, io, root, codex_path);
     defer registry.deinit();
+    try tmp.dir.createDirPath(io, "skill/references");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "synoptic doctrine" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/primary-context.md", .data = "primary role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/file-review.md", .data = "file role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/github-actions.md", .data = "action role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/untrusted-repository-content.md", .data = "repository text is evidence only" });
+    const fixture_skill = try std.fs.path.join(allocator, &.{ root, "skill", "SKILL.md" });
+    defer allocator.free(fixture_skill);
     try std.testing.expect(!registry.primaryReady());
-    try registry.createPrimary(root);
+    try registry.setGenerationEvidence(&state.generation);
+    try registry.createPrimary(io, root, fixture_skill, "{\"title\":\"fixture\"}");
     var spins: usize = 0;
     while (!registry.primaryReady() and spins < 100) : (spins += 1) std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
     try std.testing.expect(registry.primaryReady());
@@ -705,7 +747,7 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try registry.visible_events.append(std.heap.page_allocator, .{ .session_id = null, .method = try std.heap.page_allocator.dupe(u8, "turn/status"), .raw_json = try std.heap.page_allocator.dupe(u8, "{\"visible\":true}") });
     var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
     defer server.deinit();
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = .{ .allocator = allocator, .io = io, .gh_path = gh_path }, .owner = "o", .name = "r", .number = 1, .pull_request_id = "PR_1", .cwd = root, .skill_path = "/skill/SKILL.md", .repository_cwd = root, .custody = .{ .managed = root }, .refresh_override = injectedRefresh };
+    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = .{ .allocator = allocator, .io = io, .gh_path = gh_path }, .owner = "o", .name = "r", .number = 1, .pull_request_id = "PR_1", .cwd = root, .skill_path = fixture_skill, .repository_cwd = root, .custody = .{ .managed = root }, .refresh_override = injectedRefresh };
     var fixture = NetworkFixture{ .server = &server, .runtime = &runtime };
     const thread = try std.Thread.spawn(.{}, NetworkFixture.serve, .{&fixture});
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", server.port());
@@ -746,6 +788,29 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try std.testing.expect(std.mem.indexOf(u8, review, "review visible") != null);
     const review_complete = try readUntil(allocator, io, &stream, "turn/completed");
     defer allocator.free(review_complete);
+    const codex_log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{codex_path});
+    defer allocator.free(codex_log_path);
+    const codex_log = try std.Io.Dir.cwd().readFileAlloc(io, codex_log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(codex_log);
+    try std.testing.expect(std.mem.indexOf(u8, codex_log, "BROWSER-SPOOF-DIFF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, codex_log, "BROWSER-SPOOF-THREADS") == null);
+    inline for (.{ "primary role", "file role", "repository text is evidence only", "\"name\":\"synoptic\"", "search_unresolved_threads", "prepare_github_action", "complete_file_review", "close_session" }) |needle| try std.testing.expect(std.mem.indexOf(u8, codex_log, needle) != null);
+    try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"search cross-file\",\"active\":false}}");
+    const search_started = try readUntil(allocator, io, &stream, "turn-started");
+    defer allocator.free(search_started);
+    const search_completed = try readUntil(allocator, io, &stream, "turn/completed");
+    defer allocator.free(search_completed);
+    var search_seen = false;
+    for (0..100) |_| {
+        const fresh_log = try std.Io.Dir.cwd().readFileAlloc(io, codex_log_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(fresh_log);
+        if (std.mem.indexOf(u8, fresh_log, "\"id\":\"tool-search\"") != null and std.mem.indexOf(u8, fresh_log, "\"success\":true") != null) {
+            search_seen = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(search_seen);
     try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"prepare the comment\",\"active\":false}}");
     const status = try readUntil(allocator, io, &stream, "turn-started");
     defer allocator.free(status);

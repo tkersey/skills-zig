@@ -234,7 +234,11 @@ pub const Server = struct {
             const event = try runtime.app.openFile(path);
             self.allocator.free(event);
             const revision = runtime.app.official_revision orelse return error.MissingRevision;
-            const opened = try runtime.registry.openFile(runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, payloadString(payload, "diff") orelse "", payloadString(payload, "threads") orelse "[]", runtime.skill_path);
+            const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, path);
+            defer self.allocator.free(diff);
+            const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(self.allocator, path, null, &.{}, false);
+            defer self.allocator.free(threads);
+            const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path);
             defer opened.deinit();
             const body = try std.fmt.allocPrint(self.allocator, "{{\"initialReview\":{},\"reused\":{},\"sessionId\":{f}}}", .{ !opened.reused, opened.reused, std.json.fmt(opened.session_id, .{}) });
             defer self.allocator.free(body);
@@ -332,7 +336,13 @@ pub const Server = struct {
             }
         }
         runtime.app.replaceGeneration(next);
-        try runtime.registry.updatePrimary("The pull request was explicitly refreshed. Re-evaluate the current base/head and changed-file relationships in the shared worktree.");
+        try runtime.registry.setGenerationEvidence(&runtime.app.generation);
+        var files: std.Io.Writer.Allocating = .init(self.allocator);
+        defer files.deinit();
+        try std.json.Stringify.value(runtime.app.generation.files.items, .{}, &files.writer);
+        const update = try std.fmt.allocPrint(self.allocator, "The pull request was explicitly refreshed. Authoritative current base OID: {s}. Authoritative current head OID: {s}. Current changed files: {s}. Re-evaluate intent, invariants, and cross-file relationships from this generation and the synchronized shared worktree.", .{ runtime.app.generation.base_oid, runtime.app.generation.head_oid, files.written() });
+        defer self.allocator.free(update);
+        try runtime.registry.updatePrimary(update);
     }
 };
 

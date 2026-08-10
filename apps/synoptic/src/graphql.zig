@@ -3,7 +3,7 @@ const std = @import("std");
 pub const snapshot_query =
     "query SynopticPullRequest($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id number url title body baseRefName baseRefOid headRefName headRefOid files(first:100,after:$after){nodes{path additions deletions changeType viewerViewedState}pageInfo{hasNextPage endCursor}}}}}";
 pub const threads_query =
-    "query SynopticReviewThreads($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{id path line isResolved isOutdated}pageInfo{hasNextPage endCursor}}}}}";
+    "query SynopticReviewThreads($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve comments(first:100){nodes{id body createdAt url author{login} viewerDidAuthor pullRequestReview{id state}}}}pageInfo{hasNextPage endCursor}}}}}";
 pub const file_state_query =
     "query SynopticFileState($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid files(first:100,after:$after){nodes{path viewerViewedState}pageInfo{hasNextPage endCursor}}}}}";
 pub const anchor_query =

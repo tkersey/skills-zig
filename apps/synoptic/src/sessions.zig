@@ -1,8 +1,15 @@
 const std = @import("std");
 const cas_runtime = @import("cas_runtime");
 const action_tools = @import("tools.zig");
+const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
+pub const dynamic_tools_json =
+    "[{\"type\":\"namespace\",\"name\":\"synoptic\",\"description\":\"Human-directed Synoptic review operations\",\"tools\":[" ++
+    "{\"name\":\"search_unresolved_threads\",\"description\":\"Search server-owned unresolved current-PR review evidence; use whole-PR only for cross-file concerns\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"includeWholePullRequest\":{\"type\":\"boolean\"}}}}," ++
+    "{\"name\":\"prepare_github_action\",\"description\":\"Only after explicit human instruction, prepare an immutable confirmable GitHub action; forbidden during initial review\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"slot\",\"kind\",\"effectSummary\",\"payload\"],\"properties\":{\"slot\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\",\"enum\":[\"add_inline_comment\",\"reply_thread\",\"resolve_thread\",\"unresolve_thread\",\"update_comment\",\"delete_comment\",\"mark_viewed\",\"unmark_viewed\",\"graphql\"]},\"effectSummary\":{\"type\":\"string\"},\"payload\":{\"type\":\"object\"}}}}," ++
+    "{\"name\":\"complete_file_review\",\"description\":\"Complete the official current file only after explicit human instruction\",\"inputSchema\":{\"type\":\"object\"}}," ++
+    "{\"name\":\"close_session\",\"description\":\"Close this local session only after explicit human instruction\",\"inputSchema\":{\"type\":\"object\"}}]}]";
 pub const SessionStatus = enum { current, stale_origin, completed, closed };
 pub const HumanAuthority = enum { github_any, add_inline_comment, reply_thread, resolve_thread, unresolve_thread, update_comment, delete_comment, mark_viewed, unmark_viewed, graphql, complete, close };
 pub const Session = struct {
@@ -68,10 +75,7 @@ pub const Registry = struct {
     primary_thread_id: ?[]u8 = null,
     latest_primary_turn_id: ?[]u8 = null,
     primary_start_turn_id: ?[]u8 = null,
-    file_thread_id: ?[]u8 = null,
-    file_turn_id: ?[]u8 = null,
-    file_path: ?[]u8 = null,
-    file_revision: ?[]u8 = null,
+    evidence: ?domain.PrGeneration = null,
     notification_count: u64 = 0,
     mutex: RegistryMutex = .{},
     sessions: std.ArrayList(Session) = .empty,
@@ -98,26 +102,37 @@ pub const Registry = struct {
         if (self.primary_thread_id) |v| self.allocator.free(v);
         if (self.latest_primary_turn_id) |v| self.allocator.free(v);
         if (self.primary_start_turn_id) |v| self.allocator.free(v);
-        if (self.file_thread_id) |v| self.allocator.free(v);
-        if (self.file_turn_id) |v| self.allocator.free(v);
-        if (self.file_path) |v| self.allocator.free(v);
-        if (self.file_revision) |v| self.allocator.free(v);
+        if (self.evidence) |*value| value.deinit();
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
         for (self.visible_events.items) |event| event.deinit(self.allocator);
         self.visible_events.deinit(self.allocator);
     }
 
-    pub fn createPrimary(self: *Registry, cwd: []const u8) !void {
+    pub fn setGenerationEvidence(self: *Registry, generation: *const domain.PrGeneration) !void {
+        const next = try generation.clone(self.allocator);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.evidence) |*old| old.deinit();
+        self.evidence = next;
+    }
+
+    pub fn createPrimary(self: *Registry, io: std.Io, cwd: []const u8, skill_path: []const u8, pr_json: []const u8) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         try actor.subscribe(.{ .context = self, .handle = onNotification });
         try actor.setServerRequestHandler(.{ .context = self, .handle = onServerRequest });
-        const params = try std.fmt.allocPrint(self.allocator, "{{\"cwd\":{f},\"ephemeral\":true}}", .{std.json.fmt(cwd, .{})});
+        const params = try std.fmt.allocPrint(self.allocator, "{{\"cwd\":{f},\"ephemeral\":true,\"dynamicTools\":{s}}}", .{ std.json.fmt(cwd, .{}), dynamic_tools_json });
         defer self.allocator.free(params);
         const response = try actor.requestJson("thread/start", params, null);
         defer self.allocator.free(response);
         self.primary_thread_id = try extractString(self.allocator, response, &.{ "thread", "id" });
-        const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"input\":[{{\"type\":\"text\",\"text\":\"Build common PR context. Do not take GitHub actions.\"}}]}}", .{std.json.fmt(self.primary_thread_id.?, .{})});
+        const primary_role = try readReference(self.allocator, io, skill_path, "primary-context.md");
+        defer self.allocator.free(primary_role);
+        const untrusted = try readReference(self.allocator, io, skill_path, "untrusted-repository-content.md");
+        defer self.allocator.free(untrusted);
+        const prompt = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}\n\nAuthoritative current pull request:\n{s}\nThis primary context is hidden infrastructure. Do not invoke Synoptic tools or produce publication-ready per-file review actions.", .{ primary_role, untrusted, pr_json });
+        defer self.allocator.free(prompt);
+        const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(self.primary_thread_id.?, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
         defer self.allocator.free(turn_params);
         const turn = try actor.requestJson("turn/start", turn_params, null);
         defer self.allocator.free(turn);
@@ -180,7 +195,7 @@ pub const Registry = struct {
         return result;
     }
 
-    pub fn openFile(self: *Registry, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8) !OpenResult {
+    pub fn openFile(self: *Registry, io: std.Io, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8) !OpenResult {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         self.mutex.lock();
         for (self.sessions.items) |session| if (session.status == .current and std.mem.eql(u8, session.path, path) and std.mem.eql(u8, session.revision, revision)) {
@@ -191,36 +206,50 @@ pub const Registry = struct {
         for (self.sessions.items) |*session| {
             if (session.status == .current and std.mem.eql(u8, session.path, path)) session.status = .stale_origin;
         }
+        const primary_thread = self.allocator.dupe(u8, self.primary_thread_id orelse {
+            self.mutex.unlock();
+            return error.PrimaryNotReady;
+        }) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        const primary_turn = self.allocator.dupe(u8, self.latest_primary_turn_id orelse {
+            self.allocator.free(primary_thread);
+            self.mutex.unlock();
+            return error.PrimaryNotReady;
+        }) catch |err| {
+            self.allocator.free(primary_thread);
+            self.mutex.unlock();
+            return err;
+        };
         self.mutex.unlock();
-        if (self.file_thread_id) |old_thread| {
-            const inject = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"items\":[{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(old_thread, .{}), std.json.fmt(diff, .{}) });
-            defer self.allocator.free(inject);
-            const injected = try actor.requestJson("thread/inject_items", inject, null);
-            defer self.allocator.free(injected);
-        }
-        const params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"lastTurnId\":{f},\"ephemeral\":true}}", .{ std.json.fmt(self.primary_thread_id orelse return error.PrimaryNotReady, .{}), std.json.fmt(self.latest_primary_turn_id orelse return error.PrimaryNotReady, .{}) });
+        defer self.allocator.free(primary_thread);
+        defer self.allocator.free(primary_turn);
+        const params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"lastTurnId\":{f},\"ephemeral\":true}}", .{ std.json.fmt(primary_thread, .{}), std.json.fmt(primary_turn, .{}) });
         defer self.allocator.free(params);
         const response = try actor.requestJson("thread/fork", params, null);
         defer self.allocator.free(response);
-        if (self.file_thread_id) |old| self.allocator.free(old);
-        self.file_thread_id = try extractString(self.allocator, response, &.{ "thread", "id" });
-        if (self.file_path) |old| self.allocator.free(old);
-        self.file_path = try self.allocator.dupe(u8, path);
-        if (self.file_revision) |old| self.allocator.free(old);
-        self.file_revision = try self.allocator.dupe(u8, revision);
-        const prompt = try std.fmt.allocPrint(self.allocator, "Review {s} against base {s} at head {s}. Diff:\n{s}\nUnresolved file threads: {s}\nPerform the review now; report findings, risk, proposed inline comments, and suspicions. Do not invoke GitHub tools, mark viewed, edit source, or act during this initial turn. Wait for the human.", .{ path, base_oid, head_oid, diff, threads_json });
+        const file_thread_id = try extractString(self.allocator, response, &.{ "thread", "id" });
+        defer self.allocator.free(file_thread_id);
+        const file_role = try readReference(self.allocator, io, skill_path, "file-review.md");
+        defer self.allocator.free(file_role);
+        const actions = try readReference(self.allocator, io, skill_path, "github-actions.md");
+        defer self.allocator.free(actions);
+        const untrusted = try readReference(self.allocator, io, skill_path, "untrusted-repository-content.md");
+        defer self.allocator.free(untrusted);
+        const prompt = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}\n\n{s}\n\nAssigned path: {s}\nRevision: {s}\nBase: {s}\nHead: {s}\nServer-computed canonical diff:\n{s}\nComplete unresolved assigned-file thread evidence:\n{s}\nPerform the review now; report findings, risk, proposed inline comments, and suspicions. Do not invoke a GitHub action tool during this initial review. Do not mark viewed or edit source. Wait for the human.", .{ file_role, actions, untrusted, path, revision, base_oid, head_oid, diff, threads_json });
         defer self.allocator.free(prompt);
-        const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"cwd\":{f},\"input\":[{{\"type\":\"skill\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(self.file_thread_id.?, .{}), std.json.fmt(cwd, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
+        const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"cwd\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(file_thread_id, .{}), std.json.fmt(cwd, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
         defer self.allocator.free(turn_params);
         const turn = try actor.requestJson("turn/start", turn_params, null);
         defer self.allocator.free(turn);
-        if (self.file_turn_id) |old| self.allocator.free(old);
-        self.file_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        const file_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        defer self.allocator.free(file_turn_id);
         self.mutex.lock();
         defer self.mutex.unlock();
         const session_id = try std.fmt.allocPrint(self.allocator, "ses-{d}", .{self.next_session_id});
         self.next_session_id += 1;
-        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = try self.allocator.dupe(u8, self.file_thread_id.?), .turn_id = try self.allocator.dupe(u8, self.file_turn_id.?), .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, revision) });
+        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = try self.allocator.dupe(u8, file_thread_id), .turn_id = try self.allocator.dupe(u8, file_turn_id), .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, revision) });
         return .{ .reused = false, .session_id = try self.allocator.dupe(u8, session_id), .allocator = self.allocator };
     }
 
@@ -320,6 +349,11 @@ pub const Registry = struct {
         self.notification_count += 1;
         if (visibleMethod(notification.method) and self.visible_events.items.len < max_visible_events) {
             const session_id = self.sessionForNotificationLocked(notification.raw_json) catch null;
+            if (session_id == null) {
+                self.mutex.unlock();
+                if (std.mem.eql(u8, notification.method, "turn/completed")) self.recordPrimaryCompletion(notification.raw_json);
+                return;
+            }
             self.visible_events.append(self.allocator, .{ .session_id = session_id, .method = self.allocator.dupe(u8, notification.method) catch {
                 self.mutex.unlock();
                 return;
@@ -341,8 +375,12 @@ pub const Registry = struct {
         }
         self.mutex.unlock();
         if (!std.mem.eql(u8, notification.method, "turn/completed")) return;
-        const turn_id = extractString(self.allocator, notification.raw_json, &.{ "params", "turn", "id" }) catch return;
-        const thread_id = extractString(self.allocator, notification.raw_json, &.{ "params", "threadId" }) catch {
+        self.recordPrimaryCompletion(notification.raw_json);
+    }
+
+    fn recordPrimaryCompletion(self: *Registry, raw_json: []const u8) void {
+        const turn_id = extractString(self.allocator, raw_json, &.{ "params", "turn", "id" }) catch return;
+        const thread_id = extractString(self.allocator, raw_json, &.{ "params", "threadId" }) catch {
             self.allocator.free(turn_id);
             return;
         };
@@ -368,6 +406,7 @@ pub const Registry = struct {
         const self: *Registry = @ptrCast(@alignCast(context));
         if (std.mem.eql(u8, request.method, "item/fileChange/requestApproval")) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
         if (std.mem.eql(u8, request.method, "item/tool/call")) {
+            if (std.mem.indexOf(u8, request.raw_json, "search_unresolved_threads") != null) return self.searchThreads(request.raw_json, allocator);
             const kind: ?[]const u8 = if (std.mem.indexOf(u8, request.raw_json, "prepare_github_action") != null) "action.prepared" else if (std.mem.indexOf(u8, request.raw_json, "complete_file_review") != null) "file.complete.requested" else if (std.mem.indexOf(u8, request.raw_json, "close_session") != null) "session.close.requested" else null;
             if (kind) |event_kind| {
                 const origin_thread = extractString(self.allocator, request.raw_json, &.{ "params", "threadId" }) catch return allocator.dupe(u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"missing originating thread\"}],\"success\":false}");
@@ -387,6 +426,31 @@ pub const Registry = struct {
         return allocator.dupe(u8, "{\"decision\":\"decline\"}");
     }
 
+    fn searchThreads(self: *Registry, raw: []const u8, allocator: std.mem.Allocator) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params") orelse return error.MalformedToolCall;
+        const thread_id = params.object.get("threadId") orelse return error.MalformedToolCall;
+        var assigned: ?[]const u8 = null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const generation = if (self.evidence) |*value| value else return allocator.dupe(u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"current PR evidence unavailable\"}],\"success\":false}");
+        for (self.sessions.items) |session| if (std.mem.eql(u8, session.thread_id, thread_id.string)) {
+            assigned = session.path;
+            break;
+        };
+        const assigned_path = assigned orelse return error.UnknownSession;
+        const args = params.object.get("arguments") orelse return error.MalformedToolCall;
+        const query: ?[]const u8 = if (args == .object and args.object.get("query") != null and args.object.get("query").? == .string) args.object.get("query").?.string else null;
+        const whole = args == .object and args.object.get("includeWholePullRequest") != null and args.object.get("includeWholePullRequest").? == .bool and args.object.get("includeWholePullRequest").?.bool;
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer paths.deinit(allocator);
+        if (args == .object) if (args.object.get("paths")) |value| if (value == .array) for (value.array.items) |path| if (path == .string) try paths.append(allocator, path.string);
+        const evidence = try generation.unresolvedThreadsJsonAlloc(allocator, assigned_path, query, paths.items, whole);
+        defer allocator.free(evidence);
+        return std.fmt.allocPrint(allocator, "{{\"contentItems\":[{{\"type\":\"inputText\",\"text\":{f}}}],\"success\":true}}", .{std.json.fmt(evidence, .{})});
+    }
+
     fn extractString(allocator: std.mem.Allocator, raw: []const u8, path: []const []const u8) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
@@ -401,6 +465,13 @@ pub const Registry = struct {
         };
     }
 };
+
+fn readReference(allocator: std.mem.Allocator, io: std.Io, skill_path: []const u8, name: []const u8) ![]u8 {
+    const root = std.fs.path.dirname(skill_path) orelse return error.InvalidSkillPath;
+    const path = try std.fs.path.join(allocator, &.{ root, "references", name });
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+}
 
 fn visibleMethod(method: []const u8) bool {
     return std.mem.startsWith(u8, method, "turn/") or std.mem.startsWith(u8, method, "item/") or std.mem.indexOf(u8, method, "delta") != null;
@@ -448,6 +519,10 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 test "file selection remains gated without completed primary" {
     const registry = Registry{ .allocator = std.testing.allocator };
     try std.testing.expect(registry.latest_primary_turn_id == null);
+}
+
+test "session context dynamic tool namespace exposes the exact authoritative surface" {
+    inline for (.{ "search_unresolved_threads", "prepare_github_action", "complete_file_review", "close_session", "\"required\":[\"slot\",\"kind\",\"effectSummary\",\"payload\"]" }) |needle| try std.testing.expect(std.mem.indexOf(u8, dynamic_tools_json, needle) != null);
 }
 
 test "turn start response alone never opens primary gate" {

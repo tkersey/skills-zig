@@ -157,6 +157,13 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer allocator.free(gh_resolved);
     const codex_resolved = try @import("cas_runtime").resolveExecutableAlloc(allocator, codex_path);
     defer allocator.free(codex_resolved);
+    const schema_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "codex-schema" });
+    defer allocator.free(schema_dir);
+    if (try config.codexSchemaProblemAlloc(allocator, io, codex_resolved, schema_dir)) |problem| {
+        defer allocator.free(problem);
+        try writeLaunchProblem(allocator, io, runtime_root, launch_id, problem);
+        return error.CodexSchemaIncompatible;
+    }
     if (options.pr == null or !std.mem.startsWith(u8, options.pr.?, "https://")) try requireGhAuthentication(allocator, io, gh_resolved, "github.com");
     const selector_url = try resolveSelectorUrl(allocator, io, gh_resolved, options.cwd, options.pr);
     defer allocator.free(selector_url);
@@ -171,10 +178,18 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer allocator.free(snapshot_base);
     const pull_request_id = try snapshotField(allocator, pages.files.items[0], "id");
     defer allocator.free(pull_request_id);
+    const title = try snapshotField(allocator, pages.files.items[0], "title");
+    defer allocator.free(title);
+    const body = try snapshotOptionalTextField(allocator, pages.files.items[0], "body");
+    defer allocator.free(body);
+    const base_ref = try snapshotField(allocator, pages.files.items[0], "baseRefName");
+    defer allocator.free(base_ref);
+    const head_ref = try snapshotField(allocator, pages.files.items[0], "headRefName");
+    defer allocator.free(head_ref);
     var generation = try domain.PrGeneration.initFull(allocator, snapshot_base, snapshot_head);
     errdefer generation.deinit();
     for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
-    for (pages.threads.items) |page| try loadThreads(allocator, page, &generation);
+    for (pages.threads.items) |page| try github.loadThreads(allocator, page, &generation);
 
     const managed_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "worktree" });
     defer allocator.free(managed_path);
@@ -188,7 +203,12 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
 
     var registry = try sessions.Registry.start(allocator, io, review_cwd, codex_resolved);
     defer registry.deinit();
-    try registry.createPrimary(review_cwd);
+    try registry.setGenerationEvidence(&state.generation);
+    const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
+    defer allocator.free(skill_path);
+    const pr_context = try primaryContextAlloc(allocator, identity.owner, identity.repository, identity.number, title, body, base_ref, snapshot_base, head_ref, snapshot_head, &state.generation);
+    defer allocator.free(pr_context);
+    try registry.createPrimary(io, review_cwd, skill_path, pr_context);
     state.primary_ready = registry.primaryReady();
     var server = try http.Server.bind(allocator, io, options.skill_root);
     defer server.deinit();
@@ -205,8 +225,6 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     const ready_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "ready.json" });
     defer allocator.free(ready_path);
     try writeOperationalFile(allocator, io, ready_path, receipt);
-    const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
-    defer allocator.free(skill_path);
     var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .launch_id = launch_id };
     while (!runtime.stop_requested) {
         state.primary_ready = registry.primaryReady();
@@ -359,9 +377,27 @@ fn writeOperationalFile(allocator: std.mem.Allocator, io: std.Io, path: []const 
 fn writeLaunchError(allocator: std.mem.Allocator, io: std.Io, runtime_root: []const u8, launch_id: []const u8, err: anyerror) !void {
     const path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "error.json" });
     defer allocator.free(path);
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
     const receipt = try std.fmt.allocPrint(allocator, "{{\"schema\":\"synoptic-launch-error/v1\",\"status\":\"blocked\",\"reason\":{f},\"remediation\":{f}}}", .{ std.json.fmt(@errorName(err), .{}), std.json.fmt(launchRemediation(err), .{}) });
     defer allocator.free(receipt);
     try writeOperationalFile(allocator, io, path, receipt);
+}
+
+fn writeLaunchProblem(allocator: std.mem.Allocator, io: std.Io, runtime_root: []const u8, launch_id: []const u8, reason: []const u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "error.json" });
+    defer allocator.free(path);
+    const receipt = try std.fmt.allocPrint(allocator, "{{\"schema\":\"synoptic-launch-error/v1\",\"status\":\"blocked\",\"reason\":{f},\"remediation\":\"Install a Codex version providing every named app-server surface.\"}}", .{std.json.fmt(reason, .{})});
+    defer allocator.free(receipt);
+    try writeOperationalFile(allocator, io, path, receipt);
+}
+
+fn primaryContextAlloc(allocator: std.mem.Allocator, owner: []const u8, repo: []const u8, number: u64, title: []const u8, body: []const u8, base_ref: []const u8, base_oid: []const u8, head_ref: []const u8, head_oid: []const u8, generation: *const domain.PrGeneration) ![]u8 {
+    var files: std.Io.Writer.Allocating = .init(allocator);
+    defer files.deinit();
+    try std.json.Stringify.value(generation.files.items, .{}, &files.writer);
+    const repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+    defer allocator.free(repository);
+    return std.fmt.allocPrint(allocator, "{{\"repository\":{f},\"pullRequest\":{d},\"title\":{f},\"body\":{f},\"baseRefName\":{f},\"baseRefOid\":{f},\"headRefName\":{f},\"headRefOid\":{f},\"files\":{s}}}", .{ std.json.fmt(repository, .{}), number, std.json.fmt(title, .{}), std.json.fmt(body, .{}), std.json.fmt(base_ref, .{}), std.json.fmt(base_oid, .{}), std.json.fmt(head_ref, .{}), std.json.fmt(head_oid, .{}), files.written() });
 }
 
 fn launchRemediation(err: anyerror) []const u8 {
@@ -416,6 +452,12 @@ fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u
     defer parsed.deinit();
     return allocator.dupe(u8, (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object.get(field).?.string);
 }
+fn snapshotOptionalTextField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const value = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object.get(field) orelse return error.InvalidSnapshot;
+    return allocator.dupe(u8, if (value == .null) "" else value.string);
+}
 fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -431,18 +473,6 @@ fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: 
         try generation.addFile(.{ .path = path, .additions = @intCast(o.get("additions").?.integer), .deletions = @intCast(o.get("deletions").?.integer), .change_type = change_type, .viewed = if (std.mem.eql(u8, state, "VIEWED")) .viewed else if (std.mem.eql(u8, state, "DISMISSED")) .dismissed else .unviewed, .revision_key = revision });
     }
 }
-fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const pull = (((parsed.value.object.get("data").?).object.get("repository").?).object.get("pullRequest").?).object;
-    for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |node| {
-        const o = node.object;
-        if (o.get("isResolved").?.bool) continue;
-        const line: ?u32 = if (o.get("line").? == .null) null else @intCast(o.get("line").?.integer);
-        try generation.addThread(.{ .id = o.get("id").?.string, .path = o.get("path").?.string, .line = line, .outdated = o.get("isOutdated").?.bool });
-    }
-}
-
 fn resolveSelectorUrl(allocator: std.mem.Allocator, io: std.Io, gh_path: []const u8, cwd: []const u8, selector: ?[]const u8) ![]u8 {
     if (selector) |value| if (std.mem.startsWith(u8, value, "https://github.com/")) return allocator.dupe(u8, value);
     const argv: []const []const u8 = if (selector) |value| &.{ gh_path, "pr", "view", value, "--json", "url", "--jq", ".url" } else &.{ gh_path, "pr", "view", "--json", "url", "--jq", ".url" };
