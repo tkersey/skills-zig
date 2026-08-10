@@ -5,6 +5,13 @@ pub const RequestHandle = struct {
     id: i64,
 };
 
+pub const TerminalState = enum {
+    running,
+    poisoned,
+    disconnected,
+    stopped,
+};
+
 /// Borrowed notification envelope delivered by the app-server read loop.
 pub const Notification = struct {
     method: []const u8,
@@ -22,6 +29,24 @@ pub const ServerRequest = struct {
     id: RequestId,
     method: []const u8,
     raw_json: []const u8,
+};
+
+/// A handler returns an owned exact JSON result. The actor serializes the
+/// matching JSON-RPC response and frees the returned bytes after enqueueing.
+pub const ServerRequestHandler = struct {
+    context: *anyopaque,
+    handle: *const fn (
+        context: *anyopaque,
+        request: ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8,
+};
+
+/// Notification callbacks are invoked serially by the permanent reader. The
+/// envelope is borrowed only for the duration of the callback.
+pub const NotificationHandler = struct {
+    context: *anyopaque,
+    handle: *const fn (context: *anyopaque, notification: Notification) void,
 };
 
 test "protocol carriers preserve correlation and raw envelopes" {
@@ -42,4 +67,5 @@ test "protocol carriers preserve correlation and raw envelopes" {
         "item/commandExecution/requestApproval",
         request.method,
     );
+    try std.testing.expectEqual(TerminalState.running, .running);
 }

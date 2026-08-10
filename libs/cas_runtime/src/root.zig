@@ -6,9 +6,14 @@ pub const websocket = @import("websocket.zig");
 
 pub const ManagedServer = managed_server.ManagedServer;
 pub const Client = client.Client;
+pub const Actor = client.Actor;
+pub const ActorOptions = client.ActorOptions;
 pub const Notification = protocol.Notification;
 pub const ServerRequest = protocol.ServerRequest;
 pub const RequestHandle = protocol.RequestHandle;
+pub const NotificationHandler = protocol.NotificationHandler;
+pub const ServerRequestHandler = protocol.ServerRequestHandler;
+pub const TerminalState = protocol.TerminalState;
 
 pub const hooks = client.hooks;
 pub const app_server_launch = client.app_server_launch;
@@ -43,6 +48,8 @@ pub const intField = client.intField;
 
 test {
     _ = Client;
+    _ = Actor;
+    _ = ActorOptions;
     _ = ManagedServer;
     _ = Notification;
     _ = ServerRequest;

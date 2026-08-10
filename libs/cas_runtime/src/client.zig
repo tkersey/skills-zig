@@ -2,6 +2,7 @@ const core_json = @import("core_json");
 pub const hooks = @import("cas_hook_policy");
 pub const app_server_launch = @import("transport.zig");
 const builtin = @import("builtin");
+const protocol = @import("protocol.zig");
 const std = @import("std");
 pub const websocket_transport = @import("websocket.zig");
 
@@ -420,6 +421,17 @@ pub const Client = struct {
         }
 
         return startStdio(allocator, opts, overload_retry_seed);
+    }
+
+    /// Starts the compatibility client, completes initialize/initialized, then
+    /// transfers transport ownership to the permanent-reader actor.
+    pub fn startActor(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        actor_options: ActorOptions,
+    ) !Actor {
+        const synchronous = try Client.start(allocator, opts);
+        return Actor.initOwned(allocator, synchronous, actor_options);
     }
 
     fn startStdio(
@@ -1383,6 +1395,670 @@ pub const Client = struct {
         }
     }
 };
+
+pub const max_actor_outbound_queue: usize = 1024;
+pub const max_actor_subscriptions: usize = 64;
+pub const max_actor_server_request_queue: usize = 128;
+
+pub const ActorOptions = struct {
+    outbound_queue_capacity: usize = 128,
+    server_request_queue_capacity: usize = 32,
+    default_request_timeout_ms: u32 = 30_000,
+    server_request_timeout_ms: u32 = 30_000,
+    overload_retry_policy: OverloadRetryPolicy = .{},
+    overload_retry_seed: ?u64 = null,
+    server_request_handler: ?protocol.ServerRequestHandler = null,
+};
+
+const ActorMutex = struct {
+    state: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *ActorMutex) void {
+        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *ActorMutex) void {
+        self.state.unlock();
+    }
+};
+
+const ActorPending = struct {
+    done: bool = false,
+    is_error: bool = false,
+    response_json: ?[]u8 = null,
+};
+
+const ActorOutbound = struct {
+    payload: []u8,
+};
+
+const ActorServerRequest = struct {
+    id_json: []u8,
+    method: []u8,
+    raw_json: []u8,
+    deadline_ms: i64,
+
+    fn deinit(self: ActorServerRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.id_json);
+        allocator.free(self.method);
+        allocator.free(self.raw_json);
+    }
+};
+
+const ActorState = struct {
+    allocator: std.mem.Allocator,
+    client: Client,
+    mutex: ActorMutex = .{},
+    terminal: protocol.TerminalState = .running,
+    transport_closed: bool = false,
+    outbound: std.ArrayList(ActorOutbound) = .empty,
+    outbound_capacity: usize,
+    server_requests: std.ArrayList(ActorServerRequest) = .empty,
+    server_request_capacity: usize,
+    server_request_timeout_ms: u32,
+    pending: std.AutoHashMap(i64, *ActorPending),
+    subscriptions: std.ArrayList(protocol.NotificationHandler) = .empty,
+    server_request_handler: ?protocol.ServerRequestHandler,
+    next_request_id: i64 = 1,
+    default_request_timeout_ms: u32,
+    overload_retry_policy: OverloadRetryPolicy,
+    overload_retry_seed: u64,
+    reader_thread: ?std.Thread = null,
+    writer_thread: ?std.Thread = null,
+    handler_thread: ?std.Thread = null,
+
+    fn deinit(self: *ActorState) void {
+        for (self.outbound.items) |item| self.allocator.free(item.payload);
+        self.outbound.deinit(self.allocator);
+        for (self.server_requests.items) |item| item.deinit(self.allocator);
+        self.server_requests.deinit(self.allocator);
+        self.pending.deinit();
+        self.subscriptions.deinit(self.allocator);
+        self.client.deinit();
+    }
+};
+
+/// Owner-lived app-server actor. Exactly one reader owns response routing;
+/// callers may issue concurrent requests while the bounded writer queue owns
+/// all transport writes.
+pub const Actor = struct {
+    state: *ActorState,
+
+    fn initOwned(
+        allocator: std.mem.Allocator,
+        synchronous: Client,
+        options: ActorOptions,
+    ) !Actor {
+        var owned_client = synchronous;
+        var client_owned = true;
+        errdefer if (client_owned) {
+            owned_client.close();
+            owned_client.deinit();
+        };
+        if (options.outbound_queue_capacity == 0 or
+            options.outbound_queue_capacity > max_actor_outbound_queue or
+            options.server_request_queue_capacity == 0 or
+            options.server_request_queue_capacity > max_actor_server_request_queue or
+            options.default_request_timeout_ms == 0 or
+            options.server_request_timeout_ms == 0)
+        {
+            return error.InvalidActorOptions;
+        }
+        try validateOverloadRetryPolicy(options.overload_retry_policy);
+        const seed = try resolveOverloadRetrySeed(options.overload_retry_seed, owned_client.io);
+
+        const state = try allocator.create(ActorState);
+        errdefer allocator.destroy(state);
+        state.* = .{
+            .allocator = allocator,
+            .client = owned_client,
+            .outbound_capacity = options.outbound_queue_capacity,
+            .server_request_capacity = options.server_request_queue_capacity,
+            .server_request_timeout_ms = options.server_request_timeout_ms,
+            .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+            .server_request_handler = options.server_request_handler,
+            .default_request_timeout_ms = options.default_request_timeout_ms,
+            .overload_retry_policy = options.overload_retry_policy,
+            .overload_retry_seed = seed,
+        };
+        client_owned = false;
+        // The synchronous client deadline is request-scoped. The actor owns
+        // deadlines per pending request instead of sharing one transport field.
+        state.client.request_deadline_ms = null;
+
+        state.writer_thread = std.Thread.spawn(.{}, actorWriterMain, .{state}) catch |err| {
+            state.client.close();
+            state.deinit();
+            return err;
+        };
+        state.handler_thread = std.Thread.spawn(.{}, actorHandlerMain, .{state}) catch |err| {
+            actorSetTerminal(state, .stopped);
+            actorCloseTransportOnce(state);
+            state.writer_thread.?.join();
+            state.deinit();
+            return err;
+        };
+        state.reader_thread = std.Thread.spawn(.{}, actorReaderMain, .{state}) catch |err| {
+            actorSetTerminal(state, .stopped);
+            actorCloseTransportOnce(state);
+            state.writer_thread.?.join();
+            state.handler_thread.?.join();
+            state.deinit();
+            return err;
+        };
+        return .{ .state = state };
+    }
+
+    pub fn deinit(self: *Actor) void {
+        const state = self.state;
+        actorSetTerminal(state, .stopped);
+        // Closing the underlying transport releases a reader blocked in I/O.
+        actorCloseTransportOnce(state);
+        if (state.writer_thread) |thread| thread.join();
+        if (state.reader_thread) |thread| thread.join();
+        if (state.handler_thread) |thread| thread.join();
+        state.deinit();
+        state.allocator.destroy(state);
+        self.* = undefined;
+    }
+
+    pub fn terminalState(self: *const Actor) protocol.TerminalState {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        return self.state.terminal;
+    }
+
+    pub fn subscribe(
+        self: *Actor,
+        subscription: protocol.NotificationHandler,
+    ) !void {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
+        if (self.state.subscriptions.items.len >= max_actor_subscriptions) {
+            return error.NotificationSubscriptionLimitExceeded;
+        }
+        try self.state.subscriptions.append(self.state.allocator, subscription);
+    }
+
+    pub fn setServerRequestHandler(
+        self: *Actor,
+        handler: ?protocol.ServerRequestHandler,
+    ) !void {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
+        self.state.server_request_handler = handler;
+    }
+
+    pub fn requestJson(
+        self: *Actor,
+        method: []const u8,
+        params_json: ?[]const u8,
+        timeout_ms: ?u32,
+    ) ![]u8 {
+        const budget_ms = timeout_ms orelse self.state.default_request_timeout_ms;
+        if (budget_ms == 0) return error.InvalidRequestDeadline;
+        const deadline = monotonicMillis() + @as(i64, budget_ms);
+        var retry_index: u32 = 0;
+        while (true) {
+            const remaining_ms = deadline - monotonicMillis();
+            if (remaining_ms <= 0) return error.RequestDeadlineExceeded;
+            const response = try self.requestOnce(
+                method,
+                params_json,
+                @intCast(remaining_ms),
+            );
+            if (!response.is_error) return response.json;
+
+            const retryable = actorResponseIsOverload(self.state.allocator, response.json);
+            if (!retryable or retry_index >= self.state.overload_retry_policy.max_retries) {
+                self.state.allocator.free(response.json);
+                return error.RequestFailed;
+            }
+            self.state.allocator.free(response.json);
+            const delay_ms = overloadRetryDelayMs(
+                self.state.overload_retry_policy,
+                retry_index,
+                self.state.overload_retry_seed,
+            );
+            if (@as(i64, delay_ms) >= deadline - monotonicMillis()) {
+                return error.RequestDeadlineExceeded;
+            }
+            try std.Io.sleep(self.state.client.io, .fromMilliseconds(delay_ms), .awake);
+            retry_index += 1;
+        }
+    }
+
+    const Response = struct {
+        json: []u8,
+        is_error: bool,
+    };
+
+    fn requestOnce(
+        self: *Actor,
+        method: []const u8,
+        params_json: ?[]const u8,
+        timeout_ms: u32,
+    ) !Response {
+        if (timeout_ms == 0) return error.InvalidRequestDeadline;
+        const deadline = monotonicMillis() + @as(i64, timeout_ms);
+        var pending: ActorPending = .{};
+
+        self.state.mutex.lock();
+        if (self.state.terminal != .running) {
+            const terminal = self.state.terminal;
+            self.state.mutex.unlock();
+            return actorTerminalError(terminal);
+        }
+        const request_id = self.state.next_request_id;
+        self.state.next_request_id += 1;
+        self.state.pending.put(request_id, &pending) catch |err| {
+            self.state.mutex.unlock();
+            return err;
+        };
+        self.state.mutex.unlock();
+        errdefer {
+            self.state.mutex.lock();
+            _ = self.state.pending.remove(request_id);
+            self.state.mutex.unlock();
+        }
+
+        const payload = try actorRequestPayloadAlloc(
+            self.state.allocator,
+            request_id,
+            method,
+            params_json,
+        );
+        try actorEnqueueOwned(self.state, payload, deadline);
+
+        while (true) {
+            self.state.mutex.lock();
+            if (pending.done) {
+                _ = self.state.pending.remove(request_id);
+                const result = Response{
+                    .json = pending.response_json.?,
+                    .is_error = pending.is_error,
+                };
+                self.state.mutex.unlock();
+                return result;
+            }
+            if (self.state.terminal != .running) {
+                _ = self.state.pending.remove(request_id);
+                const terminal = self.state.terminal;
+                self.state.mutex.unlock();
+                return actorTerminalError(terminal);
+            }
+            if (monotonicMillis() >= deadline) {
+                _ = self.state.pending.remove(request_id);
+                self.state.mutex.unlock();
+                return error.RequestDeadlineExceeded;
+            }
+            self.state.mutex.unlock();
+            try std.Io.sleep(self.state.client.io, .fromMilliseconds(2), .awake);
+        }
+    }
+};
+
+fn actorWriterMain(state: *ActorState) void {
+    while (true) {
+        state.mutex.lock();
+        if (state.terminal != .running and state.outbound.items.len == 0) {
+            state.mutex.unlock();
+            return;
+        }
+        const maybe_item: ?ActorOutbound = if (state.outbound.items.len == 0)
+            null
+        else
+            state.outbound.orderedRemove(0);
+        state.mutex.unlock();
+
+        if (maybe_item) |item| {
+            defer state.allocator.free(item.payload);
+            state.client.sendPayload(item.payload, null) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        } else {
+            std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        }
+    }
+}
+
+fn actorHandlerMain(state: *ActorState) void {
+    while (true) {
+        state.mutex.lock();
+        if (state.terminal != .running) {
+            state.mutex.unlock();
+            return;
+        }
+        const maybe_work: ?ActorServerRequest = if (state.server_requests.items.len == 0)
+            null
+        else
+            state.server_requests.orderedRemove(0);
+        state.mutex.unlock();
+
+        if (maybe_work) |work| {
+            defer work.deinit(state.allocator);
+            actorHandleServerRequest(state, work) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        } else {
+            std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        }
+    }
+}
+
+fn actorReaderMain(state: *ActorState) void {
+    while (true) {
+        state.mutex.lock();
+        const running = state.terminal == .running;
+        state.mutex.unlock();
+        if (!running) return;
+
+        const maybe_line = state.client.readLineAlloc() catch {
+            actorSetTerminal(state, .disconnected);
+            actorCloseTransportOnce(state);
+            return;
+        };
+        const line = maybe_line orelse {
+            actorSetTerminal(state, .disconnected);
+            actorCloseTransportOnce(state);
+            return;
+        };
+        defer state.allocator.free(line);
+        actorRouteLine(state, line) catch {
+            actorSetTerminal(state, .poisoned);
+            actorCloseTransportOnce(state);
+            return;
+        };
+    }
+}
+
+fn actorRouteLine(state: *ActorState, line: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, state.allocator, line, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidAppServerEnvelope,
+    };
+    const method = core_json.stringField(object, "method");
+    const id_value = object.get("id");
+
+    if (method != null and id_value == null) {
+        try actorDispatchNotification(state, method.?, line);
+        return;
+    }
+    if (method != null and id_value != null) {
+        try actorDispatchServerRequest(state, method.?, id_value.?, line);
+        return;
+    }
+
+    const response_id = id_value orelse return error.InvalidAppServerEnvelope;
+    const integer_id = core_json.intFromValue(response_id) orelse
+        return error.InvalidAppServerEnvelope;
+    const response_value = object.get("result") orelse object.get("error") orelse
+        return error.InvalidAppServerEnvelope;
+    const response_json = try core_json.stringifyAlloc(state.allocator, response_value);
+    errdefer state.allocator.free(response_json);
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    const pending = state.pending.get(integer_id) orelse return;
+    pending.response_json = response_json;
+    pending.is_error = object.get("error") != null;
+    pending.done = true;
+}
+
+fn actorDispatchNotification(
+    state: *ActorState,
+    method: []const u8,
+    line: []const u8,
+) !void {
+    state.mutex.lock();
+    const subscriptions = state.allocator.dupe(
+        protocol.NotificationHandler,
+        state.subscriptions.items,
+    ) catch |err| {
+        state.mutex.unlock();
+        return err;
+    };
+    state.mutex.unlock();
+    defer state.allocator.free(subscriptions);
+    const notification = protocol.Notification{ .method = method, .raw_json = line };
+    for (subscriptions) |subscription| subscription.handle(subscription.context, notification);
+}
+
+fn actorDispatchServerRequest(
+    state: *ActorState,
+    method: []const u8,
+    id_value: std.json.Value,
+    line: []const u8,
+) !void {
+    switch (id_value) {
+        .integer, .string => {},
+        else => return error.InvalidAppServerEnvelope,
+    }
+    const deadline_ms = monotonicMillis() + @as(i64, state.server_request_timeout_ms);
+    state.mutex.lock();
+    const handler = state.server_request_handler;
+    const queue_full = state.server_requests.items.len >= state.server_request_capacity;
+    state.mutex.unlock();
+    if (handler == null) return actorEnqueueServerError(
+        state,
+        id_value,
+        -32601,
+        "server request handler unavailable",
+        deadline_ms,
+    );
+    if (queue_full) return actorEnqueueServerError(
+        state,
+        id_value,
+        -32000,
+        "server request queue is full",
+        deadline_ms,
+    );
+
+    var work = ActorServerRequest{
+        .id_json = try core_json.stringifyAlloc(state.allocator, id_value),
+        .method = undefined,
+        .raw_json = undefined,
+        .deadline_ms = deadline_ms,
+    };
+    errdefer state.allocator.free(work.id_json);
+    work.method = try state.allocator.dupe(u8, method);
+    errdefer state.allocator.free(work.method);
+    work.raw_json = try state.allocator.dupe(u8, line);
+    errdefer state.allocator.free(work.raw_json);
+
+    state.mutex.lock();
+    if (state.terminal != .running) {
+        const terminal = state.terminal;
+        state.mutex.unlock();
+        return actorTerminalError(terminal);
+    }
+    state.server_requests.append(state.allocator, work) catch |err| {
+        state.mutex.unlock();
+        return err;
+    };
+    state.mutex.unlock();
+}
+
+fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void {
+    var parsed_id = try std.json.parseFromSlice(
+        std.json.Value,
+        state.allocator,
+        work.id_json,
+        .{},
+    );
+    defer parsed_id.deinit();
+    const request_id: protocol.RequestId = switch (parsed_id.value) {
+        .integer => |value| .{ .integer = value },
+        .string => |value| .{ .string = value },
+        else => return error.InvalidAppServerEnvelope,
+    };
+    state.mutex.lock();
+    const handler = state.server_request_handler;
+    state.mutex.unlock();
+    const configured = handler orelse return actorEnqueueServerError(
+        state,
+        parsed_id.value,
+        -32601,
+        "server request handler unavailable",
+        work.deadline_ms,
+    );
+    const request = protocol.ServerRequest{
+        .id = request_id,
+        .method = work.method,
+        .raw_json = work.raw_json,
+    };
+    const result_json = configured.handle(configured.context, request, state.allocator) catch
+        return actorEnqueueServerError(
+            state,
+            parsed_id.value,
+            -32603,
+            "server request handler failed",
+            work.deadline_ms,
+        );
+    defer state.allocator.free(result_json);
+    const payload = try actorServerResultPayloadAlloc(
+        state.allocator,
+        parsed_id.value,
+        result_json,
+    );
+    try actorEnqueueOwned(state, payload, work.deadline_ms);
+}
+
+fn actorEnqueueServerError(
+    state: *ActorState,
+    id_value: std.json.Value,
+    code: i64,
+    message: []const u8,
+    deadline_ms: i64,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(state.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"id\":");
+    try std.json.Stringify.value(id_value, .{}, &output.writer);
+    try output.writer.writeAll(",\"error\":{\"code\":");
+    try std.json.Stringify.value(code, .{}, &output.writer);
+    try output.writer.writeAll(",\"message\":");
+    try std.json.Stringify.value(message, .{}, &output.writer);
+    try output.writer.writeAll("}}");
+    try actorEnqueueOwned(
+        state,
+        try state.allocator.dupe(u8, output.written()),
+        deadline_ms,
+    );
+}
+
+fn actorServerResultPayloadAlloc(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    result_json: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"id\":");
+    try std.json.Stringify.value(id_value, .{}, &output.writer);
+    try output.writer.writeAll(",\"result\":");
+    try output.writer.writeAll(result_json);
+    try output.writer.writeByte('}');
+    return allocator.dupe(u8, output.written());
+}
+
+fn actorRequestPayloadAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    method: []const u8,
+    params_json: ?[]const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"method\":");
+    try std.json.Stringify.value(method, .{}, &output.writer);
+    try output.writer.writeAll(",\"id\":");
+    try std.json.Stringify.value(id, .{}, &output.writer);
+    if (params_json) |raw| {
+        if (raw.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try output.writer.writeAll(",\"params\":");
+        try std.json.Stringify.value(parsed.value, .{}, &output.writer);
+    }
+    try output.writer.writeByte('}');
+    return allocator.dupe(u8, output.written());
+}
+
+fn actorEnqueueOwned(state: *ActorState, payload: []u8, deadline_ms: i64) !void {
+    const owned = payload;
+    errdefer state.allocator.free(owned);
+    while (true) {
+        state.mutex.lock();
+        if (state.terminal != .running) {
+            const terminal = state.terminal;
+            state.mutex.unlock();
+            return actorTerminalError(terminal);
+        }
+        if (monotonicMillis() >= deadline_ms) {
+            state.mutex.unlock();
+            return error.RequestDeadlineExceeded;
+        }
+        if (state.outbound.items.len < state.outbound_capacity) {
+            state.outbound.append(state.allocator, .{ .payload = owned }) catch |err| {
+                state.mutex.unlock();
+                return err;
+            };
+            state.mutex.unlock();
+            return;
+        }
+        state.mutex.unlock();
+        try std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake);
+    }
+}
+
+fn actorSetTerminal(state: *ActorState, terminal: protocol.TerminalState) void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (state.terminal == .running) state.terminal = terminal;
+}
+
+fn actorCloseTransportOnce(state: *ActorState) void {
+    state.mutex.lock();
+    if (state.transport_closed) {
+        state.mutex.unlock();
+        return;
+    }
+    state.transport_closed = true;
+    state.mutex.unlock();
+    state.client.close();
+}
+
+fn actorTerminalError(terminal: protocol.TerminalState) anyerror {
+    return switch (terminal) {
+        .running => error.ActorNotTerminal,
+        .poisoned => error.ActorPoisoned,
+        .disconnected => error.ActorDisconnected,
+        .stopped => error.ActorStopped,
+    };
+}
+
+fn actorResponseIsOverload(allocator: std.mem.Allocator, raw: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    return isStructuredOverloadError(parsed.value);
+}
 
 fn retireStdioChild(
     io: std.Io,
@@ -2877,6 +3553,357 @@ test "overload retry policy validation and deterministic jitter are bounded" {
     }
     try std.testing.expect(saw_distinct_default);
     try std.testing.expectEqual(@as(u64, 42), try resolveOverloadRetrySeed(42, std.testing.io));
+}
+
+fn actorFakeCodexScriptAlloc(
+    allocator: std.mem.Allocator,
+    mode: []const u8,
+    reply_log_path: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.print(
+        "#!/bin/sh\nset -eu\nmode='{s}'\nreply_log='{s}'\n",
+        .{ mode, reply_log_path },
+    );
+    try writer.writer.writeAll(
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
+        \\    *'"method":"initialized"'*) break ;;
+        \\  esac
+        \\done
+        \\if [ "$mode" = concurrent ]; then
+        \\  IFS= read -r first
+        \\  IFS= read -r second
+        \\  first_id=$(printf '%s\n' "$first" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  second_id=$(printf '%s\n' "$second" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  first_method=$(printf '%s\n' "$first" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+        \\  second_method=$(printf '%s\n' "$second" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+        \\  printf '{"id":%s,"result":{"method":"%s"}}\n' "$second_id" "$second_method"
+        \\  printf '%s\n' '{"method":"turn/started","params":{}}'
+        \\  printf '{"id":%s,"result":{"method":"%s"}}\n' "$first_id" "$first_method"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
+        \\if [ "$mode" = nested_server_request ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"id":"tool-nested","method":"item/tool/call","params":{"tool":"nested"}}'
+        \\  IFS= read -r nested
+        \\  nested_id=$(printf '%s\n' "$nested" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '{"id":%s,"result":{"nested":true}}\n' "$nested_id"
+        \\  IFS= read -r reply
+        \\  printf '%s\n' "$reply" > "$reply_log"
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
+        \\if [ "$mode" = server_request ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"id":"tool-1","method":"item/tool/call","params":{"tool":"synoptic"}}'
+        \\  IFS= read -r reply
+        \\  printf '%s\n' "$reply" > "$reply_log"
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
+        \\attempt=0
+        \\while IFS= read -r request; do
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  if [ "$mode" = poison ]; then printf '%s\n' 'not-json'; sleep 5; exit 0; fi
+        \\  if [ "$mode" = deadline ]; then sleep 5; exit 0; fi
+        \\  attempt=$((attempt + 1))
+        \\  if [ "$attempt" -lt 3 ]; then
+        \\    printf '{"id":%s,"error":{"code":-32001,"message":"overloaded"}}\n' "$request_id"
+        \\  else
+        \\    printf '{"id":%s,"result":{"attempt":%s}}\n' "$request_id" "$attempt"
+        \\  fi
+        \\done
+        \\
+    );
+    return writer.toOwnedSlice();
+}
+
+const ActorFixture = struct {
+    allocator: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    root: [:0]u8,
+    executable: []u8,
+    reply_log: []u8,
+
+    fn init(allocator: std.mem.Allocator, mode: []const u8) !ActorFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const io = std.testing.io;
+        const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        errdefer allocator.free(root);
+        const executable = try std.fs.path.join(allocator, &.{ root, "actor-codex" });
+        errdefer allocator.free(executable);
+        const reply_log = try std.fs.path.join(allocator, &.{ root, "reply.json" });
+        errdefer allocator.free(reply_log);
+        const script = try actorFakeCodexScriptAlloc(allocator, mode, reply_log);
+        defer allocator.free(script);
+        try tmp.dir.writeFile(io, .{ .sub_path = "actor-codex", .data = script });
+        try std.Io.Dir.cwd().setFilePermissions(
+            io,
+            executable,
+            std.Io.File.Permissions.fromMode(0o755),
+            .{},
+        );
+        return .{
+            .allocator = allocator,
+            .tmp = tmp,
+            .root = root,
+            .executable = executable,
+            .reply_log = reply_log,
+        };
+    }
+
+    fn deinit(self: *ActorFixture) void {
+        self.allocator.free(self.reply_log);
+        self.allocator.free(self.executable);
+        self.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+
+    fn start(self: *ActorFixture, options: ActorOptions) !Actor {
+        return Client.startActor(self.allocator, .{
+            .cwd = self.root,
+            .io = std.testing.io,
+            .codex_path = self.executable,
+        }, options);
+    }
+};
+
+const ActorCall = struct {
+    actor: *Actor,
+    method: []const u8,
+    result: ?[]u8 = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *ActorCall) void {
+        self.result = self.actor.requestJson(self.method, "{}", 2_000) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+const NotificationProbe = struct {
+    mutex: ActorMutex = .{},
+    count: usize = 0,
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *NotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.count += 1;
+    }
+};
+
+const ServerRequestProbe = struct {
+    calls: usize = 0,
+
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        const self: *ServerRequestProbe = @ptrCast(@alignCast(context));
+        try std.testing.expectEqualStrings("item/tool/call", request.method);
+        self.calls += 1;
+        return allocator.dupe(u8, "{\"handled\":true}");
+    }
+};
+
+const NestedServerRequestProbe = struct {
+    actor: *Actor,
+    nested_completed: bool = false,
+
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        const self: *NestedServerRequestProbe = @ptrCast(@alignCast(context));
+        try std.testing.expectEqualStrings("item/tool/call", request.method);
+        const nested = try self.actor.requestJson("actor/nested", "{}", 2_000);
+        defer allocator.free(nested);
+        try std.testing.expect(std.mem.indexOf(u8, nested, "\"nested\":true") != null);
+        self.nested_completed = true;
+        return allocator.dupe(u8, "{\"handled\":\"nested\"}");
+    }
+};
+
+test "actor falsifier permanent reader correlates concurrent reversed responses and notifications" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "concurrent");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{ .outbound_queue_capacity = 2 });
+    defer actor.deinit();
+    var notifications = NotificationProbe{};
+    try actor.subscribe(.{ .context = &notifications, .handle = NotificationProbe.observe });
+
+    var first = ActorCall{ .actor = &actor, .method = "actor/first" };
+    var second = ActorCall{ .actor = &actor, .method = "actor/second" };
+    const first_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(second.failure == null);
+    defer allocator.free(first.result.?);
+    defer allocator.free(second.result.?);
+    try std.testing.expect(std.mem.indexOf(u8, first.result.?, "actor/first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.result.?, "actor/second") != null);
+    notifications.mutex.lock();
+    defer notifications.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), notifications.count);
+}
+
+test "actor falsifier dispatches server requests through configured handler and bounded writer" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "server_request");
+    defer fixture.deinit();
+    var probe = ServerRequestProbe{};
+    var actor = try fixture.start(.{
+        .outbound_queue_capacity = 1,
+        .server_request_handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
+    });
+    defer actor.deinit();
+    const result = try actor.requestJson("actor/server-request", "{}", 2_000);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const reply = try fixture.tmp.dir.readFileAlloc(
+        std.testing.io,
+        "reply.json",
+        allocator,
+        .limited(4 * 1024),
+    );
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":true") != null);
+}
+
+test "actor falsifier nested request in server handler cannot deadlock permanent reader" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "nested_server_request");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{
+        .outbound_queue_capacity = 2,
+        .server_request_queue_capacity = 1,
+    });
+    defer actor.deinit();
+    var probe = NestedServerRequestProbe{ .actor = &actor };
+    try actor.setServerRequestHandler(.{
+        .context = &probe,
+        .handle = NestedServerRequestProbe.handle,
+    });
+    const result = try actor.requestJson("actor/original", "{}", 3_000);
+    defer allocator.free(result);
+    try std.testing.expect(probe.nested_completed);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    const reply = try fixture.tmp.dir.readFileAlloc(
+        std.testing.io,
+        "reply.json",
+        allocator,
+        .limited(4 * 1024),
+    );
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-nested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":\"nested\"") != null);
+}
+
+test "actor falsifier retries only structured overload and honors per-request deadline" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var overload_fixture = try ActorFixture.init(allocator, "overload");
+    defer overload_fixture.deinit();
+    var overload_actor = try overload_fixture.start(.{
+        .overload_retry_policy = .{
+            .max_retries = 2,
+            .base_delay_ms = 1,
+            .max_delay_ms = 2,
+            .jitter_percent = 0,
+        },
+        .overload_retry_seed = 7,
+    });
+    defer overload_actor.deinit();
+    const result = try overload_actor.requestJson("actor/overload", null, 2_000);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"attempt\":3") != null);
+
+    var deadline_fixture = try ActorFixture.init(allocator, "deadline");
+    defer deadline_fixture.deinit();
+    var deadline_actor = try deadline_fixture.start(.{});
+    defer deadline_actor.deinit();
+    try std.testing.expectError(
+        error.RequestDeadlineExceeded,
+        deadline_actor.requestJson("actor/deadline", null, 20),
+    );
+}
+
+test "actor falsifier malformed envelope poisons instead of losing correlation" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "poison");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+    defer actor.deinit();
+    try std.testing.expectError(
+        error.ActorPoisoned,
+        actor.requestJson("actor/poison", null, 2_000),
+    );
+    try std.testing.expectEqual(protocol.TerminalState.poisoned, actor.terminalState());
+}
+
+test "actor falsifier rejects zero and unbounded queues before ownership transfer" {
+    var client = serverRequestTestClient();
+    try std.testing.expectError(
+        error.InvalidActorOptions,
+        Actor.initOwned(std.testing.allocator, client, .{ .outbound_queue_capacity = 0 }),
+    );
+    client = serverRequestTestClient();
+    try std.testing.expectError(
+        error.InvalidActorOptions,
+        Actor.initOwned(std.testing.allocator, client, .{
+            .outbound_queue_capacity = max_actor_outbound_queue + 1,
+        }),
+    );
+}
+
+test "actor falsifier saturated stalled writer consumes the request deadline" {
+    const allocator = std.testing.allocator;
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    try state.outbound.append(allocator, .{
+        .payload = try allocator.dupe(u8, "stalled"),
+    });
+    var actor = Actor{ .state = &state };
+    const started = monotonicMillis();
+    try std.testing.expectError(
+        error.RequestDeadlineExceeded,
+        actor.requestJson("actor/blocked", null, 20),
+    );
+    try std.testing.expect(monotonicMillis() - started < 500);
+    try std.testing.expectEqual(@as(usize, 0), state.pending.count());
 }
 
 test "transport acquisition helpers require an already resolved retry seed" {

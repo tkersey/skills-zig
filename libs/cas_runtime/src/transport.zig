@@ -1,3 +1,9 @@
+//! Canonical launch and endpoint policy for reusable app-server consumers.
+//!
+//! The legacy CAS source remains a compatibility mirror until its owning
+//! module can migrate in a separately authorized operation. Keep behavioral
+//! changes centralized here and prove the mirror against the CAS suite.
+
 const std = @import("std");
 
 pub const max_endpoint_bytes: usize = 4 * 1024;

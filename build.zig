@@ -691,6 +691,16 @@ pub fn build(b: *std.Build) void {
         "Run reusable CAS app-server runtime tests",
         .{ .link_libc = true },
     );
+    const run_cas_runtime_falsifier_tests = addTestStepWithOptions(
+        b,
+        cas_runtime_root,
+        "test-cas-runtime-falsifiers",
+        "Run CAS runtime actor falsifier tests",
+        .{
+            .link_libc = true,
+            .filters = &.{"actor falsifier"},
+        },
+    );
     const run_cas_transport_tests = addTestStepWithOptions(
         b,
         cas_transport_tests_root,
@@ -749,6 +759,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_runtime_tests.step);
+    test_cas.dependOn(&run_cas_runtime_falsifier_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
     test_cas.dependOn(&run_cas_transport_tests.step);
     test_cas.dependOn(&run_cas_app_server_contract_tests.step);
