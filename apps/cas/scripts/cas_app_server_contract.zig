@@ -2255,6 +2255,23 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
         .bool => |value| value,
         else => return false,
     };
+    var keys = schema_object.iterator();
+    while (keys.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const allowed = std.mem.eql(u8, name, "$ref") or
+            std.mem.eql(u8, name, "anyOf") or
+            std.mem.eql(u8, name, "oneOf") or
+            std.mem.eql(u8, name, "allOf") or
+            std.mem.eql(u8, name, "title") or
+            std.mem.eql(u8, name, "description") or
+            std.mem.eql(u8, name, "default") or
+            std.mem.eql(u8, name, "examples") or
+            std.mem.eql(u8, name, "$comment") or
+            std.mem.eql(u8, name, "deprecated") or
+            std.mem.eql(u8, name, "readOnly") or
+            std.mem.eql(u8, name, "writeOnly");
+        if (!allowed) return false;
+    }
     var applicator_count: u8 = if (schema_object.get("$ref") != null) 1 else 0;
     for ([_][]const u8{ "anyOf", "oneOf", "allOf" }) |union_name| {
         if (schema_object.get(union_name) != null) applicator_count += 1;
@@ -2326,10 +2343,18 @@ test "reference target matching rejects alternate union branches" {
         .{},
     );
     defer mixed.deinit();
+    var uncounted = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"allOf\":[{\"$ref\":\"#/definitions/Expected\"}],\"not\":{}}",
+        .{},
+    );
+    defer uncounted.deinit();
 
     try std.testing.expect(referenceTargetMatches(selector.value, exact.value));
     try std.testing.expect(!referenceTargetMatches(selector.value, alternate.value));
     try std.testing.expect(!referenceTargetMatches(selector.value, mixed.value));
+    try std.testing.expect(!referenceTargetMatches(selector.value, uncounted.value));
 }
 
 fn documentBytes(bundle: SchemaBundle, name: []const u8) ![]const u8 {
