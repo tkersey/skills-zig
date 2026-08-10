@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note img)
+apps=(seq lift cas synoptic ledger memory-note img)
 
 resolve_ref() {
   local ref=$1
@@ -53,6 +53,11 @@ case "$mode" in
     mark_trace_consumers() {
       mark_app seq
       mark_app cas
+    }
+
+    mark_cas_runtime_consumers() {
+      mark_app cas
+      mark_app synoptic
     }
 
     mark_store_consumers() {
@@ -118,6 +123,10 @@ case "$mode" in
         mark_app cas
         matched=0
       fi
+      if grep -Eqi '(^|[^[:alnum:]_])synoptic([^[:alnum:]_]|$)|synoptic[_\.]' <<<"$raw"; then
+        mark_app synoptic
+        matched=0
+      fi
       if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
         mark_ledger
         matched=0
@@ -127,7 +136,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.\{ \.(link_libc|sqlite) = true \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
@@ -151,6 +160,9 @@ case "$mode" in
           ;;
         libs/trace_core/*)
           mark_trace_consumers
+          ;;
+        libs/cas_runtime/*)
+          mark_cas_runtime_consumers
           ;;
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
@@ -176,6 +188,9 @@ case "$mode" in
         .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
+        .github/workflows/release-synoptic.yml)
+          mark_app synoptic
+          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -190,6 +205,9 @@ case "$mode" in
           for app in "${apps[@]}"; do
             case "$path" in
               "apps/$app/README.md")
+                if [[ "$app" == synoptic ]]; then
+                  mark_app synoptic
+                fi
                 matched=1
                 ;;
               "apps/$app/"*)

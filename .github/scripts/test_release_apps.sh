@@ -11,7 +11,7 @@ git init -q
 git config user.email test@example.invalid
 git config user.name release-apps-test
 
-apps=(seq lift cas ledger memory-note img)
+apps=(seq lift cas synoptic ledger memory-note img)
 for app in "${apps[@]}"; do
   mkdir -p "apps/$app"
   printf '1.0.0\n' >"apps/$app/VERSION"
@@ -94,6 +94,25 @@ write_trace_core() {
   printf 'trace\n' >libs/trace_core/root.zig
 }
 
+write_cas_runtime() {
+  mkdir -p libs/cas_runtime
+  printf 'runtime\n' >libs/cas_runtime/root.zig
+}
+
+write_synoptic() {
+  mkdir -p apps/synoptic/src
+  printf 'synoptic\n' >apps/synoptic/src/main.zig
+}
+
+write_synoptic_readme() {
+  printf '# Synoptic release contract changed\n' >apps/synoptic/README.md
+}
+
+write_synoptic_release_workflow() {
+  mkdir -p .github/workflows
+  printf 'name: Release synoptic\n' >.github/workflows/release-synoptic.yml
+}
+
 write_store_core() {
   mkdir -p libs/durable_store
   printf 'store\n' >libs/durable_store/root.zig
@@ -132,6 +151,43 @@ write_seq_build() {
 
 write_cas_control_plane_build() {
   printf 'const cas_app_server_preflight = b.addExecutable(.{});\nconst cas_automation_install = b.addInstallArtifact(cas_automation, .{});\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+write_synoptic_cas_runtime_build() {
+  cat >build.zig <<'EOF'
+const img_meta = "apps/img/VERSION";
+const cas_hook_policy_root = b.createModule(.{
+    .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+const cas_runtime_root = b.createModule(.{
+    .root_source_file = b.path("libs/cas_runtime/src/root.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+const synoptic_release_safe_root = b.createModule(.{
+    .root_source_file = b.path("apps/synoptic/src/main.zig"),
+    .target = target,
+    .optimize = .ReleaseSafe,
+});
+const run_cas_runtime_falsifier_tests = addTestStepWithOptions(
+    b,
+    cas_runtime_root,
+    "test-cas-runtime-falsifiers",
+    "Run CAS runtime actor falsifier tests",
+    .{ .link_libc = true, .filters = &.{"actor falsifier"} },
+);
+const run_synoptic_tests = addTestStepWithOptions(
+    b,
+    synoptic_release_safe_root,
+    "test-synoptic-unit",
+    "Run Synoptic tests",
+    .{ .link_libc = true, .filters = &.{"falsifier"} },
+);
+run_synoptic_tests.step.dependOn(&synoptic_install.step);
+pub fn build() void {}
+EOF
 }
 
 write_ledger_build() {
@@ -218,38 +274,45 @@ write_frozen_cas_automation_fixture() {
 }
 
 assert_affected seq write_seq
+assert_affected synoptic write_synoptic
+assert_affected synoptic write_synoptic_readme
 assert_affected ledger write_ledger
 assert_affected cas write_frozen_cas_automation_fixture
 assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
+assert_affected cas,synoptic write_cas_runtime
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq,cas,ledger,memory-note write_jsonl_core
-assert_affected seq,lift,cas,ledger,memory-note,img change_shared_perf_contract
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
 assert_affected cas write_cas_control_plane_build
+assert_affected cas,synoptic write_synoptic_cas_runtime_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected img move_build_line
-assert_affected seq,lift,cas,ledger,memory-note,img write_mixed_seq_unknown_build
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_mixed_seq_unknown_build
 assert_affected seq,cas,ledger write_definition_package_path
 assert_affected ledger write_ledger_package_path
 assert_affected ledger write_learnings_package_path
 assert_affected ledger write_synesthesia_package_path
-assert_affected seq,lift,cas,ledger,memory-note,img write_unknown_package_change
-assert_affected seq,lift,cas,ledger,memory-note,img write_build_only
-assert_affected seq,lift,cas,ledger,memory-note,img write_unknown_app
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_unknown_package_change
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_build_only
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_unknown_app
+assert_affected synoptic write_synoptic_release_workflow
 assert_affected "" write_readme
 assert_affected seq write_durable_store_perf
 assert_ci_affected seq,cas,ledger write_definition_guard
+assert_ci_affected cas,synoptic write_cas_runtime
+assert_ci_affected synoptic write_synoptic
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
-assert_ci_affected seq,lift,cas,ledger,memory-note,img write_ci_helper
+assert_ci_affected seq,lift,cas,synoptic,ledger,memory-note,img write_ci_helper
 
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.
@@ -299,3 +362,10 @@ printf '1.0.1\n' >apps/ledger/VERSION
 git add apps/ledger/VERSION
 git commit -qm version
 test "$(bash "$classifier" version-changed "$base" HEAD)" = ledger
+
+git reset --hard -q "$base"
+printf '1.0.1\n' >apps/cas/VERSION
+printf '1.0.1\n' >apps/synoptic/VERSION
+git add apps/cas/VERSION apps/synoptic/VERSION
+git commit -qm coupled-version
+test "$(bash "$classifier" version-changed "$base" HEAD | paste -sd, -)" = cas,synoptic

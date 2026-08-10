@@ -9,10 +9,12 @@ on:
       - "apps/seq/**"
       - "apps/lift/**"
       - "apps/cas/**"
+      - "apps/synoptic/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
       - "apps/img/**"
       - "libs/core/**"
+      - "libs/cas_runtime/**"
       - "libs/definition_core/**"
       - "libs/definition_compat/**"
       - "libs/durable_store/**"
@@ -42,6 +44,7 @@ jobs:
       seq: ${{ steps.classify.outputs.seq }}
       lift: ${{ steps.classify.outputs.lift }}
       cas: ${{ steps.classify.outputs.cas }}
+      synoptic: ${{ steps.classify.outputs.synoptic }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
       img: ${{ steps.classify.outputs.img }}
@@ -69,7 +72,7 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas ledger memory-note img; do
+          for app in seq lift cas synoptic ledger memory-note img; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -442,6 +445,41 @@ jobs:
           version: 0.16.0
       - name: Fuzz CAS budget governor (Linux)
         run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
+
+  synoptic:
+    needs: changes
+    if: needs.changes.outputs.synoptic == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test Synoptic behavior and falsifiers
+        run: |
+          zig build test-synoptic
+          zig build test-synoptic-falsifiers
+          zig build test-synoptic-e2e
+      - name: Build Synoptic ReleaseSafe command surface
+        run: zig build release-synoptic-safe
+      - name: Verify Synoptic version and capabilities
+        run: |
+          set -euo pipefail
+          expected_version="$(tr -d '[:space:]' < apps/synoptic/VERSION)"
+          test "$(./zig-out/bin/synoptic version)" = "synoptic ${expected_version}"
+          capabilities="$(./zig-out/bin/synoptic capabilities --format json)"
+          jq -e --arg version "${expected_version}" '
+            .synopticCapabilities.version == $version and
+            .synopticCapabilities.platform == "macos" and
+            .synopticCapabilities.skillAbi == "synoptic-skill-abi/v1" and
+            .synopticCapabilities.uiAbi == "synoptic-ui/v1" and
+            .synopticCapabilities.features == {
+              casRuntimeV1: true,
+              githubViewedQueueV1: true,
+              ephemeralFileSessionsV1: true,
+              githubActionCardsV1: true
+            }
+          ' <<<"${capabilities}"
 
   perf-hub:
     needs: changes

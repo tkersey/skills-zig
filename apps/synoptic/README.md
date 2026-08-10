@@ -82,3 +82,22 @@ Runtime receipts contain only operational identity and launch data. They never
 contain tabs, conversations, action cards, or review state. After stop or a
 machine/process restart, Synoptic rebuilds the queue from GitHub and creates
 fresh ephemeral Codex threads.
+
+## Release contract
+
+Synoptic is released only for macOS. `synoptic-v<version>` must equal
+`apps/synoptic/VERSION`, and the release contains exactly these archives:
+
+- `synoptic-v<version>-darwin-arm64.tar.gz`
+- `synoptic-v<version>-darwin-x86_64.tar.gz`
+
+Each archive contains one executable at its root named `synoptic`. The native
+runner and packaged binary architecture are verified before publication, as are
+the exact `synoptic version` value (`synoptic <version>`) and the `synoptic-skill-abi/v1`,
+`synoptic-ui/v1`, and four v1 capability flags reported by
+`synoptic capabilities --format json`. No Linux or Windows Synoptic artifact is
+published.
+
+`libs/cas_runtime/**` is shipped by both CAS and Synoptic. A material change to
+that shared runtime therefore requires coupled `apps/cas/VERSION` and
+`apps/synoptic/VERSION` bumps even when only one product-facing caller changes.
