@@ -995,6 +995,8 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/manifest.json", .data = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":\"synoptic-ui/v1\",\"requiredSkillAbi\":\"synoptic-skill-abi/v1\",\"entry\":\"index.html\",\"assets\":[\"app.css\",\"app.js\"]}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/exclusions.json", .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{\"reason\":\"lockfile\",\"globs\":[\"package-lock.json\"]}]}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/index.html", .data = "<!doctype html><title>fixture</title>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/app.css", .data = "body { color: white; }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/app.js", .data = "document.title = 'fixture';" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "# fixture" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/primary-context.md", .data = "primary role" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/file-review.md", .data = "file role" });
@@ -1073,6 +1075,22 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expect(primary_ready);
+
+    const index_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/?token={s}", .{ first_address.port, first_address.token });
+    defer allocator.free(index_url);
+    const index = try runLifecycleCommand(allocator, io, &environment, &.{ "/usr/bin/curl", "-fsS", index_url });
+    defer allocator.free(index);
+    try std.testing.expect(std.mem.indexOf(u8, index, "fixture") != null);
+    const asset_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/assets/app.js", .{first_address.port});
+    defer allocator.free(asset_url);
+    const asset = try runLifecycleCommand(allocator, io, &environment, &.{ "/usr/bin/curl", "-fsS", asset_url });
+    defer allocator.free(asset);
+    try std.testing.expect(std.mem.indexOf(u8, asset, "document.title") != null);
+    const unauthenticated_bootstrap = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/bootstrap", .{first_address.port});
+    defer allocator.free(unauthenticated_bootstrap);
+    const bootstrap_status = try runLifecycleCommand(allocator, io, &environment, &.{ "/usr/bin/curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", unauthenticated_bootstrap });
+    defer allocator.free(bootstrap_status);
+    try std.testing.expectEqualStrings("403", bootstrap_status);
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", first_address.port);
     var stream = try address.connect(io, .{ .mode = .stream });

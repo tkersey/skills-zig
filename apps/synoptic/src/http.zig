@@ -71,8 +71,8 @@ pub const Server = struct {
         var token_buf: [64]u8 = undefined;
         const token = self.tokenHex(&token_buf);
         if (std.mem.startsWith(u8, target, "/ws?")) return self.upgradeWebSocket(&stream, raw, token, runtime);
-        if (!authorized(target, raw, token)) return writeResponse(self.io, &stream, "403 Forbidden", "text/plain", "forbidden", false);
-        if (std.mem.startsWith(u8, target, "/api/bootstrap")) {
+        if (requiresToken(target)) {
+            if (!authorized(target, raw, token)) return writeResponse(self.io, &stream, "403 Forbidden", "text/plain", "forbidden", false);
             const body = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(body);
             return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
@@ -432,6 +432,10 @@ fn authorized(target: []const u8, raw: []const u8, token: []const u8) bool {
     if (queryToken(target)) |value| if (std.mem.eql(u8, value, token)) return true;
     return if (headerValue(raw, "authorization")) |v| std.mem.startsWith(u8, v, "Bearer ") and std.mem.eql(u8, v[7..], token) else false;
 }
+
+fn requiresToken(target: []const u8) bool {
+    return std.mem.eql(u8, target, "/api/bootstrap") or std.mem.startsWith(u8, target, "/api/bootstrap?");
+}
 fn queryToken(target: []const u8) ?[]const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
@@ -556,4 +560,12 @@ test "token parsing is exact and unique" {
     try std.testing.expectEqualStrings("abc", queryToken("/ws?token=abc").?);
     try std.testing.expect(queryToken("/ws?x=1&token=abc") == null);
     try std.testing.expect(queryToken("/ws?token=abc&token=abc") == null);
+}
+
+test "static assets are not state-bearing authorization targets" {
+    try std.testing.expect(!requiresToken("/assets/app.js"));
+    try std.testing.expect(!requiresToken("/?token=launch"));
+    try std.testing.expect(requiresToken("/api/bootstrap"));
+    try std.testing.expect(requiresToken("/api/bootstrap?token=launch"));
+    try std.testing.expect(!requiresToken("/api/bootstrap-impersonator"));
 }
