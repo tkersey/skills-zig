@@ -53,7 +53,11 @@ The same fixture also proves managed-custody refresh reconciliation, stale-origi
 delta injection, a fresh official revision session, Finish-round increment, and
 reconnect snapshots containing the queue, tabs, cards, and round. Production
 refresh continues to re-query file and thread pagination independently and refuses
-to mutate a reused user checkout.
+to mutate while review commands are active. Safe boundaries interrupt active
+turns and wait boundedly for command quiescence. Managed custody restores tracked
+files to the selected head and removes only artifacts created after its baseline;
+reused custody never cleans user content and advances only through a clean
+fast-forward of the original PR branch.
 
 Runtime receipts contain only operational identity and launch data. They never
 contain tabs, conversations, action cards, or review state. After stop or a

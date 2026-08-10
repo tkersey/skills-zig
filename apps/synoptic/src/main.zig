@@ -193,10 +193,12 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
 
     const managed_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "worktree" });
     defer allocator.free(managed_path);
-    var custody = try worktree.select(allocator, io, options.cwd, snapshot_head, managed_path);
+    var custody = try worktree.select(allocator, io, options.cwd, head_ref, snapshot_head, managed_path);
     defer allocator.free(custody.path());
     const review_cwd = custody.path();
     try hydrateRevisionKeys(allocator, io, review_cwd, snapshot_base, &generation);
+    var worktree_baseline = try worktree.Baseline.capture(allocator, io, review_cwd);
+    defer worktree_baseline.deinit();
     var state = try App.init(allocator, snapshot_head);
     state.replaceGeneration(generation);
     defer state.deinit();
@@ -225,14 +227,26 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     const ready_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "ready.json" });
     defer allocator.free(ready_path);
     try writeOperationalFile(allocator, io, ready_path, receipt);
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .launch_id = launch_id };
+    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .baseline = &worktree_baseline, .launch_id = launch_id };
+    const stop_request_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "stop.request" });
+    defer allocator.free(stop_request_path);
+    var terminal_error: ?anyerror = null;
     while (!runtime.stop_requested) {
         state.primary_ready = registry.primaryReady();
         server.serveOne(&runtime) catch |err| switch (err) {
             error.EndOfStream => continue,
-            else => return err,
+            else => {
+                terminal_error = err;
+                break;
+            },
         };
+        if (std.Io.Dir.cwd().access(io, stop_request_path, .{})) |_| runtime.stop_requested = true else |_| {}
     }
+    try registry.beginSynchronization(io, sessions.safe_boundary_timeout_ms);
+    defer registry.endSynchronization();
+    try worktree.reconcileShutdown(allocator, io, custody, state.generation.head_oid, &worktree_baseline);
+    std.Io.Dir.cwd().deleteFile(io, stop_request_path) catch {};
+    if (terminal_error) |err| return err;
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     removeCurrentIfLaunch(allocator, io, current_path, launch_id);
@@ -273,15 +287,15 @@ fn stop(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proces
         return printStopResult(io, json, null, false);
     }
     const pid = std.math.cast(std.posix.pid_t, record.pid) orelse return error.InvalidRuntimePid;
-    std.posix.kill(pid, std.posix.SIG.TERM) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => return err,
-    };
+    const stop_request_path = try std.fs.path.join(allocator, &.{ record.runtime_root, record.launch_id, "stop.request" });
+    defer allocator.free(stop_request_path);
+    try writeOperationalFile(allocator, io, stop_request_path, "{}\n");
+    wakeLoopback(allocator, io, record.url) catch {};
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
     while (try verifiedProcess(allocator, io, record)) {
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
         if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
-            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            std.posix.kill(pid, std.posix.SIG.TERM) catch {};
             break;
         }
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
@@ -294,6 +308,21 @@ fn stop(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proces
     }
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
     return printStopResult(io, json, record.launch_id, true);
+}
+
+fn wakeLoopback(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+    const prefix = "http://127.0.0.1:";
+    if (!std.mem.startsWith(u8, url, prefix)) return error.InvalidLifecycleUrl;
+    const slash = std.mem.indexOfScalarPos(u8, url, prefix.len, '/') orelse return error.InvalidLifecycleUrl;
+    const port = try std.fmt.parseInt(u16, url[prefix.len..slash], 10);
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    const request = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{ url[slash..], port });
+    defer allocator.free(request);
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
 }
 
 fn printStopResult(io: std.Io, json: bool, launch_id: ?[]const u8, stopped: bool) !void {

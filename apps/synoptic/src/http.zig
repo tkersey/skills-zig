@@ -19,6 +19,7 @@ pub const Runtime = struct {
     skill_path: []const u8,
     repository_cwd: []const u8,
     custody: worktree.Custody,
+    baseline: ?*worktree.Baseline = null,
     launch_id: []const u8 = "embedded-test",
     stop_requested: bool = false,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
@@ -323,9 +324,11 @@ pub const Server = struct {
 
     fn refresh(self: *Server, runtime: *Runtime) !void {
         if (runtime.refresh_override) |run| return run(runtime);
+        try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
+        defer runtime.registry.endSynchronization();
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         errdefer next.deinit();
-        try worktree.synchronizeManaged(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid);
+        try worktree.synchronize(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid, runtime.baseline orelse return error.MissingWorktreeBaseline);
         try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
         for (runtime.app.generation.files.items) |old_file| {
             const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse continue;

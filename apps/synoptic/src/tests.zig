@@ -445,6 +445,217 @@ fn runGit(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []con
     return result.stdout;
 }
 
+test "worktree integrity managed cleanup restores tracked and removes only review artifacts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = ".zig-cache/\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "selected\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", ".gitignore", "tracked.txt" }, &.{ "git", "commit", "-qm", "selected" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    try tmp.dir.createDirPath(io, ".zig-cache/preexisting");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".zig-cache/preexisting/keep", .data = "keep" });
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    const selected = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(selected);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "review mutation\n" });
+    try tmp.dir.createDirPath(io, ".zig-cache/review");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".zig-cache/review/output", .data = "artifact" });
+    try worktree.reconcileShutdown(allocator, io, .{ .managed = root }, selected, &baseline);
+    const tracked = try tmp.dir.readFileAlloc(io, "tracked.txt", allocator, .limited(1024));
+    defer allocator.free(tracked);
+    try std.testing.expectEqualStrings("selected\n", tracked);
+    _ = try tmp.dir.statFile(io, ".zig-cache/preexisting/keep", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".zig-cache/review/output", .{}));
+}
+
+test "worktree integrity reused contamination blocks without cleanup" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "ignored/\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "selected\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "selected" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    try tmp.dir.createDirPath(io, "ignored");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ignored/before", .data = "before" });
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ignored/after", .data = "after" });
+    try std.testing.expectError(error.ReusedCheckoutRefreshRequiresManagedMigration, worktree.reconcileShutdown(allocator, io, .{ .reused_current = root }, baseline.head_oid, &baseline));
+    _ = try tmp.dir.statFile(io, "ignored/after", .{});
+}
+
+test "worktree integrity managed cleanup rejects same-tree HEAD movement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "same tree\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "selected" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    const selected = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(selected);
+    const output = try runGit(allocator, io, root, &.{ "git", "commit", "--allow-empty", "-qm", "same tree other identity" });
+    allocator.free(output);
+    try std.testing.expectError(error.ManagedWorktreeCleanupIncomplete, worktree.reconcileShutdown(allocator, io, .{ .managed = root }, selected, &baseline));
+}
+
+test "worktree integrity managed synchronization cleans then advances detached head" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source");
+    const source = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(source);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/.gitignore", .data = "artifacts/\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "base" } }) |argv| {
+        const output = try runGit(allocator, io, source, argv);
+        allocator.free(output);
+    }
+    const base_raw = try runGit(allocator, io, source, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/tracked.txt", .data = "head\n" });
+    for ([_][]const []const u8{ &.{ "git", "add", "tracked.txt" }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        const output = try runGit(allocator, io, source, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, source, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    var output = try runGit(allocator, io, source, &.{ "git", "remote", "add", "origin", source });
+    allocator.free(output);
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed-sync" });
+    defer allocator.free(managed);
+    output = try runGit(allocator, io, source, &.{ "git", "worktree", "add", "--detach", managed, base });
+    allocator.free(output);
+    var baseline = try worktree.Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    const managed_tracked = try std.fs.path.join(allocator, &.{ managed, "tracked.txt" });
+    defer allocator.free(managed_tracked);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = managed_tracked, .data = "review mutation\n" });
+    const artifact_dir = try std.fs.path.join(allocator, &.{ managed, "artifacts" });
+    defer allocator.free(artifact_dir);
+    try std.Io.Dir.cwd().createDirPath(io, artifact_dir);
+    const artifact = try std.fs.path.join(allocator, &.{ artifact_dir, "output" });
+    defer allocator.free(artifact);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = artifact, .data = "artifact" });
+    try worktree.synchronize(allocator, io, .{ .managed = managed }, source, head, &baseline);
+    try std.testing.expectEqualStrings(head, baseline.head_oid);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, artifact, .{}));
+}
+
+test "worktree integrity reused checkout advances only by clean fast forward" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "base" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    const base_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    var output = try runGit(allocator, io, root, &.{ "git", "switch", "-qc", "upstream" });
+    allocator.free(output);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "head\n" });
+    for ([_][]const []const u8{ &.{ "git", "add", "tracked.txt" }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    output = try runGit(allocator, io, root, &.{ "git", "switch", "-qc", "feature", base });
+    allocator.free(output);
+    output = try runGit(allocator, io, root, &.{ "git", "remote", "add", "origin", root });
+    allocator.free(output);
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    try worktree.synchronize(allocator, io, .{ .reused_current = root }, root, head, &baseline);
+    try std.testing.expectEqualStrings(head, baseline.head_oid);
+    try std.testing.expectEqualStrings("feature", baseline.branch.?);
+}
+
+test "worktree integrity safe boundary interrupts active turns before mutation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const codex_path = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(codex_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-codex", .data = fakeCodexScript() });
+    try std.Io.Dir.cwd().setFilePermissions(io, codex_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    var registry = try sessions.Registry.start(allocator, io, root, codex_path);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.primary_start_turn_id = try allocator.dupe(u8, "primary-turn");
+    registry.primary_turn_active = true;
+    try registry.beginSynchronization(io, 200);
+    registry.endSynchronization();
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{codex_path});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"method\":\"turn/interrupt\"") != null);
+}
+
+test "worktree integrity dirty launch selects managed custody" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "head\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "switch", "-qc", "feature" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        const output = try runGit(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const output = try runGit(allocator, io, repo, &.{ "git", "remote", "add", "origin", repo });
+    allocator.free(output);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "dirty\n" });
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
+    defer allocator.free(managed);
+    const custody = try worktree.select(allocator, io, repo, "feature", head, managed);
+    defer allocator.free(custody.path());
+    try std.testing.expect(custody == .managed);
+}
+
 fn fakeLifecycleGhScriptAlloc(allocator: std.mem.Allocator, base: []const u8, head: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\#!/bin/sh

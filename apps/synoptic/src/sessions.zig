@@ -4,6 +4,8 @@ const action_tools = @import("tools.zig");
 const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
+pub const safe_boundary_timeout_ms: u32 = 5_000;
+const safe_boundary_quiescence_ms: u32 = 50;
 pub const dynamic_tools_json =
     "[{\"type\":\"namespace\",\"name\":\"synoptic\",\"description\":\"Human-directed Synoptic review operations\",\"tools\":[" ++
     "{\"name\":\"search_unresolved_threads\",\"description\":\"Search server-owned unresolved current-PR review evidence; use whole-PR only for cross-file concerns\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"includeWholePullRequest\":{\"type\":\"boolean\"}}}}," ++
@@ -20,6 +22,7 @@ pub const Session = struct {
     revision: []u8,
     status: SessionStatus = .current,
     initial_turn_active: bool = true,
+    turn_active: bool = true,
     human_authority: ?HumanAuthority = null,
     fn deinit(self: Session, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -68,6 +71,7 @@ const RegistryMutex = struct {
         self.state.unlock();
     }
 };
+const TurnRef = struct { thread: []u8, turn: []u8 };
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
@@ -75,11 +79,15 @@ pub const Registry = struct {
     primary_thread_id: ?[]u8 = null,
     latest_primary_turn_id: ?[]u8 = null,
     primary_start_turn_id: ?[]u8 = null,
+    primary_turn_active: bool = false,
     evidence: ?domain.PrGeneration = null,
     notification_count: u64 = 0,
     mutex: RegistryMutex = .{},
     sessions: std.ArrayList(Session) = .empty,
     visible_events: std.ArrayList(VisibleEvent) = .empty,
+    active_command_ids: std.ArrayList([]u8) = .empty,
+    completed_turn_ids: std.ArrayList([]u8) = .empty,
+    synchronizing: bool = false,
     next_session_id: u64 = 1,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, codex_path: []const u8) !Registry {
@@ -107,6 +115,81 @@ pub const Registry = struct {
         self.sessions.deinit(self.allocator);
         for (self.visible_events.items) |event| event.deinit(self.allocator);
         self.visible_events.deinit(self.allocator);
+        for (self.active_command_ids.items) |id| self.allocator.free(id);
+        self.active_command_ids.deinit(self.allocator);
+        for (self.completed_turn_ids.items) |id| self.allocator.free(id);
+        self.completed_turn_ids.deinit(self.allocator);
+    }
+
+    pub fn beginSynchronization(self: *Registry, io: std.Io, timeout_ms: u32) !void {
+        self.mutex.lock();
+        if (self.synchronizing) {
+            self.mutex.unlock();
+            return error.SynchronizationAlreadyActive;
+        }
+        self.synchronizing = true;
+        var turns: std.ArrayList(TurnRef) = .empty;
+        defer {
+            for (turns.items) |turn| {
+                self.allocator.free(turn.thread);
+                self.allocator.free(turn.turn);
+            }
+            turns.deinit(self.allocator);
+        }
+        if (self.primary_turn_active and self.primary_thread_id != null and self.primary_start_turn_id != null) self.appendTurnRef(&turns, self.primary_thread_id.?, self.primary_start_turn_id.?) catch |err| {
+            self.synchronizing = false;
+            self.mutex.unlock();
+            return err;
+        };
+        for (self.sessions.items) |session| if (session.turn_active and session.status != .closed) self.appendTurnRef(&turns, session.thread_id, session.turn_id) catch |err| {
+            self.synchronizing = false;
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        errdefer self.endSynchronization();
+        if (turns.items.len > 0) {
+            const actor = &(self.actor orelse return error.AppServerUnavailable);
+            for (turns.items) |turn| {
+                const params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"turnId\":{f}}}", .{ std.json.fmt(turn.thread, .{}), std.json.fmt(turn.turn, .{}) });
+                defer self.allocator.free(params);
+                const response = actor.requestJson("turn/interrupt", params, null) catch return error.TurnInterruptFailed;
+                self.allocator.free(response);
+            }
+        }
+        const started = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        var quiet_since: ?i128 = null;
+        while (true) {
+            self.mutex.lock();
+            const active = self.active_command_ids.items.len;
+            self.mutex.unlock();
+            const now = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+            if (active == 0) {
+                if (quiet_since == null) quiet_since = now;
+                if (now - quiet_since.? >= safe_boundary_quiescence_ms) return;
+            } else quiet_since = null;
+            if (now - started >= timeout_ms) return error.ActiveReviewCommandsTimeout;
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    pub fn endSynchronization(self: *Registry) void {
+        self.mutex.lock();
+        self.synchronizing = false;
+        self.mutex.unlock();
+    }
+
+    fn appendTurnRef(self: *Registry, turns: *std.ArrayList(TurnRef), thread: []const u8, turn: []const u8) !void {
+        const owned_thread = try self.allocator.dupe(u8, thread);
+        errdefer self.allocator.free(owned_thread);
+        const owned_turn = try self.allocator.dupe(u8, turn);
+        errdefer self.allocator.free(owned_turn);
+        try turns.append(self.allocator, .{ .thread = owned_thread, .turn = owned_turn });
+    }
+    pub fn activeCommandCount(self: *Registry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.active_command_ids.items.len;
     }
 
     pub fn setGenerationEvidence(self: *Registry, generation: *const domain.PrGeneration) !void {
@@ -136,7 +219,11 @@ pub const Registry = struct {
         defer self.allocator.free(turn_params);
         const turn = try actor.requestJson("turn/start", turn_params, null);
         defer self.allocator.free(turn);
-        self.primary_start_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        const primary_turn = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.primary_start_turn_id = primary_turn;
+        self.primary_turn_active = self.latest_primary_turn_id == null or !std.mem.eql(u8, self.latest_primary_turn_id.?, primary_turn);
     }
 
     pub fn primaryReady(self: *Registry) bool {
@@ -196,8 +283,11 @@ pub const Registry = struct {
     }
 
     pub fn openFile(self: *Registry, io: std.Io, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8) !OpenResult {
-        const actor = &(self.actor orelse return error.AppServerUnavailable);
         self.mutex.lock();
+        if (self.synchronizing) {
+            self.mutex.unlock();
+            return error.WorktreeSynchronizationActive;
+        }
         for (self.sessions.items) |session| if (session.status == .current and std.mem.eql(u8, session.path, path) and std.mem.eql(u8, session.revision, revision)) {
             const id = try self.allocator.dupe(u8, session.id);
             self.mutex.unlock();
@@ -223,6 +313,7 @@ pub const Registry = struct {
             return err;
         };
         self.mutex.unlock();
+        const actor = &(self.actor orelse return error.AppServerUnavailable);
         defer self.allocator.free(primary_thread);
         defer self.allocator.free(primary_turn);
         const params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"lastTurnId\":{f},\"ephemeral\":true}}", .{ std.json.fmt(primary_thread, .{}), std.json.fmt(primary_turn, .{}) });
@@ -249,13 +340,17 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         const session_id = try std.fmt.allocPrint(self.allocator, "ses-{d}", .{self.next_session_id});
         self.next_session_id += 1;
-        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = try self.allocator.dupe(u8, file_thread_id), .turn_id = try self.allocator.dupe(u8, file_turn_id), .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, revision) });
+        const already_completed = self.turnCompletedLocked(file_turn_id);
+        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = try self.allocator.dupe(u8, file_thread_id), .turn_id = try self.allocator.dupe(u8, file_turn_id), .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, revision), .initial_turn_active = !already_completed, .turn_active = !already_completed });
         return .{ .reused = false, .session_id = try self.allocator.dupe(u8, session_id), .allocator = self.allocator };
     }
 
     pub fn message(self: *Registry, session_id: []const u8, text: []const u8, active: bool) !void {
-        const actor = &(self.actor orelse return error.AppServerUnavailable);
         self.mutex.lock();
+        if (self.synchronizing) {
+            self.mutex.unlock();
+            return error.WorktreeSynchronizationActive;
+        }
         var thread_id: ?[]u8 = null;
         var turn_id: ?[]u8 = null;
         for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id) and session.status != .closed) {
@@ -264,6 +359,7 @@ pub const Registry = struct {
             break;
         };
         self.mutex.unlock();
+        const actor = &(self.actor orelse return error.AppServerUnavailable);
         defer if (thread_id) |v| self.allocator.free(v);
         defer if (turn_id) |v| self.allocator.free(v);
         const method = if (active) "turn/steer" else "turn/start";
@@ -279,6 +375,7 @@ pub const Registry = struct {
                 if (std.mem.eql(u8, session.id, session_id)) {
                     self.allocator.free(session.turn_id);
                     session.turn_id = next_turn;
+                    session.turn_active = !self.turnCompletedLocked(next_turn);
                     return;
                 }
             }
@@ -341,10 +438,17 @@ pub const Registry = struct {
         defer self.allocator.free(params);
         const response = try actor.requestJson("turn/start", params, null);
         defer self.allocator.free(response);
+        const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.primary_start_turn_id) |old| self.allocator.free(old);
+        self.primary_start_turn_id = next_turn;
+        self.primary_turn_active = self.latest_primary_turn_id == null or !std.mem.eql(u8, self.latest_primary_turn_id.?, next_turn);
     }
 
     fn onNotification(context: *anyopaque, notification: cas_runtime.Notification) void {
         const self: *Registry = @ptrCast(@alignCast(context));
+        self.recordCommandActivity(notification.method, notification.raw_json);
         self.mutex.lock();
         self.notification_count += 1;
         if (visibleMethod(notification.method) and self.visible_events.items.len < max_visible_events) {
@@ -366,16 +470,30 @@ pub const Registry = struct {
             };
         }
         if (std.mem.eql(u8, notification.method, "turn/completed")) {
+            if (extractString(self.allocator, notification.raw_json, &.{ "params", "turn", "id" })) |completed_turn| {
+                defer self.allocator.free(completed_turn);
+                if (!self.turnCompletedLocked(completed_turn) and self.completed_turn_ids.items.len < 512) if (self.allocator.dupe(u8, completed_turn)) |owned| {
+                    self.completed_turn_ids.append(self.allocator, owned) catch self.allocator.free(owned);
+                } else |_| {};
+            } else |_| {}
             if (extractString(self.allocator, notification.raw_json, &.{ "params", "threadId" })) |thread| {
                 defer self.allocator.free(thread);
                 for (self.sessions.items) |*session| {
-                    if (std.mem.eql(u8, session.thread_id, thread)) session.initial_turn_active = false;
+                    if (std.mem.eql(u8, session.thread_id, thread)) {
+                        session.initial_turn_active = false;
+                        session.turn_active = false;
+                    }
                 }
             } else |_| {}
         }
         self.mutex.unlock();
         if (!std.mem.eql(u8, notification.method, "turn/completed")) return;
         self.recordPrimaryCompletion(notification.raw_json);
+    }
+
+    fn turnCompletedLocked(self: *Registry, turn_id: []const u8) bool {
+        for (self.completed_turn_ids.items) |id| if (std.mem.eql(u8, id, turn_id)) return true;
+        return false;
     }
 
     fn recordPrimaryCompletion(self: *Registry, raw_json: []const u8) void {
@@ -390,6 +508,7 @@ pub const Registry = struct {
         if (self.primary_thread_id) |primary| if (std.mem.eql(u8, primary, thread_id)) {
             if (self.latest_primary_turn_id) |old| self.allocator.free(old);
             self.latest_primary_turn_id = turn_id;
+            self.primary_turn_active = false;
             return;
         };
         self.allocator.free(turn_id);
@@ -404,6 +523,12 @@ pub const Registry = struct {
 
     fn onServerRequest(context: *anyopaque, request: cas_runtime.ServerRequest, allocator: std.mem.Allocator) ![]u8 {
         const self: *Registry = @ptrCast(@alignCast(context));
+        if (std.mem.eql(u8, request.method, "item/commandExecution/requestApproval")) {
+            self.mutex.lock();
+            const blocked = self.synchronizing;
+            self.mutex.unlock();
+            if (blocked) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        }
         if (std.mem.eql(u8, request.method, "item/fileChange/requestApproval")) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
         if (std.mem.eql(u8, request.method, "item/tool/call")) {
             if (std.mem.indexOf(u8, request.raw_json, "search_unresolved_threads") != null) return self.searchThreads(request.raw_json, allocator);
@@ -424,6 +549,37 @@ pub const Registry = struct {
             }
         }
         return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+    }
+
+    fn recordCommandActivity(self: *Registry, method: []const u8, raw: []const u8) void {
+        const started = std.mem.eql(u8, method, "item/started");
+        const completed = std.mem.eql(u8, method, "item/completed");
+        if (!started and !completed) return;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{}) catch return;
+        defer parsed.deinit();
+        const params = if (parsed.value == .object) parsed.value.object.get("params") orelse return else return;
+        const item = if (params == .object) params.object.get("item") orelse return else return;
+        if (item != .object) return;
+        const kind = item.object.get("type") orelse return;
+        if (kind != .string or (!std.mem.eql(u8, kind.string, "commandExecution") and !std.mem.eql(u8, kind.string, "command_execution"))) return;
+        const id = item.object.get("id") orelse return;
+        if (id != .string) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.active_command_ids.items, 0..) |existing, index| if (std.mem.eql(u8, existing, id.string)) {
+            if (completed) {
+                const removed = self.active_command_ids.orderedRemove(index);
+                self.allocator.free(removed);
+            }
+            return;
+        };
+        if (started) {
+            const owned = self.allocator.dupe(u8, id.string) catch return;
+            self.active_command_ids.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                return;
+            };
+        }
     }
 
     fn searchThreads(self: *Registry, raw: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -523,6 +679,26 @@ test "file selection remains gated without completed primary" {
 
 test "session context dynamic tool namespace exposes the exact authoritative surface" {
     inline for (.{ "search_unresolved_threads", "prepare_github_action", "complete_file_review", "close_session", "\"required\":[\"slot\",\"kind\",\"effectSummary\",\"payload\"]" }) |needle| try std.testing.expect(std.mem.indexOf(u8, dynamic_tools_json, needle) != null);
+}
+
+test "worktree integrity synchronization waits for commands and times out bounded" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.recordCommandActivity("item/started", "{\"params\":{\"item\":{\"id\":\"cmd-1\",\"type\":\"commandExecution\"}}}");
+    try std.testing.expectEqual(@as(usize, 1), registry.activeCommandCount());
+    try std.testing.expectError(error.ActiveReviewCommandsTimeout, registry.beginSynchronization(std.testing.io, 20));
+    try std.testing.expect(!registry.synchronizing);
+    registry.recordCommandActivity("item/completed", "{\"params\":{\"item\":{\"id\":\"cmd-1\",\"type\":\"commandExecution\"}}}");
+    try std.testing.expectEqual(@as(usize, 0), registry.activeCommandCount());
+    try registry.beginSynchronization(std.testing.io, 100);
+    registry.endSynchronization();
+}
+
+test "worktree integrity synchronization freezes new file and message work" {
+    var registry = Registry{ .allocator = std.testing.allocator, .synchronizing = true };
+    defer registry.deinit();
+    try std.testing.expectError(error.WorktreeSynchronizationActive, registry.openFile(std.testing.io, "/repo", "a", "r", "b", "h", "", "[]", "/skill/SKILL.md"));
+    try std.testing.expectError(error.WorktreeSynchronizationActive, registry.message("missing", "hello", false));
 }
 
 test "turn start response alone never opens primary gate" {
