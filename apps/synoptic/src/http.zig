@@ -20,6 +20,7 @@ pub const Runtime = struct {
     repository_cwd: []const u8,
     custody: worktree.Custody,
     baseline: ?*worktree.Baseline = null,
+    settings: ?*const config.Settings = null,
     launch_id: []const u8 = "embedded-test",
     stop_requested: bool = false,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
@@ -152,6 +153,12 @@ pub const Server = struct {
             visible.deinit(self.allocator);
         }
         for (visible.items) |event| {
+            if (event.session_id == null and std.mem.eql(u8, event.method, "file.excluded")) {
+                const envelope = try runtime.app.nextEnvelope("file.excluded", event.raw_json);
+                defer self.allocator.free(envelope);
+                try writeServerText(self.io, stream, envelope);
+                continue;
+            }
             if (std.mem.eql(u8, event.method, "action.prepared")) {
                 const session_id = event.session_id orelse return error.MissingOriginSession;
                 const input = try tools.decodePreparedAction(self.allocator, event.raw_json);
@@ -239,9 +246,10 @@ pub const Server = struct {
             defer self.allocator.free(diff);
             const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(self.allocator, path, null, &.{}, false);
             defer self.allocator.free(threads);
-            const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path);
+            const immediate = if (runtime.settings) |settings| settings.file_review_start_mode == .immediate else true;
+            const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path, immediate);
             defer opened.deinit();
-            const body = try std.fmt.allocPrint(self.allocator, "{{\"initialReview\":{},\"reused\":{},\"sessionId\":{f}}}", .{ !opened.reused, opened.reused, std.json.fmt(opened.session_id, .{}) });
+            const body = try std.fmt.allocPrint(self.allocator, "{{\"initialReview\":{},\"reused\":{},\"sessionId\":{f}}}", .{ immediate and !opened.reused, opened.reused, std.json.fmt(opened.session_id, .{}) });
             defer self.allocator.free(body);
             return runtime.app.nextEnvelope("session.opened", body);
         }
@@ -339,6 +347,14 @@ pub const Server = struct {
             }
         }
         runtime.app.replaceGeneration(next);
+        if (runtime.settings) |settings| {
+            var outcomes = try runtime.app.applyAutomaticExclusions(settings, runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, runtime.cwd);
+            defer {
+                for (outcomes.items) |outcome| outcome.deinit();
+                outcomes.deinit(self.allocator);
+            }
+            try queueExclusionEvents(runtime.registry, outcomes.items);
+        }
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         var files: std.Io.Writer.Allocating = .init(self.allocator);
         defer files.deinit();
@@ -348,6 +364,14 @@ pub const Server = struct {
         try runtime.registry.updatePrimary(update);
     }
 };
+
+pub fn queueExclusionEvents(registry: *sessions.Registry, outcomes: []const @import("app.zig").ExclusionOutcome) !void {
+    for (outcomes) |outcome| {
+        const payload = try std.fmt.allocPrint(registry.allocator, "{{\"path\":{f},\"reason\":{f},\"status\":{f},\"syncError\":{f}}}", .{ std.json.fmt(outcome.path, .{}), std.json.fmt(outcome.reason, .{}), std.json.fmt(if (outcome.sync_error == null) "viewed" else "sync-error", .{}), std.json.fmt(outcome.sync_error, .{}) });
+        defer registry.allocator.free(payload);
+        try registry.queueSystemEvent("file.excluded", payload);
+    }
+}
 
 fn payloadString(payload: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = payload.get(key) orelse return null;

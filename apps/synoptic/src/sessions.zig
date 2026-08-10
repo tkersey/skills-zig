@@ -24,12 +24,16 @@ pub const Session = struct {
     initial_turn_active: bool = true,
     turn_active: bool = true,
     human_authority: ?HumanAuthority = null,
+    pending_initial_prompt: ?[]u8 = null,
+    pending_skill_path: ?[]u8 = null,
     fn deinit(self: Session, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.thread_id);
         allocator.free(self.turn_id);
         allocator.free(self.path);
         allocator.free(self.revision);
+        if (self.pending_initial_prompt) |value| allocator.free(value);
+        if (self.pending_skill_path) |value| allocator.free(value);
     }
 };
 pub const OpenResult = struct {
@@ -282,7 +286,18 @@ pub const Registry = struct {
         return result;
     }
 
-    pub fn openFile(self: *Registry, io: std.Io, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8) !OpenResult {
+    pub fn queueSystemEvent(self: *Registry, method: []const u8, raw_json: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.visible_events.items.len >= max_visible_events) return error.VisibleEventLimitExceeded;
+        const owned_method = try self.allocator.dupe(u8, method);
+        errdefer self.allocator.free(owned_method);
+        const owned_json = try self.allocator.dupe(u8, raw_json);
+        errdefer self.allocator.free(owned_json);
+        try self.visible_events.append(self.allocator, .{ .session_id = null, .method = owned_method, .raw_json = owned_json });
+    }
+
+    pub fn openFile(self: *Registry, io: std.Io, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8, start_immediately: bool) !OpenResult {
         self.mutex.lock();
         if (self.synchronizing) {
             self.mutex.unlock();
@@ -330,44 +345,81 @@ pub const Registry = struct {
         defer self.allocator.free(untrusted);
         const prompt = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}\n\n{s}\n\nAssigned path: {s}\nRevision: {s}\nBase: {s}\nHead: {s}\nServer-computed canonical diff:\n{s}\nComplete unresolved assigned-file thread evidence:\n{s}\nPerform the review now; report findings, risk, proposed inline comments, and suspicions. Do not invoke a GitHub action tool during this initial review. Do not mark viewed or edit source. Wait for the human.", .{ file_role, actions, untrusted, path, revision, base_oid, head_oid, diff, threads_json });
         defer self.allocator.free(prompt);
-        const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"cwd\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(file_thread_id, .{}), std.json.fmt(cwd, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
-        defer self.allocator.free(turn_params);
-        const turn = try actor.requestJson("turn/start", turn_params, null);
-        defer self.allocator.free(turn);
-        const file_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        var file_turn_id = try self.allocator.dupe(u8, "");
         defer self.allocator.free(file_turn_id);
+        if (start_immediately) {
+            const turn_params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"cwd\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(file_thread_id, .{}), std.json.fmt(cwd, .{}), std.json.fmt(skill_path, .{}), std.json.fmt(prompt, .{}) });
+            defer self.allocator.free(turn_params);
+            const turn = try actor.requestJson("turn/start", turn_params, null);
+            defer self.allocator.free(turn);
+            self.allocator.free(file_turn_id);
+            file_turn_id = try extractString(self.allocator, turn, &.{ "turn", "id" });
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
         const session_id = try std.fmt.allocPrint(self.allocator, "ses-{d}", .{self.next_session_id});
+        errdefer self.allocator.free(session_id);
         self.next_session_id += 1;
-        const already_completed = self.turnCompletedLocked(file_turn_id);
-        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = try self.allocator.dupe(u8, file_thread_id), .turn_id = try self.allocator.dupe(u8, file_turn_id), .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, revision), .initial_turn_active = !already_completed, .turn_active = !already_completed });
+        const already_completed = start_immediately and self.turnCompletedLocked(file_turn_id);
+        const thread_id = try self.allocator.dupe(u8, file_thread_id);
+        errdefer self.allocator.free(thread_id);
+        const turn_id = try self.allocator.dupe(u8, file_turn_id);
+        errdefer self.allocator.free(turn_id);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_revision = try self.allocator.dupe(u8, revision);
+        errdefer self.allocator.free(owned_revision);
+        const pending_prompt = if (start_immediately) null else try self.allocator.dupe(u8, prompt);
+        errdefer if (pending_prompt) |value| self.allocator.free(value);
+        const pending_skill = if (start_immediately) null else try self.allocator.dupe(u8, skill_path);
+        errdefer if (pending_skill) |value| self.allocator.free(value);
+        try self.sessions.append(self.allocator, .{ .id = session_id, .thread_id = thread_id, .turn_id = turn_id, .path = owned_path, .revision = owned_revision, .initial_turn_active = start_immediately and !already_completed, .turn_active = start_immediately and !already_completed, .pending_initial_prompt = pending_prompt, .pending_skill_path = pending_skill });
         return .{ .reused = false, .session_id = try self.allocator.dupe(u8, session_id), .allocator = self.allocator };
     }
 
     pub fn message(self: *Registry, session_id: []const u8, text: []const u8, active: bool) !void {
         self.mutex.lock();
+        var locked = true;
+        errdefer if (locked) self.mutex.unlock();
         if (self.synchronizing) {
             self.mutex.unlock();
+            locked = false;
             return error.WorktreeSynchronizationActive;
         }
         var thread_id: ?[]u8 = null;
         var turn_id: ?[]u8 = null;
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id) and session.status != .closed) {
+        var initial_prompt: ?[]u8 = null;
+        var skill_path: ?[]u8 = null;
+        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id) and session.status != .closed) {
             thread_id = try self.allocator.dupe(u8, session.thread_id);
             turn_id = try self.allocator.dupe(u8, session.turn_id);
+            initial_prompt = if (session.pending_initial_prompt) |value| try self.allocator.dupe(u8, value) else null;
+            skill_path = if (session.pending_skill_path) |value| try self.allocator.dupe(u8, value) else null;
+            if (session.pending_initial_prompt != null) {
+                session.initial_turn_active = true;
+                session.human_authority = null;
+            }
             break;
         };
         self.mutex.unlock();
+        locked = false;
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         defer if (thread_id) |v| self.allocator.free(v);
         defer if (turn_id) |v| self.allocator.free(v);
-        const method = if (active) "turn/steer" else "turn/start";
-        const params = try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"expectedTurnId\":{f},\"input\":[{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(thread_id orelse return error.UnknownSession, .{}), std.json.fmt(turn_id orelse "", .{}), std.json.fmt(text, .{}) });
+        defer if (initial_prompt) |v| self.allocator.free(v);
+        defer if (skill_path) |v| self.allocator.free(v);
+        const first_turn = initial_prompt != null;
+        const method = if (active and !first_turn) "turn/steer" else "turn/start";
+        const combined = if (initial_prompt) |prompt| try std.fmt.allocPrint(self.allocator, "{s}\n\nThe human opened this idle session and now says:\n{s}", .{ prompt, text }) else try self.allocator.dupe(u8, text);
+        defer self.allocator.free(combined);
+        const params = if (first_turn)
+            try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"input\":[{{\"type\":\"skill\",\"name\":\"synoptic\",\"path\":{f}}},{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(thread_id orelse return error.UnknownSession, .{}), std.json.fmt(skill_path.?, .{}), std.json.fmt(combined, .{}) })
+        else
+            try std.fmt.allocPrint(self.allocator, "{{\"threadId\":{f},\"expectedTurnId\":{f},\"input\":[{{\"type\":\"text\",\"text\":{f}}}]}}", .{ std.json.fmt(thread_id orelse return error.UnknownSession, .{}), std.json.fmt(turn_id orelse "", .{}), std.json.fmt(combined, .{}) });
         defer self.allocator.free(params);
         const response = try actor.requestJson(method, params, null);
         defer self.allocator.free(response);
-        if (!active) {
+        if (!active or first_turn) {
             const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -376,6 +428,10 @@ pub const Registry = struct {
                     self.allocator.free(session.turn_id);
                     session.turn_id = next_turn;
                     session.turn_active = !self.turnCompletedLocked(next_turn);
+                    if (session.pending_initial_prompt) |value| self.allocator.free(value);
+                    if (session.pending_skill_path) |value| self.allocator.free(value);
+                    session.pending_initial_prompt = null;
+                    session.pending_skill_path = null;
                     return;
                 }
             }
@@ -697,7 +753,7 @@ test "worktree integrity synchronization waits for commands and times out bounde
 test "worktree integrity synchronization freezes new file and message work" {
     var registry = Registry{ .allocator = std.testing.allocator, .synchronizing = true };
     defer registry.deinit();
-    try std.testing.expectError(error.WorktreeSynchronizationActive, registry.openFile(std.testing.io, "/repo", "a", "r", "b", "h", "", "[]", "/skill/SKILL.md"));
+    try std.testing.expectError(error.WorktreeSynchronizationActive, registry.openFile(std.testing.io, "/repo", "a", "r", "b", "h", "", "[]", "/skill/SKILL.md", true));
     try std.testing.expectError(error.WorktreeSynchronizationActive, registry.message("missing", "hello", false));
 }
 

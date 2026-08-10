@@ -61,8 +61,8 @@ pub fn isClean(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !bool 
     return status.len == 0;
 }
 
-pub fn select(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, head_ref: []const u8, head_oid: []const u8, managed_path: []const u8) !Custody {
-    if (try isClean(io, allocator, cwd)) {
+pub fn select(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, head_ref: []const u8, head_oid: []const u8, managed_path: []const u8, prefer_current_pr_checkout: bool) !Custody {
+    if (prefer_current_pr_checkout and try isClean(io, allocator, cwd)) {
         const head = try gitOutput(allocator, io, cwd, &.{ "git", "rev-parse", "HEAD" }, error.WorktreeHeadReadFailed);
         defer allocator.free(head);
         const branch = try gitOutput(allocator, io, cwd, &.{ "git", "branch", "--show-current" }, error.WorktreeBranchReadFailed);

@@ -70,7 +70,11 @@ pub const Broker = struct {
     }
 
     pub fn markViewed(self: Broker, pull_request_id: []const u8, path: []const u8) !void {
-        const vars = try std.fmt.allocPrint(self.allocator, "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"clientMutationId\":\"synoptic-complete\"}}}}", .{ std.json.fmt(pull_request_id, .{}), std.json.fmt(path, .{}) });
+        return self.markViewedWithId(pull_request_id, path, "synoptic-complete");
+    }
+
+    pub fn markViewedWithId(self: Broker, pull_request_id: []const u8, path: []const u8, client_mutation_id: []const u8) !void {
+        const vars = try std.fmt.allocPrint(self.allocator, "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(pull_request_id, .{}), std.json.fmt(path, .{}), std.json.fmt(client_mutation_id, .{}) });
         defer self.allocator.free(vars);
         const response = try self.call(graphql.mark_viewed_mutation, vars);
         defer self.allocator.free(response);

@@ -59,6 +59,16 @@ files to the selected head and removes only artifacts created after its baseline
 reused custody never cleans user content and advances only through a clean
 fast-forward of the original PR branch.
 
+The native process validates `assets/exclusions.json` from the skill package and
+loads the optional `${XDG_CONFIG_HOME:-$HOME/.config}/synoptic/config.toml`.
+The supported settings are limited to file-session immediate/idle start,
+browser opening, current-checkout preference, and exclusion enable/add/remove
+globs. Strong excluded-file matches are marked viewed immediately and disappear
+only after a same-head `VIEWED` read-back; failures remain queued with their
+stable exclusion reason and synchronization error. Idle sessions retain the
+same server-owned diff, thread evidence, skill item, and role instructions for
+their first human-started turn.
+
 Runtime receipts contain only operational identity and launch data. They never
 contain tabs, conversations, action cards, or review state. After stop or a
 machine/process restart, Synoptic rebuilds the queue from GitHub and creates

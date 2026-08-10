@@ -59,6 +59,8 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
     const options = try parseLaunch(args);
     try config.validateManifest(allocator, io, options.skill_root);
+    var settings = try config.Settings.load(allocator, io, environment, options.skill_root);
+    defer settings.deinit();
     const runtime_root = try runtimeRootAlloc(allocator, environment);
     defer allocator.free(runtime_root);
     try std.Io.Dir.cwd().createDirPath(io, runtime_root);
@@ -126,7 +128,7 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     defer ready.deinit();
     if (!try verifiedProcess(allocator, io, ready)) return error.InvalidLaunchReadiness;
     try writeOperationalFile(allocator, io, current_path, ready.raw);
-    if (!options.no_browser) openBrowser(allocator, io, ready.url) catch |err| {
+    if (!options.no_browser and settings.browser_open) openBrowser(allocator, io, ready.url) catch |err| {
         removeCurrentIfLaunch(allocator, io, current_path, launch_id);
         return err;
     };
@@ -151,6 +153,8 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
     const options = try parseLaunch(args);
     try config.validateManifest(allocator, io, options.skill_root);
+    var settings = try config.Settings.load(allocator, io, environment, options.skill_root);
+    defer settings.deinit();
     const gh_path = environment.get("SYNOPTIC_GH") orelse "gh";
     const codex_path = environment.get("SYNOPTIC_CODEX") orelse "codex";
     const gh_resolved = try @import("cas_runtime").resolveExecutableAlloc(allocator, gh_path);
@@ -193,7 +197,7 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
 
     const managed_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "worktree" });
     defer allocator.free(managed_path);
-    var custody = try worktree.select(allocator, io, options.cwd, head_ref, snapshot_head, managed_path);
+    var custody = try worktree.select(allocator, io, options.cwd, head_ref, snapshot_head, managed_path, settings.worktree_prefer_current_pr_checkout);
     defer allocator.free(custody.path());
     const review_cwd = custody.path();
     try hydrateRevisionKeys(allocator, io, review_cwd, snapshot_base, &generation);
@@ -201,10 +205,17 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer worktree_baseline.deinit();
     var state = try App.init(allocator, snapshot_head);
     state.replaceGeneration(generation);
+    state.file_review_start_mode = settings.file_review_start_mode;
     defer state.deinit();
 
     var registry = try sessions.Registry.start(allocator, io, review_cwd, codex_resolved);
     defer registry.deinit();
+    var exclusion_outcomes = try state.applyAutomaticExclusions(&settings, broker, identity.owner, identity.repository, identity.number, pull_request_id, review_cwd);
+    defer {
+        for (exclusion_outcomes.items) |outcome| outcome.deinit();
+        exclusion_outcomes.deinit(allocator);
+    }
+    try http.queueExclusionEvents(&registry, exclusion_outcomes.items);
     try registry.setGenerationEvidence(&state.generation);
     const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
     defer allocator.free(skill_path);
@@ -227,7 +238,7 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     const ready_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "ready.json" });
     defer allocator.free(ready_path);
     try writeOperationalFile(allocator, io, ready_path, receipt);
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .baseline = &worktree_baseline, .launch_id = launch_id };
+    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .baseline = &worktree_baseline, .settings = &settings, .launch_id = launch_id };
     const stop_request_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "stop.request" });
     defer allocator.free(stop_request_path);
     var terminal_error: ?anyerror = null;
@@ -435,7 +446,8 @@ fn launchRemediation(err: anyerror) []const u8 {
         error.GitHubAuthenticationFailed => "Run gh auth login for the target GitHub host, then retry.",
         error.PullRequestResolutionFailed => "Run gh pr view successfully from the checkout or pass a valid --pr selector.",
         error.BaseFetchFailed, error.ManagedWorktreeFetchFailed => "Ensure the PR base and head objects are fetchable from origin.",
-        error.InvalidUiManifest => "Install a Synoptic skill package compatible with synoptic-ui/v1.",
+        error.InvalidUiManifest, error.InvalidExclusionsManifest => "Install a Synoptic skill package with valid synoptic-ui/v1 and synoptic-exclusions/v1 assets.",
+        error.InvalidSynopticConfig => "Correct the supported Synoptic settings in config.toml, then retry.",
         else => "Inspect the exact reason and retry after correcting the dependency or repository state.",
     };
 }

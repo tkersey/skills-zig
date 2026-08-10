@@ -445,6 +445,210 @@ fn runGit(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []con
     return result.stdout;
 }
 
+test "exclusions config XDG precedence and strong classification" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill/assets");
+    try tmp.dir.createDirPath(io, "xdg/synoptic");
+    try tmp.dir.createDirPath(io, "home/.config/synoptic");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/exclusions.json", .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{\"reason\":\"lockfile\",\"globs\":[\"package-lock.json\"]},{\"reason\":\"vendored\",\"globs\":[\"vendor/**\"]},{\"reason\":\"snapshot\",\"globs\":[\"**/__snapshots__/**\"]}]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "xdg/synoptic/config.toml", .data = "[file_review]\nstart_mode = \"idle\"\n[browser]\nopen = false\n[worktree]\nprefer_current_pr_checkout = false\n[exclusions]\nenabled = true\nadditional_globs = [\"docs/generated/**\"]\nremoved_default_globs = [\"package-lock.json\"]\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/synoptic/config.toml", .data = "[file_review]\nstart_mode = \"immediate\"\n[browser]\nopen = true\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
+    defer allocator.free(skill);
+    const xdg = try std.fs.path.join(allocator, &.{ root, "xdg" });
+    defer allocator.free(xdg);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_CONFIG_HOME", xdg);
+    try environment.put("HOME", home);
+    var settings = try config.Settings.load(allocator, io, &environment, skill);
+    defer settings.deinit();
+    try std.testing.expectEqual(config.FileReviewStartMode.idle, settings.file_review_start_mode);
+    try std.testing.expect(!settings.browser_open);
+    try std.testing.expect(!settings.worktree_prefer_current_pr_checkout);
+    try std.testing.expect(settings.classify("package-lock.json", "@@ text") == null);
+    try std.testing.expectEqualStrings("vendored", settings.classify("vendor/lib/a.js", "@@ text").?);
+    try std.testing.expectEqualStrings("configured-glob", settings.classify("docs/generated/api.md", "@@ text").?);
+    try std.testing.expectEqualStrings("binary", settings.classify("assets/photo.dat", "GIT binary patch").?);
+    try std.testing.expect(settings.classify("src/very-large.zig", "@@ ordinary source") == null);
+    settings.exclusions_enabled = false;
+    try std.testing.expect(settings.classify("vendor/lib/a.js", "GIT binary patch") == null);
+}
+
+test "exclusions config worktree preference can force managed custody without weakening cleanliness" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/a.zig", .data = "clean\n" });
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "switch", "-qc", "feature" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        const output = try runGit(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const output = try runGit(allocator, io, repo, &.{ "git", "remote", "add", "origin", repo });
+    allocator.free(output);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const unused = try std.fs.path.join(allocator, &.{ root, "unused" });
+    defer allocator.free(unused);
+    const reused = try worktree.select(allocator, io, repo, "feature", head, unused, true);
+    defer allocator.free(reused.path());
+    try std.testing.expect(reused == .reused_current);
+    const managed_path = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed_path);
+    const managed = try worktree.select(allocator, io, repo, "feature", head, managed_path, false);
+    defer allocator.free(managed.path());
+    try std.testing.expect(managed == .managed);
+}
+
+test "exclusions config mutation readback and failure retention across generations" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill/assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/exclusions.json", .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{\"reason\":\"lockfile\",\"globs\":[\"package-lock.json\"]},{\"reason\":\"vendored\",\"globs\":[\"vendor/**\"]}]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-lock.json", .data = "base\n" });
+    try tmp.dir.createDirPath(io, "vendor");
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/fail.js", .data = "base\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/ambiguous.js", .data = "base\n" });
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/large.zig", .data = "base\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "base" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    const base_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-lock.json", .data = "head\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/fail.js", .data = "head\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/ambiguous.js", .data = "head\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/large.zig", .data = "head\n" });
+    for ([_][]const []const u8{ &.{ "git", "add", "." }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        const output = try runGit(allocator, io, root, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const state_path = try std.fs.path.join(allocator, &.{ root, "gh.state" });
+    defer allocator.free(state_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "gh.log" });
+    defer allocator.free(log_path);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh" });
+    defer allocator.free(gh_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(cat)\nprintf '%s\\n%s\\n' \"$*\" \"$input\" >> {s}\nif printf '%s' \"$input\" | grep -q SynopticMarkFileViewed; then\n  if printf '%s' \"$input\" | grep -q 'vendor/fail.js'; then exit 1; fi\n  if printf '%s' \"$input\" | grep -q 'vendor/ambiguous.js'; then printf '%s\\n' ambiguous >> {s}; exit 1; fi\n  printf '%s\\n' package >> {s}\n  printf '%s\\n' '{{\"data\":{{\"markFileAsViewed\":{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'\n  exit 0\nfi\npackage_viewed=UNVIEWED\nambiguous_viewed=UNVIEWED\n[ -f {s} ] && grep -q package {s} && package_viewed=VIEWED\n[ -f {s} ] && grep -q ambiguous {s} && ambiguous_viewed=VIEWED\nprintf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"{s}\",\"files\":{{\"nodes\":[{{\"path\":\"package-lock.json\",\"viewerViewedState\":\"%s\"}},{{\"path\":\"vendor/fail.js\",\"viewerViewedState\":\"UNVIEWED\"}},{{\"path\":\"vendor/ambiguous.js\",\"viewerViewedState\":\"%s\"}},{{\"path\":\"src/large.zig\",\"viewerViewedState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}}}\\n' \"$package_viewed\" \"$ambiguous_viewed\"\n",
+        .{ log_path, state_path, state_path, state_path, state_path, state_path, state_path, head },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
+    defer allocator.free(skill);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var settings = try config.Settings.load(allocator, io, &environment, skill);
+    defer settings.deinit();
+    var state = try app.App.init(allocator, head);
+    defer state.deinit();
+    var generation = try domain.PrGeneration.initFull(allocator, base, head);
+    try generation.addFile(.{ .path = "package-lock.json", .viewed = .unviewed, .revision_key = "r1" });
+    try generation.addFile(.{ .path = "vendor/fail.js", .viewed = .unviewed, .revision_key = "r2" });
+    try generation.addFile(.{ .path = "vendor/ambiguous.js", .viewed = .unviewed, .revision_key = "r3" });
+    try generation.addFile(.{ .path = "src/large.zig", .viewed = .unviewed, .revision_key = "r4" });
+    state.replaceGeneration(generation);
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    var outcomes = try state.applyAutomaticExclusions(&settings, broker, "o", "r", 1, "PR_1", root);
+    defer {
+        for (outcomes.items) |outcome| outcome.deinit();
+        outcomes.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 3), outcomes.items.len);
+    try std.testing.expect(!state.generation.queued("package-lock.json"));
+    try std.testing.expect(state.generation.queued("vendor/fail.js"));
+    try std.testing.expect(!state.generation.queued("vendor/ambiguous.js"));
+    try std.testing.expect(state.generation.queued("src/large.zig"));
+    try std.testing.expect(state.generation.files.items[1].exclusion_sync_error != null);
+    try std.testing.expect(state.generation.files.items[2].exclusion_sync_error == null);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "api graphql --hostname github.com --input -") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "synoptic-auto-exclusion") != null);
+
+    var refreshed = try domain.PrGeneration.initFull(allocator, base, head);
+    try refreshed.addFile(.{ .path = "package-lock.json", .viewed = .unviewed, .revision_key = "r4" });
+    state.replaceGeneration(refreshed);
+    var refreshed_outcomes = try state.applyAutomaticExclusions(&settings, broker, "o", "r", 1, "PR_1", root);
+    defer {
+        for (refreshed_outcomes.items) |outcome| outcome.deinit();
+        refreshed_outcomes.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), refreshed_outcomes.items.len);
+    try std.testing.expect(!state.generation.queued("package-lock.json"));
+}
+
+test "exclusions config immediate and idle sessions preserve canonical context" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDirPath(io, "skill/references");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "skill" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/file-review.md", .data = "file role" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/github-actions.md", .data = "actions" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/untrusted-repository-content.md", .data = "untrusted" });
+    const codex_path = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(codex_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-codex", .data = fakeCodexScript() });
+    try std.Io.Dir.cwd().setFilePermissions(io, codex_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const skill_path = try std.fs.path.join(allocator, &.{ root, "skill", "SKILL.md" });
+    defer allocator.free(skill_path);
+    var registry = try sessions.Registry.start(allocator, io, root, codex_path);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const idle = try registry.openFile(io, root, "idle.zig", "r1", "base", "head", "canonical idle diff", "[]", skill_path, false);
+    defer idle.deinit();
+    var identity = try registry.sessionIdentity(idle.session_id);
+    try std.testing.expectEqualStrings("", identity.turn_id);
+    identity.deinit();
+    try registry.markHumanInstruction(idle.session_id, "post this comment");
+    try registry.message(idle.session_id, "review it", false);
+    try std.testing.expect(registry.sessions.items[0].human_authority == null);
+    identity = try registry.sessionIdentity(idle.session_id);
+    try std.testing.expect(identity.turn_id.len > 0);
+    identity.deinit();
+    const immediate = try registry.openFile(io, root, "immediate.zig", "r2", "base", "head", "canonical immediate diff", "[]", skill_path, true);
+    defer immediate.deinit();
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{codex_path});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "canonical idle diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "review it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "canonical immediate diff") != null);
+}
+
 test "worktree integrity managed cleanup restores tracked and removes only review artifacts" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -651,7 +855,7 @@ test "worktree integrity dirty launch selects managed custody" {
     defer allocator.free(tmp_root);
     const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
     defer allocator.free(managed);
-    const custody = try worktree.select(allocator, io, repo, "feature", head, managed);
+    const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
 }
@@ -733,6 +937,7 @@ test "e2e real child lifecycle returns ready, verifies identity, stops, and reco
     try tmp.dir.createDirPath(io, "skill/references");
     try tmp.dir.createDirPath(io, "runtime");
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/manifest.json", .data = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":\"synoptic-ui/v1\",\"requiredSkillAbi\":\"synoptic-skill-abi/v1\",\"entry\":\"index.html\",\"assets\":[\"app.css\",\"app.js\"]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/exclusions.json", .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{\"reason\":\"lockfile\",\"globs\":[\"package-lock.json\"]}]}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/index.html", .data = "<!doctype html><title>fixture</title>" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "# fixture" });
     try tmp.dir.writeFile(io, .{ .sub_path = "skill/references/primary-context.md", .data = "primary role" });

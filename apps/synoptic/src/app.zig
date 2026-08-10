@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config.zig");
 const domain = @import("domain.zig");
 const github = @import("github.zig");
 const pr = @import("pr.zig");
@@ -6,6 +7,19 @@ const sessions = @import("sessions.zig");
 const tools = @import("tools.zig");
 const ui = @import("ui_protocol.zig");
 const worktree = @import("worktree.zig");
+
+pub const ExclusionOutcome = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    reason: []u8,
+    sync_error: ?[]u8 = null,
+
+    pub fn deinit(self: ExclusionOutcome) void {
+        self.allocator.free(self.path);
+        self.allocator.free(self.reason);
+        if (self.sync_error) |value| self.allocator.free(value);
+    }
+};
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -21,6 +35,7 @@ pub const App = struct {
     action_store: tools.ActionStore,
     round: u64 = 1,
     action_state_fresh: bool = true,
+    file_review_start_mode: config.FileReviewStartMode = .immediate,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{ .allocator = allocator, .generation = try .init(allocator, head), .action_store = .{ .allocator = allocator } };
@@ -58,7 +73,7 @@ pub const App = struct {
             self.official_revision = try self.allocator.dupe(u8, file.revision_key);
             break;
         };
-        self.initial_review_active = true;
+        self.initial_review_active = self.file_review_start_mode == .immediate;
         var existing = false;
         for (self.tabs.items) |tab| {
             if (tab.status == .current and std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, self.official_revision.?)) existing = true;
@@ -68,7 +83,7 @@ pub const App = struct {
             try self.tabs.append(self.allocator, .{ .id = id, .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, self.official_revision.?) });
         }
         self.seq += 1;
-        const payload = try std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"initialReview\":true}}", .{std.json.fmt(path, .{})});
+        const payload = try std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"initialReview\":{}}}", .{ std.json.fmt(path, .{}), self.file_review_start_mode == .immediate });
         defer self.allocator.free(payload);
         return ui.envelopeAlloc(self.allocator, "session.opened", self.seq, payload);
     }
@@ -183,6 +198,47 @@ pub const App = struct {
         return self.round;
     }
 
+    pub fn applyAutomaticExclusions(self: *App, settings: *const config.Settings, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, cwd: []const u8) !std.ArrayList(ExclusionOutcome) {
+        var outcomes: std.ArrayList(ExclusionOutcome) = .empty;
+        errdefer {
+            for (outcomes.items) |outcome| outcome.deinit();
+            outcomes.deinit(self.allocator);
+        }
+        for (0..self.generation.files.items.len) |index| {
+            if (!settings.exclusions_enabled) break;
+            const file = self.generation.files.items[index];
+            if (file.viewed == .viewed) continue;
+            const reason = settings.classifyPath(file.path) orelse binary: {
+                const diff = github.canonicalDiffAlloc(self.allocator, broker.io, cwd, self.generation.base_oid, self.generation.head_oid, file.path) catch continue;
+                defer self.allocator.free(diff);
+                break :binary settings.classifyDiff(diff) orelse continue;
+            };
+            const client_mutation_id = try exclusionMutationIdAlloc(self.allocator, file.path, file.revision_key);
+            defer self.allocator.free(client_mutation_id);
+            var mutation_error: ?[]const u8 = null;
+            broker.markViewedWithId(pull_request_id, file.path, client_mutation_id) catch |err| {
+                mutation_error = @errorName(err);
+            };
+            var readback_error: ?[]const u8 = null;
+            const viewed = broker.viewedAfterMutation(owner, name, number, self.generation.head_oid, file.path) catch |err| blk: {
+                readback_error = @errorName(err);
+                break :blk false;
+            };
+            const sync_error: ?[]const u8 = if (viewed) null else readback_error orelse mutation_error orelse "MarkViewedReadbackFailed";
+            if (viewed) self.generation.files.items[index].viewed = .viewed;
+            try self.generation.setExclusion(file.path, reason, sync_error);
+            const outcome_path = try self.allocator.dupe(u8, file.path);
+            errdefer self.allocator.free(outcome_path);
+            const outcome_reason = try self.allocator.dupe(u8, reason);
+            errdefer self.allocator.free(outcome_reason);
+            const outcome_error = if (sync_error) |value| try self.allocator.dupe(u8, value) else null;
+            errdefer if (outcome_error) |value| self.allocator.free(value);
+            const outcome = ExclusionOutcome{ .allocator = self.allocator, .path = outcome_path, .reason = outcome_reason, .sync_error = outcome_error };
+            try outcomes.append(self.allocator, outcome);
+        }
+        return outcomes;
+    }
+
     pub fn bootstrapAlloc(self: *App) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer out.deinit();
@@ -191,7 +247,7 @@ pub const App = struct {
         for (self.generation.files.items) |file| if (file.viewed != .viewed) {
             if (!first) try out.writer.writeByte(',');
             first = false;
-            try out.writer.print("{{\"path\":{f},\"additions\":{d},\"deletions\":{d}}}", .{ std.json.fmt(file.path, .{}), file.additions, file.deletions });
+            try out.writer.print("{{\"path\":{f},\"additions\":{d},\"deletions\":{d},\"exclusionReason\":{f},\"exclusionSyncError\":{f}}}", .{ std.json.fmt(file.path, .{}), file.additions, file.deletions, std.json.fmt(file.exclusion_reason, .{}), std.json.fmt(file.exclusion_sync_error, .{}) });
         };
         try out.writer.print("],\"tabs\":[", .{});
         for (self.tabs.items, 0..) |tab, i| {
@@ -209,6 +265,16 @@ pub const App = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn exclusionMutationIdAlloc(allocator: std.mem.Allocator, path: []const u8, revision: []const u8) ![]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(path);
+    hash.update(&.{0});
+    hash.update(revision);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.allocPrint(allocator, "synoptic-auto-exclusion-{x}", .{digest});
+}
 
 test "close and completion are different transitions" {
     var app = try App.init(std.testing.allocator, "h");

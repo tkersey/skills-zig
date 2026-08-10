@@ -49,6 +49,8 @@ pub const File = struct {
     change_type: []const u8 = "MODIFIED",
     viewed: ViewedState,
     revision_key: []const u8,
+    exclusion_reason: ?[]const u8 = null,
+    exclusion_sync_error: ?[]const u8 = null,
 };
 
 pub const PrGeneration = struct {
@@ -70,6 +72,8 @@ pub const PrGeneration = struct {
             self.allocator.free(file.path);
             self.allocator.free(file.revision_key);
             self.allocator.free(file.change_type);
+            if (file.exclusion_reason) |value| self.allocator.free(value);
+            if (file.exclusion_sync_error) |value| self.allocator.free(value);
         }
         self.files.deinit(self.allocator);
         for (self.threads.items) |thread| {
@@ -81,13 +85,25 @@ pub const PrGeneration = struct {
     }
 
     pub fn addFile(self: *PrGeneration, file: File) !void {
+        const path = try self.allocator.dupe(u8, file.path);
+        errdefer self.allocator.free(path);
+        const change_type = try self.allocator.dupe(u8, file.change_type);
+        errdefer self.allocator.free(change_type);
+        const revision_key = try self.allocator.dupe(u8, file.revision_key);
+        errdefer self.allocator.free(revision_key);
+        const exclusion_reason = if (file.exclusion_reason) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (exclusion_reason) |value| self.allocator.free(value);
+        const exclusion_sync_error = if (file.exclusion_sync_error) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (exclusion_sync_error) |value| self.allocator.free(value);
         try self.files.append(self.allocator, .{
-            .path = try self.allocator.dupe(u8, file.path),
+            .path = path,
             .additions = file.additions,
             .deletions = file.deletions,
-            .change_type = try self.allocator.dupe(u8, file.change_type),
+            .change_type = change_type,
             .viewed = file.viewed,
-            .revision_key = try self.allocator.dupe(u8, file.revision_key),
+            .revision_key = revision_key,
+            .exclusion_reason = exclusion_reason,
+            .exclusion_sync_error = exclusion_sync_error,
         });
     }
 
@@ -160,6 +176,20 @@ pub const PrGeneration = struct {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
             self.allocator.free(file.revision_key);
             file.revision_key = try self.allocator.dupe(u8, revision);
+            return;
+        };
+        return error.UnknownFile;
+    }
+
+    pub fn setExclusion(self: *PrGeneration, path: []const u8, reason: []const u8, sync_error: ?[]const u8) !void {
+        for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
+            const owned_reason = try self.allocator.dupe(u8, reason);
+            errdefer self.allocator.free(owned_reason);
+            const owned_error = if (sync_error) |value| try self.allocator.dupe(u8, value) else null;
+            if (file.exclusion_reason) |value| self.allocator.free(value);
+            if (file.exclusion_sync_error) |value| self.allocator.free(value);
+            file.exclusion_reason = owned_reason;
+            file.exclusion_sync_error = owned_error;
             return;
         };
         return error.UnknownFile;
