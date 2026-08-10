@@ -251,7 +251,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Install and fingerprint exact Codex 0.146.0
+      # This exact release is a reproducible compatibility fixture, not a
+      # minimum supported Codex version or an admission rule.
+      - name: Install reproducible Codex compatibility fixture
         shell: bash
         env:
           CODEX_ASSET: ${{ matrix.codex_asset }}
@@ -330,7 +332,7 @@ jobs:
           } | tee "${evidence}"
 
           {
-            echo "### CAS Codex 0.146.0 evidence (${CODEX_PLATFORM})"
+            echo "### CAS reproducible Codex compatibility fixture (${CODEX_PLATFORM})"
             echo '```text'
             cat "${evidence}"
             echo '```'
@@ -391,8 +393,8 @@ jobs:
           esac
           apps/cas/testdata/automation/cron-0.2.13/verify.sh \
             ./zig-out/bin/cas automation
-      - name: Verify exact Codex 0.146.0 app-server contract
-        run: .github/scripts/test_cas_app_server_preflight_0146.sh "${CODEX_BIN}"
+      - name: Verify Codex app-server capability contract
+        run: .github/scripts/test_cas_app_server_preflight.sh "${CODEX_BIN}"
       - name: Verify packaged Linux CAS dispatcher layout
         if: matrix.platform == 'linux-x86_64'
         run: |

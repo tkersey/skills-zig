@@ -19,13 +19,9 @@ const max_binary_bytes: u64 = 512 * 1024 * 1024;
 const max_manifest_bytes: usize = 64 * 1024;
 
 pub const CodexVersion = struct {
-    major: u64,
-    minor: u64,
-    patch: u64,
     text: []u8,
     banner: []u8,
     pre: ?[]const u8,
-    build: ?[]const u8,
 
     pub fn deinit(self: *CodexVersion, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -269,7 +265,8 @@ fn ensureSchemaCacheLocked(
 ) !CachedSchemas {
     // Bind the generation to the identity and banner observed after lock acquisition.
     try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
-    const paths = try CachePaths.init(allocator, executable_root, version.text);
+    const binary_hex = identity.binary_digest["sha256:".len..];
+    const paths = try CachePaths.init(allocator, executable_root, binary_hex);
     errdefer paths.deinit(allocator);
 
     if (!options.refresh) {
@@ -433,49 +430,36 @@ fn absoluteCacheRootAlloc(allocator: std.mem.Allocator, io: std.Io, raw: []const
 }
 
 fn parseCodexVersion(allocator: std.mem.Allocator, raw: []const u8) !CodexVersion {
-    if (raw.len == 0 or raw[raw.len - 1] != '\n' or std.mem.countScalar(u8, raw, '\n') != 1 or
-        std.mem.indexOfScalar(u8, raw, '\r') != null)
-        return error.InvalidCodexVersion;
-    const banner = raw[0 .. raw.len - 1];
+    if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidCodexVersion;
+    const banner = std.mem.trim(u8, raw, " \t\r\n");
+    if (banner.len == 0) return error.InvalidCodexVersion;
     const prefix = "codex-cli ";
-    if (!std.mem.startsWith(u8, banner, prefix)) return error.InvalidCodexVersion;
-    const semver = banner[prefix.len..];
-    if (semver.len == 0 or std.mem.indexOfScalar(u8, semver, ' ') != null or
-        std.mem.indexOfScalar(u8, semver, '\t') != null)
-        return error.InvalidCodexVersion;
-
-    const plus = std.mem.indexOfScalar(u8, semver, '+');
-    const without_build = if (plus) |index| semver[0..index] else semver;
-    const dash = std.mem.indexOfScalar(u8, without_build, '-');
-    const core = if (dash) |index| without_build[0..index] else without_build;
-    const pre_slice = if (dash) |index| without_build[index + 1 ..] else null;
-    const build_slice = if (plus) |index| semver[index + 1 ..] else null;
-    if ((pre_slice != null and !validSemverIdentifiers(pre_slice.?)) or
-        (build_slice != null and !validSemverIdentifiers(build_slice.?)))
-        return error.InvalidCodexVersion;
-    var parts = std.mem.splitScalar(u8, core, '.');
-    const major_text = parts.next() orelse return error.InvalidCodexVersion;
-    const minor_text = parts.next() orelse return error.InvalidCodexVersion;
-    const patch_text = parts.next() orelse return error.InvalidCodexVersion;
-    if (parts.next() != null or
-        !validCoreNumber(major_text) or
-        !validCoreNumber(minor_text) or
-        !validCoreNumber(patch_text))
-        return error.InvalidCodexVersion;
-
-    const owned_text = try allocator.dupe(u8, semver);
+    const diagnostic = if (std.mem.startsWith(u8, banner, prefix) and banner.len > prefix.len)
+        banner[prefix.len..]
+    else
+        banner;
+    const owned_text = try allocator.dupe(u8, diagnostic);
     errdefer allocator.free(owned_text);
-    const pre = if (dash) |index| owned_text[index + 1 .. (plus orelse semver.len)] else null;
-    const build = if (plus) |index| owned_text[index + 1 ..] else null;
     return .{
-        .major = std.fmt.parseUnsigned(u64, major_text, 10) catch return error.InvalidCodexVersion,
-        .minor = std.fmt.parseUnsigned(u64, minor_text, 10) catch return error.InvalidCodexVersion,
-        .patch = std.fmt.parseUnsigned(u64, patch_text, 10) catch return error.InvalidCodexVersion,
         .text = owned_text,
         .banner = try allocator.dupe(u8, banner),
-        .pre = pre,
-        .build = build,
+        .pre = semanticPrereleaseSlice(owned_text),
     };
+}
+
+fn semanticPrereleaseSlice(text: []const u8) ?[]const u8 {
+    const plus = std.mem.indexOfScalar(u8, text, '+');
+    const without_build = if (plus) |index| text[0..index] else text;
+    const dash = std.mem.indexOfScalar(u8, without_build, '-') orelse return null;
+    const core = without_build[0..dash];
+    var parts = std.mem.splitScalar(u8, core, '.');
+    const major = parts.next() orelse return null;
+    const minor = parts.next() orelse return null;
+    const patch = parts.next() orelse return null;
+    if (parts.next() != null or !validCoreNumber(major) or !validCoreNumber(minor) or
+        !validCoreNumber(patch)) return null;
+    const value = without_build[dash + 1 ..];
+    return if (validSemverIdentifiers(value)) value else null;
 }
 
 fn validCoreNumber(text: []const u8) bool {
@@ -1219,11 +1203,16 @@ pub fn inspect(
     const experimental_contract = try objectField(baseline.*, "experimental");
     var methods = try InspectionMethods.init(allocator, stable, experimental);
     defer methods.deinit(allocator);
-    const required = try RequiredMethods.init(stable_contract, experimental_contract);
-    try inspectRequiredMethods(allocator, required, &methods, profile, &report);
+    const required = try RequiredMethods.init(
+        baseline.*,
+        stable_contract,
+        experimental_contract,
+        profile,
+    );
+    try inspectRequiredMethods(allocator, required, &methods, &report);
     try inspectAdditiveMethods(allocator, required, &methods, &report);
     const policies = try objectField(baseline.*, "serverRequestPolicies");
-    try inspectServerPolicies(allocator, required, &methods, policies, &report);
+    try inspectServerPolicies(allocator, required, &methods, policies, profile, &report);
     try inspectShapesForProfile(
         allocator,
         stable_contract,
@@ -1241,6 +1230,11 @@ fn validateBaseline(root: std.json.Value) !void {
     try validateBaselineHeader(root);
     const stable = try objectField(root, "stable");
     const experimental = try objectField(root, "experimental");
+    try validateProfileRequirements(
+        try objectField(root, "profiles"),
+        stable,
+        experimental,
+    );
     try validateBaselineMethodSets(stable, experimental);
     const policies = try objectField(root, "serverRequestPolicies");
     try validateBaselinePolicies(stable, policies);
@@ -1258,6 +1252,7 @@ fn validateBaselineHeader(root: std.json.Value) !void {
     const keys = [_][]const u8{
         "schema",
         "contractId",
+        "profiles",
         "stable",
         "experimental",
         "serverRequestPolicies",
@@ -1275,6 +1270,51 @@ fn validateBaselineHeader(root: std.json.Value) !void {
         try stringField(root, "contractId"),
         app_server_contract_id,
     )) return error.InvalidContract;
+}
+
+fn validateProfileRequirements(
+    profiles: std.json.Value,
+    stable: std.json.Value,
+    experimental: std.json.Value,
+) !void {
+    const object = switch (profiles) {
+        .object => |value| value,
+        else => return error.InvalidContract,
+    };
+    if (object.count() != 4) return error.InvalidContract;
+    for ([_][]const u8{ "core", "review", "session-inquiry", "full" }) |name| {
+        const profile = try objectField(profiles, name);
+        try validateStringArray(try arrayField(profile, "stableClientMethods"));
+        try validateStringArray(try arrayField(profile, "stableServerRequests"));
+        try validateStringArray(try arrayField(profile, "stableNotifications"));
+        try validateStringArray(try arrayField(profile, "experimentalClientMethods"));
+        try requireArraySubset(
+            try arrayField(profile, "stableClientMethods"),
+            try arrayField(stable, "requiredClientMethods"),
+        );
+        try requireArraySubset(
+            try arrayField(profile, "stableServerRequests"),
+            try arrayField(stable, "requiredServerRequests"),
+        );
+        try requireArraySubset(
+            try arrayField(profile, "stableNotifications"),
+            try arrayField(stable, "requiredNotifications"),
+        );
+        try requireArraySubset(
+            try arrayField(profile, "experimentalClientMethods"),
+            try arrayField(experimental, "requiredClientMethods"),
+        );
+    }
+}
+
+fn requireArraySubset(selected: std.json.Array, complete: std.json.Array) !void {
+    for (selected.items) |item| {
+        const value = switch (item) {
+            .string => |text| text,
+            else => return error.InvalidContract,
+        };
+        if (!jsonArrayContains(complete, value)) return error.InvalidContract;
+    }
 }
 
 fn validateBaselineMethodSets(
@@ -1370,11 +1410,20 @@ const RequiredMethods = struct {
     stable_servers: std.json.Array,
     notifications: std.json.Array,
     experimental_clients: std.json.Array,
+    selected_stable_clients: std.json.Array,
+    selected_stable_servers: std.json.Array,
+    selected_notifications: std.json.Array,
+    selected_experimental_clients: std.json.Array,
+    full_snapshot: bool,
 
     fn init(
+        root: std.json.Value,
         stable_contract: std.json.Value,
         experimental_contract: std.json.Value,
+        profile: Profile,
     ) !RequiredMethods {
+        const profiles = try objectField(root, "profiles");
+        const selected = try objectField(profiles, profileName(profile));
         return .{
             .stable_clients = try arrayField(stable_contract, "requiredClientMethods"),
             .stable_servers = try arrayField(stable_contract, "requiredServerRequests"),
@@ -1383,9 +1432,26 @@ const RequiredMethods = struct {
                 experimental_contract,
                 "requiredClientMethods",
             ),
+            .selected_stable_clients = try arrayField(selected, "stableClientMethods"),
+            .selected_stable_servers = try arrayField(selected, "stableServerRequests"),
+            .selected_notifications = try arrayField(selected, "stableNotifications"),
+            .selected_experimental_clients = try arrayField(
+                selected,
+                "experimentalClientMethods",
+            ),
+            .full_snapshot = boolField(selected, "fullSnapshot") catch false,
         };
     }
 };
+
+fn profileName(profile: Profile) []const u8 {
+    return switch (profile) {
+        .core => "core",
+        .review => "review",
+        .session_inquiry => "session-inquiry",
+        .full => "full",
+    };
+}
 
 const InspectionMethods = struct {
     stable_clients: MethodSet,
@@ -1454,25 +1520,44 @@ fn inspectRequiredMethods(
     allocator: std.mem.Allocator,
     required: RequiredMethods,
     methods: *const InspectionMethods,
-    profile: Profile,
     report: *InspectionReport,
 ) !void {
+    const stable_clients = if (required.full_snapshot)
+        required.stable_clients
+    else
+        required.selected_stable_clients;
+    const stable_servers = if (required.full_snapshot)
+        required.stable_servers
+    else
+        required.selected_stable_servers;
+    const notifications = if (required.full_snapshot)
+        required.notifications
+    else
+        required.selected_notifications;
+    const experimental_clients = if (required.full_snapshot)
+        required.experimental_clients
+    else
+        required.selected_experimental_clients;
     const Comparison = struct { required: std.json.Array, actual: []const []u8 };
     const comparisons = [_]Comparison{
-        .{ .required = required.stable_clients, .actual = methods.stable_clients.items.items },
+        .{ .required = stable_clients, .actual = methods.stable_clients.items.items },
         .{
-            .required = required.stable_clients,
+            .required = stable_clients,
             .actual = methods.experimental_clients.items.items,
         },
-        .{ .required = required.stable_servers, .actual = methods.stable_servers.items.items },
+        .{ .required = stable_servers, .actual = methods.stable_servers.items.items },
         .{
-            .required = required.stable_servers,
+            .required = stable_servers,
             .actual = methods.experimental_servers.items.items,
         },
-        .{ .required = required.notifications, .actual = methods.stable_notifications.items.items },
+        .{ .required = notifications, .actual = methods.stable_notifications.items.items },
         .{
-            .required = required.notifications,
+            .required = notifications,
             .actual = methods.experimental_notifications.items.items,
+        },
+        .{
+            .required = experimental_clients,
+            .actual = methods.experimental_clients.items.items,
         },
     };
     for (comparisons) |comparison| {
@@ -1482,31 +1567,6 @@ fn inspectRequiredMethods(
             comparison.actual,
             &report.missing_required,
         );
-    }
-    switch (profile) {
-        .core, .review => {},
-        .session_inquiry => {
-            try requireMethod(
-                allocator,
-                required.experimental_clients,
-                methods.experimental_clients.items.items,
-                "thread/turns/list",
-                &report.missing_required,
-            );
-            try requireMethod(
-                allocator,
-                required.experimental_clients,
-                methods.experimental_clients.items.items,
-                "thread/items/list",
-                &report.missing_required,
-            );
-        },
-        .full => try compareRequired(
-            allocator,
-            required.experimental_clients,
-            methods.experimental_clients.items.items,
-            &report.missing_required,
-        ),
     }
 }
 
@@ -1547,10 +1607,11 @@ fn inspectServerPolicies(
     required: RequiredMethods,
     methods: *const InspectionMethods,
     policies: std.json.Value,
+    profile: Profile,
     report: *InspectionReport,
 ) !void {
     try inspectHandlerParity(allocator, policies, &report.handler_failures);
-    try comparePolicyRequired(
+    if (profile == .full) try comparePolicyRequired(
         allocator,
         policies,
         methods.experimental_servers.items.items,
@@ -2253,6 +2314,10 @@ const stable_shapes =
     \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
+const stable_profile_shapes =
+    \\{"definitions":{"ThreadStartParams":{"properties":{"developerInstructions":{"type":["string","null"]}}},"ThreadReadParams":{"properties":{"includeTurns":{"type":"boolean"}}},"ThreadResumeParams":{"type":"object","required":["threadId"]}}}
+;
+
 const experimental_shapes =
     \\{"definitions":{"ThreadForkParams":{"type":"object","required":["threadId"],"properties":{"beforeTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"},"deferGoalContinuation":{"type":"boolean"}}},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]}}}
 ;
@@ -2355,11 +2420,20 @@ fn inspectTestBundlesForProfile(
     experimental_shape_doc: []const u8,
     profile: Profile,
 ) !InspectionReport {
+    const complete_stable_shapes = try mergeDefinitionDocuments(
+        allocator,
+        stable_shape_doc,
+        stable_profile_shapes,
+    );
+    defer allocator.free(complete_stable_shapes);
     const stable_docs = [_]Document{
         .{ .name = "ClientRequest.json", .bytes = bundles.stable_client },
         .{ .name = "ServerRequest.json", .bytes = bundles.stable_server },
         .{ .name = "ServerNotification.json", .bytes = bundles.stable_notification },
-        .{ .name = "codex_app_server_protocol.v2.schemas.json", .bytes = stable_shape_doc },
+        .{
+            .name = "codex_app_server_protocol.v2.schemas.json",
+            .bytes = complete_stable_shapes,
+        },
     };
     const experimental_docs = [_]Document{
         .{ .name = "ClientRequest.json", .bytes = bundles.experimental_client },
@@ -2382,6 +2456,25 @@ fn inspectTestBundlesForProfile(
         .{ .documents = &stable_docs },
         .{ .documents = &adjusted },
         profile,
+    );
+}
+
+fn mergeDefinitionDocuments(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    supplement: []const u8,
+) ![]u8 {
+    const prefix = "{\"definitions\":{";
+    if (!std.mem.startsWith(u8, base, prefix) or !std.mem.endsWith(u8, base, "}}") or
+        !std.mem.startsWith(u8, supplement, prefix) or !std.mem.endsWith(u8, supplement, "}}"))
+        return error.InvalidJsonShape;
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"definitions\":{{{s},{s}}}}}",
+        .{
+            base[prefix.len .. base.len - 2],
+            supplement[prefix.len .. supplement.len - 2],
+        },
     );
 }
 
@@ -2516,13 +2609,24 @@ fn containsProfile(profiles: []const Profile, expected: Profile) bool {
 test "stable obligations remain fail closed within their selected profiles" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
-    try expectMethodDriftAllProfiles(
+    try expectMethodDriftProfiles(
         &baseline.value,
         .stable_client,
         "externalAgentConfig/import/recordHistory",
+        &.{.full},
     );
-    try expectMethodDriftAllProfiles(&baseline.value, .experimental_server, "currentTime/read");
-    try expectMethodDriftAllProfiles(&baseline.value, .stable_notification, "error");
+    try expectMethodDriftProfiles(
+        &baseline.value,
+        .stable_client,
+        "review/start",
+        &.{ .review, .full },
+    );
+    try expectMethodDriftProfiles(
+        &baseline.value,
+        .stable_notification,
+        "error",
+        &.{.full},
+    );
     try expectStableShapeProfiles(
         &baseline.value,
         "experimentalApi",
@@ -2536,10 +2640,11 @@ test "stable obligations remain fail closed within their selected profiles" {
 
 const TestMethodSurface = enum { stable_client, experimental_server, stable_notification };
 
-fn expectMethodDriftAllProfiles(
+fn expectMethodDriftProfiles(
     baseline: *const std.json.Value,
     surface: TestMethodSurface,
     method: []const u8,
+    required_profiles: []const Profile,
 ) !void {
     for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
         var bundles = try makeTestBundles(std.testing.allocator, baseline.*);
@@ -2561,7 +2666,11 @@ fn expectMethodDriftAllProfiles(
             profile,
         );
         defer report.deinit(std.testing.allocator);
-        try std.testing.expectEqual(Status.incompatible, report.status);
+        const expected: Status = if (containsProfile(required_profiles, profile))
+            .incompatible
+        else
+            .compatible;
+        try std.testing.expectEqual(expected, report.status);
     }
 }
 
@@ -2903,7 +3012,7 @@ test "missing experimental notification is incompatible" {
     try std.testing.expect(contains(report.missing_required.items, method));
 }
 
-test "exact codex version parsing distinguishes prerelease from build metadata" {
+test "codex banner is diagnostic and semantic prerelease detection is optional" {
     const cases = [_]struct { raw: []const u8, prerelease: bool }{
         .{ .raw = "codex-cli 0.146.0\n", .prerelease = false },
         .{ .raw = "codex-cli 0.146.0-alpha.1\n", .prerelease = true },
@@ -2915,17 +3024,17 @@ test "exact codex version parsing distinguishes prerelease from build metadata" 
         defer version.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.prerelease, version.prerelease());
     }
-    const malformed = [_][]const u8{
-        "codex 0.146.0\n",
-        "codex-cli 0.146\n",
-        "codex-cli 00.146.0\n",
-        "codex-cli 0.146.0\ntrailing\n",
-        "codex-cli 0.146.0 trailing\n",
-        "codex-cli 0.146.0",
-        "codex-cli 0.146.0\r\n",
-        "codex-cli 0.146.0-\n",
+    const diagnostics = [_][]const u8{
+        "codex-cli dev-build\n",
+        "custom Codex development build",
+        "codex 0.146\r\n",
     };
-    for (malformed) |raw| {
+    for (diagnostics) |raw| {
+        var version = try parseCodexVersion(std.testing.allocator, raw);
+        defer version.deinit(std.testing.allocator);
+        try std.testing.expect(!version.prerelease());
+    }
+    for ([_][]const u8{ "", " \t\r\n" }) |raw| {
         try std.testing.expectError(
             error.InvalidCodexVersion,
             parseCodexVersion(std.testing.allocator, raw),
@@ -2962,7 +3071,7 @@ test "schema cache admission is independent of Codex version and release channel
     const io = std.testing.io;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5" }, 0..) |version_text, index| {
+    for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5", "dev-build" }, 0..) |version_text, index| {
         const executable = try std.fmt.allocPrint(
             allocator,
             "{s}/fake-codex-{d}",

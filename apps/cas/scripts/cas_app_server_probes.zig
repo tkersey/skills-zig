@@ -14,9 +14,9 @@ pub const PaginatedForkFixture = struct {
 
 pub const ExecutorSkillFixture = struct {
     pub const name = "cas-executor-probe";
-    pub const description = "Deterministic Codex 0.146 executor skill/resource probe.";
-    pub const resource_bytes = "codex-app-server-executor-skill-probe-0.146.0\n";
-    pub const resource_base64 = "Y29kZXgtYXBwLXNlcnZlci1leGVjdXRvci1za2lsbC1wcm9iZS0wLjE0Ni4wCg==";
+    pub const description = "Deterministic Codex app-server executor skill/resource probe.";
+    pub const resource_bytes = "codex-app-server-executor-skill-probe-v1\n";
+    pub const resource_base64 = "Y29kZXgtYXBwLXNlcnZlci1leGVjdXRvci1za2lsbC1wcm9iZS12MQo=";
 };
 
 pub const LiveWitness = struct {
@@ -474,13 +474,10 @@ pub fn structuredReviewProbe(
     const thread_params = stringifyAnyAlloc(allocator, .{
         .cwd = cwd,
         .experimentalRawEvents = false,
-        .ephemeral = true,
-        .approvalPolicy = "never",
-        .sandbox = "read-only",
-        .runtimeWorkspaceRoots = &[_][]const u8{},
+        .developerInstructions = @as(?[]const u8, null),
     }) catch return LiveWitness.failed(
         "structured_review_thread_encode_failed",
-        "ephemeral thread/start parameters could not be encoded",
+        "production thread/start parameters could not be encoded",
     );
     defer allocator.free(thread_params);
     const thread_json = client.requestJson(
@@ -488,7 +485,7 @@ pub fn structuredReviewProbe(
         thread_params,
     ) catch return LiveWitness.failed(
         "structured_review_thread_start_failed",
-        "ephemeral thread/start failed before review dispatch",
+        "production thread/start failed before review dispatch",
     );
     defer allocator.free(thread_json);
     const thread_id = threadIdAlloc(allocator, thread_json) catch
@@ -527,7 +524,29 @@ pub fn structuredReviewProbe(
             "and in-progress turn",
     );
     defer allocator.free(turn_id);
-    interruptTurn(allocator, client, thread_id, turn_id);
+    if (!interruptTurn(allocator, client, thread_id, turn_id)) return LiveWitness.failed(
+        "structured_review_interrupt_failed",
+        "the dispatched review turn could not be interrupted through the production envelope",
+    );
+    const read_params = stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .includeTurns = true,
+    }) catch return LiveWitness.failed(
+        "structured_review_read_encode_failed",
+        "production thread/read parameters could not be encoded",
+    );
+    defer allocator.free(read_params);
+    const read_json = client.requestJson("thread/read", read_params) catch
+        return LiveWitness.failed(
+            "structured_review_terminal_read_failed",
+            "thread/read could not observe the interrupted review turn",
+        );
+    defer allocator.free(read_json);
+    if (!interruptedReviewTurnObserved(read_json, turn_id)) return LiveWitness.failed(
+        "structured_review_terminal_shape_failed",
+        "thread/read did not preserve the exact review turn as terminal after interruption",
+    );
+    deleteThread(allocator, client, thread_id);
     return LiveWitness.passed();
 }
 
@@ -658,7 +677,7 @@ fn selectedCapabilityRootProbe(
             },
         }{
             .{
-                .id = "cas-executor-probe@0.146.0",
+                .id = "cas-executor-probe@v1",
                 .location = .{
                     .type = "environment",
                     .environmentId = "local",
@@ -2043,14 +2062,44 @@ fn interruptTurn(
     client: *proxy.Client,
     thread_id: []const u8,
     turn_id: []const u8,
-) void {
+) bool {
     const params = stringifyAnyAlloc(
         allocator,
         .{ .threadId = thread_id, .turnId = turn_id },
-    ) catch return;
+    ) catch return false;
     defer allocator.free(params);
-    const response = client.requestJson("turn/interrupt", params) catch return;
+    const response = client.requestJson("turn/interrupt", params) catch return false;
     allocator.free(response);
+    return true;
+}
+
+fn interruptedReviewTurnObserved(raw: []const u8, expected_turn_id: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch
+        return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const thread_value = root.get("thread") orelse return false;
+    const thread = switch (thread_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const turns_value = thread.get("turns") orelse return false;
+    const turns = switch (turns_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    for (turns.items) |turn_value| {
+        const turn = switch (turn_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (!objectStringEquals(turn, "id", expected_turn_id)) continue;
+        return objectStringEquals(turn, "status", "interrupted");
+    }
+    return false;
 }
 
 fn row(
@@ -2396,11 +2445,20 @@ test "structured review response requires exact inline identity and echoed item"
     );
 }
 
+test "structured review terminal read binds the exact interrupted turn" {
+    const valid =
+        "{\"thread\":{\"turns\":[{\"id\":\"turn-other\",\"status\":\"completed\"}," ++
+        "{\"id\":\"turn-review\",\"status\":\"interrupted\"}]}}";
+    try std.testing.expect(interruptedReviewTurnObserved(valid, "turn-review"));
+    try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-other"));
+    try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-missing"));
+}
+
 test "executor skill and selected root helpers preserve exact native identities" {
     const list =
         "{\"data\":[{\"cwd\":\"/probe\",\"skills\":[{" ++
         "\"name\":\"cas-executor-probe\",\"description\":" ++
-        "\"Deterministic Codex 0.146 executor skill/resource probe.\"," ++
+        "\"Deterministic Codex app-server executor skill/resource probe.\"," ++
         "\"path\":\"/root/cas-executor-probe/SKILL.md\",\"scope\":\"user\"," ++
         "\"enabled\":true,\"future\":7}],\"errors\":[]}],\"future\":true}";
     try std.testing.expect(skillsListContainsExactFixture(

@@ -299,8 +299,11 @@ fn endpointVersionFromUserAgentAlloc(
     allocator: std.mem.Allocator,
     user_agent: []const u8,
 ) ![]u8 {
-    const slash = std.mem.indexOfScalar(u8, user_agent, '/') orelse
+    if (user_agent.len == 0 or !std.unicode.utf8ValidateSlice(user_agent)) {
         return error.InvalidEndpointRuntimeIdentity;
+    }
+    const slash = std.mem.indexOfScalar(u8, user_agent, '/') orelse
+        return allocator.dupe(u8, user_agent);
     const suffix = user_agent[slash + 1 ..];
     var end: usize = 0;
     while (end < suffix.len and suffix[end] != ' ' and suffix[end] != '\t' and
@@ -308,7 +311,7 @@ fn endpointVersionFromUserAgentAlloc(
     {
         end += 1;
     }
-    if (end == 0) return error.InvalidEndpointRuntimeIdentity;
+    if (end == 0) return allocator.dupe(u8, user_agent);
     return allocator.dupe(u8, suffix[0..end]);
 }
 
@@ -1195,16 +1198,6 @@ fn collectLifecycle(
         state.lifecycle_failure_hint = @errorName(err);
         return;
     };
-    if (!std.mem.eql(
-        u8,
-        state.endpoint_runtime.?.version,
-        schemas.version.text,
-    )) {
-        state.lifecycle_failure_code = "endpoint_runtime_version_mismatch";
-        state.lifecycle_failure_hint =
-            "initialize userAgent version does not match the schema source";
-        return;
-    }
     contract.verifyExecutableIdentity(allocator, io, &schemas.executable) catch |err| {
         state.lifecycle_failure_code = "codex_executable_changed";
         state.lifecycle_failure_hint = @errorName(err);
@@ -2111,7 +2104,7 @@ fn firstFailure(
     return .{ .code = null, .hint = null };
 }
 
-test "endpoint runtime identity requires typed fields and a versioned user agent" {
+test "endpoint runtime identity treats the user agent version as diagnostic" {
     const allocator = std.testing.allocator;
     var identity = try parseEndpointRuntimeIdentityAlloc(
         allocator,
@@ -2129,14 +2122,13 @@ test "endpoint runtime identity requires typed fields and a versioned user agent
         error.InvalidEndpointRuntimeIdentity,
         parseEndpointRuntimeIdentityAlloc(allocator, "{}"),
     );
-    try std.testing.expectError(
-        error.InvalidEndpointRuntimeIdentity,
-        parseEndpointRuntimeIdentityAlloc(
-            allocator,
-            "{\"userAgent\":\"codex_cli_rs\",\"codexHome\":\"/tmp/codex-home\"," ++
-                "\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}",
-        ),
+    var development = try parseEndpointRuntimeIdentityAlloc(
+        allocator,
+        "{\"userAgent\":\"codex_cli_rs dev-build\",\"codexHome\":\"/tmp/codex-home\"," ++
+            "\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}",
     );
+    defer development.deinit(allocator);
+    try std.testing.expectEqualStrings("codex_cli_rs dev-build", development.version);
 }
 
 test "external endpoint keeps transport proof separate from unbound feature proof" {

@@ -1653,7 +1653,7 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
         if (!accepts and content != null and content.? != .null) {
             return error.InvalidElicitationResponse;
         }
-        // `_meta` is intentionally unconstrained by the 0.146 schema and is
+        // `_meta` is intentionally unconstrained by the generated schema and is
         // preserved byte-for-byte by the full response carrier.
     }
     if (opts.dynamic_tool_response_json) |raw| {
@@ -1843,7 +1843,7 @@ test "server reply payload preserves integer and string request ids" {
     try std.testing.expectEqualStrings("{\"id\":\"req-7\",\"result\":{}}", string_payload);
 }
 
-test "all codex 0.146 server request methods and unknown have one typed reply" {
+test "all contracted server request methods and unknown have one typed reply" {
     const cases = [_]struct { []const u8, Client.ServerRequestMethod }{
         .{ "item/commandExecution/requestApproval", .command_execution_approval },
         .{ "item/fileChange/requestApproval", .file_change_approval },
