@@ -95,10 +95,25 @@ jobs:
         run: |
           set -euo pipefail
           archive="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          archive_check="${archive}.reproducibility-check"
           mkdir -p dist
-          cp zig-out/bin/synoptic dist/synoptic
-          chmod +x dist/synoptic
-          tar -czf "${archive}" -C dist synoptic
+          install -m 0755 zig-out/bin/synoptic dist/synoptic
+          TZ=UTC touch -t 198001010000 dist/synoptic
+          make_archive() {
+            local output="$1"
+            COPYFILE_DISABLE=1 tar \
+              --format ustar \
+              --uid 0 \
+              --gid 0 \
+              --uname root \
+              --gname root \
+              -cf - \
+              -C dist synoptic \
+              | gzip -n -9 > "${output}"
+          }
+          make_archive "${archive}"
+          make_archive "${archive_check}"
+          cmp "${archive}" "${archive_check}"
           test "$(tar -tzf "${archive}")" = "synoptic"
           echo "ARCHIVE=${archive}" >> "${GITHUB_ENV}"
       - name: Upload Synoptic workflow artifact
