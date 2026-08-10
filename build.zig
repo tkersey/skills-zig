@@ -225,12 +225,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = lift_meta },
         },
     });
+    const cas_hook_policy_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+        },
+    });
+    const cas_runtime_root = b.createModule(.{
+        .root_source_file = b.path("libs/cas_runtime/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "cas_hook_policy", .module = cas_hook_policy_root },
+        },
+    });
     const cas_proxy_client_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_smoke_root = b.createModule(.{
@@ -241,6 +259,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_runner_root = b.createModule(.{
@@ -251,6 +270,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_review_session_root = b.createModule(.{
@@ -263,6 +283,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_session_inquiry_anchor_root = b.createModule(.{
@@ -282,6 +303,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
             .{
                 .name = "cas_session_inquiry_anchor",
                 .module = cas_session_inquiry_anchor_root,
@@ -307,6 +329,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_account_root = b.createModule(.{
@@ -318,6 +341,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_io", .module = core_io },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
     const cas_transport_tests_root = b.createModule(.{
@@ -660,6 +684,13 @@ pub fn build(b: *std.Build) void {
         "test-cas-proxy-client",
         "Run cas_proxy_client tests",
     );
+    const run_cas_runtime_tests = addTestStepWithOptions(
+        b,
+        cas_runtime_root,
+        "test-cas-runtime",
+        "Run reusable CAS app-server runtime tests",
+        .{ .link_libc = true },
+    );
     const run_cas_transport_tests = addTestStepWithOptions(
         b,
         cas_transport_tests_root,
@@ -717,6 +748,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
+    test_cas.dependOn(&run_cas_runtime_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
     test_cas.dependOn(&run_cas_transport_tests.step);
     test_cas.dependOn(&run_cas_app_server_contract_tests.step);

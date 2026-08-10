@@ -1,6 +1,6 @@
 const app_meta = @import("app_meta");
-const cas = @import("cas_proxy_client.zig");
-const cas_websocket = @import("cas_websocket_transport.zig");
+const cas = @import("cas_runtime");
+const cas_websocket = cas.websocket;
 const core_cli = @import("core_cli");
 const std = @import("std");
 

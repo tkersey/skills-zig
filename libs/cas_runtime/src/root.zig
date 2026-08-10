@@ -1,0 +1,55 @@
+pub const client = @import("client.zig");
+pub const managed_server = @import("managed_server.zig");
+pub const protocol = @import("protocol.zig");
+pub const transport = @import("transport.zig");
+pub const websocket = @import("websocket.zig");
+
+pub const ManagedServer = managed_server.ManagedServer;
+pub const Client = client.Client;
+pub const Notification = protocol.Notification;
+pub const ServerRequest = protocol.ServerRequest;
+pub const RequestHandle = protocol.RequestHandle;
+
+pub const hooks = client.hooks;
+pub const app_server_launch = client.app_server_launch;
+pub const max_server_request_carrier_bytes = client.max_server_request_carrier_bytes;
+pub const max_initialize_capabilities_bytes = client.max_initialize_capabilities_bytes;
+pub const max_codex_enable_features = client.max_codex_enable_features;
+pub const InitializeCapabilityBuilder = client.InitializeCapabilityBuilder;
+pub const ServerRequestHandlerKind = client.ServerRequestHandlerKind;
+pub const ServerRequestHandlerDescriptor = client.ServerRequestHandlerDescriptor;
+pub const server_request_handler_descriptors = client.server_request_handler_descriptors;
+pub const serverRequestHandler = client.serverRequestHandler;
+pub const max_overload_retries = client.max_overload_retries;
+pub const max_overload_delay_ms = client.max_overload_delay_ms;
+pub const max_overload_jitter_percent = client.max_overload_jitter_percent;
+pub const OverloadRetryPolicy = client.OverloadRetryPolicy;
+pub const OverloadRetryTelemetry = client.OverloadRetryTelemetry;
+pub const validateOverloadRetryPolicy = client.validateOverloadRetryPolicy;
+pub const overloadRetryDelayMs = client.overloadRetryDelayMs;
+pub const isStructuredOverloadError = client.isStructuredOverloadError;
+pub const TransportKind = client.TransportKind;
+pub const MultiAgentMode = client.MultiAgentMode;
+pub const MultiAgentModeSupport = client.MultiAgentModeSupport;
+pub const ClientOptions = client.ClientOptions;
+pub const RequestSendObserver = client.RequestSendObserver;
+pub const validateClientOptions = client.validateClientOptions;
+pub const resolveExecutableAlloc = client.resolveExecutableAlloc;
+pub const ObjectMap = client.ObjectMap;
+pub const stringifyValueAlloc = client.stringifyValueAlloc;
+pub const objectField = client.objectField;
+pub const stringField = client.stringField;
+pub const intField = client.intField;
+
+test {
+    _ = Client;
+    _ = ManagedServer;
+    _ = Notification;
+    _ = ServerRequest;
+    _ = RequestHandle;
+    _ = @import("protocol.zig");
+    _ = @import("transport.zig");
+    _ = @import("managed_server.zig");
+    _ = @import("client.zig");
+    _ = @import("websocket.zig");
+}
