@@ -12,7 +12,16 @@ pub const ActionKind = enum {
     unmark_viewed,
     graphql,
 };
-pub const ActionStatus = enum { pending, superseded, rejected, executing, succeeded, failed, outcome_unknown, invalidated };
+pub const ActionStatus = enum {
+    pending,
+    superseded,
+    rejected,
+    executing,
+    succeeded,
+    failed,
+    outcome_unknown,
+    invalidated,
+};
 pub const ToolPhase = enum { initial_review, conversation };
 pub const max_tool_payload_bytes: usize = 128 * 1024;
 
@@ -72,7 +81,19 @@ pub const PreparedActionInput = struct {
         allocator.free(self.slot);
         allocator.free(self.effect_summary);
         allocator.free(self.payload_json);
-        inline for (.{ self.path, self.side, self.body, self.thread_id, self.comment_id, self.operation_name, self.document, self.variables }) |value| if (value) |owned| allocator.free(owned);
+        inline for (
+            .{
+                self.path,
+                self.side,
+                self.body,
+                self.thread_id,
+                self.comment_id,
+                self.operation_name,
+                self.document,
+                self.variables,
+            },
+        ) |value| if (value) |owned|
+            allocator.free(owned);
     }
 };
 
@@ -94,22 +115,35 @@ pub fn initialReviewMayPrepareAction(initial_turn: bool, human_directed: bool) b
 }
 
 pub fn parseKind(value: []const u8) !ActionKind {
-    inline for (std.meta.fields(ActionKind)) |field| if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (std.meta.fields(ActionKind)) |field| if (std.mem.eql(u8, value, field.name))
+        return @enumFromInt(field.value);
     return error.UnsupportedGithubActionKind;
 }
 
 pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !PreparedActionInput {
     if (raw.len > max_tool_payload_bytes) return error.ToolPayloadTooLarge;
-    var root = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .max_value_len = graphql.TransparentLimits.variables_bytes });
+    var root = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw,
+        .{ .max_value_len = graphql.TransparentLimits.variables_bytes },
+    );
     defer root.deinit();
     const root_object = object(root.value) orelse return error.InvalidToolPayload;
-    const params = if (root_object.get("params")) |value| object(value) orelse return error.InvalidToolPayload else root_object;
-    const arguments = object(params.get("arguments") orelse params.get("input") orelse return error.InvalidToolPayload) orelse return error.InvalidToolPayload;
+    const params = if (root_object.get("params")) |value|
+        object(value) orelse return error.InvalidToolPayload
+    else
+        root_object;
+    const argument_value = params.get("arguments") orelse
+        params.get("input") orelse return error.InvalidToolPayload;
+    const arguments = object(argument_value) orelse return error.InvalidToolPayload;
     const slot_value = string(arguments.get("slot")) orelse return error.InvalidToolPayload;
     const kind_value = string(arguments.get("kind")) orelse "add_inline_comment";
     const kind = try parseKind(kind_value);
-    const effect = string(arguments.get("effectSummary")) orelse string(arguments.get("effect_summary")) orelse return error.InvalidToolPayload;
-    if (slot_value.len == 0 or slot_value.len > 128 or effect.len == 0 or effect.len > 2048) return error.InvalidToolPayload;
+    const effect = string(arguments.get("effectSummary")) orelse
+        string(arguments.get("effect_summary")) orelse return error.InvalidToolPayload;
+    if (slot_value.len == 0 or slot_value.len > 128 or effect.len == 0 or effect.len > 2048)
+        return error.InvalidToolPayload;
     const payload_value = arguments.get("payload") orelse rootPayload(arguments, kind);
     const payload = object(payload_value) orelse return error.InvalidToolPayload;
     const payload_json = try stringifyAlloc(allocator, payload_value);
@@ -126,12 +160,16 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
     result.start_line = uint32(payload.get("startLine") orelse payload.get("start_line"));
     result.side = try dupeOptional(allocator, string(payload.get("side")));
     result.body = try dupeOptional(allocator, string(payload.get("body")));
-    result.thread_id = try dupeOptional(allocator, string(payload.get("threadId") orelse payload.get("thread_id")));
-    result.comment_id = try dupeOptional(allocator, string(payload.get("commentId") orelse payload.get("comment_id")));
+    result.thread_id = try dupeOptional(allocator, string(payload.get("threadId") orelse
+        payload.get("thread_id")));
+    result.comment_id = try dupeOptional(allocator, string(payload.get("commentId") orelse
+        payload.get("comment_id")));
     if (kind == .graphql) {
         result.operation_name = try dupeOptional(allocator, string(payload.get("operationName")));
         result.document = try dupeOptional(allocator, string(payload.get("document")));
-        if (payload.get("variables")) |variables| result.variables = try stringifyAlloc(allocator, variables);
+        if (payload.get("variables")) |variables| {
+            result.variables = try stringifyAlloc(allocator, variables);
+        }
     }
     try validateInput(result);
     return result;
@@ -144,19 +182,29 @@ fn rootPayload(arguments: std.json.ObjectMap, kind: ActionKind) std.json.Value {
 
 pub fn validateInput(input: PreparedActionInput) !void {
     switch (input.kind) {
-        .add_inline_comment => if (input.path == null or input.line == null or input.line.? == 0 or input.body == null or input.body.?.len == 0) return error.InvalidInlineAction,
-        .reply_thread => if (input.thread_id == null or input.body == null or input.body.?.len == 0) return error.InvalidThreadAction,
-        .resolve_thread, .unresolve_thread => if (input.thread_id == null) return error.InvalidThreadAction,
-        .update_comment => if (input.comment_id == null or input.body == null or input.body.?.len == 0) return error.InvalidCommentAction,
+        .add_inline_comment => if (input.path == null or input.line == null or input.line.? ==
+            0 or input.body == null or input.body.?.len == 0) return error.InvalidInlineAction,
+        .reply_thread => if (input.thread_id == null or input.body == null or input.body.?.len ==
+            0) return error.InvalidThreadAction,
+        .resolve_thread, .unresolve_thread => if (input.thread_id == null)
+            return error.InvalidThreadAction,
+        .update_comment => if (input.comment_id == null or input.body == null or
+            input.body.?.len == 0) return error.InvalidCommentAction,
         .delete_comment => if (input.comment_id == null) return error.InvalidCommentAction,
         .mark_viewed, .unmark_viewed => if (input.path == null) return error.InvalidViewedAction,
-        .graphql => if (input.operation_name == null or input.document == null or input.variables == null) return error.InvalidGraphqlAction,
+        .graphql => if (input.operation_name == null or input.document == null or
+            input.variables == null) return error.InvalidGraphqlAction,
     }
-    if (input.side) |side| if (!std.mem.eql(u8, side, "RIGHT") and !std.mem.eql(u8, side, "LEFT")) return error.InvalidDiffSide;
+    if (input.side) |side| {
+        const valid = std.mem.eql(u8, side, "RIGHT") or std.mem.eql(u8, side, "LEFT");
+        if (!valid) return error.InvalidDiffSide;
+    }
 }
 
 pub fn validateAgainstSession(input: PreparedActionInput, session_path: []const u8) !void {
-    if (input.path) |path| if (!std.mem.eql(u8, path, session_path)) return error.ActionTargetsAnotherSession;
+    if (input.path) |path| {
+        if (!std.mem.eql(u8, path, session_path)) return error.ActionTargetsAnotherSession;
+    }
 }
 
 pub const ActionStore = struct {
@@ -169,12 +217,25 @@ pub const ActionStore = struct {
         self.cards.deinit(self.allocator);
     }
 
-    pub fn prepare(self: *ActionStore, session_id: []const u8, source_turn_id: []const u8, input: PreparedActionInput, authoritative: AuthoritativeTarget) !*ActionCard {
+    pub fn prepare(
+        self: *ActionStore,
+        session_id: []const u8,
+        source_turn_id: []const u8,
+        input: PreparedActionInput,
+        authoritative: AuthoritativeTarget,
+    ) !*ActionCard {
         try validateAgainstSession(input, authoritative.session_path);
-        if (input.kind == .graphql) try graphql.validateTransparent(input.document.?, input.operation_name.?, input.variables.?, authoritative.pull_request_id);
+        if (input.kind == .graphql) try graphql.validateTransparent(
+            input.document.?,
+            input.operation_name.?,
+            input.variables.?,
+            authoritative.pull_request_id,
+        );
         var superseded_index: ?usize = null;
         var supersedes: ?[]const u8 = null;
-        for (self.cards.items, 0..) |card, index| if (card.status == .pending and std.mem.eql(u8, card.session_id, session_id) and std.mem.eql(u8, card.slot, input.slot)) {
+        for (self.cards.items, 0..) |card, index| if (card.status == .pending and
+            std.mem.eql(u8, card.session_id, session_id) and std.mem.eql(u8, card.slot, input.slot))
+        {
             superseded_index = index;
             supersedes = card.id;
         };
@@ -215,8 +276,16 @@ pub const ActionStore = struct {
         return &self.cards.items[self.cards.items.len - 1];
     }
 
-    pub fn pendingIdForSlot(self: *const ActionStore, session_id: []const u8, slot: []const u8) ?[]const u8 {
-        for (self.cards.items) |card| if (card.status == .pending and std.mem.eql(u8, card.session_id, session_id) and std.mem.eql(u8, card.slot, slot)) return card.id;
+    pub fn pendingIdForSlot(
+        self: *const ActionStore,
+        session_id: []const u8,
+        slot: []const u8,
+    ) ?[]const u8 {
+        for (self.cards.items) |card| if (card.status == .pending and std.mem.eql(
+            u8,
+            card.session_id,
+            session_id,
+        ) and std.mem.eql(u8, card.slot, slot)) return card.id;
         return null;
     }
     pub fn pendingById(self: *ActionStore, id: []const u8) !*ActionCard {
@@ -240,7 +309,8 @@ pub const ActionStore = struct {
         card.status = .invalidated;
     }
     pub fn setTerminal(self: *ActionStore, id: []const u8, status: ActionStatus) !void {
-        if (status != .succeeded and status != .failed and status != .outcome_unknown and status != .invalidated) return error.InvalidTerminalStatus;
+        if (status != .succeeded and status != .failed and status != .outcome_unknown and
+            status != .invalidated) return error.InvalidTerminalStatus;
         for (self.cards.items) |*card| if (std.mem.eql(u8, card.id, id)) {
             if (card.status != .executing) return error.ActionNotExecuting;
             card.status = status;
@@ -250,16 +320,56 @@ pub const ActionStore = struct {
     }
 
     fn freeCard(self: *ActionStore, card: ActionCard) void {
-        inline for (.{ card.id, card.session_id, card.source_turn_id, card.slot, card.effect_summary, card.target.repository, card.target.pull_request_id, card.target.head_oid, card.payload_json }) |value| self.allocator.free(value);
-        inline for (.{ card.target.path, card.target.side, card.target.thread_id, card.target.comment_id, card.body, card.supersedes }) |value| if (value) |owned| self.allocator.free(owned);
-        if (card.graphql) |action| inline for (.{ action.operation_name, action.document, action.variables }) |value| self.allocator.free(value);
+        inline for (
+            .{
+                card.id,
+                card.session_id,
+                card.source_turn_id,
+                card.slot,
+                card.effect_summary,
+                card.target.repository,
+                card.target.pull_request_id,
+                card.target.head_oid,
+                card.payload_json,
+            },
+        ) |value| self.allocator.free(value);
+        inline for (
+            .{
+                card.target.path,
+                card.target.side,
+                card.target.thread_id,
+                card.target.comment_id,
+                card.body,
+                card.supersedes,
+            },
+        ) |value| if (value) |owned|
+            self.allocator.free(owned);
+        if (card.graphql) |action| inline for (
+            .{ action.operation_name, action.document, action.variables },
+        ) |value| self.allocator.free(value);
     }
 };
 
 pub fn cardJsonAlloc(allocator: std.mem.Allocator, card: ActionCard) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try out.writer.print("{{\"schema\":\"synoptic-github-action/v1\",\"id\":{f},\"sessionId\":{f},\"sourceTurnId\":{f},\"slot\":{f},\"status\":{f},\"kind\":{f},\"effectSummary\":{f},\"target\":{{\"repository\":{f},\"pullRequest\":{d},\"headOid\":{f},\"path\":", .{ std.json.fmt(card.id, .{}), std.json.fmt(card.session_id, .{}), std.json.fmt(card.source_turn_id, .{}), std.json.fmt(card.slot, .{}), std.json.fmt(actionStatusName(card.status), .{}), std.json.fmt(@tagName(card.kind), .{}), std.json.fmt(card.effect_summary, .{}), std.json.fmt(card.target.repository, .{}), card.target.pull_request, std.json.fmt(card.target.head_oid, .{}) });
+    const header_arguments = .{
+        std.json.fmt(card.id, .{}),
+        std.json.fmt(card.session_id, .{}),
+        std.json.fmt(card.source_turn_id, .{}),
+        std.json.fmt(card.slot, .{}),
+        std.json.fmt(actionStatusName(card.status), .{}),
+        std.json.fmt(@tagName(card.kind), .{}),
+        std.json.fmt(card.effect_summary, .{}),
+        std.json.fmt(card.target.repository, .{}),
+        card.target.pull_request,
+        std.json.fmt(card.target.head_oid, .{}),
+    };
+    try out.writer.print("{{\"schema\":\"synoptic-github-action/v1\",\"id\":{f}," ++
+        "\"sessionId\":{f},\"sourceTurnId\":{f},\"slot\":{f},\"" ++
+        "status\":{f},\"kind\":{f},\"effectSummary\":{f},\"targ" ++
+        "et\":{{\"repository\":{f},\"pullRequest\":{d},\"headOi" ++
+        "d\":{f},\"path\":", header_arguments);
     try writeOptionalString(&out.writer, card.target.path);
     try out.writer.writeAll(",\"line\":");
     try writeOptionalInt(&out.writer, card.target.line);
@@ -276,7 +386,14 @@ pub fn cardJsonAlloc(allocator: std.mem.Allocator, card: ActionCard) ![]u8 {
     try out.writer.writeAll(",\"payload\":");
     try out.writer.writeAll(card.payload_json);
     try out.writer.writeAll(",\"graphql\":");
-    if (card.graphql) |action| try out.writer.print("{{\"operationName\":{f},\"document\":{f},\"variables\":{s}}}", .{ std.json.fmt(action.operation_name, .{}), std.json.fmt(action.document, .{}), action.variables }) else try out.writer.writeAll("null");
+    if (card.graphql) |action| {
+        try out.writer.print("{{\"operationName\":{f},\"document\":{f},\"variables\":" ++
+            "{s}}}", .{
+            std.json.fmt(action.operation_name, .{}),
+            std.json.fmt(action.document, .{}),
+            action.variables,
+        });
+    } else try out.writer.writeAll("null");
     try out.writer.writeAll(",\"supersedes\":");
     try writeOptionalString(&out.writer, card.supersedes);
     try out.writer.writeByte('}');
@@ -290,7 +407,9 @@ pub fn actionStatusName(status: ActionStatus) []const u8 {
     };
 }
 fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |present| try std.json.Stringify.value(present, .{}, writer) else try writer.writeAll("null");
+    if (value) |present| {
+        try std.json.Stringify.value(present, .{}, writer);
+    } else try writer.writeAll("null");
 }
 fn writeOptionalInt(writer: *std.Io.Writer, value: ?u32) !void {
     if (value) |present| try writer.print("{d}", .{present}) else try writer.writeAll("null");
@@ -326,14 +445,39 @@ fn stringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
 }
 
 test "initial tool call is rejected even with plausible payload" {
-    try std.testing.expectError(error.InitialReviewActionForbidden, authorizeTool(.initial_review, true));
+    try std.testing.expectError(
+        error.InitialReviewActionForbidden,
+        authorizeTool(.initial_review, true),
+    );
 }
 test "same session slot supersedes immutably and execution is once" {
     var store = ActionStore{ .allocator = std.testing.allocator };
     defer store.deinit();
-    const target = AuthoritativeTarget{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a" };
-    const one = PreparedActionInput{ .slot = @constCast("finding"), .kind = .add_inline_comment, .effect_summary = @constCast("first"), .payload_json = @constCast("{}"), .path = @constCast("a"), .line = 1, .body = @constCast("one") };
-    const two = PreparedActionInput{ .slot = @constCast("finding"), .kind = .add_inline_comment, .effect_summary = @constCast("second"), .payload_json = @constCast("{}"), .path = @constCast("a"), .line = 2, .body = @constCast("two") };
+    const target = AuthoritativeTarget{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .head_oid = "h",
+        .session_path = "a",
+    };
+    const one = PreparedActionInput{
+        .slot = @constCast("finding"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("first"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("a"),
+        .line = 1,
+        .body = @constCast("one"),
+    };
+    const two = PreparedActionInput{
+        .slot = @constCast("finding"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("second"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("a"),
+        .line = 2,
+        .body = @constCast("two"),
+    };
     _ = try store.prepare("s", "t1", one, target);
     _ = try store.prepare("s", "t2", two, target);
     try std.testing.expectEqual(ActionStatus.superseded, store.cards.items[0].status);
@@ -344,7 +488,32 @@ test "same session slot supersedes immutably and execution is once" {
 test "transparent validation runs before immutable card creation" {
     var store = ActionStore{ .allocator = std.testing.allocator };
     defer store.deinit();
-    const input = PreparedActionInput{ .slot = @constCast("unsafe"), .kind = .graphql, .effect_summary = @constCast("Add a note"), .payload_json = @constCast("{}"), .operation_name = @constCast("AddNote"), .document = @constCast("mutation AddNote($input:AddCommentInput!){hidden:addComment(input:$input){clientMutationId}}"), .variables = @constCast("{\"input\":{\"subjectId\":\"PR_1\"}}") };
-    try std.testing.expectError(error.GraphqlAliasForbidden, store.prepare("s", "t", input, .{ .repository = "o/r", .pull_request = 1, .pull_request_id = "PR_1", .head_oid = "h", .session_path = "a" }));
+    const input = PreparedActionInput{
+        .slot = @constCast("unsafe"),
+        .kind = .graphql,
+        .effect_summary = @constCast("Add a note"),
+        .payload_json = @constCast("{}"),
+        .operation_name = @constCast("AddNote"),
+        .document = @constCast(
+            "mutation AddNote($input:AddCommentInput!){hidden:" ++
+                "addComment(input:$input){clientMutationId}}",
+        ),
+        .variables = @constCast("{\"input\":{\"subjectId\":\"PR_1\"}}"),
+    };
+    try std.testing.expectError(
+        error.GraphqlAliasForbidden,
+        store.prepare(
+            "s",
+            "t",
+            input,
+            .{
+                .repository = "o/r",
+                .pull_request = 1,
+                .pull_request_id = "PR_1",
+                .head_oid = "h",
+                .session_path = "a",
+            },
+        ),
+    );
     try std.testing.expectEqual(@as(usize, 0), store.cards.items.len);
 }

@@ -484,7 +484,36 @@ pub const Client = struct {
         const stdin_file = child.stdin orelse return error.ChildMissingStdin;
         const stdout_file = child.stdout orelse return error.ChildMissingStdout;
 
-        var client = Client{
+        var client = initStdioClient(
+            allocator,
+            io,
+            child,
+            process_group_id,
+            stdin_file,
+            stdout_file,
+            opts,
+            overload_retry_seed,
+        );
+        child_owned = false;
+        errdefer {
+            client.close();
+            client.deinit();
+        }
+        try client.handshake(opts);
+        return client;
+    }
+
+    fn initStdioClient(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        child: std.process.Child,
+        process_group_id: ?u64,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
+        opts: ClientOptions,
+        overload_retry_seed: u64,
+    ) Client {
+        return .{
             .allocator = allocator,
             .io = io,
             .transport_kind = .stdio,
@@ -514,13 +543,6 @@ pub const Client = struct {
             .overload_retry_seed = overload_retry_seed,
             .overload_retry_telemetry = opts.overload_retry_telemetry,
         };
-        child_owned = false;
-        errdefer {
-            client.close();
-            client.deinit();
-        }
-        try client.handshake(opts);
-        return client;
     }
 
     fn startWebsocket(
@@ -717,18 +739,7 @@ pub const Client = struct {
         defer self.request_deadline_ms = previous_deadline_ms;
         self.request_send_started = false;
         if (self.overload_retry_telemetry) |telemetry| telemetry.reset();
-        var captured_notification_bytes: usize = 0;
-        if (notification_lines) |lines| {
-            if (lines.items.len > max_captured_notifications) {
-                return error.AppServerNotificationLimitExceeded;
-            }
-            for (lines.items) |line| {
-                captured_notification_bytes = try addCapturedNotificationBytes(
-                    captured_notification_bytes,
-                    line.len,
-                );
-            }
-        }
+        var captured_notification_bytes = try capturedNotificationBytes(notification_lines);
         var interleaved: usize = 0;
         var retry_index: u32 = 0;
         // The retry policy and request deadline bound this request-attempt loop.
@@ -758,32 +769,44 @@ pub const Client = struct {
                 .rpc_error => |rpc_error| {
                     self.setLastErrorOwned(rpc_error.json);
                     if (!rpc_error.retryable_overload) return error.RequestFailed;
-                    if (self.overload_retry_telemetry) |telemetry| {
-                        telemetry.overload_responses += 1;
-                    }
-                    if (retry_index >= self.overload_retry_policy.max_retries) {
-                        if (self.overload_retry_telemetry) |telemetry| telemetry.exhausted = true;
-                        return error.RequestFailed;
-                    }
-                    const delay_ms = overloadRetryDelayMs(
-                        self.overload_retry_policy,
-                        retry_index,
-                        self.overload_retry_seed,
-                    );
-                    if (self.overload_retry_telemetry) |telemetry| {
-                        telemetry.delays_ms[telemetry.delay_count] = delay_ms;
-                        telemetry.delay_count += 1;
-                        telemetry.retries += 1;
-                    }
-                    const remaining_ms = self.request_deadline_ms.? - monotonicMillis();
-                    if (remaining_ms <= 0 or delay_ms > remaining_ms) {
-                        return error.ConnectionTimedOut;
-                    }
-                    try std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake);
+                    try self.waitForOverloadRetry(retry_index);
                     retry_index += 1;
                 },
             }
         }
+    }
+
+    fn waitForOverloadRetry(self: *Client, retry_index: u32) !void {
+        if (self.overload_retry_telemetry) |telemetry| telemetry.overload_responses += 1;
+        if (retry_index >= self.overload_retry_policy.max_retries) {
+            if (self.overload_retry_telemetry) |telemetry| telemetry.exhausted = true;
+            return error.RequestFailed;
+        }
+        const delay_ms = overloadRetryDelayMs(
+            self.overload_retry_policy,
+            retry_index,
+            self.overload_retry_seed,
+        );
+        if (self.overload_retry_telemetry) |telemetry| {
+            telemetry.delays_ms[telemetry.delay_count] = delay_ms;
+            telemetry.delay_count += 1;
+            telemetry.retries += 1;
+        }
+        const remaining_ms = self.request_deadline_ms.? - monotonicMillis();
+        if (remaining_ms <= 0 or delay_ms > remaining_ms) return error.ConnectionTimedOut;
+        try std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake);
+    }
+
+    fn capturedNotificationBytes(notification_lines: ?*std.ArrayList([]u8)) !usize {
+        const lines = notification_lines orelse return 0;
+        if (lines.items.len > max_captured_notifications) {
+            return error.AppServerNotificationLimitExceeded;
+        }
+        var total: usize = 0;
+        for (lines.items) |line| {
+            total = try addCapturedNotificationBytes(total, line.len);
+        }
+        return total;
     }
 
     const RequestAttemptResponse = union(enum) {
@@ -810,7 +833,12 @@ pub const Client = struct {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                line,
+                .{},
+            ) catch continue;
             defer parsed.deinit();
             const msg_obj = switch (parsed.value) {
                 .object => |obj| obj,
@@ -894,7 +922,12 @@ pub const Client = struct {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                line,
+                .{},
+            ) catch continue;
             defer parsed.deinit();
             const msg_obj = switch (parsed.value) {
                 .object => |obj| obj,
@@ -940,7 +973,12 @@ pub const Client = struct {
             if (raw.len > websocket_transport.max_message_bytes) {
                 return error.AppServerMessageTooLarge;
             }
-            var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
+            var parsed_params = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                raw,
+                .{},
+            );
             defer parsed_params.deinit();
 
             const ReqWithParams = struct {
@@ -1363,13 +1401,17 @@ pub const Client = struct {
             .stdio => {},
         }
 
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             if (std.mem.indexOfScalar(u8, self.line_buf.items, '\n')) |nl_idx| {
                 const line = try self.allocator.dupe(u8, self.line_buf.items[0..nl_idx]);
                 const keep_from = nl_idx + 1;
                 const keep_len = self.line_buf.items.len - keep_from;
                 if (keep_len > 0) {
-                    std.mem.copyForwards(u8, self.line_buf.items[0..keep_len], self.line_buf.items[keep_from..]);
+                    std.mem.copyForwards(
+                        u8,
+                        self.line_buf.items[0..keep_len],
+                        self.line_buf.items[keep_from..],
+                    );
                 }
                 self.line_buf.items.len = keep_len;
                 return line;
@@ -1601,7 +1643,7 @@ pub const Actor = struct {
         if (budget_ms == 0) return error.InvalidRequestDeadline;
         const deadline = monotonicMillis() + @as(i64, budget_ms);
         var retry_index: u32 = 0;
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const remaining_ms = deadline - monotonicMillis();
             if (remaining_ms <= 0) return error.RequestDeadlineExceeded;
             const response = try self.requestOnce(
@@ -1672,7 +1714,7 @@ pub const Actor = struct {
         );
         try actorEnqueueOwned(self.state, payload, deadline);
 
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.state.mutex.lock();
             if (pending.done) {
                 _ = self.state.pending.remove(request_id);
@@ -1701,7 +1743,7 @@ pub const Actor = struct {
 };
 
 fn actorWriterMain(state: *ActorState) void {
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
         if (state.terminal != .running and state.outbound.items.len == 0) {
             state.mutex.unlock();
@@ -1731,7 +1773,7 @@ fn actorWriterMain(state: *ActorState) void {
 }
 
 fn actorHandlerMain(state: *ActorState) void {
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
         if (state.terminal != .running) {
             state.mutex.unlock();
@@ -1761,7 +1803,7 @@ fn actorHandlerMain(state: *ActorState) void {
 }
 
 fn actorReaderMain(state: *ActorState) void {
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
         const running = state.terminal == .running;
         state.mutex.unlock();
@@ -2004,7 +2046,7 @@ fn actorRequestPayloadAlloc(
 fn actorEnqueueOwned(state: *ActorState, payload: []u8, deadline_ms: i64) !void {
     const owned = payload;
     errdefer state.allocator.free(owned);
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
         if (state.terminal != .running) {
             const terminal = state.terminal;
@@ -2270,131 +2312,143 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
     try validateChoice(opts.permissions_approval, &.{ "grant-turn", "grant-session", "deny" });
     try validateChoice(opts.elicitation_action, &.{ "accept", "decline", "cancel" });
 
-    if (opts.request_user_input_response_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidRequestUserInputResponse,
-        };
-        const answers = object.get("answers") orelse return error.InvalidRequestUserInputResponse;
-        const answers_object = switch (answers) {
-            .object => |value| value,
-            else => return error.InvalidRequestUserInputResponse,
-        };
-        var answer_iterator = answers_object.iterator();
-        while (answer_iterator.next()) |entry| {
-            const answer_object = switch (entry.value_ptr.*) {
-                .object => |value| value,
-                else => return error.InvalidRequestUserInputResponse,
-            };
-            const answer_values = answer_object.get("answers") orelse
-                return error.InvalidRequestUserInputResponse;
-            const answer_array = switch (answer_values) {
-                .array => |value| value.items,
-                else => return error.InvalidRequestUserInputResponse,
-            };
-            for (answer_array) |answer| {
-                if (answer != .string) return error.InvalidRequestUserInputResponse;
-            }
-        }
-    }
-    if (opts.elicitation_content_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        if (parsed.value == .null) return error.InvalidElicitationContent;
-    }
+    if (opts.request_user_input_response_json) |raw| try validateUserInputCarrier(allocator, raw);
+    if (opts.elicitation_content_json) |raw| try validateElicitationContent(allocator, raw);
     if (opts.elicitation_action) |action| {
         if (std.mem.eql(u8, action, "accept") and opts.elicitation_content_json == null) {
             return error.MissingElicitationContent;
         }
     }
-    if (opts.elicitation_response_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
+    if (opts.elicitation_response_json) |raw| try validateElicitationCarrier(allocator, raw);
+    if (opts.dynamic_tool_response_json) |raw| try validateDynamicToolCarrier(allocator, raw);
+    if (opts.auth_refresh_response_json) |raw| try validateAuthRefreshCarrier(allocator, raw);
+    if (opts.attestation_response_json) |raw| try validateAttestationCarrier(allocator, raw);
+}
+
+fn validateUserInputCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidRequestUserInputResponse,
+    };
+    const answers = object.get("answers") orelse return error.InvalidRequestUserInputResponse;
+    const answers_object = switch (answers) {
+        .object => |value| value,
+        else => return error.InvalidRequestUserInputResponse,
+    };
+    var answer_iterator = answers_object.iterator();
+    while (answer_iterator.next()) |entry| {
+        const answer_object = switch (entry.value_ptr.*) {
             .object => |value| value,
-            else => return error.InvalidElicitationResponse,
+            else => return error.InvalidRequestUserInputResponse,
         };
-        const action = core_json.stringField(object, "action") orelse
-            return error.InvalidElicitationResponse;
-        const accepts = std.mem.eql(u8, action, "accept");
-        const declines = std.mem.eql(u8, action, "decline");
-        const cancels = std.mem.eql(u8, action, "cancel");
-        if (!accepts and !declines and !cancels) return error.InvalidElicitationResponse;
-        const content = object.get("content");
-        if (accepts and (content == null or content.? == .null)) {
-            return error.InvalidElicitationResponse;
-        }
-        if (!accepts and content != null and content.? != .null) {
-            return error.InvalidElicitationResponse;
-        }
-        // `_meta` is intentionally unconstrained by the generated schema and is
-        // preserved byte-for-byte by the full response carrier.
-    }
-    if (opts.dynamic_tool_response_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidDynamicToolResponse,
-        };
-        const content_items = object.get("contentItems") orelse
-            return error.InvalidDynamicToolResponse;
-        const success = object.get("success") orelse return error.InvalidDynamicToolResponse;
-        const items = switch (content_items) {
+        const answer_values = answer_object.get("answers") orelse
+            return error.InvalidRequestUserInputResponse;
+        const answer_array = switch (answer_values) {
             .array => |value| value.items,
-            else => return error.InvalidDynamicToolResponse,
+            else => return error.InvalidRequestUserInputResponse,
         };
-        if (success != .bool) return error.InvalidDynamicToolResponse;
-        for (items) |item| {
-            const item_object = switch (item) {
-                .object => |value| value,
-                else => return error.InvalidDynamicToolResponse,
-            };
-            const item_type = core_json.stringField(item_object, "type") orelse
-                return error.InvalidDynamicToolResponse;
-            const required_field = if (std.mem.eql(u8, item_type, "inputText"))
-                "text"
-            else if (std.mem.eql(u8, item_type, "inputImage"))
-                "imageUrl"
-            else if (std.mem.eql(u8, item_type, "inputAudio"))
-                "audioUrl"
-            else
-                return error.InvalidDynamicToolResponse;
-            const required_value = item_object.get(required_field) orelse
-                return error.InvalidDynamicToolResponse;
-            if (required_value != .string) return error.InvalidDynamicToolResponse;
+        for (answer_array) |answer| {
+            if (answer != .string) return error.InvalidRequestUserInputResponse;
         }
     }
-    if (opts.auth_refresh_response_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidAuthRefreshResponse,
-        };
-        const access_token = core_json.stringField(object, "accessToken") orelse
-            return error.InvalidAuthRefreshResponse;
-        const account_id = core_json.stringField(object, "chatgptAccountId") orelse
-            return error.InvalidAuthRefreshResponse;
-        if (access_token.len == 0 or account_id.len == 0) return error.InvalidAuthRefreshResponse;
-        if (object.get("chatgptPlanType")) |plan| switch (plan) {
-            .null, .string => {},
-            else => return error.InvalidAuthRefreshResponse,
-        };
+}
+
+fn validateElicitationContent(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    if (parsed.value == .null) return error.InvalidElicitationContent;
+}
+
+fn validateElicitationCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidElicitationResponse,
+    };
+    const action = core_json.stringField(object, "action") orelse
+        return error.InvalidElicitationResponse;
+    const accepts = std.mem.eql(u8, action, "accept");
+    const declines = std.mem.eql(u8, action, "decline");
+    const cancels = std.mem.eql(u8, action, "cancel");
+    if (!accepts and !declines and !cancels) return error.InvalidElicitationResponse;
+    const content = object.get("content");
+    if (accepts and (content == null or content.? == .null)) {
+        return error.InvalidElicitationResponse;
     }
-    if (opts.attestation_response_json) |raw| {
-        var parsed = try parseExactCarrier(allocator, raw);
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidAttestationResponse,
-        };
-        const token = core_json.stringField(object, "token") orelse
-            return error.InvalidAttestationResponse;
-        if (token.len == 0) return error.InvalidAttestationResponse;
+    if (!accepts and content != null and content.? != .null) {
+        return error.InvalidElicitationResponse;
     }
+    // `_meta` is intentionally unconstrained by the generated schema and is
+    // preserved byte-for-byte by the full response carrier.
+}
+
+fn validateDynamicToolCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidDynamicToolResponse,
+    };
+    const content_items = object.get("contentItems") orelse
+        return error.InvalidDynamicToolResponse;
+    const success = object.get("success") orelse return error.InvalidDynamicToolResponse;
+    const items = switch (content_items) {
+        .array => |value| value.items,
+        else => return error.InvalidDynamicToolResponse,
+    };
+    if (success != .bool) return error.InvalidDynamicToolResponse;
+    for (items) |item| {
+        const item_object = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidDynamicToolResponse,
+        };
+        const item_type = core_json.stringField(item_object, "type") orelse
+            return error.InvalidDynamicToolResponse;
+        const required_field = if (std.mem.eql(u8, item_type, "inputText"))
+            "text"
+        else if (std.mem.eql(u8, item_type, "inputImage"))
+            "imageUrl"
+        else if (std.mem.eql(u8, item_type, "inputAudio"))
+            "audioUrl"
+        else
+            return error.InvalidDynamicToolResponse;
+        const required_value = item_object.get(required_field) orelse
+            return error.InvalidDynamicToolResponse;
+        if (required_value != .string) return error.InvalidDynamicToolResponse;
+    }
+}
+
+fn validateAuthRefreshCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidAuthRefreshResponse,
+    };
+    const access_token = core_json.stringField(object, "accessToken") orelse
+        return error.InvalidAuthRefreshResponse;
+    const account_id = core_json.stringField(object, "chatgptAccountId") orelse
+        return error.InvalidAuthRefreshResponse;
+    if (access_token.len == 0 or account_id.len == 0) return error.InvalidAuthRefreshResponse;
+    if (object.get("chatgptPlanType")) |plan| switch (plan) {
+        .null, .string => {},
+        else => return error.InvalidAuthRefreshResponse,
+    };
+}
+
+fn validateAttestationCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try parseExactCarrier(allocator, raw);
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidAttestationResponse,
+    };
+    const token = core_json.stringField(object, "token") orelse
+        return error.InvalidAttestationResponse;
+    if (token.len == 0) return error.InvalidAttestationResponse;
 }
 
 fn validateChoice(value: ?[]const u8, allowed: []const []const u8) !void {
@@ -2419,24 +2473,38 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     if (value.len == 0) return error.MissingExecutable;
 
     if (std.mem.indexOfScalar(u8, value, '/') != null) {
-        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), value, .{}) catch return error.ExecutableNotFound;
+        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), value, .{}) catch
+            return error.ExecutableNotFound;
         return allocator.dupe(u8, value);
     }
 
-    const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
+    const exe_dir =
+        std.process.executableDirPathAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            allocator,
+        ) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
-        const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
+        const sibling = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ dir, value },
+        );
         errdefer allocator.free(sibling);
         if (pathExists(sibling)) return sibling;
         allocator.free(sibling);
     }
 
-    const path_env = std.Io.Threaded.global_single_threaded.environString("PATH") orelse return error.ExecutableNotFound;
+    const path_env = std.Io.Threaded.global_single_threaded.environString("PATH") orelse
+        return error.ExecutableNotFound;
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         if (dir.len == 0) continue;
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
+        const candidate = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ dir, value },
+        );
         errdefer allocator.free(candidate);
         if (pathExists(candidate)) return candidate;
         allocator.free(candidate);
@@ -2452,10 +2520,12 @@ fn monotonicMillis() i64 {
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch
+            return false;
         return true;
     }
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch
+        return false;
     return true;
 }
 
@@ -3111,7 +3181,7 @@ test "server request reply write failure poisons the client" {
     try std.testing.expectEqualStrings("server request reply write failed", client.lastError().?);
 }
 
-test "exact response carriers are bounded and shape checked before launch" {
+test "exact input response carriers are shape checked before launch" {
     try std.testing.expectError(
         error.InvalidServerRequestPolicy,
         validateServerRequestOptions(std.testing.allocator, .{
@@ -3144,6 +3214,9 @@ test "exact response carriers are bounded and shape checked before launch" {
         .cwd = ".",
         .request_user_input_response_json = "{\"answers\":{\"q\":{\"answers\":[\"yes\",\"no\"]}}}",
     });
+}
+
+test "exact dynamic response carriers are bounded and shape checked before launch" {
     try std.testing.expectError(
         error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
@@ -3420,12 +3493,36 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
         notifications.deinit(allocator);
     }
 
+    try verifyRetryOutcome(
+        allocator,
+        mode,
+        policy,
+        &client,
+        &telemetry,
+        &observer,
+        &notifications,
+    );
+    if (!std.mem.eql(u8, mode, "failure_then_success")) {
+        try std.testing.expectEqual(@as(usize, 1), observer.calls);
+    }
+    try verifyRetryRequests(allocator, io, &tmp, mode, telemetry.wire_attempts);
+}
+
+fn verifyRetryOutcome(
+    allocator: std.mem.Allocator,
+    mode: []const u8,
+    policy: OverloadRetryPolicy,
+    client: *Client,
+    telemetry: *OverloadRetryTelemetry,
+    observer: *SendObserverProbe,
+    notifications: *std.ArrayList([]u8),
+) !void {
     if (std.mem.eql(u8, mode, "success")) {
         const result = try client.requestJsonCaptureNotificationsWithSendObserver(
             "test/retry",
             "{\"value\":7}",
-            &notifications,
-            .{ .context = &observer, .before_send = SendObserverProbe.count },
+            notifications,
+            .{ .context = observer, .before_send = SendObserverProbe.count },
         );
         defer allocator.free(result);
         try std.testing.expectEqualStrings("{\"ok\":true}", result);
@@ -3452,7 +3549,7 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
             client.requestJsonWithSendObserver(
                 "test/retry",
                 "{\"value\":7}",
-                .{ .context = &observer, .before_send = SendObserverProbe.count },
+                .{ .context = observer, .before_send = SendObserverProbe.count },
             ),
         );
         if (std.mem.eql(u8, mode, "nonoverload")) {
@@ -3465,10 +3562,15 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
             try std.testing.expect(telemetry.exhausted);
         }
     }
-    if (!std.mem.eql(u8, mode, "failure_then_success")) {
-        try std.testing.expectEqual(@as(usize, 1), observer.calls);
-    }
+}
 
+fn verifyRetryRequests(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    mode: []const u8,
+    wire_attempts: u32,
+) !void {
     const requests = try tmp.dir.readFileAlloc(
         io,
         "requests.jsonl",
@@ -3481,14 +3583,18 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
     while (lines.next()) |line| : (index += 1) {
         try std.testing.expect(std.mem.indexOf(u8, line, "\"method\":\"test/retry\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"params\":{\"value\":7}") != null);
-        const expected_id = try std.fmt.allocPrint(allocator, "\"id\":{d}", .{index + 1});
+        const expected_id = try std.fmt.allocPrint(
+            allocator,
+            "\"id\":{d}",
+            .{index + 1},
+        );
         defer allocator.free(expected_id);
         try std.testing.expect(std.mem.indexOf(u8, line, expected_id) != null);
     }
     const expected_requests: usize = if (std.mem.eql(u8, mode, "failure_then_success"))
         2
     else
-        telemetry.wire_attempts;
+        wire_attempts;
     try std.testing.expectEqual(expected_requests, index);
 }
 
@@ -4157,11 +4263,20 @@ test "resolvePermissionsApproval honors explicit grants and read_only" {
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(Client.PermissionsApproval.grant_session, client.resolvePermissionsApproval());
+    try std.testing.expectEqual(
+        Client.PermissionsApproval.grant_session,
+        client.resolvePermissionsApproval(),
+    );
     client.permissions_approval = "grant-turn";
-    try std.testing.expectEqual(Client.PermissionsApproval.grant_turn, client.resolvePermissionsApproval());
+    try std.testing.expectEqual(
+        Client.PermissionsApproval.grant_turn,
+        client.resolvePermissionsApproval(),
+    );
     client.read_only = true;
-    try std.testing.expectEqual(Client.PermissionsApproval.deny, client.resolvePermissionsApproval());
+    try std.testing.expectEqual(
+        Client.PermissionsApproval.deny,
+        client.resolvePermissionsApproval(),
+    );
 }
 
 test "resolveElicitationAction defaults to decline" {
@@ -4186,9 +4301,18 @@ test "resolveElicitationAction defaults to decline" {
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(Client.McpElicitationResponseAction.decline, client.resolveElicitationAction());
+    try std.testing.expectEqual(
+        Client.McpElicitationResponseAction.decline,
+        client.resolveElicitationAction(),
+    );
     client.elicitation_action = "accept";
-    try std.testing.expectEqual(Client.McpElicitationResponseAction.accept, client.resolveElicitationAction());
+    try std.testing.expectEqual(
+        Client.McpElicitationResponseAction.accept,
+        client.resolveElicitationAction(),
+    );
     client.elicitation_action = "cancel";
-    try std.testing.expectEqual(Client.McpElicitationResponseAction.cancel, client.resolveElicitationAction());
+    try std.testing.expectEqual(
+        Client.McpElicitationResponseAction.cancel,
+        client.resolveElicitationAction(),
+    );
 }

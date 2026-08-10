@@ -43,7 +43,13 @@ pub const Server = struct {
         const listener = try address.listen(io, .{ .mode = .stream });
         var token: [32]u8 = undefined;
         io.random(&token);
-        return .{ .allocator = allocator, .io = io, .listener = listener, .token = token, .skill_root = try allocator.dupe(u8, skill_root) };
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .listener = listener,
+            .token = token,
+            .skill_root = try allocator.dupe(u8, skill_root),
+        };
     }
     pub fn deinit(self: *Server) void {
         self.listener.deinit(self.io);
@@ -53,7 +59,9 @@ pub const Server = struct {
         return self.listener.socket.address.getPort();
     }
     pub fn tokenHex(self: *const Server, out: *[64]u8) []const u8 {
-        return std.fmt.bufPrint(out, "{x}", .{self.token}) catch unreachable;
+        return std.fmt.bufPrint(out, "{x}", .{self.token}) catch |err| switch (err) {
+            error.NoSpaceLeft => "",
+        };
     }
 
     pub fn serveOne(self: *Server, runtime: *Runtime) !void {
@@ -71,15 +79,30 @@ pub const Server = struct {
         const target = requestTarget(raw) orelse return error.InvalidHttpRequest;
         var token_buf: [64]u8 = undefined;
         const token = self.tokenHex(&token_buf);
-        if (std.mem.startsWith(u8, target, "/ws?")) return self.upgradeWebSocket(&stream, raw, token, runtime);
+        if (std.mem.startsWith(u8, target, "/ws?")) {
+            return self.upgradeWebSocket(&stream, raw, token, runtime);
+        }
         if (requiresToken(target)) {
-            if (!authorized(target, raw, token)) return writeResponse(self.io, &stream, "403 Forbidden", "text/plain", "forbidden", false);
+            if (!authorized(target, raw, token)) return writeResponse(
+                self.io,
+                &stream,
+                "403 Forbidden",
+                "text/plain",
+                "forbidden",
+                false,
+            );
             const body = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(body);
             return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
         }
-        if (std.mem.startsWith(u8, target, "/healthz") or std.mem.startsWith(u8, target, "/readyz")) {
-            const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ok\",\"launchId\":{f},\"pid\":{d}}}", .{ std.json.fmt(runtime.launch_id, .{}), std.c.getpid() });
+        const health = std.mem.startsWith(u8, target, "/healthz") or
+            std.mem.startsWith(u8, target, "/readyz");
+        if (health) {
+            const body = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"status\":\"ok\",\"launchId\":{f},\"pid\":{d}}}",
+                .{ std.json.fmt(runtime.launch_id, .{}), std.c.getpid() },
+            );
             defer self.allocator.free(body);
             return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
         }
@@ -87,10 +110,23 @@ pub const Server = struct {
     }
 
     fn serveAsset(self: *Server, stream: *std.Io.net.Stream, target: []const u8) !void {
-        const clean = if (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/?")) "index.html" else blk: {
+        const clean = if (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/?"))
+            "index.html"
+        else blk: {
             const end = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
             const p = target[0..end];
-            if (!std.mem.startsWith(u8, p, "/assets/") or std.mem.indexOf(u8, p, "..") != null or std.mem.indexOfScalar(u8, p, '\\') != null or std.mem.indexOfScalar(u8, p, '%') != null) return writeResponse(self.io, stream, "404 Not Found", "text/plain", "not found", false);
+            const invalid = !std.mem.startsWith(u8, p, "/assets/") or
+                std.mem.indexOf(u8, p, "..") != null or
+                std.mem.indexOfScalar(u8, p, '\\') != null or
+                std.mem.indexOfScalar(u8, p, '%') != null;
+            if (invalid) return writeResponse(
+                self.io,
+                stream,
+                "404 Not Found",
+                "text/plain",
+                "not found",
+                false,
+            );
             break :blk p["/assets/".len..];
         };
         const root = try std.fs.path.join(self.allocator, &.{ self.skill_root, "assets", "ui" });
@@ -99,20 +135,86 @@ pub const Server = struct {
         defer self.allocator.free(root_real);
         const candidate = try std.fs.path.join(self.allocator, &.{ root_real, clean });
         defer self.allocator.free(candidate);
-        const real = std.Io.Dir.cwd().realPathFileAlloc(self.io, candidate, self.allocator) catch return writeResponse(self.io, stream, "404 Not Found", "text/plain", "not found", false);
+        const real = std.Io.Dir.cwd().realPathFileAlloc(
+            self.io,
+            candidate,
+            self.allocator,
+        ) catch return writeResponse(
+            self.io,
+            stream,
+            "404 Not Found",
+            "text/plain",
+            "not found",
+            false,
+        );
         defer self.allocator.free(real);
-        if (!pathConfined(root_real, real)) return writeResponse(self.io, stream, "404 Not Found", "text/plain", "not found", false);
-        const body = try std.Io.Dir.cwd().readFileAlloc(self.io, real, self.allocator, .limited(8 * 1024 * 1024));
+        if (!pathConfined(root_real, real)) return writeResponse(
+            self.io,
+            stream,
+            "404 Not Found",
+            "text/plain",
+            "not found",
+            false,
+        );
+        const body = try std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            real,
+            self.allocator,
+            .limited(8 * 1024 * 1024),
+        );
         defer self.allocator.free(body);
-        const content_type = if (std.mem.endsWith(u8, real, ".html")) "text/html; charset=utf-8" else if (std.mem.endsWith(u8, real, ".css")) "text/css" else "text/javascript";
+        const content_type = if (std.mem.endsWith(u8, real, ".html"))
+            "text/html; charset=utf-8"
+        else if (std.mem.endsWith(u8, real, ".css")) "text/css" else "text/javascript";
         try writeResponse(self.io, stream, "200 OK", content_type, body, true);
     }
 
-    fn upgradeWebSocket(self: *Server, stream: *std.Io.net.Stream, raw: []const u8, token: []const u8, runtime: *Runtime) !void {
+    fn upgradeWebSocket(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        raw: []const u8,
+        token: []const u8,
+        runtime: *Runtime,
+    ) !void {
         const target = requestTarget(raw) orelse return error.InvalidHttpRequest;
-        if (!authorized(target, raw, token) or !loopbackOrigin(raw, self.port())) return writeResponse(self.io, stream, "403 Forbidden", "text/plain", "forbidden", false);
-        const key = headerValue(raw, "sec-websocket-key") orelse return writeResponse(self.io, stream, "400 Bad Request", "text/plain", "missing websocket key", false);
-        if (!headerToken(raw, "upgrade", "websocket") or !headerToken(raw, "connection", "upgrade")) return writeResponse(self.io, stream, "400 Bad Request", "text/plain", "invalid upgrade", false);
+        if (!authorized(target, raw, token) or !loopbackOrigin(raw, self.port())) {
+            return writeResponse(
+                self.io,
+                stream,
+                "403 Forbidden",
+                "text/plain",
+                "forbidden",
+                false,
+            );
+        }
+        const key = headerValue(raw, "sec-websocket-key") orelse return writeResponse(
+            self.io,
+            stream,
+            "400 Bad Request",
+            "text/plain",
+            "missing websocket key",
+            false,
+        );
+        const invalid_upgrade = !headerToken(raw, "upgrade", "websocket") or
+            !headerToken(raw, "connection", "upgrade");
+        if (invalid_upgrade) return writeResponse(
+            self.io,
+            stream,
+            "400 Bad Request",
+            "text/plain",
+            "invalid upgrade",
+            false,
+        );
+        try self.writeUpgradeResponse(stream, key);
+        defer runtime.registry.declineAllApprovals("browser-disconnected");
+        try self.serveWebSocket(stream, runtime);
+    }
+
+    fn writeUpgradeResponse(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        key: []const u8,
+    ) !void {
         var sha1 = std.crypto.hash.Sha1.init(.{});
         sha1.update(key);
         sha1.update(websocket_guid);
@@ -120,14 +222,27 @@ pub const Server = struct {
         sha1.final(&digest);
         var enc: [28]u8 = undefined;
         const accept = std.base64.standard.Encoder.encode(&enc, &digest);
-        const response = try std.fmt.allocPrint(self.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
+        const format = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket" ++
+            "\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n";
+        const response = try std.fmt.allocPrint(self.allocator, format, .{accept});
         defer self.allocator.free(response);
         var writer = stream.writer(self.io, &.{});
         try writer.interface.writeAll(response);
         try writer.interface.flush();
-        defer runtime.registry.declineAllApprovals("browser-disconnected");
-        while (true) {
-            const message = readClientTextAllocTimeout(self.allocator, self.io, stream, config.visible_event_flush_ms) catch |err| switch (err) {
+    }
+
+    fn serveWebSocket(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+    ) !void {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
+            const message = readClientTextAllocTimeout(
+                self.allocator,
+                self.io,
+                stream,
+                config.visible_event_flush_ms,
+            ) catch |err| switch (err) {
                 error.Timeout => {
                     try self.flushVisible(stream, runtime);
                     if (runtime.stop_request_path) |path| {
@@ -144,7 +259,11 @@ pub const Server = struct {
             };
             defer self.allocator.free(message);
             const reply = self.handleCommandAlloc(runtime, message) catch |err| error_reply: {
-                const payload = try std.fmt.allocPrint(self.allocator, "{{\"code\":{f}}}", .{std.json.fmt(@errorName(err), .{})});
+                const payload = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"code\":{f}}}",
+                    .{std.json.fmt(@errorName(err), .{})},
+                );
                 defer self.allocator.free(payload);
                 break :error_reply try runtime.app.nextEnvelope("error", payload);
             };
@@ -164,7 +283,10 @@ pub const Server = struct {
         const primary_ready = runtime.registry.primaryReady();
         if (primary_ready and !runtime.app.primary_ready) {
             runtime.app.primary_ready = true;
-            const envelope = try runtime.app.nextEnvelope("primary.status", "{\"status\":\"completed\"}");
+            const envelope = try runtime.app.nextEnvelope(
+                "primary.status",
+                "{\"status\":\"completed\"}",
+            );
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
         }
@@ -184,90 +306,170 @@ pub const Server = struct {
             for (visible.items) |event| event.deinit(self.allocator);
             visible.deinit(self.allocator);
         }
-        for (visible.items) |event| {
-            if ((event.session_id == null and std.mem.eql(u8, event.method, "file.excluded")) or std.mem.eql(u8, event.method, "approval.requested") or std.mem.eql(u8, event.method, "approval.resolved")) {
-                const envelope = try runtime.app.nextEnvelope(event.method, event.raw_json);
-                defer self.allocator.free(envelope);
-                try writeServerText(self.io, stream, envelope);
-                continue;
-            }
-            if (std.mem.eql(u8, event.method, "action.prepared")) {
-                const session_id = event.session_id orelse return error.MissingOriginSession;
-                const input = try tools.decodePreparedAction(self.allocator, event.raw_json);
-                defer input.deinit(self.allocator);
-                const identity = try runtime.registry.sessionIdentity(session_id);
-                defer identity.deinit();
-                try tools.validateAgainstSession(input, identity.path);
-                const superseded = if (runtime.app.action_store.pendingIdForSlot(session_id, input.slot)) |id| try self.allocator.dupe(u8, id) else null;
-                defer if (superseded) |id| self.allocator.free(id);
-                const repository = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ runtime.owner, runtime.name });
-                defer self.allocator.free(repository);
-                const card = try runtime.app.prepareModelAction(session_id, identity.turn_id, input, repository, runtime.number, runtime.pull_request_id, identity.path);
-                if (superseded) |id| {
-                    const superseded_payload = try std.fmt.allocPrint(self.allocator, "{{\"sessionId\":{f},\"id\":{f}}}", .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(id, .{}) });
-                    defer self.allocator.free(superseded_payload);
-                    const superseded_envelope = try runtime.app.nextEnvelope("action.superseded", superseded_payload);
-                    defer self.allocator.free(superseded_envelope);
-                    try writeServerText(self.io, stream, superseded_envelope);
-                }
-                const card_payload = try tools.cardJsonAlloc(self.allocator, card);
-                defer self.allocator.free(card_payload);
-                const card_envelope = try runtime.app.nextEnvelope("action.prepared", card_payload);
-                defer self.allocator.free(card_envelope);
-                try writeServerText(self.io, stream, card_envelope);
-                continue;
-            }
-            if (std.mem.eql(u8, event.method, "file.complete.requested")) {
-                const session_id = event.session_id orelse return error.MissingOriginSession;
-                const identity = try runtime.registry.sessionIdentity(session_id);
-                defer identity.deinit();
-                runtime.app.completeRevision(
-                    runtime.broker,
-                    runtime.owner,
-                    runtime.name,
-                    runtime.number,
-                    runtime.pull_request_id,
-                    identity.path,
-                    identity.revision,
-                ) catch |err| {
-                    const failed = try std.fmt.allocPrint(
-                        self.allocator,
-                        "{{\"status\":\"failed\",\"reason\":{f}}}",
-                        .{std.json.fmt(@errorName(err), .{})},
-                    );
-                    defer self.allocator.free(failed);
-                    const warning = try runtime.app.nextEnvelope("warning", failed);
-                    defer self.allocator.free(warning);
-                    try writeServerText(self.io, stream, warning);
-                    continue;
-                };
-                try runtime.registry.markCompleted(session_id);
-                const payload = try ui.visibleEventPayloadAlloc(self.allocator, session_id, event.method, "{\"status\":\"viewed\"}");
-                defer self.allocator.free(payload);
-                const envelope = try runtime.app.nextEnvelope("file.completed", payload);
-                defer self.allocator.free(envelope);
-                try writeServerText(self.io, stream, envelope);
-                continue;
-            }
-            if (std.mem.eql(u8, event.method, "session.close.requested")) {
-                const session_id = event.session_id orelse return error.MissingOriginSession;
-                const identity = try runtime.registry.sessionIdentity(session_id);
-                defer identity.deinit();
-                try runtime.registry.closeSession(session_id);
-                try runtime.app.closeTab(identity.path, identity.revision);
-                const payload = try ui.visibleEventPayloadAlloc(self.allocator, session_id, event.method, "{\"status\":\"closed\"}");
-                defer self.allocator.free(payload);
-                const envelope = try runtime.app.nextEnvelope("session.closed", payload);
-                defer self.allocator.free(envelope);
-                try writeServerText(self.io, stream, envelope);
-                continue;
-            }
-            const payload = try ui.visibleEventPayloadAlloc(self.allocator, event.session_id, event.method, event.raw_json);
-            defer self.allocator.free(payload);
-            const envelope = try runtime.app.nextEnvelope("session.item.delta", payload);
+        for (visible.items) |event| try self.flushVisibleEvent(stream, runtime, event);
+    }
+
+    fn flushVisibleEvent(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+        event: sessions.VisibleEvent,
+    ) !void {
+        if ((event.session_id == null and std.mem.eql(
+            u8,
+            event.method,
+            "file.excluded",
+        )) or std.mem.eql(
+            u8,
+            event.method,
+            "approval.requested",
+        ) or std.mem.eql(u8, event.method, "approval.resolved")) {
+            const envelope = try runtime.app.nextEnvelope(event.method, event.raw_json);
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
+            return;
         }
+        if (std.mem.eql(u8, event.method, "action.prepared")) {
+            return self.flushPreparedAction(stream, runtime, event);
+        }
+        if (std.mem.eql(u8, event.method, "file.complete.requested")) {
+            return self.flushCompletedFile(stream, runtime, event);
+        }
+        if (std.mem.eql(u8, event.method, "session.close.requested")) {
+            return self.flushClosedSession(stream, runtime, event);
+        }
+        const payload = try ui.visibleEventPayloadAlloc(
+            self.allocator,
+            event.session_id,
+            event.method,
+            event.raw_json,
+        );
+        defer self.allocator.free(payload);
+        const envelope = try runtime.app.nextEnvelope("session.item.delta", payload);
+        defer self.allocator.free(envelope);
+        try writeServerText(self.io, stream, envelope);
+    }
+
+    fn flushPreparedAction(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+        event: sessions.VisibleEvent,
+    ) !void {
+        const session_id = event.session_id orelse return error.MissingOriginSession;
+        const input = try tools.decodePreparedAction(self.allocator, event.raw_json);
+        defer input.deinit(self.allocator);
+        const identity = try runtime.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try tools.validateAgainstSession(input, identity.path);
+        const pending_id = runtime.app.action_store.pendingIdForSlot(
+            session_id,
+            input.slot,
+        );
+        const superseded = if (pending_id) |id|
+            try self.allocator.dupe(u8, id)
+        else
+            null;
+        defer if (superseded) |id| self.allocator.free(id);
+        const repository = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ runtime.owner, runtime.name },
+        );
+        defer self.allocator.free(repository);
+        const card = try runtime.app.prepareModelAction(
+            session_id,
+            identity.turn_id,
+            input,
+            repository,
+            runtime.number,
+            runtime.pull_request_id,
+            identity.path,
+        );
+        if (superseded) |id| {
+            const superseded_payload = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"sessionId\":{f},\"id\":{f}}}",
+                .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(id, .{}) },
+            );
+            defer self.allocator.free(superseded_payload);
+            const superseded_envelope = try runtime.app.nextEnvelope(
+                "action.superseded",
+                superseded_payload,
+            );
+            defer self.allocator.free(superseded_envelope);
+            try writeServerText(self.io, stream, superseded_envelope);
+        }
+        const card_payload = try tools.cardJsonAlloc(self.allocator, card);
+        defer self.allocator.free(card_payload);
+        const card_envelope = try runtime.app.nextEnvelope("action.prepared", card_payload);
+        defer self.allocator.free(card_envelope);
+        try writeServerText(self.io, stream, card_envelope);
+    }
+
+    fn flushCompletedFile(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+        event: sessions.VisibleEvent,
+    ) !void {
+        const session_id = event.session_id orelse return error.MissingOriginSession;
+        const identity = try runtime.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        runtime.app.completeRevision(
+            runtime.broker,
+            runtime.owner,
+            runtime.name,
+            runtime.number,
+            runtime.pull_request_id,
+            identity.path,
+            identity.revision,
+        ) catch |err| {
+            const failed = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"status\":\"failed\",\"reason\":{f}}}",
+                .{std.json.fmt(@errorName(err), .{})},
+            );
+            defer self.allocator.free(failed);
+            const warning = try runtime.app.nextEnvelope("warning", failed);
+            defer self.allocator.free(warning);
+            try writeServerText(self.io, stream, warning);
+            return;
+        };
+        try runtime.registry.markCompleted(session_id);
+        const payload = try ui.visibleEventPayloadAlloc(
+            self.allocator,
+            session_id,
+            event.method,
+            "{\"status\":\"viewed\"}",
+        );
+        defer self.allocator.free(payload);
+        const envelope = try runtime.app.nextEnvelope("file.completed", payload);
+        defer self.allocator.free(envelope);
+        try writeServerText(self.io, stream, envelope);
+    }
+
+    fn flushClosedSession(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+        event: sessions.VisibleEvent,
+    ) !void {
+        const session_id = event.session_id orelse return error.MissingOriginSession;
+        const identity = try runtime.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try runtime.registry.closeSession(session_id);
+        try runtime.app.closeTab(identity.path, identity.revision);
+        const payload = try ui.visibleEventPayloadAlloc(
+            self.allocator,
+            session_id,
+            event.method,
+            "{\"status\":\"closed\"}",
+        );
+        defer self.allocator.free(payload);
+        const envelope = try runtime.app.nextEnvelope("session.closed", payload);
+        defer self.allocator.free(envelope);
+        try writeServerText(self.io, stream, envelope);
     }
 
     fn handleCommandAlloc(self: *Server, runtime: *Runtime, raw: []const u8) ![]u8 {
@@ -285,126 +487,23 @@ pub const Server = struct {
             .object => |o| o,
             else => return error.InvalidUiCommand,
         };
-        if (std.mem.eql(u8, command, "file.open")) {
-            const path = switch (payload.get("path") orelse return error.InvalidUiCommand) {
-                .string => |s| s,
-                else => return error.InvalidUiCommand,
-            };
-            if (!runtime.app.primary_ready) return error.PrimaryNotReady;
-            if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
-            const revision = @import("domain.zig").revisionFor(
-                &runtime.app.generation,
-                path,
-            ) orelse return error.MissingRevision;
-            const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, path);
-            defer self.allocator.free(diff);
-            const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(self.allocator, path, null, &.{}, false);
-            defer self.allocator.free(threads);
-            const immediate = if (runtime.settings) |settings| settings.file_review_start_mode == .immediate else true;
-            const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path, immediate);
-            defer opened.deinit();
-            const event = runtime.app.openFile(path) catch |err| {
-                if (!opened.reused) {
-                    runtime.registry.discardOpenedSession(opened.session_id);
-                }
-                return err;
-            };
-            self.allocator.free(event);
-            runtime.app.recordOpenedSession(
-                path,
-                revision,
-                opened.session_id,
-                diff,
-                opened.reused,
-                immediate and !opened.reused,
-            ) catch |err| {
-                if (!opened.reused) {
-                    runtime.registry.discardOpenedSession(opened.session_id);
-                }
-                runtime.app.rollbackOpenedFile(path, revision, opened.reused);
-                return err;
-            };
-            const body = try runtime.app.sessionOpenedPayloadAlloc(path, revision);
-            defer self.allocator.free(body);
-            return runtime.app.nextEnvelope("session.opened", body);
-        }
+        if (std.mem.eql(u8, command, "file.open")) return self.openFile(runtime, payload);
         if (std.mem.eql(u8, command, "session.close")) {
-            const session_id = payloadString(payload, "sessionId") orelse return error.InvalidUiCommand;
-            const identity = try runtime.registry.sessionIdentity(session_id);
-            defer identity.deinit();
-            try runtime.registry.closeSession(session_id);
-            try runtime.app.closeTab(identity.path, identity.revision);
-            return runtime.app.nextEnvelope("session.closed", "{}");
+            return self.closeSession(runtime, payload);
         }
         if (std.mem.eql(u8, command, "session.message")) {
-            runtime.app.initial_review_active = false;
-            const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
-            const session_id = payloadString(payload, "sessionId") orelse return error.InvalidUiCommand;
-            try runtime.registry.message(session_id, text);
-            return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
+            return self.messageSession(runtime, payload);
         }
         if (std.mem.eql(u8, command, "session.interrupt")) {
-            try runtime.registry.interrupt(payloadString(payload, "sessionId") orelse return error.InvalidUiCommand);
-            return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
+            return self.interruptSession(runtime, payload);
         }
         if (std.mem.eql(u8, command, "approval.resolve")) {
-            if (payload.count() != 2 and payload.count() != 3) return error.InvalidUiCommand;
-            const session_id = payloadString(payload, "sessionId");
-            if (payload.count() == 3 and session_id == null) return error.InvalidUiCommand;
-            const approval_id = payloadString(payload, "approvalId") orelse return error.InvalidUiCommand;
-            const decision = payload.get("decision") orelse return error.InvalidUiCommand;
-            const choice_json = try stringifyValueAlloc(self.allocator, decision);
-            defer self.allocator.free(choice_json);
-            try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
-            return runtime.app.nextEnvelope("session.status", "{\"status\":\"approval-resolving\"}");
+            return self.resolveApproval(runtime, payload);
         }
         if (std.mem.eql(u8, command, "action.confirm")) {
-            if (payload.count() != 1) return error.InvalidUiCommand;
-            const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
-            const card = (try runtime.app.action_store.pendingById(card_id)).*;
-            runtime.broker.validateAction(runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, card) catch |err| {
-                try runtime.app.action_store.invalidate(card_id);
-                const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}", .{ std.json.fmt(card_id, .{}), std.json.fmt(@errorName(err), .{}) });
-                defer self.allocator.free(status);
-                return runtime.app.nextEnvelope("action.status", status);
-            };
-            if (card.kind == .add_inline_comment) {
-                const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, card.target.path.?);
-                defer self.allocator.free(diff);
-                if (!github.validateDiffAnchor(diff, card.target.line.?, card.target.start_line, card.target.side orelse "RIGHT")) {
-                    try runtime.app.action_store.invalidate(card_id);
-                    const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":\"StaleCommentAnchor\"}}", .{std.json.fmt(card_id, .{})});
-                    defer self.allocator.free(status);
-                    return runtime.app.nextEnvelope("action.status", status);
-                }
-            }
-            const terminal = try runtime.app.confirmAction(runtime.broker, runtime.owner, runtime.name, runtime.number, card_id);
-            if (terminal == .succeeded) {
-                if (runtime.broker.readGeneration(
-                    runtime.owner,
-                    runtime.name,
-                    runtime.number,
-                )) |generation_value| {
-                    var generation = generation_value;
-                    defer generation.deinit();
-                    try runtime.registry.setGenerationEvidence(&generation);
-                    runtime.app.action_state_fresh = true;
-                } else |_| {
-                    runtime.app.action_state_fresh = false;
-                }
-            }
-            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":{f},\"stateFresh\":{}}}", .{ std.json.fmt(card_id, .{}), std.json.fmt(tools.actionStatusName(terminal), .{}), runtime.app.action_state_fresh });
-            defer self.allocator.free(status);
-            return runtime.app.nextEnvelope("action.status", status);
+            return self.confirmAction(runtime, payload);
         }
-        if (std.mem.eql(u8, command, "action.reject")) {
-            if (payload.count() != 1) return error.InvalidUiCommand;
-            const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
-            try runtime.app.rejectAction(card_id);
-            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"rejected\"}}", .{std.json.fmt(card_id, .{})});
-            defer self.allocator.free(status);
-            return runtime.app.nextEnvelope("action.status", status);
-        }
+        if (std.mem.eql(u8, command, "action.reject")) return self.rejectAction(runtime, payload);
         if (std.mem.eql(u8, command, "snapshot.get")) {
             const snapshot = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(snapshot);
@@ -430,6 +529,242 @@ pub const Server = struct {
         return error.UnsupportedUiCommand;
     }
 
+    fn openFile(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        const path = switch (payload.get("path") orelse return error.InvalidUiCommand) {
+            .string => |s| s,
+            else => return error.InvalidUiCommand,
+        };
+        if (!runtime.app.primary_ready) return error.PrimaryNotReady;
+        if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
+        const revision = @import("domain.zig").revisionFor(
+            &runtime.app.generation,
+            path,
+        ) orelse return error.MissingRevision;
+        const diff = try github.canonicalDiffAlloc(
+            self.allocator,
+            self.io,
+            runtime.cwd,
+            runtime.app.generation.base_oid,
+            runtime.app.generation.head_oid,
+            path,
+        );
+        defer self.allocator.free(diff);
+        const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(
+            self.allocator,
+            path,
+            null,
+            &.{},
+            false,
+        );
+        defer self.allocator.free(threads);
+        const immediate = if (runtime.settings) |settings| settings.file_review_start_mode ==
+            .immediate else true;
+        const opened = try runtime.registry.openFile(
+            self.io,
+            runtime.cwd,
+            path,
+            revision,
+            runtime.app.generation.base_oid,
+            runtime.app.generation.head_oid,
+            diff,
+            threads,
+            runtime.skill_path,
+            immediate,
+        );
+        defer opened.deinit();
+        const event = runtime.app.openFile(path) catch |err| {
+            if (!opened.reused) {
+                runtime.registry.discardOpenedSession(opened.session_id);
+            }
+            return err;
+        };
+        self.allocator.free(event);
+        runtime.app.recordOpenedSession(
+            path,
+            revision,
+            opened.session_id,
+            diff,
+            opened.reused,
+            immediate and !opened.reused,
+        ) catch |err| {
+            if (!opened.reused) {
+                runtime.registry.discardOpenedSession(opened.session_id);
+            }
+            runtime.app.rollbackOpenedFile(path, revision, opened.reused);
+            return err;
+        };
+        const body = try runtime.app.sessionOpenedPayloadAlloc(path, revision);
+        defer self.allocator.free(body);
+        return runtime.app.nextEnvelope("session.opened", body);
+    }
+
+    fn closeSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        _ = self;
+        const session_id = payloadString(payload, "sessionId") orelse
+            return error.InvalidUiCommand;
+        const identity = try runtime.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try runtime.registry.closeSession(session_id);
+        try runtime.app.closeTab(identity.path, identity.revision);
+        return runtime.app.nextEnvelope("session.closed", "{}");
+    }
+
+    fn messageSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        _ = self;
+        runtime.app.initial_review_active = false;
+        const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
+        const session_id = payloadString(payload, "sessionId") orelse
+            return error.InvalidUiCommand;
+        try runtime.registry.message(session_id, text);
+        return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
+    }
+
+    fn interruptSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        _ = self;
+        const session_id = payloadString(payload, "sessionId") orelse
+            return error.InvalidUiCommand;
+        try runtime.registry.interrupt(session_id);
+        return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
+    }
+
+    fn resolveApproval(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        if (payload.count() != 2 and payload.count() != 3) return error.InvalidUiCommand;
+        const session_id = payloadString(payload, "sessionId");
+        if (payload.count() == 3 and session_id == null) return error.InvalidUiCommand;
+        const approval_id = payloadString(payload, "approvalId") orelse
+            return error.InvalidUiCommand;
+        const decision = payload.get("decision") orelse return error.InvalidUiCommand;
+        const choice_json = try stringifyValueAlloc(self.allocator, decision);
+        defer self.allocator.free(choice_json);
+        try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
+        return runtime.app.nextEnvelope(
+            "session.status",
+            "{\"status\":\"approval-resolving\"}",
+        );
+    }
+
+    fn confirmAction(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        if (payload.count() != 1) return error.InvalidUiCommand;
+        const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
+        const card = (try runtime.app.action_store.pendingById(card_id)).*;
+        runtime.broker.validateAction(
+            runtime.owner,
+            runtime.name,
+            runtime.number,
+            runtime.pull_request_id,
+            card,
+        ) catch |err| {
+            try runtime.app.action_store.invalidate(card_id);
+            const format = "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}";
+            const status = try std.fmt.allocPrint(
+                self.allocator,
+                format,
+                .{ std.json.fmt(card_id, .{}), std.json.fmt(@errorName(err), .{}) },
+            );
+            defer self.allocator.free(status);
+            return runtime.app.nextEnvelope("action.status", status);
+        };
+        if (card.kind == .add_inline_comment) {
+            if (!try self.commentAnchorValid(runtime, card)) {
+                try runtime.app.action_store.invalidate(card_id);
+                const format = "{{\"id\":{f},\"status\":\"invalidated\"," ++
+                    "\"reason\":\"StaleCommentAnchor\"}}";
+                const status = try std.fmt.allocPrint(
+                    self.allocator,
+                    format,
+                    .{std.json.fmt(card_id, .{})},
+                );
+                defer self.allocator.free(status);
+                return runtime.app.nextEnvelope("action.status", status);
+            }
+        }
+        const terminal = try runtime.app.confirmAction(
+            runtime.broker,
+            runtime.owner,
+            runtime.name,
+            runtime.number,
+            card_id,
+        );
+        try self.refreshActionEvidence(runtime, terminal);
+        return self.actionStatusEnvelope(runtime, card_id, terminal);
+    }
+
+    fn commentAnchorValid(
+        self: *Server,
+        runtime: *Runtime,
+        card: tools.ActionCard,
+    ) !bool {
+        const diff = try github.canonicalDiffAlloc(
+            self.allocator,
+            self.io,
+            runtime.cwd,
+            runtime.app.generation.base_oid,
+            runtime.app.generation.head_oid,
+            card.target.path.?,
+        );
+        defer self.allocator.free(diff);
+        return github.validateDiffAnchor(
+            diff,
+            card.target.line.?,
+            card.target.start_line,
+            card.target.side orelse "RIGHT",
+        );
+    }
+
+    fn refreshActionEvidence(
+        self: *Server,
+        runtime: *Runtime,
+        terminal: tools.ActionStatus,
+    ) !void {
+        _ = self;
+        if (terminal == .succeeded) {
+            if (runtime.broker.readGeneration(
+                runtime.owner,
+                runtime.name,
+                runtime.number,
+            )) |generation_value| {
+                var generation = generation_value;
+                defer generation.deinit();
+                try runtime.registry.setGenerationEvidence(&generation);
+                runtime.app.action_state_fresh = true;
+            } else |_| {
+                runtime.app.action_state_fresh = false;
+            }
+        }
+    }
+
+    fn actionStatusEnvelope(
+        self: *Server,
+        runtime: *Runtime,
+        card_id: []const u8,
+        terminal: tools.ActionStatus,
+    ) ![]u8 {
+        const status = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{f},\"status\":{f},\"stateFresh\":{}}}",
+            .{
+                std.json.fmt(card_id, .{}),
+                std.json.fmt(tools.actionStatusName(terminal), .{}),
+                runtime.app.action_state_fresh,
+            },
+        );
+        defer self.allocator.free(status);
+        return runtime.app.nextEnvelope("action.status", status);
+    }
+
+    fn rejectAction(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
+        if (payload.count() != 1) return error.InvalidUiCommand;
+        const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
+        try runtime.app.rejectAction(card_id);
+        const status = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{f},\"status\":\"rejected\"}}",
+            .{std.json.fmt(card_id, .{})},
+        );
+        defer self.allocator.free(status);
+        return runtime.app.nextEnvelope("action.status", status);
+    }
+
     fn refresh(self: *Server, runtime: *Runtime) !void {
         if (runtime.refresh_override) |run| return run(runtime);
         try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
@@ -437,23 +772,59 @@ pub const Server = struct {
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
-        try worktree.synchronize(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid, runtime.baseline orelse return error.MissingWorktreeBaseline);
+        try worktree.synchronize(
+            self.allocator,
+            self.io,
+            runtime.custody,
+            runtime.repository_cwd,
+            next.head_oid,
+            runtime.baseline orelse return error.MissingWorktreeBaseline,
+        );
         try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
+        try self.refreshTabDiffs(runtime, &next);
+        try self.markChangedSessions(runtime, &next);
+        try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
+        runtime.app.replaceGeneration(next);
+        next_owned = false;
+        try self.applyRefreshExclusions(runtime);
+        try runtime.registry.setGenerationEvidence(&runtime.app.generation);
+        try self.updatePrimaryContext(runtime);
+    }
+
+    fn refreshTabDiffs(
+        self: *Server,
+        runtime: *Runtime,
+        next: *const @import("domain.zig").PrGeneration,
+    ) !void {
         for (runtime.app.tabs.items) |tab| {
             if (tab.status == .closed) continue;
-            if (@import("domain.zig").revisionFor(&next, tab.path) == null) {
+            if (@import("domain.zig").revisionFor(next, tab.path) == null) {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
             }
-            const current_diff = github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, next.base_oid, next.head_oid, tab.path) catch {
+            const current_diff = github.canonicalDiffAlloc(
+                self.allocator,
+                self.io,
+                runtime.cwd,
+                next.base_oid,
+                next.head_oid,
+                tab.path,
+            ) catch {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
             };
             defer self.allocator.free(current_diff);
             try runtime.app.updateTabDiff(tab.path, current_diff);
         }
+    }
+
+    fn markChangedSessions(
+        self: *Server,
+        runtime: *Runtime,
+        next: *const @import("domain.zig").PrGeneration,
+    ) !void {
         for (runtime.app.generation.files.items) |old_file| {
-            const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse {
+            const next_revision = @import("domain.zig").revisionFor(next, old_file.path) orelse {
                 try runtime.registry.markPathChangedAndInject(
                     old_file.path,
                     "deleted",
@@ -462,35 +833,78 @@ pub const Server = struct {
                 continue;
             };
             if (!std.mem.eql(u8, old_file.revision_key, next_revision)) {
-                const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, next.base_oid, next.head_oid, old_file.path);
+                const diff = try github.canonicalDiffAlloc(
+                    self.allocator,
+                    self.io,
+                    runtime.cwd,
+                    next.base_oid,
+                    next.head_oid,
+                    old_file.path,
+                );
                 defer self.allocator.free(diff);
                 try runtime.registry.markPathChangedAndInject(old_file.path, next_revision, diff);
             }
         }
-        try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
-        runtime.app.replaceGeneration(next);
-        next_owned = false;
+    }
+
+    fn applyRefreshExclusions(self: *Server, runtime: *Runtime) !void {
         if (runtime.settings) |settings| {
-            var outcomes = try runtime.app.applyAutomaticExclusions(settings, runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, runtime.cwd);
+            var outcomes = try runtime.app.applyAutomaticExclusions(
+                settings,
+                runtime.broker,
+                runtime.owner,
+                runtime.name,
+                runtime.number,
+                runtime.pull_request_id,
+                runtime.cwd,
+            );
             defer {
                 for (outcomes.items) |outcome| outcome.deinit();
                 outcomes.deinit(self.allocator);
             }
             try queueExclusionEvents(runtime.registry, outcomes.items);
         }
-        try runtime.registry.setGenerationEvidence(&runtime.app.generation);
+    }
+
+    fn updatePrimaryContext(self: *Server, runtime: *Runtime) !void {
         var files: std.Io.Writer.Allocating = .init(self.allocator);
         defer files.deinit();
         try std.json.Stringify.value(runtime.app.generation.files.items, .{}, &files.writer);
-        const update = try std.fmt.allocPrint(self.allocator, "The pull request was explicitly refreshed. Authoritative current base OID: {s}. Authoritative current head OID: {s}. Current changed files: {s}. Re-evaluate intent, invariants, and cross-file relationships from this generation and the synchronized shared worktree.", .{ runtime.app.generation.base_oid, runtime.app.generation.head_oid, files.written() });
+        const update_format = "The pull request was explicitly refreshed. Authoritati" ++
+            "ve current base OID: {s}. Authoritative current head O" ++
+            "ID: {s}. Current changed files: {s}. Re-evaluate inten" ++
+            "t, invariants, and cross-file relationships from this " ++
+            "generation and the synchronized shared worktree.";
+        const update = try std.fmt.allocPrint(
+            self.allocator,
+            update_format,
+            .{
+                runtime.app.generation.base_oid,
+                runtime.app.generation.head_oid,
+                files.written(),
+            },
+        );
         defer self.allocator.free(update);
         try runtime.registry.updatePrimary(update);
     }
 };
 
-pub fn queueExclusionEvents(registry: *sessions.Registry, outcomes: []const @import("app.zig").ExclusionOutcome) !void {
+pub fn queueExclusionEvents(
+    registry: *sessions.Registry,
+    outcomes: []const @import("app.zig").ExclusionOutcome,
+) !void {
     for (outcomes) |outcome| {
-        const payload = try std.fmt.allocPrint(registry.allocator, "{{\"path\":{f},\"reason\":{f},\"status\":{f},\"syncError\":{f}}}", .{ std.json.fmt(outcome.path, .{}), std.json.fmt(outcome.reason, .{}), std.json.fmt(if (outcome.sync_error == null) "viewed" else "sync-error", .{}), std.json.fmt(outcome.sync_error, .{}) });
+        const state = if (outcome.sync_error == null) "viewed" else "sync-error";
+        const payload = try std.fmt.allocPrint(
+            registry.allocator,
+            "{{\"path\":{f},\"reason\":{f},\"status\":{f},\"syncError\":{f}}}",
+            .{
+                std.json.fmt(outcome.path, .{}),
+                std.json.fmt(outcome.reason, .{}),
+                std.json.fmt(state, .{}),
+                std.json.fmt(outcome.sync_error, .{}),
+            },
+        );
         defer registry.allocator.free(payload);
         try registry.queueSystemEvent("file.excluded", payload);
     }
@@ -520,16 +934,19 @@ fn stringifyValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u
 }
 
 pub fn pathConfined(root: []const u8, candidate: []const u8) bool {
-    return std.mem.eql(u8, root, candidate) or (std.mem.startsWith(u8, candidate, root) and candidate.len > root.len and candidate[root.len] == std.fs.path.sep);
+    return std.mem.eql(u8, root, candidate) or (std.mem.startsWith(u8, candidate, root) and
+        candidate.len > root.len and candidate[root.len] == std.fs.path.sep);
 }
 
 fn authorized(target: []const u8, raw: []const u8, token: []const u8) bool {
     if (queryToken(target)) |value| if (std.mem.eql(u8, value, token)) return true;
-    return if (headerValue(raw, "authorization")) |v| std.mem.startsWith(u8, v, "Bearer ") and std.mem.eql(u8, v[7..], token) else false;
+    return if (headerValue(raw, "authorization")) |v| std.mem.startsWith(u8, v, "Bearer ") and
+        std.mem.eql(u8, v[7..], token) else false;
 }
 
 fn requiresToken(target: []const u8) bool {
-    return std.mem.eql(u8, target, "/api/bootstrap") or std.mem.startsWith(u8, target, "/api/bootstrap?");
+    return std.mem.eql(u8, target, "/api/bootstrap") or
+        std.mem.startsWith(u8, target, "/api/bootstrap?");
 }
 fn queryToken(target: []const u8) ?[]const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
@@ -564,27 +981,47 @@ fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
     while (lines.next()) |line| {
         if (line.len == 0) break;
         const i = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..i], " \t"), name)) return std.mem.trim(u8, line[i + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(
+            std.mem.trim(u8, line[0..i], " \t"),
+            name,
+        )) return std.mem.trim(u8, line[i + 1 ..], " \t");
     }
     return null;
 }
 fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool {
     const value = headerValue(raw, name) orelse return false;
     var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |part| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    while (it.next()) |part| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token))
+        return true;
     return false;
 }
 
-pub fn readClientTextAlloc(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream) ![]u8 {
+pub fn readClientTextAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+) ![]u8 {
     return readClientTextAllocTimeout(allocator, io, stream, null);
 }
-pub fn readClientTextAllocTimeout(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream, timeout_ms: ?u32) ![]u8 {
+pub fn readClientTextAllocTimeout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    timeout_ms: ?u32,
+) ![]u8 {
     var head: [2]u8 = undefined;
     if (timeout_ms) |milliseconds| {
-        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = std.Io.Duration.fromMilliseconds(milliseconds), .clock = .awake });
+        const deadline = std.Io.Clock.Timestamp.fromNow(
+            io,
+            .{ .raw = std.Io.Duration.fromMilliseconds(milliseconds), .clock = .awake },
+        );
         var offset: usize = 0;
         while (offset < head.len) {
-            const received = try stream.socket.receiveTimeout(io, head[offset..], .{ .deadline = deadline });
+            const received = try stream.socket.receiveTimeout(
+                io,
+                head[offset..],
+                .{ .deadline = deadline },
+            );
             if (received.data.len == 0) return error.EndOfStream;
             offset += received.data.len;
         }
@@ -633,7 +1070,9 @@ fn writeServerText(io: std.Io, stream: *std.Io.net.Stream, body: []const u8) !vo
     if (body.len > max_ws_message_bytes) return error.FrameTooLarge;
     var writer = stream.writer(io, &.{});
     try writer.interface.writeByte(0x81);
-    if (body.len <= 125) try writer.interface.writeByte(@intCast(body.len)) else if (body.len <= std.math.maxInt(u16)) {
+    if (body.len <= 125) try writer.interface.writeByte(@intCast(body.len)) else if (body.len <=
+        std.math.maxInt(u16))
+    {
         try writer.interface.writeByte(126);
         var len: [2]u8 = undefined;
         std.mem.writeInt(u16, &len, @intCast(body.len), .big);
@@ -647,10 +1086,23 @@ fn writeServerText(io: std.Io, stream: *std.Io.net.Stream, body: []const u8) !vo
     try writer.interface.writeAll(body);
     try writer.interface.flush();
 }
-fn writeResponse(io: std.Io, stream: *std.Io.net.Stream, status: []const u8, content_type: []const u8, body: []const u8, secure: bool) !void {
+fn writeResponse(
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    status: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+    secure: bool,
+) !void {
     var writer = stream.writer(io, &.{});
-    try writer.interface.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n", .{ status, content_type, body.len });
-    if (secure) try writer.interface.writeAll("Content-Security-Policy: default-src 'self'; connect-src 'self' ws://127.0.0.1:*; object-src 'none'; base-uri 'none'\r\n");
+    try writer.interface.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {" ++
+        "d}\r\nConnection: close\r\nX-Content-Type-Options: nos" ++
+        "niff\r\n", .{ status, content_type, body.len });
+    if (secure) try writer.interface.writeAll(
+        "Content-Security-Policy: default-src 'self'; connect-s" ++
+            "rc 'self' ws://127.0.0.1:*; object-src 'none'; base-ur" ++
+            "i 'none'\r\n",
+    );
     try writer.interface.writeAll("\r\n");
     try writer.interface.writeAll(body);
     try writer.interface.flush();

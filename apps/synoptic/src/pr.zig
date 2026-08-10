@@ -15,16 +15,29 @@ pub fn parseUrl(raw: []const u8) !Identity {
     var parts = std.mem.splitScalar(u8, canonical[prefix.len..], '/');
     const owner = parts.next() orelse return error.InvalidPullRequestSelector;
     const repo = parts.next() orelse return error.InvalidPullRequestSelector;
-    if (!std.mem.eql(u8, parts.next() orelse return error.InvalidPullRequestSelector, "pull")) return error.InvalidPullRequestSelector;
-    const number = try std.fmt.parseInt(u64, parts.next() orelse return error.InvalidPullRequestSelector, 10);
+    if (!std.mem.eql(u8, parts.next() orelse return error.InvalidPullRequestSelector, "pull"))
+        return error.InvalidPullRequestSelector;
+    const number = try std.fmt.parseInt(
+        u64,
+        parts.next() orelse return error.InvalidPullRequestSelector,
+        10,
+    );
     if (parts.next() != null) return error.InvalidPullRequestSelector;
     return .{ .owner = owner, .repository = repo, .number = number };
 }
 
-pub fn parseSelector(raw: []const u8, context_owner: ?[]const u8, context_repository: ?[]const u8) !Identity {
+pub fn parseSelector(
+    raw: []const u8,
+    context_owner: ?[]const u8,
+    context_repository: ?[]const u8,
+) !Identity {
     if (std.mem.startsWith(u8, raw, "https://")) return parseUrl(raw);
     const number = std.fmt.parseInt(u64, raw, 10) catch return error.SelectorRequiresGhResolution;
-    return .{ .owner = context_owner orelse return error.RepositoryContextRequired, .repository = context_repository orelse return error.RepositoryContextRequired, .number = number };
+    return .{
+        .owner = context_owner orelse return error.RepositoryContextRequired,
+        .repository = context_repository orelse return error.RepositoryContextRequired,
+        .number = number,
+    };
 }
 
 test "canonical PR URL" {

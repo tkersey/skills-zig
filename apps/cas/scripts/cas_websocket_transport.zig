@@ -14,9 +14,11 @@ pub const owner_watchdog_shutdown_grace_ms = websocket.owner_watchdog_shutdown_g
 pub const ManagedServer = websocket.ManagedServer;
 pub const Connection = websocket.Connection;
 pub const startManagedLoopbackServer = websocket.startManagedLoopbackServer;
-pub const startManagedLoopbackServerWithCodeModeHost = websocket.startManagedLoopbackServerWithCodeModeHost;
+pub const startManagedLoopbackServerWithCodeModeHost =
+    websocket.startManagedLoopbackServerWithCodeModeHost;
 pub const startOwnerLivedLoopbackServer = websocket.startOwnerLivedLoopbackServer;
-pub const startOwnerLivedLoopbackServerWithCodeModeHost = websocket.startOwnerLivedLoopbackServerWithCodeModeHost;
+pub const startOwnerLivedLoopbackServerWithCodeModeHost =
+    websocket.startOwnerLivedLoopbackServerWithCodeModeHost;
 pub const spawnDetachedProcess = websocket.spawnDetachedProcess;
 pub const processAlive = websocket.processAlive;
 pub const processGroupAlive = websocket.processGroupAlive;

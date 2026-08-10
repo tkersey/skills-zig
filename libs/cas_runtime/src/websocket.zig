@@ -148,11 +148,15 @@ pub const Connection = struct {
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
             .clock = .awake,
         });
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const stream = address.connect(io, .{ .mode = .stream }) catch |err| {
                 const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
                 if (now_ms - started_ms >= timeout_ms) return err;
-                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch |ignored_error| {
+                    switch (ignored_error) {
+                        else => {},
+                    }
+                };
                 continue;
             };
 
@@ -291,69 +295,94 @@ pub const Connection = struct {
         var fragmented: std.ArrayList(u8) = .empty;
         defer fragmented.deinit(self.allocator);
 
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const frame = self.readFrameAlloc(deadline) catch |err| {
                 self.poison();
                 return err;
             };
             defer if (frame.payload) |owned| self.allocator.free(owned);
 
-            switch (frame.opcode) {
-                0x1 => {
-                    if (fragment_type != null) {
-                        return self.protocolFailure(error.WebSocketInvalidFragmentSequence);
-                    }
-                    if (frame.fin) {
-                        if (!std.unicode.utf8ValidateSlice(frame.payload.?))
-                            return self.protocolFailure(error.WebSocketInvalidUtf8);
-                        const owned = try self.allocator.dupe(u8, frame.payload.?);
-                        return owned;
-                    }
-                    fragment_type = frame.opcode;
-                    fragment_count = 1;
-                    fragmented.appendSlice(self.allocator, frame.payload.?) catch |err|
-                        return self.protocolFailure(err);
-                },
-                0x2 => return self.protocolFailure(error.WebSocketBinaryMessageUnsupported),
-                0x0 => {
-                    if (fragment_type == null) {
-                        return self.protocolFailure(error.WebSocketUnexpectedContinuation);
-                    }
-                    fragment_count += 1;
-                    if (fragment_count > max_fragments) {
-                        return self.protocolFailure(error.WebSocketTooManyFragments);
-                    }
-                    if (fragmented.items.len > max_message_bytes - frame.payload.?.len) {
-                        return self.protocolFailure(error.WebSocketMessageTooLarge);
-                    }
-                    fragmented.appendSlice(self.allocator, frame.payload.?) catch |err|
-                        return self.protocolFailure(err);
-                    if (frame.fin) {
-                        if (!std.unicode.utf8ValidateSlice(fragmented.items))
-                            return self.protocolFailure(error.WebSocketInvalidUtf8);
-                        const owned = fragmented.toOwnedSlice(self.allocator) catch |err|
-                            return self.protocolFailure(err);
-                        return owned;
-                    }
-                },
-                0x8 => {
-                    if (!validClosePayload(frame.payload.?))
-                        return self.protocolFailure(error.WebSocketInvalidClosePayload);
-                    writeClientFrame(self, 0x8, frame.payload.?, deadline) catch |err| {
-                        self.poison();
-                        return err;
-                    };
-                    self.close();
-                    return null;
-                },
-                0x9 => writeClientFrame(self, 0xA, frame.payload.?, deadline) catch |err| {
-                    self.poison();
-                    return err;
-                },
-                0xA => {},
-                else => return self.protocolFailure(error.WebSocketUnexpectedOpcode),
+            const outcome = try self.handleDataFrame(
+                frame,
+                &fragment_type,
+                &fragment_count,
+                &fragmented,
+                deadline,
+            );
+            switch (outcome) {
+                .continue_read => {},
+                .closed => return null,
+                .message => |message| return message,
             }
         }
+    }
+
+    const FrameOutcome = union(enum) { continue_read, closed, message: []u8 };
+
+    fn handleDataFrame(
+        self: *Connection,
+        frame: Frame,
+        fragment_type: *?u8,
+        fragment_count: *usize,
+        fragmented: *std.ArrayList(u8),
+        deadline: ?std.Io.Clock.Timestamp,
+    ) !FrameOutcome {
+        switch (frame.opcode) {
+            0x1 => {
+                if (fragment_type.* != null) {
+                    return self.protocolFailure(error.WebSocketInvalidFragmentSequence);
+                }
+                if (frame.fin) {
+                    if (!std.unicode.utf8ValidateSlice(frame.payload.?))
+                        return self.protocolFailure(error.WebSocketInvalidUtf8);
+                    const owned = try self.allocator.dupe(u8, frame.payload.?);
+                    return .{ .message = owned };
+                }
+                fragment_type.* = frame.opcode;
+                fragment_count.* = 1;
+                fragmented.appendSlice(self.allocator, frame.payload.?) catch |err|
+                    return self.protocolFailure(err);
+            },
+            0x2 => return self.protocolFailure(error.WebSocketBinaryMessageUnsupported),
+            0x0 => {
+                if (fragment_type.* == null) {
+                    return self.protocolFailure(error.WebSocketUnexpectedContinuation);
+                }
+                fragment_count.* += 1;
+                if (fragment_count.* > max_fragments) {
+                    return self.protocolFailure(error.WebSocketTooManyFragments);
+                }
+                if (fragmented.items.len > max_message_bytes - frame.payload.?.len) {
+                    return self.protocolFailure(error.WebSocketMessageTooLarge);
+                }
+                fragmented.appendSlice(self.allocator, frame.payload.?) catch |err|
+                    return self.protocolFailure(err);
+                if (frame.fin) {
+                    if (!std.unicode.utf8ValidateSlice(fragmented.items))
+                        return self.protocolFailure(error.WebSocketInvalidUtf8);
+                    const owned = fragmented.toOwnedSlice(self.allocator) catch |err|
+                        return self.protocolFailure(err);
+                    return .{ .message = owned };
+                }
+            },
+            0x8 => {
+                if (!validClosePayload(frame.payload.?))
+                    return self.protocolFailure(error.WebSocketInvalidClosePayload);
+                writeClientFrame(self, 0x8, frame.payload.?, deadline) catch |err| {
+                    self.poison();
+                    return err;
+                };
+                self.close();
+                return .closed;
+            },
+            0x9 => writeClientFrame(self, 0xA, frame.payload.?, deadline) catch |err| {
+                self.poison();
+                return err;
+            },
+            0xA => {},
+            else => return self.protocolFailure(error.WebSocketUnexpectedOpcode),
+        }
+        return .continue_read;
     }
 
     fn protocolFailure(self: *Connection, err: anyerror) anyerror {
@@ -543,61 +572,85 @@ fn startManagedLoopbackServerWithOwnership(
         code_mode_host,
     );
 
-    if (owner_lived) {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-            return error.OwnerLivedManagedServerUnsupported;
-        }
-        const owner_receipt_dir = receipt_dir orelse return error.MissingOwnerLivedReceiptDirectory;
-        try std.Io.Dir.cwd().createDirPath(io, owner_receipt_dir);
-        const capture_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}/cas-app-server-startup-{d}.log",
-            .{ owner_receipt_dir, std.Io.Clock.real.now(io).nanoseconds },
-        );
-        defer allocator.free(capture_path);
-        defer std.Io.Dir.deleteFileAbsolute(io, capture_path) catch |err| switch (err) {
-            else => {},
-        };
-        const mkfifo = try std.process.run(allocator, io, .{
-            .argv = &.{ "/usr/bin/mkfifo", capture_path },
-            .stdout_limit = .limited(1024),
-            .stderr_limit = .limited(4096),
-        });
-        defer allocator.free(mkfifo.stdout);
-        defer allocator.free(mkfifo.stderr);
-        const fifo_ok = switch (mkfifo.term) {
-            .exited => |code| code == 0,
-            else => false,
-        };
-        if (!fifo_ok) return error.ManagedStartupPipeCreateFailed;
-        var managed = try spawnOwnerPipeManagedServer(
-            allocator,
-            cwd,
-            owner_receipt_dir,
-            argv.items,
-            try allocator.dupe(u8, requested_listen_url),
-            capture_path,
-            io,
-        );
-        errdefer {
-            managed.kill();
-            managed.deinit(allocator);
-        }
-        const startup_pipe = try std.Io.Dir.openFileAbsolute(io, capture_path, .{});
-        var pipe_owned = true;
-        errdefer if (pipe_owned) startup_pipe.close(io);
-        const startup = try readManagedStartup(allocator, startup_pipe, default_startup_timeout_ms);
-        defer allocator.free(startup.readyz_url);
-        try requireReady(startup.readyz_url, default_startup_timeout_ms);
-        managed.stderr_drainer = try StderrDrainer.start(allocator, startup_pipe);
-        pipe_owned = false;
-        allocator.free(managed.listen_url);
-        managed.listen_url = startup.listen_url;
-        return managed;
-    }
+    if (owner_lived) return startOwnerLivedServer(
+        allocator,
+        cwd,
+        receipt_dir,
+        argv.items,
+        requested_listen_url,
+        io,
+    );
+    return startOrdinaryServer(allocator, cwd, argv.items, io);
+}
 
+fn startOwnerLivedServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    receipt_dir: ?[]const u8,
+    argv: []const []const u8,
+    requested_listen_url: []const u8,
+    io: std.Io,
+) !ManagedServer {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.OwnerLivedManagedServerUnsupported;
+    }
+    const owner_receipt_dir = receipt_dir orelse return error.MissingOwnerLivedReceiptDirectory;
+    try std.Io.Dir.cwd().createDirPath(io, owner_receipt_dir);
+    const capture_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/cas-app-server-startup-{d}.log",
+        .{ owner_receipt_dir, std.Io.Clock.real.now(io).nanoseconds },
+    );
+    defer allocator.free(capture_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, capture_path) catch |err| switch (err) {
+        else => {},
+    };
+    const mkfifo = try std.process.run(allocator, io, .{
+        .argv = &.{ "/usr/bin/mkfifo", capture_path },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(mkfifo.stdout);
+    defer allocator.free(mkfifo.stderr);
+    const fifo_ok = switch (mkfifo.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!fifo_ok) return error.ManagedStartupPipeCreateFailed;
+    var managed = try spawnOwnerPipeManagedServer(
+        allocator,
+        cwd,
+        owner_receipt_dir,
+        argv,
+        try allocator.dupe(u8, requested_listen_url),
+        capture_path,
+        io,
+    );
+    errdefer {
+        managed.kill();
+        managed.deinit(allocator);
+    }
+    const startup_pipe = try std.Io.Dir.openFileAbsolute(io, capture_path, .{});
+    var pipe_owned = true;
+    errdefer if (pipe_owned) startup_pipe.close(io);
+    const startup = try readManagedStartup(allocator, startup_pipe, default_startup_timeout_ms);
+    defer allocator.free(startup.readyz_url);
+    try requireReady(startup.readyz_url, default_startup_timeout_ms);
+    managed.stderr_drainer = try StderrDrainer.start(allocator, startup_pipe);
+    pipe_owned = false;
+    allocator.free(managed.listen_url);
+    managed.listen_url = startup.listen_url;
+    return managed;
+}
+
+fn startOrdinaryServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    io: std.Io,
+) !ManagedServer {
     var child = try std.process.spawn(io, .{
-        .argv = argv.items,
+        .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -828,7 +881,11 @@ fn spawnOwnerPipeManagedServer(
     var receipt_random: [16]u8 = undefined;
     io.random(&receipt_random);
     const receipt_hex = std.fmt.bytesToHex(receipt_random, .lower);
-    const shutdown_receipt_token = try std.fmt.allocPrint(allocator, "{s}", .{&receipt_hex});
+    const shutdown_receipt_token = try std.fmt.allocPrint(
+        allocator,
+        "{s}",
+        .{&receipt_hex},
+    );
     errdefer allocator.free(shutdown_receipt_token);
     const shutdown_receipt_path = try std.fmt.allocPrint(
         allocator,
@@ -837,6 +894,30 @@ fn spawnOwnerPipeManagedServer(
     );
     errdefer allocator.free(shutdown_receipt_path);
 
+    return spawnOwnerPipeWithReceipt(
+        allocator,
+        cwd,
+        server_argv,
+        listen_url,
+        startup_capture_path,
+        io,
+        boot_id,
+        shutdown_receipt_path,
+        shutdown_receipt_token,
+    );
+}
+
+fn spawnOwnerPipeWithReceipt(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    server_argv: []const []const u8,
+    listen_url: []u8,
+    startup_capture_path: ?[]const u8,
+    io: std.Io,
+    boot_id: []u8,
+    shutdown_receipt_path: []u8,
+    shutdown_receipt_token: []u8,
+) !ManagedServer {
     var watchdog_argv: std.ArrayList([]const u8) = .empty;
     defer watchdog_argv.deinit(allocator);
     try watchdog_argv.appendSlice(allocator, &.{
@@ -902,12 +983,8 @@ fn spawnOwnerPipeManagedServerPosix(
     if (std.c.pipe(&pipe_fds) != 0) return error.SystemResources;
     var read_open = true;
     var write_open = true;
-    defer if (read_open) {
-        _ = std.c.close(pipe_fds[0]);
-    };
-    errdefer if (write_open) {
-        _ = std.c.close(pipe_fds[1]);
-    };
+    defer closeFdIf(read_open, pipe_fds[0]);
+    errdefer closeFdIf(write_open, pipe_fds[1]);
     const write_fd_flags = std.c.fcntl(pipe_fds[1], std.c.F.GETFD);
     if (write_fd_flags < 0 or
         std.c.fcntl(
@@ -930,61 +1007,13 @@ fn spawnOwnerPipeManagedServerPosix(
         return error.SpawnAttributesFailed;
     }
     defer _ = std.c.posix_spawnattr_destroy(&attributes);
-    if (std.c.posix_spawnattr_setflags(
-        &attributes,
-        .{ .SETPGROUP = true },
-    ) != 0 or posix_spawnattr_setpgroup(&attributes, 0) != 0) {
+    const group_flags = std.c.posix_spawnattr_setflags(&attributes, .{ .SETPGROUP = true });
+    if (group_flags != 0 or posix_spawnattr_setpgroup(&attributes, 0) != 0) {
         return error.SpawnAttributesFailed;
     }
 
-    const cwd_storage = try allocator.dupeZ(u8, cwd);
-    defer allocator.free(cwd_storage);
-    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) {
-        return error.SpawnFileActionsFailed;
-    }
-    if (pipe_fds[0] != 0 and
-        (std.c.posix_spawn_file_actions_adddup2(&actions, pipe_fds[0], 0) != 0 or
-            std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[0]) != 0))
-    {
-        return error.SpawnFileActionsFailed;
-    }
-    if (pipe_fds[1] != 0 and
-        std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[1]) != 0)
-    {
-        return error.SpawnFileActionsFailed;
-    }
-    const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
-    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0 or
-        std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0)
-    {
-        return error.SpawnFileActionsFailed;
-    }
-
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, watchdog_argv.len, null);
-    defer allocator.free(argv_buf);
-    var arg_storage = try allocator.alloc([:0]u8, watchdog_argv.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-    for (watchdog_argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
-        arg_count += 1;
-        argv_buf[i] = arg_storage[i].ptr;
-    }
-
-    var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = std.c.posix_spawn(
-        &pid,
-        argv_buf[0].?,
-        &actions,
-        &attributes,
-        argv_buf.ptr,
-        envp,
-    );
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+    try configureSpawnActions(allocator, cwd, pipe_fds, &actions);
+    const pid = try posixSpawnArgv(allocator, watchdog_argv, &actions, &attributes);
 
     _ = std.c.close(pipe_fds[0]);
     read_open = false;
@@ -1010,6 +1039,66 @@ fn spawnOwnerPipeManagedServerPosix(
     };
 }
 
+fn closeFdIf(open: bool, fd: std.c.fd_t) void {
+    if (open) _ = std.c.close(fd);
+}
+
+fn configureSpawnActions(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    pipe_fds: [2]std.c.fd_t,
+    actions: *std.c.posix_spawn_file_actions_t,
+) !void {
+    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    defer allocator.free(cwd_storage);
+    if (std.c.posix_spawn_file_actions_addchdir_np(actions, cwd_storage.ptr) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[0] != 0 and
+        (std.c.posix_spawn_file_actions_adddup2(actions, pipe_fds[0], 0) != 0 or
+            std.c.posix_spawn_file_actions_addclose(actions, pipe_fds[0]) != 0))
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[1] != 0 and
+        std.c.posix_spawn_file_actions_addclose(actions, pipe_fds[1]) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
+    if (std.c.posix_spawn_file_actions_addopen(actions, 1, "/dev/null", write_null, 0) != 0 or
+        std.c.posix_spawn_file_actions_addopen(actions, 2, "/dev/null", write_null, 0) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+}
+
+fn posixSpawnArgv(
+    allocator: std.mem.Allocator,
+    source_argv: []const []const u8,
+    actions: *std.c.posix_spawn_file_actions_t,
+    attributes: *std.c.posix_spawnattr_t,
+) !std.c.pid_t {
+    var argv = try allocator.allocSentinel(?[*:0]const u8, source_argv.len, null);
+    defer allocator.free(argv);
+    var storage = try allocator.alloc([:0]u8, source_argv.len);
+    var count: usize = 0;
+    defer {
+        for (storage[0..count]) |arg| allocator.free(arg);
+        allocator.free(storage);
+    }
+    for (source_argv, 0..) |arg, index| {
+        storage[index] = try allocator.dupeZ(u8, arg);
+        count += 1;
+        argv[index] = storage[index].ptr;
+    }
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const rc = std.c.posix_spawn(&pid, argv[0].?, actions, attributes, argv.ptr, envp);
+    if (rc != 0) return posixSpawnError(rc);
+    return pid;
+}
+
 extern "c" fn posix_spawnattr_setpgroup(
     attr: *std.c.posix_spawnattr_t,
     process_group: std.c.pid_t,
@@ -1021,7 +1110,9 @@ pub fn spawnDetachedProcess(
     argv: []const []const u8,
     io: std.Io,
 ) !std.process.Child {
-    if (builtin.os.tag == .macos and builtin.link_libc) return spawnManagedServerPosix(allocator, cwd, argv);
+    if (builtin.os.tag == .macos and builtin.link_libc) {
+        return spawnManagedServerPosix(allocator, cwd, argv);
+    }
     return std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
@@ -1045,12 +1136,17 @@ fn spawnManagedServerPosix(
 
     const cwd_storage = try allocator.dupeZ(u8, cwd);
     defer allocator.free(cwd_storage);
-    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
     const read_null: c_int = @bitCast(std.c.O{ .ACCMODE = .RDONLY });
     const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
-    if (std.c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", read_null, 0) != 0) return error.SpawnFileActionsFailed;
-    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0) return error.SpawnFileActionsFailed;
-    if (std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", read_null, 0) != 0)
+        return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0)
+        return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0)
+        return error.SpawnFileActionsFailed;
 
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
     defer allocator.free(argv_buf);
@@ -1244,7 +1340,11 @@ pub fn terminateProcess(process_id: u64) void {
         .windows, .wasi => {},
         else => {
             const pid: std.posix.pid_t = @intCast(process_id);
-            std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            std.posix.kill(pid, std.posix.SIG.TERM) catch |ignored_error| {
+                switch (ignored_error) {
+                    else => {},
+                }
+            };
         },
     }
 }
@@ -1262,7 +1362,8 @@ fn parseWsUrl(ws_url: []const u8) !ParsedWsUrl {
     const slash_idx = mem.indexOfScalar(u8, remainder, '/') orelse remainder.len;
     const authority = remainder[0..slash_idx];
     const path = if (slash_idx < remainder.len) remainder[slash_idx..] else "/";
-    const colon_idx = mem.lastIndexOfScalar(u8, authority, ':') orelse return error.InvalidWebSocketUrl;
+    const colon_idx = mem.lastIndexOfScalar(u8, authority, ':') orelse
+        return error.InvalidWebSocketUrl;
     const port = std.fmt.parseInt(
         u16,
         authority[colon_idx + 1 ..],
@@ -1297,28 +1398,7 @@ fn handshakeClient(
     var key_buf: [24]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&key_buf, &random_bytes);
 
-    const request = if (port == 0)
-        try std.fmt.allocPrint(
-            allocator,
-            "GET {s} HTTP/1.1\r\n" ++
-                "Host: {s}\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Version: 13\r\n" ++
-                "Sec-WebSocket-Key: {s}\r\n\r\n",
-            .{ path, host, key },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "GET {s} HTTP/1.1\r\n" ++
-                "Host: {s}:{d}\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Version: 13\r\n" ++
-                "Sec-WebSocket-Key: {s}\r\n\r\n",
-            .{ path, host, port, key },
-        );
+    const request = try handshakeRequestAlloc(allocator, host, port, path, key);
     defer allocator.free(request);
     try writeStreamAllUntil(stream, request, deadline);
 
@@ -1336,8 +1416,36 @@ fn handshakeClient(
         try response_buf.append(allocator, tmp[0]);
     }
 
-    const header_end = mem.indexOf(u8, response_buf.items, "\r\n\r\n").? + 4;
-    const headers = response_buf.items[0..header_end];
+    try validateHandshakeResponse(response_buf.items, key);
+}
+
+fn handshakeRequestAlloc(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+    key: []const u8,
+) ![]u8 {
+    const host_line = if (port == 0)
+        try allocator.dupe(u8, host)
+    else
+        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+    defer allocator.free(host_line);
+    return std.fmt.allocPrint(
+        allocator,
+        "GET {s} HTTP/1.1\r\n" ++
+            "Host: {s}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n\r\n",
+        .{ path, host_line, key },
+    );
+}
+
+fn validateHandshakeResponse(response: []const u8, key: []const u8) !void {
+    const header_end = mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    const headers = response[0..header_end];
     const status_line_end = mem.indexOf(u8, headers, "\r\n") orelse
         return error.WebSocketHandshakeRejected;
     const status_line = headers[0..status_line_end];
@@ -1348,7 +1456,10 @@ fn handshakeClient(
     const connection = headerValue(headers, "connection") orelse
         return error.WebSocketMissingConnection;
     if (!headerHasToken(connection, "upgrade")) return error.WebSocketInvalidConnection;
-    const accept = headerValue(headers, "sec-websocket-accept") orelse return error.WebSocketMissingAccept;
+    const accept = headerValue(
+        headers,
+        "sec-websocket-accept",
+    ) orelse return error.WebSocketMissingAccept;
 
     var sha1 = std.crypto.hash.Sha1.init(.{});
     sha1.update(key);
@@ -1719,8 +1830,31 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     try std.testing.expectEqual(watchdog_pid, managed.processGroupId().?);
     try std.testing.expect(managed.bootId().?.len > 0);
 
-    var server_pid: ?u64 = null;
-    var descendant_pid: ?u64 = null;
+    const process_ids = try awaitOwnerProcessIds(allocator, io, pid_path);
+    const server_pid = process_ids.server;
+    const descendant_pid = process_ids.descendant;
+    try std.testing.expect(processAlive(watchdog_pid));
+    try std.testing.expect(processAlive(server_pid));
+    try std.testing.expect(processAlive(descendant_pid));
+    const receipt_path = managed.shutdownReceiptPath().?;
+    const receipt_token = managed.shutdownReceiptToken().?;
+    try std.testing.expectEqualStrings(root, std.fs.path.dirname(receipt_path).?);
+
+    managed.kill();
+    try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
+    try std.testing.expect(waitForProcessExit(server_pid, 2_000));
+    try std.testing.expect(waitForProcessExit(descendant_pid, 2_000));
+    try std.testing.expect(waitForProcessGroupExit(managed.processGroupId().?, 2_000));
+    try verifyShutdownReceipt(allocator, io, receipt_path, receipt_token);
+}
+
+const OwnerProcessIds = struct { server: u64, descendant: u64 };
+
+fn awaitOwnerProcessIds(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pid_path: []const u8,
+) !OwnerProcessIds {
     for (0..500) |_| {
         const pid_bytes = std.Io.Dir.cwd().readFileAlloc(
             io,
@@ -1735,32 +1869,27 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
         };
         defer allocator.free(pid_bytes);
         var pid_fields = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
-        server_pid = try std.fmt.parseInt(
+        const server_pid = try std.fmt.parseInt(
             u64,
             pid_fields.next() orelse return error.InvalidPidFixture,
             10,
         );
-        descendant_pid = try std.fmt.parseInt(
+        const descendant_pid = try std.fmt.parseInt(
             u64,
             pid_fields.next() orelse return error.InvalidPidFixture,
             10,
         );
-        break;
+        return .{ .server = server_pid, .descendant = descendant_pid };
     }
-    try std.testing.expect(server_pid != null);
-    try std.testing.expect(descendant_pid != null);
-    try std.testing.expect(processAlive(watchdog_pid));
-    try std.testing.expect(processAlive(server_pid.?));
-    try std.testing.expect(processAlive(descendant_pid.?));
-    const receipt_path = managed.shutdownReceiptPath().?;
-    const receipt_token = managed.shutdownReceiptToken().?;
-    try std.testing.expectEqualStrings(root, std.fs.path.dirname(receipt_path).?);
+    return error.InvalidPidFixture;
+}
 
-    managed.kill();
-    try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
-    try std.testing.expect(waitForProcessExit(server_pid.?, 2_000));
-    try std.testing.expect(waitForProcessExit(descendant_pid.?, 2_000));
-    try std.testing.expect(waitForProcessGroupExit(managed.processGroupId().?, 2_000));
+fn verifyShutdownReceipt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    receipt_path: []const u8,
+    receipt_token: []const u8,
+) !void {
     const receipt = try std.Io.Dir.cwd().readFileAlloc(
         io,
         receipt_path,

@@ -532,7 +532,11 @@ pub fn build(b: *std.Build) void {
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
     const synoptic = addExecutable(b, "synoptic", synoptic_root);
     synoptic.root_module.linkSystemLibrary("c", .{});
-    const synoptic_release_safe = addExecutable(b, "synoptic-release-safe", synoptic_release_safe_root);
+    const synoptic_release_safe = addExecutable(
+        b,
+        "synoptic-release-safe",
+        synoptic_release_safe_root,
+    );
     synoptic_release_safe.root_module.linkSystemLibrary("c", .{});
     cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
     cas_release.configureExecutables(&.{
@@ -886,7 +890,10 @@ pub fn build(b: *std.Build) void {
         .{ .link_libc = true, .filters = &.{"ui domain"} },
     );
     run_synoptic_ui_domain.step.dependOn(&synoptic_install.step);
-    const test_synoptic = b.step("test-synoptic", "Run Synoptic generation, session, product, and falsifier tests");
+    const test_synoptic = b.step(
+        "test-synoptic",
+        "Run Synoptic generation, session, product, and falsifier tests",
+    );
     test_synoptic.dependOn(&run_synoptic_tests.step);
     test_synoptic.dependOn(&run_synoptic_falsifiers.step);
     test_synoptic.dependOn(&run_synoptic_e2e.step);
@@ -896,25 +903,52 @@ pub fn build(b: *std.Build) void {
     test_synoptic.dependOn(&run_synoptic_exclusions_config.step);
     test_synoptic.dependOn(&run_synoptic_command_approvals.step);
     test_synoptic.dependOn(&run_synoptic_ui_domain.step);
-    const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
+    const test_synoptic_falsifiers = b.step(
+        "test-synoptic-falsifiers",
+        "Run Synoptic falsifiers",
+    );
     test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
-    const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the real masked-WebSocket fake-Codex/fake-GitHub product fixture");
+    const test_synoptic_e2e = b.step(
+        "test-synoptic-e2e",
+        "Run the real masked-WebSocket fake-Codex/fake-GitHub product fixture",
+    );
     test_synoptic_e2e.dependOn(&run_synoptic_e2e.step);
-    const test_synoptic_action_broker = b.step("test-synoptic-action-broker", "Run typed action and bounded transparent GraphQL fixtures");
+    const test_synoptic_action_broker = b.step(
+        "test-synoptic-action-broker",
+        "Run typed action and bounded transparent GraphQL fixtures",
+    );
     test_synoptic_action_broker.dependOn(&run_synoptic_action_broker.step);
-    const test_synoptic_session_context = b.step("test-synoptic-session-context", "Run installed-schema and authoritative session-context fixtures");
+    const test_synoptic_session_context = b.step(
+        "test-synoptic-session-context",
+        "Run installed-schema and authoritative session-context fixtures",
+    );
     test_synoptic_session_context.dependOn(&run_synoptic_session_context.step);
-    const test_synoptic_worktree_integrity = b.step("test-synoptic-worktree-integrity", "Run safe-boundary and custody-integrity fixtures");
+    const test_synoptic_worktree_integrity = b.step(
+        "test-synoptic-worktree-integrity",
+        "Run safe-boundary and custody-integrity fixtures",
+    );
     test_synoptic_worktree_integrity.dependOn(&run_synoptic_worktree_integrity.step);
-    const test_synoptic_exclusions_config = b.step("test-synoptic-exclusions-config", "Run config precedence, exclusion sync, and session start-mode fixtures");
+    const test_synoptic_exclusions_config = b.step(
+        "test-synoptic-exclusions-config",
+        "Run config precedence, exclusion sync, and session start-mode fixtures",
+    );
     test_synoptic_exclusions_config.dependOn(&run_synoptic_exclusions_config.step);
-    const test_synoptic_command_approvals = b.step("test-synoptic-command-approvals", "Run server-request approval routing and cleanup fixtures");
+    const test_synoptic_command_approvals = b.step(
+        "test-synoptic-command-approvals",
+        "Run server-request approval routing and cleanup fixtures",
+    );
     test_synoptic_command_approvals.dependOn(&run_synoptic_command_approvals.step);
-    const test_synoptic_ui_domain = b.step("test-synoptic-ui-domain", "Run owned browser-domain payload and diff continuity fixtures");
+    const test_synoptic_ui_domain = b.step(
+        "test-synoptic-ui-domain",
+        "Run owned browser-domain payload and diff continuity fixtures",
+    );
     test_synoptic_ui_domain.dependOn(&run_synoptic_ui_domain.step);
     const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
     build_synoptic.dependOn(&synoptic_install.step);
-    const release_synoptic_safe = b.step("release-synoptic-safe", "Build Synoptic with ReleaseSafe optimization");
+    const release_synoptic_safe = b.step(
+        "release-synoptic-safe",
+        "Build Synoptic with ReleaseSafe optimization",
+    );
     release_synoptic_safe.dependOn(&synoptic_release_safe_install.step);
 
     const cas_automation_oracle = b.addSystemCommand(&.{"sh"});

@@ -46,7 +46,19 @@ pub const OwnedPullRequestHeader = struct {
         const head_ref_oid = try allocator.dupe(u8, value.head_ref_oid);
         errdefer allocator.free(head_ref_oid);
         const state = try allocator.dupe(u8, value.state);
-        return .{ .allocator = allocator, .repository = repository, .number = value.number, .title = title, .url = url, .base_ref_name = base_ref_name, .base_ref_oid = base_ref_oid, .head_ref_name = head_ref_name, .head_ref_oid = head_ref_oid, .state = state, .is_draft = value.is_draft };
+        return .{
+            .allocator = allocator,
+            .repository = repository,
+            .number = value.number,
+            .title = title,
+            .url = url,
+            .base_ref_name = base_ref_name,
+            .base_ref_oid = base_ref_oid,
+            .head_ref_name = head_ref_name,
+            .head_ref_oid = head_ref_oid,
+            .state = state,
+            .is_draft = value.is_draft,
+        };
     }
 
     pub fn deinit(self: *OwnedPullRequestHeader) void {
@@ -60,7 +72,11 @@ pub const OwnedPullRequestHeader = struct {
         self.allocator.free(self.state);
     }
 
-    pub fn setGeneration(self: *OwnedPullRequestHeader, base_oid: []const u8, head_oid: []const u8) !void {
+    pub fn setGeneration(
+        self: *OwnedPullRequestHeader,
+        base_oid: []const u8,
+        head_oid: []const u8,
+    ) !void {
         const next_base = try self.allocator.dupe(u8, base_oid);
         errdefer self.allocator.free(next_base);
         const next_head = try self.allocator.dupe(u8, head_oid);
@@ -79,8 +95,15 @@ pub const PullRequestTarget = struct {
     id: []const u8,
     head_oid: []const u8,
 
-    pub fn matches(self: PullRequestTarget, repository: []const u8, number: u64, id: []const u8, head_oid: []const u8) bool {
-        return self.number == number and std.mem.eql(u8, self.repository, repository) and std.mem.eql(u8, self.id, id) and std.mem.eql(u8, self.head_oid, head_oid);
+    pub fn matches(
+        self: PullRequestTarget,
+        repository: []const u8,
+        number: u64,
+        id: []const u8,
+        head_oid: []const u8,
+    ) bool {
+        return self.number == number and std.mem.eql(u8, self.repository, repository) and
+            std.mem.eql(u8, self.id, id) and std.mem.eql(u8, self.head_oid, head_oid);
     }
 };
 
@@ -140,8 +163,16 @@ pub const PrGeneration = struct {
     pub fn init(allocator: std.mem.Allocator, head_oid: []const u8) !PrGeneration {
         return initFull(allocator, "unknown-base", head_oid);
     }
-    pub fn initFull(allocator: std.mem.Allocator, base_oid: []const u8, head_oid: []const u8) !PrGeneration {
-        return .{ .allocator = allocator, .head_oid = try allocator.dupe(u8, head_oid), .base_oid = try allocator.dupe(u8, base_oid) };
+    pub fn initFull(
+        allocator: std.mem.Allocator,
+        base_oid: []const u8,
+        head_oid: []const u8,
+    ) !PrGeneration {
+        return .{
+            .allocator = allocator,
+            .head_oid = try allocator.dupe(u8, head_oid),
+            .base_oid = try allocator.dupe(u8, base_oid),
+        };
     }
 
     pub fn deinit(self: *PrGeneration) void {
@@ -168,9 +199,15 @@ pub const PrGeneration = struct {
         errdefer self.allocator.free(change_type);
         const revision_key = try self.allocator.dupe(u8, file.revision_key);
         errdefer self.allocator.free(revision_key);
-        const exclusion_reason = if (file.exclusion_reason) |value| try self.allocator.dupe(u8, value) else null;
+        const exclusion_reason = if (file.exclusion_reason) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
         errdefer if (exclusion_reason) |value| self.allocator.free(value);
-        const exclusion_sync_error = if (file.exclusion_sync_error) |value| try self.allocator.dupe(u8, value) else null;
+        const exclusion_sync_error = if (file.exclusion_sync_error) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
         errdefer if (exclusion_sync_error) |value| self.allocator.free(value);
         try self.files.append(self.allocator, .{
             .path = path,
@@ -198,7 +235,14 @@ pub const PrGeneration = struct {
         return copy;
     }
 
-    pub fn unresolvedThreadsJsonAlloc(self: *const PrGeneration, allocator: std.mem.Allocator, assigned_path: []const u8, query: ?[]const u8, paths: []const []const u8, whole_pr: bool) ![]u8 {
+    pub fn unresolvedThreadsJsonAlloc(
+        self: *const PrGeneration,
+        allocator: std.mem.Allocator,
+        assigned_path: []const u8,
+        query: ?[]const u8,
+        paths: []const []const u8,
+        whole_pr: bool,
+    ) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         try out.writer.writeByte('[');
@@ -215,14 +259,19 @@ pub const PrGeneration = struct {
                 };
                 if (!matched) continue;
             }
-            if (query) |needle| if (needle.len > 0 and std.mem.indexOf(u8, thread.path, needle) == null) {
-                var matched = false;
-                for (thread.comments) |comment| if (std.mem.indexOf(u8, comment.body, needle) != null) {
-                    matched = true;
-                    break;
-                };
-                if (!matched) continue;
-            };
+            if (query) |needle| {
+                const path_misses = std.mem.indexOf(u8, thread.path, needle) == null;
+                if (needle.len > 0 and path_misses) {
+                    var matched = false;
+                    for (thread.comments) |comment| {
+                        if (std.mem.indexOf(u8, comment.body, needle) != null) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) continue;
+                }
+            }
             if (!first) try out.writer.writeByte(',');
             first = false;
             try std.json.Stringify.value(thread, .{}, &out.writer);
@@ -258,11 +307,19 @@ pub const PrGeneration = struct {
         return error.UnknownFile;
     }
 
-    pub fn setExclusion(self: *PrGeneration, path: []const u8, reason: []const u8, sync_error: ?[]const u8) !void {
+    pub fn setExclusion(
+        self: *PrGeneration,
+        path: []const u8,
+        reason: []const u8,
+        sync_error: ?[]const u8,
+    ) !void {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
             const owned_reason = try self.allocator.dupe(u8, reason);
             errdefer self.allocator.free(owned_reason);
-            const owned_error = if (sync_error) |value| try self.allocator.dupe(u8, value) else null;
+            const owned_error = if (sync_error) |value|
+                try self.allocator.dupe(u8, value)
+            else
+                null;
             if (file.exclusion_reason) |value| self.allocator.free(value);
             if (file.exclusion_sync_error) |value| self.allocator.free(value);
             file.exclusion_reason = owned_reason;
@@ -287,7 +344,16 @@ fn dupeComment(allocator: std.mem.Allocator, comment: ReviewComment) !ReviewComm
     const review_id = try allocator.dupe(u8, comment.review_id);
     errdefer allocator.free(review_id);
     const state = try allocator.dupe(u8, comment.review_state);
-    return .{ .id = id, .body = body, .created_at = created, .url = url, .author = author, .viewer_did_author = comment.viewer_did_author, .review_id = review_id, .review_state = state };
+    return .{
+        .id = id,
+        .body = body,
+        .created_at = created,
+        .url = url,
+        .author = author,
+        .viewer_did_author = comment.viewer_did_author,
+        .review_id = review_id,
+        .review_state = state,
+    };
 }
 fn freeComment(allocator: std.mem.Allocator, comment: ReviewComment) void {
     allocator.free(comment.id);
@@ -319,7 +385,20 @@ fn dupeThread(allocator: std.mem.Allocator, thread: ReviewThread) !ReviewThread 
         comments[i] = try dupeComment(allocator, comment);
         initialized += 1;
     }
-    return .{ .id = id, .path = path, .line = thread.line, .start_line = thread.start_line, .diff_side = diff_side, .start_diff_side = start_diff_side, .subject_type = subject, .outdated = thread.outdated, .viewer_can_reply = thread.viewer_can_reply, .viewer_can_resolve = thread.viewer_can_resolve, .viewer_can_unresolve = thread.viewer_can_unresolve, .comments = comments };
+    return .{
+        .id = id,
+        .path = path,
+        .line = thread.line,
+        .start_line = thread.start_line,
+        .diff_side = diff_side,
+        .start_diff_side = start_diff_side,
+        .subject_type = subject,
+        .outdated = thread.outdated,
+        .viewer_can_reply = thread.viewer_can_reply,
+        .viewer_can_resolve = thread.viewer_can_resolve,
+        .viewer_can_unresolve = thread.viewer_can_unresolve,
+        .comments = comments,
+    };
 }
 fn freeThread(allocator: std.mem.Allocator, thread: ReviewThread) void {
     allocator.free(thread.id);
@@ -331,7 +410,13 @@ fn freeThread(allocator: std.mem.Allocator, thread: ReviewThread) void {
     allocator.free(thread.comments);
 }
 
-pub fn revisionKey(allocator: std.mem.Allocator, path: []const u8, change_type: []const u8, blob: []const u8, diff: []const u8) ![]u8 {
+pub fn revisionKey(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    change_type: []const u8,
+    blob: []const u8,
+    diff: []const u8,
+) ![]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(path);
     hash.update(&.{0});
@@ -349,11 +434,17 @@ pub fn sameRevision(a: File, b: File) bool {
     return std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.revision_key, b.revision_key);
 }
 pub fn revisionFor(generation: *const PrGeneration, path: []const u8) ?[]const u8 {
-    for (generation.files.items) |file| if (std.mem.eql(u8, file.path, path)) return file.revision_key;
+    for (generation.files.items) |file| {
+        if (std.mem.eql(u8, file.path, path)) return file.revision_key;
+    }
     return null;
 }
 
-pub fn revisionChanged(previous: *const PrGeneration, next: *const PrGeneration, path: []const u8) bool {
+pub fn revisionChanged(
+    previous: *const PrGeneration,
+    next: *const PrGeneration,
+    path: []const u8,
+) bool {
     const before = revisionFor(previous, path) orelse return revisionFor(next, path) != null;
     const after = revisionFor(next, path) orelse return true;
     return !std.mem.eql(u8, before, after);

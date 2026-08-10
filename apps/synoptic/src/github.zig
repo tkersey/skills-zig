@@ -2,6 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
+const max_pages: usize = 10_000;
 
 pub const Broker = struct {
     allocator: std.mem.Allocator,
@@ -17,7 +18,15 @@ pub const Broker = struct {
         ), "mutation");
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
-        const argv = [_][]const u8{ self.gh_path, "api", "graphql", "--hostname", self.host, "--input", "-" };
+        const argv = [_][]const u8{
+            self.gh_path,
+            "api",
+            "graphql",
+            "--hostname",
+            self.host,
+            "--input",
+            "-",
+        };
         if (!hasFixedArgv(&argv)) return error.InvalidGitHubBrokerArgv;
         var child = try std.process.spawn(self.io, .{
             .argv = &argv,
@@ -32,14 +41,23 @@ pub const Broker = struct {
         child.stdin.?.close(self.io);
         child.stdin = null;
         var stdout_reader = child.stdout.?.reader(self.io, &.{});
-        const stdout = try stdout_reader.interface.allocRemaining(self.allocator, .limited(16 * 1024 * 1024));
+        const stdout = try stdout_reader.interface.allocRemaining(self.allocator, .limited(16 *
+            1024 * 1024));
         errdefer self.allocator.free(stdout);
         var stderr_reader = child.stderr.?.reader(self.io, &.{});
-        const stderr = try stderr_reader.interface.allocRemaining(self.allocator, .limited(1024 * 1024));
+        const stderr = try stderr_reader.interface.allocRemaining(
+            self.allocator,
+            .limited(1024 * 1024),
+        );
         defer self.allocator.free(stderr);
         const term = try child.wait(self.io);
         if (stdout.len > 0) {
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, stdout, .{}) catch {
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                stdout,
+                .{},
+            ) catch {
                 if (term != .exited or term.exited != 0) return error.GitHubTransportAmbiguous;
                 return error.InvalidGraphqlResponse;
             };
@@ -50,14 +68,26 @@ pub const Broker = struct {
             }
             if (parsed.value != .object) return error.InvalidGraphqlResponse;
         }
-        if (term != .exited or term.exited != 0 or stdout.len == 0) return error.GitHubTransportAmbiguous;
+        const failed = term != .exited or term.exited != 0 or stdout.len == 0;
+        if (failed) return error.GitHubTransportAmbiguous;
         return stdout;
     }
 
-    pub fn readGenerationPages(self: Broker, owner: []const u8, name: []const u8, number: u64) !GenerationPages {
+    pub fn readGenerationPages(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+    ) !GenerationPages {
         var files = try self.callPages(graphql.snapshot_query, "files", owner, name, number);
         errdefer freePages(self.allocator, &files);
-        var threads = try self.callPages(graphql.threads_query, "reviewThreads", owner, name, number);
+        var threads = try self.callPages(
+            graphql.threads_query,
+            "reviewThreads",
+            owner,
+            name,
+            number,
+        );
         errdefer freePages(self.allocator, &threads);
         try self.appendNestedThreadPages(&threads);
         try validateGenerationHeads(self.allocator, files.items, threads.items);
@@ -96,7 +126,7 @@ pub const Broker = struct {
     ) !void {
         var cursor = try self.allocator.dupe(u8, first_cursor);
         defer self.allocator.free(cursor);
-        while (true) {
+        for (0..max_pages) |_| {
             const vars = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"threadId\":{f},\"after\":{f}}}",
@@ -114,14 +144,20 @@ pub const Broker = struct {
             defer parsed.deinit();
             const node = parsed.value.object.get("data").?.object.get("node").?.object;
             const info = node.get("comments").?.object.get("pageInfo").?.object;
-            if (!info.get("hasNextPage").?.bool) break;
+            if (!info.get("hasNextPage").?.bool) return;
             const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
             self.allocator.free(cursor);
             cursor = next;
         }
+        return error.PaginationLimitExceeded;
     }
 
-    pub fn readGeneration(self: Broker, owner: []const u8, name: []const u8, number: u64) !domain.PrGeneration {
+    pub fn readGeneration(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+    ) !domain.PrGeneration {
         var pages = try self.readGenerationPages(owner, name, number);
         defer pages.deinit();
         if (pages.files.items.len == 0) return error.InvalidSnapshot;
@@ -140,15 +176,31 @@ pub const Broker = struct {
         return self.markViewedWithId(pull_request_id, path, "synoptic-complete");
     }
 
-    pub fn markViewedWithId(self: Broker, pull_request_id: []const u8, path: []const u8, client_mutation_id: []const u8) !void {
-        const vars = try std.fmt.allocPrint(self.allocator, "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(pull_request_id, .{}), std.json.fmt(path, .{}), std.json.fmt(client_mutation_id, .{}) });
+    pub fn markViewedWithId(
+        self: Broker,
+        pull_request_id: []const u8,
+        path: []const u8,
+        client_mutation_id: []const u8,
+    ) !void {
+        const format = "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"cli" ++
+            "entMutationId\":{f}}}}}";
+        const vars = try std.fmt.allocPrint(self.allocator, format, .{
+            std.json.fmt(pull_request_id, .{}),
+            std.json.fmt(path, .{}),
+            std.json.fmt(client_mutation_id, .{}),
+        });
         defer self.allocator.free(vars);
         const response = try self.call(graphql.mark_viewed_mutation, vars);
         defer self.allocator.free(response);
     }
 
     pub fn executeAction(self: Broker, card: tools.ActionCard) !void {
-        if (card.kind == .graphql) try graphql.validateTransparent(card.graphql.?.document, card.graphql.?.operation_name, card.graphql.?.variables, card.target.pull_request_id);
+        if (card.kind == .graphql) try graphql.validateTransparent(
+            card.graphql.?.document,
+            card.graphql.?.operation_name,
+            card.graphql.?.variables,
+            card.target.pull_request_id,
+        );
         const document: []const u8 = switch (card.kind) {
             .add_inline_comment => graphql.add_inline_comment_mutation,
             .reply_thread => graphql.reply_thread_mutation,
@@ -169,88 +221,196 @@ pub const Broker = struct {
         self.allocator.free(response);
     }
 
-    pub fn validateAction(self: Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, card: tools.ActionCard) !void {
+    pub fn validateAction(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        card: tools.ActionCard,
+    ) !void {
         const repository = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ owner, name });
         defer self.allocator.free(repository);
-        if (!std.mem.eql(u8, card.target.repository, repository) or card.target.pull_request != number or !std.mem.eql(u8, card.target.pull_request_id, pull_request_id)) return error.ActionTargetMismatch;
-        if (card.kind == .graphql) try graphql.validateTransparent(card.graphql.?.document, card.graphql.?.operation_name, card.graphql.?.variables, card.target.pull_request_id);
-        if (card.target.path) |path| try self.validateCurrentPath(owner, name, number, card.target.head_oid, path) else try self.validateCurrentHead(owner, name, number, card.target.head_oid);
-        if (card.target.thread_id != null or card.target.comment_id != null) try self.validateReviewAuthority(owner, name, number, card);
+        if (!std.mem.eql(u8, card.target.repository, repository) or card.target.pull_request !=
+            number or !std.mem.eql(
+            u8,
+            card.target.pull_request_id,
+            pull_request_id,
+        )) return error.ActionTargetMismatch;
+        if (card.kind == .graphql) try graphql.validateTransparent(
+            card.graphql.?.document,
+            card.graphql.?.operation_name,
+            card.graphql.?.variables,
+            card.target.pull_request_id,
+        );
+        if (card.target.path) |path| try self.validateCurrentPath(
+            owner,
+            name,
+            number,
+            card.target.head_oid,
+            path,
+        ) else try self.validateCurrentHead(owner, name, number, card.target.head_oid);
+        const review_target = card.target.thread_id != null or card.target.comment_id != null;
+        if (review_target) try self.validateReviewAuthority(owner, name, number, card);
     }
 
-    pub fn validateCurrentHead(self: Broker, owner: []const u8, name: []const u8, number: u64, expected_head: []const u8) !void {
+    pub fn validateCurrentHead(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        expected_head: []const u8,
+    ) !void {
         var pages = try self.callPages(graphql.anchor_query, "files", owner, name, number);
         defer freePages(self.allocator, &pages);
         if (pages.items.len == 0) return error.InvalidSnapshot;
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
-            const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head)) return error.PullRequestChanged;
+            const pull = try pullObject(parsed.value);
+            if (!std.mem.eql(
+                u8,
+                pull.get("headRefOid").?.string,
+                expected_head,
+            )) return error.PullRequestChanged;
         }
     }
 
-    pub fn validateReviewAuthority(self: Broker, owner: []const u8, name: []const u8, number: u64, card: tools.ActionCard) !void {
-        var pages = try self.callPages(graphql.action_authority_query, "reviewThreads", owner, name, number);
+    pub fn validateReviewAuthority(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        card: tools.ActionCard,
+    ) !void {
+        var pages = try self.callPages(
+            graphql.action_authority_query,
+            "reviewThreads",
+            owner,
+            name,
+            number,
+        );
         defer freePages(self.allocator, &pages);
         var found = false;
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
-            const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, card.target.head_oid)) return error.PullRequestChanged;
-            for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |node| {
-                const thread = node.object;
-                if (card.target.thread_id) |thread_id| if (std.mem.eql(u8, thread.get("id").?.string, thread_id)) {
-                    const allowed = switch (card.kind) {
-                        .reply_thread => thread.get("viewerCanReply").?.bool,
-                        .resolve_thread => thread.get("viewerCanResolve").?.bool,
-                        .unresolve_thread => thread.get("viewerCanUnresolve").?.bool,
-                        else => true,
-                    };
-                    if (!allowed) return error.GitHubActionNotAuthorized;
-                    found = true;
-                };
-                if (card.target.comment_id) |comment_id| for (thread.get("comments").?.object.get("nodes").?.array.items) |comment| if (std.mem.eql(u8, comment.object.get("id").?.string, comment_id)) {
-                    if (!comment.object.get("viewerDidAuthor").?.bool) return error.GitHubActionNotAuthorized;
-                    found = true;
-                };
-                if (!found) if (card.target.comment_id) |comment_id| {
-                    const comments = thread.get("comments").?.object;
-                    const next = nextCursor(comments) orelse continue;
-                    if (try self.commentById(
-                        thread.get("id").?.string,
-                        comment_id,
-                        next,
-                    )) |comment| {
-                        if (!comment.viewer_did_author) {
-                            return error.GitHubActionNotAuthorized;
-                        }
-                        found = true;
-                    }
-                };
-            }
+            const pull = try pullObject(parsed.value);
+            if (!std.mem.eql(
+                u8,
+                pull.get("headRefOid").?.string,
+                card.target.head_oid,
+            )) return error.PullRequestChanged;
+            const threads = pull.get("reviewThreads").?.object.get("nodes").?.array.items;
+            try self.validateAuthorityThreads(threads, card, &found);
         }
         if (!found) return error.GitHubActionTargetMissing;
     }
 
-    pub fn reconcileAction(self: Broker, owner: []const u8, name: []const u8, number: u64, card: tools.ActionCard, started_unix_s: i64) !bool {
-        if (card.kind == .mark_viewed or card.kind == .unmark_viewed) return self.viewedStateAfterMutation(owner, name, number, card.target.head_oid, card.target.path.?, card.kind == .mark_viewed);
+    fn validateAuthorityThreads(
+        self: Broker,
+        threads: []const std.json.Value,
+        card: tools.ActionCard,
+        found: *bool,
+    ) !void {
+        for (threads) |node| {
+            const thread = node.object;
+            if (card.target.thread_id) |thread_id| if (std.mem.eql(
+                u8,
+                thread.get("id").?.string,
+                thread_id,
+            )) {
+                const allowed = switch (card.kind) {
+                    .reply_thread => thread.get("viewerCanReply").?.bool,
+                    .resolve_thread => thread.get("viewerCanResolve").?.bool,
+                    .unresolve_thread => thread.get("viewerCanUnresolve").?.bool,
+                    else => true,
+                };
+                if (!allowed) return error.GitHubActionNotAuthorized;
+                found.* = true;
+            };
+            if (card.target.comment_id) |comment_id| {
+                const comments = thread.get("comments").?.object.get("nodes").?.array.items;
+                for (comments) |comment| if (std.mem.eql(
+                    u8,
+                    comment.object.get("id").?.string,
+                    comment_id,
+                )) {
+                    if (!comment.object.get("viewerDidAuthor").?.bool) {
+                        return error.GitHubActionNotAuthorized;
+                    }
+                    found.* = true;
+                };
+            }
+            if (!found.*) if (card.target.comment_id) |comment_id| {
+                const comments = thread.get("comments").?.object;
+                const next = nextCursor(comments) orelse continue;
+                if (try self.commentById(
+                    thread.get("id").?.string,
+                    comment_id,
+                    next,
+                )) |comment| {
+                    if (!comment.viewer_did_author) {
+                        return error.GitHubActionNotAuthorized;
+                    }
+                    found.* = true;
+                }
+            };
+        }
+    }
+
+    pub fn reconcileAction(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        card: tools.ActionCard,
+        started_unix_s: i64,
+    ) !bool {
+        if (card.kind == .mark_viewed or card.kind == .unmark_viewed) {
+            return self.viewedStateAfterMutation(
+                owner,
+                name,
+                number,
+                card.target.head_oid,
+                card.target.path.?,
+                card.kind == .mark_viewed,
+            );
+        }
         if (card.kind == .graphql) return false;
-        var pages = try self.callPages(graphql.reconcile_query, "reviewThreads", owner, name, number);
+        var pages = try self.callPages(
+            graphql.reconcile_query,
+            "reviewThreads",
+            owner,
+            name,
+            number,
+        );
         defer freePages(self.allocator, &pages);
         var target_comment_found = false;
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
-            const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, card.target.head_oid)) return error.PullRequestChanged;
+            const pull = try pullObject(parsed.value);
+            if (!std.mem.eql(
+                u8,
+                pull.get("headRefOid").?.string,
+                card.target.head_oid,
+            )) return error.PullRequestChanged;
             for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
-                if (card.target.thread_id) |thread_id| if (!std.mem.eql(u8, thread.object.get("id").?.string, thread_id)) continue;
+                if (card.target.thread_id) |thread_id| if (!std.mem.eql(
+                    u8,
+                    thread.object.get("id").?.string,
+                    thread_id,
+                )) continue;
                 if (card.kind == .resolve_thread) return thread.object.get("isResolved").?.bool;
                 if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
-                if (card.target.path) |path| if (!std.mem.eql(u8, thread.object.get("path").?.string, path)) continue;
-                if (card.target.line) |line| if (thread.object.get("line").? != .null and thread.object.get("line").?.integer != line) continue;
+                if (card.target.path) |path| if (!std.mem.eql(
+                    u8,
+                    thread.object.get("path").?.string,
+                    path,
+                )) continue;
+                if (card.target.line) |line| if (thread.object.get("line").? != .null and
+                    thread.object.get("line").?.integer != line) continue;
                 const observed = try self.commentMutationObserved(
                     thread.object,
                     card,
@@ -276,7 +436,7 @@ pub const Broker = struct {
     ) !?CommentSnapshot {
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
-        while (true) {
+        for (0..max_pages) |_| {
             const page = try self.threadCommentPage(thread_id, cursor);
             defer self.allocator.free(page);
             var parsed = try std.json.parseFromSlice(
@@ -302,6 +462,7 @@ pub const Broker = struct {
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
         }
+        return error.PaginationLimitExceeded;
     }
 
     fn commentMutationObserved(
@@ -322,7 +483,7 @@ pub const Broker = struct {
         const first_cursor = nextCursor(initial) orelse return false;
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
-        while (true) {
+        for (0..max_pages) |_| {
             const page = try self.threadCommentPage(
                 thread.get("id").?.string,
                 cursor,
@@ -350,6 +511,7 @@ pub const Broker = struct {
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
         }
+        return error.PaginationLimitExceeded;
     }
 
     fn threadCommentPage(
@@ -366,25 +528,58 @@ pub const Broker = struct {
         return self.call(graphql.thread_comments_query, vars);
     }
 
-    pub fn refreshRelevantState(self: Broker, owner: []const u8, name: []const u8, number: u64, card: tools.ActionCard) !void {
+    pub fn refreshRelevantState(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        card: tools.ActionCard,
+    ) !void {
         switch (card.kind) {
             .mark_viewed, .unmark_viewed => return,
-            .add_inline_comment, .graphql => return self.validateCurrentHead(owner, name, number, card.target.head_oid),
+            .add_inline_comment, .graphql => return self.validateCurrentHead(
+                owner,
+                name,
+                number,
+                card.target.head_oid,
+            ),
             .reply_thread, .resolve_thread, .unresolve_thread, .update_comment, .delete_comment => {
-                var pages = try self.callPages(graphql.action_authority_query, "reviewThreads", owner, name, number);
+                var pages = try self.callPages(
+                    graphql.action_authority_query,
+                    "reviewThreads",
+                    owner,
+                    name,
+                    number,
+                );
                 defer freePages(self.allocator, &pages);
                 if (pages.items.len == 0) return error.InvalidSnapshot;
                 for (pages.items) |page| {
-                    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
+                    var parsed = try std.json.parseFromSlice(
+                        std.json.Value,
+                        self.allocator,
+                        page,
+                        .{},
+                    );
                     defer parsed.deinit();
-                    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-                    if (!std.mem.eql(u8, pull.get("headRefOid").?.string, card.target.head_oid)) return error.PullRequestChanged;
+                    const pull = try pullObject(parsed.value);
+                    if (!std.mem.eql(
+                        u8,
+                        pull.get("headRefOid").?.string,
+                        card.target.head_oid,
+                    )) return error.PullRequestChanged;
                 }
             },
         }
     }
 
-    pub fn callPages(self: Broker, document: []const u8, connection: []const u8, owner: []const u8, name: []const u8, number: u64) !std.ArrayList([]u8) {
+    pub fn callPages(
+        self: Broker,
+        document: []const u8,
+        connection: []const u8,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+    ) !std.ArrayList([]u8) {
         var pages: std.ArrayList([]u8) = .empty;
         errdefer {
             for (pages.items) |page| self.allocator.free(page);
@@ -392,25 +587,50 @@ pub const Broker = struct {
         }
         var cursor: ?[]u8 = null;
         defer if (cursor) |c| self.allocator.free(c);
-        while (true) {
-            const cursor_json = if (cursor) |c| try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{c}) else try self.allocator.dupe(u8, "null");
+        for (0..max_pages) |_| {
+            const cursor_json = if (cursor) |c| try std.fmt.allocPrint(
+                self.allocator,
+                "\"{s}\"",
+                .{c},
+            ) else try self.allocator.dupe(u8, "null");
             defer self.allocator.free(cursor_json);
-            const vars = try std.fmt.allocPrint(self.allocator, "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{s}}}", .{ std.json.fmt(owner, .{}), std.json.fmt(name, .{}), number, cursor_json });
+            const format = "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{s}}}";
+            const vars = try std.fmt.allocPrint(self.allocator, format, .{
+                std.json.fmt(owner, .{}),
+                std.json.fmt(name, .{}),
+                number,
+                cursor_json,
+            });
             defer self.allocator.free(vars);
             const page = try self.call(document, vars);
             try pages.append(self.allocator, page);
             const next = try graphql.pageCursor(self.allocator, page, connection);
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
-            if (cursor == null) break;
+            if (cursor == null) return pages;
         }
-        return pages;
+        return error.PaginationLimitExceeded;
     }
 
-    pub fn viewedAfterMutation(self: Broker, owner: []const u8, name: []const u8, number: u64, expected_head: []const u8, path: []const u8) !bool {
+    pub fn viewedAfterMutation(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        expected_head: []const u8,
+        path: []const u8,
+    ) !bool {
         return self.viewedStateAfterMutation(owner, name, number, expected_head, path, true);
     }
-    pub fn viewedStateAfterMutation(self: Broker, owner: []const u8, name: []const u8, number: u64, expected_head: []const u8, path: []const u8, expected_viewed: bool) !bool {
+    pub fn viewedStateAfterMutation(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        expected_head: []const u8,
+        path: []const u8,
+        expected_viewed: bool,
+    ) !bool {
         var pages = try self.callPages(graphql.file_state_query, "files", owner, name, number);
         defer {
             for (pages.items) |p| self.allocator.free(p);
@@ -419,13 +639,32 @@ pub const Broker = struct {
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
-            const pull = (((parsed.value.object.get("data").?).object.get("repository").?).object.get("pullRequest").?).object;
-            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head)) return error.PullRequestChanged;
-            for (pull.get("files").?.object.get("nodes").?.array.items) |node| if (std.mem.eql(u8, node.object.get("path").?.string, path)) return std.mem.eql(u8, node.object.get("viewerViewedState").?.string, "VIEWED") == expected_viewed;
+            const pull = try pullObject(parsed.value);
+            if (!std.mem.eql(
+                u8,
+                pull.get("headRefOid").?.string,
+                expected_head,
+            )) return error.PullRequestChanged;
+            for (pull.get("files").?.object.get("nodes").?.array.items) |node| if (std.mem.eql(
+                u8,
+                node.object.get("path").?.string,
+                path,
+            )) return std.mem.eql(
+                u8,
+                node.object.get("viewerViewedState").?.string,
+                "VIEWED",
+            ) == expected_viewed;
         }
         return false;
     }
-    pub fn validateCurrentPath(self: Broker, owner: []const u8, name: []const u8, number: u64, expected_head: []const u8, path: []const u8) !void {
+    pub fn validateCurrentPath(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        expected_head: []const u8,
+        path: []const u8,
+    ) !void {
         var pages = try self.callPages(graphql.anchor_query, "files", owner, name, number);
         defer {
             for (pages.items) |p| self.allocator.free(p);
@@ -435,8 +674,12 @@ pub const Broker = struct {
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
-            const pull = (((parsed.value.object.get("data").?).object.get("repository").?).object.get("pullRequest").?).object;
-            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head)) return error.PullRequestChanged;
+            const pull = try pullObject(parsed.value);
+            if (!std.mem.eql(
+                u8,
+                pull.get("headRefOid").?.string,
+                expected_head,
+            )) return error.PullRequestChanged;
             for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
                 if (std.mem.eql(u8, node.object.get("path").?.string, path)) found = true;
             }
@@ -492,14 +735,16 @@ fn commentsObserve(
 }
 
 fn parseGithubTimestampSeconds(raw: []const u8) ?i64 {
-    if (raw.len < 20 or raw[4] != '-' or raw[7] != '-' or raw[10] != 'T' or raw[13] != ':' or raw[16] != ':' or raw[19] != 'Z') return null;
+    if (raw.len < 20 or raw[4] != '-' or raw[7] != '-' or raw[10] != 'T' or raw[13] != ':' or
+        raw[16] != ':' or raw[19] != 'Z') return null;
     const year = std.fmt.parseInt(i64, raw[0..4], 10) catch return null;
     const month = std.fmt.parseInt(u8, raw[5..7], 10) catch return null;
     const day = std.fmt.parseInt(u8, raw[8..10], 10) catch return null;
     const hour = std.fmt.parseInt(i64, raw[11..13], 10) catch return null;
     const minute = std.fmt.parseInt(i64, raw[14..16], 10) catch return null;
     const second = std.fmt.parseInt(i64, raw[17..19], 10) catch return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second >
+        59) return null;
     var y = year;
     const m: i64 = month;
     const d: i64 = day;
@@ -519,16 +764,64 @@ fn variablesForCard(allocator: std.mem.Allocator, card: tools.ActionCard) ![]u8 
         .add_inline_comment => blk: {
             var out: std.Io.Writer.Allocating = .init(allocator);
             errdefer out.deinit();
-            try out.writer.print("{{\"input\":{{\"pullRequestId\":{f},\"commitOID\":{f},\"event\":\"COMMENT\",\"clientMutationId\":{f},\"threads\":[{{\"path\":{f},", .{ std.json.fmt(card.target.pull_request_id, .{}), std.json.fmt(card.target.head_oid, .{}), std.json.fmt(client_id, .{}), std.json.fmt(card.target.path.?, .{}) });
-            if (card.target.start_line) |start| try out.writer.print("\"startLine\":{d},\"startSide\":{f},", .{ start, std.json.fmt(card.target.side orelse "RIGHT", .{}) });
-            try out.writer.print("\"line\":{d},\"side\":{f},\"body\":{f}}}]}}}}", .{ card.target.line.?, std.json.fmt(card.target.side orelse "RIGHT", .{}), std.json.fmt(card.body.?, .{}) });
+            try out.writer.print("{{\"input\":{{\"pullRequestId\":{f},\"commitOID\":{f}," ++
+                "\"event\":\"COMMENT\",\"clientMutationId\":{f},\"threa" ++
+                "ds\":[{{\"path\":{f},", .{
+                std.json.fmt(
+                    card.target.pull_request_id,
+                    .{},
+                ),
+                std.json.fmt(card.target.head_oid, .{}),
+                std.json.fmt(client_id, .{}),
+                std.json.fmt(card.target.path.?, .{}),
+            });
+            if (card.target.start_line) |start| try out.writer.print(
+                "\"startLine\":{d},\"startSide\":{f},",
+                .{ start, std.json.fmt(card.target.side orelse "RIGHT", .{}) },
+            );
+            try out.writer.print(
+                "\"line\":{d},\"side\":{f},\"body\":{f}}}]}}}}",
+                .{
+                    card.target.line.?,
+                    std.json.fmt(card.target.side orelse "RIGHT", .{}),
+                    std.json.fmt(card.body.?, .{}),
+                },
+            );
             break :blk try out.toOwnedSlice();
         },
-        .reply_thread => std.fmt.allocPrint(allocator, "{{\"input\":{{\"pullRequestReviewThreadId\":{f},\"body\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(card.target.thread_id.?, .{}), std.json.fmt(card.body.?, .{}), std.json.fmt(client_id, .{}) }),
-        .resolve_thread, .unresolve_thread => std.fmt.allocPrint(allocator, "{{\"input\":{{\"threadId\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(card.target.thread_id.?, .{}), std.json.fmt(client_id, .{}) }),
-        .update_comment => std.fmt.allocPrint(allocator, "{{\"input\":{{\"pullRequestReviewCommentId\":{f},\"body\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(card.target.comment_id.?, .{}), std.json.fmt(card.body.?, .{}), std.json.fmt(client_id, .{}) }),
-        .delete_comment => std.fmt.allocPrint(allocator, "{{\"input\":{{\"id\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(card.target.comment_id.?, .{}), std.json.fmt(client_id, .{}) }),
-        .mark_viewed, .unmark_viewed => std.fmt.allocPrint(allocator, "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"clientMutationId\":{f}}}}}", .{ std.json.fmt(card.target.pull_request_id, .{}), std.json.fmt(card.target.path.?, .{}), std.json.fmt(client_id, .{}) }),
+        .reply_thread => std.fmt.allocPrint(allocator, "{{\"input\":{{\"pullRequestReview" ++
+            "ThreadId\":{f},\"body" ++
+            "\":{f},\"clientMutationId\":{f}}}}}", .{
+            std.json.fmt(card.target.thread_id.?, .{}),
+            std.json.fmt(card.body.?, .{}),
+            std.json.fmt(client_id, .{}),
+        }),
+        .resolve_thread, .unresolve_thread => std.fmt.allocPrint(
+            allocator,
+            "{{\"input\":{{\"threadId\":{f},\"clientMutationId\":{f}}}}}",
+            .{ std.json.fmt(card.target.thread_id.?, .{}), std.json.fmt(client_id, .{}) },
+        ),
+        .update_comment => std.fmt.allocPrint(allocator, "{{\"input\":{{\"pullRequestReview" ++
+            "CommentId\":{f},\"bod" ++
+            "y\":{f},\"clientMutationId\":{f}}}}}", .{
+            std.json.fmt(card.target.comment_id.?, .{}),
+            std.json.fmt(card.body.?, .{}),
+            std.json.fmt(client_id, .{}),
+        }),
+        .delete_comment => std.fmt.allocPrint(
+            allocator,
+            "{{\"input\":{{\"id\":{f},\"clientMutationId\":{f}}}}}",
+            .{ std.json.fmt(card.target.comment_id.?, .{}), std.json.fmt(client_id, .{}) },
+        ),
+        .mark_viewed, .unmark_viewed => std.fmt.allocPrint(
+            allocator,
+            "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"clientMutationId\":{f}}}}}",
+            .{
+                std.json.fmt(card.target.pull_request_id, .{}),
+                std.json.fmt(card.target.path.?, .{}),
+                std.json.fmt(client_id, .{}),
+            },
+        ),
         .graphql => unreachable,
     };
 }
@@ -548,29 +841,59 @@ fn freePages(allocator: std.mem.Allocator, pages: *std.ArrayList([]u8)) void {
     pages.deinit(allocator);
 }
 
+fn viewedState(value: []const u8) domain.ViewedState {
+    if (std.mem.eql(u8, value, "VIEWED")) return .viewed;
+    if (std.mem.eql(u8, value, "DISMISSED")) return .dismissed;
+    return .unviewed;
+}
+
 fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
+    const pull = try pullObject(parsed.value);
     return allocator.dupe(u8, (pull.get(field) orelse return error.InvalidSnapshot).string);
 }
 
-fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
+fn loadSnapshotFiles(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    generation: *domain.PrGeneration,
+) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
-    for ((pull.get("files") orelse return error.InvalidSnapshot).object.get("nodes").?.array.items) |node| {
+    const pull = try pullObject(parsed.value);
+    const files = (pull.get("files") orelse return error.InvalidSnapshot).object;
+    for (files.get("nodes").?.array.items) |node| {
         const object = node.object;
         const viewed = object.get("viewerViewedState").?.string;
         const path = object.get("path").?.string;
         const change_type = object.get("changeType").?.string;
-        const revision = try domain.revisionKey(allocator, path, change_type, "pending-worktree-sync", path);
+        const revision = try domain.revisionKey(
+            allocator,
+            path,
+            change_type,
+            "pending-worktree-sync",
+            path,
+        );
         defer allocator.free(revision);
-        try generation.addFile(.{ .path = path, .additions = @intCast(object.get("additions").?.integer), .deletions = @intCast(object.get("deletions").?.integer), .change_type = change_type, .viewed = if (std.mem.eql(u8, viewed, "VIEWED")) .viewed else if (std.mem.eql(u8, viewed, "DISMISSED")) .dismissed else .unviewed, .revision_key = revision });
+        try generation.addFile(
+            .{
+                .path = path,
+                .additions = @intCast(object.get("additions").?.integer),
+                .deletions = @intCast(object.get("deletions").?.integer),
+                .change_type = change_type,
+                .viewed = viewedState(viewed),
+                .revision_key = revision,
+            },
+        );
     }
 }
 
-pub fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
+pub fn loadThreads(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    generation: *domain.PrGeneration,
+) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const data = (parsed.value.object.get("data") orelse return error.InvalidSnapshot).object;
@@ -604,7 +927,22 @@ pub fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *d
                 .review_state = review.get("state").?.string,
             });
         }
-        try generation.addThread(.{ .id = object.get("id").?.string, .path = object.get("path").?.string, .line = optionalU32(object.get("line")), .start_line = optionalU32(object.get("startLine")), .diff_side = optionalString(object.get("diffSide")), .start_diff_side = optionalString(object.get("startDiffSide")), .subject_type = object.get("subjectType").?.string, .outdated = object.get("isOutdated").?.bool, .viewer_can_reply = object.get("viewerCanReply").?.bool, .viewer_can_resolve = object.get("viewerCanResolve").?.bool, .viewer_can_unresolve = object.get("viewerCanUnresolve").?.bool, .comments = comments.items });
+        try generation.addThread(
+            .{
+                .id = object.get("id").?.string,
+                .path = object.get("path").?.string,
+                .line = optionalU32(object.get("line")),
+                .start_line = optionalU32(object.get("startLine")),
+                .diff_side = optionalString(object.get("diffSide")),
+                .start_diff_side = optionalString(object.get("startDiffSide")),
+                .subject_type = object.get("subjectType").?.string,
+                .outdated = object.get("isOutdated").?.bool,
+                .viewer_can_reply = object.get("viewerCanReply").?.bool,
+                .viewer_can_resolve = object.get("viewerCanResolve").?.bool,
+                .viewer_can_unresolve = object.get("viewerCanUnresolve").?.bool,
+                .comments = comments.items,
+            },
+        );
     }
 }
 
@@ -617,16 +955,35 @@ fn optionalString(value: ?std.json.Value) ?[]const u8 {
     return if (v == .null) null else v.string;
 }
 
-pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, generation: *domain.PrGeneration) !void {
+pub fn hydrateRevisionKeys(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    generation: *domain.PrGeneration,
+) !void {
     try fetchObject(allocator, io, cwd, generation.base_oid);
     for (generation.files.items) |file| {
         const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
         defer allocator.free(spec);
-        const blob_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } });
+        const blob_result = try std.process.run(
+            allocator,
+            io,
+            .{ .argv = &.{ "git", "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
+        );
         defer allocator.free(blob_result.stdout);
         defer allocator.free(blob_result.stderr);
-        const blob = if (blob_result.term == .exited and blob_result.term.exited == 0) std.mem.trim(u8, blob_result.stdout, "\r\n") else "DELETION";
-        const diff = try canonicalDiffAlloc(allocator, io, cwd, generation.base_oid, generation.head_oid, file.path);
+        const blob = if (blob_result.term == .exited and blob_result.term.exited == 0)
+            std.mem.trim(u8, blob_result.stdout, "\r\n")
+        else
+            "DELETION";
+        const diff = try canonicalDiffAlloc(
+            allocator,
+            io,
+            cwd,
+            generation.base_oid,
+            generation.head_oid,
+            file.path,
+        );
         defer allocator.free(diff);
         const revision = try domain.revisionKey(allocator, file.path, file.change_type, blob, diff);
         defer allocator.free(revision);
@@ -634,7 +991,14 @@ pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []cons
     }
 }
 
-pub fn canonicalDiffAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, base: []const u8, head: []const u8, path: []const u8) ![]u8 {
+pub fn canonicalDiffAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    base: []const u8,
+    head: []const u8,
+    path: []const u8,
+) ![]u8 {
     const merge = try std.process.run(allocator, io, .{
         .argv = &.{ "git", "merge-base", base, head },
         .cwd = .{ .path = cwd },
@@ -645,7 +1009,14 @@ pub fn canonicalDiffAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const
     const merge_base = std.mem.trim(u8, merge.stdout, "\r\n");
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
-    const result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "diff", "--no-ext-diff", "--no-color", range, "--", path }, .cwd = .{ .path = cwd } });
+    const result = try std.process.run(
+        allocator,
+        io,
+        .{
+            .argv = &.{ "git", "diff", "--no-ext-diff", "--no-color", range, "--", path },
+            .cwd = .{ .path = cwd },
+        },
+    );
     defer allocator.free(result.stderr);
     errdefer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.FileDiffFailed;
@@ -727,7 +1098,9 @@ fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
             new_line = std.fmt.parseInt(u32, tail[0..end], 10) catch 0;
             continue;
         }
-        if (line.len == 0 or std.mem.startsWith(u8, line, "---") or std.mem.startsWith(u8, line, "+++")) continue;
+        const metadata = line.len == 0 or std.mem.startsWith(u8, line, "---") or
+            std.mem.startsWith(u8, line, "+++");
+        if (metadata) continue;
         if (std.mem.eql(u8, side, "RIGHT") and line[0] != '-' and new_line == target) return true;
         if (std.mem.eql(u8, side, "LEFT") and line[0] != '+' and old_line == target) return true;
         if (line[0] != '-') new_line += 1;
@@ -737,8 +1110,10 @@ fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
 }
 
 pub fn hasFixedArgv(argv: []const []const u8) bool {
-    return argv.len == 7 and std.mem.eql(u8, argv[1], "api") and std.mem.eql(u8, argv[2], "graphql") and
-        std.mem.eql(u8, argv[3], "--hostname") and std.mem.eql(u8, argv[5], "--input") and std.mem.eql(u8, argv[6], "-");
+    return argv.len == 7 and std.mem.eql(u8, argv[1], "api") and
+        std.mem.eql(u8, argv[2], "graphql") and
+        std.mem.eql(u8, argv[3], "--hostname") and std.mem.eql(u8, argv[5], "--input") and
+        std.mem.eql(u8, argv[6], "-");
 }
 
 test "generation pages reject mixed heads" {
@@ -784,7 +1159,9 @@ test "thread evidence accepts deleted authors and nested comment pages" {
 }
 
 test "GitHub transport is a fixed argv stdin broker" {
-    try std.testing.expect(hasFixedArgv(&.{ "gh", "api", "graphql", "--hostname", "github.com", "--input", "-" }));
+    try std.testing.expect(hasFixedArgv(
+        &.{ "gh", "api", "graphql", "--hostname", "github.com", "--input", "-" },
+    ));
     try std.testing.expect(!hasFixedArgv(&.{ "sh", "-c", "gh api" }));
 }
 test "canonical RIGHT anchor accepts only represented new lines" {

@@ -26,16 +26,36 @@ pub const Baseline = struct {
     artifacts: std.ArrayList([]u8) = .empty,
 
     pub fn capture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !Baseline {
-        const head = try gitOutput(allocator, io, cwd, &.{ "git", "rev-parse", "HEAD" }, error.WorktreeHeadReadFailed);
+        const head = try gitOutput(
+            allocator,
+            io,
+            cwd,
+            &.{ "git", "rev-parse", "HEAD" },
+            error.WorktreeHeadReadFailed,
+        );
         defer allocator.free(head);
-        const branch_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "branch", "--show-current" }, .cwd = .{ .path = cwd } });
+        const branch_result = try std.process.run(
+            allocator,
+            io,
+            .{ .argv = &.{ "git", "branch", "--show-current" }, .cwd = .{ .path = cwd } },
+        );
         defer allocator.free(branch_result.stdout);
         defer allocator.free(branch_result.stderr);
-        if (branch_result.term != .exited or branch_result.term.exited != 0) return error.WorktreeBranchReadFailed;
+        const branch_failed = branch_result.term != .exited or branch_result.term.exited != 0;
+        if (branch_failed) return error.WorktreeBranchReadFailed;
         const branch_text = std.mem.trim(u8, branch_result.stdout, "\r\n");
         const porcelain = try statusAlloc(allocator, io, cwd);
         errdefer allocator.free(porcelain);
-        var baseline = Baseline{ .allocator = allocator, .head_oid = try allocator.dupe(u8, std.mem.trim(u8, head, "\r\n")), .branch = if (branch_text.len == 0) null else try allocator.dupe(u8, branch_text), .porcelain_v2 = porcelain, .tracked_digest = try trackedDigest(allocator, io, cwd) };
+        var baseline = Baseline{
+            .allocator = allocator,
+            .head_oid = try allocator.dupe(u8, std.mem.trim(u8, head, "\r\n")),
+            .branch = if (branch_text.len == 0)
+                null
+            else
+                try allocator.dupe(u8, branch_text),
+            .porcelain_v2 = porcelain,
+            .tracked_digest = try trackedDigest(allocator, io, cwd),
+        };
         errdefer baseline.deinit();
         try listArtifacts(allocator, io, cwd, &baseline.artifacts);
         return baseline;
@@ -61,17 +81,51 @@ pub fn isClean(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !bool 
     return status.len == 0;
 }
 
-pub fn select(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, head_ref: []const u8, head_oid: []const u8, managed_path: []const u8, prefer_current_pr_checkout: bool) !Custody {
+pub fn select(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    head_ref: []const u8,
+    head_oid: []const u8,
+    managed_path: []const u8,
+    prefer_current_pr_checkout: bool,
+) !Custody {
     if (prefer_current_pr_checkout and try isClean(io, allocator, cwd)) {
-        const head = try gitOutput(allocator, io, cwd, &.{ "git", "rev-parse", "HEAD" }, error.WorktreeHeadReadFailed);
+        const head = try gitOutput(
+            allocator,
+            io,
+            cwd,
+            &.{ "git", "rev-parse", "HEAD" },
+            error.WorktreeHeadReadFailed,
+        );
         defer allocator.free(head);
-        const branch = try gitOutput(allocator, io, cwd, &.{ "git", "branch", "--show-current" }, error.WorktreeBranchReadFailed);
+        const branch = try gitOutput(
+            allocator,
+            io,
+            cwd,
+            &.{ "git", "branch", "--show-current" },
+            error.WorktreeBranchReadFailed,
+        );
         defer allocator.free(branch);
-        if (std.mem.eql(u8, std.mem.trim(u8, head, "\r\n"), head_oid) and std.mem.eql(u8, std.mem.trim(u8, branch, "\r\n"), head_ref)) return .{ .reused_current = try allocator.dupe(u8, cwd) };
+        if (std.mem.eql(u8, std.mem.trim(u8, head, "\r\n"), head_oid) and std.mem.eql(
+            u8,
+            std.mem.trim(u8, branch, "\r\n"),
+            head_ref,
+        )) return .{ .reused_current = try allocator.dupe(u8, cwd) };
     }
-    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(managed_path) orelse return error.InvalidManagedWorktreePath);
+    try std.Io.Dir.cwd().createDirPath(
+        io,
+        std.fs.path.dirname(managed_path) orelse return error.InvalidManagedWorktreePath,
+    );
     try fetch(allocator, io, cwd, head_oid);
-    const add = try std.process.run(allocator, io, .{ .argv = &.{ "git", "worktree", "add", "--detach", managed_path, head_oid }, .cwd = .{ .path = cwd } });
+    const add = try std.process.run(
+        allocator,
+        io,
+        .{
+            .argv = &.{ "git", "worktree", "add", "--detach", managed_path, head_oid },
+            .cwd = .{ .path = cwd },
+        },
+    );
     defer allocator.free(add.stdout);
     defer allocator.free(add.stderr);
     if (add.term != .exited or add.term.exited != 0) return error.ManagedWorktreeCreationFailed;
@@ -85,14 +139,40 @@ pub fn requireManagedRefresh(custody: Custody) !void {
     if (custody != .managed) return error.ReusedCheckoutRefreshRequiresManagedMigration;
 }
 
-pub fn synchronize(allocator: std.mem.Allocator, io: std.Io, custody: Custody, repository_cwd: []const u8, next_head: []const u8, baseline: *Baseline) !void {
+pub fn synchronize(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+    next_head: []const u8,
+    baseline: *Baseline,
+) !void {
     switch (custody) {
-        .managed => try synchronizeManaged(allocator, io, custody, repository_cwd, next_head, baseline),
-        .reused_current => try synchronizeReused(allocator, io, custody.path(), next_head, baseline),
+        .managed => try synchronizeManaged(
+            allocator,
+            io,
+            custody,
+            repository_cwd,
+            next_head,
+            baseline,
+        ),
+        .reused_current => try synchronizeReused(
+            allocator,
+            io,
+            custody.path(),
+            next_head,
+            baseline,
+        ),
     }
 }
 
-pub fn reconcileShutdown(allocator: std.mem.Allocator, io: std.Io, custody: Custody, selected_head: []const u8, baseline: *Baseline) !void {
+pub fn reconcileShutdown(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    selected_head: []const u8,
+    baseline: *Baseline,
+) !void {
     switch (custody) {
         .managed => try cleanManaged(allocator, io, custody.path(), selected_head, baseline),
         .reused_current => try requireReusedUnchanged(allocator, io, custody.path(), baseline),
@@ -117,33 +197,78 @@ pub fn retireManaged(
     }
 }
 
-pub fn synchronizeManaged(allocator: std.mem.Allocator, io: std.Io, custody: Custody, repository_cwd: []const u8, head_oid: []const u8, baseline: *Baseline) !void {
+pub fn synchronizeManaged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+    head_oid: []const u8,
+    baseline: *Baseline,
+) !void {
     try requireManagedRefresh(custody);
     try cleanManaged(allocator, io, custody.path(), baseline.head_oid, baseline);
     try fetch(allocator, io, repository_cwd, head_oid);
-    const checkout = try std.process.run(allocator, io, .{ .argv = &.{ "git", "checkout", "--detach", head_oid }, .cwd = .{ .path = custody.path() } });
+    const checkout = try std.process.run(
+        allocator,
+        io,
+        .{
+            .argv = &.{ "git", "checkout", "--detach", head_oid },
+            .cwd = .{ .path = custody.path() },
+        },
+    );
     defer allocator.free(checkout.stdout);
     defer allocator.free(checkout.stderr);
-    if (checkout.term != .exited or checkout.term.exited != 0) return error.ManagedWorktreeRefreshFailed;
+    const checkout_failed = checkout.term != .exited or checkout.term.exited != 0;
+    if (checkout_failed) return error.ManagedWorktreeRefreshFailed;
     const next = try Baseline.capture(allocator, io, custody.path());
     baseline.replace(next);
 }
 
-fn synchronizeReused(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, next_head: []const u8, baseline: *Baseline) !void {
+fn synchronizeReused(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    next_head: []const u8,
+    baseline: *Baseline,
+) !void {
     try requireReusedUnchanged(allocator, io, cwd, baseline);
-    const branch = baseline.branch orelse return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    const current_branch = try gitOutput(allocator, io, cwd, &.{ "git", "branch", "--show-current" }, error.WorktreeBranchReadFailed);
+    const branch = baseline.branch orelse
+        return error.ReusedCheckoutRefreshRequiresManagedMigration;
+    const current_branch = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "branch", "--show-current" },
+        error.WorktreeBranchReadFailed,
+    );
     defer allocator.free(current_branch);
-    if (!std.mem.eql(u8, std.mem.trim(u8, current_branch, "\r\n"), branch)) return error.ReusedCheckoutRefreshRequiresManagedMigration;
+    if (!std.mem.eql(
+        u8,
+        std.mem.trim(u8, current_branch, "\r\n"),
+        branch,
+    )) return error.ReusedCheckoutRefreshRequiresManagedMigration;
     try fetch(allocator, io, cwd, next_head);
-    const ancestor = try std.process.run(allocator, io, .{ .argv = &.{ "git", "merge-base", "--is-ancestor", baseline.head_oid, next_head }, .cwd = .{ .path = cwd } });
+    const ancestor = try std.process.run(
+        allocator,
+        io,
+        .{
+            .argv = &.{ "git", "merge-base", "--is-ancestor", baseline.head_oid, next_head },
+            .cwd = .{ .path = cwd },
+        },
+    );
     defer allocator.free(ancestor.stdout);
     defer allocator.free(ancestor.stderr);
-    if (ancestor.term != .exited or ancestor.term.exited != 0) return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    const merge = try std.process.run(allocator, io, .{ .argv = &.{ "git", "merge", "--ff-only", next_head }, .cwd = .{ .path = cwd } });
+    const not_ancestor = ancestor.term != .exited or ancestor.term.exited != 0;
+    if (not_ancestor) return error.ReusedCheckoutRefreshRequiresManagedMigration;
+    const merge = try std.process.run(
+        allocator,
+        io,
+        .{ .argv = &.{ "git", "merge", "--ff-only", next_head }, .cwd = .{ .path = cwd } },
+    );
     defer allocator.free(merge.stdout);
     defer allocator.free(merge.stderr);
-    if (merge.term != .exited or merge.term.exited != 0) return error.ReusedCheckoutFastForwardFailed;
+    const merge_failed = merge.term != .exited or merge.term.exited != 0;
+    if (merge_failed) return error.ReusedCheckoutFastForwardFailed;
     const next = try Baseline.capture(allocator, io, cwd);
     if (!std.mem.eql(u8, next.head_oid, next_head) or next.porcelain_v2.len != 0) {
         var invalid = next;
@@ -153,8 +278,19 @@ fn synchronizeReused(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, 
     baseline.replace(next);
 }
 
-fn requireReusedUnchanged(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, baseline: *const Baseline) !void {
-    const head = try gitOutput(allocator, io, cwd, &.{ "git", "rev-parse", "HEAD" }, error.WorktreeHeadReadFailed);
+fn requireReusedUnchanged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    baseline: *const Baseline,
+) !void {
+    const head = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.WorktreeHeadReadFailed,
+    );
     defer allocator.free(head);
     const status = try statusAlloc(allocator, io, cwd);
     defer allocator.free(status);
@@ -165,14 +301,48 @@ fn requireReusedUnchanged(allocator: std.mem.Allocator, io: std.Io, cwd: []const
         artifacts.deinit(allocator);
     }
     try listArtifacts(allocator, io, cwd, &artifacts);
-    if (!std.mem.eql(u8, std.mem.trim(u8, head, "\r\n"), baseline.head_oid) or !std.mem.eql(u8, status, baseline.porcelain_v2) or !std.mem.eql(u8, &digest, &baseline.tracked_digest) or !samePaths(artifacts.items, baseline.artifacts.items)) return error.ReusedCheckoutRefreshRequiresManagedMigration;
+    if (!std.mem.eql(
+        u8,
+        std.mem.trim(u8, head, "\r\n"),
+        baseline.head_oid,
+    ) or !std.mem.eql(u8, status, baseline.porcelain_v2) or !std.mem.eql(
+        u8,
+        &digest,
+        &baseline.tracked_digest,
+    ) or !samePaths(
+        artifacts.items,
+        baseline.artifacts.items,
+    )) return error.ReusedCheckoutRefreshRequiresManagedMigration;
 }
 
-fn cleanManaged(allocator: std.mem.Allocator, io: std.Io, root: []const u8, selected_head: []const u8, baseline: *const Baseline) !void {
-    const restore = try std.process.run(allocator, io, .{ .argv = &.{ "git", "restore", "--source", selected_head, "--staged", "--worktree", "--", "." }, .cwd = .{ .path = root } });
+fn cleanManaged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    selected_head: []const u8,
+    baseline: *const Baseline,
+) !void {
+    const restore = try std.process.run(
+        allocator,
+        io,
+        .{
+            .argv = &.{
+                "git",
+                "restore",
+                "--source",
+                selected_head,
+                "--staged",
+                "--worktree",
+                "--",
+                ".",
+            },
+            .cwd = .{ .path = root },
+        },
+    );
     defer allocator.free(restore.stdout);
     defer allocator.free(restore.stderr);
-    if (restore.term != .exited or restore.term.exited != 0) return error.ManagedTrackedCleanupFailed;
+    const restore_failed = restore.term != .exited or restore.term.exited != 0;
+    if (restore_failed) return error.ManagedTrackedCleanupFailed;
     const status = try statusAlloc(allocator, io, root);
     defer allocator.free(status);
     var current: std.ArrayList([]u8) = .empty;
@@ -193,22 +363,67 @@ fn cleanManaged(allocator: std.mem.Allocator, io: std.Io, root: []const u8, sele
         final_artifacts.deinit(allocator);
     }
     try listArtifacts(allocator, io, root, &final_artifacts);
-    const final_head = try gitOutput(allocator, io, root, &.{ "git", "rev-parse", "HEAD" }, error.WorktreeHeadReadFailed);
+    const final_head = try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.WorktreeHeadReadFailed,
+    );
     defer allocator.free(final_head);
     const final_digest = try trackedDigest(allocator, io, root);
-    if (!std.mem.eql(u8, std.mem.trim(u8, final_head, "\r\n"), selected_head) or !std.mem.eql(u8, &final_digest, &baseline.tracked_digest) or !std.mem.eql(u8, final_status, baseline.porcelain_v2) or !samePaths(final_artifacts.items, baseline.artifacts.items)) return error.ManagedWorktreeCleanupIncomplete;
+    if (!std.mem.eql(u8, std.mem.trim(u8, final_head, "\r\n"), selected_head) or
+        !std.mem.eql(
+            u8,
+            &final_digest,
+            &baseline.tracked_digest,
+        ) or !std.mem.eql(u8, final_status, baseline.porcelain_v2) or !samePaths(
+        final_artifacts.items,
+        baseline.artifacts.items,
+    )) return error.ManagedWorktreeCleanupIncomplete;
 }
 
 fn statusAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]u8 {
-    return gitOutput(allocator, io, cwd, &.{ "git", "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none" }, error.WorktreeStatusFailed);
+    return gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{
+            "git",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        },
+        error.WorktreeStatusFailed,
+    );
 }
 
 fn trackedDigest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![32]u8 {
-    const identity = try gitOutput(allocator, io, cwd, &.{ "git", "ls-files", "-s", "-z" }, error.WorktreeDigestFailed);
+    const identity = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "ls-files", "-s", "-z" },
+        error.WorktreeDigestFailed,
+    );
     defer allocator.free(identity);
-    const diff = try gitOutput(allocator, io, cwd, &.{ "git", "diff", "--no-ext-diff", "--binary", "HEAD", "--" }, error.WorktreeDigestFailed);
+    const diff = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "diff", "--no-ext-diff", "--binary", "HEAD", "--" },
+        error.WorktreeDigestFailed,
+    );
     defer allocator.free(diff);
-    const cached = try gitOutput(allocator, io, cwd, &.{ "git", "diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--" }, error.WorktreeDigestFailed);
+    const cached = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "diff", "--cached", "--no-ext-diff", "--binary", "HEAD", "--" },
+        error.WorktreeDigestFailed,
+    );
     defer allocator.free(cached);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(identity);
@@ -221,14 +436,34 @@ fn trackedDigest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![32
     return digest;
 }
 
-fn listArtifacts(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, output: *std.ArrayList([]u8)) !void {
-    const ordinary = try gitOutput(allocator, io, cwd, &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" }, error.WorktreeStatusFailed);
+fn listArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    output: *std.ArrayList([]u8),
+) !void {
+    const ordinary = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" },
+        error.WorktreeStatusFailed,
+    );
     defer allocator.free(ordinary);
-    const ignored = try gitOutput(allocator, io, cwd, &.{ "git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z" }, error.WorktreeStatusFailed);
+    const ignored = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z" },
+        error.WorktreeStatusFailed,
+    );
     defer allocator.free(ignored);
     for ([_][]const u8{ ordinary, ignored }) |raw| {
         var paths = std.mem.splitScalar(u8, raw, 0);
-        while (paths.next()) |path| if (path.len > 0) try output.append(allocator, try allocator.dupe(u8, path));
+        while (paths.next()) |path| if (path.len > 0) try output.append(
+            allocator,
+            try allocator.dupe(u8, path),
+        );
     }
 }
 
@@ -243,9 +478,15 @@ fn samePaths(a: []const []u8, b: []const []u8) bool {
 }
 
 fn deleteConfined(io: std.Io, root: []const u8, relative: []const u8) !void {
-    if (relative.len == 0 or std.fs.path.isAbsolute(relative)) return error.UnsafeManagedArtifactPath;
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative)) {
+        return error.UnsafeManagedArtifactPath;
+    }
     var parts = std.mem.splitScalar(u8, relative, std.fs.path.sep);
-    while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, "..")) return error.UnsafeManagedArtifactPath;
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, "..")) {
+            return error.UnsafeManagedArtifactPath;
+        }
+    }
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
     defer dir.close(io);
     dir.deleteFile(io, relative) catch |err| switch (err) {
@@ -265,13 +506,23 @@ fn deleteConfined(io: std.Io, root: []const u8, relative: []const u8) !void {
 }
 
 fn fetch(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, head_oid: []const u8) !void {
-    const result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", head_oid }, .cwd = .{ .path = cwd } });
+    const result = try std.process.run(
+        allocator,
+        io,
+        .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", head_oid }, .cwd = .{ .path = cwd } },
+    );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) return error.ManagedWorktreeFetchFailed;
 }
 
-fn gitOutput(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []const []const u8, failure: anyerror) ![]u8 {
+fn gitOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+    failure: anyerror,
+) ![]u8 {
     const result = try std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
