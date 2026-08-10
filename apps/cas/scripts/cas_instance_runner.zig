@@ -873,10 +873,13 @@ fn transportName(transport: cas.app_server_launch.RequestedTransport) []const u8
     };
 }
 
+const multi_agent_mode_removed_hint =
+    "Request-scoped multiAgentMode is retired; configure [agents] in " ++
+    "config.toml and use current Codex reasoning-effort controls instead.";
+
 fn usageDetailForParseError(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.MultiAgentModeRemoved => "Codex 0.145 ignores request-scoped multiAgentMode; configure [agents] " ++
-            "in config.toml and use the current Codex reasoning-effort controls instead.",
+        error.MultiAgentModeRemoved => multi_agent_mode_removed_hint,
         else => null,
     };
 }

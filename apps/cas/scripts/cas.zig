@@ -437,7 +437,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("dcp_v2").?.bool);
 }
 
-test "capabilities publish current 0.146 runtime features" {
+test "capabilities publish current contract features" {
     var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer text_output.deinit();
     try writeCapabilities(&text_output.writer, false);
