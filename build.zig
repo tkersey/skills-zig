@@ -242,6 +242,26 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cas_hook_policy", .module = cas_hook_policy_root },
         },
     });
+    const synoptic_meta = addVersionModule(b, @embedFile("apps/synoptic/VERSION"));
+    const synoptic_root = b.createModule(.{
+        .root_source_file = b.path("apps/synoptic/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+        .imports = &.{
+            .{ .name = "app_meta", .module = synoptic_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
+        },
+    });
+    const synoptic_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/synoptic/src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app_meta", .module = synoptic_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
+        },
+    });
     const cas_proxy_client_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
         .target = target,
@@ -501,6 +521,8 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
+    const synoptic = addExecutable(b, "synoptic", synoptic_root);
+    synoptic.root_module.linkSystemLibrary("c", .{});
     cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
     cas_release.configureExecutables(&.{
         cas,
@@ -545,6 +567,7 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cas_automation_install = addInstallStep(b, cas_automation);
+    const synoptic_install = addInstallStep(b, synoptic);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
@@ -566,6 +589,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cas_automation_install.step);
+    install_all.dependOn(&synoptic_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
     install_all.dependOn(&img_install.step);
@@ -779,6 +803,28 @@ pub fn build(b: *std.Build) void {
         },
     );
     test_cas.dependOn(&run_cas_automation_tests.step);
+
+    const run_synoptic_tests = addTestStepWithOptions(
+        b,
+        synoptic_tests_root,
+        "test-synoptic-unit",
+        "Run Synoptic unit and vertical state tests",
+        .{ .link_libc = true },
+    );
+    const run_synoptic_falsifiers = addTestStepWithOptions(
+        b,
+        synoptic_tests_root,
+        "test-synoptic-falsifiers-only",
+        "Run Synoptic security and authority falsifiers",
+        .{ .link_libc = true, .filters = &.{"falsifier"} },
+    );
+    const test_synoptic = b.step("test-synoptic", "Run Synoptic product and falsifier tests");
+    test_synoptic.dependOn(&run_synoptic_tests.step);
+    test_synoptic.dependOn(&run_synoptic_falsifiers.step);
+    const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
+    test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
+    const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
+    build_synoptic.dependOn(&synoptic_install.step);
 
     const cas_automation_oracle = b.addSystemCommand(&.{"sh"});
     cas_automation_oracle.addFileArg(b.path("apps/cas/testdata/automation/cron-0.2.13/verify.sh"));
