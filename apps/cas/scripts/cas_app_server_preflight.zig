@@ -1785,6 +1785,7 @@ fn runIsolatedFullProbes(
         executor_root,
         executor_manifest,
         executor_resource,
+        review_required,
     );
     if (review_required and witnesses.structured_review.status != .passed) {
         model_fixture.?.kill(io);
@@ -1821,6 +1822,7 @@ fn runIsolatedWitnessClient(
     executor_root: []const u8,
     executor_manifest: []const u8,
     executor_resource: []const u8,
+    review_required: bool,
 ) !FeatureWitnesses {
     var client = try proxy.Client.start(allocator, .{
         .cwd = cwd,
@@ -1859,7 +1861,10 @@ fn runIsolatedWitnessClient(
             executor_manifest,
             executor_resource,
         ),
-        .structured_review = probes.structuredReviewProbe(allocator, io, &client, cwd),
+        .structured_review = if (review_required)
+            probes.structuredReviewProbe(allocator, io, &client, cwd)
+        else
+            .{},
         .external_import_history = probes.externalImportHistoryProbe(allocator, &client, cwd),
     };
 }

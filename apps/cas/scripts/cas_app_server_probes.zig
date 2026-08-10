@@ -527,13 +527,14 @@ pub fn structuredReviewProbe(
             "and in-progress turn",
     );
     defer allocator.free(turn_id);
-    return structuredReviewTerminalProbe(allocator, io, client, thread_id, turn_id);
+    return structuredReviewTerminalProbe(allocator, io, client, cwd, thread_id, turn_id);
 }
 
 fn structuredReviewTerminalProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
     client: *proxy.Client,
+    cwd: []const u8,
     thread_id: []const u8,
     turn_id: []const u8,
 ) LiveWitness {
@@ -552,25 +553,18 @@ fn structuredReviewTerminalProbe(
     const deadline_ms = started_ms + structured_review_probe_timeout_ms;
     const previous_deadline_ms = client.swapRequestDeadlineMs(deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_deadline_ms);
+    const completion = waitForReviewCompletionNotification(
+        allocator,
+        io,
+        client,
+        cwd,
+        thread_id,
+        turn_id,
+        deadline_ms,
+    );
+    if (completion.status != .passed) return completion;
     while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
         const read_json = client.requestJson("thread/read", read_params) catch |err| {
-            if (err == error.RequestFailed) {
-                const now_ms = @divFloor(
-                    std.Io.Clock.awake.now(io).nanoseconds,
-                    1_000_000,
-                );
-                if (now_ms - started_ms >= structured_review_probe_timeout_ms) {
-                    return LiveWitness.failed(
-                        "structured_review_completion_timeout",
-                        "the deterministic structured review did not complete within the probe bound",
-                    );
-                }
-                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
-                    "structured_review_poll_failed",
-                    "the bounded structured-review completion poll failed",
-                );
-                continue;
-            }
             if (err == error.ConnectionTimedOut) return LiveWitness.failed(
                 "structured_review_completion_timeout",
                 "the deterministic structured review did not complete within the probe bound",
@@ -601,6 +595,66 @@ fn structuredReviewTerminalProbe(
             "the bounded structured-review completion poll failed",
         );
     }
+}
+
+fn waitForReviewCompletionNotification(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *proxy.Client,
+    cwd: []const u8,
+    thread_id: []const u8,
+    turn_id: []const u8,
+    deadline_ms: i64,
+) LiveWitness {
+    const list_params = threadListParamsAlloc(allocator, cwd, false) catch
+        return LiveWitness.failed(
+            "structured_review_poll_encode_failed",
+            "thread/list poll parameters could not be encoded",
+        );
+    defer allocator.free(list_params);
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+    while (!deadlineExpired(io, deadline_ms)) { // tiger: event-loop -- bounded by deadline_ms.
+        const list_json = client.requestJsonCaptureNotifications(
+            "thread/list",
+            list_params,
+            &notifications,
+        ) catch |err| {
+            if (err == error.ConnectionTimedOut) break;
+            return LiveWitness.failed(
+                "structured_review_completion_poll_failed",
+                "thread/list could not observe structured review completion",
+            );
+        };
+        allocator.free(list_json);
+        switch (reviewCompletionNotificationState(notifications.items, thread_id, turn_id)) {
+            .passed => return LiveWitness.passed(),
+            .failed => return LiveWitness.failed(
+                "structured_review_turn_failed",
+                "the exact structured review turn terminated without completion",
+            ),
+            .pending => {},
+        }
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
+            "structured_review_poll_failed",
+            "the bounded structured-review completion poll failed",
+        );
+    }
+    return LiveWitness.failed(
+        "structured_review_completion_timeout",
+        "the deterministic structured review did not complete within the probe bound",
+    );
+}
+
+fn deadlineExpired(io: std.Io, deadline_ms: i64) bool {
+    const now_ms: i64 = @intCast(@divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    ));
+    return now_ms >= deadline_ms;
 }
 
 pub fn executorSkillResourcesProbe(
@@ -2112,6 +2166,56 @@ fn deleteThread(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: 
 
 const ReviewCompletionState = enum { pending, passed, failed };
 
+fn reviewCompletionNotificationState(
+    lines: []const []const u8,
+    expected_thread_id: []const u8,
+    expected_turn_id: []const u8,
+) ReviewCompletionState {
+    var result: ReviewCompletionState = .pending;
+    for (lines) |line| {
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            std.heap.page_allocator,
+            line,
+            .{},
+        ) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |value| value,
+            else => continue,
+        };
+        const method_value = root.get("method") orelse continue;
+        const method = switch (method_value) {
+            .string => |value| value,
+            else => continue,
+        };
+        const params_value = root.get("params") orelse continue;
+        const params = switch (params_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (!objectStringEquals(params, "threadId", expected_thread_id)) continue;
+        const observed = if (std.mem.eql(u8, method, "turn/completed")) blk: {
+            const turn_value = params.get("turn") orelse continue;
+            const turn = switch (turn_value) {
+                .object => |value| value,
+                else => continue,
+            };
+            if (!objectStringEquals(turn, "id", expected_turn_id)) continue;
+            break :blk if (objectStringEquals(turn, "status", "completed"))
+                ReviewCompletionState.passed
+            else
+                ReviewCompletionState.failed;
+        } else if (std.mem.eql(u8, method, "turn/aborted")) blk: {
+            if (!objectStringEquals(params, "turnId", expected_turn_id)) continue;
+            break :blk ReviewCompletionState.failed;
+        } else continue;
+        if (result != .pending) return .failed;
+        result = observed;
+    }
+    return result;
+}
+
 fn completedReviewTurnState(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2300,7 +2404,8 @@ fn unitNumberField(object: std.json.ObjectMap, field: []const u8) bool {
 
 fn positiveIntegerField(object: std.json.ObjectMap, field: []const u8) ?i64 {
     const value = object.get(field) orelse return null;
-    if (value != .integer or value.integer <= 0) return null;
+    if (value != .integer or value.integer <= 0 or
+        value.integer > std.math.maxInt(u32)) return null;
     return value.integer;
 }
 
