@@ -250,7 +250,8 @@ pub const Server = struct {
             const immediate = if (runtime.settings) |settings| settings.file_review_start_mode == .immediate else true;
             const opened = try runtime.registry.openFile(self.io, runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, diff, threads, runtime.skill_path, immediate);
             defer opened.deinit();
-            const body = try std.fmt.allocPrint(self.allocator, "{{\"initialReview\":{},\"reused\":{},\"sessionId\":{f}}}", .{ immediate and !opened.reused, opened.reused, std.json.fmt(opened.session_id, .{}) });
+            try runtime.app.recordOpenedSession(path, revision, opened.session_id, diff, opened.reused, immediate and !opened.reused);
+            const body = try runtime.app.sessionOpenedPayloadAlloc(path, revision);
             defer self.allocator.free(body);
             return runtime.app.nextEnvelope("session.opened", body);
         }
@@ -351,6 +352,19 @@ pub const Server = struct {
         errdefer next.deinit();
         try worktree.synchronize(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid, runtime.baseline orelse return error.MissingWorktreeBaseline);
         try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
+        for (runtime.app.tabs.items) |tab| {
+            if (tab.status == .closed) continue;
+            if (@import("domain.zig").revisionFor(&next, tab.path) == null) {
+                try runtime.app.updateTabDiff(tab.path, null);
+                continue;
+            }
+            const current_diff = github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, next.base_oid, next.head_oid, tab.path) catch {
+                try runtime.app.updateTabDiff(tab.path, null);
+                continue;
+            };
+            defer self.allocator.free(current_diff);
+            try runtime.app.updateTabDiff(tab.path, current_diff);
+        }
         for (runtime.app.generation.files.items) |old_file| {
             const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse continue;
             if (!std.mem.eql(u8, old_file.revision_key, next_revision)) {
@@ -359,6 +373,7 @@ pub const Server = struct {
                 try runtime.registry.markPathChangedAndInject(old_file.path, next_revision, diff);
             }
         }
+        try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
         runtime.app.replaceGeneration(next);
         if (runtime.settings) |settings| {
             var outcomes = try runtime.app.applyAutomaticExclusions(settings, runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, runtime.cwd);

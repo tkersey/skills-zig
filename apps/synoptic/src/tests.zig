@@ -121,6 +121,42 @@ test "e2e domain lifecycle preserves queue tabs supersession and changed revisio
     try std.testing.expectEqual(@as(u64, 2), state.finishRound());
 }
 
+test "ui domain bootstrap owns PR queue tab diff and reconnect state" {
+    var state = try app.App.init(std.testing.allocator, "h1");
+    defer state.deinit();
+    try state.setPullRequest(.{ .repository = "o/r", .number = 7, .title = "Review me", .url = "https://github.com/o/r/pull/7", .base_ref_name = "main", .base_ref_oid = "b1", .head_ref_name = "feature", .head_ref_oid = "h1", .state = "OPEN", .is_draft = true });
+    try state.generation.addFile(.{ .path = "a.zig", .additions = 4, .deletions = 2, .change_type = "MODIFIED", .viewed = .unviewed, .revision_key = "r1", .exclusion_reason = "generated", .exclusion_sync_error = "readback-failed" });
+    state.primary_ready = true;
+    const provisional = try state.openFile("a.zig");
+    defer std.testing.allocator.free(provisional);
+    try state.recordOpenedSession("a.zig", "r1", "ses-1", "@@ -1 +1 @@\n-old\n+new\n", false, true);
+
+    const initial = try state.bootstrapAlloc();
+    defer std.testing.allocator.free(initial);
+    inline for (.{ "\"repository\":\"o/r\"", "\"number\":7", "\"title\":\"Review me\"", "\"isDraft\":true", "\"changeType\":\"MODIFIED\"", "\"viewedState\":\"UNVIEWED\"", "\"revisionKey\":\"r1\"", "\"activeSessionId\":\"ses-1\"", "\"currentRevisionSession\":true", "\"exclusionReason\":\"generated\"", "\"exclusionSyncError\":\"readback-failed\"", "\"state\":\"text\"", "+new" }) |needle| try std.testing.expect(std.mem.indexOf(u8, initial, needle) != null);
+
+    const opened = try state.sessionOpenedPayloadAlloc("a.zig", "r1");
+    defer std.testing.allocator.free(opened);
+    inline for (.{ "\"path\":\"a.zig\"", "\"revisionKey\":\"r1\"", "\"sessionId\":\"ses-1\"", "\"reused\":false", "\"initialReview\":true", "+new" }) |needle| try std.testing.expect(std.mem.indexOf(u8, opened, needle) != null);
+
+    try state.updateTabDiff("a.zig", "@@ -1 +1 @@\n-new\n+newer\n");
+    var refreshed = try domain.PrGeneration.initFull(std.testing.allocator, "b2", "h2");
+    try refreshed.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
+    try state.updatePullRequestGeneration("b2", "h2");
+    state.replaceGeneration(refreshed);
+    const reconnect = try state.bootstrapAlloc();
+    defer std.testing.allocator.free(reconnect);
+    inline for (.{ "\"baseRefOid\":\"b2\"", "\"headRefOid\":\"h2\"", "\"status\":\"stale_origin\"", "+newer" }) |needle| try std.testing.expect(std.mem.indexOf(u8, reconnect, needle) != null);
+
+    try state.updateTabDiff("a.zig", null);
+    const removed = try domain.PrGeneration.initFull(std.testing.allocator, "b3", "h3");
+    try state.updatePullRequestGeneration("b3", "h3");
+    state.replaceGeneration(removed);
+    const unavailable = try state.bootstrapAlloc();
+    defer std.testing.allocator.free(unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "\"diff\":{\"state\":\"unavailable\",\"text\":null}") != null);
+}
+
 const NetworkFixture = struct {
     server: *http.Server,
     runtime: *http.Runtime,
@@ -1112,7 +1148,9 @@ fn injectedRefresh(runtime: *http.Runtime) !void {
     errdefer next.deinit();
     try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
     try next.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
+    try runtime.app.updateTabDiff("a.zig", "@@ -1 +1 @@\n+refreshed\n");
     try runtime.registry.markPathChangedAndInject("a.zig", "r2", "@@ -1 +1 @@\n+refreshed\n");
+    try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
     runtime.app.replaceGeneration(next);
     try runtime.registry.setGenerationEvidence(&runtime.app.generation);
     try runtime.registry.updatePrimary("fixture refresh");
@@ -1145,6 +1183,7 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     const head = std.mem.trim(u8, head_raw, "\r\n");
     var state = try app.App.init(allocator, head);
     defer state.deinit();
+    try state.setPullRequest(.{ .repository = "o/r", .number = 1, .title = "Fixture PR", .url = "https://github.com/o/r/pull/1", .base_ref_name = "main", .base_ref_oid = base, .head_ref_name = "feature", .head_ref_oid = head, .state = "OPEN", .is_draft = false });
     var generation = try domain.PrGeneration.initFull(allocator, base, head);
     try generation.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r1" });
     try generation.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
@@ -1214,11 +1253,15 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "snapshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"repository\":\"o/r\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"changeType\":\"MODIFIED\"") != null);
     try sendMaskedText(io, &stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"a.zig\",\"diff\":\"@@ -1 +1 @@\\n+x\",\"threads\":\"[]\"}}");
     const opened = try readUntil(allocator, io, &stream, "\"type\":\"session.opened\"");
     defer allocator.free(opened);
     try std.testing.expect(std.mem.indexOf(u8, opened, "session.opened") != null);
     try std.testing.expect(std.mem.indexOf(u8, opened, "ses-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opened, "\"revisionKey\":\"r1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opened, "+new") != null);
     const review = try readUntil(allocator, io, &stream, "review visible");
     defer allocator.free(review);
     try std.testing.expect(std.mem.indexOf(u8, review, "review visible") != null);
@@ -1314,6 +1357,7 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     defer allocator.free(completed_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, completed_snapshot, "\"queue\":[{\"path\":\"b.zig\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, completed_snapshot, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed_snapshot, "+new") != null);
 
     try sendMaskedText(io, &stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"b.zig\",\"diff\":\"@@ -1 +1 @@\\n+new-b\",\"threads\":\"[]\"}}");
     const opened_b = try readUntil(allocator, io, &stream, "ses-2");
@@ -1361,12 +1405,14 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     const round_finished = try readUntil(allocator, io, &stream, "\"type\":\"round.finished\"");
     defer allocator.free(round_finished);
     try std.testing.expect(std.mem.indexOf(u8, round_finished, "\"round\":2") != null);
+    const pending_primary = try readUntil(allocator, io, &stream, "\"ownerKind\":\"primary\"");
+    defer allocator.free(pending_primary);
 
     stream.close(io);
     thread.join();
     first_joined = true;
     var disconnect_declined = false;
-    for (0..100) |_| {
+    for (0..400) |_| {
         const disconnect_log = try std.Io.Dir.cwd().readFileAlloc(io, codex_log_path, allocator, .limited(1024 * 1024));
         defer allocator.free(disconnect_log);
         if (std.mem.indexOf(u8, disconnect_log, "\"id\":\"approval-primary\",\"result\":{\"decision\":\"decline\"}") != null) {
@@ -1393,6 +1439,7 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     defer allocator.free(reconnect_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "\"round\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "\"status\":\"stale_origin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "+refreshed") != null);
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "act-1") != null);
     try sendMaskedText(io, &reconnect, "{\"type\":\"app.stop\",\"payload\":{}}");
     const stopped = try readUntil(allocator, io, &reconnect, "\"type\":\"app.stopped\"");

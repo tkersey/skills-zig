@@ -878,6 +878,14 @@ pub fn build(b: *std.Build) void {
         .{ .link_libc = true, .filters = &.{"command approvals"} },
     );
     run_synoptic_command_approvals.step.dependOn(&synoptic_install.step);
+    const run_synoptic_ui_domain = addTestStepWithOptions(
+        b,
+        synoptic_tests_root,
+        "test-synoptic-ui-domain-only",
+        "Run Synoptic owned PR, queue, tab, and canonical diff payload fixtures",
+        .{ .link_libc = true, .filters = &.{"ui domain"} },
+    );
+    run_synoptic_ui_domain.step.dependOn(&synoptic_install.step);
     const test_synoptic = b.step("test-synoptic", "Run Synoptic generation, session, product, and falsifier tests");
     test_synoptic.dependOn(&run_synoptic_tests.step);
     test_synoptic.dependOn(&run_synoptic_falsifiers.step);
@@ -887,6 +895,7 @@ pub fn build(b: *std.Build) void {
     test_synoptic.dependOn(&run_synoptic_worktree_integrity.step);
     test_synoptic.dependOn(&run_synoptic_exclusions_config.step);
     test_synoptic.dependOn(&run_synoptic_command_approvals.step);
+    test_synoptic.dependOn(&run_synoptic_ui_domain.step);
     const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
     test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
     const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the real masked-WebSocket fake-Codex/fake-GitHub product fixture");
@@ -901,6 +910,8 @@ pub fn build(b: *std.Build) void {
     test_synoptic_exclusions_config.dependOn(&run_synoptic_exclusions_config.step);
     const test_synoptic_command_approvals = b.step("test-synoptic-command-approvals", "Run server-request approval routing and cleanup fixtures");
     test_synoptic_command_approvals.dependOn(&run_synoptic_command_approvals.step);
+    const test_synoptic_ui_domain = b.step("test-synoptic-ui-domain", "Run owned browser-domain payload and diff continuity fixtures");
+    test_synoptic_ui_domain.dependOn(&run_synoptic_ui_domain.step);
     const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
     build_synoptic.dependOn(&synoptic_install.step);
     const release_synoptic_safe = b.step("release-synoptic-safe", "Build Synoptic with ReleaseSafe optimization");

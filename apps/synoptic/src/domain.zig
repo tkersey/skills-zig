@@ -2,6 +2,74 @@ const std = @import("std");
 
 pub const ViewedState = enum { viewed, unviewed, dismissed };
 pub const SessionStatus = enum { current, stale_origin, completed, closed };
+pub const DiffDisplayState = enum { text, binary, unavailable };
+
+pub const PullRequestHeader = struct {
+    repository: []const u8,
+    number: u64,
+    title: []const u8,
+    url: []const u8,
+    base_ref_name: []const u8,
+    base_ref_oid: []const u8,
+    head_ref_name: []const u8,
+    head_ref_oid: []const u8,
+    state: []const u8,
+    is_draft: bool,
+};
+
+pub const OwnedPullRequestHeader = struct {
+    allocator: std.mem.Allocator,
+    repository: []u8,
+    number: u64,
+    title: []u8,
+    url: []u8,
+    base_ref_name: []u8,
+    base_ref_oid: []u8,
+    head_ref_name: []u8,
+    head_ref_oid: []u8,
+    state: []u8,
+    is_draft: bool,
+
+    pub fn init(allocator: std.mem.Allocator, value: PullRequestHeader) !OwnedPullRequestHeader {
+        const repository = try allocator.dupe(u8, value.repository);
+        errdefer allocator.free(repository);
+        const title = try allocator.dupe(u8, value.title);
+        errdefer allocator.free(title);
+        const url = try allocator.dupe(u8, value.url);
+        errdefer allocator.free(url);
+        const base_ref_name = try allocator.dupe(u8, value.base_ref_name);
+        errdefer allocator.free(base_ref_name);
+        const base_ref_oid = try allocator.dupe(u8, value.base_ref_oid);
+        errdefer allocator.free(base_ref_oid);
+        const head_ref_name = try allocator.dupe(u8, value.head_ref_name);
+        errdefer allocator.free(head_ref_name);
+        const head_ref_oid = try allocator.dupe(u8, value.head_ref_oid);
+        errdefer allocator.free(head_ref_oid);
+        const state = try allocator.dupe(u8, value.state);
+        return .{ .allocator = allocator, .repository = repository, .number = value.number, .title = title, .url = url, .base_ref_name = base_ref_name, .base_ref_oid = base_ref_oid, .head_ref_name = head_ref_name, .head_ref_oid = head_ref_oid, .state = state, .is_draft = value.is_draft };
+    }
+
+    pub fn deinit(self: *OwnedPullRequestHeader) void {
+        self.allocator.free(self.repository);
+        self.allocator.free(self.title);
+        self.allocator.free(self.url);
+        self.allocator.free(self.base_ref_name);
+        self.allocator.free(self.base_ref_oid);
+        self.allocator.free(self.head_ref_name);
+        self.allocator.free(self.head_ref_oid);
+        self.allocator.free(self.state);
+    }
+
+    pub fn setGeneration(self: *OwnedPullRequestHeader, base_oid: []const u8, head_oid: []const u8) !void {
+        const next_base = try self.allocator.dupe(u8, base_oid);
+        errdefer self.allocator.free(next_base);
+        const next_head = try self.allocator.dupe(u8, head_oid);
+        self.allocator.free(self.base_ref_oid);
+        self.allocator.free(self.head_ref_oid);
+        self.base_ref_oid = next_base;
+        self.head_ref_oid = next_head;
+    }
+};
 
 /// Stable server-owned identity injected into action cards. Model payloads may
 /// describe an effect, but cannot choose a different repository or PR.
@@ -40,7 +108,16 @@ pub const ReviewThread = struct {
     viewer_can_unresolve: bool = false,
     comments: []const ReviewComment = &.{},
 };
-pub const Tab = struct { id: []const u8, path: []const u8, revision: []const u8, status: SessionStatus = .current };
+pub const Tab = struct {
+    id: []const u8,
+    path: []const u8,
+    revision: []const u8,
+    status: SessionStatus = .current,
+    diff_state: DiffDisplayState = .unavailable,
+    diff: []const u8,
+    reused: bool = false,
+    initial_review: bool = false,
+};
 
 pub const File = struct {
     path: []const u8,

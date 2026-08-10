@@ -36,6 +36,7 @@ pub const App = struct {
     round: u64 = 1,
     action_state_fresh: bool = true,
     file_review_start_mode: config.FileReviewStartMode = .immediate,
+    pull_request: ?domain.OwnedPullRequestHeader = null,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{ .allocator = allocator, .generation = try .init(allocator, head), .action_store = .{ .allocator = allocator } };
@@ -44,10 +45,12 @@ pub const App = struct {
         self.generation.deinit();
         if (self.open_path) |p| self.allocator.free(p);
         if (self.official_revision) |r| self.allocator.free(r);
+        if (self.pull_request) |*header| header.deinit();
         for (self.tabs.items) |tab| {
             self.allocator.free(tab.id);
             self.allocator.free(tab.path);
             self.allocator.free(tab.revision);
+            self.allocator.free(tab.diff);
         }
         self.tabs.deinit(self.allocator);
         self.action_store.deinit();
@@ -59,8 +62,19 @@ pub const App = struct {
         for (self.tabs.items) |*tab| {
             if (domain.revisionFor(&next, tab.path)) |revision| {
                 if (!std.mem.eql(u8, tab.revision, revision) and (tab.status == .current or tab.status == .completed)) tab.status = .stale_origin;
-            }
+            } else if (tab.status == .current or tab.status == .completed) tab.status = .stale_origin;
         }
+    }
+
+    pub fn setPullRequest(self: *App, value: domain.PullRequestHeader) !void {
+        var owned = try domain.OwnedPullRequestHeader.init(self.allocator, value);
+        errdefer owned.deinit();
+        if (self.pull_request) |*old| old.deinit();
+        self.pull_request = owned;
+    }
+
+    pub fn updatePullRequestGeneration(self: *App, base_oid: []const u8, head_oid: []const u8) !void {
+        if (self.pull_request) |*header| try header.setGeneration(base_oid, head_oid);
     }
 
     pub fn openFile(self: *App, path: []const u8) ![]u8 {
@@ -80,12 +94,52 @@ pub const App = struct {
         }
         if (!existing) {
             const id = try std.fmt.allocPrint(self.allocator, "tab-{d}", .{self.tabs.items.len + 1});
-            try self.tabs.append(self.allocator, .{ .id = id, .path = try self.allocator.dupe(u8, path), .revision = try self.allocator.dupe(u8, self.official_revision.?) });
+            errdefer self.allocator.free(id);
+            const tab_path = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(tab_path);
+            const revision = try self.allocator.dupe(u8, self.official_revision.?);
+            errdefer self.allocator.free(revision);
+            const diff = try self.allocator.dupe(u8, "");
+            errdefer self.allocator.free(diff);
+            try self.tabs.append(self.allocator, .{ .id = id, .path = tab_path, .revision = revision, .diff = diff });
         }
         self.seq += 1;
         const payload = try std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"initialReview\":{}}}", .{ std.json.fmt(path, .{}), self.file_review_start_mode == .immediate });
         defer self.allocator.free(payload);
         return ui.envelopeAlloc(self.allocator, "session.opened", self.seq, payload);
+    }
+
+    pub fn recordOpenedSession(self: *App, path: []const u8, revision: []const u8, session_id: []const u8, diff: []const u8, reused: bool, initial_review: bool) !void {
+        for (self.tabs.items) |*tab| if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and tab.status == .current) {
+            const id = try self.allocator.dupe(u8, session_id);
+            errdefer self.allocator.free(id);
+            const content = try self.allocator.dupe(u8, diff);
+            self.allocator.free(tab.id);
+            self.allocator.free(tab.diff);
+            tab.id = id;
+            tab.diff = content;
+            tab.diff_state = diffDisplayState(diff);
+            tab.reused = reused;
+            tab.initial_review = initial_review;
+            return;
+        };
+        return error.UnknownTab;
+    }
+
+    pub fn updateTabDiff(self: *App, path: []const u8, diff: ?[]const u8) !void {
+        for (self.tabs.items) |*tab| if (std.mem.eql(u8, tab.path, path) and tab.status != .closed) {
+            const content = try self.allocator.dupe(u8, diff orelse "");
+            self.allocator.free(tab.diff);
+            tab.diff = content;
+            tab.diff_state = if (diff) |value| diffDisplayState(value) else .unavailable;
+        };
+    }
+
+    pub fn sessionOpenedPayloadAlloc(self: *const App, path: []const u8, revision: []const u8) ![]u8 {
+        for (self.tabs.items) |tab| if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and tab.status == .current) {
+            return std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"revisionKey\":{f},\"sessionId\":{f},\"reused\":{},\"initialReview\":{},\"diff\":{{\"state\":{f},\"text\":{f}}}}}", .{ std.json.fmt(tab.path, .{}), std.json.fmt(tab.revision, .{}), std.json.fmt(tab.id, .{}), tab.reused, tab.initial_review, std.json.fmt(@tagName(tab.diff_state), .{}), std.json.fmt(if (tab.diff_state == .text) tab.diff else null, .{}) });
+        };
+        return error.UnknownTab;
     }
 
     pub fn prepareModelAction(self: *App, session_id: []const u8, source_turn_id: []const u8, input: tools.PreparedActionInput, repository: []const u8, pull_request: u64, pull_request_id: []const u8, session_path: []const u8) !tools.ActionCard {
@@ -242,17 +296,23 @@ pub const App = struct {
     pub fn bootstrapAlloc(self: *App) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer out.deinit();
-        try out.writer.print("{{\"schema\":\"synoptic-bootstrap/v1\",\"primaryReady\":{},\"queue\":[", .{self.primary_ready});
+        try out.writer.writeAll("{\"schema\":\"synoptic-bootstrap/v1\",\"pullRequest\":");
+        if (self.pull_request) |header| try out.writer.print("{{\"repository\":{f},\"number\":{d},\"title\":{f},\"url\":{f},\"baseRefName\":{f},\"baseRefOid\":{f},\"headRefName\":{f},\"headRefOid\":{f},\"state\":{f},\"isDraft\":{}}}", .{ std.json.fmt(header.repository, .{}), header.number, std.json.fmt(header.title, .{}), std.json.fmt(header.url, .{}), std.json.fmt(header.base_ref_name, .{}), std.json.fmt(header.base_ref_oid, .{}), std.json.fmt(header.head_ref_name, .{}), std.json.fmt(header.head_ref_oid, .{}), std.json.fmt(header.state, .{}), header.is_draft }) else try out.writer.writeAll("null");
+        try out.writer.print(",\"primaryReady\":{},\"queue\":[", .{self.primary_ready});
         var first = true;
         for (self.generation.files.items) |file| if (file.viewed != .viewed) {
             if (!first) try out.writer.writeByte(',');
             first = false;
-            try out.writer.print("{{\"path\":{f},\"additions\":{d},\"deletions\":{d},\"exclusionReason\":{f},\"exclusionSyncError\":{f}}}", .{ std.json.fmt(file.path, .{}), file.additions, file.deletions, std.json.fmt(file.exclusion_reason, .{}), std.json.fmt(file.exclusion_sync_error, .{}) });
+            const active = self.currentSessionId(file.path, file.revision_key);
+            try out.writer.print("{{\"path\":{f},\"additions\":{d},\"deletions\":{d},\"changeType\":{f},\"viewedState\":{f},\"revisionKey\":{f},\"activeSessionId\":{f},\"currentRevisionSession\":{},\"exclusionReason\":{f},\"exclusionSyncError\":{f}}}", .{ std.json.fmt(file.path, .{}), file.additions, file.deletions, std.json.fmt(file.change_type, .{}), std.json.fmt(viewedStateName(file.viewed), .{}), std.json.fmt(file.revision_key, .{}), std.json.fmt(active, .{}), active != null, std.json.fmt(file.exclusion_reason, .{}), std.json.fmt(file.exclusion_sync_error, .{}) });
         };
         try out.writer.print("],\"tabs\":[", .{});
-        for (self.tabs.items, 0..) |tab, i| {
-            if (i > 0) try out.writer.writeByte(',');
-            try out.writer.print("{{\"id\":{f},\"path\":{f},\"revision\":{f},\"status\":{f}}}", .{ std.json.fmt(tab.id, .{}), std.json.fmt(tab.path, .{}), std.json.fmt(tab.revision, .{}), std.json.fmt(@tagName(tab.status), .{}) });
+        first = true;
+        for (self.tabs.items) |tab| {
+            if (tab.status == .closed) continue;
+            if (!first) try out.writer.writeByte(',');
+            first = false;
+            try out.writer.print("{{\"id\":{f},\"sessionId\":{f},\"path\":{f},\"revisionKey\":{f},\"status\":{f},\"reused\":{},\"initialReview\":{},\"diff\":{{\"state\":{f},\"text\":{f}}}}}", .{ std.json.fmt(tab.id, .{}), std.json.fmt(tab.id, .{}), std.json.fmt(tab.path, .{}), std.json.fmt(tab.revision, .{}), std.json.fmt(@tagName(tab.status), .{}), tab.reused, tab.initial_review, std.json.fmt(@tagName(tab.diff_state), .{}), std.json.fmt(if (tab.diff_state == .text) tab.diff else null, .{}) });
         }
         try out.writer.writeAll("],\"actions\":[");
         for (self.action_store.cards.items, 0..) |card, i| {
@@ -264,7 +324,25 @@ pub const App = struct {
         try out.writer.print("],\"completedTabOpen\":{},\"actionStateFresh\":{},\"seq\":{d},\"round\":{d}}}", .{ self.completed_tab_open, self.action_state_fresh, self.seq, self.round });
         return out.toOwnedSlice();
     }
+
+    fn currentSessionId(self: *const App, path: []const u8, revision: []const u8) ?[]const u8 {
+        for (self.tabs.items) |tab| if (tab.status == .current and std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision)) return tab.id;
+        return null;
+    }
 };
+
+fn diffDisplayState(diff: []const u8) domain.DiffDisplayState {
+    if (std.mem.indexOf(u8, diff, "GIT binary patch") != null or std.mem.indexOf(u8, diff, "Binary files ") != null) return .binary;
+    return .text;
+}
+
+fn viewedStateName(state: domain.ViewedState) []const u8 {
+    return switch (state) {
+        .viewed => "VIEWED",
+        .unviewed => "UNVIEWED",
+        .dismissed => "DISMISSED",
+    };
+}
 
 fn exclusionMutationIdAlloc(allocator: std.mem.Allocator, path: []const u8, revision: []const u8) ![]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

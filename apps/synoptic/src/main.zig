@@ -190,6 +190,11 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer allocator.free(base_ref);
     const head_ref = try snapshotField(allocator, pages.files.items[0], "headRefName");
     defer allocator.free(head_ref);
+    const pull_url = try snapshotField(allocator, pages.files.items[0], "url");
+    defer allocator.free(pull_url);
+    const pull_state = try snapshotField(allocator, pages.files.items[0], "state");
+    defer allocator.free(pull_state);
+    const is_draft = try snapshotBoolField(allocator, pages.files.items[0], "isDraft");
     var generation = try domain.PrGeneration.initFull(allocator, snapshot_base, snapshot_head);
     errdefer generation.deinit();
     for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
@@ -205,6 +210,9 @@ fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std
     defer worktree_baseline.deinit();
     var state = try App.init(allocator, snapshot_head);
     state.replaceGeneration(generation);
+    const header_repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ identity.owner, identity.repository });
+    defer allocator.free(header_repository);
+    try state.setPullRequest(.{ .repository = header_repository, .number = identity.number, .title = title, .url = pull_url, .base_ref_name = base_ref, .base_ref_oid = snapshot_base, .head_ref_name = head_ref, .head_ref_oid = snapshot_head, .state = pull_state, .is_draft = is_draft });
     state.file_review_start_mode = settings.file_review_start_mode;
     defer state.deinit();
 
@@ -498,6 +506,11 @@ fn snapshotOptionalTextField(allocator: std.mem.Allocator, raw: []const u8, fiel
     defer parsed.deinit();
     const value = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object.get(field) orelse return error.InvalidSnapshot;
     return allocator.dupe(u8, if (value == .null) "" else value.string);
+}
+fn snapshotBoolField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    return (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object.get(field).?.bool;
 }
 fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
