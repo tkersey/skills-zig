@@ -823,6 +823,7 @@ pub fn build(b: *std.Build) void {
         "Run Synoptic unit and vertical state tests",
         .{ .link_libc = true },
     );
+    run_synoptic_tests.step.dependOn(&synoptic_install.step);
     const run_synoptic_falsifiers = addTestStepWithOptions(
         b,
         synoptic_tests_root,
@@ -837,6 +838,7 @@ pub fn build(b: *std.Build) void {
         "Run the bounded Synoptic lifecycle fixture",
         .{ .link_libc = true, .filters = &.{"e2e"} },
     );
+    run_synoptic_e2e.step.dependOn(&synoptic_install.step);
     const run_synoptic_action_broker = addTestStepWithOptions(
         b,
         synoptic_tests_root,

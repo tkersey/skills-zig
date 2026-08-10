@@ -31,8 +31,8 @@ pub fn commandType(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     };
 }
 
-pub const allowed_commands = [_][]const u8{ "file.open", "session.message", "session.interrupt", "session.close", "action.confirm", "action.reject", "snapshot.get", "pr.refresh", "round.finish" };
-pub const autonomous_events = [_][]const u8{ "session.item.delta", "action.prepared", "action.superseded", "action.status", "file.completed", "session.closed" };
+pub const allowed_commands = [_][]const u8{ "file.open", "session.message", "session.interrupt", "session.close", "action.confirm", "action.reject", "snapshot.get", "pr.refresh", "round.finish", "app.stop" };
+pub const autonomous_events = [_][]const u8{ "session.item.delta", "action.prepared", "action.superseded", "action.status", "file.completed", "session.closed", "app.stopped" };
 pub fn commandAllowed(value: []const u8) bool {
     for (allowed_commands) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
     return false;

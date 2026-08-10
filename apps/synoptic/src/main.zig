@@ -18,6 +18,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, argv[1], "version")) return printVersion(init.io);
     if (std.mem.eql(u8, argv[1], "capabilities")) return printCapabilities(init.io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "launch")) return launch(allocator, init.io, init.environ_map, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "serve")) return serve(allocator, init.io, init.environ_map, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "status")) return status(allocator, init.io, init.environ_map, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "stop")) return stop(allocator, init.io, init.environ_map, argv[2..]);
     return usage();
 }
 
@@ -34,7 +37,117 @@ fn printCapabilities(io: std.Io, args: []const []const u8) !void {
     try out.interface.flush();
 }
 
+const LifecycleRecord = struct {
+    allocator: std.mem.Allocator,
+    raw: []u8,
+    launch_id: []u8,
+    runtime_root: []u8,
+    executable: []u8,
+    url: []u8,
+    pid: u64,
+
+    fn deinit(self: *LifecycleRecord) void {
+        self.allocator.free(self.raw);
+        self.allocator.free(self.launch_id);
+        self.allocator.free(self.runtime_root);
+        self.allocator.free(self.executable);
+        self.allocator.free(self.url);
+    }
+};
+
 fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, args: []const []const u8) !void {
+    if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
+    const options = try parseLaunch(args);
+    try config.validateManifest(allocator, io, options.skill_root);
+    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    defer allocator.free(runtime_root);
+    try std.Io.Dir.cwd().createDirPath(io, runtime_root);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    if (readLifecycleRecord(allocator, io, current_path)) |record_value| {
+        var record = record_value;
+        defer record.deinit();
+        if (try verifiedProcess(allocator, io, record)) return error.SynopticAlreadyRunning;
+        std.Io.Dir.cwd().deleteFile(io, current_path) catch {};
+    } else |_| {}
+
+    var launch_bytes: [24]u8 = undefined;
+    io.random(&launch_bytes);
+    var launch_buf: [48]u8 = undefined;
+    const launch_id = try std.fmt.bufPrint(&launch_buf, "{x}", .{launch_bytes});
+    const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
+    defer allocator.free(launch_dir);
+    try std.Io.Dir.cwd().createDirPath(io, launch_dir);
+    const ready_path = try std.fs.path.join(allocator, &.{ launch_dir, "ready.json" });
+    defer allocator.free(ready_path);
+    const error_path = try std.fs.path.join(allocator, &.{ launch_dir, "error.json" });
+    defer allocator.free(error_path);
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_path);
+    var child_argv: std.ArrayList([]const u8) = .empty;
+    defer child_argv.deinit(allocator);
+    try child_argv.appendSlice(allocator, &.{ self_path, "serve", "--launch-id", launch_id, "--runtime-root", runtime_root });
+    try child_argv.appendSlice(allocator, args);
+    var child = try std.process.spawn(io, .{
+        .argv = child_argv.items,
+        .environ_map = environment,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    var child_owned = true;
+    errdefer if (child_owned) child.kill(io);
+    const child_pid: u64 = @intCast(child.id orelse return error.ChildMissingPid);
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    var ready: LifecycleRecord = undefined;
+    while (true) {
+        if (readLifecycleRecord(allocator, io, ready_path)) |candidate| {
+            if (candidate.pid != child_pid or !std.mem.eql(u8, candidate.launch_id, launch_id)) {
+                var invalid = candidate;
+                invalid.deinit();
+                return error.InvalidLaunchReadiness;
+            }
+            ready = candidate;
+            break;
+        } else |_| {}
+        if (std.Io.Dir.cwd().readFileAlloc(io, error_path, allocator, .limited(64 * 1024))) |child_error| {
+            defer allocator.free(child_error);
+            var err_out = std.Io.File.stderr().writer(io, &.{});
+            try err_out.interface.print("{s}\n", .{child_error});
+            try err_out.interface.flush();
+            return error.SynopticChildLaunchFailed;
+        } else |_| {}
+        if (!processAlive(child_pid)) return error.SynopticChildExitedBeforeReady;
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms >= config.lifecycle_ready_timeout_ms) return error.SynopticReadinessTimeout;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    defer ready.deinit();
+    if (!try verifiedProcess(allocator, io, ready)) return error.InvalidLaunchReadiness;
+    try writeOperationalFile(allocator, io, current_path, ready.raw);
+    if (!options.no_browser) openBrowser(allocator, io, ready.url) catch |err| {
+        removeCurrentIfLaunch(allocator, io, current_path, launch_id);
+        return err;
+    };
+    var out = std.Io.File.stdout().writer(io, &.{});
+    if (options.json) try out.interface.print("{s}\n", .{ready.raw}) else try out.interface.print("{s}\n", .{ready.url});
+    try out.interface.flush();
+    child_owned = false;
+}
+
+fn serve(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, args: []const []const u8) !void {
+    if (args.len < 4 or !std.mem.eql(u8, args[0], "--launch-id") or !std.mem.eql(u8, args[2], "--runtime-root")) return error.InvalidArguments;
+    const launch_id = args[1];
+    const runtime_root = args[3];
+    if (launch_id.len != 48 or std.mem.indexOfScalar(u8, launch_id, std.fs.path.sep) != null) return error.InvalidLaunchId;
+    serveReview(allocator, io, environment, args[4..], launch_id, runtime_root) catch |err| {
+        writeLaunchError(allocator, io, runtime_root, launch_id, err) catch {};
+        return err;
+    };
+}
+
+fn serveReview(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, args: []const []const u8, launch_id: []const u8, runtime_root: []const u8) !void {
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
     const options = try parseLaunch(args);
     try config.validateManifest(allocator, io, options.skill_root);
@@ -44,9 +157,11 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     defer allocator.free(gh_resolved);
     const codex_resolved = try @import("cas_runtime").resolveExecutableAlloc(allocator, codex_path);
     defer allocator.free(codex_resolved);
+    if (options.pr == null or !std.mem.startsWith(u8, options.pr.?, "https://")) try requireGhAuthentication(allocator, io, gh_resolved, "github.com");
     const selector_url = try resolveSelectorUrl(allocator, io, gh_resolved, options.cwd, options.pr);
     defer allocator.free(selector_url);
     const identity = try pr.parseUrl(selector_url);
+    try requireGhAuthentication(allocator, io, gh_resolved, identity.host);
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_resolved, .host = identity.host };
     var pages = try broker.readGenerationPages(identity.owner, identity.repository, identity.number);
     defer pages.deinit();
@@ -61,7 +176,7 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
     for (pages.threads.items) |page| try loadThreads(allocator, page, &generation);
 
-    const managed_path = try std.fmt.allocPrint(allocator, "/tmp/synoptic/{d}/worktree", .{std.c.getpid()});
+    const managed_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "worktree" });
     defer allocator.free(managed_path);
     var custody = try worktree.select(allocator, io, options.cwd, snapshot_head, managed_path);
     defer allocator.free(custody.path());
@@ -81,21 +196,196 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     const token = server.tokenHex(&token_buf);
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/?token={s}", .{ server.port(), token });
     defer allocator.free(url);
-    var out = std.Io.File.stdout().writer(io, &.{});
     const repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ identity.owner, identity.repository });
     defer allocator.free(repository);
-    if (options.json) try out.interface.print("{{\"schema\":\"synoptic-launch-ready/v1\",\"status\":\"ready\",\"capabilityState\":\"ready\",\"lifecycle\":\"owner-lived\",\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}\n", .{ std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) }) else try out.interface.print("{s}\n", .{url});
-    try out.interface.flush();
+    const executable = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable);
+    const receipt = try std.fmt.allocPrint(allocator, "{{\"schema\":\"synoptic-launch-ready/v1\",\"runtimeSchema\":\"{s}\",\"status\":\"ready\",\"capabilityState\":\"ready\",\"lifecycle\":\"detached\",\"launchId\":{f},\"runtimeRoot\":{f},\"executable\":{f},\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}", .{ config.lifecycle_schema, std.json.fmt(launch_id, .{}), std.json.fmt(runtime_root, .{}), std.json.fmt(executable, .{}), std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) });
+    defer allocator.free(receipt);
+    const ready_path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "ready.json" });
+    defer allocator.free(ready_path);
+    try writeOperationalFile(allocator, io, ready_path, receipt);
     const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
     defer allocator.free(skill_path);
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody };
-    while (true) {
+    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody, .launch_id = launch_id };
+    while (!runtime.stop_requested) {
         state.primary_ready = registry.primaryReady();
         server.serveOne(&runtime) catch |err| switch (err) {
             error.EndOfStream => continue,
             else => return err,
         };
     }
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    removeCurrentIfLaunch(allocator, io, current_path, launch_id);
+}
+
+fn status(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const json = try parseJsonOnly(args);
+    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    defer allocator.free(runtime_root);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    var out = std.Io.File.stdout().writer(io, &.{});
+    var record = readLifecycleRecord(allocator, io, current_path) catch {
+        if (json) try out.interface.writeAll("{\"schema\":\"synoptic-status/v1\",\"status\":\"stopped\"}\n") else try out.interface.writeAll("stopped\n");
+        try out.interface.flush();
+        return;
+    };
+    defer record.deinit();
+    if (!try verifiedProcess(allocator, io, record)) {
+        std.Io.Dir.cwd().deleteFile(io, current_path) catch {};
+        if (json) try out.interface.writeAll("{\"schema\":\"synoptic-status/v1\",\"status\":\"stopped\"}\n") else try out.interface.writeAll("stopped\n");
+    } else if (json) {
+        try out.interface.print("{{\"schema\":\"synoptic-status/v1\",\"status\":\"running\",\"launchId\":{f},\"pid\":{d},\"url\":{f}}}\n", .{ std.json.fmt(record.launch_id, .{}), record.pid, std.json.fmt(record.url, .{}) });
+    } else try out.interface.print("running {d} {s}\n", .{ record.pid, record.url });
+    try out.interface.flush();
+}
+
+fn stop(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const json = try parseJsonOnly(args);
+    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    defer allocator.free(runtime_root);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    var record = readLifecycleRecord(allocator, io, current_path) catch return printStopResult(io, json, null, false);
+    defer record.deinit();
+    if (!try verifiedProcess(allocator, io, record)) {
+        std.Io.Dir.cwd().deleteFile(io, current_path) catch {};
+        return printStopResult(io, json, null, false);
+    }
+    const pid = std.math.cast(std.posix.pid_t, record.pid) orelse return error.InvalidRuntimePid;
+    std.posix.kill(pid, std.posix.SIG.TERM) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => return err,
+    };
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (try verifiedProcess(allocator, io, record)) {
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    const killed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (try verifiedProcess(allocator, io, record)) {
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - killed_ms >= 1_000) return error.SynopticStopTimeout;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
+    return printStopResult(io, json, record.launch_id, true);
+}
+
+fn printStopResult(io: std.Io, json: bool, launch_id: ?[]const u8, stopped: bool) !void {
+    var out = std.Io.File.stdout().writer(io, &.{});
+    if (json) try out.interface.print("{{\"schema\":\"synoptic-stop/v1\",\"status\":\"{s}\",\"launchId\":{f}}}\n", .{ if (stopped) "stopped" else "not-running", std.json.fmt(launch_id orelse "", .{}) }) else try out.interface.print("{s}\n", .{if (stopped) "stopped" else "not running"});
+    try out.interface.flush();
+}
+
+fn parseJsonOnly(args: []const []const u8) !bool {
+    if (args.len == 0) return false;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) return true;
+    return error.InvalidArguments;
+}
+
+fn runtimeRootAlloc(allocator: std.mem.Allocator, environment: *const std.process.Environ.Map) ![]u8 {
+    return std.fs.path.join(allocator, &.{ environment.get("TMPDIR") orelse "/tmp", "synoptic" });
+}
+
+fn readLifecycleRecord(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LifecycleRecord {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
+    errdefer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidLifecycleRecord,
+    };
+    const runtime_schema = object.get("runtimeSchema") orelse return error.InvalidLifecycleRecord;
+    if (runtime_schema != .string or !std.mem.eql(u8, runtime_schema.string, config.lifecycle_schema)) return error.InvalidLifecycleRecord;
+    const launch_id = try lifecycleStringAlloc(allocator, object, "launchId");
+    errdefer allocator.free(launch_id);
+    const runtime_root = try lifecycleStringAlloc(allocator, object, "runtimeRoot");
+    errdefer allocator.free(runtime_root);
+    const executable = try lifecycleStringAlloc(allocator, object, "executable");
+    errdefer allocator.free(executable);
+    const url = try lifecycleStringAlloc(allocator, object, "url");
+    errdefer allocator.free(url);
+    const pid_value = object.get("pid") orelse return error.InvalidLifecycleRecord;
+    if (pid_value != .integer or pid_value.integer <= 0) return error.InvalidLifecycleRecord;
+    return .{ .allocator = allocator, .raw = raw, .launch_id = launch_id, .runtime_root = runtime_root, .executable = executable, .url = url, .pid = @intCast(pid_value.integer) };
+}
+
+fn lifecycleStringAlloc(allocator: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
+    const value = object.get(key) orelse return error.InvalidLifecycleRecord;
+    if (value != .string or value.string.len == 0) return error.InvalidLifecycleRecord;
+    return allocator.dupe(u8, value.string);
+}
+
+fn verifiedProcess(allocator: std.mem.Allocator, io: std.Io, record: LifecycleRecord) !bool {
+    if (!processAlive(record.pid)) return false;
+    const pid_text = try std.fmt.allocPrint(allocator, "{d}", .{record.pid});
+    defer allocator.free(pid_text);
+    const result = try std.process.run(allocator, io, .{ .argv = &.{ "/bin/ps", "-ww", "-p", pid_text, "-o", "command=" } });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return false;
+    const command = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const identity = try std.fmt.allocPrint(allocator, "serve --launch-id {s} --runtime-root {s}", .{ record.launch_id, record.runtime_root });
+    defer allocator.free(identity);
+    return std.mem.startsWith(u8, command, record.executable) and std.mem.indexOf(u8, command, identity) != null;
+}
+
+fn processAlive(process_id: u64) bool {
+    const pid = std.math.cast(std.posix.pid_t, process_id) orelse return false;
+    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn writeOperationalFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    const staging = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.c.getpid() });
+    defer allocator.free(staging);
+    std.Io.Dir.cwd().deleteFile(io, staging) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(io, staging) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = contents });
+    try std.Io.Dir.renameAbsolute(staging, path, io);
+}
+
+fn writeLaunchError(allocator: std.mem.Allocator, io: std.Io, runtime_root: []const u8, launch_id: []const u8, err: anyerror) !void {
+    const path = try std.fs.path.join(allocator, &.{ runtime_root, launch_id, "error.json" });
+    defer allocator.free(path);
+    const receipt = try std.fmt.allocPrint(allocator, "{{\"schema\":\"synoptic-launch-error/v1\",\"status\":\"blocked\",\"reason\":{f},\"remediation\":{f}}}", .{ std.json.fmt(@errorName(err), .{}), std.json.fmt(launchRemediation(err), .{}) });
+    defer allocator.free(receipt);
+    try writeOperationalFile(allocator, io, path, receipt);
+}
+
+fn launchRemediation(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound, error.ExecutableNotFound, error.MissingExecutable => "Install codex and gh and ensure both resolve on PATH.",
+        error.GitHubAuthenticationFailed => "Run gh auth login for the target GitHub host, then retry.",
+        error.PullRequestResolutionFailed => "Run gh pr view successfully from the checkout or pass a valid --pr selector.",
+        error.BaseFetchFailed, error.ManagedWorktreeFetchFailed => "Ensure the PR base and head objects are fetchable from origin.",
+        error.InvalidUiManifest => "Install a Synoptic skill package compatible with synoptic-ui/v1.",
+        else => "Inspect the exact reason and retry after correcting the dependency or repository state.",
+    };
+}
+
+fn removeCurrentIfLaunch(allocator: std.mem.Allocator, io: std.Io, path: []const u8, launch_id: []const u8) void {
+    var record = readLifecycleRecord(allocator, io, path) catch return;
+    defer record.deinit();
+    if (std.mem.eql(u8, record.launch_id, launch_id)) std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+fn openBrowser(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = &.{ "/usr/bin/open", url } });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.BrowserOpenFailed;
 }
 
 fn parseLaunch(args: []const []const u8) !config.LaunchOptions {
@@ -103,17 +393,22 @@ fn parseLaunch(args: []const []const u8) !config.LaunchOptions {
     var root: ?[]const u8 = null;
     var selector: ?[]const u8 = null;
     var json = false;
+    var no_browser = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--json")) {
             json = true;
             continue;
         }
+        if (std.mem.eql(u8, args[i], "--no-browser")) {
+            no_browser = true;
+            continue;
+        }
         if (i + 1 >= args.len) return error.InvalidArguments;
         if (std.mem.eql(u8, args[i], "--cwd")) cwd = args[i + 1] else if (std.mem.eql(u8, args[i], "--skill-root")) root = args[i + 1] else if (std.mem.eql(u8, args[i], "--pr")) selector = args[i + 1] else return error.InvalidArguments;
         i += 1;
     }
-    return .{ .cwd = cwd orelse return error.MissingCwd, .skill_root = root orelse return error.MissingSkillRoot, .pr = selector, .json = json };
+    return .{ .cwd = cwd orelse return error.MissingCwd, .skill_root = root orelse return error.MissingSkillRoot, .pr = selector, .json = json, .no_browser = no_browser };
 }
 
 fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]const u8 {
@@ -156,6 +451,12 @@ fn resolveSelectorUrl(allocator: std.mem.Allocator, io: std.Io, gh_path: []const
     defer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.PullRequestResolutionFailed;
     return allocator.dupe(u8, std.mem.trim(u8, result.stdout, "\r\n"));
+}
+fn requireGhAuthentication(allocator: std.mem.Allocator, io: std.Io, gh_path: []const u8, host: []const u8) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = &.{ gh_path, "auth", "status", "--hostname", host } });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.GitHubAuthenticationFailed;
 }
 fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, base_oid: []const u8, generation: *domain.PrGeneration) !void {
     const fetch = try std.process.run(allocator, io, .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", base_oid }, .cwd = .{ .path = cwd } });

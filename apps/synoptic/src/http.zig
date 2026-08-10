@@ -19,6 +19,8 @@ pub const Runtime = struct {
     skill_path: []const u8,
     repository_cwd: []const u8,
     custody: worktree.Custody,
+    launch_id: []const u8 = "embedded-test",
+    stop_requested: bool = false,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
 };
 
@@ -73,8 +75,11 @@ pub const Server = struct {
             defer self.allocator.free(body);
             return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
         }
-        if (std.mem.startsWith(u8, target, "/healthz") or std.mem.startsWith(u8, target, "/readyz"))
-            return writeResponse(self.io, &stream, "200 OK", "application/json", "{\"status\":\"ok\"}", true);
+        if (std.mem.startsWith(u8, target, "/healthz") or std.mem.startsWith(u8, target, "/readyz")) {
+            const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ok\",\"launchId\":{f},\"pid\":{d}}}", .{ std.json.fmt(runtime.launch_id, .{}), std.c.getpid() });
+            defer self.allocator.free(body);
+            return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
+        }
         return self.serveAsset(&stream, target);
     }
 
@@ -135,6 +140,7 @@ pub const Server = struct {
             defer self.allocator.free(reply);
             try writeServerText(self.io, stream, reply);
             try self.flushVisible(stream, runtime);
+            if (runtime.stop_requested) return;
         }
     }
 
@@ -302,6 +308,11 @@ pub const Server = struct {
             const body = try std.fmt.allocPrint(self.allocator, "{{\"round\":{d}}}", .{round});
             defer self.allocator.free(body);
             return runtime.app.nextEnvelope("round.finished", body);
+        }
+        if (std.mem.eql(u8, command, "app.stop")) {
+            if (payload.count() != 0) return error.InvalidUiCommand;
+            runtime.stop_requested = true;
+            return runtime.app.nextEnvelope("app.stopped", "{\"status\":\"stopping\"}");
         }
         return error.UnsupportedUiCommand;
     }

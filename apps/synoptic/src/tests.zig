@@ -66,6 +66,7 @@ test "browser protocol exposes action confirmation but not preparation or comple
     try std.testing.expect(ui.commandAllowed("action.reject"));
     try std.testing.expect(!ui.commandAllowed("action.prepare"));
     try std.testing.expect(!ui.commandAllowed("file.complete"));
+    try std.testing.expect(ui.commandAllowed("app.stop"));
 }
 test "action cards serialize exact effect target payload and rejection terminality" {
     var store = tools.ActionStore{ .allocator = std.testing.allocator };
@@ -418,6 +419,225 @@ fn runGit(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []con
     return result.stdout;
 }
 
+fn fakeLifecycleGhScriptAlloc(allocator: std.mem.Allocator, base: []const u8, head: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\set -eu
+        \\if [ "${{1:-}}" = auth ]; then exit 0; fi
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\if grep -q 'SynopticPullRequest' "$input"; then
+        \\  printf '%s\n' '{{"data":{{"repository":{{"id":"R_1","nameWithOwner":"o/r","pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"fixture","body":"body","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticReviewThreads' "$input"; then
+        \\  printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
+        \\fi
+        \\printf '%s\n' '{{"data":{{}}}}'
+        \\
+    , .{ base, head });
+}
+
+fn runLifecycleCommand(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, argv: []const []const u8) ![]u8 {
+    const result = try std.process.run(allocator, io, .{ .argv = argv, .environ_map = environment });
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return error.LifecycleCommandFailed;
+    }
+    return result.stdout;
+}
+
+fn bestEffortLifecycleStop(allocator: std.mem.Allocator, io: std.Io, environment: *const std.process.Environ.Map, binary: []const u8) void {
+    const result = std.process.run(allocator, io, .{ .argv = &.{ binary, "stop", "--json" }, .environ_map = environment }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+}
+
+const ReceiptAddress = struct {
+    port: u16,
+    token: []u8,
+    launch_id: []u8,
+    allocator: std.mem.Allocator,
+    fn deinit(self: *ReceiptAddress) void {
+        self.allocator.free(self.token);
+        self.allocator.free(self.launch_id);
+    }
+};
+
+fn receiptAddress(allocator: std.mem.Allocator, raw: []const u8) !ReceiptAddress {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const url = object.get("url").?.string;
+    const prefix = "http://127.0.0.1:";
+    if (!std.mem.startsWith(u8, url, prefix)) return error.InvalidLaunchReceipt;
+    const slash = std.mem.indexOfScalarPos(u8, url, prefix.len, '/') orelse return error.InvalidLaunchReceipt;
+    const token_marker = "?token=";
+    const marker = std.mem.indexOf(u8, url[slash..], token_marker) orelse return error.InvalidLaunchReceipt;
+    return .{
+        .port = try std.fmt.parseInt(u16, url[prefix.len..slash], 10),
+        .token = try allocator.dupe(u8, url[slash + marker + token_marker.len ..]),
+        .launch_id = try allocator.dupe(u8, object.get("launchId").?.string),
+        .allocator = allocator,
+    };
+}
+
+test "e2e real child lifecycle returns ready, verifies identity, stops, and reconstructs without semantic recovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.createDirPath(io, "skill/assets/ui");
+    try tmp.dir.createDirPath(io, "runtime");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/manifest.json", .data = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":\"synoptic-ui/v1\",\"requiredSkillAbi\":\"synoptic-skill-abi/v1\",\"entry\":\"index.html\",\"assets\":[\"app.css\",\"app.js\"]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/assets/ui/index.html", .data = "<!doctype html><title>fixture</title>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill/SKILL.md", .data = "# fixture" });
+    const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
+    defer allocator.free(repo);
+    const file_path = try std.fs.path.join(allocator, &.{ repo, "a.zig" });
+    defer allocator.free(file_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "old\n" });
+    for ([_][]const []const u8{ &.{ "git", "init", "-q" }, &.{ "git", "config", "user.email", "synoptic@example.test" }, &.{ "git", "config", "user.name", "Synoptic Test" }, &.{ "git", "add", "a.zig" }, &.{ "git", "commit", "-qm", "base" } }) |argv| {
+        const output = try runGit(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const base_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "new\n" });
+    for ([_][]const []const u8{ &.{ "git", "add", "a.zig" }, &.{ "git", "commit", "-qm", "head" } }) |argv| {
+        const output = try runGit(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const remote = try runGit(allocator, io, repo, &.{ "git", "remote", "add", "origin", repo });
+    allocator.free(remote);
+
+    const codex_path = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(codex_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-codex", .data = fakeCodexScript() });
+    try std.Io.Dir.cwd().setFilePermissions(io, codex_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh" });
+    defer allocator.free(gh_path);
+    const gh_script = try fakeLifecycleGhScriptAlloc(allocator, base, head);
+    defer allocator.free(gh_script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh", .data = gh_script });
+    try std.Io.Dir.cwd().setFilePermissions(io, gh_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const binary = try std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/synoptic", allocator);
+    defer allocator.free(binary);
+    const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
+    defer allocator.free(skill);
+    const runtime_tmp = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime_tmp);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    try environment.put("HOME", root);
+    try environment.put("TMPDIR", runtime_tmp);
+    try environment.put("SYNOPTIC_GH", gh_path);
+    try environment.put("SYNOPTIC_CODEX", codex_path);
+    defer bestEffortLifecycleStop(allocator, io, &environment, binary);
+    const selector = "https://github.com/o/r/pull/1";
+    const first = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "launch", "--cwd", repo, "--skill-root", skill, "--pr", selector, "--no-browser", "--json" });
+    defer allocator.free(first);
+    var first_address = try receiptAddress(allocator, first);
+    defer first_address.deinit();
+    const status_running = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "status", "--json" });
+    defer allocator.free(status_running);
+    try std.testing.expect(std.mem.indexOf(u8, status_running, "\"status\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_running, first_address.launch_id) != null);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_tmp, "synoptic", "current.json" });
+    defer allocator.free(current_path);
+    const operational = try std.Io.Dir.cwd().readFileAlloc(io, current_path, allocator, .limited(64 * 1024));
+    defer allocator.free(operational);
+    try std.testing.expect(std.mem.indexOf(u8, operational, "\"tabs\"") == null and std.mem.indexOf(u8, operational, "\"actions\"") == null);
+
+    const first_bootstrap_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/bootstrap?token={s}", .{ first_address.port, first_address.token });
+    defer allocator.free(first_bootstrap_url);
+    var primary_ready = false;
+    for (0..200) |_| {
+        const bootstrap = try runLifecycleCommand(allocator, io, &environment, &.{ "/usr/bin/curl", "-fsS", first_bootstrap_url });
+        if (std.mem.indexOf(u8, bootstrap, "\"primaryReady\":true") != null) primary_ready = true;
+        allocator.free(bootstrap);
+        if (primary_ready) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(primary_ready);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", first_address.port);
+    var stream = try address.connect(io, .{ .mode = .stream });
+    const request = try std.fmt.allocPrint(allocator, "GET /ws?token={s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: http://127.0.0.1:{d}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", .{ first_address.token, first_address.port, first_address.port });
+    defer allocator.free(request);
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+    var handshake: [1024]u8 = undefined;
+    const incoming = try stream.socket.receive(io, &handshake);
+    try std.testing.expect(std.mem.indexOf(u8, incoming.data, "101 Switching Protocols") != null);
+    try sendMaskedText(io, &stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"a.zig\",\"diff\":\"@@ -1 +1 @@\\n+new\",\"threads\":\"[]\"}}");
+    const opened = try readUntil(allocator, io, &stream, "\"type\":\"session.opened\"");
+    defer allocator.free(opened);
+    const review = try readUntil(allocator, io, &stream, "turn/completed");
+    defer allocator.free(review);
+    try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"prepare the comment\",\"active\":false}}");
+    const prepared = try readUntil(allocator, io, &stream, "\"type\":\"action.prepared\"");
+    defer allocator.free(prepared);
+    try sendMaskedText(io, &stream, "{\"type\":\"app.stop\",\"payload\":{}}");
+    const quit = try readUntil(allocator, io, &stream, "\"type\":\"app.stopped\"");
+    defer allocator.free(quit);
+    stream.close(io);
+    var stopped_seen = false;
+    for (0..200) |_| {
+        const stopped_status = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "status", "--json" });
+        defer allocator.free(stopped_status);
+        if (std.mem.indexOf(u8, stopped_status, "\"status\":\"stopped\"") != null) {
+            stopped_seen = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(stopped_seen);
+
+    const second = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "launch", "--cwd", repo, "--skill-root", skill, "--pr", selector, "--no-browser", "--json" });
+    defer allocator.free(second);
+    var second_address = try receiptAddress(allocator, second);
+    defer second_address.deinit();
+    try std.testing.expect(!std.mem.eql(u8, first_address.launch_id, second_address.launch_id));
+    const bootstrap_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/bootstrap?token={s}", .{ second_address.port, second_address.token });
+    defer allocator.free(bootstrap_url);
+    const bootstrap = try runLifecycleCommand(allocator, io, &environment, &.{ "/usr/bin/curl", "-fsS", bootstrap_url });
+    defer allocator.free(bootstrap);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap, "\"tabs\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap, "\"actions\":[]") != null);
+    const stopped = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "stop", "--json" });
+    defer allocator.free(stopped);
+    try std.testing.expect(std.mem.indexOf(u8, stopped, "\"status\":\"stopped\"") != null);
+
+    const runtime_root_path = try std.fs.path.join(allocator, &.{ runtime_tmp, "synoptic" });
+    defer allocator.free(runtime_root_path);
+    const stale = try std.fmt.allocPrint(allocator, "{{\"runtimeSchema\":\"synoptic-runtime/v1\",\"launchId\":\"000000000000000000000000000000000000000000000000\",\"runtimeRoot\":{f},\"executable\":{f},\"url\":\"http://127.0.0.1:1/?token=stale\",\"pid\":{d}}}", .{ std.json.fmt(runtime_root_path, .{}), std.json.fmt(binary, .{}), std.c.getpid() });
+    defer allocator.free(stale);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = current_path, .data = stale });
+    const stale_status = try runLifecycleCommand(allocator, io, &environment, &.{ binary, "status", "--json" });
+    defer allocator.free(stale_status);
+    try std.testing.expect(std.mem.indexOf(u8, stale_status, "\"status\":\"stopped\"") != null);
+
+    try environment.put("SYNOPTIC_GH", "/definitely/missing/synoptic-gh");
+    const failed = try std.process.run(allocator, io, .{ .argv = &.{ binary, "launch", "--cwd", repo, "--skill-root", skill, "--pr", selector, "--no-browser", "--json" }, .environ_map = &environment });
+    defer allocator.free(failed.stdout);
+    defer allocator.free(failed.stderr);
+    try std.testing.expect(failed.term == .exited and failed.term.exited != 0);
+    try std.testing.expect(std.mem.indexOf(u8, failed.stderr, "\"schema\":\"synoptic-launch-error/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.stderr, "\"reason\":\"ExecutableNotFound\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.stderr, "Install codex and gh") != null);
+}
+
 fn injectedRefresh(runtime: *http.Runtime) !void {
     try worktree.requireManagedRefresh(runtime.custody);
     var next = try domain.PrGeneration.initFull(runtime.app.allocator, runtime.app.generation.base_oid, "refreshed-head");
@@ -616,6 +836,10 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "\"round\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "\"status\":\"stale_origin\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reconnect_snapshot, "act-1") != null);
+    try sendMaskedText(io, &reconnect, "{\"type\":\"app.stop\",\"payload\":{}}");
+    const stopped = try readUntil(allocator, io, &reconnect, "\"type\":\"app.stopped\"");
+    defer allocator.free(stopped);
+    try std.testing.expect(runtime.stop_requested);
     try std.testing.expect(!fixture.failed.load(.acquire));
     try std.testing.expect(!reconnect_fixture.failed.load(.acquire));
 }
