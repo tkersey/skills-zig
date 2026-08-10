@@ -24,11 +24,12 @@ const Usage =
 const Action = enum { schema, preflight };
 
 const pinning_probe_thread_id = "019dd901-0000-7000-8000-000000000146";
-const internal_model_fixture_marker = "CAS_INTERNAL_CODE_MODE_MODEL_FIXTURE";
-const internal_model_fixture_marker_value = "owner-probe-v1";
-const internal_model_fixture_ready_path = "CAS_INTERNAL_CODE_MODE_MODEL_READY_PATH";
-const internal_model_fixture_evidence_path = "CAS_INTERNAL_CODE_MODE_MODEL_EVIDENCE_PATH";
-const internal_model_fixture_nonce = "CAS_INTERNAL_CODE_MODE_MODEL_NONCE";
+const internal_model_fixture_marker = "CAS_INTERNAL_MODEL_FIXTURE";
+const code_mode_fixture_marker_value = "code-mode-owner-probe-v1";
+const review_fixture_marker_value = "structured-review-probe-v1";
+const internal_model_fixture_ready_path = "CAS_INTERNAL_MODEL_READY_PATH";
+const internal_model_fixture_evidence_path = "CAS_INTERNAL_MODEL_EVIDENCE_PATH";
+const internal_model_fixture_nonce = "CAS_INTERNAL_MODEL_NONCE";
 const code_mode_probe_timeout_ms: i64 = 15_000;
 const max_model_request_bytes: usize = 8 * 1024 * 1024;
 const max_model_fixture_requests: usize = 8;
@@ -58,10 +59,13 @@ const Seen = struct {
 };
 
 const InternalModelFixtureOptions = struct {
+    mode: InternalModelFixtureMode,
     ready_path: []const u8,
     evidence_path: []const u8,
-    nonce: []const u8,
+    nonce: ?[]const u8,
 };
+
+const InternalModelFixtureMode = enum { code_mode, structured_review };
 
 fn internalModelFixtureOptions(
     argv: []const []const u8,
@@ -69,22 +73,28 @@ fn internalModelFixtureOptions(
 ) !?InternalModelFixtureOptions {
     if (argv.len != 1) return null;
     const marker = environment.get(internal_model_fixture_marker) orelse return null;
-    if (!std.mem.eql(u8, marker, internal_model_fixture_marker_value)) {
-        return error.InvalidInternalFixtureEnvironment;
-    }
+    const mode: InternalModelFixtureMode = if (std.mem.eql(
+        u8,
+        marker,
+        code_mode_fixture_marker_value,
+    )) .code_mode else if (std.mem.eql(
+        u8,
+        marker,
+        review_fixture_marker_value,
+    )) .structured_review else return error.InvalidInternalFixtureEnvironment;
     const ready_path = environment.get(internal_model_fixture_ready_path) orelse
         return error.InvalidInternalFixtureEnvironment;
     const evidence_path = environment.get(internal_model_fixture_evidence_path) orelse
         return error.InvalidInternalFixtureEnvironment;
-    const nonce = environment.get(internal_model_fixture_nonce) orelse
-        return error.InvalidInternalFixtureEnvironment;
+    const nonce = environment.get(internal_model_fixture_nonce);
     if (!validInternalFixturePath(ready_path) or
         !validInternalFixturePath(evidence_path) or
-        !validCodeModeProbeNonce(nonce))
+        (mode == .code_mode and (nonce == null or !validCodeModeProbeNonce(nonce.?))))
     {
         return error.InvalidInternalFixtureEnvironment;
     }
     return .{
+        .mode = mode,
         .ready_path = ready_path,
         .evidence_path = evidence_path,
         .nonce = nonce,
@@ -116,6 +126,7 @@ pub fn main(init: std.process.Init) void {
             init.io,
             options.ready_path,
             options.evidence_path,
+            options.mode,
             options.nonce,
         ) catch |err| fatal(err, false);
         return;
@@ -551,6 +562,7 @@ fn codeModeHostOwnerProbeInRoot(
         cwd,
         ready_path,
         evidence_path,
+        .code_mode,
         nonce,
     );
     var model_fixture_running = true;
@@ -610,17 +622,21 @@ fn spawnInternalModelFixture(
     cwd: []const u8,
     ready_path: []const u8,
     evidence_path: []const u8,
-    nonce: []const u8,
+    mode: InternalModelFixtureMode,
+    nonce: ?[]const u8,
 ) !std.process.Child {
     var environment = try parent_environment.clone(allocator);
     defer environment.deinit();
     try environment.put(
         internal_model_fixture_marker,
-        internal_model_fixture_marker_value,
+        switch (mode) {
+            .code_mode => code_mode_fixture_marker_value,
+            .structured_review => review_fixture_marker_value,
+        },
     );
     try environment.put(internal_model_fixture_ready_path, ready_path);
     try environment.put(internal_model_fixture_evidence_path, evidence_path);
-    try environment.put(internal_model_fixture_nonce, nonce);
+    if (nonce) |value| try environment.put(internal_model_fixture_nonce, value);
     return std.process.spawn(io, .{
         .argv = &.{self_path},
         .cwd = .{ .path = cwd },
@@ -829,7 +845,8 @@ fn serveInternalModelFixture(
     io: std.Io,
     ready_path: []const u8,
     evidence_path: []const u8,
-    nonce: []const u8,
+    mode: InternalModelFixtureMode,
+    nonce: ?[]const u8,
 ) !void {
     var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try listen_address.listen(io, .{ .mode = .stream });
@@ -855,6 +872,7 @@ fn serveInternalModelFixture(
             &stream,
             &request,
             evidence_path,
+            mode,
             nonce,
             &responses_seen,
         );
@@ -869,7 +887,8 @@ fn handleInternalModelRequest(
     stream: *std.Io.net.Stream,
     request: *const RawHttpRequest,
     evidence_path: []const u8,
-    nonce: []const u8,
+    mode: InternalModelFixtureMode,
+    nonce: ?[]const u8,
     responses_seen: *usize,
 ) !bool {
     if (std.mem.eql(u8, request.method, "GET") and
@@ -896,8 +915,21 @@ fn handleInternalModelRequest(
         );
         return false;
     }
+    if (mode == .structured_review) {
+        const body = try reviewModelSseAlloc(allocator);
+        defer allocator.free(body);
+        try writeHttpResponse(allocator, io, stream, "text/event-stream", body);
+        try writeAtomicFileAlloc(
+            allocator,
+            io,
+            evidence_path,
+            "{\"schema\":\"cas-structured-review-model-evidence/v1\",\"status\":\"passed\"}",
+        );
+        return true;
+    }
+    const code_mode_nonce = nonce orelse return error.InvalidInternalFixtureEnvironment;
     if (responses_seen.* == 0) {
-        const body = try firstModelSseAlloc(allocator, nonce);
+        const body = try firstModelSseAlloc(allocator, code_mode_nonce);
         defer allocator.free(body);
         try writeHttpResponse(allocator, io, stream, "text/event-stream", body);
         responses_seen.* += 1;
@@ -906,7 +938,7 @@ fn handleInternalModelRequest(
     const passed = customToolOutputContainsNonce(
         allocator,
         request.body,
-        nonce,
+        code_mode_nonce,
     ) catch false;
     const body = try finalModelSseAlloc(allocator);
     defer allocator.free(body);
@@ -1056,6 +1088,34 @@ fn finalModelSseAlloc(allocator: std.mem.Allocator) ![]u8 {
             "\"output_tokens\":0,\"output_tokens_details\":null," ++
             "\"total_tokens\":0}}}\n\n",
     );
+}
+
+fn reviewModelSseAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const review =
+        "{\"findings\":[],\"overall_correctness\":\"patch is correct\"," ++
+        "\"overall_explanation\":\"CAS structured-review capability probe completed.\"," ++
+        "\"overall_confidence_score\":1.0}";
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    try writer.writeAll(
+        "event: response.output_item.done\n" ++
+            "data: {\"type\":\"response.output_item.done\"," ++
+            "\"item\":{\"type\":\"message\",\"role\":\"assistant\"," ++
+            "\"id\":\"cas-review-message\",\"content\":[" ++
+            "{\"type\":\"output_text\",\"text\":",
+    );
+    try std.json.Stringify.value(review, .{}, writer);
+    try writer.writeAll(
+        "}]}}\n\n" ++
+            "event: response.completed\n" ++
+            "data: {\"type\":\"response.completed\"," ++
+            "\"response\":{\"id\":\"cas-review-1\",\"usage\":" ++
+            "{\"input_tokens\":0,\"input_tokens_details\":null," ++
+            "\"output_tokens\":0,\"output_tokens_details\":null," ++
+            "\"total_tokens\":0}}}\n\n",
+    );
+    return output.toOwnedSlice();
 }
 
 fn customToolOutputContainsNonce(
@@ -1638,7 +1698,39 @@ fn runIsolatedFullProbes(
         ignoreError(err);
     const codex_home = try std.Io.Dir.cwd().realPathFileAlloc(io, requested_codex_home, allocator);
     defer allocator.free(codex_home);
-    try createIsolatedProbeConfig(allocator, io, codex_home);
+    const ready_path = try std.fs.path.join(allocator, &.{ codex_home, "model.ready" });
+    defer allocator.free(ready_path);
+    const evidence_path = try std.fs.path.join(allocator, &.{ codex_home, "model.evidence.json" });
+    defer allocator.free(evidence_path);
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_path);
+    var model_fixture = try spawnInternalModelFixture(
+        allocator,
+        io,
+        parent_environment,
+        self_path,
+        cwd,
+        ready_path,
+        evidence_path,
+        .structured_review,
+        null,
+    );
+    var model_fixture_running = true;
+    defer if (model_fixture_running) model_fixture.kill(io);
+    const model_base_url_raw = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        ready_path,
+        1024,
+        5_000,
+    );
+    defer allocator.free(model_base_url_raw);
+    try createIsolatedProbeConfig(
+        allocator,
+        io,
+        codex_home,
+        std.mem.trim(u8, model_base_url_raw, " \t\r\n"),
+    );
 
     var child_environment = try parent_environment.clone(allocator);
     defer child_environment.deinit();
@@ -1677,6 +1769,24 @@ fn runIsolatedFullProbes(
         executor_manifest,
         executor_resource,
     );
+    if (witnesses.structured_review.status != .passed) {
+        model_fixture.kill(io);
+        model_fixture_running = false;
+        try std.Io.Dir.cwd().deleteTree(io, codex_home);
+        return witnesses;
+    }
+    const evidence = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        evidence_path,
+        4096,
+        code_mode_probe_timeout_ms,
+    );
+    defer allocator.free(evidence);
+    if (!try modelEvidencePassed(allocator, evidence)) return error.ModelFixtureFailed;
+    const term = try model_fixture.wait(io);
+    model_fixture_running = false;
+    if (term != .exited or term.exited != 0) return error.ModelFixtureFailed;
     try std.Io.Dir.cwd().deleteTree(io, codex_home);
     return witnesses;
 }
@@ -1728,7 +1838,7 @@ fn runIsolatedWitnessClient(
             executor_manifest,
             executor_resource,
         ),
-        .structured_review = probes.structuredReviewProbe(allocator, &client, cwd),
+        .structured_review = probes.structuredReviewProbe(allocator, io, &client, cwd),
         .external_import_history = probes.externalImportHistoryProbe(allocator, &client, cwd),
     };
 }
@@ -1737,18 +1847,25 @@ fn createIsolatedProbeConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
     codex_home: []const u8,
+    model_base_url: []const u8,
 ) !void {
     const path = try std.fs.path.join(allocator, &.{ codex_home, "config.toml" });
     defer allocator.free(path);
-    const contents =
+    const contents = try std.fmt.allocPrint(
+        allocator,
         "model = \"cas-preflight-probe\"\n" ++
-        "model_provider = \"cas_preflight\"\n" ++
-        "\n" ++
-        "[model_providers.cas_preflight]\n" ++
-        "name = \"CAS Preflight Loopback\"\n" ++
-        "base_url = \"http://127.0.0.1:1/v1\"\n" ++
-        "wire_api = \"responses\"\n" ++
-        "requires_openai_auth = false\n";
+            "model_provider = \"cas_preflight\"\n" ++
+            "\n" ++
+            "[model_providers.cas_preflight]\n" ++
+            "name = \"CAS Preflight Loopback\"\n" ++
+            "base_url = \"{s}\"\n" ++
+            "wire_api = \"responses\"\n" ++
+            "requires_openai_auth = false\n" ++
+            "request_max_retries = 0\n" ++
+            "stream_max_retries = 0\n",
+        .{model_base_url},
+    );
+    defer allocator.free(contents);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 

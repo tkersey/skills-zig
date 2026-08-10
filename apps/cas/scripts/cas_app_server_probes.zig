@@ -2,6 +2,7 @@ const std = @import("std");
 const contract = @import("cas_app_server_contract");
 const proxy = @import("cas_proxy_client");
 const inquiry_anchor = @import("cas_session_inquiry_anchor");
+const structured_review_probe_timeout_ms: i64 = 15_000;
 
 pub const ProbeStatus = enum { passed, failed, unavailable, not_applicable };
 
@@ -468,6 +469,7 @@ fn externalImportRecordProbe(
 
 pub fn structuredReviewProbe(
     allocator: std.mem.Allocator,
+    io: std.Io,
     client: *proxy.Client,
     cwd: []const u8,
 ) LiveWitness {
@@ -494,6 +496,7 @@ pub fn structuredReviewProbe(
             "thread/start did not return a thread identity",
         );
     defer allocator.free(thread_id);
+    defer deleteThread(allocator, client, thread_id);
 
     const instructions = "CAS structured-review dispatch conformance probe.";
     const review_params = stringifyAnyAlloc(allocator, .{
@@ -524,22 +527,16 @@ pub fn structuredReviewProbe(
             "and in-progress turn",
     );
     defer allocator.free(turn_id);
-    const terminal = structuredReviewTerminalProbe(allocator, client, thread_id, turn_id);
-    if (terminal.status != .passed) return terminal;
-    deleteThread(allocator, client, thread_id);
-    return LiveWitness.passed();
+    return structuredReviewTerminalProbe(allocator, io, client, thread_id, turn_id);
 }
 
 fn structuredReviewTerminalProbe(
     allocator: std.mem.Allocator,
+    io: std.Io,
     client: *proxy.Client,
     thread_id: []const u8,
     turn_id: []const u8,
 ) LiveWitness {
-    if (!interruptTurn(allocator, client, thread_id, turn_id)) return LiveWitness.failed(
-        "structured_review_interrupt_failed",
-        "the dispatched review turn could not be interrupted through the production envelope",
-    );
     const read_params = stringifyAnyAlloc(allocator, .{
         .threadId = thread_id,
         .includeTurns = true,
@@ -548,17 +545,58 @@ fn structuredReviewTerminalProbe(
         "production thread/read parameters could not be encoded",
     );
     defer allocator.free(read_params);
-    const read_json = client.requestJson("thread/read", read_params) catch
-        return LiveWitness.failed(
-            "structured_review_terminal_read_failed",
-            "thread/read could not observe the interrupted review turn",
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
+        const read_json = client.requestJson("thread/read", read_params) catch {
+            if (emptyRolloutReadPending(client.lastError())) {
+                const now_ms = @divFloor(
+                    std.Io.Clock.awake.now(io).nanoseconds,
+                    1_000_000,
+                );
+                if (now_ms - started_ms >= structured_review_probe_timeout_ms) {
+                    return LiveWitness.failed(
+                        "structured_review_completion_timeout",
+                        "the deterministic structured review did not complete within the probe bound",
+                    );
+                }
+                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
+                    "structured_review_poll_failed",
+                    "the bounded structured-review completion poll failed",
+                );
+                continue;
+            }
+            return LiveWitness.failed(
+                "structured_review_terminal_read_failed",
+                "thread/read could not observe the completed review turn",
+            );
+        };
+        defer allocator.free(read_json);
+        switch (completedReviewTurnState(allocator, io, read_json, turn_id)) {
+            .passed => return LiveWitness.passed(),
+            .failed => return LiveWitness.failed(
+                "structured_review_terminal_shape_failed",
+                "the exact review turn did not complete with exited_review_mode.review_output",
+            ),
+            .pending => {},
+        }
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+        if (now_ms - started_ms >= structured_review_probe_timeout_ms) {
+            return LiveWitness.failed(
+                "structured_review_completion_timeout",
+                "the deterministic structured review did not complete within the probe bound",
+            );
+        }
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
+            "structured_review_poll_failed",
+            "the bounded structured-review completion poll failed",
         );
-    defer allocator.free(read_json);
-    if (!interruptedReviewTurnObserved(read_json, turn_id)) return LiveWitness.failed(
-        "structured_review_terminal_shape_failed",
-        "thread/read did not preserve the exact review turn as terminal after interruption",
-    );
-    return LiveWitness.passed();
+    }
+}
+
+fn emptyRolloutReadPending(last_error: ?[]const u8) bool {
+    const message = last_error orelse return false;
+    return std.mem.indexOf(u8, message, "rollout at ") != null and
+        std.mem.indexOf(u8, message, " is empty") != null;
 }
 
 pub fn executorSkillResourcesProbe(
@@ -2068,45 +2106,30 @@ fn deleteThread(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: 
     allocator.free(response);
 }
 
-fn interruptTurn(
-    allocator: std.mem.Allocator,
-    client: *proxy.Client,
-    thread_id: []const u8,
-    turn_id: []const u8,
-) bool {
-    const params = stringifyAnyAlloc(
-        allocator,
-        .{ .threadId = thread_id, .turnId = turn_id },
-    ) catch return false;
-    defer allocator.free(params);
-    const response = client.requestJson("turn/interrupt", params) catch return false;
-    allocator.free(response);
-    return true;
-}
+const ReviewCompletionState = enum { pending, passed, failed };
 
-fn interruptedReviewTurnObserved(raw: []const u8, expected_turn_id: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch
-        return false;
+fn completedReviewTurnState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    raw: []const u8,
+    expected_turn_id: []const u8,
+) ReviewCompletionState {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return .failed;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |value| value,
-        else => return false,
+        else => return .failed,
     };
-    const thread_value = root.get("thread") orelse return false;
+    const thread_value = root.get("thread") orelse return .failed;
     const thread = switch (thread_value) {
         .object => |value| value,
-        else => return false,
+        else => return .failed,
     };
-    const path_value = thread.get("path") orelse return false;
-    const path = switch (path_value) {
-        .string => |value| value,
-        else => return false,
-    };
-    if (path.len == 0) return false;
-    const turns_value = thread.get("turns") orelse return false;
+    const turns_value = thread.get("turns") orelse return .failed;
     const turns = switch (turns_value) {
         .array => |value| value,
-        else => return false,
+        else => return .failed,
     };
     for (turns.items) |turn_value| {
         const turn = switch (turn_value) {
@@ -2114,9 +2137,89 @@ fn interruptedReviewTurnObserved(raw: []const u8, expected_turn_id: []const u8) 
             else => continue,
         };
         if (!objectStringEquals(turn, "id", expected_turn_id)) continue;
-        return objectStringEquals(turn, "status", "interrupted");
+        if (objectStringEquals(turn, "status", "inProgress")) return .pending;
+        if (!objectStringEquals(turn, "status", "completed")) return .failed;
+        if (!reviewModeItemsComplete(turn)) return .pending;
+        const path_value = thread.get("path") orelse return .pending;
+        const path = switch (path_value) {
+            .string => |value| value,
+            else => return .pending,
+        };
+        if (path.len == 0) return .pending;
+        const rollout = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(8 * 1024 * 1024),
+        ) catch return .pending;
+        defer allocator.free(rollout);
+        return if (rolloutHasValidReviewOutput(allocator, rollout)) .passed else .pending;
+    }
+    return .pending;
+}
+
+fn reviewModeItemsComplete(turn: std.json.ObjectMap) bool {
+    const items_value = turn.get("items") orelse return false;
+    const items = switch (items_value) {
+        .array => |value| value,
+        else => return false,
+    };
+    var entered = false;
+    var exited = false;
+    for (items.items) |item_value| {
+        const item = switch (item_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        entered = entered or objectStringEquals(item, "type", "enteredReviewMode");
+        exited = exited or objectStringEquals(item, "type", "exitedReviewMode");
+    }
+    return entered and exited;
+}
+
+fn rolloutHasValidReviewOutput(allocator: std.mem.Allocator, raw: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (!objectStringEquals(root, "type", "event_msg")) continue;
+        const payload_value = root.get("payload") orelse continue;
+        const payload = switch (payload_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (!objectStringEquals(payload, "type", "exited_review_mode")) continue;
+        const output_value = payload.get("review_output") orelse continue;
+        const output = switch (output_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (validReviewOutput(output)) return true;
     }
     return false;
+}
+
+fn validReviewOutput(output: std.json.ObjectMap) bool {
+    const findings = output.get("findings") orelse return false;
+    if (findings != .array) return false;
+    const correctness = output.get("overall_correctness") orelse return false;
+    if (correctness != .string or
+        (!std.mem.eql(u8, correctness.string, "patch is correct") and
+            !std.mem.eql(u8, correctness.string, "patch is incorrect"))) return false;
+    const explanation = output.get("overall_explanation") orelse return false;
+    if (explanation != .string or explanation.string.len == 0) return false;
+    const confidence = output.get("overall_confidence_score") orelse return false;
+    const score: f64 = switch (confidence) {
+        .integer => |value| @floatFromInt(value),
+        .float => |value| value,
+        else => return false,
+    };
+    return score >= 0 and score <= 1;
 }
 
 fn row(
@@ -2462,19 +2565,45 @@ test "structured review response requires exact inline identity and echoed item"
     );
 }
 
-test "structured review terminal read binds the exact interrupted turn" {
-    const valid =
-        "{\"thread\":{\"path\":\"/tmp/review.jsonl\",\"turns\":[{" ++
-        "\"id\":\"turn-other\",\"status\":\"completed\"}," ++
-        "{\"id\":\"turn-review\",\"status\":\"interrupted\"}]}}";
-    try std.testing.expect(interruptedReviewTurnObserved(valid, "turn-review"));
-    try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-other"));
-    try std.testing.expect(!interruptedReviewTurnObserved(valid, "turn-missing"));
-    try std.testing.expect(!interruptedReviewTurnObserved(
-        "{\"thread\":{\"path\":null,\"turns\":[{\"id\":\"turn-review\"," ++
-            "\"status\":\"interrupted\"}]}}",
-        "turn-review",
-    ));
+test "structured review terminal read requires completed rollout review output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const rollout_path = try std.fs.path.join(allocator, &.{ root, "review.jsonl" });
+    defer allocator.free(rollout_path);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "review.jsonl",
+        .data = "{\"type\":\"event_msg\",\"payload\":{" ++
+            "\"type\":\"exited_review_mode\",\"review_output\":{" ++
+            "\"findings\":[],\"overall_correctness\":\"patch is correct\"," ++
+            "\"overall_explanation\":\"clean\",\"overall_confidence_score\":1}}}\n",
+    });
+    const completed = try std.fmt.allocPrint(
+        allocator,
+        "{{\"thread\":{{\"path\":\"{s}\",\"turns\":[{{" ++
+            "\"id\":\"turn-review\",\"status\":\"completed\",\"items\":[" ++
+            "{{\"type\":\"enteredReviewMode\"}}," ++
+            "{{\"type\":\"exitedReviewMode\"}}]}}]}}}}",
+        .{rollout_path},
+    );
+    defer allocator.free(completed);
+    try std.testing.expectEqual(
+        ReviewCompletionState.passed,
+        completedReviewTurnState(allocator, io, completed, "turn-review"),
+    );
+    try std.testing.expectEqual(
+        ReviewCompletionState.pending,
+        completedReviewTurnState(
+            allocator,
+            io,
+            "{\"thread\":{\"path\":null,\"turns\":[{" ++
+                "\"id\":\"turn-review\",\"status\":\"inProgress\"}]}}",
+            "turn-review",
+        ),
+    );
 }
 
 test "executor skill and selected root helpers preserve exact native identities" {

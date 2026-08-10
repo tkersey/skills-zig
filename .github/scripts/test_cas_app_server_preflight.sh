@@ -49,14 +49,17 @@ grep -Fq 'UnknownAction' "${public_surface_stderr}"
 schema_json="${fixture_root}/schema.json"
 preflight_json="${fixture_root}/preflight.json"
 
-./zig-out/bin/cas app-server schema \
+if ! ./zig-out/bin/cas app-server schema \
   --cwd "${fixture_root}/repo" \
   --codex-path "${codex_bin}" \
   --profile review \
   --refresh \
-  --json >"${schema_json}"
+  --json >"${schema_json}"; then
+  cat "${schema_json}" >&2
+  exit 1
+fi
 
-json_filter -e '
+if ! json_filter -e '
   .schema == "cas-app-server-preflight/v1" and
   .action == "schema" and
   .contractId == "codex-app-server-capabilities-v1" and
@@ -69,16 +72,22 @@ json_filter -e '
   .handlerCoverage.status == "passed" and
   .shapeChecks.status == "passed" and
   .failureCode == null
-' "${schema_json}" >/dev/null
+' "${schema_json}" >/dev/null; then
+  cat "${schema_json}" >&2
+  exit 1
+fi
 
-./zig-out/bin/cas app-server preflight \
+if ! ./zig-out/bin/cas app-server preflight \
   --cwd "${fixture_root}/repo" \
   --codex-path "${codex_bin}" \
   --profile review \
   --app-server-transport stdio \
-  --json >"${preflight_json}"
+  --json >"${preflight_json}"; then
+  cat "${preflight_json}" >&2
+  exit 1
+fi
 
-json_filter -e '
+if ! json_filter -e '
   .schema == "cas-app-server-preflight/v1" and
   .action == "preflight" and
   .profile == "review" and
@@ -87,7 +96,10 @@ json_filter -e '
   any(.behavioralProbes[]; .id == "structured-review" and .requirement == "required" and .status == "passed") and
   ([.behavioralProbes[] | select(.requirement == "required" and .status != "passed")] | length) == 0 and
   .failureCode == null
-' "${preflight_json}" >/dev/null
+' "${preflight_json}" >/dev/null; then
+  cat "${preflight_json}" >&2
+  exit 1
+fi
 
 zig build build-cas-code-mode-host-fixture
 host_ready="${fixture_root}/code-mode-host.ready"
