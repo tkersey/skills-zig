@@ -262,6 +262,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cas_runtime", .module = cas_runtime_root },
         },
     });
+    const synoptic_release_safe_root = b.createModule(.{
+        .root_source_file = b.path("apps/synoptic/src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{
+            .{ .name = "app_meta", .module = synoptic_meta },
+            .{ .name = "cas_runtime", .module = cas_runtime_root },
+        },
+    });
     const cas_proxy_client_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
         .target = target,
@@ -523,6 +532,8 @@ pub fn build(b: *std.Build) void {
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
     const synoptic = addExecutable(b, "synoptic", synoptic_root);
     synoptic.root_module.linkSystemLibrary("c", .{});
+    const synoptic_release_safe = addExecutable(b, "synoptic-release-safe", synoptic_release_safe_root);
+    synoptic_release_safe.root_module.linkSystemLibrary("c", .{});
     cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
     cas_release.configureExecutables(&.{
         cas,
@@ -568,6 +579,7 @@ pub fn build(b: *std.Build) void {
     const cas_install = addInstallStep(b, cas);
     const cas_automation_install = addInstallStep(b, cas_automation);
     const synoptic_install = addInstallStep(b, synoptic);
+    const synoptic_release_safe_install = addInstallStep(b, synoptic_release_safe);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
@@ -818,13 +830,25 @@ pub fn build(b: *std.Build) void {
         "Run Synoptic security and authority falsifiers",
         .{ .link_libc = true, .filters = &.{"falsifier"} },
     );
+    const run_synoptic_e2e = addTestStepWithOptions(
+        b,
+        synoptic_tests_root,
+        "test-synoptic-e2e-only",
+        "Run the bounded Synoptic lifecycle fixture",
+        .{ .link_libc = true, .filters = &.{"e2e"} },
+    );
     const test_synoptic = b.step("test-synoptic", "Run Synoptic generation, session, product, and falsifier tests");
     test_synoptic.dependOn(&run_synoptic_tests.step);
     test_synoptic.dependOn(&run_synoptic_falsifiers.step);
+    test_synoptic.dependOn(&run_synoptic_e2e.step);
     const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
     test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
+    const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the bounded Synoptic lifecycle fixture");
+    test_synoptic_e2e.dependOn(&run_synoptic_e2e.step);
     const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
     build_synoptic.dependOn(&synoptic_install.step);
+    const release_synoptic_safe = b.step("release-synoptic-safe", "Build Synoptic with ReleaseSafe optimization");
+    release_synoptic_safe.dependOn(&synoptic_release_safe_install.step);
 
     const cas_automation_oracle = b.addSystemCommand(&.{"sh"});
     cas_automation_oracle.addFileArg(b.path("apps/cas/testdata/automation/cron-0.2.13/verify.sh"));

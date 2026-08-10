@@ -17,3 +17,9 @@ no shell or generic GitHub endpoint.
 File and review-thread connections are paginated independently. A file becomes
 locally complete only after the mark-viewed mutation and an independent VIEWED
 read-back at the same PR head.
+
+The current capability receipt remains `preview`: the native kernel now owns
+concurrency-safe multi-revision sessions, visible event buffering, action-slot
+supersession, canonical-diff anchors, and round state. The distributable feature
+flags remain disabled until a spawned fake-GitHub/fake-Codex same-launch test
+proves the entire network path.

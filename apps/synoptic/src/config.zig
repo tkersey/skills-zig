@@ -13,6 +13,8 @@ pub const LaunchOptions = struct {
 };
 
 pub const max_page_count: usize = 10_000;
+pub const max_open_sessions: usize = 256;
+pub const max_visible_events: usize = 1024;
 
 pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ skill_root, "assets", "ui", "manifest.json" });
@@ -21,7 +23,10 @@ pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    const obj = switch (parsed.value) { .object => |o| o, else => return error.InvalidUiManifest };
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidUiManifest,
+    };
     try expectString(obj, "schema", manifest_schema);
     try expectString(obj, "uiAbi", ui_abi);
     try expectString(obj, "requiredSkillAbi", skill_abi);
