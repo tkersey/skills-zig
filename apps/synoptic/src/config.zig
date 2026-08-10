@@ -15,6 +15,8 @@ pub const LaunchOptions = struct {
 pub const max_page_count: usize = 10_000;
 pub const max_open_sessions: usize = 256;
 pub const max_visible_events: usize = 1024;
+/// Keeps the browser event stream live without requiring a client command.
+pub const visible_event_flush_ms: u32 = 50;
 
 pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ skill_root, "assets", "ui", "manifest.json" });

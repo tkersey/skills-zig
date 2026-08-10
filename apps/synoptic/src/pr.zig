@@ -10,7 +10,9 @@ pub const Identity = struct {
 pub fn parseUrl(raw: []const u8) !Identity {
     const prefix = "https://github.com/";
     if (!std.mem.startsWith(u8, raw, prefix)) return error.InvalidPullRequestSelector;
-    var parts = std.mem.splitScalar(u8, raw[prefix.len..], '/');
+    const query = std.mem.indexOfAny(u8, raw, "?#") orelse raw.len;
+    const canonical = std.mem.trimEnd(u8, raw[0..query], "/");
+    var parts = std.mem.splitScalar(u8, canonical[prefix.len..], '/');
     const owner = parts.next() orelse return error.InvalidPullRequestSelector;
     const repo = parts.next() orelse return error.InvalidPullRequestSelector;
     if (!std.mem.eql(u8, parts.next() orelse return error.InvalidPullRequestSelector, "pull")) return error.InvalidPullRequestSelector;
@@ -31,5 +33,10 @@ test "canonical PR URL" {
 }
 
 test "numeric selector uses repository context" {
-    const id = try parseSelector("7", "o", "r"); try std.testing.expectEqual(@as(u64, 7), id.number);
+    const id = try parseSelector("7", "o", "r");
+    try std.testing.expectEqual(@as(u64, 7), id.number);
+}
+test "canonical URL accepts browser query and trailing slash" {
+    const id = try parseUrl("https://github.com/o/r/pull/9/?tab=files");
+    try std.testing.expectEqual(@as(u64, 9), id.number);
 }

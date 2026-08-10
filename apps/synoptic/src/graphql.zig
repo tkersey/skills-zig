@@ -13,6 +13,13 @@ pub const mark_viewed_mutation =
 pub const add_inline_comment_mutation =
     "mutation SynopticAddInlineComment($input:AddPullRequestReviewInput!){addPullRequestReview(input:$input){pullRequestReview{id url}}}";
 
+pub fn operationName(document: []const u8) ?[]const u8 {
+    const open = std.mem.indexOfScalar(u8, document, '(') orelse return null;
+    const prefix = std.mem.trim(u8, document[0..open], " \t\r\n");
+    const space = std.mem.lastIndexOfScalar(u8, prefix, ' ') orelse return null;
+    return prefix[space + 1 ..];
+}
+
 pub fn requestAlloc(allocator: std.mem.Allocator, query: []const u8, variables_json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, variables_json, .{});
     defer parsed.deinit();
@@ -41,4 +48,8 @@ test "GraphQL request owns document and variables" {
     const out = try requestAlloc(std.testing.allocator, "query X{viewer{login}}", "{}");
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"variables\":{}") != null);
+}
+
+test "operation identity remains inspectable in fake gh stdin" {
+    try std.testing.expectEqualStrings("SynopticMarkFileViewed", operationName(mark_viewed_mutation).?);
 }

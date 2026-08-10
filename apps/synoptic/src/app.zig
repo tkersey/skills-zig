@@ -80,10 +80,17 @@ pub const App = struct {
         const card = try self.action_store.prepare("finding-1", path, line, body);
         self.pending = card.*;
     }
+    pub fn prepareModelAction(self: *App, session_id: []const u8, slot: []const u8, path: []const u8, line: u32, body: []const u8) !tools.ActionCard {
+        const session_slot = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session_id, slot });
+        defer self.allocator.free(session_slot);
+        const card = try self.action_store.prepare(session_slot, path, line, body);
+        self.pending = card.*;
+        return card.*;
+    }
 
-    pub fn confirmInline(self: *App, broker: github.Broker, pull_request_id: []const u8, head_oid: []const u8) !void {
-        var card = self.pending orelse return error.NoPendingAction;
-        try tools.validateInline(card, self.open_path orelse return error.NoOpenSession);
+    pub fn confirmInline(self: *App, broker: github.Broker, pull_request_id: []const u8, head_oid: []const u8, card_id: []const u8) !void {
+        var card = (try self.action_store.pendingById(card_id)).*;
+        try tools.validateInline(card, card.path);
         _ = try self.action_store.beginExecute(card.id);
         card.status = .executing;
         self.pending = card;
@@ -114,6 +121,17 @@ pub const App = struct {
             if (tab.status == .current and std.mem.eql(u8, tab.path, path)) tab.status = .completed;
         }
     }
+    pub fn completeRevision(self: *App, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, path: []const u8, revision: []const u8) !void {
+        const current = domain.revisionFor(&self.generation, path) orelse return error.FileNotQueued;
+        if (!std.mem.eql(u8, current, revision)) return error.StaleOriginSession;
+        try broker.markViewed(pull_request_id, path);
+        if (!try broker.viewedAfterMutation(owner, name, number, self.generation.head_oid, path)) return error.MarkViewedReadbackFailed;
+        try self.generation.markViewed(path);
+        for (self.tabs.items) |*tab| {
+            if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and tab.status == .current) tab.status = .completed;
+        }
+        self.completed_tab_open = true;
+    }
 
     pub fn close(self: *App) void {
         if (self.open_path) |p| self.allocator.free(p);
@@ -122,6 +140,15 @@ pub const App = struct {
         for (self.tabs.items) |*tab| {
             if (tab.status != .closed and (self.official_revision == null or std.mem.eql(u8, tab.revision, self.official_revision.?))) tab.status = .closed;
         }
+    }
+    pub fn closeTab(self: *App, path: []const u8, revision: []const u8) !void {
+        for (self.tabs.items) |*tab| {
+            if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and tab.status != .closed) {
+                tab.status = .closed;
+                return;
+            }
+        }
+        return error.UnknownTab;
     }
 
     pub fn nextEnvelope(self: *App, event_type: []const u8, payload: []const u8) ![]u8 {

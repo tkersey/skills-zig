@@ -1,7 +1,11 @@
 const std = @import("std");
 const App = @import("app.zig").App;
+const config = @import("config.zig");
 const github = @import("github.zig");
 const sessions = @import("sessions.zig");
+const tools = @import("tools.zig");
+const ui = @import("ui_protocol.zig");
+const worktree = @import("worktree.zig");
 
 pub const Runtime = struct {
     app: *App,
@@ -13,6 +17,8 @@ pub const Runtime = struct {
     pull_request_id: []const u8,
     cwd: []const u8,
     skill_path: []const u8,
+    repository_cwd: []const u8,
+    custody: worktree.Custody,
 };
 
 pub const max_header_bytes = 32 * 1024;
@@ -110,8 +116,15 @@ pub const Server = struct {
         var writer = stream.writer(self.io, &.{});
         try writer.interface.writeAll(response);
         try writer.interface.flush();
-        for (0..64) |_| {
-            const message = readClientTextAlloc(self.allocator, self.io, stream) catch return;
+        while (true) {
+            const message = readClientTextAllocTimeout(self.allocator, self.io, stream, config.visible_event_flush_ms) catch |err| switch (err) {
+                error.Timeout => {
+                    try self.flushVisible(stream, runtime);
+                    continue;
+                },
+                error.EndOfStream => return,
+                else => return err,
+            };
             defer self.allocator.free(message);
             const reply = self.handleCommandAlloc(runtime, message) catch |err| error_reply: {
                 const payload = try std.fmt.allocPrint(self.allocator, "{{\"code\":{f}}}", .{std.json.fmt(@errorName(err), .{})});
@@ -120,18 +133,74 @@ pub const Server = struct {
             };
             defer self.allocator.free(reply);
             try writeServerText(self.io, stream, reply);
-            var visible = try runtime.registry.drainVisible(self.allocator);
-            defer {
-                for (visible.items) |event| event.deinit(self.allocator);
-                visible.deinit(self.allocator);
+            try self.flushVisible(stream, runtime);
+        }
+    }
+
+    fn flushVisible(self: *Server, stream: *std.Io.net.Stream, runtime: *Runtime) !void {
+        var visible = try runtime.registry.drainVisible(self.allocator);
+        defer {
+            for (visible.items) |event| event.deinit(self.allocator);
+            visible.deinit(self.allocator);
+        }
+        for (visible.items) |event| {
+            if (std.mem.eql(u8, event.method, "action.prepared")) {
+                const session_id = event.session_id orelse return error.MissingOriginSession;
+                const input = try tools.decodePreparedAction(self.allocator, event.raw_json);
+                defer input.deinit(self.allocator);
+                const identity = try runtime.registry.sessionIdentity(session_id);
+                defer identity.deinit();
+                if (!std.mem.eql(u8, input.path, identity.path)) return error.ActionTargetsAnotherSession;
+                const session_slot = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ session_id, input.slot });
+                defer self.allocator.free(session_slot);
+                const superseded = if (runtime.app.action_store.pendingIdForSlot(session_slot)) |id| try self.allocator.dupe(u8, id) else null;
+                defer if (superseded) |id| self.allocator.free(id);
+                const card = try runtime.app.prepareModelAction(session_id, input.slot, input.path, input.line, input.body);
+                if (superseded) |id| {
+                    const superseded_payload = try std.fmt.allocPrint(self.allocator, "{{\"sessionId\":{f},\"id\":{f}}}", .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(id, .{}) });
+                    defer self.allocator.free(superseded_payload);
+                    const superseded_envelope = try runtime.app.nextEnvelope("action.superseded", superseded_payload);
+                    defer self.allocator.free(superseded_envelope);
+                    try writeServerText(self.io, stream, superseded_envelope);
+                }
+                const card_payload = try std.fmt.allocPrint(self.allocator, "{{\"sessionId\":{f},\"id\":{f},\"slot\":{f},\"path\":{f},\"line\":{d},\"body\":{f},\"status\":\"pending\"}}", .{ std.json.fmt(event.session_id orelse "", .{}), std.json.fmt(card.id, .{}), std.json.fmt(card.slot, .{}), std.json.fmt(card.path, .{}), card.line, std.json.fmt(card.body, .{}) });
+                defer self.allocator.free(card_payload);
+                const card_envelope = try runtime.app.nextEnvelope("action.prepared", card_payload);
+                defer self.allocator.free(card_envelope);
+                try writeServerText(self.io, stream, card_envelope);
+                continue;
             }
-            for (visible.items) |event| {
-                const payload = try @import("ui_protocol.zig").visibleEventPayloadAlloc(self.allocator, event.session_id, event.method, event.raw_json);
+            if (std.mem.eql(u8, event.method, "file.complete.requested")) {
+                const session_id = event.session_id orelse return error.MissingOriginSession;
+                const identity = try runtime.registry.sessionIdentity(session_id);
+                defer identity.deinit();
+                try runtime.app.completeRevision(runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, identity.path, identity.revision);
+                try runtime.registry.markCompleted(session_id);
+                const payload = try ui.visibleEventPayloadAlloc(self.allocator, session_id, event.method, "{\"status\":\"viewed\"}");
                 defer self.allocator.free(payload);
-                const envelope = try runtime.app.nextEnvelope("session.item.delta", payload);
+                const envelope = try runtime.app.nextEnvelope("file.completed", payload);
                 defer self.allocator.free(envelope);
                 try writeServerText(self.io, stream, envelope);
+                continue;
             }
+            if (std.mem.eql(u8, event.method, "session.close.requested")) {
+                const session_id = event.session_id orelse return error.MissingOriginSession;
+                const identity = try runtime.registry.sessionIdentity(session_id);
+                defer identity.deinit();
+                try runtime.registry.closeSession(session_id);
+                try runtime.app.closeTab(identity.path, identity.revision);
+                const payload = try ui.visibleEventPayloadAlloc(self.allocator, session_id, event.method, "{\"status\":\"closed\"}");
+                defer self.allocator.free(payload);
+                const envelope = try runtime.app.nextEnvelope("session.closed", payload);
+                defer self.allocator.free(envelope);
+                try writeServerText(self.io, stream, envelope);
+                continue;
+            }
+            const payload = try ui.visibleEventPayloadAlloc(self.allocator, event.session_id, event.method, event.raw_json);
+            defer self.allocator.free(payload);
+            const envelope = try runtime.app.nextEnvelope("session.item.delta", payload);
+            defer self.allocator.free(envelope);
+            try writeServerText(self.io, stream, envelope);
         }
     }
 
@@ -158,50 +227,55 @@ pub const Server = struct {
             const event = try runtime.app.openFile(path);
             self.allocator.free(event);
             const revision = runtime.app.official_revision orelse return error.MissingRevision;
-            const reused = try runtime.registry.openFile(runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, payloadString(payload, "diff") orelse "", payloadString(payload, "threads") orelse "[]", runtime.skill_path);
-            return runtime.app.nextEnvelope("session.opened", if (reused) "{\"initialReview\":false,\"reused\":true}" else "{\"initialReview\":true,\"reused\":false}");
+            const opened = try runtime.registry.openFile(runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, payloadString(payload, "diff") orelse "", payloadString(payload, "threads") orelse "[]", runtime.skill_path);
+            defer opened.deinit();
+            const body = try std.fmt.allocPrint(self.allocator, "{{\"initialReview\":{},\"reused\":{},\"sessionId\":{f}}}", .{ !opened.reused, opened.reused, std.json.fmt(opened.session_id, .{}) });
+            defer self.allocator.free(body);
+            return runtime.app.nextEnvelope("session.opened", body);
         }
         if (std.mem.eql(u8, command, "session.close")) {
-            runtime.app.close();
+            const session_id = payloadString(payload, "sessionId") orelse return error.InvalidUiCommand;
+            const identity = try runtime.registry.sessionIdentity(session_id);
+            defer identity.deinit();
+            try runtime.registry.closeSession(session_id);
+            try runtime.app.closeTab(identity.path, identity.revision);
             return runtime.app.nextEnvelope("session.closed", "{}");
         }
         if (std.mem.eql(u8, command, "session.message")) {
             runtime.app.initial_review_active = false;
             const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
-            if (payloadString(payload, "sessionId")) |session_id| try runtime.registry.markHumanInstruction(session_id, text);
-            try runtime.registry.message(text, false);
+            const session_id = payloadString(payload, "sessionId") orelse return error.InvalidUiCommand;
+            try runtime.registry.markHumanInstruction(session_id, text);
+            try runtime.registry.message(session_id, text, payloadBool(payload, "active") orelse false);
             return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
         }
         if (std.mem.eql(u8, command, "session.interrupt")) {
-            try runtime.registry.interrupt();
+            try runtime.registry.interrupt(payloadString(payload, "sessionId") orelse return error.InvalidUiCommand);
             return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
         }
-        if (std.mem.eql(u8, command, "action.prepare")) {
-            try runtime.app.prepareInline(payloadString(payload, "path") orelse return error.InvalidUiCommand, @intCast(payload.get("line").?.integer), payloadString(payload, "body") orelse return error.InvalidUiCommand, true);
-            return runtime.app.nextEnvelope("action.prepared", "{\"id\":\"act-1\",\"status\":\"pending\"}");
-        }
         if (std.mem.eql(u8, command, "action.confirm")) {
-            const card = runtime.app.pending orelse return error.NoPendingAction;
+            const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
+            const card = (try runtime.app.action_store.pendingById(card_id)).*;
             try runtime.broker.validateCurrentPath(runtime.owner, runtime.name, runtime.number, runtime.app.generation.head_oid, card.path);
             const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, runtime.app.generation.base_oid, runtime.app.generation.head_oid, card.path);
             defer self.allocator.free(diff);
             if (!github.validateRightLine(diff, card.line)) return error.StaleCommentAnchor;
-            try runtime.app.confirmInline(runtime.broker, runtime.pull_request_id, runtime.app.generation.head_oid);
-            return runtime.app.nextEnvelope("action.status", "{\"id\":\"act-1\",\"status\":\"succeeded\"}");
-        }
-        if (std.mem.eql(u8, command, "file.complete")) {
-            const path = payloadString(payload, "path") orelse return error.InvalidUiCommand;
-            try runtime.app.complete(runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, path, true);
-            return runtime.app.nextEnvelope("file.completed", "{}");
+            try runtime.app.confirmInline(runtime.broker, runtime.pull_request_id, runtime.app.generation.head_oid, card_id);
+            const status = try std.fmt.allocPrint(self.allocator, "{{\"id\":{f},\"status\":\"succeeded\"}}", .{std.json.fmt(card_id, .{})});
+            defer self.allocator.free(status);
+            return runtime.app.nextEnvelope("action.status", status);
         }
         if (std.mem.eql(u8, command, "snapshot.get")) {
             const snapshot = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(snapshot);
             return runtime.app.nextEnvelope("snapshot", snapshot);
         }
-        if (std.mem.eql(u8, command, "events.poll")) return runtime.app.nextEnvelope("session.status", "{\"status\":\"polled\"}");
-        if (std.mem.eql(u8, command, "pr.refresh")) return runtime.app.nextEnvelope("pr.refreshed", "{\"status\":\"requery-required\"}");
+        if (std.mem.eql(u8, command, "pr.refresh")) {
+            try self.refresh(runtime);
+            return runtime.app.nextEnvelope("pr.refreshed", "{\"status\":\"reconciled\"}");
+        }
         if (std.mem.eql(u8, command, "round.finish")) {
+            try self.refresh(runtime);
             const round = runtime.app.finishRound();
             const body = try std.fmt.allocPrint(self.allocator, "{{\"round\":{d}}}", .{round});
             defer self.allocator.free(body);
@@ -209,12 +283,37 @@ pub const Server = struct {
         }
         return error.UnsupportedUiCommand;
     }
+
+    fn refresh(self: *Server, runtime: *Runtime) !void {
+        var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
+        errdefer next.deinit();
+        try worktree.synchronizeManaged(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid);
+        try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
+        for (runtime.app.generation.files.items) |old_file| {
+            const next_revision = @import("domain.zig").revisionFor(&next, old_file.path) orelse continue;
+            if (!std.mem.eql(u8, old_file.revision_key, next_revision)) {
+                const diff = try github.canonicalDiffAlloc(self.allocator, self.io, runtime.cwd, next.base_oid, next.head_oid, old_file.path);
+                defer self.allocator.free(diff);
+                try runtime.registry.markPathChangedAndInject(old_file.path, next_revision, diff);
+            }
+        }
+        runtime.app.replaceGeneration(next);
+        try runtime.registry.updatePrimary("The pull request was explicitly refreshed. Re-evaluate the current base/head and changed-file relationships in the shared worktree.");
+    }
 };
 
 fn payloadString(payload: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = payload.get(key) orelse return null;
     return switch (value) {
         .string => |s| s,
+        else => null,
+    };
+}
+
+fn payloadBool(payload: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = payload.get(key) orelse return null;
+    return switch (value) {
+        .bool => |v| v,
         else => null,
     };
 }
@@ -272,8 +371,19 @@ fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool {
 }
 
 pub fn readClientTextAlloc(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream) ![]u8 {
+    return readClientTextAllocTimeout(allocator, io, stream, null);
+}
+pub fn readClientTextAllocTimeout(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream, timeout_ms: ?u32) ![]u8 {
     var head: [2]u8 = undefined;
-    try readExact(io, stream, &head);
+    if (timeout_ms) |milliseconds| {
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = std.Io.Duration.fromMilliseconds(milliseconds), .clock = .awake });
+        var offset: usize = 0;
+        while (offset < head.len) {
+            const received = try stream.socket.receiveTimeout(io, head[offset..], .{ .deadline = deadline });
+            if (received.data.len == 0) return error.EndOfStream;
+            offset += received.data.len;
+        }
+    } else try readExact(io, stream, &head);
     if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or (head[0] & 0x0f) != 1 or (head[1] & 0x80) == 0) return error.InvalidClientWebSocketFrame;
     var len: u64 = head[1] & 0x7f;
     if (len == 126) {

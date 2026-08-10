@@ -18,8 +18,21 @@ File and review-thread connections are paginated independently. A file becomes
 locally complete only after the mark-viewed mutation and an independent VIEWED
 read-back at the same PR head.
 
-The current capability receipt remains `preview`: the native kernel now owns
-concurrency-safe multi-revision sessions, visible event buffering, action-slot
-supersession, canonical-diff anchors, and round state. The distributable feature
-flags remain disabled until a spawned fake-GitHub/fake-Codex same-launch test
-proves the entire network path.
+The current capability receipt remains `preview`. Browser connections now drain
+normalized model events autonomously from a single writer loop, and every
+message, interrupt, close, prepare, and completion request is bound to the
+originating session. Model preparation is rejected during the initial review;
+same-slot cards supersede immutably; completion requires mark-viewed plus an
+independent `VIEWED` read-back; close stays local.
+
+The distributable feature flags remain disabled. The current E2E now drives the
+real loopback server with a masked WebSocket client and a spawned fake Codex,
+including primary completion, file fork/review streaming, explicit-session
+messaging, and a model-originated action card. Refresh now re-queries independent
+file/thread pages, advances only managed custody, injects changed-file deltas,
+replaces the queue generation, and starts a background primary update.
+
+The fixture does not yet spawn a fake `gh` to prove confirmed-comment mutation,
+VIEWED read-back completion, changed-revision refresh, finish-round, and reconnect
+through the same network path. Those missing effects keep the viewed-queue,
+ephemeral-session, and action-card capability flags false.

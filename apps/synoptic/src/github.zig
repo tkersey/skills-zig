@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
 
 pub const Broker = struct {
@@ -34,6 +35,29 @@ pub const Broker = struct {
         defer parsed.deinit();
         if (parsed.value != .object or parsed.value.object.get("errors") != null) return error.GitHubGraphqlRejected;
         return stdout;
+    }
+
+    pub fn readGenerationPages(self: Broker, owner: []const u8, name: []const u8, number: u64) !GenerationPages {
+        var files = try self.callPages(graphql.snapshot_query, "files", owner, name, number);
+        errdefer freePages(self.allocator, &files);
+        var threads = try self.callPages(graphql.threads_query, "reviewThreads", owner, name, number);
+        errdefer freePages(self.allocator, &threads);
+        return .{ .allocator = self.allocator, .files = files, .threads = threads };
+    }
+
+    pub fn readGeneration(self: Broker, owner: []const u8, name: []const u8, number: u64) !domain.PrGeneration {
+        var pages = try self.readGenerationPages(owner, name, number);
+        defer pages.deinit();
+        if (pages.files.items.len == 0) return error.InvalidSnapshot;
+        const head = try snapshotField(self.allocator, pages.files.items[0], "headRefOid");
+        defer self.allocator.free(head);
+        const base = try snapshotField(self.allocator, pages.files.items[0], "baseRefOid");
+        defer self.allocator.free(base);
+        var generation = try domain.PrGeneration.initFull(self.allocator, base, head);
+        errdefer generation.deinit();
+        for (pages.files.items) |page| try loadSnapshotFiles(self.allocator, page, &generation);
+        for (pages.threads.items) |page| try loadThreads(self.allocator, page, &generation);
+        return generation;
     }
 
     pub fn markViewed(self: Broker, pull_request_id: []const u8, path: []const u8) !void {
@@ -100,6 +124,71 @@ pub const Broker = struct {
         if (!found) return error.CommentPathNotCurrent;
     }
 };
+
+pub const GenerationPages = struct {
+    allocator: std.mem.Allocator,
+    files: std.ArrayList([]u8),
+    threads: std.ArrayList([]u8),
+    pub fn deinit(self: *GenerationPages) void {
+        freePages(self.allocator, &self.files);
+        freePages(self.allocator, &self.threads);
+    }
+};
+
+fn freePages(allocator: std.mem.Allocator, pages: *std.ArrayList([]u8)) void {
+    for (pages.items) |page| allocator.free(page);
+    pages.deinit(allocator);
+}
+
+fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
+    return allocator.dupe(u8, (pull.get(field) orelse return error.InvalidSnapshot).string);
+}
+
+fn loadSnapshotFiles(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
+    for ((pull.get("files") orelse return error.InvalidSnapshot).object.get("nodes").?.array.items) |node| {
+        const object = node.object;
+        const viewed = object.get("viewerViewedState").?.string;
+        const path = object.get("path").?.string;
+        const change_type = object.get("changeType").?.string;
+        const revision = try domain.revisionKey(allocator, path, change_type, "pending-worktree-sync", path);
+        defer allocator.free(revision);
+        try generation.addFile(.{ .path = path, .additions = @intCast(object.get("additions").?.integer), .deletions = @intCast(object.get("deletions").?.integer), .change_type = change_type, .viewed = if (std.mem.eql(u8, viewed, "VIEWED")) .viewed else if (std.mem.eql(u8, viewed, "DISMISSED")) .dismissed else .unviewed, .revision_key = revision });
+    }
+}
+
+fn loadThreads(allocator: std.mem.Allocator, raw: []const u8, generation: *domain.PrGeneration) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = (((parsed.value.object.get("data") orelse return error.InvalidSnapshot).object.get("repository") orelse return error.InvalidSnapshot).object.get("pullRequest") orelse return error.InvalidSnapshot).object;
+    for ((pull.get("reviewThreads") orelse return error.InvalidSnapshot).object.get("nodes").?.array.items) |node| {
+        const object = node.object;
+        if (object.get("isResolved").?.bool) continue;
+        const line: ?u32 = if (object.get("line").? == .null) null else @intCast(object.get("line").?.integer);
+        try generation.addThread(.{ .id = object.get("id").?.string, .path = object.get("path").?.string, .line = line, .outdated = object.get("isOutdated").?.bool });
+    }
+}
+
+pub fn hydrateRevisionKeys(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, generation: *domain.PrGeneration) !void {
+    for (generation.files.items) |file| {
+        const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
+        defer allocator.free(spec);
+        const blob_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } });
+        defer allocator.free(blob_result.stdout);
+        defer allocator.free(blob_result.stderr);
+        const blob = if (blob_result.term == .exited and blob_result.term.exited == 0) std.mem.trim(u8, blob_result.stdout, "\r\n") else "DELETION";
+        const diff = try canonicalDiffAlloc(allocator, io, cwd, generation.base_oid, generation.head_oid, file.path);
+        defer allocator.free(diff);
+        const revision = try domain.revisionKey(allocator, file.path, file.change_type, blob, diff);
+        defer allocator.free(revision);
+        try generation.setRevision(file.path, revision);
+    }
+}
 
 pub fn canonicalDiffAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, base: []const u8, head: []const u8, path: []const u8) ![]u8 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ base, head });

@@ -106,6 +106,12 @@ pub fn revisionFor(generation: *const PrGeneration, path: []const u8) ?[]const u
     return null;
 }
 
+pub fn revisionChanged(previous: *const PrGeneration, next: *const PrGeneration, path: []const u8) bool {
+    const before = revisionFor(previous, path) orelse return revisionFor(next, path) != null;
+    const after = revisionFor(next, path) orelse return true;
+    return !std.mem.eql(u8, before, after);
+}
+
 test "viewed state is the queue" {
     var gen = try PrGeneration.init(std.testing.allocator, "head");
     defer gen.deinit();
@@ -121,4 +127,14 @@ test "revision identity includes change type" {
     const b = try revisionKey(std.testing.allocator, "a", "RENAMED", "blob", "diff");
     defer std.testing.allocator.free(b);
     try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "generation replacement identifies changed and removed revisions" {
+    var old = try PrGeneration.init(std.testing.allocator, "h1");
+    defer old.deinit();
+    try old.addFile(.{ .path = "a", .viewed = .unviewed, .revision_key = "r1" });
+    var next = try PrGeneration.init(std.testing.allocator, "h2");
+    defer next.deinit();
+    try next.addFile(.{ .path = "a", .viewed = .unviewed, .revision_key = "r2" });
+    try std.testing.expect(revisionChanged(&old, &next, "a"));
 }

@@ -31,7 +31,8 @@ pub fn commandType(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     };
 }
 
-pub const allowed_commands = [_][]const u8{ "file.open", "session.message", "session.interrupt", "session.close", "action.prepare", "action.confirm", "file.complete", "snapshot.get", "events.poll", "pr.refresh", "round.finish" };
+pub const allowed_commands = [_][]const u8{ "file.open", "session.message", "session.interrupt", "session.close", "action.confirm", "snapshot.get", "pr.refresh", "round.finish" };
+pub const autonomous_events = [_][]const u8{ "session.item.delta", "action.prepared", "action.superseded", "file.completed", "session.closed" };
 pub fn commandAllowed(value: []const u8) bool {
     for (allowed_commands) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
     return false;
@@ -45,4 +46,9 @@ test "domain envelopes are versioned and sequenced" {
     const bytes = try envelopeAlloc(std.testing.allocator, "queue.updated", 7, "{}");
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"seq\":7") != null);
+}
+test "browser cannot bypass model action authority" {
+    try std.testing.expect(!commandAllowed("action.prepare"));
+    try std.testing.expect(!commandAllowed("file.complete"));
+    try std.testing.expect(!commandAllowed("events.poll"));
 }

@@ -843,7 +843,7 @@ pub fn build(b: *std.Build) void {
     test_synoptic.dependOn(&run_synoptic_e2e.step);
     const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
     test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
-    const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the bounded Synoptic lifecycle fixture");
+    const test_synoptic_e2e = b.step("test-synoptic-e2e", "Run the bounded Synoptic lifecycle fixture (network launch proof pending)");
     test_synoptic_e2e.dependOn(&run_synoptic_e2e.step);
     const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
     build_synoptic.dependOn(&synoptic_install.step);

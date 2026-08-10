@@ -48,26 +48,18 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     defer allocator.free(selector_url);
     const identity = try pr.parseUrl(selector_url);
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_resolved, .host = identity.host };
-    var file_pages = try broker.callPages(graphql.snapshot_query, "files", identity.owner, identity.repository, identity.number);
-    defer {
-        for (file_pages.items) |p| allocator.free(p);
-        file_pages.deinit(allocator);
-    }
-    var thread_pages = try broker.callPages(graphql.threads_query, "reviewThreads", identity.owner, identity.repository, identity.number);
-    defer {
-        for (thread_pages.items) |p| allocator.free(p);
-        thread_pages.deinit(allocator);
-    }
-    const snapshot_head = try snapshotField(allocator, file_pages.items[0], "headRefOid");
+    var pages = try broker.readGenerationPages(identity.owner, identity.repository, identity.number);
+    defer pages.deinit();
+    const snapshot_head = try snapshotField(allocator, pages.files.items[0], "headRefOid");
     defer allocator.free(snapshot_head);
-    const snapshot_base = try snapshotField(allocator, file_pages.items[0], "baseRefOid");
+    const snapshot_base = try snapshotField(allocator, pages.files.items[0], "baseRefOid");
     defer allocator.free(snapshot_base);
-    const pull_request_id = try snapshotField(allocator, file_pages.items[0], "id");
+    const pull_request_id = try snapshotField(allocator, pages.files.items[0], "id");
     defer allocator.free(pull_request_id);
     var generation = try domain.PrGeneration.initFull(allocator, snapshot_base, snapshot_head);
     errdefer generation.deinit();
-    for (file_pages.items) |page| try loadSnapshotFiles(allocator, page, &generation);
-    for (thread_pages.items) |page| try loadThreads(allocator, page, &generation);
+    for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
+    for (pages.threads.items) |page| try loadThreads(allocator, page, &generation);
 
     const managed_path = try std.fmt.allocPrint(allocator, "/tmp/synoptic/{d}/worktree", .{std.c.getpid()});
     defer allocator.free(managed_path);
@@ -79,7 +71,7 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     state.replaceGeneration(generation);
     defer state.deinit();
 
-    var registry = try sessions.Registry.start(allocator, review_cwd, codex_resolved);
+    var registry = try sessions.Registry.start(allocator, io, review_cwd, codex_resolved);
     defer registry.deinit();
     try registry.createPrimary(review_cwd);
     state.primary_ready = registry.primaryReady();
@@ -92,11 +84,11 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     var out = std.Io.File.stdout().writer(io, &.{});
     const repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ identity.owner, identity.repository });
     defer allocator.free(repository);
-    if (options.json) try out.interface.print("{{\"schema\":\"synoptic-launch-ready/v1\",\"status\":\"ready\",\"capabilityState\":\"preview\",\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}\n", .{ std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) }) else try out.interface.print("{s}\n", .{url});
+    if (options.json) try out.interface.print("{{\"schema\":\"synoptic-launch-ready/v1\",\"status\":\"ready\",\"capabilityState\":\"preview\",\"lifecycle\":\"owner-lived\",\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}\n", .{ std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) }) else try out.interface.print("{s}\n", .{url});
     try out.interface.flush();
     const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
     defer allocator.free(skill_path);
-    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path };
+    var runtime = http.Runtime{ .app = &state, .registry = &registry, .broker = broker, .owner = identity.owner, .name = identity.repository, .number = identity.number, .pull_request_id = pull_request_id, .cwd = review_cwd, .skill_path = skill_path, .repository_cwd = options.cwd, .custody = custody };
     while (true) {
         state.primary_ready = registry.primaryReady();
         server.serveOne(&runtime) catch |err| switch (err) {
