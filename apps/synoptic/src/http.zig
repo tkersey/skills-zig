@@ -124,6 +124,7 @@ pub const Server = struct {
         var writer = stream.writer(self.io, &.{});
         try writer.interface.writeAll(response);
         try writer.interface.flush();
+        defer runtime.registry.declineAllApprovals("browser-disconnected");
         while (true) {
             const message = readClientTextAllocTimeout(self.allocator, self.io, stream, config.visible_event_flush_ms) catch |err| switch (err) {
                 error.Timeout => {
@@ -153,8 +154,8 @@ pub const Server = struct {
             visible.deinit(self.allocator);
         }
         for (visible.items) |event| {
-            if (event.session_id == null and std.mem.eql(u8, event.method, "file.excluded")) {
-                const envelope = try runtime.app.nextEnvelope("file.excluded", event.raw_json);
+            if ((event.session_id == null and std.mem.eql(u8, event.method, "file.excluded")) or std.mem.eql(u8, event.method, "approval.requested") or std.mem.eql(u8, event.method, "approval.resolved")) {
+                const envelope = try runtime.app.nextEnvelope(event.method, event.raw_json);
                 defer self.allocator.free(envelope);
                 try writeServerText(self.io, stream, envelope);
                 continue;
@@ -273,6 +274,17 @@ pub const Server = struct {
             try runtime.registry.interrupt(payloadString(payload, "sessionId") orelse return error.InvalidUiCommand);
             return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
         }
+        if (std.mem.eql(u8, command, "approval.resolve")) {
+            if (payload.count() != 2 and payload.count() != 3) return error.InvalidUiCommand;
+            const session_id = payloadString(payload, "sessionId");
+            if (payload.count() == 3 and session_id == null) return error.InvalidUiCommand;
+            const approval_id = payloadString(payload, "approvalId") orelse return error.InvalidUiCommand;
+            const decision = payload.get("decision") orelse return error.InvalidUiCommand;
+            const choice_json = try stringifyValueAlloc(self.allocator, decision);
+            defer self.allocator.free(choice_json);
+            try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
+            return runtime.app.nextEnvelope("session.status", "{\"status\":\"approval-resolving\"}");
+        }
         if (std.mem.eql(u8, command, "action.confirm")) {
             if (payload.count() != 1) return error.InvalidUiCommand;
             const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
@@ -324,6 +336,7 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, command, "app.stop")) {
             if (payload.count() != 0) return error.InvalidUiCommand;
+            runtime.registry.declineAllApprovals("shutdown");
             runtime.stop_requested = true;
             return runtime.app.nextEnvelope("app.stopped", "{\"status\":\"stopping\"}");
         }
@@ -387,6 +400,13 @@ fn payloadBool(payload: std.json.ObjectMap, key: []const u8) ?bool {
         .bool => |v| v,
         else => null,
     };
+}
+
+fn stringifyValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
 pub fn pathConfined(root: []const u8, candidate: []const u8) bool {

@@ -257,7 +257,7 @@ pub fn codexSchemaProblemAlloc(allocator: std.mem.Allocator, io: std.Io, codex_p
     defer aggregate_json.deinit();
     var v2_json = std.json.parseFromSlice(std.json.Value, allocator, v2, .{}) catch return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: invalid app-server v2 schema bundle", .{version}));
     defer v2_json.deinit();
-    const methods = [_][]const u8{ "initialize", "initialized", "thread/start", "thread/fork", "turn/start", "turn/steer", "turn/interrupt", "thread/inject_items", "item/tool/call" };
+    const methods = [_][]const u8{ "initialize", "initialized", "thread/start", "thread/fork", "turn/start", "turn/steer", "turn/interrupt", "thread/inject_items", "item/tool/call", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval" };
     for (methods) |method| if (!containsExactString(aggregate_json.value, method) and !containsExactString(v2_json.value, method)) return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: missing app-server surface {s}", .{ version, method }));
     const fork = readSchema(allocator, io, out_dir, "v2/ThreadForkParams.json") catch return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: missing thread/fork schema", .{version}));
     defer allocator.free(fork);
@@ -275,7 +275,40 @@ pub fn codexSchemaProblemAlloc(allocator: std.mem.Allocator, io: std.Io, codex_p
         const bytes = readSchema(allocator, io, out_dir, file) catch return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: missing notification family {s}", .{ version, file }));
         allocator.free(bytes);
     }
+    const approval_schemas = [_]struct { file: []const u8, properties: []const []const u8, required: []const []const u8, values: []const []const u8 }{
+        .{ .file = "CommandExecutionRequestApprovalParams.json", .properties = &.{ "threadId", "availableDecisions" }, .required = &.{"threadId"}, .values = &.{} },
+        .{ .file = "CommandExecutionRequestApprovalResponse.json", .properties = &.{"decision"}, .required = &.{"decision"}, .values = &.{ "accept", "acceptForSession", "decline", "cancel" } },
+        .{ .file = "FileChangeRequestApprovalResponse.json", .properties = &.{"decision"}, .required = &.{"decision"}, .values = &.{"decline"} },
+        .{ .file = "PermissionsRequestApprovalParams.json", .properties = &.{ "threadId", "permissions" }, .required = &.{ "threadId", "permissions" }, .values = &.{} },
+        .{ .file = "PermissionsRequestApprovalResponse.json", .properties = &.{ "permissions", "scope" }, .required = &.{"permissions"}, .values = &.{ "turn", "session" } },
+    };
+    for (approval_schemas) |approval| {
+        const bytes = readSchema(allocator, io, out_dir, approval.file) catch return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: missing approval schema {s}", .{ version, approval.file }));
+        defer allocator.free(bytes);
+        var schema_json = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: invalid approval schema {s}", .{ version, approval.file }));
+        defer schema_json.deinit();
+        if (!approvalSchemaHas(schema_json.value, approval.properties, approval.required, approval.values)) return @as(?[]u8, try std.fmt.allocPrint(allocator, "installed Codex {s}: incompatible approval schema {s}", .{ version, approval.file }));
+    }
     return null;
+}
+
+fn approvalSchemaHas(value: std.json.Value, properties: []const []const u8, required: []const []const u8, values: []const []const u8) bool {
+    if (value != .object) return false;
+    const property_map = value.object.get("properties") orelse return false;
+    if (property_map != .object) return false;
+    for (properties) |name| if (!property_map.object.contains(name)) return false;
+    const required_values = value.object.get("required") orelse return false;
+    if (required_values != .array) return false;
+    for (required) |name| {
+        var found = false;
+        for (required_values.array.items) |item| if (item == .string and std.mem.eql(u8, item.string, name)) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    for (values) |expected| if (!containsExactString(value, expected)) return false;
+    return true;
 }
 
 fn containsExactString(value: std.json.Value, needle: []const u8) bool {
@@ -375,4 +408,41 @@ test "session context installed schema drift names Codex version and missing sur
     defer allocator.free(problem);
     try std.testing.expect(std.mem.indexOf(u8, problem, "codex-test 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, problem, "initialized") != null);
+}
+
+test "command approvals installed schema requires exact request and response surfaces" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const script_path = try std.fs.path.join(allocator, &.{ root, "codex" });
+    defer allocator.free(script_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\if [ "${1:-}" = --version ]; then echo 'codex-test approvals'; exit 0; fi
+        \\out=''
+        \\while [ $# -gt 0 ]; do if [ "$1" = --out ]; then shift; out="$1"; fi; shift; done
+        \\mkdir -p "$out/v2"
+        \\printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
+        \\cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
+        \\printf '%s' '{"lastTurnId":{},"ephemeral":{}}' > "$out/v2/ThreadForkParams.json"
+        \\printf '%s' '{"dynamicTools":{}}' > "$out/v2/ThreadStartParams.json"
+        \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
+        \\for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+        \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
+        \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["accept","acceptForSession","decline","cancel"]}' > "$out/CommandExecutionRequestApprovalResponse.json"
+        \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["decline"]}' > "$out/FileChangeRequestApprovalResponse.json"
+        \\printf '%s' '{"properties":{"threadId":{},"permissions":{}},"required":["threadId","permissions"]}' > "$out/PermissionsRequestApprovalParams.json"
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "codex", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, script_path, std.Io.File.Permissions.fromMode(0o755), .{});
+    const schema = try std.fs.path.join(allocator, &.{ root, "schema" });
+    defer allocator.free(schema);
+    const problem = (try codexSchemaProblemAlloc(allocator, io, script_path, schema)).?;
+    defer allocator.free(problem);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "codex-test approvals") != null);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "PermissionsRequestApprovalResponse.json") != null);
 }

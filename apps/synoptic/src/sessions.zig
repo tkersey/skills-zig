@@ -5,6 +5,10 @@ const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
 pub const safe_boundary_timeout_ms: u32 = 5_000;
+pub const approval_timeout_ms: u32 = 25_000;
+const max_approval_records: usize = 64;
+const max_approval_decisions: usize = 16;
+const max_approval_request_bytes: usize = 512 * 1024;
 const safe_boundary_quiescence_ms: u32 = 50;
 pub const dynamic_tools_json =
     "[{\"type\":\"namespace\",\"name\":\"synoptic\",\"description\":\"Human-directed Synoptic review operations\",\"tools\":[" ++
@@ -77,6 +81,40 @@ const RegistryMutex = struct {
 };
 const TurnRef = struct { thread: []u8, turn: []u8 };
 
+const ApprovalState = enum { pending, resolved, expired };
+const OfferedDecision = struct {
+    choice_json: []u8,
+    result_json: []u8,
+
+    fn deinit(self: OfferedDecision, allocator: std.mem.Allocator) void {
+        allocator.free(self.choice_json);
+        allocator.free(self.result_json);
+    }
+};
+const PendingApproval = struct {
+    id: []u8,
+    session_id: ?[]u8,
+    thread_id: []u8,
+    method: []u8,
+    request_json: []u8,
+    decisions: std.ArrayList(OfferedDecision) = .empty,
+    decline_result_json: []u8,
+    result_json: ?[]u8 = null,
+    state: ApprovalState = .pending,
+
+    fn deinit(self: *PendingApproval, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.session_id) |value| allocator.free(value);
+        allocator.free(self.thread_id);
+        allocator.free(self.method);
+        allocator.free(self.request_json);
+        for (self.decisions.items) |decision| decision.deinit(allocator);
+        self.decisions.deinit(allocator);
+        allocator.free(self.decline_result_json);
+        if (self.result_json) |value| allocator.free(value);
+    }
+};
+
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     actor: ?cas_runtime.Actor = null,
@@ -91,11 +129,15 @@ pub const Registry = struct {
     visible_events: std.ArrayList(VisibleEvent) = .empty,
     active_command_ids: std.ArrayList([]u8) = .empty,
     completed_turn_ids: std.ArrayList([]u8) = .empty,
+    approvals: std.ArrayList(PendingApproval) = .empty,
     synchronizing: bool = false,
     next_session_id: u64 = 1,
+    next_approval_id: u64 = 1,
+    approval_wait_timeout_ms: u32 = approval_timeout_ms,
+    io: ?std.Io = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, codex_path: []const u8) !Registry {
-        var registry = Registry{ .allocator = allocator };
+        var registry = Registry{ .allocator = allocator, .io = io };
         registry.actor = try cas_runtime.Client.startActor(allocator, .{
             .cwd = cwd,
             .io = io,
@@ -110,6 +152,7 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
+        self.declineAllApprovals("shutdown");
         if (self.actor) |*actor| actor.deinit();
         if (self.primary_thread_id) |v| self.allocator.free(v);
         if (self.latest_primary_turn_id) |v| self.allocator.free(v);
@@ -123,6 +166,8 @@ pub const Registry = struct {
         self.active_command_ids.deinit(self.allocator);
         for (self.completed_turn_ids.items) |id| self.allocator.free(id);
         self.completed_turn_ids.deinit(self.allocator);
+        for (self.approvals.items) |*approval| approval.deinit(self.allocator);
+        self.approvals.deinit(self.allocator);
     }
 
     pub fn beginSynchronization(self: *Registry, io: std.Io, timeout_ms: u32) !void {
@@ -132,6 +177,7 @@ pub const Registry = struct {
             return error.SynchronizationAlreadyActive;
         }
         self.synchronizing = true;
+        self.declineApprovalsLocked(null, .resolved, "synchronization");
         var turns: std.ArrayList(TurnRef) = .empty;
         defer {
             for (turns.items) |turn| {
@@ -255,6 +301,7 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
             session.status = .closed;
+            self.declineApprovalsLocked(session_id, .resolved, "session-closed");
             return;
         };
         return error.UnknownSession;
@@ -295,6 +342,36 @@ pub const Registry = struct {
         const owned_json = try self.allocator.dupe(u8, raw_json);
         errdefer self.allocator.free(owned_json);
         try self.visible_events.append(self.allocator, .{ .session_id = null, .method = owned_method, .raw_json = owned_json });
+    }
+
+    pub fn resolveApproval(self: *Registry, session_id: ?[]const u8, approval_id: []const u8, choice_json: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.approvals.items) |*approval| if (std.mem.eql(u8, approval.id, approval_id)) {
+            if ((approval.session_id == null) != (session_id == null)) return error.CrossSessionApproval;
+            if (approval.session_id != null and !std.mem.eql(u8, approval.session_id.?, session_id.?)) return error.CrossSessionApproval;
+            switch (approval.state) {
+                .pending => {},
+                .resolved => return error.ApprovalAlreadyResolved,
+                .expired => return error.ApprovalExpired,
+            }
+            for (approval.decisions.items) |decision| if (std.mem.eql(u8, decision.choice_json, choice_json)) {
+                const result = try self.allocator.dupe(u8, decision.result_json);
+                errdefer self.allocator.free(result);
+                try self.queueApprovalResolvedLocked(approval.*, choice_json, "human");
+                approval.result_json = result;
+                approval.state = .resolved;
+                return;
+            };
+            return error.ApprovalDecisionNotOffered;
+        };
+        return error.UnknownApproval;
+    }
+
+    pub fn declineAllApprovals(self: *Registry, reason: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.declineApprovalsLocked(null, .resolved, reason);
     }
 
     pub fn openFile(self: *Registry, io: std.Io, cwd: []const u8, path: []const u8, revision: []const u8, base_oid: []const u8, head_oid: []const u8, diff: []const u8, threads_json: []const u8, skill_path: []const u8, start_immediately: bool) !OpenResult {
@@ -579,13 +656,9 @@ pub const Registry = struct {
 
     fn onServerRequest(context: *anyopaque, request: cas_runtime.ServerRequest, allocator: std.mem.Allocator) ![]u8 {
         const self: *Registry = @ptrCast(@alignCast(context));
-        if (std.mem.eql(u8, request.method, "item/commandExecution/requestApproval")) {
-            self.mutex.lock();
-            const blocked = self.synchronizing;
-            self.mutex.unlock();
-            if (blocked) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
-        }
+        if (std.mem.eql(u8, request.method, "item/commandExecution/requestApproval") or std.mem.eql(u8, request.method, "item/permissions/requestApproval")) return self.handleApprovalRequest(request, allocator);
         if (std.mem.eql(u8, request.method, "item/fileChange/requestApproval")) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        if (std.mem.eql(u8, request.method, "applyPatchApproval") or std.mem.eql(u8, request.method, "execCommandApproval")) return allocator.dupe(u8, "{\"decision\":{\"denied\":{\"rejection\":\"Synoptic never authorizes direct file changes or deprecated approval requests\"}}}");
         if (std.mem.eql(u8, request.method, "item/tool/call")) {
             if (std.mem.indexOf(u8, request.raw_json, "search_unresolved_threads") != null) return self.searchThreads(request.raw_json, allocator);
             const kind: ?[]const u8 = if (std.mem.indexOf(u8, request.raw_json, "prepare_github_action") != null) "action.prepared" else if (std.mem.indexOf(u8, request.raw_json, "complete_file_review") != null) "file.complete.requested" else if (std.mem.indexOf(u8, request.raw_json, "close_session") != null) "session.close.requested" else null;
@@ -605,6 +678,228 @@ pub const Registry = struct {
             }
         }
         return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+    }
+
+    fn handleApprovalRequest(self: *Registry, request: cas_runtime.ServerRequest, allocator: std.mem.Allocator) ![]u8 {
+        if (request.raw_json.len > max_approval_request_bytes) return allocator.dupe(u8, declineResult(request.method));
+        const io = self.io orelse return allocator.dupe(u8, declineResult(request.method));
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request.raw_json, .{}) catch return allocator.dupe(u8, declineResult(request.method));
+        defer parsed.deinit();
+        const params = if (parsed.value == .object) parsed.value.object.get("params") orelse return allocator.dupe(u8, declineResult(request.method)) else return allocator.dupe(u8, declineResult(request.method));
+        if (params != .object) return allocator.dupe(u8, declineResult(request.method));
+        const thread_value = params.object.get("threadId") orelse return allocator.dupe(u8, declineResult(request.method));
+        if (thread_value != .string) return allocator.dupe(u8, declineResult(request.method));
+
+        self.mutex.lock();
+        if (self.synchronizing) {
+            self.mutex.unlock();
+            return allocator.dupe(u8, declineResult(request.method));
+        }
+        var owner: ?[]const u8 = null;
+        var owner_count: usize = 0;
+        for (self.sessions.items) |session| if (session.status != .closed and std.mem.eql(u8, session.thread_id, thread_value.string)) {
+            owner = session.id;
+            owner_count += 1;
+        };
+        const matches_primary = self.primary_thread_id != null and std.mem.eql(u8, self.primary_thread_id.?, thread_value.string);
+        const primary_owner = owner_count == 0 and matches_primary;
+        if ((owner_count == 1 and matches_primary) or (owner_count != 1 and !primary_owner)) {
+            self.mutex.unlock();
+            return allocator.dupe(u8, declineResult(request.method));
+        }
+        self.pruneApprovalsLocked();
+        if (self.approvals.items.len >= max_approval_records or self.visible_events.items.len >= max_visible_events) {
+            self.mutex.unlock();
+            return allocator.dupe(u8, declineResult(request.method));
+        }
+        var approval = self.makeApprovalLocked(if (primary_owner) null else owner.?, thread_value.string, request.method, request.raw_json, params.object) catch |err| {
+            self.mutex.unlock();
+            return switch (err) {
+                error.MalformedApprovalRequest => allocator.dupe(u8, declineResult(request.method)),
+                else => err,
+            };
+        };
+        var approval_transferred = false;
+        errdefer if (!approval_transferred) approval.deinit(self.allocator);
+        const approval_id = self.allocator.dupe(u8, approval.id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        defer self.allocator.free(approval_id);
+        const requested_payload = self.approvalRequestedPayloadLocked(approval) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        defer self.allocator.free(requested_payload);
+        self.appendVisibleLocked(approval.session_id, "approval.requested", requested_payload) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.approvals.append(self.allocator, approval) catch |err| {
+            const event = self.visible_events.pop().?;
+            event.deinit(self.allocator);
+            self.mutex.unlock();
+            return err;
+        };
+        approval_transferred = true;
+        self.mutex.unlock();
+
+        const started = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        while (true) {
+            self.mutex.lock();
+            var found = false;
+            for (self.approvals.items) |*pending| if (std.mem.eql(u8, pending.id, approval_id)) {
+                found = true;
+                if (pending.result_json) |result| {
+                    const owned = allocator.dupe(u8, result) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    self.mutex.unlock();
+                    return owned;
+                }
+                const now = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+                if (now - started >= self.approval_wait_timeout_ms) {
+                    pending.result_json = self.allocator.dupe(u8, pending.decline_result_json) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    pending.state = .expired;
+                    self.queueApprovalResolvedLocked(pending.*, "\"decline\"", "timeout") catch {};
+                    const owned = allocator.dupe(u8, pending.result_json.?) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    self.mutex.unlock();
+                    return owned;
+                }
+                self.mutex.unlock();
+                std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return allocator.dupe(u8, declineResult(request.method));
+                break;
+            };
+            if (!found) {
+                self.mutex.unlock();
+                return allocator.dupe(u8, declineResult(request.method));
+            }
+        }
+    }
+
+    fn makeApprovalLocked(self: *Registry, session_id: ?[]const u8, thread_id: []const u8, method: []const u8, raw: []const u8, params: std.json.ObjectMap) !PendingApproval {
+        const id = try std.fmt.allocPrint(self.allocator, "apr-{d}", .{self.next_approval_id});
+        errdefer self.allocator.free(id);
+        self.next_approval_id += 1;
+        var approval = PendingApproval{
+            .id = id,
+            .session_id = if (session_id) |value| try self.allocator.dupe(u8, value) else null,
+            .thread_id = undefined,
+            .method = undefined,
+            .request_json = undefined,
+            .decline_result_json = undefined,
+        };
+        errdefer if (approval.session_id) |value| self.allocator.free(value);
+        approval.thread_id = try self.allocator.dupe(u8, thread_id);
+        errdefer self.allocator.free(approval.thread_id);
+        approval.method = try self.allocator.dupe(u8, method);
+        errdefer self.allocator.free(approval.method);
+        approval.request_json = try self.allocator.dupe(u8, raw);
+        errdefer self.allocator.free(approval.request_json);
+        approval.decline_result_json = try self.allocator.dupe(u8, declineResult(method));
+        errdefer self.allocator.free(approval.decline_result_json);
+        errdefer {
+            for (approval.decisions.items) |decision| decision.deinit(self.allocator);
+            approval.decisions.deinit(self.allocator);
+        }
+        if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
+            const available = params.get("availableDecisions");
+            if (available) |choices| switch (choices) {
+                .null => inline for (.{ "accept", "acceptForSession", "decline", "cancel" }) |choice| try self.appendStringDecision(&approval.decisions, choice, true, null),
+                .array => |array| {
+                    if (array.items.len == 0 or array.items.len > max_approval_decisions) return error.MalformedApprovalRequest;
+                    for (array.items) |choice| try self.appendCommandDecision(&approval.decisions, choice);
+                },
+                else => return error.MalformedApprovalRequest,
+            } else inline for (.{ "accept", "acceptForSession", "decline", "cancel" }) |choice| try self.appendStringDecision(&approval.decisions, choice, true, null);
+        } else {
+            const requested = params.get("permissions") orelse return error.MalformedApprovalRequest;
+            if (requested != .object) return error.MalformedApprovalRequest;
+            const requested_json = try stringifyValueAlloc(self.allocator, requested);
+            defer self.allocator.free(requested_json);
+            const accept = try std.fmt.allocPrint(self.allocator, "{{\"permissions\":{s},\"scope\":\"turn\"}}", .{requested_json});
+            defer self.allocator.free(accept);
+            const session = try std.fmt.allocPrint(self.allocator, "{{\"permissions\":{s},\"scope\":\"session\"}}", .{requested_json});
+            defer self.allocator.free(session);
+            try self.appendStringDecision(&approval.decisions, "accept", false, accept);
+            try self.appendStringDecision(&approval.decisions, "acceptForSession", false, session);
+            try self.appendStringDecision(&approval.decisions, "decline", false, "{\"permissions\":{},\"scope\":\"turn\"}");
+        }
+        return approval;
+    }
+
+    fn appendCommandDecision(self: *Registry, decisions: *std.ArrayList(OfferedDecision), value: std.json.Value) !void {
+        const choice = try stringifyValueAlloc(self.allocator, value);
+        errdefer self.allocator.free(choice);
+        const result = try std.fmt.allocPrint(self.allocator, "{{\"decision\":{s}}}", .{choice});
+        errdefer self.allocator.free(result);
+        try decisions.append(self.allocator, .{ .choice_json = choice, .result_json = result });
+    }
+
+    fn appendStringDecision(self: *Registry, decisions: *std.ArrayList(OfferedDecision), choice: []const u8, wrap_command: bool, result_json: ?[]const u8) !void {
+        const choice_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(choice, .{})});
+        errdefer self.allocator.free(choice_json);
+        const result = if (result_json) |value| try self.allocator.dupe(u8, value) else if (wrap_command) try std.fmt.allocPrint(self.allocator, "{{\"decision\":{s}}}", .{choice_json}) else return error.MissingApprovalResult;
+        errdefer self.allocator.free(result);
+        try decisions.append(self.allocator, .{ .choice_json = choice_json, .result_json = result });
+    }
+
+    fn approvalRequestedPayloadLocked(self: *Registry, approval: PendingApproval) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        try out.writer.print("{{\"approvalId\":{f},\"ownerKind\":{f},\"sessionId\":{f},\"threadId\":{f},\"method\":{f},\"request\":{s},\"decisions\":[", .{ std.json.fmt(approval.id, .{}), std.json.fmt(if (approval.session_id == null) "primary" else "file", .{}), std.json.fmt(approval.session_id, .{}), std.json.fmt(approval.thread_id, .{}), std.json.fmt(approval.method, .{}), approval.request_json });
+        for (approval.decisions.items, 0..) |decision, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll(decision.choice_json);
+        }
+        try out.writer.writeAll("]}");
+        return out.toOwnedSlice();
+    }
+
+    fn queueApprovalResolvedLocked(self: *Registry, approval: PendingApproval, choice_json: []const u8, reason: []const u8) !void {
+        const payload = try std.fmt.allocPrint(self.allocator, "{{\"approvalId\":{f},\"ownerKind\":{f},\"sessionId\":{f},\"decision\":{s},\"reason\":{f}}}", .{ std.json.fmt(approval.id, .{}), std.json.fmt(if (approval.session_id == null) "primary" else "file", .{}), std.json.fmt(approval.session_id, .{}), choice_json, std.json.fmt(reason, .{}) });
+        defer self.allocator.free(payload);
+        try self.appendVisibleLocked(approval.session_id, "approval.resolved", payload);
+    }
+
+    fn declineApprovalsLocked(self: *Registry, session_id: ?[]const u8, state: ApprovalState, reason: []const u8) void {
+        for (self.approvals.items) |*approval| {
+            if (approval.state != .pending or (session_id != null and (approval.session_id == null or !std.mem.eql(u8, approval.session_id.?, session_id.?)))) continue;
+            approval.result_json = self.allocator.dupe(u8, approval.decline_result_json) catch continue;
+            approval.state = state;
+            self.queueApprovalResolvedLocked(approval.*, "\"decline\"", reason) catch {};
+        }
+    }
+
+    fn pruneApprovalsLocked(self: *Registry) void {
+        while (self.approvals.items.len >= max_approval_records) {
+            var removable: ?usize = null;
+            for (self.approvals.items, 0..) |approval, index| if (approval.state != .pending) {
+                removable = index;
+                break;
+            };
+            const index = removable orelse return;
+            var removed = self.approvals.orderedRemove(index);
+            removed.deinit(self.allocator);
+        }
+    }
+
+    fn appendVisibleLocked(self: *Registry, session_id: ?[]const u8, method: []const u8, raw_json: []const u8) !void {
+        if (self.visible_events.items.len >= max_visible_events) return error.VisibleEventLimitExceeded;
+        const owned_session = if (session_id) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_session) |value| self.allocator.free(value);
+        const owned_method = try self.allocator.dupe(u8, method);
+        errdefer self.allocator.free(owned_method);
+        const owned_json = try self.allocator.dupe(u8, raw_json);
+        errdefer self.allocator.free(owned_json);
+        try self.visible_events.append(self.allocator, .{ .session_id = owned_session, .method = owned_method, .raw_json = owned_json });
     }
 
     fn recordCommandActivity(self: *Registry, method: []const u8, raw: []const u8) void {
@@ -722,6 +1017,20 @@ fn authorityCovers(granted: ?HumanAuthority, requested: HumanAuthority) bool {
     const value = granted orelse return false;
     return value == requested or (value == .github_any and requested != .complete and requested != .close);
 }
+
+fn declineResult(method: []const u8) []const u8 {
+    return if (std.mem.eql(u8, method, "item/permissions/requestApproval"))
+        "{\"permissions\":{},\"scope\":\"turn\"}"
+    else
+        "{\"decision\":\"decline\"}";
+}
+
+fn stringifyValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or needle.len > haystack.len) return false;
     for (0..haystack.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
@@ -779,4 +1088,135 @@ test "explicit broad GitHub operation grants generic action authority without or
     try std.testing.expectEqual(HumanAuthority.close, classifyHumanInstruction("close this session").?);
     try std.testing.expect(classifyHumanInstruction("which labels are already on this pull request?") == null);
     try std.testing.expect(classifyHumanInstruction("tell me how to add a label to the pull request") == null);
+}
+
+const ApprovalInvocation = struct {
+    registry: *Registry,
+    method: []const u8,
+    raw: []const u8,
+    response: ?[]u8 = null,
+
+    fn run(self: *ApprovalInvocation) void {
+        const request = cas_runtime.ServerRequest{ .id = .{ .string = "server-request" }, .method = self.method, .raw_json = self.raw };
+        self.response = Registry.onServerRequest(self.registry, request, std.heap.page_allocator) catch null;
+    }
+};
+
+fn appendApprovalTestSession(registry: *Registry, id: []const u8, thread: []const u8) !void {
+    try registry.sessions.append(registry.allocator, .{
+        .id = try registry.allocator.dupe(u8, id),
+        .thread_id = try registry.allocator.dupe(u8, thread),
+        .turn_id = try registry.allocator.dupe(u8, "turn"),
+        .path = try registry.allocator.dupe(u8, "a.zig"),
+        .revision = try registry.allocator.dupe(u8, "r1"),
+        .initial_turn_active = false,
+        .turn_active = true,
+    });
+}
+
+fn waitForApproval(registry: *Registry) !void {
+    for (0..200) |_| {
+        registry.mutex.lock();
+        const pending = registry.approvals.items.len > 0 and registry.approvals.items[registry.approvals.items.len - 1].state == .pending;
+        registry.mutex.unlock();
+        if (pending) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    return error.ExpectedApprovalMissing;
+}
+
+test "command approvals block for exact offered decision and reject spoof duplicate and invented choices" {
+    var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    var invocation = ApprovalInvocation{
+        .registry = &registry,
+        .method = "item/commandExecution/requestApproval",
+        .raw = "{\"id\":7,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"file-1\",\"turnId\":\"turn\",\"itemId\":\"cmd\",\"startedAtMs\":1,\"command\":\"make test\",\"availableDecisions\":[\"accept\",\"decline\"]}}",
+    };
+    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
+    try waitForApproval(&registry);
+    try std.testing.expectError(error.CrossSessionApproval, registry.resolveApproval("ses-2", "apr-1", "\"accept\""));
+    try std.testing.expectError(error.ApprovalDecisionNotOffered, registry.resolveApproval("ses-1", "apr-1", "\"invented\""));
+    try registry.resolveApproval("ses-1", "apr-1", "\"accept\"");
+    thread.join();
+    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"decision\":\"accept\"}", invocation.response.?);
+    try std.testing.expectError(error.ApprovalAlreadyResolved, registry.resolveApproval("ses-1", "apr-1", "\"accept\""));
+}
+
+test "command approvals permissions grant only the exact requested carrier and scope" {
+    var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    var invocation = ApprovalInvocation{
+        .registry = &registry,
+        .method = "item/permissions/requestApproval",
+        .raw = "{\"id\":8,\"method\":\"item/permissions/requestApproval\",\"params\":{\"threadId\":\"file-1\",\"turnId\":\"turn\",\"itemId\":\"permission\",\"startedAtMs\":1,\"cwd\":\"/repo\",\"permissions\":{\"network\":{\"enabled\":true}}}}",
+    };
+    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
+    try waitForApproval(&registry);
+    try registry.resolveApproval("ses-1", "apr-1", "\"acceptForSession\"");
+    thread.join();
+    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"permissions\":{\"network\":{\"enabled\":true}},\"scope\":\"session\"}", invocation.response.?);
+    registry.approval_wait_timeout_ms = 5;
+    const decline = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 9 }, .method = invocation.method, .raw_json = invocation.raw }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(decline);
+    try std.testing.expectEqualStrings("{\"permissions\":{},\"scope\":\"turn\"}", decline);
+}
+
+test "command approvals timeout close and synchronization conservatively decline" {
+    var timed = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io, .approval_wait_timeout_ms = 5 };
+    defer timed.deinit();
+    try appendApprovalTestSession(&timed, "ses-1", "file-1");
+    const request = cas_runtime.ServerRequest{ .id = .{ .integer = 1 }, .method = "item/commandExecution/requestApproval", .raw_json = "{\"id\":1,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"file-1\",\"turnId\":\"turn\",\"itemId\":\"cmd\",\"startedAtMs\":1,\"availableDecisions\":[\"accept\",\"decline\"]}}" };
+    const timeout_response = try Registry.onServerRequest(&timed, request, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(timeout_response);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", timeout_response);
+    try std.testing.expectError(error.ApprovalExpired, timed.resolveApproval("ses-1", "apr-1", "\"accept\""));
+
+    var closed = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer closed.deinit();
+    try appendApprovalTestSession(&closed, "ses-1", "file-1");
+    var invocation = ApprovalInvocation{ .registry = &closed, .method = request.method, .raw = request.raw_json };
+    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
+    try waitForApproval(&closed);
+    try closed.closeSession("ses-1");
+    thread.join();
+    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", invocation.response.?);
+
+    var syncing = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer syncing.deinit();
+    try appendApprovalTestSession(&syncing, "ses-1", "file-1");
+    syncing.sessions.items[0].turn_active = false;
+    var sync_invocation = ApprovalInvocation{ .registry = &syncing, .method = request.method, .raw = request.raw_json };
+    const sync_thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&sync_invocation});
+    try waitForApproval(&syncing);
+    try syncing.beginSynchronization(std.testing.io, 100);
+    syncing.endSynchronization();
+    sync_thread.join();
+    defer if (sync_invocation.response) |response| std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", sync_invocation.response.?);
+}
+
+test "command approvals direct file change deprecated and unowned requests hard decline without browser events" {
+    var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer registry.deinit();
+    const file = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 1 }, .method = "item/fileChange/requestApproval", .raw_json = "{}" }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(file);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", file);
+    const deprecated = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 2 }, .method = "applyPatchApproval", .raw_json = "{}" }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(deprecated);
+    try std.testing.expect(std.mem.indexOf(u8, deprecated, "denied") != null);
+    const unowned = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 3 }, .method = "item/commandExecution/requestApproval", .raw_json = "{\"params\":{\"threadId\":\"primary\",\"availableDecisions\":[\"accept\",\"decline\"]}}" }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(unowned);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", unowned);
+    registry.primary_thread_id = try std.heap.page_allocator.dupe(u8, "shared");
+    try appendApprovalTestSession(&registry, "ses-1", "shared");
+    const ambiguous = try Registry.onServerRequest(&registry, .{ .id = .{ .integer = 4 }, .method = "item/commandExecution/requestApproval", .raw_json = "{\"params\":{\"threadId\":\"shared\",\"availableDecisions\":[\"accept\",\"decline\"]}}" }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(ambiguous);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", ambiguous);
+    try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
 }

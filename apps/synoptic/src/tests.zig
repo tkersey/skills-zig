@@ -191,21 +191,30 @@ fn fakeCodexScript() []const u8 {
     \\  out=''
     \\  while [ "$#" -gt 0 ]; do if [ "$1" = "--out" ] || [ "$1" = "-o" ]; then shift; out="$1"; fi; shift; done
     \\  mkdir -p "$out/v2"
-    \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call"]}' > "$out/codex_app_server_protocol.schemas.json"
+    \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
     \\  cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
     \\  printf '%s' '{"lastTurnId":{},"ephemeral":{}}' > "$out/v2/ThreadForkParams.json"
     \\  printf '%s' '{"dynamicTools":{}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
     \\  for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+    \\  printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
+    \\  printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["accept","acceptForSession","decline","cancel"]}' > "$out/CommandExecutionRequestApprovalResponse.json"
+    \\  printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["decline"]}' > "$out/FileChangeRequestApprovalResponse.json"
+    \\  printf '%s' '{"properties":{"threadId":{},"permissions":{}},"required":["threadId","permissions"]}' > "$out/PermissionsRequestApprovalParams.json"
+    \\  printf '%s' '{"properties":{"permissions":{},"scope":{}},"required":["permissions"],"values":["turn","session"]}' > "$out/PermissionsRequestApprovalResponse.json"
     \\  exit 0
     \\fi
     \\forks=0
+    \\primary_turns=0
     \\while IFS= read -r line; do
     \\  printf '%s\n' "$line" >> "$0.log"
     \\  case "$line" in
     \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
     \\    *'"method":"initialized"'*) continue ;;
     \\    *'"id":"tool-'*) continue ;;
+    \\    *'"id":"approval-command"'*) printf '%s' "$line" | grep -q '"decision":"accept"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn"}}}'; continue ;;
+    \\    *'"id":"approval-file-change"'*) printf '%s' "$line" | grep -q '"decision":"decline"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn"}}}'; continue ;;
+    \\    *'"id":"approval-primary"'*) printf '%s' "$line" | grep -Eq '"decision":"(accept|decline)"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn"}}}'; continue ;;
     \\  esac
     \\  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
     \\  case "$line" in
@@ -215,7 +224,12 @@ fn fakeCodexScript() []const u8 {
     \\    *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     \\    *'"method":"turn/start"'*)
     \\      if printf '%s' "$line" | grep -q '"threadId":"primary"'; then
+    \\        primary_turns=$((primary_turns + 1))
     \\        printf '{"id":%s,"result":{"turn":{"id":"primary-turn"}}}\n' "$id"
+    \\        if [ "$primary_turns" -gt 1 ]; then
+    \\          printf '%s\n' '{"id":"approval-primary","method":"item/commandExecution/requestApproval","params":{"threadId":"primary","turnId":"primary-turn","itemId":"primary-cmd","startedAtMs":1,"command":"git log --oneline","availableDecisions":["accept","decline"]}}'
+    \\          continue
+    \\        fi
     \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn"}}}'
     \\      else
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
@@ -228,6 +242,12 @@ fn fakeCodexScript() []const u8 {
     \\          printf '{"id":"tool-close","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.close_session","arguments":{}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'search cross-file'; then
     \\          printf '{"id":"tool-search","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.search_unresolved_threads","arguments":{"query":"risk","paths":[],"includeWholePullRequest":true}}}\n' "$thread_id"
+    \\        elif printf '%s' "$line" | grep -q 'run approved command'; then
+    \\          printf '{"id":"approval-command","method":"item/commandExecution/requestApproval","params":{"threadId":"%s","turnId":"file-turn","itemId":"cmd-1","startedAtMs":1,"command":"make test","availableDecisions":["accept","decline"]}}\n' "$thread_id"
+    \\          continue
+    \\        elif printf '%s' "$line" | grep -q 'attempt file change'; then
+    \\          printf '{"id":"approval-file-change","method":"item/fileChange/requestApproval","params":{"threadId":"%s","turnId":"file-turn","itemId":"patch-1","reason":"write"}}\n' "$thread_id"
+    \\          continue
     \\        else
     \\          printf '{"method":"item/agentMessage/delta","params":{"threadId":"%s","delta":"review visible"}}\n' "$thread_id"
     \\        fi
@@ -1227,6 +1247,41 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
         std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
     }
     try std.testing.expect(search_seen);
+    try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"run approved command\",\"active\":false}}");
+    const approval_turn = try readUntil(allocator, io, &stream, "turn-started");
+    defer allocator.free(approval_turn);
+    const approval = try readUntil(allocator, io, &stream, "\"type\":\"approval.requested\"");
+    defer allocator.free(approval);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "apr-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "make test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "\"decisions\":[\"accept\",\"decline\"]") != null);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-1\",\"approvalId\":\"apr-999\",\"decision\":\"accept\"}}");
+    const unknown_approval = try readUntil(allocator, io, &stream, "UnknownApproval");
+    defer allocator.free(unknown_approval);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-2\",\"approvalId\":\"apr-1\",\"decision\":\"accept\"}}");
+    const cross_session = try readUntil(allocator, io, &stream, "CrossSessionApproval");
+    defer allocator.free(cross_session);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"invented\"}}");
+    const invented = try readUntil(allocator, io, &stream, "ApprovalDecisionNotOffered");
+    defer allocator.free(invented);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"accept\"}}");
+    const resolved = try readUntil(allocator, io, &stream, "\"type\":\"approval.resolved\"");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"decision\":\"accept\"") != null);
+    const approval_complete = try readUntil(allocator, io, &stream, "turn/completed");
+    defer allocator.free(approval_complete);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"accept\"}}");
+    const duplicate = try readUntil(allocator, io, &stream, "ApprovalAlreadyResolved");
+    defer allocator.free(duplicate);
+    try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"attempt file change\",\"active\":false}}");
+    const file_change_turn = try readUntil(allocator, io, &stream, "turn-started");
+    defer allocator.free(file_change_turn);
+    const file_change_complete = try readUntil(allocator, io, &stream, "turn/completed");
+    defer allocator.free(file_change_complete);
+    const approval_log = try std.Io.Dir.cwd().readFileAlloc(io, codex_log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(approval_log);
+    try std.testing.expect(std.mem.indexOf(u8, approval_log, "\"id\":\"approval-command\",\"result\":{\"decision\":\"accept\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval_log, "\"id\":\"approval-file-change\",\"result\":{\"decision\":\"decline\"}") != null);
     try sendMaskedText(io, &stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId\":\"ses-1\",\"text\":\"prepare the comment\",\"active\":false}}");
     const status = try readUntil(allocator, io, &stream, "turn-started");
     defer allocator.free(status);
@@ -1282,6 +1337,17 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     try sendMaskedText(io, &stream, "{\"type\":\"pr.refresh\",\"payload\":{}}");
     const refreshed = try readUntil(allocator, io, &stream, "\"type\":\"pr.refreshed\"");
     defer allocator.free(refreshed);
+    const primary_approval = try readUntil(allocator, io, &stream, "\"ownerKind\":\"primary\"");
+    defer allocator.free(primary_approval);
+    try std.testing.expect(std.mem.indexOf(u8, primary_approval, "\"sessionId\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, primary_approval, "git log --oneline") != null);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"sessionId\":\"ses-1\",\"approvalId\":\"apr-2\",\"decision\":\"accept\"}}");
+    const primary_spoof = try readUntil(allocator, io, &stream, "CrossSessionApproval");
+    defer allocator.free(primary_spoof);
+    try sendMaskedText(io, &stream, "{\"type\":\"approval.resolve\",\"payload\":{\"approvalId\":\"apr-2\",\"decision\":\"accept\"}}");
+    const primary_resolved = try readUntil(allocator, io, &stream, "\"type\":\"approval.resolved\"");
+    defer allocator.free(primary_resolved);
+    try std.testing.expect(std.mem.indexOf(u8, primary_resolved, "\"ownerKind\":\"primary\"") != null);
     try std.testing.expect(state.generation.queued("a.zig"));
     try std.testing.expectEqual(domain.SessionStatus.stale_origin, state.tabs.items[0].status);
     try std.testing.expectEqual(sessions.SessionStatus.stale_origin, registry.sessions.items[0].status);
@@ -1299,6 +1365,17 @@ test "e2e real loopback masked websocket and fake Codex stream normalized review
     stream.close(io);
     thread.join();
     first_joined = true;
+    var disconnect_declined = false;
+    for (0..100) |_| {
+        const disconnect_log = try std.Io.Dir.cwd().readFileAlloc(io, codex_log_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(disconnect_log);
+        if (std.mem.indexOf(u8, disconnect_log, "\"id\":\"approval-primary\",\"result\":{\"decision\":\"decline\"}") != null) {
+            disconnect_declined = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(disconnect_declined);
     var reconnect_fixture = NetworkFixture{ .server = &server, .runtime = &runtime };
     const reconnect_thread = try std.Thread.spawn(.{}, NetworkFixture.serve, .{&reconnect_fixture});
     var reconnect = try address.connect(io, .{ .mode = .stream });
