@@ -450,6 +450,7 @@ fn collectProbeState(
                 cache_root,
                 cwd,
                 schemas.executable.resolved_path,
+                options.profile,
             ) catch |err| isolatedFailures(err));
         }
     }
@@ -1092,8 +1093,13 @@ fn finalModelSseAlloc(allocator: std.mem.Allocator) ![]u8 {
 
 fn reviewModelSseAlloc(allocator: std.mem.Allocator) ![]u8 {
     const review =
-        "{\"findings\":[],\"overall_correctness\":\"patch is correct\"," ++
-        "\"overall_explanation\":\"CAS structured-review capability probe completed.\"," ++
+        "{\"findings\":[{\"title\":\"[P2] Deterministic capability probe\"," ++
+        "\"body\":\"Exercises the complete structured finding shape.\"," ++
+        "\"confidence_score\":1.0,\"priority\":2,\"code_location\":{" ++
+        "\"absolute_file_path\":\"/cas/structured-review-probe.zig\"," ++
+        "\"line_range\":{\"start\":1,\"end\":1}}}]," ++
+        "\"overall_correctness\":\"patch is incorrect\"," ++
+        "\"overall_explanation\":\"The deterministic finding is intentional.\"," ++
         "\"overall_confidence_score\":1.0}";
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -1685,6 +1691,7 @@ fn runIsolatedFullProbes(
     cache_root: []const u8,
     cwd: []const u8,
     codex_path: []const u8,
+    profile: contract.Profile,
 ) !FeatureWitnesses {
     const nonce: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
     const requested_codex_home = try std.fmt.allocPrint(
@@ -1702,34 +1709,44 @@ fn runIsolatedFullProbes(
     defer allocator.free(ready_path);
     const evidence_path = try std.fs.path.join(allocator, &.{ codex_home, "model.evidence.json" });
     defer allocator.free(evidence_path);
-    const self_path = try std.process.executablePathAlloc(io, allocator);
-    defer allocator.free(self_path);
-    var model_fixture = try spawnInternalModelFixture(
-        allocator,
-        io,
-        parent_environment,
-        self_path,
-        cwd,
-        ready_path,
-        evidence_path,
-        .structured_review,
-        null,
-    );
-    var model_fixture_running = true;
-    defer if (model_fixture_running) model_fixture.kill(io);
-    const model_base_url_raw = try waitForBoundedFileAlloc(
-        allocator,
-        io,
-        ready_path,
-        1024,
-        5_000,
-    );
-    defer allocator.free(model_base_url_raw);
+    const review_required = profile == .review or profile == .full;
+    var model_fixture: ?std.process.Child = null;
+    var model_fixture_running = false;
+    defer if (model_fixture_running) model_fixture.?.kill(io);
+    var model_base_url_raw: ?[]u8 = null;
+    defer if (model_base_url_raw) |value| allocator.free(value);
+    if (review_required) {
+        const self_path = try std.process.executablePathAlloc(io, allocator);
+        defer allocator.free(self_path);
+        model_fixture = try spawnInternalModelFixture(
+            allocator,
+            io,
+            parent_environment,
+            self_path,
+            cwd,
+            ready_path,
+            evidence_path,
+            .structured_review,
+            null,
+        );
+        model_fixture_running = true;
+        model_base_url_raw = try waitForBoundedFileAlloc(
+            allocator,
+            io,
+            ready_path,
+            1024,
+            5_000,
+        );
+    }
+    const model_base_url = if (model_base_url_raw) |value|
+        std.mem.trim(u8, value, " \t\r\n")
+    else
+        "http://127.0.0.1:1/v1";
     try createIsolatedProbeConfig(
         allocator,
         io,
         codex_home,
-        std.mem.trim(u8, model_base_url_raw, " \t\r\n"),
+        model_base_url,
     );
 
     var child_environment = try parent_environment.clone(allocator);
@@ -1769,9 +1786,13 @@ fn runIsolatedFullProbes(
         executor_manifest,
         executor_resource,
     );
-    if (witnesses.structured_review.status != .passed) {
-        model_fixture.kill(io);
+    if (review_required and witnesses.structured_review.status != .passed) {
+        model_fixture.?.kill(io);
         model_fixture_running = false;
+        try std.Io.Dir.cwd().deleteTree(io, codex_home);
+        return witnesses;
+    }
+    if (!review_required) {
         try std.Io.Dir.cwd().deleteTree(io, codex_home);
         return witnesses;
     }
@@ -1784,7 +1805,7 @@ fn runIsolatedFullProbes(
     );
     defer allocator.free(evidence);
     if (!try modelEvidencePassed(allocator, evidence)) return error.ModelFixtureFailed;
-    const term = try model_fixture.wait(io);
+    const term = try model_fixture.?.wait(io);
     model_fixture_running = false;
     if (term != .exited or term.exited != 0) return error.ModelFixtureFailed;
     try std.Io.Dir.cwd().deleteTree(io, codex_home);

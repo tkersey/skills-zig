@@ -545,10 +545,16 @@ fn structuredReviewTerminalProbe(
         "production thread/read parameters could not be encoded",
     );
     defer allocator.free(read_params);
-    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    const started_ms: i64 = @intCast(@divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    ));
+    const deadline_ms = started_ms + structured_review_probe_timeout_ms;
+    const previous_deadline_ms = client.swapRequestDeadlineMs(deadline_ms);
+    defer _ = client.swapRequestDeadlineMs(previous_deadline_ms);
     while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
-        const read_json = client.requestJson("thread/read", read_params) catch {
-            if (emptyRolloutReadPending(client.lastError())) {
+        const read_json = client.requestJson("thread/read", read_params) catch |err| {
+            if (err == error.RequestFailed) {
                 const now_ms = @divFloor(
                     std.Io.Clock.awake.now(io).nanoseconds,
                     1_000_000,
@@ -565,6 +571,10 @@ fn structuredReviewTerminalProbe(
                 );
                 continue;
             }
+            if (err == error.ConnectionTimedOut) return LiveWitness.failed(
+                "structured_review_completion_timeout",
+                "the deterministic structured review did not complete within the probe bound",
+            );
             return LiveWitness.failed(
                 "structured_review_terminal_read_failed",
                 "thread/read could not observe the completed review turn",
@@ -591,12 +601,6 @@ fn structuredReviewTerminalProbe(
             "the bounded structured-review completion poll failed",
         );
     }
-}
-
-fn emptyRolloutReadPending(last_error: ?[]const u8) bool {
-    const message = last_error orelse return false;
-    return std.mem.indexOf(u8, message, "rollout at ") != null and
-        std.mem.indexOf(u8, message, " is empty") != null;
 }
 
 pub fn executorSkillResourcesProbe(
@@ -2153,7 +2157,10 @@ fn completedReviewTurnState(
             .limited(8 * 1024 * 1024),
         ) catch return .pending;
         defer allocator.free(rollout);
-        return if (rolloutHasValidReviewOutput(allocator, rollout)) .passed else .pending;
+        return if (rolloutHasValidReviewOutput(allocator, rollout, expected_turn_id))
+            .passed
+        else
+            .pending;
     }
     return .pending;
 }
@@ -2177,7 +2184,14 @@ fn reviewModeItemsComplete(turn: std.json.ObjectMap) bool {
     return entered and exited;
 }
 
-fn rolloutHasValidReviewOutput(allocator: std.mem.Allocator, raw: []const u8) bool {
+fn rolloutHasValidReviewOutput(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    expected_turn_id: []const u8,
+) bool {
+    var active_turn_matches = false;
+    var saw_expected_turn = false;
+    var matching_outputs: usize = 0;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -2187,39 +2201,107 @@ fn rolloutHasValidReviewOutput(allocator: std.mem.Allocator, raw: []const u8) bo
             .object => |value| value,
             else => continue,
         };
+        if (objectStringEquals(root, "type", "turn_context")) {
+            const payload_value = root.get("payload") orelse return false;
+            const payload = switch (payload_value) {
+                .object => |value| value,
+                else => return false,
+            };
+            const turn_value = payload.get("turn_id") orelse return false;
+            const turn_id = switch (turn_value) {
+                .string => |value| value,
+                else => return false,
+            };
+            active_turn_matches = std.mem.eql(u8, turn_id, expected_turn_id);
+            saw_expected_turn = saw_expected_turn or active_turn_matches;
+            continue;
+        }
         if (!objectStringEquals(root, "type", "event_msg")) continue;
         const payload_value = root.get("payload") orelse continue;
         const payload = switch (payload_value) {
             .object => |value| value,
             else => continue,
         };
+        const event_turn_matches = if (payload.get("turn_id")) |turn_value| blk: {
+            const turn_id = switch (turn_value) {
+                .string => |value| value,
+                else => return false,
+            };
+            const matches = std.mem.eql(u8, turn_id, expected_turn_id);
+            saw_expected_turn = saw_expected_turn or matches;
+            break :blk matches;
+        } else active_turn_matches;
+        if (!event_turn_matches) continue;
         if (!objectStringEquals(payload, "type", "exited_review_mode")) continue;
         const output_value = payload.get("review_output") orelse continue;
         const output = switch (output_value) {
             .object => |value| value,
             else => continue,
         };
-        if (validReviewOutput(output)) return true;
+        if (!validReviewOutput(output)) return false;
+        matching_outputs += 1;
+        if (matching_outputs > 1) return false;
     }
-    return false;
+    return saw_expected_turn and matching_outputs == 1;
 }
 
 fn validReviewOutput(output: std.json.ObjectMap) bool {
-    const findings = output.get("findings") orelse return false;
-    if (findings != .array) return false;
-    const correctness = output.get("overall_correctness") orelse return false;
-    if (correctness != .string or
-        (!std.mem.eql(u8, correctness.string, "patch is correct") and
-            !std.mem.eql(u8, correctness.string, "patch is incorrect"))) return false;
-    const explanation = output.get("overall_explanation") orelse return false;
-    if (explanation != .string or explanation.string.len == 0) return false;
-    const confidence = output.get("overall_confidence_score") orelse return false;
-    const score: f64 = switch (confidence) {
-        .integer => |value| @floatFromInt(value),
-        .float => |value| value,
+    const findings_value = output.get("findings") orelse return false;
+    const findings = switch (findings_value) {
+        .array => |value| value,
         else => return false,
     };
-    return score >= 0 and score <= 1;
+    if (findings.items.len != 1) return false;
+    const finding = switch (findings.items[0]) {
+        .object => |value| value,
+        else => return false,
+    };
+    if (!nonEmptyStringField(finding, "title") or
+        !nonEmptyStringField(finding, "body") or
+        !unitNumberField(finding, "confidence_score")) return false;
+    const priority = finding.get("priority") orelse return false;
+    if (priority != .integer or priority.integer < 0 or priority.integer > 3) return false;
+    const location_value = finding.get("code_location") orelse return false;
+    const location = switch (location_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const path_value = location.get("absolute_file_path") orelse return false;
+    if (path_value != .string or !std.fs.path.isAbsolute(path_value.string)) return false;
+    const range_value = location.get("line_range") orelse return false;
+    const range = switch (range_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const start = positiveIntegerField(range, "start") orelse return false;
+    const end = positiveIntegerField(range, "end") orelse return false;
+    if (end < start) return false;
+    const correctness = output.get("overall_correctness") orelse return false;
+    if (correctness != .string or
+        !std.mem.eql(u8, correctness.string, "patch is incorrect")) return false;
+    return nonEmptyStringField(output, "overall_explanation") and
+        unitNumberField(output, "overall_confidence_score");
+}
+
+fn nonEmptyStringField(object: std.json.ObjectMap, field: []const u8) bool {
+    const value = object.get(field) orelse return false;
+    return value == .string and std.mem.trim(u8, value.string, " \t\r\n").len > 0;
+}
+
+fn unitNumberField(object: std.json.ObjectMap, field: []const u8) bool {
+    const value = object.get(field) orelse return false;
+    const number: f64 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => return false,
+    };
+    return number >= 0 and number <= 1;
+}
+
+fn positiveIntegerField(object: std.json.ObjectMap, field: []const u8) ?i64 {
+    const value = object.get(field) orelse return null;
+    if (value != .integer or value.integer <= 0) return null;
+    return value.integer;
 }
 
 fn row(
@@ -2574,13 +2656,43 @@ test "structured review terminal read requires completed rollout review output" 
     defer allocator.free(root);
     const rollout_path = try std.fs.path.join(allocator, &.{ root, "review.jsonl" });
     defer allocator.free(rollout_path);
+    const review_event =
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"type\":\"exited_review_mode\",\"review_output\":{" ++
+        "\"findings\":[{\"title\":\"[P2] probe\",\"body\":\"complete shape\"," ++
+        "\"confidence_score\":1,\"priority\":2,\"code_location\":{" ++
+        "\"absolute_file_path\":\"/cas/probe.zig\",\"line_range\":{" ++
+        "\"start\":1,\"end\":1}}}],\"overall_correctness\":\"patch is incorrect\"," ++
+        "\"overall_explanation\":\"intentional\",\"overall_confidence_score\":1}}}";
+    const rollout = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-other\"}}}}\n" ++
+            "{s}\n{{\"type\":\"turn_context\",\"payload\":{{" ++
+            "\"turn_id\":\"turn-review\"}}}}\n{s}\n",
+        .{ review_event, review_event },
+    );
+    defer allocator.free(rollout);
     try tmp.dir.writeFile(io, .{
         .sub_path = "review.jsonl",
-        .data = "{\"type\":\"event_msg\",\"payload\":{" ++
-            "\"type\":\"exited_review_mode\",\"review_output\":{" ++
-            "\"findings\":[],\"overall_correctness\":\"patch is correct\"," ++
-            "\"overall_explanation\":\"clean\",\"overall_confidence_score\":1}}}\n",
+        .data = rollout,
     });
+    try std.testing.expect(rolloutHasValidReviewOutput(
+        allocator,
+        rollout,
+        "turn-review",
+    ));
+    try std.testing.expect(!rolloutHasValidReviewOutput(
+        allocator,
+        rollout,
+        "turn-missing",
+    ));
+    const duplicate = try std.fmt.allocPrint(allocator, "{s}{s}\n", .{ rollout, review_event });
+    defer allocator.free(duplicate);
+    try std.testing.expect(!rolloutHasValidReviewOutput(
+        allocator,
+        duplicate,
+        "turn-review",
+    ));
     const completed = try std.fmt.allocPrint(
         allocator,
         "{{\"thread\":{{\"path\":\"{s}\",\"turns\":[{{" ++
