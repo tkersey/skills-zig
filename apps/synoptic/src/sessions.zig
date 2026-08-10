@@ -281,7 +281,7 @@ pub const Registry = struct {
         }
         self.mutex.lock();
         for (self.sessions.items) |*session| {
-            if (session.status == .current and std.mem.eql(u8, session.path, path) and !std.mem.eql(u8, session.revision, revision)) {
+            if ((session.status == .current or session.status == .completed) and std.mem.eql(u8, session.path, path) and !std.mem.eql(u8, session.revision, revision)) {
                 session.status = .stale_origin;
                 threads.append(self.allocator, self.allocator.dupe(u8, session.thread_id) catch {
                     self.mutex.unlock();

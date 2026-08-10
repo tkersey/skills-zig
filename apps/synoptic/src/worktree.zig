@@ -47,10 +47,14 @@ pub fn cleanupAllowed(custody: Custody) bool {
     return custody == .managed;
 }
 
+pub fn requireManagedRefresh(custody: Custody) !void {
+    if (custody != .managed) return error.ReusedCheckoutRefreshRequiresManagedMigration;
+}
+
 /// Advances only a Synoptic-owned detached worktree. Reused user checkouts are
 /// deliberately excluded from this mutation boundary.
 pub fn synchronizeManaged(allocator: std.mem.Allocator, io: std.Io, custody: Custody, repository_cwd: []const u8, head_oid: []const u8) !void {
-    if (custody != .managed) return error.ReusedCheckoutRefreshRequiresManagedMigration;
+    try requireManagedRefresh(custody);
     const fetch = try std.process.run(allocator, io, .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", head_oid }, .cwd = .{ .path = repository_cwd } });
     defer allocator.free(fetch.stdout);
     defer allocator.free(fetch.stderr);

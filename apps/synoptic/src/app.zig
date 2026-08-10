@@ -43,7 +43,7 @@ pub const App = struct {
         self.generation = next;
         for (self.tabs.items) |*tab| {
             if (domain.revisionFor(&next, tab.path)) |revision| {
-                if (!std.mem.eql(u8, tab.revision, revision) and tab.status == .current) tab.status = .stale_origin;
+                if (!std.mem.eql(u8, tab.revision, revision) and (tab.status == .current or tab.status == .completed)) tab.status = .stale_origin;
             }
         }
     }
@@ -174,6 +174,11 @@ pub const App = struct {
         for (self.tabs.items, 0..) |tab, i| {
             if (i > 0) try out.writer.writeByte(',');
             try out.writer.print("{{\"id\":{f},\"path\":{f},\"revision\":{f},\"status\":{f}}}", .{ std.json.fmt(tab.id, .{}), std.json.fmt(tab.path, .{}), std.json.fmt(tab.revision, .{}), std.json.fmt(@tagName(tab.status), .{}) });
+        }
+        try out.writer.writeAll("],\"actions\":[");
+        for (self.action_store.cards.items, 0..) |card, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.print("{{\"id\":{f},\"slot\":{f},\"path\":{f},\"line\":{d},\"body\":{f},\"status\":{f}}}", .{ std.json.fmt(card.id, .{}), std.json.fmt(card.slot, .{}), std.json.fmt(card.path, .{}), card.line, std.json.fmt(card.body, .{}), std.json.fmt(@tagName(card.status), .{}) });
         }
         try out.writer.print("],\"completedTabOpen\":{},\"seq\":{d},\"round\":{d}}}", .{ self.completed_tab_open, self.seq, self.round });
         return out.toOwnedSlice();

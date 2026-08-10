@@ -19,6 +19,7 @@ pub const Runtime = struct {
     skill_path: []const u8,
     repository_cwd: []const u8,
     custody: worktree.Custody,
+    refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
 };
 
 pub const max_header_bytes = 32 * 1024;
@@ -285,6 +286,7 @@ pub const Server = struct {
     }
 
     fn refresh(self: *Server, runtime: *Runtime) !void {
+        if (runtime.refresh_override) |run| return run(runtime);
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         errdefer next.deinit();
         try worktree.synchronizeManaged(self.allocator, self.io, runtime.custody, runtime.repository_cwd, next.head_oid);

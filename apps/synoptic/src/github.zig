@@ -11,8 +11,10 @@ pub const Broker = struct {
     pub fn call(self: Broker, document: []const u8, variables: []const u8) ![]u8 {
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
+        const argv = [_][]const u8{ self.gh_path, "api", "graphql", "--hostname", self.host, "--input", "-" };
+        if (!hasFixedArgv(&argv)) return error.InvalidGitHubBrokerArgv;
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ self.gh_path, "api", "graphql", "--hostname", self.host, "--input", "-" },
+            .argv = &argv,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,

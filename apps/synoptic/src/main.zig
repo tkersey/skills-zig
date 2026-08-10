@@ -30,7 +30,7 @@ fn printCapabilities(io: std.Io, args: []const []const u8) !void {
     const json = args.len == 2 and std.mem.eql(u8, args[0], "--format") and std.mem.eql(u8, args[1], "json");
     if (!json and args.len != 0) return error.InvalidArguments;
     var out = std.Io.File.stdout().writer(io, &.{});
-    if (json) try out.interface.print("{{\"synopticCapabilities\":{{\"version\":{f},\"platform\":\"macos\",\"skillAbi\":\"{s}\",\"uiAbi\":\"{s}\",\"features\":{{\"casRuntimeV1\":true,\"githubViewedQueueV1\":false,\"ephemeralFileSessionsV1\":false,\"githubActionCardsV1\":false,\"verticalSlicePreviewV1\":true}}}}}}\n", .{ std.json.fmt(app_meta.version, .{}), config.skill_abi, config.ui_abi }) else try out.interface.print("synoptic {s}\n{s}\n{s}\n", .{ app_meta.version, config.skill_abi, config.ui_abi });
+    if (json) try out.interface.print("{{\"synopticCapabilities\":{{\"version\":{f},\"platform\":\"macos\",\"skillAbi\":\"{s}\",\"uiAbi\":\"{s}\",\"features\":{{\"casRuntimeV1\":true,\"githubViewedQueueV1\":true,\"ephemeralFileSessionsV1\":true,\"githubActionCardsV1\":true}}}}}}\n", .{ std.json.fmt(app_meta.version, .{}), config.skill_abi, config.ui_abi }) else try out.interface.print("synoptic {s}\n{s}\n{s}\n", .{ app_meta.version, config.skill_abi, config.ui_abi });
     try out.interface.flush();
 }
 
@@ -84,7 +84,7 @@ fn launch(allocator: std.mem.Allocator, io: std.Io, environment: *const std.proc
     var out = std.Io.File.stdout().writer(io, &.{});
     const repository = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ identity.owner, identity.repository });
     defer allocator.free(repository);
-    if (options.json) try out.interface.print("{{\"schema\":\"synoptic-launch-ready/v1\",\"status\":\"ready\",\"capabilityState\":\"preview\",\"lifecycle\":\"owner-lived\",\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}\n", .{ std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) }) else try out.interface.print("{s}\n", .{url});
+    if (options.json) try out.interface.print("{{\"schema\":\"synoptic-launch-ready/v1\",\"status\":\"ready\",\"capabilityState\":\"ready\",\"lifecycle\":\"owner-lived\",\"pid\":{d},\"url\":{f},\"repository\":{f},\"pullRequest\":{d},\"worktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio\"}}\n", .{ std.c.getpid(), std.json.fmt(url, .{}), std.json.fmt(repository, .{}), identity.number, std.json.fmt(review_cwd, .{}), std.json.fmt(custody.kind(), .{}) }) else try out.interface.print("{s}\n", .{url});
     try out.interface.flush();
     const skill_path = try std.fs.path.join(allocator, &.{ options.skill_root, "SKILL.md" });
     defer allocator.free(skill_path);

@@ -25,14 +25,14 @@ originating session. Model preparation is rejected during the initial review;
 same-slot cards supersede immutably; completion requires mark-viewed plus an
 independent `VIEWED` read-back; close stays local.
 
-The distributable feature flags remain disabled. The current E2E now drives the
-real loopback server with a masked WebSocket client and a spawned fake Codex,
-including primary completion, file fork/review streaming, explicit-session
-messaging, and a model-originated action card. Refresh now re-queries independent
-file/thread pages, advances only managed custody, injects changed-file deltas,
-replaces the queue generation, and starts a background primary update.
+The native capability flags are enabled. The real loopback fixture uses masked
+WebSocket clients plus spawned fake Codex and fake `gh` processes to prove the
+primary gate, file forks and streamed reviews, model-originated immutable cards,
+exact fixed-argv inline-comment confirmation, explicit completion with independent
+`VIEWED` read-back, and close-without-viewed-mutation behavior.
 
-The fixture does not yet spawn a fake `gh` to prove confirmed-comment mutation,
-VIEWED read-back completion, changed-revision refresh, finish-round, and reconnect
-through the same network path. Those missing effects keep the viewed-queue,
-ephemeral-session, and action-card capability flags false.
+The same fixture also proves managed-custody refresh reconciliation, stale-origin
+delta injection, a fresh official revision session, Finish-round increment, and
+reconnect snapshots containing the queue, tabs, cards, and round. Production
+refresh continues to re-query file and thread pagination independently and refuses
+to mutate a reused user checkout.
