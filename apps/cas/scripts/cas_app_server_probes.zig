@@ -3,6 +3,7 @@ const contract = @import("cas_app_server_contract");
 const proxy = @import("cas_proxy_client");
 const inquiry_anchor = @import("cas_session_inquiry_anchor");
 const structured_review_probe_timeout_ms: i64 = 15_000;
+const structured_review_materialization_grace_ms: i64 = 2_000;
 
 pub const ProbeStatus = enum { passed, failed, unavailable, not_applicable };
 
@@ -508,9 +509,15 @@ pub fn structuredReviewProbe(
         "review/start parameters could not be encoded",
     );
     defer allocator.free(review_params);
-    const review_json = client.requestJson(
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+    const review_json = client.requestJsonCaptureNotifications(
         "review/start",
         review_params,
+        &notifications,
     ) catch return LiveWitness.failed(
         "structured_review_start_failed",
         "review/start did not enter the structured inline review path",
@@ -527,16 +534,23 @@ pub fn structuredReviewProbe(
             "and in-progress turn",
     );
     defer allocator.free(turn_id);
-    return structuredReviewTerminalProbe(allocator, io, client, cwd, thread_id, turn_id);
+    return structuredReviewTerminalProbe(
+        allocator,
+        io,
+        client,
+        thread_id,
+        turn_id,
+        &notifications,
+    );
 }
 
 fn structuredReviewTerminalProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
     client: *proxy.Client,
-    cwd: []const u8,
     thread_id: []const u8,
     turn_id: []const u8,
+    notifications: *std.ArrayList([]u8),
 ) LiveWitness {
     const read_params = stringifyAnyAlloc(allocator, .{
         .threadId = thread_id,
@@ -546,25 +560,39 @@ fn structuredReviewTerminalProbe(
         "production thread/read parameters could not be encoded",
     );
     defer allocator.free(read_params);
-    const started_ms: i64 = @intCast(@divFloor(
-        std.Io.Clock.awake.now(io).nanoseconds,
-        1_000_000,
-    ));
-    const deadline_ms = started_ms + structured_review_probe_timeout_ms;
+    const deadline_ms = monotonicMilliseconds(io) + structured_review_probe_timeout_ms;
     const previous_deadline_ms = client.swapRequestDeadlineMs(deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_deadline_ms);
-    const completion = waitForReviewCompletionNotification(
-        allocator,
-        io,
-        client,
-        cwd,
-        thread_id,
-        turn_id,
-        deadline_ms,
-    );
-    if (completion.status != .passed) return completion;
+    var completion_observed_ms: ?i64 = null;
     while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
-        const read_json = client.requestJson("thread/read", read_params) catch |err| {
+        const read_json = client.requestJsonCaptureNotifications(
+            "thread/read",
+            read_params,
+            notifications,
+        ) catch |err| {
+            const notification_state = reviewCompletionNotificationState(
+                notifications.items,
+                thread_id,
+                turn_id,
+            );
+            if (notification_state == .failed) return LiveWitness.failed(
+                "structured_review_turn_failed",
+                "the exact structured review turn terminated without completion",
+            );
+            const now_ms = monotonicMilliseconds(io);
+            if (notification_state == .passed and completion_observed_ms == null) {
+                completion_observed_ms = now_ms;
+            }
+            if (err == error.RequestFailed and
+                (completion_observed_ms == null or
+                    now_ms - completion_observed_ms.? <
+                        structured_review_materialization_grace_ms))
+            {
+                if (now_ms >= deadline_ms) return structuredReviewTimeout();
+                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
+                    return structuredReviewPollFailed();
+                continue;
+            }
             if (err == error.ConnectionTimedOut) return LiveWitness.failed(
                 "structured_review_completion_timeout",
                 "the deterministic structured review did not complete within the probe bound",
@@ -575,86 +603,60 @@ fn structuredReviewTerminalProbe(
             );
         };
         defer allocator.free(read_json);
+        const notification_state = reviewCompletionNotificationState(
+            notifications.items,
+            thread_id,
+            turn_id,
+        );
+        if (notification_state == .failed) return LiveWitness.failed(
+            "structured_review_turn_failed",
+            "the exact structured review turn terminated without completion",
+        );
+        const now_ms = monotonicMilliseconds(io);
+        if (notification_state == .passed and completion_observed_ms == null) {
+            completion_observed_ms = now_ms;
+        }
         switch (completedReviewTurnState(allocator, io, read_json, turn_id)) {
-            .passed => return LiveWitness.passed(),
+            .passed => if (notification_state == .passed) return LiveWitness.passed(),
             .failed => return LiveWitness.failed(
                 "structured_review_terminal_shape_failed",
                 "the exact review turn did not complete with exited_review_mode.review_output",
             ),
             .pending => {},
         }
-        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
-        if (now_ms - started_ms >= structured_review_probe_timeout_ms) {
-            return LiveWitness.failed(
-                "structured_review_completion_timeout",
-                "the deterministic structured review did not complete within the probe bound",
-            );
+        if (completion_observed_ms) |observed_ms| {
+            if (now_ms - observed_ms >= structured_review_materialization_grace_ms) {
+                return LiveWitness.failed(
+                    "structured_review_terminal_read_failed",
+                    "thread/read did not materialize the completed review within the grace bound",
+                );
+            }
         }
-        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
-            "structured_review_poll_failed",
-            "the bounded structured-review completion poll failed",
-        );
+        if (now_ms >= deadline_ms) return structuredReviewTimeout();
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
+            return structuredReviewPollFailed();
     }
 }
 
-fn waitForReviewCompletionNotification(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    client: *proxy.Client,
-    cwd: []const u8,
-    thread_id: []const u8,
-    turn_id: []const u8,
-    deadline_ms: i64,
-) LiveWitness {
-    const list_params = threadListParamsAlloc(allocator, cwd, false) catch
-        return LiveWitness.failed(
-            "structured_review_poll_encode_failed",
-            "thread/list poll parameters could not be encoded",
-        );
-    defer allocator.free(list_params);
-    var notifications: std.ArrayList([]u8) = .empty;
-    defer {
-        for (notifications.items) |line| allocator.free(line);
-        notifications.deinit(allocator);
-    }
-    while (!deadlineExpired(io, deadline_ms)) { // tiger: event-loop -- bounded by deadline_ms.
-        const list_json = client.requestJsonCaptureNotifications(
-            "thread/list",
-            list_params,
-            &notifications,
-        ) catch |err| {
-            if (err == error.ConnectionTimedOut) break;
-            return LiveWitness.failed(
-                "structured_review_completion_poll_failed",
-                "thread/list could not observe structured review completion",
-            );
-        };
-        allocator.free(list_json);
-        switch (reviewCompletionNotificationState(notifications.items, thread_id, turn_id)) {
-            .passed => return LiveWitness.passed(),
-            .failed => return LiveWitness.failed(
-                "structured_review_turn_failed",
-                "the exact structured review turn terminated without completion",
-            ),
-            .pending => {},
-        }
-        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return LiveWitness.failed(
-            "structured_review_poll_failed",
-            "the bounded structured-review completion poll failed",
-        );
-    }
+fn structuredReviewTimeout() LiveWitness {
     return LiveWitness.failed(
         "structured_review_completion_timeout",
         "the deterministic structured review did not complete within the probe bound",
     );
 }
 
-fn deadlineExpired(io: std.Io, deadline_ms: i64) bool {
-    const now_ms: i64 = @intCast(@divFloor(
+fn structuredReviewPollFailed() LiveWitness {
+    return LiveWitness.failed(
+        "structured_review_poll_failed",
+        "the bounded structured-review completion poll failed",
+    );
+}
+
+fn monotonicMilliseconds(io: std.Io) i64 {
+    return @intCast(@divFloor(
         std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     ));
-    return now_ms >= deadline_ms;
 }
 
 pub fn executorSkillResourcesProbe(
