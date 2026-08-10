@@ -1920,7 +1920,8 @@ fn inspectShapes(
             continue;
         };
         if (!schemaKindIsCompatible(node.*, expected_kind, expected_nullable) or
-            !requiredNamesPresent(shape, node.*) or !enumValuesPresent(shape, node.*))
+            !requiredNamesPresent(shape, node.*) or !enumValuesPresent(shape, node.*) or
+            !referenceTargetMatches(shape, node.*))
         {
             try appendUnique(allocator, failures, id);
         }
@@ -2236,6 +2237,41 @@ fn enumValuesPresent(selector: std.json.Value, schema: std.json.Value) bool {
     return true;
 }
 
+fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool {
+    const selector_object = switch (selector) {
+        .object => |value| value,
+        else => return false,
+    };
+    const expected_value = selector_object.get("refEquals") orelse return true;
+    const expected = switch (expected_value) {
+        .string => |value| value,
+        else => return false,
+    };
+    const schema_object = switch (schema) {
+        .object => |value| value,
+        else => return false,
+    };
+    if (schema_object.get("$ref")) |reference| {
+        return reference == .string and std.mem.eql(u8, reference.string, expected);
+    }
+    for ([_][]const u8{ "anyOf", "oneOf", "allOf" }) |union_name| {
+        const union_value = schema_object.get(union_name) orelse continue;
+        const variants = switch (union_value) {
+            .array => |value| value,
+            else => return false,
+        };
+        for (variants.items) |variant| {
+            const object = switch (variant) {
+                .object => |value| value,
+                else => continue,
+            };
+            const reference = object.get("$ref") orelse continue;
+            if (reference == .string and std.mem.eql(u8, reference.string, expected)) return true;
+        }
+    }
+    return false;
+}
+
 fn documentBytes(bundle: SchemaBundle, name: []const u8) ![]const u8 {
     if (bundle.documents.len > max_documents) return error.SchemaTooLarge;
     for (bundle.documents) |document| if (std.mem.eql(u8, document.name, name)) {
@@ -2311,7 +2347,7 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const stable_profile_shapes =
@@ -2645,6 +2681,8 @@ test "stable obligations remain fail closed within their selected profiles" {
         "TurnCompletedNotification",
         &.{ .review, .full },
     );
+    try expectStableShapeProfiles(&baseline.value, "TurnStatus", &.{ .review, .full });
+    try expectStableShapeProfiles(&baseline.value, "custom", &.{ .review, .full });
     try expectStableShapeProfiles(&baseline.value, "ReviewDelivery", &.{ .review, .full });
     try expectPolicyDriftAllProfiles(&baseline.value);
 }
