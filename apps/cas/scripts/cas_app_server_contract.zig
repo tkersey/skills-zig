@@ -2962,7 +2962,11 @@ test "schema cache admission is independent of Codex version and release channel
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5" }, 0..) |version_text, index| {
-        const executable = try std.fmt.allocPrint(allocator, "{s}/fake-codex-{d}", .{ root, index });
+        const executable = try std.fmt.allocPrint(
+            allocator,
+            "{s}/fake-codex-{d}",
+            .{ root, index },
+        );
         defer allocator.free(executable);
         const log_path = try std.fmt.allocPrint(allocator, "{s}/log-{d}", .{ root, index });
         defer allocator.free(log_path);
