@@ -9,7 +9,10 @@ pub const LaunchOptions = struct {
     skill_root: []const u8,
     pr: ?[]const u8 = null,
     json: bool = false,
+    no_browser: bool = false,
 };
+
+pub const max_page_count: usize = 10_000;
 
 pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ skill_root, "assets", "ui", "manifest.json" });

@@ -16,6 +16,8 @@ pub const App = struct {
     open_path: ?[]u8 = null,
     completed_tab_open: bool = false,
     pending: ?tools.ActionCard = null,
+    official_revision: ?[]u8 = null,
+    initial_review_active: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{ .allocator = allocator, .generation = try .init(allocator, head) };
@@ -23,6 +25,16 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         self.generation.deinit();
         if (self.open_path) |p| self.allocator.free(p);
+        if (self.official_revision) |r| self.allocator.free(r);
+    }
+
+    pub fn replaceGeneration(self: *App, next: domain.PrGeneration) void {
+        self.generation.deinit(); self.generation = next;
+        if (self.open_path) |path| for (next.files.items) |file| if (std.mem.eql(u8, path, file.path)) {
+            if (self.official_revision) |revision| {
+                if (!std.mem.eql(u8, revision, file.revision_key)) self.completed_tab_open = false;
+            }
+        };
     }
 
     pub fn openFile(self: *App, path: []const u8) ![]u8 {
@@ -30,13 +42,16 @@ pub const App = struct {
         if (!self.generation.queued(path)) return error.FileNotQueued;
         if (self.open_path) |old| self.allocator.free(old);
         self.open_path = try self.allocator.dupe(u8, path);
+        if (self.official_revision) |old| self.allocator.free(old);
+        for (self.generation.files.items) |file| if (std.mem.eql(u8, file.path, path)) { self.official_revision = try self.allocator.dupe(u8, file.revision_key); break; };
+        self.initial_review_active = true;
         self.seq += 1;
         const payload = try std.fmt.allocPrint(self.allocator, "{{\"path\":{f},\"initialReview\":true}}", .{std.json.fmt(path, .{})}); defer self.allocator.free(payload);
         return ui.envelopeAlloc(self.allocator, "session.opened", self.seq, payload);
     }
 
     pub fn prepareInline(self: *App, path: []const u8, line: u32, body: []const u8, human_directed: bool) !void {
-        if (!tools.initialReviewMayPrepareAction(false, human_directed)) return error.HumanDirectionRequired;
+        try tools.authorizeTool(if (self.initial_review_active) .initial_review else .conversation, human_directed);
         const card = tools.ActionCard{ .id = "act-1", .slot = "finding-1", .path = path, .line = line, .body = body };
         try tools.validateInline(card, self.open_path orelse return error.NoOpenSession);
         self.pending = card;
@@ -54,10 +69,13 @@ pub const App = struct {
         broker.allocator.free(response); card.status = .succeeded; self.pending = card;
     }
 
-    pub fn complete(self: *App, broker: github.Broker, pull_request_id: []const u8, path: []const u8, human_directed: bool) !void {
+    pub fn complete(self: *App, broker: github.Broker, owner: []const u8, name: []const u8, number: u64, pull_request_id: []const u8, path: []const u8, human_directed: bool) !void {
         if (!human_directed) return error.HumanDirectionRequired;
         if (self.open_path == null or !std.mem.eql(u8, self.open_path.?, path) or !self.generation.queued(path)) return error.NotOfficialCurrentSession;
+        const revision = self.official_revision orelse return error.NotOfficialCurrentSession;
+        for (self.generation.files.items) |file| if (std.mem.eql(u8, file.path, path) and !std.mem.eql(u8, file.revision_key, revision)) return error.StaleOriginSession;
         try broker.markViewed(pull_request_id, path);
+        if (!try broker.viewedAfterMutation(owner, name, number, self.generation.head_oid, path)) return error.MarkViewedReadbackFailed;
         try self.generation.markViewed(path);
         self.completed_tab_open = true;
     }
@@ -65,7 +83,10 @@ pub const App = struct {
     pub fn close(self: *App) void {
         if (self.open_path) |p| self.allocator.free(p);
         self.open_path = null;
+        self.initial_review_active = false;
     }
+
+    pub fn nextEnvelope(self: *App, event_type: []const u8, payload: []const u8) ![]u8 { self.seq += 1; return ui.envelopeAlloc(self.allocator, event_type, self.seq, payload); }
 
     pub fn bootstrapAlloc(self: *App) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.allocator); errdefer out.deinit();
@@ -75,7 +96,7 @@ pub const App = struct {
             if (!first) try out.writer.writeByte(','); first = false;
             try out.writer.print("{{\"path\":{f},\"additions\":{d},\"deletions\":{d}}}", .{std.json.fmt(file.path, .{}), file.additions, file.deletions});
         };
-        try out.writer.print("],\"completedTabOpen\":{}}}", .{self.completed_tab_open});
+        try out.writer.print("],\"completedTabOpen\":{},\"seq\":{d}}}", .{ self.completed_tab_open, self.seq });
         return out.toOwnedSlice();
     }
 };

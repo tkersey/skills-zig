@@ -19,7 +19,17 @@ pub fn parseUrl(raw: []const u8) !Identity {
     return .{ .owner = owner, .repository = repo, .number = number };
 }
 
+pub fn parseSelector(raw: []const u8, context_owner: ?[]const u8, context_repository: ?[]const u8) !Identity {
+    if (std.mem.startsWith(u8, raw, "https://")) return parseUrl(raw);
+    const number = std.fmt.parseInt(u64, raw, 10) catch return error.SelectorRequiresGhResolution;
+    return .{ .owner = context_owner orelse return error.RepositoryContextRequired, .repository = context_repository orelse return error.RepositoryContextRequired, .number = number };
+}
+
 test "canonical PR URL" {
     const id = try parseUrl("https://github.com/o/r/pull/42");
     try std.testing.expectEqual(@as(u64, 42), id.number);
+}
+
+test "numeric selector uses repository context" {
+    const id = try parseSelector("7", "o", "r"); try std.testing.expectEqual(@as(u64, 7), id.number);
 }

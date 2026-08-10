@@ -36,6 +36,34 @@ pub const Broker = struct {
         defer self.allocator.free(vars);
         const response = try self.call(graphql.mark_viewed_mutation, vars); defer self.allocator.free(response);
     }
+
+    pub fn callPages(self: Broker, document: []const u8, connection: []const u8, owner: []const u8, name: []const u8, number: u64) !std.ArrayList([]u8) {
+        var pages: std.ArrayList([]u8) = .empty; errdefer { for (pages.items) |page| self.allocator.free(page); pages.deinit(self.allocator); }
+        var cursor: ?[]u8 = null; defer if (cursor) |c| self.allocator.free(c);
+        while (true) {
+            const cursor_json = if (cursor) |c| try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{c}) else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(cursor_json);
+            const vars = try std.fmt.allocPrint(self.allocator, "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{s}}}", .{ std.json.fmt(owner, .{}), std.json.fmt(name, .{}), number, cursor_json });
+            defer self.allocator.free(vars);
+            const page = try self.call(document, vars); try pages.append(self.allocator, page);
+            const next = try graphql.pageCursor(self.allocator, page, connection);
+            if (cursor) |old| self.allocator.free(old);
+            cursor = next;
+            if (cursor == null) break;
+        }
+        return pages;
+    }
+
+    pub fn viewedAfterMutation(self: Broker, owner: []const u8, name: []const u8, number: u64, expected_head: []const u8, path: []const u8) !bool {
+        var pages = try self.callPages(graphql.file_state_query, "files", owner, name, number); defer { for (pages.items) |p| self.allocator.free(p); pages.deinit(self.allocator); }
+        for (pages.items) |page| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{}); defer parsed.deinit();
+            const pull = (((parsed.value.object.get("data").?).object.get("repository").?).object.get("pullRequest").?).object;
+            if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head)) return error.PullRequestChanged;
+            for (pull.get("files").?.object.get("nodes").?.array.items) |node| if (std.mem.eql(u8, node.object.get("path").?.string, path)) return std.mem.eql(u8, node.object.get("viewerViewedState").?.string, "VIEWED");
+        }
+        return false;
+    }
 };
 
 pub fn hasFixedArgv(argv: []const []const u8) bool {

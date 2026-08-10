@@ -1,5 +1,19 @@
 const std = @import("std");
 const App = @import("app.zig").App;
+const github = @import("github.zig");
+const sessions = @import("sessions.zig");
+
+pub const Runtime = struct {
+    app: *App,
+    registry: *sessions.Registry,
+    broker: github.Broker,
+    owner: []const u8,
+    name: []const u8,
+    number: u64,
+    pull_request_id: []const u8,
+    cwd: []const u8,
+    skill_path: []const u8,
+};
 
 pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
@@ -22,7 +36,7 @@ pub const Server = struct {
     pub fn port(self: *const Server) u16 { return self.listener.socket.address.getPort(); }
     pub fn tokenHex(self: *const Server, out: *[64]u8) []const u8 { return std.fmt.bufPrint(out, "{x}", .{self.token}) catch unreachable; }
 
-    pub fn serveOne(self: *Server, app: *App) !void {
+    pub fn serveOne(self: *Server, runtime: *Runtime) !void {
         var stream = try self.listener.accept(self.io); defer stream.close(self.io);
         var buf: [max_header_bytes]u8 = undefined; var used: usize = 0;
         while (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n") == null) {
@@ -32,10 +46,10 @@ pub const Server = struct {
         const raw = buf[0..used];
         const target = requestTarget(raw) orelse return error.InvalidHttpRequest;
         var token_buf: [64]u8 = undefined; const token = self.tokenHex(&token_buf);
-        if (std.mem.startsWith(u8, target, "/ws?")) return self.upgradeWebSocket(&stream, raw, token, app);
+        if (std.mem.startsWith(u8, target, "/ws?")) return self.upgradeWebSocket(&stream, raw, token, runtime);
         if (!authorized(target, raw, token)) return writeResponse(self.io, &stream, "403 Forbidden", "text/plain", "forbidden", false);
         if (std.mem.startsWith(u8, target, "/api/bootstrap")) {
-            const body = try app.bootstrapAlloc(); defer self.allocator.free(body);
+            const body = try runtime.app.bootstrapAlloc(); defer self.allocator.free(body);
             return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
         }
         if (std.mem.startsWith(u8, target, "/healthz") or std.mem.startsWith(u8, target, "/readyz"))
@@ -61,7 +75,7 @@ pub const Server = struct {
         try writeResponse(self.io, stream, "200 OK", content_type, body, true);
     }
 
-    fn upgradeWebSocket(self: *Server, stream: *std.Io.net.Stream, raw: []const u8, token: []const u8, app: *App) !void {
+    fn upgradeWebSocket(self: *Server, stream: *std.Io.net.Stream, raw: []const u8, token: []const u8, runtime: *Runtime) !void {
         const target = requestTarget(raw) orelse return error.InvalidHttpRequest;
         if (!authorized(target, raw, token) or !loopbackOrigin(raw, self.port())) return writeResponse(self.io, stream, "403 Forbidden", "text/plain", "forbidden", false);
         const key = headerValue(raw, "sec-websocket-key") orelse return writeResponse(self.io, stream, "400 Bad Request", "text/plain", "missing websocket key", false);
@@ -73,43 +87,52 @@ pub const Server = struct {
         for (0..64) |_| {
             const message = readClientTextAlloc(self.allocator, self.io, stream) catch return;
             defer self.allocator.free(message);
-            const reply = self.handleCommandAlloc(app, message) catch |err| try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"schema\":\"synoptic-ui/v1\",\"type\":\"error\",\"seq\":0,\"payload\":{{\"code\":{f}}}}}",
-                .{std.json.fmt(@errorName(err), .{})},
-            );
+            const reply = self.handleCommandAlloc(runtime, message) catch |err| error_reply: {
+                const payload = try std.fmt.allocPrint(self.allocator, "{{\"code\":{f}}}", .{std.json.fmt(@errorName(err), .{})}); defer self.allocator.free(payload);
+                break :error_reply try runtime.app.nextEnvelope("error", payload);
+            };
             defer self.allocator.free(reply);
             try writeServerText(self.io, stream, reply);
         }
     }
 
-    fn handleCommandAlloc(self: *Server, app: *App, raw: []const u8) ![]u8 {
+    fn handleCommandAlloc(self: *Server, runtime: *Runtime, raw: []const u8) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{}); defer parsed.deinit();
         const root = switch (parsed.value) { .object => |o| o, else => return error.InvalidUiCommand };
         const command = switch (root.get("type") orelse return error.InvalidUiCommand) { .string => |s| s, else => return error.InvalidUiCommand };
         const payload = switch (root.get("payload") orelse return error.InvalidUiCommand) { .object => |o| o, else => return error.InvalidUiCommand };
         if (std.mem.eql(u8, command, "file.open")) {
             const path = switch (payload.get("path") orelse return error.InvalidUiCommand) { .string => |s| s, else => return error.InvalidUiCommand };
-            return app.openFile(path);
+            const event = try runtime.app.openFile(path); self.allocator.free(event);
+            const revision = runtime.app.official_revision orelse return error.MissingRevision;
+            const reused = try runtime.registry.openFile(runtime.cwd, path, revision, runtime.app.generation.base_oid, runtime.app.generation.head_oid, payloadString(payload, "diff") orelse "", payloadString(payload, "threads") orelse "[]", runtime.skill_path);
+            return runtime.app.nextEnvelope("session.opened", if (reused) "{\"initialReview\":false,\"reused\":true}" else "{\"initialReview\":true,\"reused\":false}");
         }
         if (std.mem.eql(u8, command, "session.close")) {
-            app.close();
-            return @import("ui_protocol.zig").envelopeAlloc(self.allocator, "session.closed", 1, "{}");
+            runtime.app.close();
+            return runtime.app.nextEnvelope("session.closed", "{}");
         }
-        if (std.mem.eql(u8, command, "session.message")) return @import("ui_protocol.zig").envelopeAlloc(self.allocator, "session.status", 1, "{\"status\":\"turn-started\"}");
-        if (std.mem.eql(u8, command, "session.interrupt")) return @import("ui_protocol.zig").envelopeAlloc(self.allocator, "session.status", 1, "{\"status\":\"interrupted\"}");
+        if (std.mem.eql(u8, command, "session.message")) { runtime.app.initial_review_active = false; try runtime.registry.message(payloadString(payload, "text") orelse return error.InvalidUiCommand, false); return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}"); }
+        if (std.mem.eql(u8, command, "session.interrupt")) { try runtime.registry.interrupt(); return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}"); }
+        if (std.mem.eql(u8, command, "action.prepare")) { try runtime.app.prepareInline(payloadString(payload, "path") orelse return error.InvalidUiCommand, @intCast(payload.get("line").?.integer), payloadString(payload, "body") orelse return error.InvalidUiCommand, true); return runtime.app.nextEnvelope("action.prepared", "{\"id\":\"act-1\",\"status\":\"pending\"}"); }
+        if (std.mem.eql(u8, command, "action.confirm")) { try runtime.app.confirmInline(runtime.broker, runtime.pull_request_id, runtime.app.generation.head_oid); return runtime.app.nextEnvelope("action.status", "{\"id\":\"act-1\",\"status\":\"succeeded\"}"); }
+        if (std.mem.eql(u8, command, "file.complete")) { const path = payloadString(payload, "path") orelse return error.InvalidUiCommand; try runtime.app.complete(runtime.broker, runtime.owner, runtime.name, runtime.number, runtime.pull_request_id, path, true); return runtime.app.nextEnvelope("file.completed", "{}"); }
+        if (std.mem.eql(u8, command, "snapshot.get")) { const snapshot = try runtime.app.bootstrapAlloc(); defer self.allocator.free(snapshot); return runtime.app.nextEnvelope("snapshot", snapshot); }
         return error.UnsupportedUiCommand;
     }
 };
+
+fn payloadString(payload: std.json.ObjectMap, key: []const u8) ?[]const u8 { const value = payload.get(key) orelse return null; return switch (value) { .string => |s| s, else => null }; }
 
 pub fn pathConfined(root: []const u8, candidate: []const u8) bool {
     return std.mem.eql(u8, root, candidate) or (std.mem.startsWith(u8, candidate, root) and candidate.len > root.len and candidate[root.len] == std.fs.path.sep);
 }
 
 fn authorized(target: []const u8, raw: []const u8, token: []const u8) bool {
-    const needle = std.fmt.allocPrint(std.heap.page_allocator, "token={s}", .{token}) catch return false; defer std.heap.page_allocator.free(needle);
-    return std.mem.indexOf(u8, target, needle) != null or if (headerValue(raw, "authorization")) |v| std.mem.eql(u8, v, needle) else false;
+    if (queryToken(target)) |value| if (std.mem.eql(u8, value, token)) return true;
+    return if (headerValue(raw, "authorization")) |v| std.mem.startsWith(u8, v, "Bearer ") and std.mem.eql(u8, v[7..], token) else false;
 }
+fn queryToken(target: []const u8) ?[]const u8 { const q = std.mem.indexOfScalar(u8, target, '?') orelse return null; var it = std.mem.splitScalar(u8, target[q + 1 ..], '&'); var found: ?[]const u8 = null; while (it.next()) |pair| { const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return null; if (std.mem.eql(u8, pair[0..eq], "token")) { if (found != null) return null; found = pair[eq + 1 ..]; } else return null; } return found; }
 
 fn loopbackOrigin(raw: []const u8, port: u16) bool {
     const origin = headerValue(raw, "origin") orelse return false;
@@ -127,7 +150,7 @@ fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool { cons
 
 pub fn readClientTextAlloc(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream) ![]u8 {
     var head: [2]u8 = undefined; try readExact(io, stream, &head);
-    if ((head[0] & 0x80) == 0 or (head[0] & 0x0f) != 1 or (head[1] & 0x80) == 0) return error.InvalidClientWebSocketFrame;
+    if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or (head[0] & 0x0f) != 1 or (head[1] & 0x80) == 0) return error.InvalidClientWebSocketFrame;
     var len: u64 = head[1] & 0x7f;
     if (len == 126) { var b: [2]u8 = undefined; try readExact(io, stream, &b); len = std.mem.readInt(u16, &b, .big); if (len < 126) return error.InvalidClientWebSocketFrame; }
     else if (len == 127) { var b: [8]u8 = undefined; try readExact(io, stream, &b); len = std.mem.readInt(u64, &b, .big); if (len <= 65535) return error.InvalidClientWebSocketFrame; }
@@ -152,4 +175,9 @@ fn writeResponse(io: std.Io, stream: *std.Io.net.Stream, status: []const u8, con
 test "asset confinement rejects sibling prefix and traversal" {
     try std.testing.expect(pathConfined("/tmp/ui", "/tmp/ui/app.js"));
     try std.testing.expect(!pathConfined("/tmp/ui", "/tmp/ui-evil/app.js"));
+}
+test "token parsing is exact and unique" {
+    try std.testing.expectEqualStrings("abc", queryToken("/ws?token=abc").?);
+    try std.testing.expect(queryToken("/ws?x=1&token=abc") == null);
+    try std.testing.expect(queryToken("/ws?token=abc&token=abc") == null);
 }

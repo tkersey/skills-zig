@@ -818,7 +818,7 @@ pub fn build(b: *std.Build) void {
         "Run Synoptic security and authority falsifiers",
         .{ .link_libc = true, .filters = &.{"falsifier"} },
     );
-    const test_synoptic = b.step("test-synoptic", "Run Synoptic product and falsifier tests");
+    const test_synoptic = b.step("test-synoptic", "Run Synoptic generation, session, product, and falsifier tests");
     test_synoptic.dependOn(&run_synoptic_tests.step);
     test_synoptic.dependOn(&run_synoptic_falsifiers.step);
     const test_synoptic_falsifiers = b.step("test-synoptic-falsifiers", "Run Synoptic falsifiers");
