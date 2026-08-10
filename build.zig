@@ -333,7 +333,7 @@ pub fn build(b: *std.Build) void {
     cas_app_server_contract_data.addOption(
         []const u8,
         "json",
-        @embedFile("apps/cas/contracts/codex-app-server-0.146.0.json"),
+        @embedFile("apps/cas/contracts/codex-app-server-capabilities-v1.json"),
     );
     const cas_app_server_contract_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_app_server_contract.zig"),

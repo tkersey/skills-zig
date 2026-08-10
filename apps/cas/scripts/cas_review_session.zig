@@ -16,8 +16,8 @@ const HelpSurface = core_cli.HelpSurface{
 
 const default_control_timeout_ms: u32 = 300_000;
 const default_review_timeout_ms: u32 = 2_700_000;
-const app_server_contract_id = "codex-app-server-0.146.0";
-const structured_review_capability = "cas_codex_0146_structured_review_v1";
+const app_server_contract_id = "codex-app-server-capabilities-v1";
+const structured_review_capability = "cas_structured_review_v1";
 
 const UsageText =
     \\cas review
@@ -502,14 +502,6 @@ fn supportFromStoredValue(raw: ?[]const u8) cas.MultiAgentModeSupport {
     return .not_requested;
 }
 
-const SemverTriplet = struct {
-    major: u32,
-    minor: u32,
-    patch: u32,
-};
-
-const parent_materialization_prompt =
-    "Internal bootstrap for detached review parent materialization. Reply with OK only.";
 const managed_server_orphan_ttl_seconds: u32 = 15 * 60;
 
 const ReviewStatus = struct {
@@ -931,7 +923,7 @@ const ReviewThreadIdSelectorHint =
     "pass the bare reviewThreadId; use --path for a session record or " ++
     "--latest for the newest persisted session.";
 const MultiAgentModeRemovedHint =
-    "Codex 0.145 ignores request-scoped multiAgentMode; configure [agents] in " ++
+    "Request-scoped multiAgentMode is retired; configure [agents] in " ++
     "config.toml and use the current Codex reasoning-effort controls instead.";
 
 fn usageDetailForParseError(err: anyerror) ?[]const u8 {
@@ -1097,24 +1089,24 @@ fn parseReviewRuntimeGateAlloc(
     const path = jsonStringField(codex, "path") orelse return error.InvalidReviewPreflightReceipt;
     const version = jsonStringField(codex, "version") orelse
         return error.InvalidReviewPreflightReceipt;
+    const banner = jsonStringField(codex, "banner") orelse
+        return error.InvalidReviewPreflightReceipt;
     const binary_digest = jsonStringField(codex, "binaryDigest") orelse
         return error.InvalidReviewPreflightReceipt;
     const stable_digest = jsonStringField(schemas, "stableDigest") orelse
         return error.InvalidReviewPreflightReceipt;
     const experimental_digest = jsonStringField(schemas, "experimentalDigest") orelse
         return error.InvalidReviewPreflightReceipt;
-    if (path.len == 0 or version.len == 0 or
+    if (path.len == 0 or version.len == 0 or banner.len == 0 or
         !std.mem.startsWith(u8, binary_digest, "sha256:") or
         !std.mem.startsWith(u8, stable_digest, "sha256:") or
         !std.mem.startsWith(u8, experimental_digest, "sha256:"))
     {
         return error.InvalidReviewPreflightReceipt;
     }
-    const banner = try std.fmt.allocPrint(allocator, "codex-cli {s}", .{version});
-    errdefer allocator.free(banner);
     return .{
         .resolved_path = try allocator.dupe(u8, path),
-        .version = banner,
+        .version = try allocator.dupe(u8, banner),
         .binary_digest = try allocator.dupe(u8, binary_digest),
         .stable_schema_digest = try allocator.dupe(u8, stable_digest),
         .experimental_schema_digest = try allocator.dupe(u8, experimental_digest),
@@ -1178,8 +1170,11 @@ fn runReviewRuntimeGate(
         "preflight",
         "--cwd",
         cwd,
-        "--codex-path",
-        requested_codex_path orelse "codex",
+    });
+    if (requested_codex_path) |path| {
+        try argv.appendSlice(allocator, &.{ "--codex-path", path });
+    }
+    try argv.appendSlice(allocator, &.{
         "--profile",
         "review",
         "--app-server-transport",
@@ -1260,8 +1255,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
             .{
                 .code = "incompatible_codex_review_runtime",
-                .hint = "CAS review requires the compiled 0.146 structured-review capability " ++
-                    "and a compatible review schema profile for the exact resolved Codex binary",
+                .hint = "CAS review requires the compiled structured-review capability and a " ++
+                    "compatible review profile for the exact resolved Codex binary",
             },
         );
     };
@@ -1319,12 +1314,12 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .workflow_binding = workflow_binding,
         .developer_instructions = parsed.custom_instructions,
     };
-    if (codexReviewRequiresFreshParent(codex_version) and parsed.parent_thread_id != null) {
+    if (parsed.parent_thread_id != null) {
         try renderErrorAndExit(
             parsed.json,
             "start",
             "review/start",
-            "Codex 0.146 structured review attempts require a fresh CAS-owned thread",
+            "Structured review attempts require a fresh CAS-owned thread",
             cwd,
             output_receipt,
             .{
@@ -1546,7 +1541,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         &managed_server,
     );
     defer tuple_lock_bundle.deinit(allocator);
-    const created_parent_thread = parsed.parent_thread_id == null;
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
         defer allocator.free(existing_parent_event_log_path);
@@ -1555,7 +1549,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             &client,
             existing,
             existing_parent_event_log_path,
-            codex_version,
         ) catch |err| {
             const failure = serverRequestProviderFailure(err) orelse FailureInfo{
                 .code = "pre_review_start_failed",
@@ -1596,7 +1589,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             null,
             existing_parent_event_log_path,
             null,
-            codex_version,
             .all,
         ) catch |err| {
             const failure = serverRequestProviderFailure(err) orelse FailureInfo{
@@ -1692,54 +1684,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         allocator,
         parent_thread_id,
         target,
-        codex_version,
     );
     defer allocator.free(review_params_json);
     appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
 
     var review_result_json: []u8 = undefined;
-    var review_start_retry_used = false;
-    const pre_materialize_parent = created_parent_thread and shouldPreMaterializeDetachedReviewParent(parsed.parent_mode, codex_version);
-    if (pre_materialize_parent) {
-        // Codex 0.118.x requires a persisted parent rollout before detached review/start.
-        materializeParentThreadTurn(
-            allocator,
-            &client,
-            parent_thread_id,
-            parent_event_log_path,
-            parsed.timeout_ms,
-            parsed.poll_interval_ms,
-            codex_version,
-        ) catch |err| {
-            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-                .code = "pre_review_start_failed",
-                .hint = "auto parent-mode could not bootstrap a materialized " ++
-                    "parent thread for this Codex runtime",
-            };
-            updateReviewTupleLockBestEffort(
-                allocator,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                "pre_review_start_failed",
-                failure.code,
-                null,
-                null,
-                null,
-                parent_event_log_path,
-            );
-            if (workflow_binding != null) managed_server.kill();
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                failure.hint,
-                cwd,
-                output_receipt,
-                failure,
-            );
-        };
-        appendLogRecord(allocator, parent_event_log_path, "review/start", "note", "{\"compatibility\":\"pre-materialized-fresh-parent\"}") catch {};
-    }
     var review_start_send_boundary = ReviewStartSendBoundary{
         .allocator = allocator,
         .lock_path = tuple_lock_bundle.path,
@@ -1756,10 +1705,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         &client,
         review_params_json,
         review_start_send_observer,
-    ) catch |err| blk: {
+    ) catch |err| {
         const request_send_started = client.lastRequestSendStarted();
         const raw_message = client.lastError() orelse @errorName(err);
-        const failure = failureInfoForReviewStart(err, raw_message, created_parent_thread);
+        const failure = failureInfoForReviewStart(err, raw_message);
         if (workflow_binding != null and request_send_started and
             failure != null and
             std.mem.eql(u8, failure.?.code, "account_resource_exhausted"))
@@ -1809,137 +1758,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 timeout_failure,
             );
         }
-        if (created_parent_thread and failure != null and
-            serverRequestProviderFailure(err) == null and !pre_materialize_parent)
-        {
-            materializeParentThreadTurn(
-                allocator,
-                &client,
-                parent_thread_id,
-                parent_event_log_path,
-                parsed.timeout_ms,
-                parsed.poll_interval_ms,
-                codex_version,
-            ) catch {
-                updateReviewTupleLockBestEffort(
-                    allocator,
-                    tuple_lock_bundle.path,
-                    tuple_lock_bundle.lock,
-                    "pre_review_start_failed",
-                    "pre_review_start_failed",
-                    null,
-                    null,
-                    null,
-                    parent_event_log_path,
-                );
-                if (workflow_binding != null) managed_server.kill();
-                try renderErrorAndExit(
-                    parsed.json,
-                    "start",
-                    "review/start",
-                    "fresh detached review parent could not be materialized before retry",
-                    cwd,
-                    .{
-                        .resolved_codex_path = resolved_codex_path,
-                        .resolved_codex_version = codex_version,
-                        .compatibility_verdict = "incompatible",
-                    },
-                    .{
-                        .code = "pre_review_start_failed",
-                        .hint = "fresh parent-thread retry could not materialize rollout state; upgrade codex or pass a clean materialized --parent-thread-id",
-                    },
-                );
-            };
-
-            review_start_retry_used = true;
-            break :blk requestReviewStart(
-                &client,
-                review_params_json,
-                review_start_send_observer,
-            ) catch |retry_err| {
-                const retry_send_started = client.lastRequestSendStarted();
-                const retry_message = client.lastError() orelse @errorName(retry_err);
-                const retry_failure = failureInfoForReviewStart(
-                    retry_err,
-                    retry_message,
-                    created_parent_thread,
-                );
-                if (workflow_binding != null and retry_send_started and
-                    retry_failure != null and
-                    std.mem.eql(u8, retry_failure.?.code, "account_resource_exhausted"))
-                {
-                    output_receipt.error_review_attempt_phase = "review_terminal";
-                    output_receipt.error_review_attempt_exists = true;
-                    terminalizeOwnedReviewAttempt(
-                        allocator,
-                        &managed_server,
-                        tuple_lock_bundle.path,
-                        tuple_lock_bundle.lock,
-                        .{ .event_log_path = parent_event_log_path },
-                        retry_failure.?,
-                    );
-                    try renderErrorAndExit(
-                        parsed.json,
-                        "start",
-                        "review/start",
-                        retry_failure.?.hint,
-                        cwd,
-                        output_receipt,
-                        retry_failure.?,
-                    );
-                }
-                if (reviewStartFailureOwnsAttempt(
-                    workflow_binding != null,
-                    retry_send_started,
-                    retry_err,
-                )) {
-                    output_receipt.error_review_attempt_phase = if (retry_send_started)
-                        "review_terminal"
-                    else
-                        "pre_review_start";
-                    output_receipt.error_review_attempt_exists = retry_send_started;
-                    const timeout_failure = workflowOwnedPostStartFailure(retry_err);
-                    terminalizeOwnedReviewAttempt(
-                        allocator,
-                        &managed_server,
-                        tuple_lock_bundle.path,
-                        tuple_lock_bundle.lock,
-                        .{ .event_log_path = parent_event_log_path },
-                        timeout_failure,
-                    );
-                    try renderErrorAndExit(
-                        parsed.json,
-                        "start",
-                        "review/start",
-                        timeout_failure.hint,
-                        cwd,
-                        output_receipt,
-                        timeout_failure,
-                    );
-                }
-                const message = if (retry_failure) |value| value.hint else retry_message;
-                const failure_for_lock: FailureInfo = retry_failure orelse .{
-                    .code = "pre_review_start_failed",
-                    .hint = "detached review startup failed after fresh-parent materialization retry",
-                };
-                updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, if (std.mem.eql(u8, failure_for_lock.code, "account_resource_exhausted")) "account_resource_exhausted" else "pre_review_start_failed", failure_for_lock.code, null, null, null, parent_event_log_path);
-                if (workflow_binding != null) managed_server.kill();
-                try renderErrorAndExit(
-                    parsed.json,
-                    "start",
-                    "review/start",
-                    message,
-                    cwd,
-                    .{
-                        .resolved_codex_path = resolved_codex_path,
-                        .resolved_codex_version = codex_version,
-                        .compatibility_verdict = if (retry_failure != null) "incompatible" else "not_checked",
-                    },
-                    failure_for_lock,
-                );
-            };
-        }
-
         const message = if (failure) |value| value.hint else raw_message;
         const failure_for_lock: FailureInfo = failure orelse .{
             .code = "pre_review_start_failed",
@@ -2036,9 +1854,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     ) catch |err| switch (err) {
         else => {},
     };
-    if (review_start_retry_used) {
-        appendLogRecord(allocator, event_log_path, "review/start", "note", "{\"retry\":\"fresh-parent-materialization\"}") catch {};
-    }
     const store_root = try casStoreRootAlloc(allocator);
     defer allocator.free(store_root);
     const repo_root = try repoRootForCwdAlloc(allocator, cwd);
@@ -2159,7 +1974,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             record.event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
-            codex_version,
             wait_deadline_ms,
         ) catch |err| switch (err) {
             error.WaitTimedOut => timeout: {
@@ -2190,13 +2004,12 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         record.review_thread_id,
                         record.review_turn_id,
                         record.event_log_path,
-                        codex_version,
                         parsed.poll_interval_ms,
                     ) catch {
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
                 };
-                if (reviewStatusCompletesWait(codex_version, &timeout_status)) {
+                if (reviewStatusCompletesWait(&timeout_status)) {
                     terminal_status_from_grace = true;
                     break :timeout timeout_status;
                 }
@@ -2653,7 +2466,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             .{
                 .code = "incompatible_codex_review_runtime",
                 .hint = "cas review wait requires the recorded exact Codex binary to continue " ++
-                    "satisfying the 0.146 review schema contract",
+                    "satisfying the selected app-server capability contract",
             },
         );
     };
@@ -2998,11 +2811,6 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     current_tuple.app_server_contract_id = app_server_contract_id;
     current_tuple.transport_kind = record.transport_kind orelse "websocket";
     current_tuple.code_mode_host_digest = record.code_mode_host_digest;
-    const attempt_codex_version = reviewAttemptRuntimeVersion(
-        record.codex_version,
-        current_codex_version,
-    );
-
     var terminal_status_from_grace = false;
     const latest = waitForReviewCompletion(
         allocator,
@@ -3012,7 +2820,6 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.event_log_path,
         parsed.timeout_ms,
         parsed.poll_interval_ms,
-        attempt_codex_version,
         wait_deadline_ms,
     ) catch |err| switch (err) {
         error.WaitTimedOut => timeout: {
@@ -3041,7 +2848,6 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     record.review_thread_id,
                     record.review_turn_id,
                     record.event_log_path,
-                    attempt_codex_version,
                     parsed.poll_interval_ms,
                 ) catch try makeDisconnectedReviewStatus(allocator);
             };
@@ -3049,7 +2855,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             // A semantic result observed inside the bounded final grace window
             // is terminal evidence, not a timeout diagnostic. Feed it through
             // the ordinary persistence and normalization path below.
-            if (reviewStatusCompletesWait(attempt_codex_version, &timeout_status)) {
+            if (reviewStatusCompletesWait(&timeout_status)) {
                 terminal_status_from_grace = true;
                 break :timeout timeout_status;
             }
@@ -4120,7 +3926,6 @@ fn fetchReviewStatus(
     review_turn_id: ?[]const u8,
     event_log_path: []const u8,
     live_notifications: ?*LiveReviewNotificationState,
-    codex_version: []const u8,
     thread_read_persistence: ThreadReadPersistence,
 ) !ReviewStatus {
     const params_json = try stringifyAnyAlloc(allocator, .{
@@ -4183,11 +3988,16 @@ fn fetchReviewStatus(
                 allocator,
                 event_log_path,
                 without_turns_json,
-                codex_version,
                 thread_read_persistence,
                 &status,
             );
-            if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
+            if (try maybeResumeMaterializedThread(
+                allocator,
+                client,
+                review_thread_id,
+                event_log_path,
+                &status,
+            )) {
                 status.deinit(allocator);
                 for (captured_notifications.items) |line| allocator.free(line);
                 captured_notifications.clearRetainingCapacity();
@@ -4220,7 +4030,6 @@ fn fetchReviewStatus(
                     allocator,
                     event_log_path,
                     resumed_json,
-                    codex_version,
                     thread_read_persistence,
                     &resumed_status,
                 );
@@ -4247,11 +4056,16 @@ fn fetchReviewStatus(
         allocator,
         event_log_path,
         response_json,
-        codex_version,
         thread_read_persistence,
         &status,
     );
-    if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
+    if (try maybeResumeMaterializedThread(
+        allocator,
+        client,
+        review_thread_id,
+        event_log_path,
+        &status,
+    )) {
         status.deinit(allocator);
         const params_after_resume = try stringifyAnyAlloc(allocator, .{
             .threadId = review_thread_id,
@@ -4285,7 +4099,6 @@ fn fetchReviewStatus(
             allocator,
             event_log_path,
             resumed_json,
-            codex_version,
             thread_read_persistence,
             &resumed_status,
         );
@@ -4300,7 +4113,6 @@ fn fetchReviewStatusAfterWaitTimeout(
     review_thread_id: []const u8,
     review_turn_id: ?[]const u8,
     event_log_path: []const u8,
-    codex_version: []const u8,
     poll_interval_ms: u32,
 ) !ReviewStatus {
     // Poll cadence never extends the caller's explicit operation deadline.
@@ -4317,7 +4129,6 @@ fn fetchReviewStatusAfterWaitTimeout(
         review_turn_id,
         event_log_path,
         null,
-        codex_version,
         .all,
     );
 }
@@ -4328,10 +4139,9 @@ fn finalReviewStatusGraceMs(poll_interval_ms: u32) u32 {
 }
 
 fn reviewStatusCompletesWait(
-    codex_version: []const u8,
     status: *const ReviewStatus,
 ) bool {
-    if (reviewStatusAwaitsStructuredCompletion(codex_version, status)) return false;
+    if (reviewStatusAwaitsStructuredCompletion(status)) return false;
     return status.review_result_available or isTerminalTurnStatus(status.turn_status);
 }
 
@@ -4339,11 +4149,10 @@ fn persistThreadReadResponse(
     allocator: std.mem.Allocator,
     event_log_path: []const u8,
     response_json: []const u8,
-    codex_version: []const u8,
     persistence: ThreadReadPersistence,
     status: *const ReviewStatus,
 ) !void {
-    if (persistence == .terminal_only and !reviewStatusCompletesWait(codex_version, status)) return;
+    if (persistence == .terminal_only and !reviewStatusCompletesWait(status)) return;
     try appendLogRecord(allocator, event_log_path, "thread/read", "response", response_json);
 }
 
@@ -4624,17 +4433,13 @@ fn maybeResumeMaterializedThread(
     review_thread_id: []const u8,
     event_log_path: []const u8,
     status: *const ReviewStatus,
-    codex_version: []const u8,
 ) !bool {
     if (!status.materialized) return false;
     if (!std.mem.eql(u8, status.thread_status, "notLoaded")) return false;
-    const rollout_path = status.rollout_path orelse return false;
 
     const params_json = try buildThreadResumeParamsJson(
         allocator,
         review_thread_id,
-        rollout_path,
-        codex_version,
     );
     defer allocator.free(params_json);
 
@@ -4680,87 +4485,6 @@ fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
         };
     }
     return null;
-}
-
-fn buildTurnStartParamsJson(
-    allocator: std.mem.Allocator,
-    thread_id: []const u8,
-    text: []const u8,
-) ![]u8 {
-    const thread_id_json = try quoteJsonStringAlloc(allocator, thread_id);
-    defer allocator.free(thread_id_json);
-    const text_json = try quoteJsonStringAlloc(allocator, text);
-    defer allocator.free(text_json);
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"threadId\":{s},\"input\":[{{\"type\":\"text\",\"text\":{s}}}]}}",
-        .{ thread_id_json, text_json },
-    );
-}
-
-fn waitForThreadTerminalState(
-    allocator: std.mem.Allocator,
-    client: *cas.Client,
-    thread_id: []const u8,
-    event_log_path: []const u8,
-    timeout_ms: u32,
-    poll_interval_ms: u32,
-    codex_version: []const u8,
-) !ReviewStatus {
-    const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
-    while (true) {
-        const latest = try fetchReviewStatus(
-            allocator,
-            client,
-            thread_id,
-            null,
-            event_log_path,
-            null,
-            codex_version,
-            .terminal_only,
-        );
-        if (isTerminalTurnStatus(latest.turn_status)) return latest;
-        latest.deinit(allocator);
-        if (@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - started_ms >= timeout_ms) return error.WaitTimedOut;
-        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(poll_interval_ms), .awake) catch {};
-    }
-}
-
-fn materializeParentThreadTurn(
-    allocator: std.mem.Allocator,
-    client: *cas.Client,
-    parent_thread_id: []const u8,
-    event_log_path: []const u8,
-    timeout_ms: u32,
-    poll_interval_ms: u32,
-    codex_version: []const u8,
-) !void {
-    const params_json = try buildTurnStartParamsJson(
-        allocator,
-        parent_thread_id,
-        parent_materialization_prompt,
-    );
-    defer allocator.free(params_json);
-    const result_json = try client.requestJson("turn/start", params_json);
-    defer allocator.free(result_json);
-    try appendLogRecord(allocator, event_log_path, "turn/start", "request", params_json);
-    try appendLogRecord(allocator, event_log_path, "turn/start", "response", result_json);
-
-    var terminal_status = try waitForThreadTerminalState(
-        allocator,
-        client,
-        parent_thread_id,
-        event_log_path,
-        timeout_ms,
-        poll_interval_ms,
-        codex_version,
-    );
-    defer terminal_status.deinit(allocator);
-    if (std.mem.eql(u8, terminal_status.turn_status, "failed") or
-        std.mem.eql(u8, terminal_status.turn_status, "errored"))
-    {
-        return error.ParentMaterializationFailed;
-    }
 }
 
 fn gitOutputAlloc(
@@ -5162,20 +4886,10 @@ fn isTerminalTurnStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "errored");
 }
 
-fn reviewAttemptRuntimeVersion(
-    recorded_codex_version: []const u8,
-    current_codex_version: []const u8,
-) []const u8 {
-    _ = current_codex_version;
-    return recorded_codex_version;
-}
-
 fn reviewStatusAwaitsStructuredCompletion(
-    codex_version: []const u8,
     status: *const ReviewStatus,
 ) bool {
-    return std.mem.eql(u8, codexReviewDelivery(codex_version), "inline") and
-        std.mem.eql(u8, status.turn_status, "completed") and
+    return std.mem.eql(u8, status.turn_status, "completed") and
         status.last_turn_has_entered_review_mode and
         !status.last_turn_has_exited_review_mode and
         !status.review_result_available;
@@ -5218,7 +4932,6 @@ fn waitForReviewCompletion(
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
-    codex_version: []const u8,
     absolute_deadline_ms: ?i64,
 ) !ReviewStatus {
     const deadline_ms = absolute_deadline_ms orelse
@@ -5241,13 +4954,12 @@ fn waitForReviewCompletion(
             review_turn_id,
             event_log_path,
             &live_notifications,
-            codex_version,
             .terminal_only,
         ) catch |err| switch (err) {
             error.ConnectionTimedOut => return error.WaitTimedOut,
             else => return err,
         };
-        if (reviewStatusCompletesWait(codex_version, &latest)) return latest;
+        if (reviewStatusCompletesWait(&latest)) return latest;
         latest.deinit(allocator);
         const now_ms = @divFloor(
             std.Io.Clock.awake.now(
@@ -5470,41 +5182,10 @@ fn buildThreadStartParamsJson(
     });
 }
 
-fn codexDetachedReviewNeedsLiveConnection(codex_version: []const u8) bool {
-    const semver = parseSemverTriplet(codex_version) orelse return false;
-    return semver.major == 0 and semver.minor == 118;
-}
-
-fn codexResumeSupportsExcludeTurns(codex_version: []const u8) bool {
-    const semver = parseSemverTriplet(codex_version) orelse return false;
-    return semver.major > 0 or (semver.major == 0 and semver.minor >= 145);
-}
-
 fn buildThreadResumeParamsJson(
     allocator: std.mem.Allocator,
     thread_id: []const u8,
-    path: ?[]const u8,
-    codex_version: []const u8,
 ) ![]u8 {
-    if (codexResumeSupportsExcludeTurns(codex_version)) {
-        if (path) |rollout_path| {
-            return stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id,
-                .path = rollout_path,
-                .excludeTurns = true,
-            });
-        }
-        return stringifyAnyAlloc(allocator, .{
-            .threadId = thread_id,
-            .excludeTurns = true,
-        });
-    }
-    if (path) |rollout_path| {
-        return stringifyAnyAlloc(allocator, .{
-            .threadId = thread_id,
-            .path = rollout_path,
-        });
-    }
     return stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
 }
 
@@ -5513,13 +5194,10 @@ fn resumeParentThread(
     client: *cas.Client,
     parent_thread_id: []const u8,
     parent_event_log_path: []const u8,
-    codex_version: []const u8,
 ) !void {
     const params_json = try buildThreadResumeParamsJson(
         allocator,
         parent_thread_id,
-        null,
-        codex_version,
     );
     defer allocator.free(params_json);
     const result_json = try client.requestJson("thread/resume", params_json);
@@ -5558,32 +5236,16 @@ fn buildReviewStartParamsJson(
     allocator: std.mem.Allocator,
     parent_thread_id: []const u8,
     target: TargetConfig,
-    codex_version: []const u8,
 ) ![]u8 {
     const target_json = try buildTargetJson(allocator, target);
     defer allocator.free(target_json);
     const parent_thread_id_json = try quoteJsonStringAlloc(allocator, parent_thread_id);
     defer allocator.free(parent_thread_id_json);
-    const delivery = codexReviewDelivery(codex_version);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"threadId\":{s},\"delivery\":\"{s}\",\"target\":{s}}}",
-        .{ parent_thread_id_json, delivery, target_json },
+        "{{\"threadId\":{s},\"delivery\":\"inline\",\"target\":{s}}}",
+        .{ parent_thread_id_json, target_json },
     );
-}
-
-fn codexReviewDelivery(codex_version: []const u8) []const u8 {
-    const semver = parseSemverTriplet(codex_version) orelse return "detached";
-    // Codex 0.145 routes detached delivery through an ordinary review-agent
-    // turn, which emits prose but no exited_review_mode.review_output. CAS
-    // already owns an isolated parent thread, so native inline delivery keeps
-    // the attempt isolated while preserving Codex's structured review event.
-    if (semver.major > 0 or semver.minor >= 145) return "inline";
-    return "detached";
-}
-
-fn codexReviewRequiresFreshParent(codex_version: []const u8) bool {
-    return std.mem.eql(u8, codexReviewDelivery(codex_version), "inline");
 }
 
 fn buildTargetJson(allocator: std.mem.Allocator, target: TargetConfig) ![]u8 {
@@ -6226,11 +5888,6 @@ fn validateCurrentSessionRecordAlloc(
         return error.InvalidSessionRecord;
     const terminal_failure_fields_present = record.terminal_failure_code != null or
         record.terminal_failure_hint != null or record.terminal_failure_at_unix_s != null;
-    const version = parseSemverTriplet(record.codex_version);
-    const requires_0146_runtime_identity = if (version) |value|
-        value.major > 0 or value.minor >= 146
-    else
-        true;
     const code_mode_identity_complete = (record.code_mode_host_redacted == null and
         record.code_mode_host_digest == null) or
         (nonEmptyOptional(record.code_mode_host_redacted) != null and
@@ -6271,13 +5928,12 @@ fn validateCurrentSessionRecordAlloc(
         nonEmptyOptional(record.review_turn_id) == null or
         nonEmptyOptional(record.event_log_path) == null or
         nonEmptyOptional(record.codex_version) == null or
-        (requires_0146_runtime_identity and
-            (nonEmptyOptional(record.codex_binary_digest) == null or
-                !std.mem.eql(
-                    u8,
-                    record.app_server_contract_id orelse "",
-                    app_server_contract_id,
-                ))) or
+        nonEmptyOptional(record.codex_binary_digest) == null or
+        !std.mem.eql(
+            u8,
+            record.app_server_contract_id orelse "",
+            app_server_contract_id,
+        ) or
         !code_mode_identity_complete or
         nonEmptyOptional(record.compatibility_verdict) == null or
         nonEmptyOptional(record.base_sha) == null or
@@ -8818,44 +8474,6 @@ fn readCodexVersionAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const 
     return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
 }
 
-fn shouldPreMaterializeDetachedReviewParent(parent_mode: ParentMode, codex_version: []const u8) bool {
-    if (parent_mode != .auto) return false;
-    return codexDetachedReviewNeedsLiveConnection(codex_version);
-}
-
-fn parseSemverTriplet(raw: []const u8) ?SemverTriplet {
-    var cursor: usize = 0;
-    while (cursor < raw.len and !std.ascii.isDigit(raw[cursor])) : (cursor += 1) {}
-    if (cursor == raw.len) return null;
-
-    const major = parseVersionComponent(raw[cursor..]) orelse return null;
-    cursor += major.next_offset;
-    if (cursor >= raw.len or raw[cursor] != '.') return null;
-    cursor += 1;
-
-    const minor = parseVersionComponent(raw[cursor..]) orelse return null;
-    cursor += minor.next_offset;
-    if (cursor >= raw.len or raw[cursor] != '.') return null;
-    cursor += 1;
-
-    const patch = parseVersionComponent(raw[cursor..]) orelse return null;
-    return .{
-        .major = major.value,
-        .minor = minor.value,
-        .patch = patch.value,
-    };
-}
-
-fn parseVersionComponent(raw: []const u8) ?struct { value: u32, next_offset: usize } {
-    var len: usize = 0;
-    while (len < raw.len and std.ascii.isDigit(raw[len])) : (len += 1) {}
-    if (len == 0) return null;
-    return .{
-        .value = std.fmt.parseInt(u32, raw[0..len], 10) catch return null,
-        .next_offset = len,
-    };
-}
-
 fn quoteJsonStringAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -9790,29 +9408,9 @@ fn hookSummaryFromEventLog(
 fn failureInfoForReviewStart(
     err: anyerror,
     raw_message: []const u8,
-    created_parent_thread: bool,
 ) ?FailureInfo {
     if (serverRequestProviderFailure(err)) |failure| return failure;
     if (detectAccountResourceExhaustion(raw_message)) return accountResourceExhaustedFailureInfo();
-    if (created_parent_thread and std.mem.indexOf(u8, raw_message, "no rollout found for thread id") != null) {
-        return .{
-            .code = "incompatible_codex_review_runtime",
-            .hint = "detached review on a freshly created parent thread requires a " ++
-                "newer codex build; upgrade codex or supply --parent-thread-id for " ++
-                "a materialized parent thread",
-        };
-    }
-    if (created_parent_thread and
-        std.mem.indexOf(u8, raw_message, "error creating detached review thread") != null and
-        std.mem.indexOf(u8, raw_message, "(os error 2)") != null)
-    {
-        return .{
-            .code = "incompatible_codex_review_runtime",
-            .hint = "detached review on this codex build is incompatible with " ++
-                "fresh parent-thread startup; upgrade codex or supply " ++
-                "--parent-thread-id for a materialized parent thread",
-        };
-    }
     return null;
 }
 
@@ -9847,14 +9445,6 @@ fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
             return .{
                 .code = "review_failed",
                 .hint = "detached review ended in a failed or errored state before emitting a structured reviewResult",
-            };
-        }
-        if (std.mem.eql(u8, status.thread_preview, parent_materialization_prompt) and
-            !status.last_turn_has_entered_review_mode)
-        {
-            return .{
-                .code = "incompatible_codex_review_runtime",
-                .hint = "detached review resolved to the fresh-parent bootstrap thread instead of a review-mode thread; installed codex runtime is not producing a usable detached review thread on this path",
             };
         }
         return .{
@@ -12650,29 +12240,22 @@ test "workflow-bound wait timeout is one terminal owner failure" {
 
     var grace_status = try makeDisconnectedReviewStatus(std.testing.allocator);
     defer grace_status.deinit(std.testing.allocator);
-    try std.testing.expect(!reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(!reviewStatusCompletesWait(&grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "failed");
-    try std.testing.expect(reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(reviewStatusCompletesWait(&grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "inProgress");
-    try std.testing.expect(!reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(!reviewStatusCompletesWait(&grace_status));
     grace_status.review_result_available = true;
-    try std.testing.expect(reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(reviewStatusCompletesWait(&grace_status));
 
     grace_status.review_result_available = false;
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "completed");
     grace_status.last_turn_has_entered_review_mode = true;
     grace_status.last_turn_has_exited_review_mode = false;
-    try std.testing.expect(!reviewStatusCompletesWait(
-        "codex-cli 0.145.0",
-        &grace_status,
-    ));
-    try std.testing.expect(reviewStatusCompletesWait(
-        "codex-cli 0.144.0",
-        &grace_status,
-    ));
+    try std.testing.expect(!reviewStatusCompletesWait(&grace_status));
 }
 
 test "server request provider failures retain terminal review identity" {
@@ -12699,7 +12282,7 @@ test "server request provider failures retain terminal review identity" {
         try std.testing.expectEqual(false, retryableSameTupleNowForCode(failure.code).?);
         const replay = terminalReviewOwnerFailure(failure.code).?;
         try std.testing.expectEqualStrings(failure.code, replay.code);
-        const pre_start = failureInfoForReviewStart(case.err, "opaque", false).?;
+        const pre_start = failureInfoForReviewStart(case.err, "opaque").?;
         try std.testing.expectEqualStrings(failure.code, pre_start.code);
         try std.testing.expectError(
             case.err,
@@ -12727,7 +12310,6 @@ test "terminal-only thread reads omit polling snapshots and retain terminal evid
         allocator,
         event_log_path,
         "{\"thread\":{\"status\":\"inProgress\"}}",
-        "codex-cli 0.146.0",
         .terminal_only,
         &status,
     );
@@ -12740,7 +12322,6 @@ test "terminal-only thread reads omit polling snapshots and retain terminal evid
         allocator,
         event_log_path,
         "{\"thread\":{\"status\":\"completed\"}}",
-        "codex-cli 0.146.0",
         .terminal_only,
         &status,
     );
@@ -12948,7 +12529,7 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\"," ++
@@ -12996,7 +12577,7 @@ test "session record owns and validates workflow binding across reload" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-0.146.0\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\",\"accountFingerprintReducedProtection\":false," ++
@@ -13092,6 +12673,17 @@ test "current session record rejects relocation and incomplete custody" {
         std.testing.allocator,
         "/repo/.ledger/cas/review_sessions/thr.json",
         record,
+    );
+    var missing_identity = record;
+    missing_identity.codex_version = "codex-cli 0.1.0";
+    missing_identity.codex_binary_digest = null;
+    try std.testing.expectError(
+        error.InvalidSessionRecord,
+        validateCurrentSessionRecordAlloc(
+            std.testing.allocator,
+            "/repo/.ledger/cas/review_sessions/thr.json",
+            missing_identity,
+        ),
     );
     try std.testing.expectError(
         error.InvalidSessionRecord,
@@ -13290,53 +12882,29 @@ test "request builders omit removed multi-agent mode" {
         "review only this contract",
         parsed_thread.value.object.get("developerInstructions").?.string,
     );
+}
 
-    const turn_params = try buildTurnStartParamsJson(
+test "thread resume emits only fields admitted by the selected contract" {
+    const params = try buildThreadResumeParamsJson(
         std.testing.allocator,
         "thr_1",
-        "hello",
     );
-    defer std.testing.allocator.free(turn_params);
-    var parsed_turn = try std.json.parseFromSlice(
+    defer std.testing.allocator.free(params);
+    var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        turn_params,
+        params,
         .{},
     );
-    defer parsed_turn.deinit();
-    try std.testing.expect(parsed_turn.value.object.get("multiAgentMode") == null);
-}
-
-test "thread resume excludes turns only for Codex 0.145 and newer" {
-    const current = try buildThreadResumeParamsJson(
-        std.testing.allocator,
-        "thr_1",
-        "/tmp/rollout.jsonl",
-        "codex-cli 0.145.0",
-    );
-    defer std.testing.allocator.free(current);
-    var current_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, current, .{});
-    defer current_json.deinit();
-    try std.testing.expect(current_json.value.object.get("excludeTurns").?.bool);
+    defer parsed.deinit();
     try std.testing.expectEqualStrings(
-        "/tmp/rollout.jsonl",
-        current_json.value.object.get("path").?.string,
-    );
-
-    const legacy = try buildThreadResumeParamsJson(
-        std.testing.allocator,
         "thr_1",
-        null,
-        "codex-cli 0.144.2",
+        parsed.value.object.get("threadId").?.string,
     );
-    defer std.testing.allocator.free(legacy);
-    var legacy_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, legacy, .{});
-    defer legacy_json.deinit();
-    try std.testing.expect(legacy_json.value.object.get("excludeTurns") == null);
-    try std.testing.expect(legacy_json.value.object.get("path") == null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
 }
 
-test "review start preserves structured output on Codex 0.145 and newer" {
+test "review start uses capability-proven inline structured delivery" {
     const target = TargetConfig{
         .kind = .base_branch,
         .branch = "main",
@@ -13345,7 +12913,6 @@ test "review start preserves structured output on Codex 0.145 and newer" {
         std.testing.allocator,
         "thr_isolated",
         target,
-        "codex-cli 0.145.0",
     );
     defer std.testing.allocator.free(current);
     var current_json = try std.json.parseFromSlice(
@@ -13363,27 +12930,6 @@ test "review start preserves structured output on Codex 0.145 and newer" {
         "thr_isolated",
         current_json.value.object.get("threadId").?.string,
     );
-
-    const legacy = try buildReviewStartParamsJson(
-        std.testing.allocator,
-        "thr_isolated",
-        target,
-        "codex-cli 0.144.6",
-    );
-    defer std.testing.allocator.free(legacy);
-    var legacy_json = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        legacy,
-        .{},
-    );
-    defer legacy_json.deinit();
-    try std.testing.expectEqualStrings(
-        "detached",
-        legacy_json.value.object.get("delivery").?.string,
-    );
-    try std.testing.expect(codexReviewRequiresFreshParent("codex-cli 0.145.0"));
-    try std.testing.expect(!codexReviewRequiresFreshParent("codex-cli 0.144.6"));
 }
 
 test "parseArgs captures parent mode and approvals" {
@@ -15611,7 +15157,6 @@ test "account resource exhaustion maps start and terminal status failures" {
     const start_failure = failureInfoForReviewStart(
         error.RequestFailed,
         "review/start failed: usageLimitExceeded",
-        false,
     ).?;
     try std.testing.expectEqualStrings("account_resource_exhausted", start_failure.code);
 
@@ -16084,18 +15629,17 @@ test "inline partial review completion remains pending until structured exit" {
     };
     defer status.deinit(std.testing.allocator);
 
-    try std.testing.expect(reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
-    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.144.0", &status));
+    try std.testing.expect(reviewStatusAwaitsStructuredCompletion(&status));
 
     status.last_turn_has_exited_review_mode = true;
-    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion(&status));
     status.last_turn_has_exited_review_mode = false;
     status.review_result_available = true;
-    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion(&status));
     status.review_result_available = false;
     std.testing.allocator.free(status.turn_status);
     status.turn_status = try std.testing.allocator.dupe(u8, "failed");
-    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion(&status));
 }
 
 test "parseReviewStatusAlloc selects the persisted turn and rejects thread mismatch" {
@@ -16503,47 +16047,6 @@ test "terminalLockFailureForStatus maps malformed structured verdict to invalid 
     try std.testing.expectEqualStrings("review_output_invalid", failure.code);
 }
 
-test "failureInfoForReviewStart maps detached parent rollout error" {
-    const failure = failureInfoForReviewStart(
-        error.RequestFailed,
-        "no rollout found for thread id thr_123",
-        true,
-    ).?;
-    try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
-}
-
-test "shouldPreMaterializeDetachedReviewParent gates auto mode for codex 0.118" {
-    try std.testing.expect(shouldPreMaterializeDetachedReviewParent(.auto, "codex-cli 0.118.0"));
-    try std.testing.expect(shouldPreMaterializeDetachedReviewParent(.auto, "0.118.3-dev"));
-    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.auto, "codex-cli 0.119.0"));
-    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.fresh, "codex-cli 0.118.0"));
-    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.reuse, "codex-cli 0.118.0"));
-}
-
-test "codexDetachedReviewNeedsLiveConnection matches 0.118 only" {
-    try std.testing.expect(codexDetachedReviewNeedsLiveConnection("codex-cli 0.118.0"));
-    try std.testing.expect(!codexDetachedReviewNeedsLiveConnection("codex-cli 0.119.0"));
-}
-
-test "parseSemverTriplet extracts version from codex banner text" {
-    const parsed = parseSemverTriplet("codex-cli 0.118.0").?;
-    try std.testing.expectEqual(@as(u32, 0), parsed.major);
-    try std.testing.expectEqual(@as(u32, 118), parsed.minor);
-    try std.testing.expectEqual(@as(u32, 0), parsed.patch);
-    try std.testing.expect(parseSemverTriplet("codex-cli dev-build") == null);
-}
-
-test "review wait completion semantics stay bound to the recorded runtime" {
-    try std.testing.expectEqualStrings(
-        "codex-cli 0.145.0",
-        reviewAttemptRuntimeVersion("codex-cli 0.145.0", "codex-cli 0.144.0"),
-    );
-    try std.testing.expectEqualStrings(
-        "codex-cli 0.144.0",
-        reviewAttemptRuntimeVersion("codex-cli 0.144.0", "codex-cli 0.145.0"),
-    );
-}
-
 test "failureInfoForStatus flags missing terminal review result" {
     var status = ReviewStatus{
         .thread_status = try std.testing.allocator.dupe(u8, "loaded"),
@@ -16622,50 +16125,6 @@ test "failureInfoForParentReuse rejects unsafe parents" {
     };
     defer parent.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("unsafe_parent_thread_state", failureInfoForParentReuse(&parent).?.code);
-}
-
-test "failureInfoForStatus flags bootstrap-thread substitution as incompatible runtime" {
-    var status = ReviewStatus{
-        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
-        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
-        .turn_count = 1,
-        .materialized = true,
-        .thread_preview = try std.testing.allocator.dupe(u8, parent_materialization_prompt),
-        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/bootstrap-rollout.jsonl"),
-        .turn_error_message = null,
-        .last_turn_has_entered_review_mode = false,
-        .last_turn_has_exited_review_mode = false,
-        .review_result_available = false,
-        .review_result_source = null,
-        .review_result_json = null,
-        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
-    };
-    defer status.deinit(std.testing.allocator);
-
-    const failure = failureInfoForStatus(&status).?;
-    try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
-}
-
-test "failureInfoForStatus prefers interrupted over bootstrap-thread heuristic" {
-    var status = ReviewStatus{
-        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
-        .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
-        .turn_count = 1,
-        .materialized = true,
-        .thread_preview = try std.testing.allocator.dupe(u8, parent_materialization_prompt),
-        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/bootstrap-rollout.jsonl"),
-        .turn_error_message = null,
-        .last_turn_has_entered_review_mode = false,
-        .last_turn_has_exited_review_mode = false,
-        .review_result_available = false,
-        .review_result_source = null,
-        .review_result_json = null,
-        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
-    };
-    defer status.deinit(std.testing.allocator);
-
-    const failure = failureInfoForStatus(&status).?;
-    try std.testing.expectEqualStrings("review_interrupted", failure.code);
 }
 
 test "parseArgs accepts review lock override only for review starters" {
@@ -17706,6 +17165,8 @@ test "terminal timeout session replays only through its exact tuple lock" {
         .last_observed_status = "inProgress",
         .codex_version = "codex 0.1.0",
         .resolved_codex_path = "/bin/codex",
+        .codex_binary_digest = "sha256:test",
+        .app_server_contract_id = app_server_contract_id,
         .compatibility_verdict = "compatible",
         .transport_kind = "websocket",
         .transport_selection_reason = "detached_review_requires_cross_process_truth",
@@ -18264,15 +17725,15 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
 test "review runtime gate requires live managed structured-review preflight" {
     const allocator = std.testing.allocator;
     const valid =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
     var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
     defer gate.deinit(allocator);
     try std.testing.expectEqualStrings("/tmp/codex", gate.resolved_path);
-    try std.testing.expectEqualStrings("codex-cli 0.146.0", gate.version);
+    try std.testing.expectEqualStrings("custom Codex development build", gate.version);
 
     const schema_only =
-        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-0.146.0","codex":{"path":"/tmp/codex","version":"0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","banner":"codex-cli 0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
     ;
     try std.testing.expectError(
         error.IncompatibleReviewRuntime,

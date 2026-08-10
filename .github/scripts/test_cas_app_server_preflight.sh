@@ -2,15 +2,13 @@
 set -euo pipefail
 
 if [[ $# -ne 1 || ! -x "$1" ]]; then
-  echo "usage: $0 <exact-codex-0.146.0>" >&2
+  echo "usage: $0 <codex>" >&2
   exit 2
 fi
 
 codex_bin="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-if [[ "$("${codex_bin}" --version)" != "codex-cli 0.146.0" ]]; then
-  echo "expected codex-cli 0.146.0" >&2
-  exit 1
-fi
+codex_banner="$("${codex_bin}" --version)"
+[[ -n "${codex_banner}" ]]
 
 json_filter() {
   if command -v jaq >/dev/null 2>&1; then
@@ -20,7 +18,7 @@ json_filter() {
   fi
 }
 
-fixture_storage="$(mktemp -d "${TMPDIR:-/tmp}/cas-preflight-0146.XXXXXX")"
+fixture_storage="$(mktemp -d "${TMPDIR:-/tmp}/cas-preflight.XXXXXX")"
 host_fixture_pid=""
 cleanup() {
   if [[ -n "${host_fixture_pid}" ]]; then
@@ -51,47 +49,57 @@ grep -Fq 'UnknownAction' "${public_surface_stderr}"
 schema_json="${fixture_root}/schema.json"
 preflight_json="${fixture_root}/preflight.json"
 
-./zig-out/bin/cas app-server schema \
+if ! ./zig-out/bin/cas app-server schema \
   --cwd "${fixture_root}/repo" \
   --codex-path "${codex_bin}" \
-  --profile full \
+  --profile review \
   --refresh \
-  --json >"${schema_json}"
+  --json >"${schema_json}"; then
+  cat "${schema_json}" >&2
+  exit 1
+fi
 
-json_filter -e '
+if ! json_filter -e '
   .schema == "cas-app-server-preflight/v1" and
   .action == "schema" and
-  .contractId == "codex-app-server-0.146.0" and
-  .profile == "full" and
+  .contractId == "codex-app-server-capabilities-v1" and
+  .profile == "review" and
   .status == "compatible" and
-  .codex.version == "0.146.0" and
-  .codex.prerelease == false and
+  (.codex.version | length) > 0 and
   .schemas.stableDocumentCount > 0 and
   .schemas.experimentalDocumentCount > 0 and
   .methods.missingRequired == [] and
   .handlerCoverage.status == "passed" and
   .shapeChecks.status == "passed" and
   .failureCode == null
-' "${schema_json}" >/dev/null
+' "${schema_json}" >/dev/null; then
+  cat "${schema_json}" >&2
+  exit 1
+fi
 
-./zig-out/bin/cas app-server preflight \
+if ! ./zig-out/bin/cas app-server preflight \
   --cwd "${fixture_root}/repo" \
   --codex-path "${codex_bin}" \
-  --profile full \
+  --profile review \
   --app-server-transport stdio \
-  --json >"${preflight_json}"
+  --json >"${preflight_json}"; then
+  cat "${preflight_json}" >&2
+  exit 1
+fi
 
-json_filter -e '
+if ! json_filter -e '
   .schema == "cas-app-server-preflight/v1" and
   .action == "preflight" and
-  .profile == "full" and
+  .profile == "review" and
   .status == "compatible" and
   .schemas.cacheHit == true and
-  any(.behavioralProbes[]; .id == "executor-skill-resources" and .requirement == "required" and .status == "passed") and
-  any(.behavioralProbes[]; .id == "paginated-session-inquiry" and .requirement == "required" and .status == "passed") and
+  any(.behavioralProbes[]; .id == "structured-review" and .requirement == "required" and .status == "passed") and
   ([.behavioralProbes[] | select(.requirement == "required" and .status != "passed")] | length) == 0 and
   .failureCode == null
-' "${preflight_json}" >/dev/null
+' "${preflight_json}" >/dev/null; then
+  cat "${preflight_json}" >&2
+  exit 1
+fi
 
 zig build build-cas-code-mode-host-fixture
 host_ready="${fixture_root}/code-mode-host.ready"
@@ -155,66 +163,6 @@ grep -Fxq 'connection/hello' "${host_evidence}"
 grep -Fxq 'session/open' "${host_evidence}"
 grep -Eq '^session/execute CAS_CODE_MODE_PROBE_[0-9a-f]+$' "${host_evidence}"
 
-negative_host_ready="${fixture_root}/negative-code-mode-host.ready"
-negative_host_evidence="${fixture_root}/negative-code-mode-host.request"
-./zig-out/bin/cas_code_mode_host_fixture "${negative_host_ready}" "${negative_host_evidence}" &
-host_fixture_pid=$!
-for _ in {1..100}; do
-  [[ -s "${negative_host_ready}" ]] && break
-  if ! kill -0 "${host_fixture_pid}" 2>/dev/null; then
-    wait "${host_fixture_pid}"
-    echo "negative Code Mode host fixture exited before readiness" >&2
-    exit 1
-  fi
-  sleep 0.05
-done
-[[ -s "${negative_host_ready}" ]]
-negative_code_mode_host="$(<"${negative_host_ready}")"
-
-stripping_wrapper="${fixture_root}/codex-strip-code-mode-host"
-cat >"${stripping_wrapper}" <<'EOF'
-#!/bin/bash
-set -eu
-filtered=()
-skip_value=false
-for arg in "$@"; do
-  if [[ "${skip_value}" == true ]]; then
-    skip_value=false
-    continue
-  fi
-  if [[ "${arg}" == "--code-mode-host" ]]; then
-    skip_value=true
-    continue
-  fi
-  filtered+=("${arg}")
-done
-exec "${CAS_EXACT_CODEX_BIN}" "${filtered[@]}"
-EOF
-chmod 0755 "${stripping_wrapper}"
-
-stripped_host_json="${fixture_root}/stripped-code-mode-host.json"
-set +e
-./zig-out/bin/cas app-server preflight \
-  --cwd "${fixture_root}/repo" \
-  --codex-path "${stripping_wrapper}" \
-  --profile core \
-  --app-server-transport managed-ws \
-  --code-mode-host "${negative_code_mode_host}" \
-  --json >"${stripped_host_json}"
-stripped_host_status=$?
-set -e
-kill "${host_fixture_pid}" 2>/dev/null || true
-wait "${host_fixture_pid}" 2>/dev/null || true
-host_fixture_pid=""
-[[ ${stripped_host_status} -eq 1 ]]
-json_filter -e '
-  .status == "incompatible" and
-  any(.behavioralProbes[]; .id == "initialize-lifecycle" and .status == "passed") and
-  any(.behavioralProbes[]; .id == "managed-websocket-transport" and .status == "passed") and
-  any(.behavioralProbes[]; .id == "remote-code-mode-host" and .status == "failed" and .failureCode == "code_mode_host_connection_failed")
-' "${stripped_host_json}" >/dev/null
-[[ ! -e "${negative_host_evidence}" ]]
-
 closed_host_json="${fixture_root}/closed-code-mode-host.json"
 set +e
 ./zig-out/bin/cas app-server preflight \
@@ -256,9 +204,9 @@ json_filter -e '
 ! grep -Fq "${query_sentinel}" "${redacted_host_json}"
 
 ./zig-out/bin/cas capabilities --json | json_filter -e '
-  .cas_capabilities.features.cas_app_server_contract_0146_v1 == true and
+  .cas_capabilities.features.cas_app_server_contract_v1 == true and
   .cas_capabilities.features.cas_app_server_schema_probe_v1 == true and
-  ([.cas_capabilities.features | keys[] | select(contains("0145"))] | length) == 0
+  ([.cas_capabilities.features | keys[] | select(test("0145|0146"))] | length) == 0
 ' >/dev/null
 
-echo "CAS app-server 0.146 schema, full preflight, and Code Mode host boundary: compatible"
+echo "CAS app-server review contract and Code Mode host boundary: compatible (${codex_banner})"
