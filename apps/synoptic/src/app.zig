@@ -293,8 +293,8 @@ pub const App = struct {
         number: u64,
         card_id: []const u8,
     ) !tools.ActionStatus {
+        if (!self.action_state_fresh) return error.GitHubStateStale;
         var card = (try self.action_store.pendingById(card_id)).*;
-        self.action_state_fresh = true;
         const started_unix_s: i64 =
             @intCast(@divFloor(std.Io.Clock.real.now(broker.io).nanoseconds, std.time.ns_per_s));
         _ = try self.action_store.beginExecute(card.id);
@@ -449,6 +449,7 @@ pub const App = struct {
         path: []const u8,
         revision: []const u8,
     ) !void {
+        if (!self.action_state_fresh) return error.GitHubStateStale;
         const current = domain.revisionFor(&self.generation, path) orelse
             return error.FileNotQueued;
         if (!std.mem.eql(u8, current, revision)) return error.StaleOriginSession;
@@ -459,7 +460,9 @@ pub const App = struct {
             self.generation.head_oid,
             path,
         );
-        try broker.markViewed(pull_request_id, path);
+        broker.markViewed(pull_request_id, path) catch |err| {
+            if (err != error.GitHubTransportAmbiguous) return err;
+        };
         if (!try broker.viewedAfterMutation(
             owner,
             name,

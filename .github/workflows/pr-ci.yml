@@ -458,8 +458,6 @@ jobs:
       - name: Test Synoptic behavior and falsifiers
         run: |
           zig build test-synoptic
-          zig build test-synoptic-falsifiers
-          zig build test-synoptic-e2e
       - name: Build Synoptic ReleaseSafe command surface
         run: zig build release-synoptic-safe
       - name: Verify Synoptic version and capabilities

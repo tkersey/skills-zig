@@ -460,6 +460,7 @@ fn serveGeneration(
         &custody_retired,
     ) catch |launch_error| {
         if (!custody_retired) {
+            custody_retired = true;
             try worktree.retireManaged(allocator, io, custody, context.options.cwd);
         }
         return launch_error;
@@ -489,7 +490,18 @@ fn serveSelectedGeneration(
     );
     defer state.deinit();
 
-    var registry = try sessions.Registry.start(allocator, io, review_cwd, context.codex_resolved);
+    const app_server_receipts = try std.fs.path.join(
+        allocator,
+        &.{ context.runtime_root, context.launch_id, "codex" },
+    );
+    defer allocator.free(app_server_receipts);
+    var registry = try sessions.Registry.startManagedPreferred(
+        allocator,
+        io,
+        review_cwd,
+        app_server_receipts,
+        context.codex_resolved,
+    );
     defer registry.deinit();
     const skill_path = try initializePrimary(
         allocator,
@@ -505,12 +517,7 @@ fn serveSelectedGeneration(
     try serveHttpRuntime(
         allocator,
         io,
-        context.settings,
-        context.options,
-        context.identity,
-        context.broker,
-        context.launch_id,
-        context.runtime_root,
+        context,
         context.snapshot.pull_request_id,
         custody,
         &worktree_baseline,
@@ -617,12 +624,7 @@ fn configureAppState(
 fn serveHttpRuntime(
     allocator: std.mem.Allocator,
     io: std.Io,
-    settings: *config.Settings,
-    options: config.LaunchOptions,
-    identity: pr.Identity,
-    broker: github.Broker,
-    launch_id: []const u8,
-    runtime_root: []const u8,
+    context: GenerationContext,
     pull_request_id: []const u8,
     custody: worktree.Custody,
     worktree_baseline: *worktree.Baseline,
@@ -632,28 +634,18 @@ fn serveHttpRuntime(
     skill_path: []const u8,
     custody_retired: *bool,
 ) !void {
-    var server = try http.Server.bind(allocator, io, options.skill_root);
+    var server = try http.Server.bind(allocator, io, context.options.skill_root);
     defer server.deinit();
-    queueLaunchExclusionFailures(
-        allocator,
-        settings,
-        broker,
-        identity,
-        pull_request_id,
-        review_cwd,
-        state,
-        registry,
-    );
     const stop_request_path = try std.fs.path.join(
         allocator,
-        &.{ runtime_root, launch_id, "stop.request" },
+        &.{ context.runtime_root, context.launch_id, "stop.request" },
     );
     defer allocator.free(stop_request_path);
     var runtime = makeHttpRuntime(
-        settings,
-        options,
-        identity,
-        broker,
+        context.settings,
+        context.options,
+        context.identity,
+        context.broker,
         pull_request_id,
         custody,
         worktree_baseline,
@@ -661,21 +653,119 @@ fn serveHttpRuntime(
         registry,
         review_cwd,
         skill_path,
-        launch_id,
+        context.launch_id,
         stop_request_path,
     );
-    try publishRuntimeReady(allocator, io, &server, &runtime, runtime_root);
+    const tool_domain = try configureToolDomain(
+        allocator,
+        state,
+        registry,
+        context.broker,
+        context.identity,
+        pull_request_id,
+    );
+    runtime.tool_domain = tool_domain;
+    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
+    var exclusion_work = LaunchExclusionWork.init(
+        allocator,
+        context.settings,
+        context.broker,
+        context.identity,
+        pull_request_id,
+        review_cwd,
+        state,
+        registry,
+        tool_domain,
+    );
+    const exclusion_thread = try std.Thread.spawn(.{}, LaunchExclusionWork.run, .{&exclusion_work});
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
+    exclusion_thread.join();
     try finishHttpRuntime(
         allocator,
         io,
-        options,
-        runtime_root,
+        context.options,
+        context.runtime_root,
         &runtime,
         custody_retired,
         terminal_error,
     );
 }
+
+fn configureToolDomain(
+    allocator: std.mem.Allocator,
+    state: *App,
+    registry: *sessions.Registry,
+    broker: github.Broker,
+    identity: pr.Identity,
+    pull_request_id: []const u8,
+) !*http.ToolDomainContext {
+    const context = try http.ToolDomainContext.create(
+        allocator,
+        state,
+        registry,
+        broker,
+        identity.owner,
+        identity.repository,
+        identity.number,
+        pull_request_id,
+    );
+    registry.setAuthoritativeToolHandler(context.handler()) catch |err| {
+        allocator.destroy(context);
+        return err;
+    };
+    return context;
+}
+
+const LaunchExclusionWork = struct {
+    allocator: std.mem.Allocator,
+    settings: *config.Settings,
+    broker: github.Broker,
+    identity: pr.Identity,
+    pull_request_id: []const u8,
+    review_cwd: []const u8,
+    state: *App,
+    registry: *sessions.Registry,
+    tool_domain: *http.ToolDomainContext,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        settings: *config.Settings,
+        broker: github.Broker,
+        identity: pr.Identity,
+        pull_request_id: []const u8,
+        review_cwd: []const u8,
+        state: *App,
+        registry: *sessions.Registry,
+        tool_domain: *http.ToolDomainContext,
+    ) LaunchExclusionWork {
+        return .{
+            .allocator = allocator,
+            .settings = settings,
+            .broker = broker,
+            .identity = identity,
+            .pull_request_id = pull_request_id,
+            .review_cwd = review_cwd,
+            .state = state,
+            .registry = registry,
+            .tool_domain = tool_domain,
+        };
+    }
+
+    fn run(self: *LaunchExclusionWork) void {
+        self.tool_domain.lock();
+        defer self.tool_domain.unlock();
+        queueLaunchExclusionFailures(
+            self.allocator,
+            self.settings,
+            self.broker,
+            self.identity,
+            self.pull_request_id,
+            self.review_cwd,
+            self.state,
+            self.registry,
+        );
+    }
+};
 
 fn publishRuntimeReady(
     allocator: std.mem.Allocator,
@@ -697,6 +787,7 @@ fn publishRuntimeReady(
         runtime_root,
         runtime.cwd,
         runtime.custody,
+        runtime.registry.transportName(),
     );
 }
 
@@ -806,6 +897,7 @@ fn publishReadyReceipt(
     runtime_root: []const u8,
     review_cwd: []const u8,
     custody: worktree.Custody,
+    transport: []const u8,
 ) !void {
     var token_buf: [64]u8 = undefined;
     const token = server.tokenHex(&token_buf);
@@ -828,8 +920,7 @@ fn publishReadyReceipt(
         ":\"ready\",\"lifecycle\":\"detached\",\"launchId\":{f}" ++
         ",\"runtimeRoot\":{f},\"executable\":{f},\"pid\":{d},\"" ++
         "url\":{f},\"repository\":{f},\"pullRequest\":{d},\"wor" ++
-        "ktree\":{f},\"worktreeKind\":{f},\"transport\":\"stdio" ++
-        "\"}}";
+        "ktree\":{f},\"worktreeKind\":{f},\"transport\":{f}}}";
     const receipt = try std.fmt.allocPrint(
         allocator,
         receipt_format,
@@ -844,6 +935,7 @@ fn publishReadyReceipt(
             identity.number,
             std.json.fmt(review_cwd, .{}),
             std.json.fmt(custody.kind(), .{}),
+            std.json.fmt(transport, .{}),
         },
     );
     defer allocator.free(receipt);
@@ -862,7 +954,9 @@ fn runHttpLoop(
 ) ?anyerror {
     var terminal_error: ?anyerror = null;
     while (!runtime.stop_requested) {
+        if (runtime.tool_domain) |domain_context| domain_context.lock();
         state.primary_ready = registry.primaryReady();
+        if (runtime.tool_domain) |domain_context| domain_context.unlock();
         server.serveOne(runtime) catch |err| {
             terminal_error = err;
             break;
@@ -896,8 +990,8 @@ fn shutdownReview(
         state.generation.head_oid,
         worktree_baseline,
     );
-    try worktree.retireManaged(allocator, io, custody, options.cwd);
     custody_retired.* = true;
+    try worktree.retireManaged(allocator, io, custody, options.cwd);
     std.Io.Dir.cwd().deleteFile(io, stop_request_path) catch |ignored_error| {
         switch (ignored_error) {
             else => {},
@@ -1070,12 +1164,31 @@ fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
 }
 
 fn acquireLaunchClaim(io: std.Io, path: []const u8) !std.Io.File {
-    var claim = try std.Io.Dir.cwd().createFile(io, path, .{
+    const parent_path = std.fs.path.dirname(path) orelse return error.InvalidRuntimeRoot;
+    const name = std.fs.path.basename(path);
+    var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{ .follow_symlinks = false });
+    defer parent.close(io);
+    var claim = parent.createFile(io, name, .{
         .read = true,
         .truncate = false,
-    });
+        .exclusive = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => parent.openFile(io, name, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .follow_symlinks = false,
+        }) catch |open_err| switch (open_err) {
+            error.WouldBlock => return error.SynopticLaunchInProgress,
+            else => return open_err,
+        },
+        error.WouldBlock => return error.SynopticLaunchInProgress,
+        else => return err,
+    };
     errdefer claim.close(io);
-    if (!try claim.tryLock(io, .exclusive)) return error.SynopticLaunchInProgress;
     try claim.setPermissions(io, std.Io.File.Permissions.fromMode(0o600));
     return claim;
 }

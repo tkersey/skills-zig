@@ -7,6 +7,152 @@ const tools = @import("tools.zig");
 const ui = @import("ui_protocol.zig");
 const worktree = @import("worktree.zig");
 
+const DomainMutex = struct {
+    state: std.atomic.Mutex = .unlocked,
+    fn lock(self: *DomainMutex) void {
+        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *DomainMutex) void {
+        self.state.unlock();
+    }
+};
+
+pub const ToolDomainContext = struct {
+    allocator: std.mem.Allocator,
+    app: *App,
+    registry: *sessions.Registry,
+    broker: github.Broker,
+    owner: []const u8,
+    name: []const u8,
+    number: u64,
+    pull_request_id: []const u8,
+    mutex: DomainMutex = .{},
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        app: *App,
+        registry: *sessions.Registry,
+        broker: github.Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+    ) !*ToolDomainContext {
+        const context = try allocator.create(ToolDomainContext);
+        context.* = .{
+            .allocator = allocator,
+            .app = app,
+            .registry = registry,
+            .broker = broker,
+            .owner = owner,
+            .name = name,
+            .number = number,
+            .pull_request_id = pull_request_id,
+        };
+        return context;
+    }
+
+    pub fn handler(self: *ToolDomainContext) sessions.AuthoritativeToolHandler {
+        return .{ .context = self, .handle = handleOpaque, .deinit = deinitOpaque };
+    }
+
+    pub fn pendingActionCount(self: *ToolDomainContext) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.app.action_store.cards.items.len;
+    }
+
+    pub fn fileQueued(self: *ToolDomainContext, path: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.app.generation.queued(path);
+    }
+
+    pub fn lock(self: *ToolDomainContext) void {
+        self.mutex.lock();
+    }
+
+    pub fn unlock(self: *ToolDomainContext) void {
+        self.mutex.unlock();
+    }
+
+    fn deinitOpaque(raw: *anyopaque) void {
+        const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
+        self.allocator.destroy(self);
+    }
+
+    fn handleOpaque(
+        raw: *anyopaque,
+        event_kind: []const u8,
+        raw_json: []const u8,
+        session_id: []const u8,
+    ) !void {
+        const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (std.mem.eql(u8, event_kind, "action.prepared")) {
+            return self.prepareAction(raw_json, session_id);
+        }
+        if (std.mem.eql(u8, event_kind, "file.complete.requested")) {
+            return self.completeFile(session_id);
+        }
+        if (std.mem.eql(u8, event_kind, "session.close.requested")) {
+            return self.closeSession(session_id);
+        }
+    }
+
+    fn prepareAction(
+        self: *ToolDomainContext,
+        raw_json: []const u8,
+        session_id: []const u8,
+    ) !void {
+        const input = try tools.decodePreparedAction(self.allocator, raw_json);
+        defer input.deinit(self.allocator);
+        const identity = try self.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try tools.validateAgainstSession(input, identity.path);
+        const repository = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.owner, self.name },
+        );
+        defer self.allocator.free(repository);
+        const turn_id = try toolTurnIdAlloc(self.allocator, raw_json, identity.turn_id);
+        defer self.allocator.free(turn_id);
+        _ = try self.app.prepareModelAction(
+            session_id,
+            turn_id,
+            input,
+            repository,
+            self.number,
+            self.pull_request_id,
+            identity.path,
+        );
+    }
+
+    fn completeFile(self: *ToolDomainContext, session_id: []const u8) !void {
+        const identity = try self.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try self.app.completeRevision(
+            self.broker,
+            self.owner,
+            self.name,
+            self.number,
+            self.pull_request_id,
+            identity.path,
+            identity.revision,
+        );
+        try self.registry.markCompleted(session_id);
+    }
+
+    fn closeSession(self: *ToolDomainContext, session_id: []const u8) !void {
+        const identity = try self.registry.sessionIdentity(session_id);
+        defer identity.deinit();
+        try self.registry.closeSession(session_id);
+        try self.app.closeTab(identity.path, identity.revision);
+    }
+};
+
 pub const Runtime = struct {
     app: *App,
     registry: *sessions.Registry,
@@ -25,11 +171,19 @@ pub const Runtime = struct {
     stop_request_path: ?[]const u8 = null,
     stop_requested: bool = false,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
+    tool_domain: ?*ToolDomainContext = null,
+    local_domain_mutex: DomainMutex = .{},
 };
+
+fn domainMutex(runtime: *Runtime) *DomainMutex {
+    if (runtime.tool_domain) |context| return &context.mutex;
+    return &runtime.local_domain_mutex;
+}
 
 pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
 const default_header_timeout_ms: u32 = 5_000;
+const default_write_timeout_ms: u32 = 5_000;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 fn clientConnectionError(err: anyerror) bool {
@@ -62,6 +216,8 @@ pub const Server = struct {
     token: [32]u8,
     skill_root: []u8,
     header_timeout_ms: u32 = default_header_timeout_ms,
+    write_timeout_ms: u32 = default_write_timeout_ms,
+    websocket_active: bool = false,
 
     pub fn bind(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !Server {
         var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -135,7 +291,12 @@ pub const Server = struct {
                 "forbidden",
                 false,
             );
-            const body = try runtime.app.bootstrapAlloc();
+            const body = body: {
+                const mutex = domainMutex(runtime);
+                mutex.lock();
+                defer mutex.unlock();
+                break :body try runtime.app.bootstrapAlloc();
+            };
             defer self.allocator.free(body);
             return writeResponse(self.io, stream, "200 OK", "application/json", body, true);
         }
@@ -220,6 +381,14 @@ pub const Server = struct {
         token: []const u8,
         runtime: *Runtime,
     ) !void {
+        if (self.websocket_active) return writeResponse(
+            self.io,
+            stream,
+            "409 Conflict",
+            "text/plain",
+            "websocket already connected",
+            false,
+        );
         const target = requestTarget(raw) orelse return error.InvalidHttpRequest;
         if (!authorized(target, raw, token) or !loopbackOrigin(raw, self.port())) {
             return writeResponse(
@@ -249,6 +418,8 @@ pub const Server = struct {
             "invalid upgrade",
             false,
         );
+        self.websocket_active = true;
+        defer self.websocket_active = false;
         try self.writeUpgradeResponse(stream, key);
         defer runtime.registry.declineAllApprovals("browser-disconnected");
         try self.serveWebSocket(stream, runtime);
@@ -270,9 +441,8 @@ pub const Server = struct {
             "\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n";
         const response = try std.fmt.allocPrint(self.allocator, format, .{accept});
         defer self.allocator.free(response);
-        var writer = stream.writer(self.io, &.{});
-        try writer.interface.writeAll(response);
-        try writer.interface.flush();
+        const deadline = writeDeadline(self.io, self.write_timeout_ms);
+        try writeStreamAllUntil(self.io, stream.*, response, deadline);
     }
 
     fn serveWebSocket(
@@ -281,6 +451,7 @@ pub const Server = struct {
         runtime: *Runtime,
     ) !void {
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
+            try self.servePendingConnection(runtime);
             const message = readClientTextAllocTimeout(
                 self.allocator,
                 self.io,
@@ -323,7 +494,28 @@ pub const Server = struct {
         }
     }
 
+    fn servePendingConnection(self: *Server, runtime: *Runtime) anyerror!void {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.listener.socket.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&fds, 0) == 0) return;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+            return error.HttpListenerFailed;
+        }
+        var stream = try self.listener.accept(self.io);
+        defer stream.close(self.io);
+        self.serveConnected(&stream, runtime) catch |err| {
+            if (clientConnectionError(err)) return;
+            return err;
+        };
+    }
+
     fn flushVisible(self: *Server, stream: *std.Io.net.Stream, runtime: *Runtime) !void {
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         const primary_ready = runtime.registry.primaryReady();
         if (primary_ready and !runtime.app.primary_ready) {
             runtime.app.primary_ready = true;
@@ -557,15 +749,24 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, command, "action.reject")) return self.rejectAction(runtime, payload);
         if (std.mem.eql(u8, command, "snapshot.get")) {
+            const mutex = domainMutex(runtime);
+            mutex.lock();
+            defer mutex.unlock();
             const snapshot = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(snapshot);
             return runtime.app.nextEnvelope("snapshot", snapshot);
         }
         if (std.mem.eql(u8, command, "pr.refresh")) {
+            const mutex = domainMutex(runtime);
+            mutex.lock();
+            defer mutex.unlock();
             try self.refresh(runtime);
             return runtime.app.nextEnvelope("pr.refreshed", "{\"status\":\"reconciled\"}");
         }
         if (std.mem.eql(u8, command, "round.finish")) {
+            const mutex = domainMutex(runtime);
+            mutex.lock();
+            defer mutex.unlock();
             try self.refresh(runtime);
             const round = runtime.app.finishRound();
             const body = try std.fmt.allocPrint(self.allocator, "{{\"round\":{d}}}", .{round});
@@ -576,6 +777,9 @@ pub const Server = struct {
             if (payload.count() != 0) return error.InvalidUiCommand;
             runtime.registry.declineAllApprovals("shutdown");
             runtime.stop_requested = true;
+            const mutex = domainMutex(runtime);
+            mutex.lock();
+            defer mutex.unlock();
             return runtime.app.nextEnvelope("app.stopped", "{\"status\":\"stopping\"}");
         }
         return error.UnsupportedUiCommand;
@@ -586,6 +790,9 @@ pub const Server = struct {
             .string => |s| s,
             else => return error.InvalidUiCommand,
         };
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         if (!runtime.app.primary_ready) return error.PrimaryNotReady;
         if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
         const revision = @import("domain.zig").revisionFor(
@@ -624,6 +831,18 @@ pub const Server = struct {
             immediate,
         );
         defer opened.deinit();
+        return self.recordOpenedFile(runtime, path, revision, diff, immediate, opened);
+    }
+
+    fn recordOpenedFile(
+        self: *Server,
+        runtime: *Runtime,
+        path: []const u8,
+        revision: []const u8,
+        diff: []const u8,
+        immediate: bool,
+        opened: sessions.OpenResult,
+    ) ![]u8 {
         const event = runtime.app.openFile(path) catch |err| {
             if (!opened.reused) {
                 runtime.registry.discardOpenedSession(opened.session_id);
@@ -657,17 +876,25 @@ pub const Server = struct {
         const identity = try runtime.registry.sessionIdentity(session_id);
         defer identity.deinit();
         try runtime.registry.closeSession(session_id);
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         try runtime.app.closeTab(identity.path, identity.revision);
         return runtime.app.nextEnvelope("session.closed", "{}");
     }
 
     fn messageSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
         _ = self;
-        runtime.app.initial_review_active = false;
         const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        runtime.app.initial_review_active = false;
+        mutex.unlock();
         try runtime.registry.message(session_id, text);
+        mutex.lock();
+        defer mutex.unlock();
         return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
     }
 
@@ -676,6 +903,9 @@ pub const Server = struct {
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
         try runtime.registry.interrupt(session_id);
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
     }
 
@@ -689,6 +919,9 @@ pub const Server = struct {
         const choice_json = try stringifyValueAlloc(self.allocator, decision);
         defer self.allocator.free(choice_json);
         try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         return runtime.app.nextEnvelope(
             "session.status",
             "{\"status\":\"approval-resolving\"}",
@@ -697,6 +930,9 @@ pub const Server = struct {
 
     fn confirmAction(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
         if (payload.count() != 1) return error.InvalidUiCommand;
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
         const card = (try runtime.app.action_store.pendingById(card_id)).*;
         runtime.broker.validateAction(
@@ -806,6 +1042,9 @@ pub const Server = struct {
 
     fn rejectAction(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
         if (payload.count() != 1) return error.InvalidUiCommand;
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
         const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
         try runtime.app.rejectAction(card_id);
         const status = try std.fmt.allocPrint(
@@ -821,6 +1060,7 @@ pub const Server = struct {
         if (runtime.refresh_override) |run| return run(runtime);
         try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
         defer runtime.registry.endSynchronization();
+        runtime.app.action_state_fresh = false;
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
@@ -841,6 +1081,7 @@ pub const Server = struct {
         try self.applyRefreshExclusions(runtime);
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         try self.updatePrimaryContext(runtime);
+        runtime.app.action_state_fresh = true;
     }
 
     fn refreshTabDiffs(
@@ -875,27 +1116,33 @@ pub const Server = struct {
         runtime: *Runtime,
         next: *const @import("domain.zig").PrGeneration,
     ) !void {
-        for (runtime.app.generation.files.items) |old_file| {
-            const next_revision = @import("domain.zig").revisionFor(next, old_file.path) orelse {
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer paths.deinit(self.allocator);
+        for (runtime.app.generation.files.items) |file| {
+            try appendUniquePath(self.allocator, &paths, file.path);
+        }
+        for (runtime.app.tabs.items) |tab| {
+            if (tab.status != .closed) try appendUniquePath(self.allocator, &paths, tab.path);
+        }
+        for (paths.items) |path| {
+            const next_revision = @import("domain.zig").revisionFor(next, path) orelse {
                 try runtime.registry.markPathChangedAndInject(
-                    old_file.path,
+                    path,
                     "deleted",
                     "This file was removed from the current pull request.",
                 );
                 continue;
             };
-            if (!std.mem.eql(u8, old_file.revision_key, next_revision)) {
-                const diff = try github.canonicalDiffAlloc(
-                    self.allocator,
-                    self.io,
-                    runtime.cwd,
-                    next.base_oid,
-                    next.head_oid,
-                    old_file.path,
-                );
-                defer self.allocator.free(diff);
-                try runtime.registry.markPathChangedAndInject(old_file.path, next_revision, diff);
-            }
+            const diff = try github.canonicalDiffAlloc(
+                self.allocator,
+                self.io,
+                runtime.cwd,
+                next.base_oid,
+                next.head_oid,
+                path,
+            );
+            defer self.allocator.free(diff);
+            try runtime.registry.markPathChangedAndInject(path, next_revision, diff);
         }
     }
 
@@ -968,6 +1215,32 @@ fn payloadString(payload: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn toolTurnIdAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    fallback: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value == .object) if (parsed.value.object.get("params")) |params| {
+        if (params == .object) if (params.object.get("turnId")) |turn| {
+            if (turn == .string) return allocator.dupe(u8, turn.string);
+        };
+    };
+    return allocator.dupe(u8, fallback);
+}
+
+fn appendUniquePath(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    path: []const u8,
+) !void {
+    for (paths.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try paths.append(allocator, path);
 }
 
 fn payloadBool(payload: std.json.ObjectMap, key: []const u8) ?bool {
@@ -1120,23 +1393,23 @@ fn readExactUntil(
 }
 fn writeServerText(io: std.Io, stream: *std.Io.net.Stream, body: []const u8) !void {
     if (body.len > max_ws_message_bytes) return error.FrameTooLarge;
-    var writer = stream.writer(io, &.{});
-    try writer.interface.writeByte(0x81);
-    if (body.len <= 125) try writer.interface.writeByte(@intCast(body.len)) else if (body.len <=
-        std.math.maxInt(u16))
-    {
-        try writer.interface.writeByte(126);
-        var len: [2]u8 = undefined;
-        std.mem.writeInt(u16, &len, @intCast(body.len), .big);
-        try writer.interface.writeAll(&len);
-    } else {
-        try writer.interface.writeByte(127);
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, body.len, .big);
-        try writer.interface.writeAll(&len);
-    }
-    try writer.interface.writeAll(body);
-    try writer.interface.flush();
+    var header: [10]u8 = undefined;
+    header[0] = 0x81;
+    const header_len: usize = if (body.len <= 125) blk: {
+        header[1] = @intCast(body.len);
+        break :blk 2;
+    } else if (body.len <= std.math.maxInt(u16)) blk: {
+        header[1] = 126;
+        std.mem.writeInt(u16, header[2..4], @intCast(body.len), .big);
+        break :blk 4;
+    } else blk: {
+        header[1] = 127;
+        std.mem.writeInt(u64, header[2..10], body.len, .big);
+        break :blk 10;
+    };
+    const deadline = writeDeadline(io, default_write_timeout_ms);
+    try writeStreamAllUntil(io, stream.*, header[0..header_len], deadline);
+    try writeStreamAllUntil(io, stream.*, body, deadline);
 }
 fn writeResponse(
     io: std.Io,
@@ -1146,18 +1419,74 @@ fn writeResponse(
     body: []const u8,
     secure: bool,
 ) !void {
-    var writer = stream.writer(io, &.{});
-    try writer.interface.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {" ++
+    var header: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&header);
+    try writer.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {" ++
         "d}\r\nConnection: close\r\nX-Content-Type-Options: nos" ++
         "niff\r\n", .{ status, content_type, body.len });
-    if (secure) try writer.interface.writeAll(
+    if (secure) try writer.writeAll(
         "Content-Security-Policy: default-src 'self'; connect-s" ++
             "rc 'self' ws://127.0.0.1:*; object-src 'none'; base-ur" ++
             "i 'none'\r\n",
     );
-    try writer.interface.writeAll("\r\n");
-    try writer.interface.writeAll(body);
-    try writer.interface.flush();
+    try writer.writeAll("\r\n");
+    const deadline = writeDeadline(io, default_write_timeout_ms);
+    try writeStreamAllUntil(io, stream.*, writer.buffered(), deadline);
+    try writeStreamAllUntil(io, stream.*, body, deadline);
+}
+
+fn writeDeadline(io: std.Io, timeout_ms: u32) std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.fromNow(
+        io,
+        .{ .raw = std.Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake },
+    );
+}
+
+fn writeStreamAllUntil(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    bytes: []const u8,
+    deadline: std.Io.Clock.Timestamp,
+) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const remaining_ms = deadline.durationFromNow(io).raw.toMilliseconds();
+        if (remaining_ms <= 0) return error.Timeout;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.OUT | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        if (try std.posix.poll(&fds, poll_timeout) == 0) return error.Timeout;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+            return error.ConnectionResetByPeer;
+        }
+        var iov = [_]std.posix.iovec_const{.{
+            .base = bytes[offset..].ptr,
+            .len = bytes.len - offset,
+        }};
+        var msg: std.posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = iov.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        const rc = std.posix.system.sendmsg(
+            stream.socket.handle,
+            &msg,
+            std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => offset += @intCast(rc),
+            .INTR, .AGAIN => continue,
+            .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionResetByPeer,
+            else => return error.HttpWriteFailed,
+        }
+    }
 }
 
 test "asset confinement rejects sibling prefix and traversal" {

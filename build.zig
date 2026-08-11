@@ -892,17 +892,9 @@ pub fn build(b: *std.Build) void {
     run_synoptic_ui_domain.step.dependOn(&synoptic_install.step);
     const test_synoptic = b.step(
         "test-synoptic",
-        "Run Synoptic generation, session, product, and falsifier tests",
+        "Run the complete Synoptic test root once",
     );
     test_synoptic.dependOn(&run_synoptic_tests.step);
-    test_synoptic.dependOn(&run_synoptic_falsifiers.step);
-    test_synoptic.dependOn(&run_synoptic_e2e.step);
-    test_synoptic.dependOn(&run_synoptic_action_broker.step);
-    test_synoptic.dependOn(&run_synoptic_session_context.step);
-    test_synoptic.dependOn(&run_synoptic_worktree_integrity.step);
-    test_synoptic.dependOn(&run_synoptic_exclusions_config.step);
-    test_synoptic.dependOn(&run_synoptic_command_approvals.step);
-    test_synoptic.dependOn(&run_synoptic_ui_domain.step);
     const test_synoptic_falsifiers = b.step(
         "test-synoptic-falsifiers",
         "Run Synoptic falsifiers",

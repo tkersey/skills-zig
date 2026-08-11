@@ -769,7 +769,9 @@ fn readSchema(
 }
 
 pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ skill_root, "assets", "ui", "manifest.json" });
+    const ui_root = try std.fs.path.join(allocator, &.{ skill_root, "assets", "ui" });
+    defer allocator.free(ui_root);
+    const path = try std.fs.path.join(allocator, &.{ ui_root, "manifest.json" });
     defer allocator.free(path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
     defer allocator.free(bytes);
@@ -783,6 +785,38 @@ pub fn validateManifest(allocator: std.mem.Allocator, io: std.Io, skill_root: []
     try expectString(obj, "uiAbi", ui_abi);
     try expectString(obj, "requiredSkillAbi", skill_abi);
     try expectString(obj, "entry", "index.html");
+    const assets = obj.get("assets") orelse return error.InvalidUiManifest;
+    if (assets != .array or assets.array.items.len != 2) return error.InvalidUiManifest;
+    const expected_assets = [_][]const u8{ "app.css", "app.js" };
+    for (assets.array.items, expected_assets) |asset, expected| {
+        if (asset != .string or !std.mem.eql(u8, asset.string, expected)) {
+            return error.InvalidUiManifest;
+        }
+    }
+    try validateUiFile(allocator, io, ui_root, "index.html");
+    for (expected_assets) |asset| try validateUiFile(allocator, io, ui_root, asset);
+}
+
+fn validateUiFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ui_root: []const u8,
+    relative: []const u8,
+) !void {
+    const root_real = std.Io.Dir.cwd().realPathFileAlloc(io, ui_root, allocator) catch
+        return error.InvalidUiManifest;
+    defer allocator.free(root_real);
+    const candidate = try std.fs.path.join(allocator, &.{ ui_root, relative });
+    defer allocator.free(candidate);
+    const file_real = std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator) catch
+        return error.InvalidUiManifest;
+    defer allocator.free(file_real);
+    const confined = std.mem.startsWith(u8, file_real, root_real) and
+        file_real.len > root_real.len and file_real[root_real.len] == std.fs.path.sep;
+    if (!confined) return error.InvalidUiManifest;
+    var file = std.Io.Dir.cwd().openFile(io, file_real, .{ .allow_directory = false }) catch
+        return error.InvalidUiManifest;
+    file.close(io);
 }
 
 fn expectString(obj: std.json.ObjectMap, name: []const u8, expected: []const u8) !void {
@@ -803,6 +837,34 @@ test "manifest contract rejects ABI drift" {
     try std.testing.expectError(
         error.InvalidUiManifest,
         expectString(parsed.value.object, "uiAbi", ui_abi),
+    );
+}
+
+test "manifest contract requires the declared confined UI files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill/assets/ui");
+    const root = try tmp.dir.realPathFileAlloc(io, "skill", allocator);
+    defer allocator.free(root);
+    const manifest = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":" ++
+        "\"synoptic-ui/v1\",\"requiredSkillAbi\":\"synoptic-skill-abi/v1\"," ++
+        "\"entry\":\"index.html\",\"assets\":[\"app.css\",\"app.js\"]}";
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skill/assets/ui/manifest.json",
+        .data = manifest,
+    });
+    for ([_][2][]const u8{
+        .{ "skill/assets/ui/index.html", "<title>Synoptic</title>" },
+        .{ "skill/assets/ui/app.css", "body{}" },
+        .{ "skill/assets/ui/app.js", "'use strict';" },
+    }) |file| try tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+    try validateManifest(allocator, io, root);
+    try tmp.dir.deleteFile(io, "skill/assets/ui/app.js");
+    try std.testing.expectError(
+        error.InvalidUiManifest,
+        validateManifest(allocator, io, root),
     );
 }
 

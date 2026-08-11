@@ -880,12 +880,6 @@ pub const Client = struct {
         }
     }
 
-    pub fn swapRequestDeadlineMs(self: *Client, deadline_ms: ?i64) ?i64 {
-        const previous = self.request_deadline_ms;
-        self.request_deadline_ms = deadline_ms;
-        return previous;
-    }
-
     pub fn lastRequestSendStarted(self: *const Client) bool {
         return self.request_send_started;
     }
@@ -916,7 +910,7 @@ pub const Client = struct {
             capabilities,
         );
         defer self.allocator.free(initialize);
-        try self.sendPayload(initialize, null);
+        try self.sendPayload(initialize, null, null);
 
         while (monotonicMillis() < self.request_deadline_ms.?) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
@@ -1013,13 +1007,14 @@ pub const Client = struct {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
-        try self.sendPayload(payload_writer.written(), send_observer);
+        try self.sendPayload(payload_writer.written(), send_observer, null);
     }
 
     fn sendPayload(
         self: *Client,
         payload: []const u8,
         send_observer: ?RequestSendObserver,
+        send_deadline_ms: ?i64,
     ) !void {
         if (payload.len > websocket_transport.max_message_bytes) {
             return error.AppServerMessageTooLarge;
@@ -1028,7 +1023,7 @@ pub const Client = struct {
             .stdio => {
                 if (send_observer) |observer| try observer.before_send(observer.context);
                 self.request_send_started = true;
-                const deadline_ms = self.request_deadline_ms orelse
+                const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
                     monotonicMillis() + default_request_timeout_ms;
                 writeFileAllUntil(self.stdin_file.?, payload, deadline_ms) catch |err| {
                     self.close();
@@ -1039,7 +1034,11 @@ pub const Client = struct {
                     return err;
                 };
             },
-            .websocket, .unix_socket => try self.sendWebSocket(payload, send_observer),
+            .websocket, .unix_socket => try self.sendWebSocket(
+                payload,
+                send_observer,
+                send_deadline_ms,
+            ),
         }
     }
 
@@ -1127,7 +1126,7 @@ pub const Client = struct {
                 try writeFileAllUntil(self.stdin_file.?, payload, deadline_ms);
                 try writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms);
             },
-            .websocket, .unix_socket => try self.sendWebSocket(payload, null),
+            .websocket, .unix_socket => try self.sendWebSocket(payload, null, null),
         }
     }
 
@@ -1166,8 +1165,9 @@ pub const Client = struct {
         self: *Client,
         payload: []const u8,
         send_observer: ?RequestSendObserver,
+        send_deadline_ms: ?i64,
     ) !void {
-        const deadline_ms = self.request_deadline_ms orelse
+        const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
             monotonicMillis() + default_request_timeout_ms;
         var remaining_ms = deadline_ms - monotonicMillis();
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
@@ -1759,9 +1759,7 @@ fn actorWriterMain(state: *ActorState) void {
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
             if (actorOutboundExpired(item)) continue;
-            const previous_deadline = state.client.swapRequestDeadlineMs(item.deadline_ms);
-            defer _ = state.client.swapRequestDeadlineMs(previous_deadline);
-            state.client.sendPayload(item.payload, null) catch {
+            state.client.sendPayload(item.payload, null, item.deadline_ms) catch {
                 actorSetTerminal(state, .poisoned);
                 actorCloseTransportOnce(state);
                 return;
@@ -3385,7 +3383,10 @@ test "expired request deadline remains pre-send" {
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.ConnectionTimedOut, client.sendWebSocket("{}", null));
+    try std.testing.expectError(
+        error.ConnectionTimedOut,
+        client.sendWebSocket("{}", null, null),
+    );
     try std.testing.expect(!client.lastRequestSendStarted());
 }
 
@@ -4126,7 +4127,10 @@ test "transport kinds preserve unix identity and frame behavior" {
         };
         defer client.line_buf.deinit(std.testing.allocator);
         try std.testing.expectError(error.ConnectionTimedOut, client.readLineAlloc());
-        try std.testing.expectError(error.ConnectionTimedOut, client.sendPayload("{}", null));
+        try std.testing.expectError(
+            error.ConnectionTimedOut,
+            client.sendPayload("{}", null, null),
+        );
         try std.testing.expectError(
             error.ConnectionTimedOut,
             client.emitServerReply(.{ .integer = 1 }, .{

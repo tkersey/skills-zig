@@ -62,8 +62,6 @@ jobs:
       - name: Test Synoptic on the native release runner
         run: |
           zig build test-synoptic
-          zig build test-synoptic-falsifiers
-          zig build test-synoptic-e2e
           zig build release-synoptic-safe
       - name: Build target Synoptic release binary
         run: >-

@@ -445,6 +445,16 @@ const fake_codex_script =
     \\  printf '%s' '{"properties":{"permissions":{},"scope":{}},"required":["permissions"],"values":["turn","session"]}' > "$out/PermissionsRequestApprovalResponse.json"
     \\  exit 0
     \\fi
+    \\case " $* " in
+    \\  *' --listen'*)
+    \\    i=0
+    \\    while [ "$i" -lt 16 ]; do
+    \\      echo 'managed fake unsupported' >&2
+    \\      i=$((i + 1))
+    \\    done
+    \\    exit 2
+    \\    ;;
+    \\esac
     \\forks=0
     \\primary_turns=0
     \\while IFS= read -r line; do
@@ -453,9 +463,9 @@ const fake_codex_script =
     \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
     \\    *'"method":"initialized"'*) continue ;;
     \\    *'"id":"tool-'*) continue ;;
-    \\    *'"id":"approval-command"'*) printf '%s' "$line" | grep -q '"decision":"accept"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn"}}}'; continue ;;
-    \\    *'"id":"approval-file-change"'*) printf '%s' "$line" | grep -q '"decision":"decline"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn"}}}'; continue ;;
-    \\    *'"id":"approval-primary"'*) printf '%s' "$line" | grep -Eq '"decision":"(accept|decline)"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn"}}}'; continue ;;
+    \\    *'"id":"approval-command"'*) printf '%s' "$line" | grep -q '"decision":"accept"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn","status":"completed"}}}'; continue ;;
+    \\    *'"id":"approval-file-change"'*) printf '%s' "$line" | grep -q '"decision":"decline"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn","status":"completed"}}}'; continue ;;
+    \\    *'"id":"approval-primary"'*) printf '%s' "$line" | grep -Eq '"decision":"(accept|decline)"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn","status":"completed"}}}'; continue ;;
     \\  esac
     \\  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
     \\  case "$line" in
@@ -471,7 +481,7 @@ const fake_codex_script =
     \\          printf '%s\n' '{"id":"approval-primary","method":"item/commandExecution/requestApproval","params":{"threadId":"primary","turnId":"primary-turn","itemId":"primary-cmd","startedAtMs":1,"command":"git log --oneline","availableDecisions":["accept","decline"]}}'
     \\          continue
     \\        fi
-    \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn"}}}'
+    \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn","status":"completed"}}}'
     \\      else
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
     \\        if printf '%s' "$line" | grep -q 'prepare the comment'; then
@@ -493,7 +503,7 @@ const fake_codex_script =
     \\        else
     \\          printf '{"method":"item/agentMessage/delta","params":{"threadId":"%s","delta":"review visible"}}\n' "$thread_id"
     \\        fi
-    \\        printf '{"method":"turn/completed","params":{"threadId":"%s","turn":{"id":"file-turn"}}}\n' "$thread_id"
+    \\        printf '{"method":"turn/completed","params":{"threadId":"%s","turn":{"id":"file-turn","status":"completed"}}}\n' "$thread_id"
     \\      fi ;;
     \\    *) printf '{"id":%s,"result":{}}\n' "$id" ;;
     \\  esac
@@ -523,12 +533,14 @@ fn fakeGhScriptAlloc(
         \\printf 'STDIN:' >> "$log"; cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticAddInlineComment' "$input"; then printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"review-1","url":"https://example/review"}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticMarkFileViewed' "$input"; then printf '%s\n' viewed > "$state"; printf '%s\n' '{{"data":{{"markFileAsViewed":{{"pullRequest":{{"id":"PR_1"}}}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticPullRequest' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"Fixture PR","body":"","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"base","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"%s"}},{{"path":"b.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
+        \\if grep -q 'SynopticReviewThreads' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticFileState' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","viewerViewedState":"%s"}},{{"path":"b.zig","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
         \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig"}},{{"path":"b.zig"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     ,
-        .{ log_path, state_path, head, head },
+        .{ log_path, state_path, head, head, head, head },
     );
 }
 
@@ -784,6 +796,61 @@ test "action broker reconciles an ambiguous mutation once without retry" {
     defer state.deinit();
     try state.generation.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r" });
     try verifyAmbiguousActions(allocator, io, broker, &state, log_path);
+}
+
+test "ambiguous complete-file mutation succeeds only through viewed readback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-complete" });
+    defer allocator.free(gh_path);
+    const state_path = try std.fs.path.join(allocator, &.{ root, "viewed" });
+    defer allocator.free(state_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(mktemp)\ntrap 'rm -f \"$input\"' EXIT\n" ++
+            "cat > \"$input\"\nif grep -q SynopticMarkFileViewed \"$input\"; then " ++
+            "printf viewed > {s}; exit 1; fi\n" ++
+            "if grep -q SynopticAnchor \"$input\"; then printf '%s\\n' '" ++
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"head\"," ++
+            "\"files\":{{\"nodes\":[{{\"path\":\"a.zig\"}}],\"pageInfo\":" ++
+            "{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}}}'; exit 0; fi\n" ++
+            "if grep -q SynopticFileState \"$input\"; then test -f {s}; printf '%s\\n' '" ++
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"head\"," ++
+            "\"files\":{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
+            "\"VIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}" ++
+            "}}}}}}}}}}'; exit 0; fi\nprintf '%s\\n' '{{\"data\":{{}}}}'\n",
+        .{ state_path, state_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-complete", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var state = try app.App.init(allocator, "head");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    try state.completeRevision(
+        .{ .allocator = allocator, .io = io, .gh_path = gh_path },
+        "o",
+        "r",
+        1,
+        "PR_1",
+        "a.zig",
+        "r1",
+    );
+    try std.testing.expect(!state.generation.queued("a.zig"));
+    try std.testing.expect(state.completed_tab_open);
 }
 
 fn verifyAmbiguousActions(
@@ -1333,6 +1400,45 @@ test "exclusions config immediate and idle sessions preserve canonical context" 
     const paths = try installSessionFixture(allocator, io, &tmp, root);
     defer paths.deinit();
     try verifySessionModes(allocator, io, root, paths);
+}
+
+test "file session receives every later revision and active close interrupts its turn" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const opened = try registry.openFile(
+        io,
+        root,
+        "a.zig",
+        "r1",
+        "base",
+        "head",
+        "@@ -1 +1 @@\n-old\n+new\n",
+        "[]",
+        paths.skill,
+        true,
+    );
+    defer opened.deinit();
+    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two");
+    try registry.markPathChangedAndInject("a.zig", "r3", "+revision three");
+    try std.testing.expectEqualStrings("r3", registry.sessions.items[0].last_injected_revision);
+    registry.sessions.items[0].turn_active = true;
+    try registry.closeSession(opened.session_id);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{paths.codex});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
+    try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
 }
 
 fn verifySessionModes(
@@ -2662,6 +2768,35 @@ fn verifyWsStartup(
     }
 }
 
+fn verifyHealthWhileWebSocketActive(io: std.Io, server: *http.Server) !void {
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", server.port());
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try writer.interface.flush();
+    var response: [2048]u8 = undefined;
+    const deadline = std.Io.Clock.Timestamp.fromNow(
+        io,
+        .{ .raw = .fromSeconds(2), .clock = .awake },
+    );
+    var used: usize = 0;
+    while (std.mem.indexOf(u8, response[0..used], "\"status\":\"ok\"") == null) {
+        const incoming = try stream.socket.receiveTimeout(
+            io,
+            response[used..],
+            .{ .deadline = deadline },
+        );
+        if (incoming.data.len == 0) break;
+        used += incoming.data.len;
+        if (used == response.len) break;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, response[0..used], "200 OK") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, response[0..used], "\"status\":\"ok\"") != null,
+    );
+}
+
 fn verifyWsOpen(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2814,11 +2949,19 @@ fn verifyWsAction(
     state: *app.App,
     gh_log: []const u8,
     head: []const u8,
+    tool_domain: *http.ToolDomainContext,
 ) !void {
     try sendMaskedText(io, stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId" ++
         "\":\"ses-1\",\"text\":\"prepare the comment\",\"active\":false}}");
     const started = try wsRead(allocator, io, stream, "turn-started");
     defer allocator.free(started);
+    for (0..200) |_| {
+        if (tool_domain.pendingActionCount() == 1) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), tool_domain.pendingActionCount());
     const card = try wsRead(allocator, io, stream, "\"type\":\"action.prepared\"");
     defer allocator.free(card);
     try std.testing.expect(std.mem.indexOf(u8, card, "Could this fail?") != null);
@@ -2853,11 +2996,19 @@ fn verifyWsCompletion(
     io: std.Io,
     stream: *std.Io.net.Stream,
     state: *app.App,
+    tool_domain: *http.ToolDomainContext,
 ) !void {
     try sendMaskedText(io, stream, "{\"type\":\"session.message\",\"payload\":{\"sessionId" ++
         "\":\"ses-1\",\"text\":\"complete this file\",\"active\":false}}");
     const started = try wsRead(allocator, io, stream, "turn-started");
     defer allocator.free(started);
+    for (0..200) |_| {
+        if (!tool_domain.fileQueued("a.zig")) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
+    }
+    try std.testing.expect(!tool_domain.fileQueued("a.zig"));
     const completed = try wsRead(allocator, io, stream, "\"type\":\"file.completed\"");
     defer allocator.free(completed);
     try std.testing.expect(!state.generation.queued("a.zig"));
@@ -3011,6 +3162,43 @@ fn verifyWsReconnect(
     try std.testing.expect(!connection.fixture.failed.load(.acquire));
 }
 
+fn prepareWsRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    programs: WsPrograms,
+    state: *app.App,
+    registry: *sessions.Registry,
+) !http.Runtime {
+    var runtime = http.Runtime{
+        .app = state,
+        .registry = registry,
+        .broker = .{ .allocator = allocator, .io = io, .gh_path = programs.gh },
+        .owner = "o",
+        .name = "r",
+        .number = 1,
+        .pull_request_id = "PR_1",
+        .cwd = root,
+        .skill_path = programs.skill,
+        .repository_cwd = root,
+        .custody = .{ .managed = root },
+        .refresh_override = injectedRefresh,
+    };
+    const context = try http.ToolDomainContext.create(
+        allocator,
+        state,
+        registry,
+        runtime.broker,
+        runtime.owner,
+        runtime.name,
+        runtime.number,
+        runtime.pull_request_id,
+    );
+    try registry.setAuthoritativeToolHandler(context.handler());
+    runtime.tool_domain = context;
+    return runtime;
+}
+
 test "e2e masked websocket streams normalized review and action events" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3029,24 +3217,13 @@ test "e2e masked websocket streams normalized review and action events" {
     defer registry.deinit();
     var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
     defer server.deinit();
-    var runtime = http.Runtime{
-        .app = &state,
-        .registry = &registry,
-        .broker = .{ .allocator = allocator, .io = io, .gh_path = programs.gh },
-        .owner = "o",
-        .name = "r",
-        .number = 1,
-        .pull_request_id = "PR_1",
-        .cwd = root,
-        .skill_path = programs.skill,
-        .repository_cwd = root,
-        .custody = .{ .managed = root },
-        .refresh_override = injectedRefresh,
-    };
+    var runtime = try prepareWsRuntime(allocator, io, root, programs, &state, &registry);
+    const tool_domain = runtime.tool_domain.?;
     try verifySlowHeaderIsolation(io, &server, &runtime);
     var connection = try connectWs(allocator, io, &server, &runtime);
     defer connection.deinit();
     try verifyWsStartup(allocator, io, &state, &connection.stream);
+    try verifyHealthWhileWebSocketActive(io, &server);
     const log_path = try verifyWsOpen(allocator, io, &connection.stream, programs.codex);
     defer allocator.free(log_path);
     try verifyWsSearch(allocator, io, &connection.stream, log_path);
@@ -3058,8 +3235,9 @@ test "e2e masked websocket streams normalized review and action events" {
         &state,
         programs.gh_log,
         commits.head,
+        tool_domain,
     );
-    try verifyWsCompletion(allocator, io, &connection.stream, &state);
+    try verifyWsCompletion(allocator, io, &connection.stream, &state, tool_domain);
     try verifyWsCloseSecond(allocator, io, &connection.stream, &state, programs.gh_log);
     try verifyWsRefresh(allocator, io, &connection.stream, &state, &registry);
     try verifyWsRound(allocator, io, &connection.stream, &state);
