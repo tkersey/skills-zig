@@ -13,6 +13,8 @@ const reconcile_query =
 const max_pages: usize = 10_000;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
+const canonical_diff_bytes_max: usize = 64 * 1024 * 1024;
+const git_stderr_bytes_max: usize = 1024 * 1024;
 
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
@@ -59,6 +61,7 @@ const PipeCapture = struct {
     failure: ?anyerror = null,
 
     fn run(self: *PipeCapture) void {
+        defer self.file.close(self.io);
         var reader = self.file.reader(self.io, &.{});
         self.bytes = reader.interface.allocRemaining(
             self.allocator,
@@ -82,10 +85,107 @@ const GhOutput = struct {
     }
 };
 
+const CapturedPipes = struct {
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn captureChildPipes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) !CapturedPipes {
+    var stdout_capture = PipeCapture{
+        .allocator = allocator,
+        .io = io,
+        .file = child.stdout.?,
+        .limit = stdout_limit,
+    };
+    child.stdout = null;
+    var stderr_capture = PipeCapture{
+        .allocator = allocator,
+        .io = io,
+        .file = child.stderr.?,
+        .limit = stderr_limit,
+    };
+    child.stderr = null;
+    const stdout_thread = try std.Thread.spawn(.{}, PipeCapture.run, .{&stdout_capture});
+    const stderr_thread = std.Thread.spawn(
+        .{},
+        PipeCapture.run,
+        .{&stderr_capture},
+    ) catch |err| {
+        child.kill(io);
+        stdout_thread.join();
+        return err;
+    };
+    stdout_thread.join();
+    stderr_thread.join();
+    errdefer if (stdout_capture.bytes) |bytes| allocator.free(bytes);
+    errdefer if (stderr_capture.bytes) |bytes| allocator.free(bytes);
+    if (stdout_capture.failure) |err| return err;
+    if (stderr_capture.failure) |err| return err;
+    const stdout = stdout_capture.bytes orelse return error.ProcessTransportFailed;
+    errdefer allocator.free(stdout);
+    const stderr = stderr_capture.bytes orelse return error.ProcessTransportFailed;
+    return .{ .stdout = stdout, .stderr = stderr };
+}
+
+fn runCapturedProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
+    input: ?[]const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    stdout_limit: usize,
+    stderr_limit: usize,
+) !GhOutput {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    var waited = false;
+    errdefer if (!waited and child.id != null) child.kill(io);
+    const child_id = child.id orelse return error.ProcessTransportFailed;
+    var watchdog = GhWatchdog{ .pid = @intCast(child_id), .cancelled = cancelled };
+    const watchdog_thread = try std.Thread.spawn(.{}, GhWatchdog.run, .{&watchdog});
+    defer {
+        watchdog.finished.store(true, .release);
+        watchdog_thread.join();
+    }
+    var writer = child.stdin.?.writer(io, &.{});
+    if (input) |bytes| try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    child.stdin.?.close(io);
+    child.stdin = null;
+    const captured = try captureChildPipes(allocator, io, &child, stdout_limit, stderr_limit);
+    errdefer allocator.free(captured.stdout);
+    errdefer allocator.free(captured.stderr);
+    const term = try child.wait(io);
+    waited = true;
+    if (cancelled) |flag| {
+        if (flag.load(.acquire)) return error.ProcessCallCancelled;
+    }
+    return .{
+        .allocator = allocator,
+        .stdout = captured.stdout,
+        .stderr = captured.stderr,
+        .term = term,
+    };
+}
+
 pub const Broker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     gh_path: []const u8 = "gh",
+    git_path: []const u8 = "git",
     host: []const u8 = "github.com",
     cancelled: ?*const std.atomic.Value(bool) = null,
 
@@ -134,61 +234,19 @@ pub const Broker = struct {
     }
 
     fn run(self: Broker, input: []const u8, argv: []const []const u8) !GhOutput {
-        var child = try std.process.spawn(self.io, .{
-            .argv = argv,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .pgid = 0,
-        });
-        errdefer child.kill(self.io);
-        const child_id = child.id orelse return error.GitHubTransportAmbiguous;
-        var watchdog = GhWatchdog{ .pid = @intCast(child_id), .cancelled = self.cancelled };
-        const watchdog_thread = try std.Thread.spawn(.{}, GhWatchdog.run, .{&watchdog});
-        defer {
-            watchdog.finished.store(true, .release);
-            watchdog_thread.join();
-        }
-        var writer = child.stdin.?.writer(self.io, &.{});
-        try writer.interface.writeAll(input);
-        try writer.interface.flush();
-        child.stdin.?.close(self.io);
-        child.stdin = null;
-        var stdout_capture = PipeCapture{
-            .allocator = self.allocator,
-            .io = self.io,
-            .file = child.stdout.?,
-            .limit = 16 * 1024 * 1024,
+        return runCapturedProcess(
+            self.allocator,
+            self.io,
+            argv,
+            .inherit,
+            input,
+            self.cancelled,
+            16 * 1024 * 1024,
+            1024 * 1024,
+        ) catch |err| switch (err) {
+            error.ProcessCallCancelled => error.GitHubCallCancelled,
+            else => err,
         };
-        var stderr_capture = PipeCapture{
-            .allocator = self.allocator,
-            .io = self.io,
-            .file = child.stderr.?,
-            .limit = 1024 * 1024,
-        };
-        const stdout_thread = try std.Thread.spawn(.{}, PipeCapture.run, .{&stdout_capture});
-        const stderr_thread = std.Thread.spawn(
-            .{},
-            PipeCapture.run,
-            .{&stderr_capture},
-        ) catch |err| {
-            child.kill(self.io);
-            stdout_thread.join();
-            return err;
-        };
-        stdout_thread.join();
-        stderr_thread.join();
-        if (stdout_capture.failure) |err| return err;
-        if (stderr_capture.failure) |err| return err;
-        const stdout = stdout_capture.bytes orelse return error.GitHubTransportAmbiguous;
-        errdefer self.allocator.free(stdout);
-        const stderr = stderr_capture.bytes orelse return error.GitHubTransportAmbiguous;
-        errdefer self.allocator.free(stderr);
-        const term = try child.wait(self.io);
-        if (self.cancelled) |cancelled| {
-            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
-        }
-        return .{ .allocator = self.allocator, .stdout = stdout, .stderr = stderr, .term = term };
     }
 
     pub fn readGenerationPages(
@@ -1575,36 +1633,96 @@ pub fn canonicalDiffAlloc(
     head: []const u8,
     path: []const u8,
 ) ![]u8 {
-    const merge = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "merge-base", base, head },
-        .cwd = .{ .path = cwd },
-    });
-    defer allocator.free(merge.stdout);
-    defer allocator.free(merge.stderr);
-    if (merge.term != .exited or merge.term.exited != 0) return error.MergeBaseFailed;
-    const merge_base = std.mem.trim(u8, merge.stdout, "\r\n");
-    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
-    defer allocator.free(range);
-    const result = try std.process.run(
+    const merge_base = try canonicalMergeBaseAlloc(
         allocator,
         io,
-        .{
-            .argv = &.{
-                "git",
-                "--literal-pathspecs",
-                "diff",
-                "--no-ext-diff",
-                "--no-color",
-                range,
-                "--",
-                path,
-            },
-            .cwd = .{ .path = cwd },
-        },
+        "git",
+        cwd,
+        base,
+        head,
+        null,
     );
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-    if (result.term != .exited or result.term.exited != 0) return error.FileDiffFailed;
+    defer allocator.free(merge_base);
+    return canonicalDiffFromMergeBaseAlloc(
+        allocator,
+        io,
+        "git",
+        cwd,
+        merge_base,
+        head,
+        path,
+        null,
+    );
+}
+
+pub fn canonicalMergeBaseAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    base: []const u8,
+    head: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    var merge = runCapturedProcess(
+        allocator,
+        io,
+        &.{ git_path, "merge-base", base, head },
+        .{ .path = cwd },
+        null,
+        cancelled,
+        4096,
+        git_stderr_bytes_max,
+    ) catch |err| switch (err) {
+        error.ProcessCallCancelled => return error.GitDiffCancelled,
+        error.StreamTooLong => return error.MergeBaseOutputTooLarge,
+        else => return err,
+    };
+    defer merge.deinit();
+    if (merge.term != .exited or merge.term.exited != 0) return error.MergeBaseFailed;
+    return allocator.dupe(u8, std.mem.trim(u8, merge.stdout, "\r\n"));
+}
+
+pub fn canonicalDiffFromMergeBaseAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
+    defer allocator.free(range);
+    var result = runCapturedProcess(
+        allocator,
+        io,
+        &.{
+            git_path,
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            range,
+            "--",
+            path,
+        },
+        .{ .path = cwd },
+        null,
+        cancelled,
+        canonical_diff_bytes_max,
+        git_stderr_bytes_max,
+    ) catch |err| switch (err) {
+        error.ProcessCallCancelled => return error.GitDiffCancelled,
+        error.StreamTooLong => return error.FileDiffTooLarge,
+        else => return err,
+    };
+    if (result.term != .exited or result.term.exited != 0) {
+        result.deinit();
+        return error.FileDiffFailed;
+    }
+    allocator.free(result.stderr);
     return result.stdout;
 }
 
@@ -1774,6 +1892,22 @@ test "GitHub transport is a fixed argv stdin broker" {
         &.{ "gh", "api", "graphql", "--hostname", "github.com", "--input", "-" },
     ));
     try std.testing.expect(!hasFixedArgv(&.{ "sh", "-c", "gh api" }));
+}
+
+test "captured process rejects output beyond its exact bound" {
+    try std.testing.expectError(
+        error.StreamTooLong,
+        runCapturedProcess(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "/bin/sh", "-c", "printf 0123456789abcdef" },
+            .inherit,
+            null,
+            null,
+            8,
+            8,
+        ),
+    );
 }
 
 const CancelGhCall = struct {

@@ -132,16 +132,42 @@ pub const AutomaticExclusionBatch = struct {
         cwd: []const u8,
     ) !void {
         std.debug.assert(self.candidates.items.len == 0);
+        var merge_base: ?[]u8 = null;
+        defer if (merge_base) |owned| self.allocator.free(owned);
         for (self.probes.items) |probe| {
+            if (probe.reason != null) continue;
+            merge_base = github.canonicalMergeBaseAlloc(
+                self.allocator,
+                broker.io,
+                broker.git_path,
+                cwd,
+                self.base_oid,
+                self.head_oid,
+                broker.cancelled,
+            ) catch |err| switch (err) {
+                error.GitDiffCancelled => return err,
+                else => null,
+            };
+            break;
+        }
+        for (self.probes.items) |probe| {
+            if (broker.cancelled) |cancelled| {
+                if (cancelled.load(.acquire)) return error.GitDiffCancelled;
+            }
             const reason = probe.reason orelse binary: {
-                const diff = github.canonicalDiffAlloc(
+                const diff = github.canonicalDiffFromMergeBaseAlloc(
                     self.allocator,
                     broker.io,
+                    broker.git_path,
                     cwd,
-                    self.base_oid,
+                    merge_base orelse continue,
                     self.head_oid,
                     probe.path,
-                ) catch continue;
+                    broker.cancelled,
+                ) catch |err| switch (err) {
+                    error.GitDiffCancelled => return err,
+                    else => continue,
+                };
                 defer self.allocator.free(diff);
                 break :binary settings.classifyDiff(diff) orelse continue;
             };

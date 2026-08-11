@@ -920,6 +920,7 @@ const LaunchExclusionWork = struct {
 
     fn run(self: *LaunchExclusionWork) void {
         defer self.registry.setExclusionsPending(false);
+        if (self.cancelled.load(.acquire)) return;
         var broker = self.broker;
         broker.cancelled = &self.cancelled;
         queueLaunchExclusionFailures(

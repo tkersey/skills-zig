@@ -1433,6 +1433,164 @@ test "exclusions config XDG precedence and strong classification" {
     try std.testing.expect(settings.classify("vendor/lib/a.js", "GIT binary patch") == null);
 }
 
+const CancelWhenFileExists = struct {
+    cancelled: *std.atomic.Value(bool),
+    path: []const u8,
+
+    fn run(self: CancelWhenFileExists) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        for (0..1_000) |_| {
+            std.Io.Dir.cwd().access(io, self.path, .{}) catch {
+                std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
+                continue;
+            };
+            self.cancelled.store(true, .release);
+            return;
+        }
+    }
+};
+
+fn verifyExclusionMergeBaseReuse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state: *app.App,
+    settings: *const config.Settings,
+    broker: github.Broker,
+    root: []const u8,
+    log_path: []const u8,
+) !void {
+    var batch = try state.captureAutomaticExclusions(settings);
+    defer batch.deinit();
+    try batch.classify(settings, broker, root);
+    try std.testing.expectEqual(@as(usize, 2), batch.candidates.items.len);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(4096));
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "merge-base\n"));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, log, "--literal-pathspecs\n"),
+    );
+}
+
+fn verifyExclusionDiffCancellation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state: *app.App,
+    settings: *const config.Settings,
+    broker: github.Broker,
+    root: []const u8,
+    git_path: []const u8,
+    started_path: []const u8,
+) !void {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nif [ \"$1\" = merge-base ]; then printf base; exit 0; fi\n" ++
+            "printf started > {s}\ntrap 'exit 0' TERM\nsleep 30\n",
+        .{started_path},
+    );
+    defer allocator.free(script);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = git_path, .data = script });
+    var cancelled = std.atomic.Value(bool).init(false);
+    const cancel_thread = try std.Thread.spawn(
+        .{},
+        CancelWhenFileExists.run,
+        .{CancelWhenFileExists{ .cancelled = &cancelled, .path = started_path }},
+    );
+    defer cancel_thread.join();
+    var batch = try state.captureAutomaticExclusions(settings);
+    defer batch.deinit();
+    var cancelling_broker = broker;
+    cancelling_broker.cancelled = &cancelled;
+    try std.testing.expectError(
+        error.GitDiffCancelled,
+        batch.classify(settings, cancelling_broker, root),
+    );
+}
+
+fn installBinaryProbeGeneration(allocator: std.mem.Allocator, state: *app.App) !void {
+    var generation = try domain.PrGeneration.initFull(allocator, "base", "head");
+    try generation.addFile(.{
+        .path = "src/a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    try generation.addFile(.{
+        .path = "src/b.zig",
+        .viewed = .unviewed,
+        .revision_key = "r2",
+    });
+    state.replaceGeneration(generation);
+}
+
+test "exclusions config shares merge base and cancels an in-flight diff" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skill/assets/exclusions.json",
+        .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{" ++
+            "\"reason\":\"generated\",\"globs\":[\"never/**\"]}]}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
+    defer allocator.free(skill);
+    const git_path = try std.fs.path.join(allocator, &.{ root, "fake-git" });
+    defer allocator.free(git_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "git.log" });
+    defer allocator.free(log_path);
+    const started_path = try std.fs.path.join(allocator, &.{ root, "started" });
+    defer allocator.free(started_path);
+    const counting_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {s}\n" ++
+            "if [ \"$1\" = merge-base ]; then printf base; exit 0; fi\n" ++
+            "printf 'GIT binary patch\\n'\n",
+        .{log_path},
+    );
+    defer allocator.free(counting_script);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = git_path, .data = counting_script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        git_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var settings = try config.Settings.load(allocator, io, &environment, skill);
+    defer settings.deinit();
+    var state = try app.App.init(allocator, "head");
+    defer state.deinit();
+    try installBinaryProbeGeneration(allocator, &state);
+    const broker = github.Broker{
+        .allocator = allocator,
+        .io = io,
+        .git_path = git_path,
+    };
+    try verifyExclusionMergeBaseReuse(
+        allocator,
+        io,
+        &state,
+        &settings,
+        broker,
+        root,
+        log_path,
+    );
+    try verifyExclusionDiffCancellation(
+        allocator,
+        io,
+        &state,
+        &settings,
+        broker,
+        root,
+        git_path,
+        started_path,
+    );
+}
+
 test "config can force managed worktree without weakening cleanliness" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
