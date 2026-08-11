@@ -2,6 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
+const worktree = @import("worktree.zig");
 
 const reconcile_query =
     "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
@@ -1471,7 +1472,10 @@ pub fn hydrateRevisionKeys(
     cwd: []const u8,
     generation: *domain.PrGeneration,
 ) !void {
-    try fetchObject(allocator, io, cwd, generation.base_oid);
+    worktree.ensureObjectAvailable(allocator, io, cwd, generation.base_oid) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.GitFetchFailed,
+        else => return err,
+    };
     for (generation.files.items) |file| {
         const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
         defer allocator.free(spec);
@@ -1540,23 +1544,6 @@ pub fn canonicalDiffAlloc(
     errdefer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.FileDiffFailed;
     return result.stdout;
-}
-
-fn fetchObject(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd: []const u8,
-    oid: []const u8,
-) !void {
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "fetch", "--no-tags", "origin", oid },
-        .cwd = .{ .path = cwd },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        return error.GitFetchFailed;
-    }
 }
 
 fn pullObject(value: std.json.Value) !std.json.ObjectMap {

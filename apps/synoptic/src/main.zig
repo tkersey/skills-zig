@@ -121,7 +121,7 @@ fn launch(
     defer claim.unlock(io);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
-    if (readLifecycleRecord(allocator, io, current_path)) |record_value| {
+    if (try readCurrentForLaunch(allocator, io, current_path)) |record_value| {
         var record = record_value;
         defer record.deinit();
         if (try verifiedProcess(allocator, io, record)) return error.SynopticAlreadyRunning;
@@ -131,7 +131,7 @@ fn launch(
                 else => {},
             }
         };
-    } else |_| {}
+    }
 
     var launch_bytes: [24]u8 = undefined;
     io.random(&launch_bytes);
@@ -342,7 +342,14 @@ fn serveReview(
     runtime_root: []const u8,
 ) !void {
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
-    const options = try parseLaunch(args);
+    var options = try parseLaunch(args);
+    const repository_cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.cwd,
+        allocator,
+    );
+    defer allocator.free(repository_cwd);
+    options.cwd = repository_cwd;
     try config.validateManifest(allocator, io, options.skill_root);
     var settings = try config.Settings.load(allocator, io, environment, options.skill_root);
     defer settings.deinit();
@@ -1113,10 +1120,31 @@ fn shutdownReview(
             else => {},
         }
     };
-    if (terminal_error) |err| return err;
+    try finishLifecycleRecord(allocator, io, runtime_root, launch_id, terminal_error);
+}
+
+fn finishLifecycleRecord(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    launch_id: []const u8,
+    terminal_error: ?anyerror,
+) !void {
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     removeCurrentIfLaunch(allocator, io, current_path, launch_id);
+    if (terminal_error) |err| return err;
+}
+
+fn readCurrentForLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !?LifecycleRecord {
+    return readLifecycleRecord(allocator, io, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
 }
 
 fn status(
@@ -1894,6 +1922,54 @@ test "stop cannot report success after a terminal cleanup error" {
     try std.testing.expectError(
         error.SynopticChildShutdownFailed,
         requireNoTerminalError(io, path),
+    );
+}
+test "launch distinguishes missing and unreadable lifecycle records" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(missing);
+    const current_path = try std.fs.path.join(allocator, &.{ missing, "current.json" });
+    defer allocator.free(current_path);
+    try std.testing.expect((try readCurrentForLaunch(allocator, io, current_path)) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "current.json", .data = "{}" });
+    try std.testing.expectError(
+        error.InvalidLifecycleRecord,
+        readCurrentForLaunch(allocator, io, current_path),
+    );
+}
+test "terminal shutdown removes its lifecycle record before returning failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(runtime);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime, "current.json" });
+    defer allocator.free(current_path);
+    try writeOperationalFile(
+        allocator,
+        io,
+        current_path,
+        "{\"runtimeSchema\":\"synoptic-runtime/v1\",\"launchId\":\"launch\"," ++
+            "\"runtimeRoot\":\"/tmp/runtime\",\"executable\":\"/bin/false\"," ++
+            "\"url\":\"http://127.0.0.1:1/\",\"pid\":1}",
+    );
+    try std.testing.expectError(
+        error.SyntheticTerminalFailure,
+        finishLifecycleRecord(
+            allocator,
+            io,
+            runtime,
+            "launch",
+            error.SyntheticTerminalFailure,
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, current_path, .{}),
     );
 }
 test "dead launch recovery retires managed custody" {

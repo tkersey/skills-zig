@@ -124,7 +124,10 @@ pub fn select(
         io,
         std.fs.path.dirname(managed_path) orelse return error.InvalidManagedWorktreePath,
     );
-    try fetch(allocator, io, cwd, head_oid);
+    ensureObjectAvailable(allocator, io, cwd, head_oid) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
+        else => return err,
+    };
     const add = try std.process.run(
         allocator,
         io,
@@ -226,7 +229,10 @@ pub fn synchronizeManaged(
 ) !void {
     try requireManagedRefresh(custody);
     try cleanManaged(allocator, io, custody.path(), baseline.head_oid, baseline);
-    try fetch(allocator, io, repository_cwd, head_oid);
+    ensureObjectAvailable(allocator, io, repository_cwd, head_oid) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
+        else => return err,
+    };
     const checkout = try std.process.run(
         allocator,
         io,
@@ -281,7 +287,10 @@ fn synchronizeReused(
         std.mem.trim(u8, current_branch, "\r\n"),
         branch,
     )) return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    try fetch(allocator, io, cwd, next_head);
+    ensureObjectAvailable(allocator, io, cwd, next_head) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
+        else => return err,
+    };
     const ancestor = try std.process.run(
         allocator,
         io,
@@ -294,11 +303,12 @@ fn synchronizeReused(
     defer allocator.free(ancestor.stderr);
     const not_ancestor = ancestor.term != .exited or ancestor.term.exited != 0;
     if (not_ancestor) return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    const merge = try std.process.run(
-        allocator,
-        io,
-        .{ .argv = &.{ "git", "merge", "--ff-only", next_head }, .cwd = .{ .path = cwd } },
-    );
+    const merge = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "git", "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", next_head,
+        },
+        .cwd = .{ .path = cwd },
+    });
     defer allocator.free(merge.stdout);
     defer allocator.free(merge.stderr);
     const merge_failed = merge.term != .exited or merge.term.exited != 0;
@@ -539,15 +549,55 @@ fn deleteConfined(io: std.Io, root: []const u8, relative: []const u8) !void {
     }
 }
 
-fn fetch(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, head_oid: []const u8) !void {
-    const result = try std.process.run(
+pub fn ensureObjectAvailable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    oid: []const u8,
+) !void {
+    if (try commitExists(allocator, io, cwd, oid)) return;
+    const remotes = try gitOutput(
         allocator,
         io,
-        .{ .argv = &.{ "git", "fetch", "--no-tags", "origin", head_oid }, .cwd = .{ .path = cwd } },
+        cwd,
+        &.{ "git", "remote" },
+        error.GitObjectUnavailable,
     );
+    defer allocator.free(remotes);
+    var lines = std.mem.splitScalar(u8, remotes, '\n');
+    var count: usize = 0;
+    while (lines.next()) |raw_remote| {
+        const remote = std.mem.trim(u8, raw_remote, "\r");
+        if (remote.len == 0) continue;
+        count += 1;
+        if (count > 128) return error.GitObjectUnavailable;
+        const result = try std.process.run(allocator, io, .{
+            .argv = &.{ "git", "fetch", "--no-tags", remote, oid },
+            .cwd = .{ .path = cwd },
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.term == .exited and result.term.exited == 0 and
+            try commitExists(allocator, io, cwd, oid)) return;
+    }
+    return error.GitObjectUnavailable;
+}
+
+fn commitExists(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    oid: []const u8,
+) !bool {
+    const object = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{oid});
+    defer allocator.free(object);
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "cat-file", "-e", object },
+        .cwd = .{ .path = cwd },
+    });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) return error.ManagedWorktreeFetchFailed;
+    return result.term == .exited and result.term.exited == 0;
 }
 
 fn gitOutput(

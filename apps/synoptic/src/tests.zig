@@ -2007,6 +2007,42 @@ fn prepareSyncRepo(
     };
 }
 
+test "worktree integrity Git object hydration discovers a non-origin remote" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source");
+    try tmp.dir.createDirPath(io, "consumer");
+    const source = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(source);
+    const consumer = try tmp.dir.realPathFileAlloc(io, "consumer", allocator);
+    defer allocator.free(consumer);
+    const commits = try prepareSyncRepo(allocator, io, &tmp, source);
+    defer commits.deinit();
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "remote", "add", "upstream", source },
+        &.{ "git", "fetch", "--no-tags", "upstream", commits.base },
+        &.{ "git", "checkout", "-qb", "feature", "FETCH_HEAD" },
+    }) |argv| allocator.free(try runGit(allocator, io, consumer, argv));
+    const missing = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "cat-file", "-e", commits.head },
+        .cwd = .{ .path = consumer },
+    });
+    defer allocator.free(missing.stdout);
+    defer allocator.free(missing.stderr);
+    try std.testing.expect(missing.term != .exited or missing.term.exited != 0);
+
+    try worktree.ensureObjectAvailable(allocator, io, consumer, commits.head);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{ "git", "cat-file", "-e", commits.head },
+    ));
+}
+
 test "worktree integrity managed synchronization cleans then advances detached head" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2054,6 +2090,26 @@ test "worktree integrity managed synchronization cleans then advances detached h
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, artifact, .{}));
 }
 
+fn installPostMergeWitness(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    root: []const u8,
+) !void {
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".git/hooks/post-merge",
+        .data = "#!/bin/sh\nprintf hook > post-merge-ran\n",
+    });
+    const hook_path = try std.fs.path.join(allocator, &.{ root, ".git/hooks/post-merge" });
+    defer allocator.free(hook_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        hook_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+}
+
 test "worktree integrity reused checkout advances only by clean fast forward" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2061,10 +2117,7 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    try tmp.dir.writeFile(
-        io,
-        .{ .sub_path = "tracked.txt", .data = "base\n" },
-    );
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
     for (
         [_][]const []const u8{
             &.{ "git", "init", "-q" },
@@ -2102,6 +2155,7 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     allocator.free(output);
     output = try runGit(allocator, io, root, &.{ "git", "remote", "add", "origin", root });
     allocator.free(output);
+    try installPostMergeWitness(allocator, io, &tmp, root);
     var baseline = try worktree.Baseline.capture(allocator, io, root);
     defer baseline.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "drift\n" });
@@ -2119,6 +2173,10 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     try worktree.synchronize(allocator, io, .{ .reused_current = root }, root, head, &baseline);
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectEqualStrings("feature", baseline.branch.?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "post-merge-ran", .{}),
+    );
 }
 
 test "worktree integrity safe boundary interrupts active turns before mutation" {
