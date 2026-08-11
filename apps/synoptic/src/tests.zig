@@ -1782,12 +1782,30 @@ test "config can force managed worktree without weakening cleanliness" {
     defer allocator.free(root);
     const unused = try std.fs.path.join(allocator, &.{ root, "unused" });
     defer allocator.free(unused);
-    const reused = try worktree.select(allocator, io, repo, "feature", head, unused, true);
+    const reused = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        unused,
+        true,
+        null,
+    );
     defer allocator.free(reused.path());
     try std.testing.expect(reused == .reused_current);
     const managed_path = try std.fs.path.join(allocator, &.{ root, "managed" });
     defer allocator.free(managed_path);
-    const managed = try worktree.select(allocator, io, repo, "feature", head, managed_path, false);
+    const managed = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        managed_path,
+        false,
+        null,
+    );
     defer allocator.free(managed.path());
     try std.testing.expect(managed == .managed);
 }
@@ -2498,7 +2516,7 @@ fn prepareSyncRepo(
     };
 }
 
-test "worktree integrity Git object hydration discovers a non-origin remote" {
+test "worktree integrity Git object hydration uses only the matched PR remote" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2511,12 +2529,15 @@ test "worktree integrity Git object hydration discovers a non-origin remote" {
     defer allocator.free(consumer);
     const commits = try prepareSyncRepo(allocator, io, &tmp, source);
     defer commits.deinit();
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "remote", "add", "upstream", source },
-        &.{ "git", "fetch", "--no-tags", "upstream", commits.base },
-        &.{ "git", "checkout", "-qb", "feature", "FETCH_HEAD" },
-    }) |argv| allocator.free(try runGit(allocator, io, consumer, argv));
+    const unrelated_witness = try prepareMatchedRemoteConsumer(
+        allocator,
+        io,
+        &tmp,
+        consumer,
+        source,
+        commits.base,
+    );
+    defer allocator.free(unrelated_witness);
     const missing = try std.process.run(allocator, io, .{
         .argv = &.{ "git", "cat-file", "-e", commits.head },
         .cwd = .{ .path = consumer },
@@ -2525,13 +2546,242 @@ test "worktree integrity Git object hydration discovers a non-origin remote" {
     defer allocator.free(missing.stderr);
     try std.testing.expect(missing.term != .exited or missing.term.exited != 0);
 
-    try worktree.ensureObjectAvailable(allocator, io, consumer, commits.head);
+    var fetch_source = try worktree.FetchSource.resolve(
+        allocator,
+        io,
+        consumer,
+        "github.example.test",
+        "owner",
+        "repo",
+    );
+    defer fetch_source.deinit();
+    try std.testing.expectEqualStrings("target", fetch_source.remote_name.?);
+    try std.testing.expectEqualStrings(
+        "https://github.example.test/owner/repo.git",
+        fetch_source.url,
+    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{ "git", "remote", "set-url", "target", "https://redirect.invalid/wrong/repo.git" },
+    ));
+    try worktree.ensureObjectAvailable(allocator, io, consumer, fetch_source, commits.head);
     allocator.free(try runGit(
         allocator,
         io,
         consumer,
         &.{ "git", "cat-file", "-e", commits.head },
     ));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, unrelated_witness, .{}),
+    );
+}
+
+fn prepareMatchedRemoteConsumer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    consumer: []const u8,
+    source: []const u8,
+    base: []const u8,
+) ![]u8 {
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "remote", "add", "bootstrap", source },
+        &.{ "git", "fetch", "--no-tags", "bootstrap", base },
+        &.{ "git", "checkout", "-qb", "feature", "FETCH_HEAD" },
+        &.{ "git", "remote", "remove", "bootstrap" },
+        &.{ "git", "remote", "add", "unrelated", source },
+        &.{ "git", "remote", "add", "target", "https://github.example.test/owner/repo.git" },
+    }) |argv| allocator.free(try runGit(allocator, io, consumer, argv));
+    const source_url = try std.fmt.allocPrint(allocator, "file://{s}", .{source});
+    defer allocator.free(source_url);
+    const instead_of_key = try std.fmt.allocPrint(allocator, "url.{s}.insteadOf", .{source_url});
+    defer allocator.free(instead_of_key);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{
+            "git",
+            "config",
+            instead_of_key,
+            "https://github.example.test/owner/repo.git",
+        },
+    ));
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const unrelated_witness = try std.fs.path.join(
+        allocator,
+        &.{ tmp_root, "unrelated-fetch-ran" },
+    );
+    errdefer allocator.free(unrelated_witness);
+    const unrelated_upload_pack = try std.fs.path.join(
+        allocator,
+        &.{ tmp_root, "unrelated-upload-pack" },
+    );
+    defer allocator.free(unrelated_upload_pack);
+    const unrelated_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ntouch '{s}'\nexit 1\n",
+        .{unrelated_witness},
+    );
+    defer allocator.free(unrelated_script);
+    try std.Io.Dir.cwd().writeFile(
+        io,
+        .{ .sub_path = unrelated_upload_pack, .data = unrelated_script },
+    );
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        unrelated_upload_pack,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{ "git", "config", "remote.unrelated.uploadpack", unrelated_upload_pack },
+    ));
+    return unrelated_witness;
+}
+
+test "worktree integrity local object path never invokes fetch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "commit", "--allow-empty", "-qm", "head" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const head_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    try worktree.ensureObjectAvailable(
+        allocator,
+        io,
+        root,
+        null,
+        std.mem.trim(u8, head_raw, "\r\n"),
+    );
+}
+
+test "worktree integrity stalled TERM-resistant fetch is bounded and reaped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const root = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(root);
+    var fixture = try prepareStalledFetchFixture(allocator, io, &tmp, root);
+    defer fixture.deinit();
+    try std.testing.expectError(
+        error.GitFetchTimedOut,
+        worktree.ensureObjectAvailable(
+            allocator,
+            io,
+            root,
+            .{ .url = fixture.url, .timeout_ms = 100, .termination_grace_ms = 50 },
+            "1111111111111111111111111111111111111111",
+        ),
+    );
+    const shell_pid_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        fixture.shell_pid_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(shell_pid_bytes);
+    const child_pid_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        fixture.child_pid_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(child_pid_bytes);
+    const shell_pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, shell_pid_bytes, "\r\n"),
+        10,
+    );
+    const child_pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, child_pid_bytes, "\r\n"),
+        10,
+    );
+    try expectProcessGone(io, shell_pid);
+    try expectProcessGone(io, child_pid);
+}
+
+const StalledFetchFixture = struct {
+    allocator: std.mem.Allocator,
+    url: []u8,
+    shell_pid_path: []u8,
+    child_pid_path: []u8,
+
+    fn deinit(self: *StalledFetchFixture) void {
+        self.allocator.free(self.url);
+        self.allocator.free(self.shell_pid_path);
+        self.allocator.free(self.child_pid_path);
+    }
+};
+
+fn prepareStalledFetchFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    root: []const u8,
+) !StalledFetchFixture {
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const script = try std.fs.path.join(allocator, &.{ tmp_root, "upload-pack" });
+    defer allocator.free(script);
+    const shell_pid_path = try std.fs.path.join(allocator, &.{ tmp_root, "shell.pid" });
+    errdefer allocator.free(shell_pid_path);
+    const child_pid_path = try std.fs.path.join(allocator, &.{ tmp_root, "child.pid" });
+    errdefer allocator.free(child_pid_path);
+    const script_body = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ntrap '' TERM\necho $$ > '{s}'\nsleep 60 &\necho $! > '{s}'\nwait\n",
+        .{ shell_pid_path, child_pid_path },
+    );
+    defer allocator.free(script_body);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = script, .data = script_body });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        script,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "protocol.ext.allow", "always" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const stalled_url = try std.fmt.allocPrint(allocator, "ext::{s}", .{script});
+    return .{
+        .allocator = allocator,
+        .url = stalled_url,
+        .shell_pid_path = shell_pid_path,
+        .child_pid_path = child_pid_path,
+    };
+}
+
+fn expectProcessGone(io: std.Io, pid: std.posix.pid_t) !void {
+    for (0..100) |_| {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    return error.TestExpectedProcessGone;
 }
 
 test "worktree integrity managed synchronization cleans then advances detached head" {
@@ -2577,7 +2827,15 @@ test "worktree integrity managed synchronization cleans then advances detached h
         io,
         .{ .sub_path = artifact, .data = "artifact" },
     );
-    try worktree.synchronize(allocator, io, .{ .managed = managed }, source, head, &baseline);
+    try worktree.synchronize(
+        allocator,
+        io,
+        .{ .managed = managed },
+        source,
+        head,
+        &baseline,
+        .{ .url = source },
+    );
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, artifact, .{}));
     const checkout_witness = try std.fs.path.join(
@@ -2678,6 +2936,52 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     try installPostMergeWitness(allocator, io, &tmp, root);
     var baseline = try worktree.Baseline.capture(allocator, io, root);
     defer baseline.deinit();
+    try verifyReusedCustodyDrift(allocator, io, &tmp, root, &baseline);
+    try worktree.synchronize(
+        allocator,
+        io,
+        .{ .reused_current = root },
+        root,
+        head,
+        &baseline,
+        .{ .url = root },
+    );
+    try std.testing.expectEqualStrings(head, baseline.head_oid);
+    try std.testing.expectEqualStrings("feature", baseline.branch.?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "post-merge-ran", .{}),
+    );
+}
+
+fn verifyReusedCustodyDrift(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    root: []const u8,
+    baseline: *const worktree.Baseline,
+) !void {
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "switch", "-qc", "same-head" },
+    ));
+    try std.testing.expectError(
+        error.ReusedCheckoutRefreshRequiresManagedMigration,
+        worktree.requireReviewAdmission(
+            allocator,
+            io,
+            .{ .reused_current = root },
+            baseline,
+        ),
+    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "switch", "-q", "feature" },
+    ));
     try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "drift\n" });
     try std.testing.expectError(
         error.ReusedCheckoutRefreshRequiresManagedMigration,
@@ -2685,18 +2989,15 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
             allocator,
             io,
             .{ .reused_current = root },
-            &baseline,
+            baseline,
         ),
     );
-    output = try runGit(allocator, io, root, &.{ "git", "restore", "tracked.txt" });
-    allocator.free(output);
-    try worktree.synchronize(allocator, io, .{ .reused_current = root }, root, head, &baseline);
-    try std.testing.expectEqualStrings(head, baseline.head_oid);
-    try std.testing.expectEqualStrings("feature", baseline.branch.?);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io, "post-merge-ran", .{}),
-    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "restore", "tracked.txt" },
+    ));
 }
 
 test "worktree integrity safe boundary interrupts active turns before mutation" {
@@ -2779,9 +3080,36 @@ test "worktree integrity dirty launch selects managed custody" {
     defer allocator.free(tmp_root);
     const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
     defer allocator.free(managed);
-    const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
+    const custody = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        managed,
+        true,
+        .{ .url = repo },
+    );
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
+    try verifyManagedCustodyLifecycle(
+        allocator,
+        io,
+        managed,
+        custody,
+        head,
+        repo,
+    );
+}
+
+fn verifyManagedCustodyLifecycle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    managed: []const u8,
+    custody: worktree.Custody,
+    head: []const u8,
+    repo: []const u8,
+) !void {
     const checkout_witness = try std.fs.path.join(
         allocator,
         &.{ managed, "post-checkout-ran" },
@@ -2880,7 +3208,16 @@ test "worktree integrity ignored launch artifact selects managed custody" {
     defer allocator.free(tmp_root);
     const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed-ignored" });
     defer allocator.free(managed);
-    const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
+    const custody = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        managed,
+        true,
+        .{ .url = repo },
+    );
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
     try worktree.retireManaged(allocator, io, custody, repo);
@@ -3079,7 +3416,12 @@ fn prepareLifecycleRepo(
     defer allocator.free(head_raw);
     const head = try allocator.dupe(u8, std.mem.trim(u8, head_raw, "\r\n"));
     errdefer allocator.free(head);
-    const remote = try runGit(allocator, io, repo, &.{ "git", "remote", "add", "origin", repo });
+    const remote = try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "remote", "add", "origin", "https://github.com/o/r.git" },
+    );
     allocator.free(remote);
     return .{ .allocator = allocator, .base = base, .head = head };
 }
@@ -4205,6 +4547,7 @@ fn prepareWsRuntime(
         .cwd = root,
         .skill_path = programs.skill,
         .repository_cwd = root,
+        .fetch_source = .{ .url = root },
         .custody = .{ .managed = root },
         .refresh_override = injectedRefresh,
     };

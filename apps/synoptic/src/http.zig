@@ -180,6 +180,7 @@ pub const Runtime = struct {
     cwd: []const u8,
     skill_path: []const u8,
     repository_cwd: []const u8,
+    fetch_source: ?worktree.FetchSource,
     custody: worktree.Custody,
     baseline: ?*worktree.Baseline = null,
     settings: ?*const config.Settings = null,
@@ -1146,15 +1147,7 @@ pub const Server = struct {
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
         runtime.worktree_generation_valid = false;
-        try worktree.synchronize(
-            self.allocator,
-            self.io,
-            runtime.custody,
-            runtime.repository_cwd,
-            next.head_oid,
-            runtime.baseline orelse return error.MissingWorktreeBaseline,
-        );
-        try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
+        try self.refreshWorktree(runtime, &next);
         try self.refreshTabDiffs(runtime, &next);
         try self.markChangedSessions(runtime, &next);
         const repository = try std.fmt.allocPrint(
@@ -1189,6 +1182,29 @@ pub const Server = struct {
         runtime.registry.endSynchronization();
         synchronizing = false;
         try runtime.registry.updatePrimary(primary_update);
+    }
+
+    fn refreshWorktree(
+        self: *Server,
+        runtime: *Runtime,
+        next: *@import("domain.zig").PrGeneration,
+    ) !void {
+        try worktree.synchronize(
+            self.allocator,
+            self.io,
+            runtime.custody,
+            runtime.repository_cwd,
+            next.head_oid,
+            runtime.baseline orelse return error.MissingWorktreeBaseline,
+            runtime.fetch_source,
+        );
+        try github.hydrateRevisionKeys(
+            self.allocator,
+            self.io,
+            runtime.cwd,
+            runtime.fetch_source,
+            next,
+        );
     }
 
     fn refreshTabDiffs(

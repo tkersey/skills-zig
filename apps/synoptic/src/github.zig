@@ -1605,12 +1605,14 @@ pub fn hydrateRevisionKeys(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    fetch_source: ?worktree.FetchSource,
     generation: *domain.PrGeneration,
 ) !void {
     worktree.ensureObjectAvailable(
         allocator,
         io,
         cwd,
+        fetch_source,
         generation.base_oid,
     ) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.GitFetchFailed,

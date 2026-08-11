@@ -2,7 +2,9 @@ const std = @import("std");
 const stopped_status = "{\"schema\":\"synoptic-status/v1\",\"status\":\"stopped\"}\n";
 const auth_remediation = "Run gh auth login for the target GitHub host, then retry.";
 const pr_remediation = "Run gh pr view successfully or pass a valid --pr selector.";
-const fetch_remediation = "Ensure the PR base and head objects are fetchable from origin.";
+const fetch_remediation =
+    "Configure a Git remote for the selected PR repository and ensure its " ++
+    "base and head objects are fetchable.";
 const skill_remediation = "Install valid synoptic-ui/v1 and synoptic-exclusions/v1 skill assets.";
 const builtin = @import("builtin");
 const app_meta = @import("app_meta");
@@ -424,6 +426,18 @@ fn serveResolvedPullRequest(
     defer pages.deinit();
     var snapshot = try Snapshot.load(allocator, pages.files.items[0]);
     defer snapshot.deinit();
+    var fetch_source = worktree.FetchSource.resolve(
+        allocator,
+        io,
+        options.cwd,
+        identity.host,
+        identity.owner,
+        identity.repository,
+    ) catch |err| switch (err) {
+        error.GitFetchSourceUnavailable => null,
+        else => return err,
+    };
+    defer if (fetch_source) |*source| source.deinit();
     var generation = try domain.PrGeneration.initFull(allocator, snapshot.base, snapshot.head);
     var generation_owned = true;
     errdefer if (generation_owned) generation.deinit();
@@ -441,6 +455,7 @@ fn serveResolvedPullRequest(
             .launch_id = launch_id,
             .runtime_root = runtime_root,
             .snapshot = snapshot,
+            .fetch_source = fetch_source,
         },
         &generation,
         &generation_owned,
@@ -456,6 +471,7 @@ const GenerationContext = struct {
     launch_id: []const u8,
     runtime_root: []const u8,
     snapshot: Snapshot,
+    fetch_source: ?worktree.FetchSource,
 };
 
 const Snapshot = struct {
@@ -538,6 +554,7 @@ fn serveGeneration(
         context.snapshot.head,
         managed_path,
         context.settings.worktree_prefer_current_pr_checkout,
+        context.fetch_source,
     );
     defer allocator.free(custody.path());
     var custody_retirement: CustodyRetirement = .pending;
@@ -564,7 +581,13 @@ fn serveSelectedGeneration(
     custody_retirement: *CustodyRetirement,
 ) !void {
     const review_cwd = custody.path();
-    try github.hydrateRevisionKeys(allocator, io, review_cwd, generation);
+    try github.hydrateRevisionKeys(
+        allocator,
+        io,
+        review_cwd,
+        context.fetch_source,
+        generation,
+    );
     var worktree_baseline = try worktree.Baseline.capture(allocator, io, review_cwd);
     defer worktree_baseline.deinit();
     var state = try configureAppState(
@@ -812,6 +835,7 @@ fn makeServingRuntime(
         context.options,
         context.identity,
         context.broker,
+        context.fetch_source,
         pull_request_id,
         custody,
         worktree_baseline,
@@ -992,6 +1016,7 @@ fn makeHttpRuntime(
     options: config.LaunchOptions,
     identity: pr.Identity,
     broker: github.Broker,
+    fetch_source: ?worktree.FetchSource,
     pull_request_id: []const u8,
     custody: worktree.Custody,
     worktree_baseline: *worktree.Baseline,
@@ -1013,6 +1038,7 @@ fn makeHttpRuntime(
         .cwd = review_cwd,
         .skill_path = skill_path,
         .repository_cwd = options.cwd,
+        .fetch_source = fetch_source,
         .custody = custody,
         .baseline = worktree_baseline,
         .settings = settings,
@@ -1615,7 +1641,11 @@ fn launchRemediation(err: anyerror) []const u8 {
         => "Install codex and gh and ensure both resolve on PATH.",
         error.GitHubAuthenticationFailed => auth_remediation,
         error.PullRequestResolutionFailed => pr_remediation,
-        error.BaseFetchFailed, error.ManagedWorktreeFetchFailed => fetch_remediation,
+        error.BaseFetchFailed,
+        error.ManagedWorktreeFetchFailed,
+        error.GitFetchSourceUnavailable,
+        error.GitFetchTimedOut,
+        => fetch_remediation,
         error.InvalidUiManifest, error.InvalidExclusionsManifest => skill_remediation,
         error.InvalidSynopticConfig => "Correct the supported Synoptic settings in config.toml" ++
             ", then retry.",

@@ -1,5 +1,107 @@
 const std = @import("std");
 
+const fetch_timeout_ms: u32 = 30_000;
+const fetch_termination_grace_ms: u32 = 250;
+const fetch_output_limit: usize = 1024 * 1024;
+
+pub const FetchSource = struct {
+    allocator: ?std.mem.Allocator = null,
+    url: []const u8,
+    remote_name: ?[]const u8 = null,
+    timeout_ms: u32 = fetch_timeout_ms,
+    termination_grace_ms: u32 = fetch_termination_grace_ms,
+
+    pub fn resolve(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        host: []const u8,
+        owner: []const u8,
+        repository: []const u8,
+    ) !FetchSource {
+        const remotes = try gitOutput(
+            allocator,
+            io,
+            cwd,
+            &.{ "git", "remote" },
+            error.GitFetchSourceUnavailable,
+        );
+        defer allocator.free(remotes);
+        var lines = std.mem.splitScalar(u8, remotes, '\n');
+        var remote_count: usize = 0;
+        while (lines.next()) |raw_remote| {
+            const remote = std.mem.trim(u8, raw_remote, "\r");
+            if (remote.len == 0) continue;
+            remote_count += 1;
+            if (remote_count > 128) return error.GitFetchSourceUnavailable;
+            const key = try std.fmt.allocPrint(allocator, "remote.{s}.url", .{remote});
+            defer allocator.free(key);
+            const url = gitOutput(
+                allocator,
+                io,
+                cwd,
+                &.{ "git", "config", "--get", key },
+                error.GitFetchSourceUnavailable,
+            ) catch continue;
+            defer allocator.free(url);
+            if (!remoteMatchesRepository(
+                std.mem.trim(u8, url, "\r\n"),
+                host,
+                owner,
+                repository,
+            )) continue;
+            return .{
+                .allocator = allocator,
+                .url = try allocator.dupe(u8, std.mem.trim(u8, url, "\r\n")),
+                .remote_name = try allocator.dupe(u8, remote),
+            };
+        }
+        return error.GitFetchSourceUnavailable;
+    }
+
+    pub fn deinit(self: *FetchSource) void {
+        if (self.allocator) |allocator| {
+            allocator.free(self.url);
+            if (self.remote_name) |name| allocator.free(name);
+        }
+        self.* = undefined;
+    }
+};
+
+fn remoteMatchesRepository(
+    url: []const u8,
+    host: []const u8,
+    owner: []const u8,
+    repository: []const u8,
+) bool {
+    var remote_host: []const u8 = undefined;
+    var path: []const u8 = undefined;
+    if (std.mem.indexOf(u8, url, "://")) |scheme_end| {
+        const authority_start = scheme_end + 3;
+        const path_start = std.mem.indexOfScalarPos(
+            u8,
+            url,
+            authority_start,
+            '/',
+        ) orelse return false;
+        const authority = url[authority_start..path_start];
+        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+        remote_host = authority[host_start..];
+        path = url[path_start + 1 ..];
+    } else {
+        const at = std.mem.indexOfScalar(u8, url, '@') orelse return false;
+        const colon = std.mem.indexOfScalarPos(u8, url, at + 1, ':') orelse return false;
+        remote_host = url[at + 1 .. colon];
+        path = url[colon + 1 ..];
+    }
+    path = std.mem.trimEnd(u8, path, "/");
+    if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - 4];
+    const separator = std.mem.indexOfScalar(u8, path, '/') orelse return false;
+    return std.ascii.eqlIgnoreCase(remote_host, host) and
+        std.ascii.eqlIgnoreCase(path[0..separator], owner) and
+        std.ascii.eqlIgnoreCase(path[separator + 1 ..], repository);
+}
+
 pub const Custody = union(enum) {
     reused_current: []const u8,
     managed: []const u8,
@@ -96,6 +198,7 @@ pub fn select(
     head_oid: []const u8,
     managed_path: []const u8,
     prefer_current_pr_checkout: bool,
+    fetch_source: ?FetchSource,
 ) !Custody {
     if (prefer_current_pr_checkout and try isClean(io, allocator, cwd)) {
         const head = try gitOutput(
@@ -124,7 +227,7 @@ pub fn select(
         io,
         std.fs.path.dirname(managed_path) orelse return error.InvalidManagedWorktreePath,
     );
-    ensureObjectAvailable(allocator, io, cwd, head_oid) catch |err| switch (err) {
+    ensureObjectAvailable(allocator, io, cwd, fetch_source, head_oid) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
@@ -165,6 +268,7 @@ pub fn synchronize(
     repository_cwd: []const u8,
     next_head: []const u8,
     baseline: *Baseline,
+    fetch_source: ?FetchSource,
 ) !void {
     switch (custody) {
         .managed => try synchronizeManaged(
@@ -174,6 +278,7 @@ pub fn synchronize(
             repository_cwd,
             next_head,
             baseline,
+            fetch_source,
         ),
         .reused_current => try synchronizeReused(
             allocator,
@@ -181,6 +286,7 @@ pub fn synchronize(
             custody.path(),
             next_head,
             baseline,
+            fetch_source,
         ),
     }
 }
@@ -239,10 +345,17 @@ pub fn synchronizeManaged(
     repository_cwd: []const u8,
     head_oid: []const u8,
     baseline: *Baseline,
+    fetch_source: ?FetchSource,
 ) !void {
     try requireManagedRefresh(custody);
     try cleanManaged(allocator, io, custody.path(), baseline.head_oid, baseline);
-    ensureObjectAvailable(allocator, io, repository_cwd, head_oid) catch |err| switch (err) {
+    ensureObjectAvailable(
+        allocator,
+        io,
+        repository_cwd,
+        fetch_source,
+        head_oid,
+    ) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
@@ -297,6 +410,7 @@ fn synchronizeReused(
     cwd: []const u8,
     next_head: []const u8,
     baseline: *Baseline,
+    fetch_source: ?FetchSource,
 ) !void {
     try requireReusedUnchanged(allocator, io, cwd, baseline);
     const branch = baseline.branch orelse
@@ -314,7 +428,7 @@ fn synchronizeReused(
         std.mem.trim(u8, current_branch, "\r\n"),
         branch,
     )) return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    ensureObjectAvailable(allocator, io, cwd, next_head) catch |err| switch (err) {
+    ensureObjectAvailable(allocator, io, cwd, fetch_source, next_head) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
@@ -432,6 +546,14 @@ fn requireReusedUnchanged(
     defer allocator.free(head);
     const status = try statusAlloc(allocator, io, cwd);
     defer allocator.free(status);
+    const branch = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "branch", "--show-current" },
+        error.WorktreeBranchReadFailed,
+    );
+    defer allocator.free(branch);
     const digest = try trackedDigest(allocator, io, cwd);
     var artifacts: std.ArrayList([]u8) = .empty;
     defer {
@@ -439,7 +561,12 @@ fn requireReusedUnchanged(
         artifacts.deinit(allocator);
     }
     try listArtifacts(allocator, io, cwd, &artifacts);
-    if (!std.mem.eql(
+    const current_branch = std.mem.trim(u8, branch, "\r\n");
+    const branch_matches = if (baseline.branch) |expected|
+        std.mem.eql(u8, current_branch, expected)
+    else
+        current_branch.len == 0;
+    if (!branch_matches or !std.mem.eql(
         u8,
         std.mem.trim(u8, head, "\r\n"),
         baseline.head_oid,
@@ -647,34 +774,168 @@ pub fn ensureObjectAvailable(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
+    source: ?FetchSource,
     oid: []const u8,
 ) !void {
     if (try commitExists(allocator, io, cwd, oid)) return;
-    const remotes = try gitOutput(
-        allocator,
-        io,
-        cwd,
-        &.{ "git", "remote" },
-        error.GitObjectUnavailable,
-    );
-    defer allocator.free(remotes);
-    var lines = std.mem.splitScalar(u8, remotes, '\n');
-    var count: usize = 0;
-    while (lines.next()) |raw_remote| {
-        const remote = std.mem.trim(u8, raw_remote, "\r");
-        if (remote.len == 0) continue;
-        count += 1;
-        if (count > 128) return error.GitObjectUnavailable;
-        const result = try std.process.run(allocator, io, .{
-            .argv = &.{ "git", "fetch", "--no-tags", remote, oid },
-            .cwd = .{ .path = cwd },
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        if (result.term == .exited and result.term.exited == 0 and
-            try commitExists(allocator, io, cwd, oid)) return;
+    const exact_source = source orelse return error.GitFetchSourceUnavailable;
+    const term = try runFetchBounded(allocator, io, cwd, exact_source, oid);
+    if (term != .exited or term.exited != 0 or
+        !try commitExists(allocator, io, cwd, oid)) return error.GitObjectUnavailable;
+}
+
+const FetchWatchdog = struct {
+    finished: std.atomic.Value(bool) = .init(false),
+    expired: std.atomic.Value(bool) = .init(false),
+    pid: std.posix.pid_t,
+    timeout_ms: u32,
+    termination_grace_ms: u32,
+
+    fn run(self: *FetchWatchdog) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const tick = std.Io.Duration.fromMilliseconds(5);
+        for (0..@max(@as(u32, 1), self.timeout_ms / 5)) |_| {
+            if (self.finished.load(.acquire)) return;
+            std.Io.sleep(io, tick, .awake) catch |ignored_error| switch (ignored_error) {
+                else => {},
+            };
+        }
+        if (self.finished.load(.acquire)) return;
+        self.expired.store(true, .release);
+        std.posix.kill(-self.pid, std.posix.SIG.TERM) catch |ignored_error| switch (ignored_error) {
+            else => {},
+        };
+        for (0..@max(@as(u32, 1), self.termination_grace_ms / 5)) |_| {
+            if (self.finished.load(.acquire)) return;
+            std.Io.sleep(io, tick, .awake) catch |ignored_error| switch (ignored_error) {
+                else => {},
+            };
+        }
+        if (!self.finished.load(.acquire)) {
+            std.posix.kill(
+                -self.pid,
+                std.posix.SIG.KILL,
+            ) catch |ignored_error| switch (ignored_error) {
+                else => {},
+            };
+        }
     }
-    return error.GitObjectUnavailable;
+};
+
+const FetchPipeCapture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    bytes: ?[]u8 = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *FetchPipeCapture) void {
+        defer self.file.close(self.io);
+        var reader = self.file.reader(self.io, &.{});
+        self.bytes = reader.interface.allocRemaining(
+            self.allocator,
+            .limited(fetch_output_limit),
+        ) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+fn runFetchBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    source: FetchSource,
+    oid: []const u8,
+) !std.process.Child.Term {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "git", "fetch", "--no-tags", source.url, oid },
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    var waited = false;
+    const pid: std.posix.pid_t = @intCast(child.id orelse return error.GitFetchProcessFailed);
+    errdefer terminateFetchProcess(io, &child, pid, &waited);
+    var watchdog = FetchWatchdog{
+        .pid = pid,
+        .timeout_ms = source.timeout_ms,
+        .termination_grace_ms = source.termination_grace_ms,
+    };
+    const watchdog_thread = try std.Thread.spawn(.{}, FetchWatchdog.run, .{&watchdog});
+    defer {
+        watchdog.finished.store(true, .release);
+        watchdog_thread.join();
+    }
+    var stdout_capture = FetchPipeCapture{
+        .allocator = allocator,
+        .io = io,
+        .file = child.stdout.?,
+    };
+    child.stdout = null;
+    var stderr_capture = FetchPipeCapture{
+        .allocator = allocator,
+        .io = io,
+        .file = child.stderr.?,
+    };
+    child.stderr = null;
+    const stdout_thread = std.Thread.spawn(
+        .{},
+        FetchPipeCapture.run,
+        .{&stdout_capture},
+    ) catch |err| {
+        stdout_capture.file.close(io);
+        stderr_capture.file.close(io);
+        return err;
+    };
+    const stderr_thread = std.Thread.spawn(
+        .{},
+        FetchPipeCapture.run,
+        .{&stderr_capture},
+    ) catch |err| {
+        stderr_capture.file.close(io);
+        terminateFetchProcess(io, &child, pid, &waited);
+        stdout_thread.join();
+        return err;
+    };
+    stdout_thread.join();
+    stderr_thread.join();
+    defer if (stdout_capture.bytes) |bytes| allocator.free(bytes);
+    defer if (stderr_capture.bytes) |bytes| allocator.free(bytes);
+    if (stdout_capture.failure) |err| return err;
+    if (stderr_capture.failure) |err| return err;
+    const term = try child.wait(io);
+    waited = true;
+    if (watchdog.expired.load(.acquire)) return error.GitFetchTimedOut;
+    return term;
+}
+
+fn terminateFetchProcess(
+    io: std.Io,
+    child: *std.process.Child,
+    pid: std.posix.pid_t,
+    waited: *bool,
+) void {
+    if (waited.*) return;
+    std.posix.kill(-pid, std.posix.SIG.KILL) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+    if (child.stdin) |file| file.close(io);
+    child.stdin = null;
+    if (child.stdout) |file| file.close(io);
+    child.stdout = null;
+    if (child.stderr) |file| file.close(io);
+    child.stderr = null;
+    _ = child.wait(io) catch {
+        child.kill(io);
+        _ = child.wait(io) catch |ignored_error| switch (ignored_error) {
+            else => {},
+        };
+    };
+    waited.* = true;
 }
 
 fn commitExists(
