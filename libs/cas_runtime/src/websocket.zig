@@ -226,6 +226,8 @@ pub const Connection = struct {
 
     pub fn close(self: *Connection) void {
         if (self.usable.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return;
+        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.write_mutex.unlock();
         self.stream.close(std.Io.Threaded.global_single_threaded.io());
     }
 
@@ -254,9 +256,12 @@ pub const Connection = struct {
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
             .clock = .awake,
         });
-        writeClientFrame(self, 0x1, payload, deadline) catch |err| {
-            self.poison();
-            return err;
+        writeClientFrame(self, 0x1, payload, deadline) catch |err| switch (err) {
+            error.WebSocketWriteLockTimeout => return error.Timeout,
+            else => {
+                self.poison();
+                return err;
+            },
         };
     }
 
@@ -1500,7 +1505,9 @@ fn writeClientFrame(
     const io = std.Io.Threaded.global_single_threaded.io();
     while (!self.write_mutex.tryLock()) {
         if (deadline) |limit| {
-            if (limit.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
+            if (limit.durationFromNow(io).raw.nanoseconds <= 0) {
+                return error.WebSocketWriteLockTimeout;
+            }
         }
         std.Io.sleep(io, .fromMilliseconds(1), .awake) catch |ignored_error| {
             switch (ignored_error) {
@@ -1732,7 +1739,52 @@ test "client write mutex acquisition obeys the caller deadline" {
     while (!connection.write_mutex.tryLock()) std.atomic.spinLoopHint();
     defer connection.write_mutex.unlock();
     try std.testing.expectError(error.Timeout, connection.sendTextTimeout("blocked", 5));
-    try std.testing.expect(!connection.usable.load(.acquire));
+    try std.testing.expect(connection.usable.load(.acquire));
+}
+
+const ConnectionCloseProbe = struct {
+    connection: *Connection,
+    release_writer: std.atomic.Value(bool) = .init(false),
+    writer_locked: std.atomic.Value(bool) = .init(false),
+    close_finished: std.atomic.Value(bool) = .init(false),
+
+    fn holdWriter(self: *ConnectionCloseProbe) void {
+        while (!self.connection.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.writer_locked.store(true, .release);
+        while (!self.release_writer.load(.acquire)) std.atomic.spinLoopHint();
+        self.connection.write_mutex.unlock();
+    }
+
+    fn close(self: *ConnectionCloseProbe) void {
+        self.connection.close();
+        self.close_finished.store(true, .release);
+    }
+};
+
+test "connection close serializes with the active frame writer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const peer_address = try std.Io.net.IpAddress.parse(
+        loopback_host,
+        listener.socket.address.getPort(),
+    );
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+    var connection = Connection{ .allocator = std.testing.allocator, .stream = client_stream };
+    defer connection.deinit();
+    var probe = ConnectionCloseProbe{ .connection = &connection };
+    const writer = try std.Thread.spawn(.{}, ConnectionCloseProbe.holdWriter, .{&probe});
+    while (!probe.writer_locked.load(.acquire)) std.atomic.spinLoopHint();
+    const closer = try std.Thread.spawn(.{}, ConnectionCloseProbe.close, .{&probe});
+    try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    try std.testing.expect(!probe.close_finished.load(.acquire));
+    probe.release_writer.store(true, .release);
+    writer.join();
+    closer.join();
+    try std.testing.expect(probe.close_finished.load(.acquire));
 }
 
 test "websocket endpoint parsing separates socket host from exact Host authority" {

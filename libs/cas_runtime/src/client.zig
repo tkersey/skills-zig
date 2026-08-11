@@ -1520,6 +1520,7 @@ const ActorState = struct {
     outbound: std.ArrayList(ActorOutbound) = .empty,
     outbound_capacity: usize,
     server_requests: std.ArrayList(ActorServerRequest) = .empty,
+    active_server_handlers: usize = 0,
     notifications: std.ArrayList(ActorNotification) = .empty,
     server_request_capacity: usize,
     server_request_timeout_ms: u32,
@@ -1620,6 +1621,7 @@ pub const Actor = struct {
         if (state.writer_thread) |thread| thread.join();
         if (state.reader_thread) |thread| thread.join();
         if (state.handler_thread) |thread| thread.join();
+        actorWaitForServerHandlers(state);
         if (state.notification_thread) |thread| thread.join();
         state.deinit();
         state.allocator.destroy(state);
@@ -1839,24 +1841,25 @@ fn actorHandlerMain(state: *ActorState) void {
         }
         const maybe_work: ?ActorServerRequest = if (state.server_requests.items.len == 0)
             null
-        else
-            state.server_requests.orderedRemove(0);
+        else blk: {
+            state.active_server_handlers += 1;
+            break :blk state.server_requests.orderedRemove(0);
+        };
         state.mutex.unlock();
 
         if (maybe_work) |work| {
-            defer work.deinit(state.allocator);
-            actorHandleServerRequest(state, work) catch |err| switch (err) {
-                error.RequestDeadlineExceeded => {
-                    actorSetTerminal(state, .poisoned);
-                    actorCloseTransportOnce(state);
-                    return;
-                },
-                else => {
-                    actorSetTerminal(state, .poisoned);
-                    actorCloseTransportOnce(state);
-                    return;
-                },
+            const thread = std.Thread.spawn(
+                .{},
+                actorServerRequestWorker,
+                .{ state, work },
+            ) catch {
+                work.deinit(state.allocator);
+                actorFinishServerHandler(state);
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
             };
+            thread.detach();
         } else {
             std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
                 actorSetTerminal(state, .poisoned);
@@ -1864,6 +1867,43 @@ fn actorHandlerMain(state: *ActorState) void {
                 return;
             };
         }
+    }
+}
+
+fn actorServerRequestWorker(state: *ActorState, work: ActorServerRequest) void {
+    defer work.deinit(state.allocator);
+    defer actorFinishServerHandler(state);
+    actorHandleServerRequest(state, work) catch |err| switch (err) {
+        error.RequestDeadlineExceeded,
+        error.ActorDisconnected,
+        error.ActorPoisoned,
+        error.ActorStopped,
+        => {},
+        else => {
+            actorSetTerminal(state, .poisoned);
+            actorCloseTransportOnce(state);
+        },
+    };
+}
+
+fn actorFinishServerHandler(state: *ActorState) void {
+    state.mutex.lock();
+    std.debug.assert(state.active_server_handlers > 0);
+    state.active_server_handlers -= 1;
+    state.mutex.unlock();
+}
+
+fn actorWaitForServerHandlers(state: *ActorState) void {
+    while (true) { // tiger: event-loop -- bounded by configured handler deadlines.
+        state.mutex.lock();
+        const active = state.active_server_handlers;
+        state.mutex.unlock();
+        if (active == 0) return;
+        std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch |ignored_error| {
+            switch (ignored_error) {
+                else => {},
+            }
+        };
     }
 }
 
@@ -2018,7 +2058,8 @@ fn actorDispatchServerRequest(
     const deadline_ms = monotonicMillis() + @as(i64, state.server_request_timeout_ms);
     state.mutex.lock();
     const handler = state.server_request_handler;
-    const queue_full = state.server_requests.items.len >= state.server_request_capacity;
+    const queue_full = state.server_requests.items.len + state.active_server_handlers >=
+        state.server_request_capacity;
     state.mutex.unlock();
     if (handler == null) return actorEnqueueServerError(
         state,
@@ -3871,6 +3912,18 @@ fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+        \\if [ "$mode" = concurrent_server_requests ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"id":"tool-block","method":"item/tool/call","params":{}}'
+        \\  printf '%s\n' '{"id":"tool-fast","method":"item/tool/call","params":{}}'
+        \\  IFS= read -r first_reply
+        \\  IFS= read -r second_reply
+        \\  printf '%s\n%s\n' "$first_reply" "$second_reply" > "$reply_log"
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
     );
     try writer.writeAll("\n");
 }
@@ -4055,6 +4108,31 @@ const NestedServerRequestProbe = struct {
     }
 };
 
+const ConcurrentServerRequestProbe = struct {
+    fast_completed: std.atomic.Value(bool) = .init(false),
+    block_timed_out: std.atomic.Value(bool) = .init(false),
+
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        const self: *ConcurrentServerRequestProbe = @ptrCast(@alignCast(context));
+        if (std.mem.indexOf(u8, request.raw_json, "tool-fast") != null) {
+            self.fast_completed.store(true, .release);
+            return allocator.dupe(u8, "{\"handled\":\"fast\"}");
+        }
+        for (0..200) |_| {
+            if (self.fast_completed.load(.acquire)) {
+                return allocator.dupe(u8, "{\"handled\":\"block\"}");
+            }
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        self.block_timed_out.store(true, .release);
+        return allocator.dupe(u8, "{\"handled\":\"timeout\"}");
+    }
+};
+
 test "actor falsifier permanent reader correlates concurrent reversed responses and notifications" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -4106,6 +4184,26 @@ test "actor falsifier dispatches server requests through configured handler and 
     defer allocator.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":true") != null);
+}
+
+test "actor server requests make independent bounded progress" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "concurrent_server_requests");
+    defer fixture.deinit();
+    var probe = ConcurrentServerRequestProbe{};
+    var actor = try fixture.start(.{
+        .server_request_queue_capacity = 2,
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = ConcurrentServerRequestProbe.handle,
+        },
+    });
+    defer actor.deinit();
+    const result = try actor.requestJson("actor/server-request", "{}", 2_000);
+    defer allocator.free(result);
+    try std.testing.expect(probe.fast_completed.load(.acquire));
+    try std.testing.expect(!probe.block_timed_out.load(.acquire));
 }
 
 test "actor falsifier notification callbacks may issue nested requests" {
