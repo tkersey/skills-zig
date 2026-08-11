@@ -84,6 +84,23 @@ const CapturedPipes = struct {
     stderr: []u8,
 };
 
+pub const ReconciliationBaseline = struct {
+    allocator: std.mem.Allocator,
+    comment_ids: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *ReconciliationBaseline) void {
+        for (self.comment_ids.items) |id| self.allocator.free(id);
+        self.comment_ids.deinit(self.allocator);
+    }
+
+    fn contains(self: *const ReconciliationBaseline, id: []const u8) bool {
+        for (self.comment_ids.items) |existing| {
+            if (std.mem.eql(u8, existing, id)) return true;
+        }
+        return false;
+    }
+};
+
 fn captureChildPipes(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -136,6 +153,7 @@ fn runCapturedProcess(
     cancelled: ?*const std.atomic.Value(bool),
     stdout_limit: usize,
     stderr_limit: usize,
+    effectful: bool,
 ) !GhOutput {
     var child = try std.process.spawn(io, .{
         .argv = argv,
@@ -145,6 +163,7 @@ fn runCapturedProcess(
         .stderr = .pipe,
         .pgid = 0,
     });
+    var dispatch_started = false;
     var waited = false;
     errdefer if (!waited and child.id != null) child.kill(io);
     const child_id = child.id orelse return error.ProcessTransportFailed;
@@ -154,18 +173,29 @@ fn runCapturedProcess(
         watchdog.finished.store(true, .release);
         watchdog_thread.join();
     }
-    var writer = child.stdin.?.writer(io, &.{});
-    if (input) |bytes| try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
-    child.stdin.?.close(io);
-    child.stdin = null;
-    const captured = try captureChildPipes(allocator, io, &child, stdout_limit, stderr_limit);
+    dispatch_started = try dispatchChildInput(&child, io, input, effectful);
+    const captured = captureChildPipes(
+        allocator,
+        io,
+        &child,
+        stdout_limit,
+        stderr_limit,
+    ) catch |err| {
+        if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
+        return err;
+    };
     errdefer allocator.free(captured.stdout);
     errdefer allocator.free(captured.stderr);
-    const term = try child.wait(io);
+    const term = child.wait(io) catch |err| {
+        if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
+        return err;
+    };
     waited = true;
     if (cancelled) |flag| {
-        if (flag.load(.acquire)) return error.ProcessCallCancelled;
+        if (flag.load(.acquire)) {
+            if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
+            return error.ProcessCallCancelled;
+        }
     }
     return .{
         .allocator = allocator,
@@ -173,6 +203,30 @@ fn runCapturedProcess(
         .stderr = captured.stderr,
         .term = term,
     };
+}
+
+fn dispatchChildInput(
+    child: *std.process.Child,
+    io: std.Io,
+    input: ?[]const u8,
+    effectful: bool,
+) !bool {
+    var dispatch_started = false;
+    var writer = child.stdin.?.writer(io, &.{});
+    if (input) |bytes| {
+        dispatch_started = true;
+        writer.interface.writeAll(bytes) catch |err| {
+            if (effectful) return error.ProcessOutcomeUnknown;
+            return err;
+        };
+    }
+    writer.interface.flush() catch |err| {
+        if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
+        return err;
+    };
+    child.stdin.?.close(io);
+    child.stdin = null;
+    return dispatch_started;
 }
 
 pub const Broker = struct {
@@ -200,7 +254,10 @@ pub const Broker = struct {
             "-",
         };
         if (!hasFixedArgv(&argv)) return error.InvalidGitHubBrokerArgv;
-        var output = try self.run(input, &argv);
+        var output = self.run(input, &argv, mutation) catch |err| switch (err) {
+            error.ProcessOutcomeUnknown => return error.GitHubTransportAmbiguous,
+            else => return err,
+        };
         defer output.deinit();
         if (output.stdout.len > 0) {
             var parsed = std.json.parseFromSlice(
@@ -227,7 +284,12 @@ pub const Broker = struct {
         return self.allocator.dupe(u8, output.stdout);
     }
 
-    fn run(self: Broker, input: []const u8, argv: []const []const u8) !GhOutput {
+    fn run(
+        self: Broker,
+        input: []const u8,
+        argv: []const []const u8,
+        effectful: bool,
+    ) !GhOutput {
         return runCapturedProcess(
             self.allocator,
             self.io,
@@ -237,6 +299,7 @@ pub const Broker = struct {
             self.cancelled,
             16 * 1024 * 1024,
             1024 * 1024,
+            effectful,
         ) catch |err| switch (err) {
             error.ProcessCallCancelled => error.GitHubCallCancelled,
             else => err,
@@ -820,6 +883,7 @@ pub const Broker = struct {
         number: u64,
         card: tools.ActionCard,
         started_unix_s: i64,
+        baseline: *const ReconciliationBaseline,
     ) !bool {
         if (card.kind == .mark_viewed or card.kind == .unmark_viewed) {
             return self.viewedStateAfterMutation(
@@ -844,44 +908,151 @@ pub const Broker = struct {
         var target_comment_found = false;
         var matching_comments: u32 = 0;
         for (pages.items) |page| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
-            defer parsed.deinit();
-            const pull = try pullObject(parsed.value);
-            try validateGenerationObject(
-                pull,
-                card.target.base_oid,
-                card.target.head_oid,
+            const observed = try self.reconcilePage(
+                owner,
+                name,
+                number,
+                page,
+                card,
+                started_unix_s,
+                baseline,
+                &target_comment_found,
+                &matching_comments,
             );
-            for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
-                if (card.target.thread_id) |thread_id| if (!std.mem.eql(
-                    u8,
-                    thread.object.get("id").?.string,
-                    thread_id,
-                )) continue;
-                if (card.kind == .resolve_thread) return thread.object.get("isResolved").?.bool;
-                if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
-                if (card.target.path) |path| if (!std.mem.eql(
-                    u8,
-                    thread.object.get("path").?.string,
-                    path,
-                )) continue;
-                if (!inlineThreadMatchesCard(thread.object, card)) continue;
-                const observed = try self.commentMutationObserved(
-                    owner,
-                    name,
-                    number,
-                    thread.object,
-                    card,
-                    started_unix_s,
-                    &target_comment_found,
-                    &matching_comments,
-                );
-                if (observed) return true;
-            }
+            if (observed) |result| return result;
         }
         if (card.kind == .add_inline_comment) return matching_comments == 1;
         if (card.kind == .delete_comment) return !target_comment_found;
         return false;
+    }
+
+    fn reconcilePage(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        page: []const u8,
+        card: tools.ActionCard,
+        started_unix_s: i64,
+        baseline: *const ReconciliationBaseline,
+        target_comment_found: *bool,
+        matching_comments: *u32,
+    ) !?bool {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
+        defer parsed.deinit();
+        const pull = try pullObject(parsed.value);
+        try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
+        for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
+            if (card.target.thread_id) |thread_id| if (!std.mem.eql(
+                u8,
+                thread.object.get("id").?.string,
+                thread_id,
+            )) continue;
+            if (card.kind == .resolve_thread) return thread.object.get("isResolved").?.bool;
+            if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
+            if (card.target.path) |path| if (!std.mem.eql(
+                u8,
+                thread.object.get("path").?.string,
+                path,
+            )) continue;
+            if (!inlineThreadMatchesCard(thread.object, card)) continue;
+            if (try self.commentMutationObserved(
+                owner,
+                name,
+                number,
+                thread.object,
+                card,
+                started_unix_s,
+                baseline,
+                target_comment_found,
+                matching_comments,
+            )) return true;
+        }
+        return null;
+    }
+
+    pub fn captureReconciliationBaseline(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        card: tools.ActionCard,
+    ) !ReconciliationBaseline {
+        var baseline = ReconciliationBaseline{ .allocator = self.allocator };
+        errdefer baseline.deinit();
+        if (card.kind != .add_inline_comment) return baseline;
+        var pages = try self.callPages(
+            graphql.reconcile_query,
+            "reviewThreads",
+            owner,
+            name,
+            number,
+        );
+        defer freePages(self.allocator, &pages);
+        for (pages.items) |page| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
+            defer parsed.deinit();
+            const pull = try pullObject(parsed.value);
+            try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
+            const threads = pull.get("reviewThreads") orelse return error.InvalidSnapshot;
+            if (threads != .object) return error.InvalidSnapshot;
+            const nodes = threads.object.get("nodes") orelse return error.InvalidSnapshot;
+            if (nodes != .array) return error.InvalidSnapshot;
+            for (nodes.array.items) |value| {
+                if (value != .object) return error.InvalidSnapshot;
+                const thread = value.object;
+                const path = card.target.path orelse return error.ActionTargetMismatch;
+                const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
+                if (thread_path != .string) return error.InvalidSnapshot;
+                if (!std.mem.eql(u8, thread_path.string, path)) continue;
+                if (!inlineThreadMatchesCard(thread, card)) continue;
+                try self.captureThreadCommentIds(
+                    owner,
+                    name,
+                    number,
+                    thread,
+                    card,
+                    &baseline,
+                );
+            }
+        }
+        return baseline;
+    }
+
+    fn captureThreadCommentIds(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        thread: std.json.ObjectMap,
+        card: tools.ActionCard,
+        baseline: *ReconciliationBaseline,
+    ) !void {
+        const initial = thread.get("comments") orelse return error.InvalidSnapshot;
+        if (initial != .object) return error.InvalidSnapshot;
+        try appendCommentIds(baseline, initial.object);
+        const first_cursor = nextCursor(initial.object) orelse return;
+        var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
+        defer if (cursor) |value| self.allocator.free(value);
+        for (0..max_pages) |_| {
+            const thread_id = thread.get("id") orelse return error.InvalidSnapshot;
+            if (thread_id != .string) return error.InvalidSnapshot;
+            const page = try self.threadCommentPage(owner, name, number, thread_id.string, cursor);
+            defer self.allocator.free(page);
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
+            defer parsed.deinit();
+            const comments = try validatedNodeComments(
+                parsed.value,
+                card.target.base_oid,
+                card.target.head_oid,
+            );
+            try appendCommentIds(baseline, comments);
+            const next = nextCursor(comments) orelse return;
+            const owned_next = try self.allocator.dupe(u8, next);
+            if (cursor) |old| self.allocator.free(old);
+            cursor = owned_next;
+        }
+        return error.PaginationLimitExceeded;
     }
 
     const CommentSnapshot = struct {
@@ -960,6 +1131,7 @@ pub const Broker = struct {
         thread: std.json.ObjectMap,
         card: tools.ActionCard,
         started_unix_s: i64,
+        baseline: *const ReconciliationBaseline,
         target_found: *bool,
         matching_comments: *u32,
     ) !bool {
@@ -969,6 +1141,7 @@ pub const Broker = struct {
             initial.get("nodes").?.array.items,
             card,
             started_unix_s,
+            baseline,
             target_found,
             matching_comments,
         )) return true;
@@ -1001,6 +1174,7 @@ pub const Broker = struct {
                 comments.get("nodes").?.array.items,
                 card,
                 started_unix_s,
+                baseline,
                 target_found,
                 matching_comments,
             )) return true;
@@ -1275,10 +1449,12 @@ fn commentsObserve(
     values: []const std.json.Value,
     card: tools.ActionCard,
     started_unix_s: i64,
+    baseline: *const ReconciliationBaseline,
     target_found: *bool,
     matching_comments: *u32,
 ) !bool {
     for (values) |value| {
+        if (value != .object) return error.InvalidSnapshot;
         const comment = value.object;
         if (card.target.comment_id) |comment_id| {
             if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
@@ -1295,6 +1471,9 @@ fn commentsObserve(
         const body = card.body orelse continue;
         if (!comment.get("viewerDidAuthor").?.bool or
             !std.mem.eql(u8, comment.get("body").?.string, body)) continue;
+        const comment_id = comment.get("id") orelse return error.InvalidSnapshot;
+        if (comment_id != .string) return error.InvalidSnapshot;
+        if (card.kind == .add_inline_comment and baseline.contains(comment_id.string)) continue;
         const created = parseGithubTimestampSeconds(
             comment.get("createdAt").?.string,
         ) orelse continue;
@@ -1310,6 +1489,22 @@ fn commentsObserve(
         return true;
     }
     return false;
+}
+
+fn appendCommentIds(
+    baseline: *ReconciliationBaseline,
+    comments: std.json.ObjectMap,
+) !void {
+    const nodes = comments.get("nodes") orelse return error.InvalidSnapshot;
+    if (nodes != .array) return error.InvalidSnapshot;
+    for (nodes.array.items) |value| {
+        if (value != .object) return error.InvalidSnapshot;
+        const id = value.object.get("id") orelse return error.InvalidSnapshot;
+        if (id != .string) return error.InvalidSnapshot;
+        const owned = try baseline.allocator.dupe(u8, id.string);
+        errdefer baseline.allocator.free(owned);
+        try baseline.comment_ids.append(baseline.allocator, owned);
+    }
 }
 
 fn parseGithubTimestampSeconds(raw: []const u8) ?i64 {
@@ -1757,6 +1952,7 @@ pub fn canonicalMergeBaseAlloc(
         cancelled,
         4096,
         git_stderr_bytes_max,
+        false,
     ) catch |err| switch (err) {
         error.ProcessCallCancelled => return error.GitDiffCancelled,
         error.StreamTooLong => return error.MergeBaseOutputTooLarge,
@@ -1797,6 +1993,7 @@ pub fn canonicalDiffFromMergeBaseAlloc(
         cancelled,
         canonical_diff_bytes_max,
         git_stderr_bytes_max,
+        false,
     ) catch |err| switch (err) {
         error.ProcessCallCancelled => return error.GitDiffCancelled,
         error.StreamTooLong => return error.FileDiffTooLarge,
@@ -2123,6 +2320,24 @@ test "captured process rejects output beyond its exact bound" {
             null,
             8,
             8,
+            false,
+        ),
+    );
+}
+
+test "effectful process capture failure is classified outcome unknown" {
+    try std.testing.expectError(
+        error.ProcessOutcomeUnknown,
+        runCapturedProcess(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "/bin/sh", "-c", "cat >/dev/null; printf 0123456789abcdef" },
+            .inherit,
+            "{}",
+            null,
+            8,
+            8,
+            true,
         ),
     );
 }

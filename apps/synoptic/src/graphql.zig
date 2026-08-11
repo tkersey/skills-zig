@@ -98,7 +98,8 @@ pub const action_authority_query =
 pub const reconcile_query =
     "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
     "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
-    "reviewThreads(first:100,after:$after){nodes{id path line isResolved comments(first:100){" ++
+    "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide " ++
+    "isResolved comments(first:100){" ++
     "nodes{id body createdAt viewerDidAuthor}pageInfo{hasNextPage endCursor}}}" ++
     "pageInfo{hasNextPage endCursor}}}}}";
 

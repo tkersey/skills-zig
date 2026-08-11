@@ -202,3 +202,19 @@ jobs:
           files: |
             release-assets/${{ env.RELEASE_TAG }}-darwin-arm64.tar.gz
             release-assets/${{ env.RELEASE_TAG }}-darwin-x86_64.tar.gz
+      - name: Verify exact remote Synoptic release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_arm="${RELEASE_TAG}-darwin-arm64.tar.gz"
+          expected_intel="${RELEASE_TAG}-darwin-x86_64.tar.gz"
+          mapfile -t actual < <(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              --jq '.assets[].name' | LC_ALL=C sort
+          )
+          expected=("${expected_arm}" "${expected_intel}")
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            echo "Expected exact remote assets ${expected[*]}, got ${actual[*]}" >&2
+            exit 1
+          fi

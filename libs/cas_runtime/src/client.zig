@@ -2245,14 +2245,36 @@ fn actorServerResultPayloadAlloc(
     id_value: std.json.Value,
     result_json: []const u8,
 ) ![]u8 {
+    if (result_json.len > websocket_transport.max_message_bytes) {
+        return error.AppServerMessageTooLarge;
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    defer parsed.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll("{\"id\":");
     try std.json.Stringify.value(id_value, .{}, &output.writer);
     try output.writer.writeAll(",\"result\":");
-    try output.writer.writeAll(result_json);
+    try std.json.Stringify.value(parsed.value, .{}, &output.writer);
     try output.writer.writeByte('}');
     return allocator.dupe(u8, output.written());
+}
+
+test "server handler result must be one valid JSON value before framing" {
+    var parsed_id = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "\"tool-1\"",
+        .{},
+    );
+    defer parsed_id.deinit();
+    const invalid = actorServerResultPayloadAlloc(
+        std.testing.allocator,
+        parsed_id.value,
+        "{\"handled\":true} trailing",
+    ) catch return;
+    std.testing.allocator.free(invalid);
+    return error.ExpectedInvalidJsonResult;
 }
 
 fn actorRequestPayloadAlloc(

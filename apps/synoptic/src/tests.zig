@@ -721,12 +721,13 @@ fn fakeGhScriptAlloc(
         \\if grep -q 'SynopticMarkFileViewed' "$input"; then printf '%s\n' viewed > "$state"; printf '%s\n' '{{"data":{{"markFileAsViewed":{{"pullRequest":{{"id":"PR_1"}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticPullRequest' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"Fixture PR","body":"","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"%s"}},{{"path":"b.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
         \\if grep -q 'SynopticReviewThreads' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticReconcile' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticFileState' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","viewerViewedState":"%s"}},{{"path":"b.zig","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
         \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig"}},{{"path":"b.zig"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     ,
-        .{ log_path, state_path, base, head, base, head, base, head, base, head },
+        .{ log_path, state_path, base, head, base, head, base, head, base, head, base, head },
     );
 }
 
@@ -759,13 +760,14 @@ fn fakeAmbiguousGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8
         \\#!/bin/sh
         \\set -eu
         \\log='__LOG__'
+        \\state="${log}.state"
         \\input=$(mktemp)
         \\trap 'rm -f "$input"' EXIT
         \\cat > "$input"
         \\cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi
-        \\if grep -q 'SynopticReconcile' "$input"; then now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
-        \\if grep -q 'SynopticAddInlineComment' "$input"; then exit 1; fi
+        \\if grep -q 'SynopticReconcile' "$input"; then if [ ! -f "$state" ]; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi; now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
+        \\if grep -q 'SynopticAddInlineComment' "$input"; then : > "$state"; exit 1; fi
         \\printf '%s\n' '{"data":{}}'
         \\
     ;
@@ -1211,9 +1213,10 @@ test "action broker rejects base drift during ambiguous reconciliation" {
         .resolved_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    const baseline = github.ReconciliationBaseline{ .allocator = allocator };
     try std.testing.expectError(
         error.PullRequestChanged,
-        broker.reconcileAction("o", "r", 1, card.*, 0),
+        broker.reconcileAction("o", "r", 1, card.*, 0, &baseline),
     );
 }
 
@@ -1304,7 +1307,8 @@ test "duplicate inline comment reconciliation remains unknown" {
         .session_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
-    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, card.*, 0));
+    const baseline = github.ReconciliationBaseline{ .allocator = allocator };
+    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, card.*, 0, &baseline));
 }
 
 test "ambiguous complete-file mutation succeeds only through viewed readback" {
@@ -1437,10 +1441,42 @@ fn verifyAmbiguousActions(
         tools.ActionStatus.outcome_unknown,
         try state.confirmAction(broker, "o", "r", 1, unmatched.id),
     );
+    state.action_state_fresh = true;
+    try verifyPreexistingCommentNotAttributed(broker, state);
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(log);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticAddInlineComment"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticReconcile"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, log, "SynopticAddInlineComment"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, log, "SynopticReconcile"));
+}
+
+fn verifyPreexistingCommentNotAttributed(broker: github.Broker, state: *app.App) !void {
+    const preexisting = try state.action_store.prepare(
+        "ses-1",
+        "turn-4",
+        .{
+            .slot = @constCast("finding-3"),
+            .kind = .add_inline_comment,
+            .effect_summary = @constCast("Do not attribute the preexisting comment"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("a.zig"),
+            .line = 1,
+            .side = @constCast("RIGHT"),
+            .body = @constCast("body"),
+        },
+        .{
+            .repository = "o/r",
+            .pull_request = 1,
+            .pull_request_id = "PR_1",
+            .base_oid = "unknown-base",
+            .head_oid = "h",
+            .session_path = "a.zig",
+        },
+    );
+    try broker.validateAction("o", "r", 1, "PR_1", preexisting.*);
+    try std.testing.expectEqual(
+        tools.ActionStatus.outcome_unknown,
+        try state.confirmAction(broker, "o", "r", 1, preexisting.id),
+    );
 }
 
 test "updated comment reconciliation matches identity author and body regardless of creation age" {
@@ -1460,6 +1496,10 @@ test "updated comment reconciliation matches identity author and body regardless
         io,
         .{ .sub_path = "fake-gh-update-reconcile", .data = script },
     );
+    const state_path = try std.fmt.allocPrint(allocator, "{s}.state", .{log_path});
+    defer allocator.free(state_path);
+    const state = try std.Io.Dir.createFileAbsolute(io, state_path, .{});
+    state.close(io);
     try std.Io.Dir.cwd().setFilePermissions(
         io,
         gh_path,
@@ -1467,6 +1507,14 @@ test "updated comment reconciliation matches identity author and body regardless
         .{},
     );
 
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try verifyUpdatedCommentReconciliation(allocator, broker);
+}
+
+fn verifyUpdatedCommentReconciliation(
+    allocator: std.mem.Allocator,
+    broker: github.Broker,
+) !void {
     var store = tools.ActionStore{ .allocator = allocator };
     defer store.deinit();
     const card = try store.prepare("ses-update", "turn-update", .{
@@ -1484,11 +1532,18 @@ test "updated comment reconciliation matches identity author and body regardless
         .head_oid = "h",
         .session_path = "a.zig",
     });
-    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    const baseline = github.ReconciliationBaseline{ .allocator = allocator };
     // The fixture's createdAt is current, while the mutation start is far in
     // the future. Updates reconcile from immutable identity and final state,
     // not from the comment's original creation timestamp.
-    try std.testing.expect(try broker.reconcileAction("o", "r", 1, card.*, 4_102_444_800));
+    try std.testing.expect(try broker.reconcileAction(
+        "o",
+        "r",
+        1,
+        card.*,
+        4_102_444_800,
+        &baseline,
+    ));
 
     const wrong_body = try store.prepare("ses-update", "turn-update-2", .{
         .slot = @constCast("update-other"),
@@ -1505,7 +1560,14 @@ test "updated comment reconciliation matches identity author and body regardless
         .head_oid = "h",
         .session_path = "a.zig",
     });
-    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, wrong_body.*, 0));
+    try std.testing.expect(!try broker.reconcileAction(
+        "o",
+        "r",
+        1,
+        wrong_body.*,
+        0,
+        &baseline,
+    ));
 }
 
 fn runGit(

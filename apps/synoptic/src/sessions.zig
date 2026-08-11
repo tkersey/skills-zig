@@ -505,7 +505,8 @@ pub const Registry = struct {
 
     fn activeSynchronizationWorkLocked(self: *const Registry) usize {
         var active = self.active_command_ids.items.len + self.file_admissions.items.len +
-            self.authoritative_reservations + @intFromBool(self.primary_turn_active);
+            self.authoritative_reservations + @intFromBool(self.primary_turn_active) +
+            @intFromBool(self.exclusions_pending);
         for (self.sessions.items) |session| {
             if (session.status != .closed and session.turn_active) active += 1;
             if (session.status != .closed and session.turn_starting) active += 1;
@@ -2876,6 +2877,12 @@ test "worktree integrity synchronization waits for commands and times out bounde
         "mandExecution\"}}}";
     registry.recordCommandActivity("item/completed", command_completed);
     try std.testing.expectEqual(@as(usize, 0), registry.activeCommandCount());
+    registry.setExclusionsPending(true);
+    try std.testing.expectError(
+        error.ActiveReviewCommandsTimeout,
+        registry.beginSynchronization(std.testing.io, 20),
+    );
+    registry.setExclusionsPending(false);
     try registry.beginSynchronization(std.testing.io, 100);
     registry.endSynchronization();
 }

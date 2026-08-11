@@ -512,6 +512,13 @@ pub const App = struct {
     ) !tools.ActionStatus {
         if (!self.action_state_fresh) return error.GitHubStateStale;
         var card = (try self.action_store.pendingById(card_id)).*;
+        var reconciliation_baseline = try broker.captureReconciliationBaseline(
+            owner,
+            name,
+            number,
+            card,
+        );
+        defer reconciliation_baseline.deinit();
         const started_unix_s: i64 =
             @intCast(@divFloor(std.Io.Clock.real.now(broker.io).nanoseconds, std.time.ns_per_s));
         _ = try self.action_store.beginExecute(card.id);
@@ -524,6 +531,7 @@ pub const App = struct {
             number,
             &card,
             started_unix_s,
+            &reconciliation_baseline,
         )) |status| return status;
         if (try self.synchronizeViewedAction(broker, owner, name, number, &card)) |status| {
             return status;
@@ -545,6 +553,7 @@ pub const App = struct {
         number: u64,
         card: *tools.ActionCard,
         started_unix_s: i64,
+        reconciliation_baseline: *const github.ReconciliationBaseline,
     ) !?tools.ActionStatus {
         broker.executeAction(card.*) catch |err| {
             if (err == error.GitHubTransportAmbiguous) {
@@ -554,6 +563,7 @@ pub const App = struct {
                     number,
                     card.*,
                     started_unix_s,
+                    reconciliation_baseline,
                 ) catch false;
                 if (reconciled) {
                     self.action_state_fresh = true;
