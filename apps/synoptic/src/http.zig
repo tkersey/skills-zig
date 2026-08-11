@@ -584,16 +584,17 @@ pub const Server = struct {
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
         }
-        if (runtime.registry.takePrimaryFailure()) |failure| {
+        if (runtime.registry.peekPrimaryFailure()) |failure| {
             const payload = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"status\":\"failed\",\"reason\":{f}}}",
-                .{std.json.fmt(failure, .{})},
+                .{std.json.fmt(failure.status, .{})},
             );
             defer self.allocator.free(payload);
             const envelope = try runtime.app.nextEnvelope("primary.status", payload);
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
+            runtime.registry.acknowledgePrimaryFailure(failure.epoch);
         }
         while (try runtime.registry.peekVisible(self.allocator)) |event| {
             defer event.deinit(self.allocator);

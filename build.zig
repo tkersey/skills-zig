@@ -908,6 +908,32 @@ pub fn build(b: *std.Build) void {
     ));
     synoptic_version_smoke.step.dependOn(&synoptic_install.step);
     test_synoptic.dependOn(&synoptic_version_smoke.step);
+    const synoptic_usage =
+        \\Usage:
+        \\  synoptic launch [--pr SELECTOR] --cwd PATH --skill-root PATH [--json]
+        \\  synoptic capabilities [--format json]
+        \\  synoptic version
+        \\  synoptic status [--json]
+        \\  synoptic stop [--json]
+        \\
+    ;
+    const synoptic_help_smoke = b.addRunArtifact(synoptic);
+    synoptic_help_smoke.addArg("--help");
+    synoptic_help_smoke.expectStdOutEqual(synoptic_usage);
+    synoptic_help_smoke.expectStdErrEqual("");
+    synoptic_help_smoke.step.dependOn(&synoptic_install.step);
+    test_synoptic.dependOn(&synoptic_help_smoke.step);
+    const synoptic_no_args_smoke = b.addRunArtifact(synoptic);
+    synoptic_no_args_smoke.expectStdErrEqual(synoptic_usage);
+    synoptic_no_args_smoke.expectExitCode(2);
+    synoptic_no_args_smoke.step.dependOn(&synoptic_install.step);
+    test_synoptic.dependOn(&synoptic_no_args_smoke.step);
+    const synoptic_invalid_command_smoke = b.addRunArtifact(synoptic);
+    synoptic_invalid_command_smoke.addArg("not-a-command");
+    synoptic_invalid_command_smoke.expectStdErrEqual(synoptic_usage);
+    synoptic_invalid_command_smoke.expectExitCode(2);
+    synoptic_invalid_command_smoke.step.dependOn(&synoptic_install.step);
+    test_synoptic.dependOn(&synoptic_invalid_command_smoke.step);
     const test_synoptic_falsifiers = b.step(
         "test-synoptic-falsifiers",
         "Run Synoptic falsifiers",
@@ -1092,6 +1118,8 @@ pub fn build(b: *std.Build) void {
             &cas_install.step,
             &cas_automation_install.step,
         };
+    const synoptic_aggregate_test_deps: []const *std.Build.Step =
+        if (target.result.os.tag == .macos) &.{test_synoptic} else &.{};
     const app_surfaces = [_]AppSurface{
         .{
             .path = b.path("apps/seq"),
@@ -1119,7 +1147,7 @@ pub fn build(b: *std.Build) void {
             .build_step_name = "build-synoptic",
             .build_description = "Build the native Synoptic executable",
             .build_deps = &.{&synoptic_install.step},
-            .test_deps = &.{test_synoptic},
+            .test_deps = synoptic_aggregate_test_deps,
         },
         .{
             .path = b.path("apps/ledger"),

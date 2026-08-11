@@ -463,9 +463,11 @@ jobs:
       - name: Verify Synoptic version and capabilities
         run: |
           set -euo pipefail
+          binary="./zig-out/bin/synoptic-release-safe"
+          test -x "${binary}"
           expected_version="$(tr -d '[:space:]' < apps/synoptic/VERSION)"
-          test "$(./zig-out/bin/synoptic version)" = "synoptic ${expected_version}"
-          capabilities="$(./zig-out/bin/synoptic capabilities --format json)"
+          test "$("${binary}" version)" = "synoptic ${expected_version}"
+          capabilities="$("${binary}" capabilities --format json)"
           jq -e --arg version "${expected_version}" '
             .synopticCapabilities.version == $version and
             .synopticCapabilities.platform == "macos" and

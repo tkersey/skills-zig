@@ -24,7 +24,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      release_commit: ${{ steps.tag.outputs.release_commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: tag
+        name: Resolve release tag to its immutable commit
+        run: |
+          set -euo pipefail
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"${ref_json}")"
+          object_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
+          for _ in 1 2 3 4; do
+            [[ "${object_type}" = commit ]] && break
+            [[ "${object_type}" = tag ]] || { echo "Unsupported tag object: ${object_type}" >&2; exit 1; }
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(jq -r '.object.type' <<<"${tag_json}")"
+            object_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
+          done
+          [[ "${object_type}" = commit ]] || { echo "Release tag did not resolve to a commit" >&2; exit 1; }
+          echo "release_commit=${object_sha}" >> "${GITHUB_OUTPUT}"
+
   qualify:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -40,13 +65,16 @@ jobs:
             runner_arch: X64
             binary_arch: x86_64
     runs-on: ${{ matrix.runs_on }}
+    env:
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.release_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_COMMIT }}
       - name: Validate Synoptic tag and runner architecture
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_COMMIT}"
           expected_tag="synoptic-v$(tr -d '[:space:]' < apps/synoptic/VERSION)"
           if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
             echo "Tag mismatch: expected ${expected_tag}, got ${RELEASE_TAG}" >&2
@@ -123,10 +151,11 @@ jobs:
           overwrite: false
 
   publish:
-    needs: qualify
+    needs: [resolve, qualify]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.release_commit }}
     steps:
       - name: Download Synoptic release artifacts
         uses: actions/download-artifact@v4
@@ -161,8 +190,8 @@ jobs:
             object_type="$(jq -r '.object.type' <<<"${tag_json}")"
             tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
           done
-          if [[ "${object_type}" != commit || "${tag_sha}" != "${GITHUB_SHA}" ]]; then
-            echo "Release tag does not resolve to release commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
+          if [[ "${object_type}" != commit || "${tag_sha}" != "${RELEASE_COMMIT}" ]]; then
+            echo "Release tag does not resolve to qualified commit ${RELEASE_COMMIT}: ${object_type} ${tag_sha}" >&2
             exit 1
           fi
       - name: Publish exact Synoptic release assets

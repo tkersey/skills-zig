@@ -1890,9 +1890,10 @@ fn installExclusionGh(
     const format = "#!/bin/sh\nset -eu\ninput=$(cat)\nprintf '%s\\n%s\\n' " ++
         "\"$*\" \"$input\" >> {s}\nif printf '%s' \"$input\" | grep -q" ++
         " SynopticMarkFileViewed; then\n  if printf '%s' \"$input\" | grep" ++
-        " -q 'vendor/fail.js'; then exit 1; fi\n  if printf '%s' \"$input" ++
-        "\" | grep -q 'vendor/ambiguous.js'; then printf '%s\\n' ambi" ++
-        "guous >> {s}; exit 1; fi\n  printf '%s\\n' package >> {s}\n  " ++
+        " -q 'package-lock.json'; then printf '%s\\n' package >> {s}; fi\n" ++
+        "  if printf '%s' \"$input\" | grep -q 'vendor/ambiguous.js'; then " ++
+        "printf '%s\\n' ambiguous >> {s}; fi\n  if printf '%s' \"$input\" | grep" ++
+        " -q 'vendor/fail.js'; then exit 1; fi\n  " ++
         "printf '%s\\n' '{{\"data\":{{\"markFileAsViewed\":{{\"pullReq" ++
         "uest\":{{\"id\":\"PR_1\"}}}}}}}}'\n  exit 0\nfi\npackage_view" ++
         "ed=UNVIEWED\nambiguous_viewed=UNVIEWED\n[ -f {s} ] && grep" ++
@@ -2065,6 +2066,37 @@ test "viewed mutation crossing base generation never issues an unowned inverse" 
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
 }
 
+fn verifyRefreshedExclusionState(
+    allocator: std.mem.Allocator,
+    state: *app.App,
+    settings: *config.Settings,
+    broker: github.Broker,
+    root: []const u8,
+    base: []const u8,
+    head: []const u8,
+) !void {
+    var refreshed = try domain.PrGeneration.initFull(allocator, base, head);
+    try refreshed.addFile(
+        .{ .path = "package-lock.json", .viewed = .unviewed, .revision_key = "r4" },
+    );
+    state.replaceGeneration(refreshed);
+    var outcomes = try state.applyAutomaticExclusions(
+        settings,
+        broker,
+        "o",
+        "r",
+        1,
+        "PR_1",
+        root,
+    );
+    defer {
+        for (outcomes.items) |outcome| outcome.deinit();
+        outcomes.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), outcomes.items.len);
+    try std.testing.expect(!state.generation.queued("package-lock.json"));
+}
+
 fn verifyExclusionState(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2106,34 +2138,27 @@ fn verifyExclusionState(
         "synoptic-auto-exclusion",
     ) != null);
     try std.testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 1),
         std.mem.count(u8, log, "mutation SynopticMarkFileViewed"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        std.mem.count(u8, log, "synoptic-auto-exclusion-"),
     );
     try std.testing.expectEqual(
         @as(usize, 4),
         std.mem.count(u8, log, "query SynopticFileState"),
     );
 
-    var refreshed = try domain.PrGeneration.initFull(allocator, base, head);
-    try refreshed.addFile(
-        .{ .path = "package-lock.json", .viewed = .unviewed, .revision_key = "r4" },
-    );
-    state.replaceGeneration(refreshed);
-    var refreshed_outcomes = try state.applyAutomaticExclusions(
+    try verifyRefreshedExclusionState(
+        allocator,
+        state,
         settings,
         broker,
-        "o",
-        "r",
-        1,
-        "PR_1",
         root,
+        base,
+        head,
     );
-    defer {
-        for (refreshed_outcomes.items) |outcome| outcome.deinit();
-        refreshed_outcomes.deinit(allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 1), refreshed_outcomes.items.len);
-    try std.testing.expect(!state.generation.queued("package-lock.json"));
 }
 
 const SessionFixturePaths = struct {

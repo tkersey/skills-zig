@@ -233,8 +233,9 @@ pub const Registry = struct {
     latest_primary_turn_id: ?[]u8 = null,
     primary_start_turn_id: ?[]u8 = null,
     primary_turn_active: bool = false,
-    primary_failure_reported: bool = false,
     primary_failure_status: ?PrimaryFailure = null,
+    primary_failure_epoch: u64 = 0,
+    primary_failure_acknowledged_epoch: u64 = 0,
     evidence: ?domain.PrGeneration = null,
     notification_count: u64 = 0,
     mutex: RegistryMutex = .{},
@@ -257,7 +258,11 @@ pub const Registry = struct {
     visible_overflow_count: u64 = 0,
     visible_overflow_session_id: ?[]u8 = null,
 
-    const PrimaryFailure = enum { failed, interrupted };
+    const PrimaryFailure = enum { failed, interrupted, poisoned, disconnected, stopped };
+    pub const PrimaryFailureNotice = struct {
+        status: []const u8,
+        epoch: u64,
+    };
     const PrimaryTerminalStatus = enum { completed, failed, interrupted };
     const PrimaryTerminal = struct {
         turn_id: []u8,
@@ -626,19 +631,32 @@ pub const Registry = struct {
         return self.latest_primary_turn_id != null;
     }
 
-    pub fn takePrimaryFailure(self: *Registry) ?[]const u8 {
+    pub fn peekPrimaryFailure(self: *Registry) ?PrimaryFailureNotice {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.primary_failure_reported) return null;
-        if (self.primary_failure_status) |failure| {
-            self.primary_failure_reported = true;
-            return @tagName(failure);
+        if (self.primary_failure_status == null) {
+            const actor = if (self.actor) |*value| value else return null;
+            self.primary_failure_status = switch (actor.terminalState()) {
+                .running => return null,
+                .poisoned => .poisoned,
+                .disconnected => .disconnected,
+                .stopped => .stopped,
+            };
+            self.primary_failure_epoch +%= 1;
         }
-        const actor = if (self.actor) |*value| value else return null;
-        const terminal = actor.terminalState();
-        if (terminal == .running) return null;
-        self.primary_failure_reported = true;
-        return @tagName(terminal);
+        if (self.primary_failure_acknowledged_epoch == self.primary_failure_epoch) return null;
+        return .{
+            .status = @tagName(self.primary_failure_status.?),
+            .epoch = self.primary_failure_epoch,
+        };
+    }
+
+    pub fn acknowledgePrimaryFailure(self: *Registry, epoch: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (epoch == self.primary_failure_epoch) {
+            self.primary_failure_acknowledged_epoch = epoch;
+        }
     }
 
     pub fn sessionCount(self: *Registry) usize {
@@ -1708,12 +1726,12 @@ pub const Registry = struct {
 
     fn applyPrimaryTerminalLocked(self: *Registry, terminal: PrimaryTerminal) void {
         self.primary_turn_active = false;
-        self.primary_failure_reported = false;
         if (terminal.status != .completed) {
             self.primary_failure_status = if (terminal.status == .interrupted)
                 .interrupted
             else
                 .failed;
+            self.primary_failure_epoch +%= 1;
             self.allocator.free(terminal.turn_id);
             return;
         }
@@ -2998,7 +3016,7 @@ test "visible notification overflow becomes an explicit warning after capacity d
     try std.testing.expect(std.mem.indexOf(u8, warning.raw_json, "VisibleEventOverflow") != null);
 }
 
-test "failed or interrupted primary turns never advance the fork checkpoint" {
+test "failed primary delivery survives a failed write and reconnect until acknowledged" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
     registry.primary_thread_id = try std.testing.allocator.dupe(u8, "primary");
@@ -3009,7 +3027,13 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
             "\"status\":\"failed\"}}}",
     );
     try std.testing.expect(!registry.primaryReady());
-    try std.testing.expectEqualStrings("failed", registry.takePrimaryFailure().?);
+    const failed_write = registry.peekPrimaryFailure().?;
+    try std.testing.expectEqualStrings("failed", failed_write.status);
+    const reconnect = registry.peekPrimaryFailure().?;
+    try std.testing.expectEqual(failed_write.epoch, reconnect.epoch);
+    try std.testing.expectEqualStrings(failed_write.status, reconnect.status);
+    registry.acknowledgePrimaryFailure(reconnect.epoch);
+    try std.testing.expect(registry.peekPrimaryFailure() == null);
     std.testing.allocator.free(registry.primary_start_turn_id.?);
     registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "t2");
     registry.primary_turn_active = true;
@@ -3018,12 +3042,22 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
             "\"status\":\"interrupted\"}}}",
     );
     try std.testing.expect(!registry.primaryReady());
-    try std.testing.expectEqualStrings("interrupted", registry.takePrimaryFailure().?);
+    const interrupted = registry.peekPrimaryFailure().?;
+    try std.testing.expectEqualStrings("interrupted", interrupted.status);
+    registry.acknowledgePrimaryFailure(interrupted.epoch);
     std.testing.allocator.free(registry.primary_start_turn_id.?);
     registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "t3");
     registry.recordPrimaryCompletion(
         "{\"params\":{\"threadId\":\"primary\",\"turn\":{\"id\":\"t3\"," ++
             "\"status\":\"completed\"}}}",
+    );
+    try std.testing.expect(registry.primaryReady());
+    try std.testing.expectEqualStrings("t3", registry.latest_primary_turn_id.?);
+    std.testing.allocator.free(registry.primary_start_turn_id.?);
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "refresh");
+    registry.recordPrimaryCompletion(
+        "{\"params\":{\"threadId\":\"primary\",\"turn\":{\"id\":\"refresh\"," ++
+            "\"status\":\"failed\"}}}",
     );
     try std.testing.expect(registry.primaryReady());
     try std.testing.expectEqualStrings("t3", registry.latest_primary_turn_id.?);

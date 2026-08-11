@@ -285,6 +285,7 @@ pub const Broker = struct {
             const expected_head = pull.get("headRefOid").?.string;
             const nodes = pull.get("reviewThreads").?.object.get("nodes").?.array;
             for (nodes.items) |node| {
+                if (node != .object) return error.InvalidSnapshot;
                 const comments = node.object.get("comments").?.object;
                 const cursor = nextCursor(comments) orelse continue;
                 try self.appendThreadComments(
@@ -462,13 +463,43 @@ pub const Broker = struct {
         requests: []const ViewedBatchRequest,
         results: []ViewedBatchResult,
     ) void {
-        for (requests, results) |request, *result| self.markViewedWithId(
-            pull_request_id,
-            request.path,
-            request.client_id,
-        ) catch |err| {
-            result.error_name = @errorName(err);
-        };
+        const max_mutations_per_call: usize = 50;
+        var offset: usize = 0;
+        while (offset < requests.len) {
+            const end = @min(offset + max_mutations_per_call, requests.len);
+            self.markViewedChunk(pull_request_id, requests[offset..end]) catch |err| {
+                for (results[offset..end]) |*result| result.error_name = @errorName(err);
+            };
+            offset = end;
+        }
+    }
+
+    fn markViewedChunk(
+        self: Broker,
+        pull_request_id: []const u8,
+        requests: []const ViewedBatchRequest,
+    ) !void {
+        const document = try graphql.markViewedBatchMutationAlloc(self.allocator, requests.len);
+        defer self.allocator.free(document);
+        var variables: std.Io.Writer.Allocating = .init(self.allocator);
+        defer variables.deinit();
+        try variables.writer.writeByte('{');
+        for (requests, 0..) |request, index| {
+            if (index != 0) try variables.writer.writeByte(',');
+            try variables.writer.print(
+                "\"input{d}\":{{\"pullRequestId\":{f},\"path\":{f}," ++
+                    "\"clientMutationId\":{f}}}",
+                .{
+                    index,
+                    std.json.fmt(pull_request_id, .{}),
+                    std.json.fmt(request.path, .{}),
+                    std.json.fmt(request.client_id, .{}),
+                },
+            );
+        }
+        try variables.writer.writeByte('}');
+        const response = try self.call(document, variables.written());
+        self.allocator.free(response);
     }
 
     fn readbackViewedBatch(
@@ -1534,6 +1565,7 @@ pub fn loadThreads(
             return error.InvalidSnapshot).object.get("nodes").?.array.items;
     };
     for (nodes) |node| {
+        if (node != .object) return error.InvalidSnapshot;
         const object = node.object;
         if (object.get("isResolved").?.bool) {
             generation.removeThread(object.get("id").?.string);
@@ -1608,6 +1640,24 @@ pub fn hydrateRevisionKeys(
     fetch_source: ?worktree.FetchSource,
     generation: *domain.PrGeneration,
 ) !void {
+    return hydrateRevisionKeysWithGitPath(
+        allocator,
+        io,
+        cwd,
+        fetch_source,
+        generation,
+        "git",
+    );
+}
+
+fn hydrateRevisionKeysWithGitPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    fetch_source: ?worktree.FetchSource,
+    generation: *domain.PrGeneration,
+    git_path: []const u8,
+) !void {
     worktree.ensureObjectAvailable(
         allocator,
         io,
@@ -1618,13 +1668,23 @@ pub fn hydrateRevisionKeys(
         error.GitObjectUnavailable => return error.GitFetchFailed,
         else => return err,
     };
+    const merge_base = try canonicalMergeBaseAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        generation.base_oid,
+        generation.head_oid,
+        null,
+    );
+    defer allocator.free(merge_base);
     for (generation.files.items) |file| {
         const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
         defer allocator.free(spec);
         const blob_result = try std.process.run(
             allocator,
             io,
-            .{ .argv = &.{ "git", "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
+            .{ .argv = &.{ git_path, "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
         );
         defer allocator.free(blob_result.stdout);
         defer allocator.free(blob_result.stderr);
@@ -1632,13 +1692,15 @@ pub fn hydrateRevisionKeys(
             std.mem.trim(u8, blob_result.stdout, "\r\n")
         else
             "DELETION";
-        const diff = try canonicalDiffAlloc(
+        const diff = try canonicalDiffFromMergeBaseAlloc(
             allocator,
             io,
+            git_path,
             cwd,
-            generation.base_oid,
+            merge_base,
             generation.head_oid,
             file.path,
+            null,
         );
         defer allocator.free(diff);
         const revision = try domain.revisionKey(allocator, file.path, file.change_type, blob, diff);
@@ -1907,6 +1969,139 @@ test "thread evidence accepts deleted authors and nested comment pages" {
         "{\"data\":{\"node\":{\"id\":\"T1\",\"isResolved\":true}}}";
     try loadThreads(std.testing.allocator, resolved, &generation);
     try std.testing.expectEqual(@as(usize, 0), generation.threads.items.len);
+}
+
+test "snapshot rejects nullable outer review thread nodes" {
+    var generation = try domain.PrGeneration.initFull(
+        std.testing.allocator,
+        "base",
+        "head",
+    );
+    defer generation.deinit();
+    const raw =
+        "{\"data\":{\"repository\":{\"pullRequest\":{" ++
+        "\"reviewThreads\":{\"nodes\":[null]}}}}}";
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        loadThreads(std.testing.allocator, raw, &generation),
+    );
+}
+
+fn runTestGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+    });
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return error.TestGitFailed;
+    }
+    return result.stdout;
+}
+
+fn expectSingleMergeBaseHydration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    wrapper_path: []const u8,
+    log_path: []const u8,
+    base: []const u8,
+    head: []const u8,
+) !void {
+    var generation = try domain.PrGeneration.initFull(allocator, base, head);
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "a.zig",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending-a",
+    });
+    try generation.addFile(.{
+        .path = "b.zig",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending-b",
+    });
+    try hydrateRevisionKeysWithGitPath(
+        allocator,
+        io,
+        root,
+        null,
+        &generation,
+        wrapper_path,
+    );
+    const log = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        log_path,
+        allocator,
+        .limited(16 * 1024),
+    );
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "merge-base "));
+    try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending-a"));
+    try std.testing.expect(!std.mem.eql(u8, generation.files.items[1].revision_key, "pending-b"));
+}
+
+test "revision hydration computes one merge base for a generation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "base a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "base b\n" });
+    for ([_][]const []const u8{
+        &.{ "/usr/bin/git", "init", "-q" },
+        &.{ "/usr/bin/git", "config", "user.email", "synoptic@example.test" },
+        &.{ "/usr/bin/git", "config", "user.name", "Synoptic Test" },
+        &.{ "/usr/bin/git", "add", "." },
+        &.{ "/usr/bin/git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "/usr/bin/git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "head a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "head b\n" });
+    for ([_][]const []const u8{
+        &.{ "/usr/bin/git", "add", "." },
+        &.{ "/usr/bin/git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "/usr/bin/git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const log_path = try std.fs.path.join(allocator, &.{ root, "git.log" });
+    defer allocator.free(log_path);
+    const wrapper_path = try std.fs.path.join(allocator, &.{ root, "fake-git" });
+    defer allocator.free(wrapper_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {s}\nexec /usr/bin/git \"$@\"\n",
+        .{log_path},
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-git", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        wrapper_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    try expectSingleMergeBaseHydration(
+        allocator,
+        io,
+        root,
+        wrapper_path,
+        log_path,
+        base,
+        head,
+    );
 }
 
 test "GitHub transport is a fixed argv stdin broker" {

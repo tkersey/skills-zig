@@ -38,6 +38,29 @@ pub const mark_viewed_mutation =
     "mutation SynopticMarkFileViewed($input:MarkFileAsViewe" ++
     "dInput!){markFileAsViewed(input:$input){pullRequest{id" ++
     "}}}";
+
+pub fn markViewedBatchMutationAlloc(
+    allocator: std.mem.Allocator,
+    count: usize,
+) ![]u8 {
+    if (count == 0) return error.EmptyGraphqlBatch;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("mutation SynopticMarkFileViewedBatch(");
+    for (0..count) |index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.print("$input{d}:MarkFileAsViewedInput!", .{index});
+    }
+    try out.writer.writeAll("){");
+    for (0..count) |index| {
+        try out.writer.print(
+            "file{d}:markFileAsViewed(input:$input{d}){{pullRequest{{id}}}}",
+            .{ index, index },
+        );
+    }
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
 pub const add_inline_comment_mutation =
     "mutation SynopticAddInlineComment($input:AddPullReques" ++
     "tReviewInput!){addPullRequestReview(input:$input){pull" ++
@@ -444,6 +467,17 @@ test "operation identity remains inspectable in fake gh stdin" {
         "SynopticMarkFileViewed",
         operationName(mark_viewed_mutation).?,
     );
+}
+
+test "viewed batch mutation retains one root and input per file" {
+    const document = try markViewedBatchMutationAlloc(std.testing.allocator, 3);
+    defer std.testing.allocator.free(document);
+    try std.testing.expect(try isMutation(std.testing.allocator, document));
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        std.mem.count(u8, document, ":markFileAsViewed("),
+    );
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, document, "$input2"));
 }
 
 test "operation kind ignores legal leading GraphQL comments" {

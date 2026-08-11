@@ -19,11 +19,42 @@ const pr = @import("pr.zig");
 const sessions = @import("sessions.zig");
 const worktree = @import("worktree.zig");
 const launch_shutdown_grace_ms: u32 = 500;
+const usage_text =
+    \\Usage:
+    \\  synoptic launch [--pr SELECTOR] --cwd PATH --skill-root PATH [--json]
+    \\  synoptic capabilities [--format json]
+    \\  synoptic version
+    \\  synoptic status [--json]
+    \\  synoptic stop [--json]
+    \\
+;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argv.len < 2) return usage();
+    if (argv.len < 2) {
+        try printUsage(init.io, std.Io.File.stderr());
+        std.process.exit(2);
+    }
+    if (argv.len == 2 and
+        (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h")))
+    {
+        return printUsage(init.io, std.Io.File.stdout());
+    }
+    dispatch(init, allocator, argv) catch |err| {
+        if (err == error.InvalidArguments) {
+            try printUsage(init.io, std.Io.File.stderr());
+            std.process.exit(2);
+        }
+        return err;
+    };
+}
+
+fn dispatch(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !void {
     if (isVersionCommand(argv[1..])) return printVersion(init.io);
     if (std.mem.eql(u8, argv[1], "capabilities")) return printCapabilities(init.io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "launch")) return launch(
@@ -51,6 +82,12 @@ pub fn main(init: std.process.Init) !void {
         argv[2..],
     );
     return usage();
+}
+
+fn printUsage(io: std.Io, file: std.Io.File) !void {
+    var out = file.writer(io, &.{});
+    try out.interface.writeAll(usage_text);
+    try out.interface.flush();
 }
 
 fn isVersionCommand(args: []const []const u8) bool {
