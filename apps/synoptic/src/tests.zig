@@ -934,7 +934,7 @@ test "comment action validation rejects a changed body found by nested paginatio
         \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticThreadComments' "$input"; then
-        \\  printf '%s\n' '{"data":{"node":{"comments":{"nodes":[{"id":"C_1","body":"changed elsewhere","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h"}},"node":{"comments":{"nodes":[{"id":"C_1","body":"changed elsewhere","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'; exit 0
         \\fi
         \\printf '%s\n' '{"data":{}}'
         \\
@@ -969,6 +969,113 @@ test "comment action validation rejects a changed body found by nested paginatio
         error.GitHubActionTargetChanged,
         broker.validateAction("o", "r", 1, "PR_1", card.*),
     );
+}
+
+test "action broker rejects generation drift on nested comment pagination" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-nested-drift" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\if grep -q 'SynopticAnchor' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticActionAuthority' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticThreadComments' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"changed-base","headRefOid":"head"}},"node":{"comments":{"nodes":[{"id":"C_1","body":"body","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'; exit 0
+        \\fi
+        \\printf '%s\n' '{"data":{}}'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-nested-drift", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("delete"),
+        .kind = .delete_comment,
+        .effect_summary = @constCast("Delete C_1"),
+        .payload_json = @constCast("{}"),
+        .comment_id = @constCast("C_1"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "a.zig",
+        .resolved_path = "a.zig",
+        .comment_body_snapshot = "body",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try std.testing.expectError(
+        error.PullRequestChanged,
+        broker.validateAction("o", "r", 1, "PR_1", card.*),
+    );
+}
+
+test "action broker JSON encodes opaque pagination cursors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-cursor" });
+    defer allocator.free(gh_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "cursor.log" });
+    defer allocator.free(log_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(mktemp)\ntrap 'rm -f \"$input\"' EXIT\n" ++
+            "cat > \"$input\"\ncat \"$input\" >> {s}\nprintf '\\n' >> {s}\n" ++
+            "if grep -q '\"after\":null' \"$input\"; then printf '%s\\n' '" ++
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"baseRefOid\":\"base\"," ++
+            "\"headRefOid\":\"head\",\"files\":{{\"nodes\":[],\"pageInfo\":" ++
+            "{{\"hasNextPage\":true,\"endCursor\":\"opaque\\\"\\\\cursor\"}}}}}}}}}}}}'; " ++
+            "else printf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequest\":{{" ++
+            "\"baseRefOid\":\"base\",\"headRefOid\":\"head\",\"files\":{{\"nodes\":[]," ++
+            "\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}}}'; fi\n",
+        .{ log_path, log_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-cursor", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    var pages = try broker.callPages(graphql.anchor_query, "files", "o", "r", 1);
+    defer {
+        for (pages.items) |page| allocator.free(page);
+        pages.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 2), pages.items.len);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        log,
+        "\"after\":\"opaque\\\"\\\\cursor\"",
+    ) != null);
 }
 
 fn verifyActionLog(allocator: std.mem.Allocator, io: std.Io, log_path: []const u8) !void {
@@ -1060,6 +1167,56 @@ test "action broker reconciles an ambiguous mutation once without retry" {
     try verifyAmbiguousActions(allocator, io, broker, &state, log_path);
 }
 
+test "action broker rejects base drift during ambiguous reconciliation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fake-gh-reconcile-drift" },
+    );
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\cat >/dev/null
+        \\printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"changed-base","headRefOid":"head","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-reconcile-drift", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("reply"),
+        .kind = .reply_thread,
+        .effect_summary = @constCast("Reply"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T_1"),
+        .body = @constCast("body"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "a.zig",
+        .resolved_path = "a.zig",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try std.testing.expectError(
+        error.PullRequestChanged,
+        broker.reconcileAction("o", "r", 1, card.*, 0),
+    );
+}
+
 test "malformed successful mutation response remains transport ambiguous" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1109,7 +1266,7 @@ test "duplicate inline comment reconciliation remains unknown" {
         \\trap 'rm -f "$input"' EXIT
         \\cat > "$input"
         \\now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        \\json='{"data":{"repository":{"pullRequest":{"headRefOid":"h",'
+        \\json='{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h",'
         \\json=$json'"reviewThreads":{"nodes":[{"id":"T","path":"a.zig",'
         \\json=$json'"line":1,"startLine":null,"diffSide":"RIGHT",'
         \\json=$json'"startDiffSide":null,"comments":{"nodes":['

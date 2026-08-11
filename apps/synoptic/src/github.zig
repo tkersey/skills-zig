@@ -4,12 +4,6 @@ const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
 const worktree = @import("worktree.zig");
 
-const reconcile_query =
-    "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
-    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
-    "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide " ++
-    "startDiffSide isResolved comments(first:100){nodes{id body createdAt " ++
-    "viewerDidAuthor}pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}";
 const max_pages: usize = 10_000;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
@@ -287,6 +281,8 @@ pub const Broker = struct {
             );
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
+            const expected_base = pull.get("baseRefOid").?.string;
+            const expected_head = pull.get("headRefOid").?.string;
             const nodes = pull.get("reviewThreads").?.object.get("nodes").?.array;
             for (nodes.items) |node| {
                 const comments = node.object.get("comments").?.object;
@@ -298,6 +294,8 @@ pub const Broker = struct {
                     number,
                     node.object.get("id").?.string,
                     cursor,
+                    expected_base,
+                    expected_head,
                 );
             }
         }
@@ -311,6 +309,8 @@ pub const Broker = struct {
         number: u64,
         thread_id: []const u8,
         first_cursor: []const u8,
+        expected_base: []const u8,
+        expected_head: []const u8,
     ) !void {
         var cursor = try self.allocator.dupe(u8, first_cursor);
         defer self.allocator.free(cursor);
@@ -337,7 +337,11 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const comments = try nodeComments(parsed.value);
+            const comments = try validatedNodeComments(
+                parsed.value,
+                expected_base,
+                expected_head,
+            );
             const info = comments.get("pageInfo").?.object;
             if (!info.get("hasNextPage").?.bool) return;
             const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
@@ -769,6 +773,8 @@ pub const Broker = struct {
             thread.get("id").?.string,
             comment_id,
             next,
+            card.target.base_oid,
+            card.target.head_oid,
             card.target.comment_body_snapshot.?,
         )) orelse return;
         if (!comment.viewer_did_author) return error.GitHubActionNotAuthorized;
@@ -797,7 +803,7 @@ pub const Broker = struct {
         }
         if (card.kind == .graphql) return false;
         var pages = try self.callPages(
-            reconcile_query,
+            graphql.reconcile_query,
             "reviewThreads",
             owner,
             name,
@@ -810,11 +816,11 @@ pub const Broker = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            if (!std.mem.eql(
-                u8,
-                pull.get("headRefOid").?.string,
+            try validateGenerationObject(
+                pull,
+                card.target.base_oid,
                 card.target.head_oid,
-            )) return error.PullRequestChanged;
+            );
             for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
                 if (card.target.thread_id) |thread_id| if (!std.mem.eql(
                     u8,
@@ -872,6 +878,8 @@ pub const Broker = struct {
         thread_id: []const u8,
         comment_id: []const u8,
         first_cursor: []const u8,
+        expected_base: []const u8,
+        expected_head: []const u8,
         expected_body: []const u8,
     ) !?CommentSnapshot {
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
@@ -886,7 +894,11 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const comments = try nodeComments(parsed.value);
+            const comments = try validatedNodeComments(
+                parsed.value,
+                expected_base,
+                expected_head,
+            );
             for (comments.get("nodes").?.array.items) |value| {
                 const comment = value.object;
                 if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
@@ -948,7 +960,11 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const comments = try nodeComments(parsed.value);
+            const comments = try validatedNodeComments(
+                parsed.value,
+                card.target.base_oid,
+                card.target.head_oid,
+            );
             if (try commentsObserve(
                 self.io,
                 comments.get("nodes").?.array.items,
@@ -1050,18 +1066,12 @@ pub const Broker = struct {
         var cursor: ?[]u8 = null;
         defer if (cursor) |c| self.allocator.free(c);
         for (0..max_pages) |_| {
-            const cursor_json = if (cursor) |c| try std.fmt.allocPrint(
-                self.allocator,
-                "\"{s}\"",
-                .{c},
-            ) else try self.allocator.dupe(u8, "null");
-            defer self.allocator.free(cursor_json);
-            const format = "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{s}}}";
+            const format = "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{f}}}";
             const vars = try std.fmt.allocPrint(self.allocator, format, .{
                 std.json.fmt(owner, .{}),
                 std.json.fmt(name, .{}),
                 number,
-                cursor_json,
+                std.json.fmt(cursor, .{}),
             });
             defer self.allocator.free(vars);
             const page = try self.call(document, vars);
@@ -1217,6 +1227,16 @@ fn nodeComments(value: std.json.Value) !std.json.ObjectMap {
     const comments = node.object.get("comments") orelse return error.InvalidGitHubResponse;
     if (comments != .object) return error.InvalidGitHubResponse;
     return comments.object;
+}
+
+fn validatedNodeComments(
+    value: std.json.Value,
+    expected_base: []const u8,
+    expected_head: []const u8,
+) !std.json.ObjectMap {
+    const pull = try pullObject(value);
+    try validateGenerationObject(pull, expected_base, expected_head);
+    return nodeComments(value);
 }
 
 fn commentsObserve(
