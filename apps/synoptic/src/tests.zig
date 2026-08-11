@@ -2088,6 +2088,44 @@ test "worktree integrity dirty launch selects managed custody" {
     );
 }
 
+test "worktree integrity ignored launch artifact selects managed custody" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/ignored");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "head\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.gitignore", .data = "ignored/\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| {
+        const output = try runGit(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const remote = try runGit(allocator, io, repo, &.{ "git", "remote", "add", "origin", repo });
+    allocator.free(remote);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/ignored/before", .data = "owned\n" });
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed-ignored" });
+    defer allocator.free(managed);
+    const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
+    defer allocator.free(custody.path());
+    try std.testing.expect(custody == .managed);
+    try worktree.retireManaged(allocator, io, custody, repo);
+    _ = try tmp.dir.statFile(io, "repo/ignored/before", .{});
+}
+
 fn fakeLifecycleGhScriptAlloc(
     allocator: std.mem.Allocator,
     base: []const u8,

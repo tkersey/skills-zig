@@ -78,7 +78,14 @@ pub const Baseline = struct {
 pub fn isClean(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !bool {
     const status = try statusAlloc(allocator, io, cwd);
     defer allocator.free(status);
-    return status.len == 0;
+    if (status.len != 0) return false;
+    var artifacts: std.ArrayList([]u8) = .empty;
+    defer {
+        for (artifacts.items) |path| allocator.free(path);
+        artifacts.deinit(allocator);
+    }
+    try listArtifacts(allocator, io, cwd, &artifacts);
+    return artifacts.items.len == 0;
 }
 
 pub fn select(

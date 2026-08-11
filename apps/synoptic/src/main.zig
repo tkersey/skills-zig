@@ -16,6 +16,7 @@ const http = @import("http.zig");
 const pr = @import("pr.zig");
 const sessions = @import("sessions.zig");
 const worktree = @import("worktree.zig");
+const launch_shutdown_grace_ms: u32 = 500;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -170,7 +171,7 @@ fn cleanupFailedLaunch(
     launch_dir: []const u8,
     repository_cwd: []const u8,
 ) void {
-    child.kill(io);
+    if (!retireLaunchProcessGroup(io, child)) return;
     const managed_path = std.fs.path.join(
         allocator,
         &.{ launch_dir, "worktree" },
@@ -184,6 +185,22 @@ fn cleanupFailedLaunch(
     ) catch |ignored_error| switch (ignored_error) {
         else => {},
     };
+}
+
+fn retireLaunchProcessGroup(io: std.Io, child: *std.process.Child) bool {
+    const child_id = child.id orelse return true;
+    const group_id: u64 = @intCast(child_id);
+    const positive = std.math.cast(std.posix.pid_t, group_id) orelse return false;
+    std.posix.kill(-positive, std.posix.SIG.TERM) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => {},
+    };
+    const websocket = @import("cas_runtime").websocket;
+    if (!websocket.waitForProcessGroupExit(group_id, launch_shutdown_grace_ms)) {
+        websocket.forceKillProcessGroup(group_id);
+    }
+    _ = child.wait(io) catch child.kill(io);
+    return websocket.waitForProcessGroupExit(group_id, launch_shutdown_grace_ms);
 }
 
 fn spawnServeChild(
@@ -480,7 +497,7 @@ fn serveGeneration(
     );
     defer allocator.free(custody.path());
     var custody_retirement: CustodyRetirement = .pending;
-    serveSelectedGeneration(
+    try serveSelectedGeneration(
         allocator,
         io,
         context,
@@ -488,13 +505,7 @@ fn serveGeneration(
         generation_owned,
         custody,
         &custody_retirement,
-    ) catch |launch_error| {
-        if (custody_retirement == .pending) {
-            try worktree.retireManaged(allocator, io, custody, context.options.cwd);
-            custody_retirement = .retired;
-        }
-        return launch_error;
-    };
+    );
 }
 
 const CustodyRetirement = enum { pending, preserve, retired };
@@ -1701,6 +1712,35 @@ fn usage() error{InvalidArguments} {
     return error.InvalidArguments;
 }
 
+fn runTestCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+    });
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return error.TestCommandFailed;
+    }
+    return result.stdout;
+}
+
+fn failLaunchForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    launch_dir: []const u8,
+    repository_cwd: []const u8,
+) !void {
+    errdefer cleanupFailedLaunch(allocator, io, child, launch_dir, repository_cwd);
+    return error.OriginalLaunchFailure;
+}
+
 test "launch argv is safe and explicit" {
     const options = try parseLaunch(
         &.{
@@ -1778,6 +1818,63 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
     );
     defer allocator.free(direct);
     try std.testing.expectEqualStrings("https://github.example.test/o/r/pull/9", direct);
+}
+test "failed launch retires descendants before managed custody and preserves error" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.createDirPath(io, "launch");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked", .data = "head\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
+    defer allocator.free(repo);
+    const launch_dir = try std.fs.path.join(allocator, &.{ root, "launch" });
+    defer allocator.free(launch_dir);
+    const managed = try std.fs.path.join(allocator, &.{ launch_dir, "worktree" });
+    defer allocator.free(managed);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestCommand(allocator, io, repo, argv));
+    const head_raw = try runTestCommand(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    allocator.free(try runTestCommand(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "add", "--detach", managed, head },
+    ));
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; /bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' & " ++
+                "while :; do sleep 1; done",
+        },
+        .cwd = .{ .path = managed },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const process_group: u64 = @intCast(child.id.?);
+    try std.testing.expectError(
+        error.OriginalLaunchFailure,
+        failLaunchForTest(allocator, io, &child, launch_dir, repo),
+    );
+    try std.testing.expect(@import("cas_runtime").websocket.waitForProcessGroupExit(
+        process_group,
+        1_000,
+    ));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, managed, .{}));
 }
 test {
     _ = domain;
