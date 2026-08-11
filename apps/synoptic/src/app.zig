@@ -579,6 +579,15 @@ pub const App = struct {
         return error.UnknownTab;
     }
 
+    pub fn closeTabById(self: *App, session_id: []const u8) !void {
+        for (self.tabs.items) |*tab| {
+            if (!std.mem.eql(u8, tab.id, session_id) or tab.status == .closed) continue;
+            tab.status = .closed;
+            return;
+        }
+        return error.UnknownTab;
+    }
+
     pub fn nextEnvelope(self: *App, event_type: []const u8, payload: []const u8) ![]u8 {
         self.seq += 1;
         return ui.envelopeAlloc(self.allocator, event_type, self.seq, payload);

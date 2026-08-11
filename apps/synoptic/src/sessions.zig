@@ -96,6 +96,7 @@ pub const Session = struct {
     opening: bool = false,
     initial_turn_active: bool = true,
     turn_active: bool = true,
+    turn_starting: bool = false,
     human_authority: ?HumanAuthority = null,
     pending_initial_prompt: ?[]u8 = null,
     pending_skill_path: ?[]u8 = null,
@@ -353,6 +354,15 @@ pub const Registry = struct {
         }
         self.synchronizing = true;
         self.declineApprovalsLocked(null, .resolved, "synchronization");
+        self.mutex.unlock();
+        errdefer self.endSynchronization();
+        const started = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            std.time.ns_per_ms,
+        );
+        try self.waitForTurnStarts(io, started, timeout_ms);
+
+        self.mutex.lock();
         var turns: std.ArrayList(TurnRef) = .empty;
         defer {
             for (turns.items) |turn| {
@@ -378,13 +388,35 @@ pub const Registry = struct {
             return err;
         };
         self.mutex.unlock();
-        errdefer self.endSynchronization();
-        const started = @divFloor(
-            std.Io.Clock.awake.now(io).nanoseconds,
-            std.time.ns_per_ms,
-        );
         try self.interruptSynchronizationTurns(io, turns.items, started, timeout_ms);
         try self.waitForSynchronizationQuiescence(io, started, timeout_ms);
+    }
+
+    fn waitForTurnStarts(
+        self: *Registry,
+        io: std.Io,
+        started: i128,
+        timeout_ms: u32,
+    ) !void {
+        while (true) { // tiger: event-loop -- bounded by turn admission or deadline.
+            self.mutex.lock();
+            var starting: usize = 0;
+            for (self.sessions.items) |session| {
+                if (session.status != .closed and session.turn_starting) starting += 1;
+            }
+            self.mutex.unlock();
+            if (starting == 0) return;
+            const now = @divFloor(
+                std.Io.Clock.awake.now(io).nanoseconds,
+                std.time.ns_per_ms,
+            );
+            if (now - started >= timeout_ms) return error.ActiveReviewCommandsTimeout;
+            std.Io.sleep(io, .fromMilliseconds(2), .awake) catch |ignored_error| {
+                switch (ignored_error) {
+                    else => {},
+                }
+            };
+        }
     }
 
     fn interruptSynchronizationTurns(
@@ -455,6 +487,7 @@ pub const Registry = struct {
             self.authoritative_reservations + @intFromBool(self.primary_turn_active);
         for (self.sessions.items) |session| {
             if (session.status != .closed and session.turn_active) active += 1;
+            if (session.status != .closed and session.turn_starting) active += 1;
         }
         return active;
     }
@@ -639,6 +672,7 @@ pub const Registry = struct {
             session.status = .closed;
             session.opening = false;
             session.turn_active = false;
+            session.turn_starting = false;
             session.initial_turn_active = false;
             self.declineApprovalsLocked(session_id, .resolved, "session-closed");
             break;
@@ -988,7 +1022,7 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |*session| {
-            if (!std.mem.eql(u8, session.id, session_id)) continue;
+            if (!std.mem.eql(u8, session.id, session_id) or session.status == .closed) continue;
             if (!session.opening) {
                 self.allocator.free(owned_turn);
                 return error.SessionNotOpening;
@@ -1098,6 +1132,7 @@ pub const Registry = struct {
     ) !void {
         var target = try self.messageTarget(session_id);
         defer target.deinit(self.allocator);
+        errdefer if (target.start_reserved) self.clearTurnStarting(session_id);
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         const first_turn = target.initial_prompt != null;
         const method = if (target.active and !first_turn) "turn/steer" else "turn/start";
@@ -1135,6 +1170,8 @@ pub const Registry = struct {
             if (target.active and !first_turn and err == error.RequestFailed and
                 self.waitForTurnCompletion(target.turn_id, 250))
             {
+                try self.reserveTurnStart(session_id);
+                target.start_reserved = true;
                 return self.retryCompletedSteer(
                     actor,
                     session_id,
@@ -1200,6 +1237,7 @@ pub const Registry = struct {
             self.allocator.free(session.turn_id);
             session.turn_id = next_turn;
             session.turn_active = !self.turnCompletedLocked(next_turn);
+            session.turn_starting = false;
             if (session.pending_initial_prompt) |value| self.allocator.free(value);
             if (session.pending_skill_path) |value| self.allocator.free(value);
             session.pending_initial_prompt = null;
@@ -1216,6 +1254,7 @@ pub const Registry = struct {
         initial_prompt: ?[]u8,
         skill_path: ?[]u8,
         active: bool,
+        start_reserved: bool,
 
         fn deinit(self: *MessageTarget, allocator: std.mem.Allocator) void {
             allocator.free(self.thread_id);
@@ -1231,6 +1270,7 @@ pub const Registry = struct {
         if (self.synchronizing) return error.WorktreeSynchronizationActive;
         for (self.sessions.items) |*session| {
             if (!std.mem.eql(u8, session.id, session_id) or session.status == .closed) continue;
+            if (session.turn_starting) return error.TurnStartAlreadyActive;
             const thread_id = try self.allocator.dupe(u8, session.thread_id);
             errdefer self.allocator.free(thread_id);
             const turn_id = try self.allocator.dupe(u8, session.turn_id);
@@ -1248,15 +1288,40 @@ pub const Registry = struct {
                 session.initial_turn_active = true;
                 session.human_authority = null;
             }
+            const start_reserved = !session.turn_active or
+                session.pending_initial_prompt != null;
+            if (start_reserved) session.turn_starting = true;
             return .{
                 .thread_id = thread_id,
                 .turn_id = turn_id,
                 .initial_prompt = prompt,
                 .skill_path = skill,
                 .active = session.turn_active,
+                .start_reserved = start_reserved,
             };
         }
         return error.UnknownSession;
+    }
+
+    fn reserveTurnStart(self: *Registry, session_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.synchronizing) return error.WorktreeSynchronizationActive;
+        for (self.sessions.items) |*session| {
+            if (!std.mem.eql(u8, session.id, session_id) or session.status == .closed) continue;
+            if (session.turn_starting) return error.TurnStartAlreadyActive;
+            session.turn_starting = true;
+            return;
+        }
+        return error.UnknownSession;
+    }
+
+    fn clearTurnStarting(self: *Registry, session_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| {
+            if (std.mem.eql(u8, session.id, session_id)) session.turn_starting = false;
+        }
     }
 
     fn removeSession(self: *Registry, session_id: []const u8) void {
@@ -1501,8 +1566,15 @@ pub const Registry = struct {
             &.{ "params", "threadId" },
         ) catch return;
         defer self.allocator.free(thread);
+        const turn = extractString(
+            self.allocator,
+            raw_json,
+            &.{ "params", "turn", "id" },
+        ) catch return;
+        defer self.allocator.free(turn);
         for (self.sessions.items) |*session| {
-            if (session.status == .closed or !std.mem.eql(u8, session.thread_id, thread)) continue;
+            if (session.status == .closed or !std.mem.eql(u8, session.thread_id, thread) or
+                !std.mem.eql(u8, session.turn_id, turn)) continue;
             session.initial_turn_active = false;
             session.turn_active = false;
         }
@@ -1540,6 +1612,12 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.primary_thread_id) |primary| if (std.mem.eql(u8, primary, thread_id)) {
+            if (self.primary_start_turn_id == null or
+                !std.mem.eql(u8, self.primary_start_turn_id.?, turn_id))
+            {
+                self.allocator.free(turn_id);
+                return;
+            }
             self.primary_turn_active = false;
             if (!std.mem.eql(u8, status, "completed")) {
                 self.primary_failure_status = if (std.mem.eql(u8, status, "interrupted"))
@@ -2365,17 +2443,28 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
     if (exactDirective(directive, &.{ "take the action", "prepare the action" })) {
         return .github_any;
     }
-    const action_verb = startsWordAnyIgnoreCase(directive, &.{
+    const action_object = actionObjectAfterVerb(directive, &.{
         "add",    "remove", "set",     "request", "submit",  "dismiss", "change", "execute",
         "update", "close",  "reopen",  "merge",   "resolve", "reply",   "delete", "unmark",
         "mark",   "post",   "publish", "prepare",
     });
-    const github_target = containsAnyIgnoreCase(directive, &.{
+    const github_target = action_object != null and containsAnyIgnoreCase(action_object.?, &.{
         "label",   "reviewer", "assignee", "milestone", "pull request",  "this pr",
-        "the pr",  " pr #",    "comment",  "thread",    "github review", "mark viewed",
+        "the pr",  "pr #",     "comment",  "thread",    "github review", "mark viewed",
         "graphql",
     });
-    if (action_verb and github_target) return .github_any;
+    if (github_target) return .github_any;
+    return null;
+}
+
+fn actionObjectAfterVerb(text: []const u8, verbs: []const []const u8) ?[]const u8 {
+    for (verbs) |verb| {
+        if (text.len <= verb.len or !std.ascii.eqlIgnoreCase(text[0..verb.len], verb) or
+            std.ascii.isAlphanumeric(text[verb.len])) continue;
+        const object = std.mem.trim(u8, text[verb.len..], " \t\r\n.!;?");
+        if (startsWordAnyIgnoreCase(object, &.{ "me", "us", "you", "your" })) return null;
+        return object;
+    }
     return null;
 }
 
@@ -2750,6 +2839,9 @@ test "explicit broad GitHub operation grants generic action authority without or
     ) == null);
     try std.testing.expect(classifyHumanInstruction("Summarize changes in this PR") == null);
     try std.testing.expect(classifyHumanInstruction(
+        "Update me on this pull request status",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
         "Explain the findings, then complete this file",
     ) == null);
     try std.testing.expectEqual(
@@ -2795,6 +2887,7 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
     registry.primary_thread_id = try std.testing.allocator.dupe(u8, "primary");
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "t1");
     registry.primary_turn_active = true;
     registry.recordPrimaryCompletion(
         "{\"params\":{\"threadId\":\"primary\",\"turn\":{\"id\":\"t1\"," ++
@@ -2802,6 +2895,8 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
     );
     try std.testing.expect(!registry.primaryReady());
     try std.testing.expectEqualStrings("failed", registry.takePrimaryFailure().?);
+    std.testing.allocator.free(registry.primary_start_turn_id.?);
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "t2");
     registry.primary_turn_active = true;
     registry.recordPrimaryCompletion(
         "{\"params\":{\"threadId\":\"primary\",\"turn\":{\"id\":\"t2\"," ++
@@ -2809,12 +2904,90 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
     );
     try std.testing.expect(!registry.primaryReady());
     try std.testing.expectEqualStrings("interrupted", registry.takePrimaryFailure().?);
+    std.testing.allocator.free(registry.primary_start_turn_id.?);
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "t3");
     registry.recordPrimaryCompletion(
         "{\"params\":{\"threadId\":\"primary\",\"turn\":{\"id\":\"t3\"," ++
             "\"status\":\"completed\"}}}",
     );
     try std.testing.expect(registry.primaryReady());
     try std.testing.expectEqualStrings("t3", registry.latest_primary_turn_id.?);
+}
+
+test "completion notifications correlate exact active turn identity" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try registry.sessions.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "session"),
+        .thread_id = try std.testing.allocator.dupe(u8, "thread"),
+        .turn_id = try std.testing.allocator.dupe(u8, "current-turn"),
+        .path = try std.testing.allocator.dupe(u8, "a.zig"),
+        .revision = try std.testing.allocator.dupe(u8, "r1"),
+        .last_injected_revision = try std.testing.allocator.dupe(u8, "r1"),
+        .initial_turn_active = true,
+        .turn_active = true,
+    });
+    Registry.onNotification(&registry, .{
+        .method = "turn/completed",
+        .raw_json = "{\"params\":{\"threadId\":\"thread\",\"turn\":{" ++
+            "\"id\":\"stale-turn\",\"status\":\"completed\"}}}",
+    });
+    try std.testing.expect(registry.sessions.items[0].turn_active);
+    Registry.onNotification(&registry, .{
+        .method = "turn/completed",
+        .raw_json = "{\"params\":{\"threadId\":\"thread\",\"turn\":{" ++
+            "\"id\":\"current-turn\",\"status\":\"completed\"}}}",
+    });
+    try std.testing.expect(!registry.sessions.items[0].turn_active);
+}
+
+test "primary completion ignores stale turn identity" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.primary_thread_id = try std.testing.allocator.dupe(u8, "primary");
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "current");
+    registry.latest_primary_turn_id = try std.testing.allocator.dupe(u8, "prior");
+    registry.primary_turn_active = true;
+    registry.recordPrimaryCompletion(
+        "{\"params\":{\"threadId\":\"primary\",\"turn\":{" ++
+            "\"id\":\"stale\",\"status\":\"completed\"}}}",
+    );
+    try std.testing.expect(registry.primary_turn_active);
+    try std.testing.expectEqualStrings("prior", registry.latest_primary_turn_id.?);
+    registry.recordPrimaryCompletion(
+        "{\"params\":{\"threadId\":\"primary\",\"turn\":{" ++
+            "\"id\":\"current\",\"status\":\"completed\"}}}",
+    );
+    try std.testing.expect(!registry.primary_turn_active);
+    try std.testing.expectEqualStrings("current", registry.latest_primary_turn_id.?);
+}
+
+test "turn start admission blocks synchronization snapshot" {
+    var registry = Registry{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try registry.sessions.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "session"),
+        .thread_id = try std.testing.allocator.dupe(u8, "thread"),
+        .turn_id = try std.testing.allocator.dupe(u8, ""),
+        .path = try std.testing.allocator.dupe(u8, "a.zig"),
+        .revision = try std.testing.allocator.dupe(u8, "r1"),
+        .last_injected_revision = try std.testing.allocator.dupe(u8, "r1"),
+        .initial_turn_active = false,
+        .turn_active = false,
+    });
+    var target = try registry.messageTarget("session");
+    defer target.deinit(std.testing.allocator);
+    try std.testing.expect(target.start_reserved);
+    try std.testing.expectError(
+        error.TurnStartAlreadyActive,
+        registry.messageTarget("session"),
+    );
+    try std.testing.expectError(
+        error.ActiveReviewCommandsTimeout,
+        registry.beginSynchronization(std.testing.io, 5),
+    );
+    try std.testing.expect(!registry.synchronizing);
+    registry.clearTurnStarting("session");
 }
 
 const ApprovalInvocation = struct {

@@ -378,6 +378,30 @@ test "ui domain bootstrap owns PR queue tab diff and reconnect state" {
     ) != null);
 }
 
+test "tab closure uses session identity when revisions share a path" {
+    var state = try app.App.init(std.testing.allocator, "h1");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    state.primary_ready = true;
+    const first = try state.openFile("a.zig");
+    defer std.testing.allocator.free(first);
+    try state.recordOpenedSession("a.zig", "r1", "session-r1", "diff-1", false, true);
+    var next = try domain.PrGeneration.initFull(std.testing.allocator, "base", "h2");
+    try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
+    state.replaceGeneration(next);
+    const second = try state.openFile("a.zig");
+    defer std.testing.allocator.free(second);
+    try state.recordOpenedSession("a.zig", "r2", "session-r2", "diff-2", false, true);
+
+    try state.closeTabById("session-r1");
+    try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[0].status);
+    try std.testing.expectEqual(domain.SessionStatus.current, state.tabs.items[1].status);
+}
+
 fn expectInitialUiPayload(initial: []const u8) !void {
     inline for (
         .{
