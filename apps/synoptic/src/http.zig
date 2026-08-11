@@ -230,6 +230,19 @@ test "transient action validation preserves a pending card" {
     try std.testing.expect(definitiveActionValidationFailure(error.GitHubActionTargetChanged));
 }
 
+test "session status payload binds its originating session" {
+    const payload = try sessionStatusPayloadAlloc(
+        std.testing.allocator,
+        "ses-2",
+        "interrupted",
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "{\"sessionId\":\"ses-2\",\"status\":\"interrupted\"}",
+        payload,
+    );
+}
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -897,7 +910,6 @@ pub const Server = struct {
     }
 
     fn closeSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
-        _ = self;
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
         try runtime.registry.closeSession(session_id);
@@ -905,7 +917,9 @@ pub const Server = struct {
         mutex.lock();
         defer mutex.unlock();
         try runtime.app.closeTabById(session_id);
-        return runtime.app.nextEnvelope("session.closed", "{}");
+        const body = try sessionStatusPayloadAlloc(self.allocator, session_id, "closed");
+        defer self.allocator.free(body);
+        return runtime.app.nextEnvelope("session.closed", body);
     }
 
     fn messageSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
@@ -923,18 +937,25 @@ pub const Server = struct {
         try runtime.registry.message(session_id, text);
         mutex.lock();
         defer mutex.unlock();
-        return runtime.app.nextEnvelope("session.status", "{\"status\":\"turn-started\"}");
+        const body = try sessionStatusPayloadAlloc(
+            self.allocator,
+            session_id,
+            "turn-started",
+        );
+        defer self.allocator.free(body);
+        return runtime.app.nextEnvelope("session.status", body);
     }
 
     fn interruptSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
-        _ = self;
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
         try runtime.registry.interrupt(session_id);
         const mutex = domainMutex(runtime);
         mutex.lock();
         defer mutex.unlock();
-        return runtime.app.nextEnvelope("session.status", "{\"status\":\"interrupted\"}");
+        const body = try sessionStatusPayloadAlloc(self.allocator, session_id, "interrupted");
+        defer self.allocator.free(body);
+        return runtime.app.nextEnvelope("session.status", body);
     }
 
     fn resolveApproval(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
@@ -1367,6 +1388,18 @@ fn payloadString(payload: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn sessionStatusPayloadAlloc(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    status: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"sessionId\":{f},\"status\":{f}}}",
+        .{ std.json.fmt(session_id, .{}), std.json.fmt(status, .{}) },
+    );
 }
 
 fn toolTurnIdAlloc(

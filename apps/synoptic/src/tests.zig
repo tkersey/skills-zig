@@ -3630,8 +3630,10 @@ fn verifyWsCloseSecond(
         "\":\"ses-2\",\"text\":\"close this session\",\"active\":false}}");
     const started = try wsRead(allocator, io, stream, "turn-started");
     defer allocator.free(started);
+    try std.testing.expect(std.mem.indexOf(u8, started, "\"sessionId\":\"ses-2\"") != null);
     const closed = try wsRead(allocator, io, stream, "\"type\":\"session.closed\"");
     defer allocator.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"sessionId\":\"ses-2\"") != null);
     try std.testing.expect(state.generation.queued("b.zig"));
     try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[1].status);
     const log = try std.Io.Dir.cwd().readFileAlloc(io, gh_log, allocator, .limited(1024 * 1024));
