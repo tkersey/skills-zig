@@ -2,6 +2,13 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
+
+const reconcile_query =
+    "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide " ++
+    "startDiffSide isResolved comments(first:100){nodes{id body createdAt " ++
+    "viewerDidAuthor}pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}";
 const max_pages: usize = 10_000;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
@@ -367,57 +374,12 @@ pub const Broker = struct {
             expected_head,
             path,
         ) catch |err| {
-            if (err != error.PullRequestChanged) {
-                return .{ .viewed = false, .error_name = @errorName(err) };
-            }
-            const compensated = reconciliation.compensateViewed(
-                owner,
-                name,
-                number,
-                pull_request_id,
-                path,
-                client_id,
-            ) catch |compensation_error| {
-                return .{
-                    .viewed = false,
-                    .error_name = @errorName(compensation_error),
-                };
-            };
-            return .{ .viewed = false, .error_name = compensated };
+            return .{ .viewed = false, .error_name = @errorName(err) };
         };
         return .{
             .viewed = viewed,
             .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
         };
-    }
-
-    fn compensateViewed(
-        self: Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        pull_request_id: []const u8,
-        path: []const u8,
-        prior_client_id: []const u8,
-    ) ![]const u8 {
-        const client_id = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}-compensate",
-            .{prior_client_id},
-        );
-        defer self.allocator.free(client_id);
-        try self.unmarkViewedWithId(pull_request_id, path, client_id);
-        var current = try self.readGeneration(owner, name, number);
-        defer current.deinit();
-        if (!try self.viewedStateAfterMutation(
-            owner,
-            name,
-            number,
-            current.head_oid,
-            path,
-            false,
-        )) return error.UnmarkViewedReadbackFailed;
-        return "PullRequestChangedCompensated";
     }
 
     pub fn unmarkViewedWithId(
@@ -636,7 +598,7 @@ pub const Broker = struct {
         }
         if (card.kind == .graphql) return false;
         var pages = try self.callPages(
-            graphql.reconcile_query,
+            reconcile_query,
             "reviewThreads",
             owner,
             name,
@@ -666,8 +628,7 @@ pub const Broker = struct {
                     thread.object.get("path").?.string,
                     path,
                 )) continue;
-                if (card.target.line) |line| if (thread.object.get("line").? != .null and
-                    thread.object.get("line").?.integer != line) continue;
+                if (!inlineThreadMatchesCard(thread.object, card)) continue;
                 const observed = try self.commentMutationObserved(
                     owner,
                     name,
@@ -687,6 +648,18 @@ pub const Broker = struct {
     const CommentSnapshot = struct {
         viewer_did_author: bool,
     };
+
+    fn inlineThreadMatchesCard(thread: std.json.ObjectMap, card: tools.ActionCard) bool {
+        if (card.kind != .add_inline_comment) return true;
+        if (optionalU32(thread.get("line")) != card.target.line) return false;
+        if (optionalU32(thread.get("startLine")) != card.target.start_line) return false;
+        const side = card.target.side orelse return false;
+        const diff_side = optionalString(thread.get("diffSide")) orelse return false;
+        if (!std.mem.eql(u8, diff_side, side)) return false;
+        const start_side = optionalString(thread.get("startDiffSide"));
+        if (card.target.start_line == null) return start_side == null;
+        return start_side != null and std.mem.eql(u8, start_side.?, side);
+    }
 
     fn commentById(
         self: Broker,

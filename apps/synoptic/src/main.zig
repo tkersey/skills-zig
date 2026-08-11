@@ -818,6 +818,8 @@ fn serveHttpRuntime(
         pull_request_id,
     );
     runtime.tool_domain = tool_domain;
+    registry.setExclusionsPending(true);
+    errdefer registry.setExclusionsPending(false);
     try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
     var exclusion_work = LaunchExclusionWork.init(
         allocator,
@@ -907,6 +909,7 @@ const LaunchExclusionWork = struct {
     }
 
     fn run(self: *LaunchExclusionWork) void {
+        defer self.registry.setExclusionsPending(false);
         var broker = self.broker;
         broker.cancelled = &self.cancelled;
         queueLaunchExclusionFailures(

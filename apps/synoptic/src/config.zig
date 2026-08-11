@@ -351,7 +351,19 @@ fn globMatches(pattern: []const u8, path: []const u8) bool {
         if (pattern[pi] != '*') continue;
         const double = pi + 1 < pattern.len and pattern[pi + 1] == '*';
         pi += if (double) 2 else 1;
-        if (double and pi < pattern.len and pattern[pi] == '/') pi += 1;
+        if (double and pi < pattern.len and pattern[pi] == '/') {
+            pi += 1;
+            if (pending_len == pending.len) return false;
+            pending[pending_len] = .{ .pattern = pi, .path = si };
+            pending_len += 1;
+            for (path[si..], si..) |byte, index| {
+                if (byte != '/') continue;
+                if (pending_len == pending.len) return false;
+                pending[pending_len] = .{ .pattern = pi, .path = index + 1 };
+                pending_len += 1;
+            }
+            continue;
+        }
         var end = si;
         while (end <= path.len) : (end += 1) {
             if (pending_len == pending.len) return false;
@@ -592,6 +604,7 @@ fn validateTurnSchemas(
     const notification_files = [_][]const u8{
         "v2/ThreadStartedNotification.json",
         "v2/TurnStartedNotification.json",
+        "v2/TurnCompletedNotification.json",
         "v2/ItemStartedNotification.json",
         "v2/AgentMessageDeltaNotification.json",
     };
@@ -920,7 +933,7 @@ test "command approvals installed schema requires exact request and response sur
         \\printf '%s' '{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadForkParams.json"
         \\printf '%s' '{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
-        \\for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+        \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
         \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
         \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["accept","acceptForSession","decline","cancel"]}' > "$out/CommandExecutionRequestApprovalResponse.json"
         \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["decline"]}' > "$out/FileChangeRequestApprovalResponse.json"
@@ -955,4 +968,13 @@ test "empty config roots never resolve relative repository paths" {
     const path = (try configPathAlloc(std.testing.allocator, &environment)).?;
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/safe-home/.config/synoptic/config.toml", path);
+}
+
+test "globstar slash consumes only complete path segments" {
+    try std.testing.expect(globMatches("**/__snapshots__/**", "src/__snapshots__/x.snap"));
+    try std.testing.expect(globMatches("**/__snapshots__/**", "__snapshots__/x.snap"));
+    try std.testing.expect(!globMatches(
+        "**/__snapshots__/**",
+        "src/not__snapshots__/ordinary.zig",
+    ));
 }

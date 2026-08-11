@@ -220,7 +220,22 @@ pub fn synchronizeManaged(
     defer allocator.free(checkout.stderr);
     const checkout_failed = checkout.term != .exited or checkout.term.exited != 0;
     if (checkout_failed) return error.ManagedWorktreeRefreshFailed;
-    const next = try Baseline.capture(allocator, io, custody.path());
+    const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
+        const rollback = try std.process.run(
+            allocator,
+            io,
+            .{
+                .argv = &.{ "git", "checkout", "--detach", baseline.head_oid },
+                .cwd = .{ .path = custody.path() },
+            },
+        );
+        defer allocator.free(rollback.stdout);
+        defer allocator.free(rollback.stderr);
+        if (rollback.term != .exited or rollback.term.exited != 0) {
+            return error.ManagedWorktreeRollbackFailed;
+        }
+        return capture_error;
+    };
     baseline.replace(next);
 }
 

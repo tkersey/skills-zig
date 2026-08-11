@@ -8,12 +8,15 @@ const ui = @import("ui_protocol.zig");
 const worktree = @import("worktree.zig");
 
 const DomainMutex = struct {
-    state: std.atomic.Mutex = .unlocked,
+    state: std.Io.Mutex = .init,
+    io: ?std.Io = null,
+
     fn lock(self: *DomainMutex) void {
-        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+        self.state.lockUncancelable(self.io orelse unreachable);
     }
+
     fn unlock(self: *DomainMutex) void {
-        self.state.unlock();
+        self.state.unlock(self.io orelse unreachable);
     }
 };
 
@@ -26,7 +29,7 @@ pub const ToolDomainContext = struct {
     name: []const u8,
     number: u64,
     pull_request_id: []const u8,
-    mutex: DomainMutex = .{},
+    mutex: DomainMutex,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -48,6 +51,7 @@ pub const ToolDomainContext = struct {
             .name = name,
             .number = number,
             .pull_request_id = pull_request_id,
+            .mutex = .{ .io = broker.io },
         };
         return context;
     }
@@ -178,6 +182,9 @@ pub const Runtime = struct {
 
 fn domainMutex(runtime: *Runtime) *DomainMutex {
     if (runtime.tool_domain) |context| return &context.mutex;
+    if (runtime.local_domain_mutex.io == null) {
+        runtime.local_domain_mutex.io = runtime.broker.io;
+    }
     return &runtime.local_domain_mutex;
 }
 

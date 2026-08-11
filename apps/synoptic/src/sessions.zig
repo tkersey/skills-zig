@@ -235,6 +235,7 @@ pub const Registry = struct {
     completed_turn_ids: std.ArrayList([]u8) = .empty,
     approvals: std.ArrayList(PendingApproval) = .empty,
     synchronizing: bool = false,
+    exclusions_pending: bool = false,
     next_session_id: u64 = 1,
     next_approval_id: u64 = 1,
     approval_wait_timeout_ms: u32 = approval_timeout_ms,
@@ -377,6 +378,10 @@ pub const Registry = struct {
         };
         self.mutex.unlock();
         errdefer self.endSynchronization();
+        const started = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            std.time.ns_per_ms,
+        );
         if (turns.items.len > 0) {
             const actor = &(self.actor orelse return error.AppServerUnavailable);
             for (turns.items) |turn| {
@@ -386,15 +391,21 @@ pub const Registry = struct {
                     .{ std.json.fmt(turn.thread, .{}), std.json.fmt(turn.turn, .{}) },
                 );
                 defer self.allocator.free(params);
+                const now = @divFloor(
+                    std.Io.Clock.awake.now(io).nanoseconds,
+                    std.time.ns_per_ms,
+                );
+                if (now - started >= timeout_ms) return error.ActiveReviewCommandsTimeout;
+                const remaining: u32 = @intCast(@as(i128, timeout_ms) - (now - started));
                 const response = actor.requestJson(
                     "turn/interrupt",
                     params,
-                    null,
+                    remaining,
                 ) catch return error.TurnInterruptFailed;
                 self.allocator.free(response);
+                self.markInterruptedTurn(turn.thread, turn.turn);
             }
         }
-        const started = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
         var quiet_since: ?i128 = null;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.mutex.lock();
@@ -421,8 +432,18 @@ pub const Registry = struct {
     }
 
     fn activeSynchronizationWorkLocked(self: *const Registry) usize {
-        return self.active_command_ids.items.len + self.file_admissions.items.len +
-            self.authoritative_reservations;
+        var active = self.active_command_ids.items.len + self.file_admissions.items.len +
+            self.authoritative_reservations + @intFromBool(self.primary_turn_active);
+        for (self.sessions.items) |session| {
+            if (session.status != .closed and session.turn_active) active += 1;
+        }
+        return active;
+    }
+
+    pub fn setExclusionsPending(self: *Registry, pending: bool) void {
+        self.mutex.lock();
+        self.exclusions_pending = pending;
+        self.mutex.unlock();
     }
 
     fn appendTurnRef(
@@ -436,6 +457,24 @@ pub const Registry = struct {
         const owned_turn = try self.allocator.dupe(u8, turn);
         errdefer self.allocator.free(owned_turn);
         try turns.append(self.allocator, .{ .thread = owned_thread, .turn = owned_turn });
+    }
+
+    fn markInterruptedTurn(self: *Registry, thread_id: []const u8, turn_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.primary_thread_id) |primary| {
+            if (std.mem.eql(u8, primary, thread_id) and self.primary_start_turn_id != null and
+                std.mem.eql(u8, self.primary_start_turn_id.?, turn_id))
+            {
+                self.primary_turn_active = false;
+            }
+        }
+        for (self.sessions.items) |*session| {
+            if (!std.mem.eql(u8, session.thread_id, thread_id) or
+                !std.mem.eql(u8, session.turn_id, turn_id)) continue;
+            session.turn_active = false;
+            session.initial_turn_active = false;
+        }
     }
     pub fn activeCommandCount(self: *Registry) usize {
         self.mutex.lock();
@@ -770,6 +809,7 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.synchronizing) return error.WorktreeSynchronizationActive;
+        if (self.exclusions_pending) return error.AutomaticExclusionsPending;
         var live_sessions: usize = 0;
         for (self.sessions.items) |session| {
             if (session.status == .closed) continue;
@@ -1031,6 +1071,19 @@ pub const Registry = struct {
         defer self.allocator.free(params);
         try self.markHumanInstruction(session_id, text);
         const response = actor.requestJson(method, params, null) catch |err| {
+            if (target.active and !first_turn and err == error.RequestFailed and
+                self.waitForTurnCompletion(target.turn_id, 250))
+            {
+                return self.retryCompletedSteer(
+                    actor,
+                    session_id,
+                    target.thread_id,
+                    combined,
+                ) catch |retry_error| {
+                    self.clearHumanInstruction(session_id);
+                    return retry_error;
+                };
+            }
             self.clearHumanInstruction(session_id);
             return err;
         };
@@ -1039,6 +1092,38 @@ pub const Registry = struct {
             session_id,
             response,
         );
+    }
+
+    fn waitForTurnCompletion(self: *Registry, turn_id: []const u8, timeout_ms: u32) bool {
+        const io = self.io orelse return false;
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds +
+            @as(i128, timeout_ms) * std.time.ns_per_ms;
+        while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+            self.mutex.lock();
+            const completed = self.turnCompletedLocked(turn_id);
+            self.mutex.unlock();
+            if (completed) return true;
+            std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return false;
+        }
+        return false;
+    }
+
+    fn retryCompletedSteer(
+        self: *Registry,
+        actor: *cas_runtime.Actor,
+        session_id: []const u8,
+        thread_id: []const u8,
+        text: []const u8,
+    ) !void {
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"threadId\":{f},\"input\":[{{\"type\":\"text\",\"text\":{f}}}]}}",
+            .{ std.json.fmt(thread_id, .{}), std.json.fmt(text, .{}) },
+        );
+        defer self.allocator.free(params);
+        const response = try actor.requestJson("turn/start", params, null);
+        defer self.allocator.free(response);
+        try self.recordStartedTurn(session_id, response);
     }
 
     fn recordStartedTurn(
@@ -1243,15 +1328,15 @@ pub const Registry = struct {
         self.mutex.lock();
         self.notification_count += 1;
         const origin_missing = self.queueNotificationVisibleLocked(notification);
+        if (std.mem.eql(u8, notification.method, "turn/completed")) {
+            self.recordCompletedTurnLocked(notification.raw_json);
+            self.markCompletedThreadLocked(notification.raw_json);
+        }
         if (origin_missing) {
             self.mutex.unlock();
             if (std.mem.eql(u8, notification.method, "turn/completed"))
                 self.recordPrimaryCompletion(notification.raw_json);
             return;
-        }
-        if (std.mem.eql(u8, notification.method, "turn/completed")) {
-            self.recordCompletedTurnLocked(notification.raw_json);
-            self.markCompletedThreadLocked(notification.raw_json);
         }
         self.mutex.unlock();
         if (!std.mem.eql(u8, notification.method, "turn/completed")) return;

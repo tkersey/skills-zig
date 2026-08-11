@@ -125,7 +125,9 @@ If GitHub Actions is degraded/outage and tag runs remain queued, publish manuall
 propagation is not blocked:
 
 1. On a clean checkout of the exact release tag, run the affected CLI's build and test lanes and retain the successful command output with the tag commit SHA.
-2. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`).
+2. Build and package the exact two release archives for the CLI. Synoptic uses
+   `<tag>-darwin-arm64.tar.gz` and `<tag>-darwin-x86_64.tar.gz`; every other
+   current CLI uses `<tag>-darwin-arm64.tar.gz` and `<tag>-linux-x86_64.tar.gz`.
 3. Create the release directly on the existing tag:
    - `gh release create <tag> <asset1> <asset2> --verify-tag`
 4. Update `homebrew-tap` formula version + SHA256 from the published assets.

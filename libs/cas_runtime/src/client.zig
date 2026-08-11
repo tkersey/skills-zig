@@ -1484,6 +1484,7 @@ const ActorPending = struct {
 const ActorOutbound = struct {
     payload: []u8,
     deadline_ms: i64,
+    poison_on_expiry: bool,
 };
 
 const ActorServerRequest = struct {
@@ -1733,7 +1734,7 @@ pub const Actor = struct {
             method,
             params_json,
         );
-        try actorEnqueueOwned(self.state, payload, deadline);
+        try actorEnqueueOwned(self.state, payload, deadline, false);
 
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.state.mutex.lock();
@@ -1802,7 +1803,14 @@ fn actorWriterMain(state: *ActorState) void {
 
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
-            if (actorOutboundExpired(item)) continue;
+            if (actorOutboundExpired(item)) {
+                if (item.poison_on_expiry) {
+                    actorSetTerminal(state, .poisoned);
+                    actorCloseTransportOnce(state);
+                    return;
+                }
+                continue;
+            }
             actorSendPayload(state, item.payload, item.deadline_ms) catch {
                 actorSetTerminal(state, .poisoned);
                 actorCloseTransportOnce(state);
@@ -1949,6 +1957,9 @@ fn actorRouteLine(state: *ActorState, line: []const u8) !void {
         state.allocator.free(response_json);
         return;
     };
+    if (pending.done) {
+        return error.DuplicateAppServerResponse;
+    }
     pending.response_json = response_json;
     pending.is_error = object.get("error") != null;
     pending.done = true;
@@ -2094,7 +2105,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         parsed_id.value,
         result_json,
     );
-    try actorEnqueueOwned(state, payload, work.deadline_ms);
+    try actorEnqueueOwned(state, payload, work.deadline_ms, true);
 }
 
 fn actorEnqueueServerError(
@@ -2117,6 +2128,7 @@ fn actorEnqueueServerError(
         state,
         try state.allocator.dupe(u8, output.written()),
         deadline_ms,
+        true,
     );
 }
 
@@ -2158,7 +2170,12 @@ fn actorRequestPayloadAlloc(
     return allocator.dupe(u8, output.written());
 }
 
-fn actorEnqueueOwned(state: *ActorState, payload: []u8, deadline_ms: i64) !void {
+fn actorEnqueueOwned(
+    state: *ActorState,
+    payload: []u8,
+    deadline_ms: i64,
+    poison_on_expiry: bool,
+) !void {
     const owned = payload;
     errdefer state.allocator.free(owned);
     while (true) { // tiger: event-loop -- bounded by owner state or deadline.
@@ -2176,6 +2193,7 @@ fn actorEnqueueOwned(state: *ActorState, payload: []u8, deadline_ms: i64) !void 
             state.outbound.append(state.allocator, .{
                 .payload = owned,
                 .deadline_ms = deadline_ms,
+                .poison_on_expiry = poison_on_expiry,
             }) catch |err| {
                 state.mutex.unlock();
                 return err;
@@ -4221,6 +4239,7 @@ test "actor falsifier saturated stalled writer consumes the request deadline" {
     try state.outbound.append(allocator, .{
         .payload = try allocator.dupe(u8, "stalled"),
         .deadline_ms = monotonicMillis() + 1_000,
+        .poison_on_expiry = false,
     });
     var actor = Actor{ .state = &state };
     const started = monotonicMillis();
@@ -4236,6 +4255,7 @@ test "actor falsifier expired outbound work is never eligible for transport" {
     const item = ActorOutbound{
         .payload = @constCast("expired"),
         .deadline_ms = monotonicMillis() - 1,
+        .poison_on_expiry = false,
     };
     try std.testing.expect(actorOutboundExpired(item));
 }
@@ -4288,6 +4308,32 @@ test "actor falsifier releases an uncorrelated late response" {
     defer state.deinit();
     try actorRouteLine(&state, "{\"id\":99,\"result\":{\"late\":true}}");
     try std.testing.expectEqual(@as(usize, 0), state.pending.count());
+}
+
+test "actor response correlation rejects a duplicate before replacement" {
+    const allocator = std.testing.allocator;
+    var pending = ActorPending{};
+    defer if (pending.response_json) |response| allocator.free(response);
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    try state.pending.put(7, &pending);
+    try actorRouteLine(&state, "{\"id\":7,\"result\":{\"first\":true}}");
+    try std.testing.expectError(
+        error.DuplicateAppServerResponse,
+        actorRouteLine(&state, "{\"id\":7,\"result\":{\"second\":true}}"),
+    );
+    try std.testing.expectEqualStrings("{\"first\":true}", pending.response_json.?);
 }
 
 test "transport acquisition helpers require an already resolved retry seed" {
