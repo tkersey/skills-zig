@@ -258,9 +258,9 @@ fn configPathAlloc(
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
 ) !?[]u8 {
-    if (environment.get("XDG_CONFIG_HOME")) |root| if (root.len > 0)
+    if (environment.get("XDG_CONFIG_HOME")) |root| if (std.fs.path.isAbsolute(root))
         return try std.fs.path.join(allocator, &.{ root, "synoptic", "config.toml" });
-    if (environment.get("HOME")) |home| if (home.len > 0)
+    if (environment.get("HOME")) |home| if (std.fs.path.isAbsolute(home))
         return try std.fs.path.join(
             allocator,
             &.{ home, ".config", "synoptic", "config.toml" },
@@ -1043,6 +1043,13 @@ test "empty config roots never resolve relative repository paths" {
     const path = (try configPathAlloc(std.testing.allocator, &environment)).?;
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/safe-home/.config/synoptic/config.toml", path);
+
+    try environment.put("XDG_CONFIG_HOME", ".config");
+    const fallback = (try configPathAlloc(std.testing.allocator, &environment)).?;
+    defer std.testing.allocator.free(fallback);
+    try std.testing.expectEqualStrings("/safe-home/.config/synoptic/config.toml", fallback);
+    try environment.put("HOME", "relative-home");
+    try std.testing.expect(try configPathAlloc(std.testing.allocator, &environment) == null);
 }
 
 test "schema validation ignores required field names outside root properties" {

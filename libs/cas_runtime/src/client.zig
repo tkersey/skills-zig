@@ -4108,7 +4108,7 @@ fn writeActorFakeCodexTerminalModes(writer: *std.Io.Writer) !void {
         \\while IFS= read -r request; do
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
         \\  if [ "$mode" = poison ]; then printf '%s\n' 'not-json'; sleep 5; exit 0; fi
-        \\  if [ "$mode" = deadline ]; then sleep 5; exit 0; fi
+        \\  if [ "$mode" = deadline ]; then printf '%s\n' "$request" > "$reply_log"; sleep 5; exit 0; fi
         \\  attempt=$((attempt + 1))
         \\  if [ "$attempt" -lt 3 ]; then
         \\    printf '{"id":%s,"error":{"code":-32001,"message":"overloaded"}}\n' "$request_id"
@@ -4174,11 +4174,12 @@ const ActorFixture = struct {
 const ActorCall = struct {
     actor: *Actor,
     method: []const u8,
+    timeout_ms: u32 = 2_000,
     result: ?[]u8 = null,
     failure: ?anyerror = null,
 
     fn run(self: *ActorCall) void {
-        self.result = self.actor.requestJson(self.method, "{}", 2_000) catch |err| {
+        self.result = self.actor.requestJson(self.method, "{}", self.timeout_ms) catch |err| {
             self.failure = err;
             return;
         };
@@ -4498,10 +4499,29 @@ test "actor falsifier retries only structured overload and honors per-request de
     defer deadline_fixture.deinit();
     var deadline_actor = try deadline_fixture.start(.{});
     defer deadline_actor.deinit();
-    try std.testing.expectError(
-        error.RequestDeadlineExceeded,
-        deadline_actor.requestJson("actor/deadline", null, 20),
-    );
+    var deadline_call = ActorCall{
+        .actor = &deadline_actor,
+        .method = "actor/deadline",
+        .timeout_ms = 500,
+    };
+    var deadline_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&deadline_call});
+    var deadline_thread_owned = true;
+    defer if (deadline_thread_owned) deadline_thread.join();
+    var request_observed = false;
+    for (0..500) |_| {
+        if (std.Io.Dir.cwd().access(std.testing.io, deadline_fixture.reply_log, .{})) |_| {
+            request_observed = true;
+            break;
+        } else |_| {}
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(request_observed);
+    deadline_thread.join();
+    deadline_thread_owned = false;
+    if (deadline_call.result) |value| allocator.free(value);
+    if (deadline_call.failure) |failure| {
+        try std.testing.expect(failure == error.RequestDeadlineExceeded);
+    } else return error.TestExpectedError;
     try std.testing.expectEqual(protocol.TerminalState.poisoned, deadline_actor.terminalState());
 }
 

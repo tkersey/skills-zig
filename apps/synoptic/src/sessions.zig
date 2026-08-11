@@ -675,19 +675,16 @@ pub const Registry = struct {
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
             found = true;
             if (session.turn_active and session.turn_id.len > 0) {
-                thread_id = self.allocator.dupe(u8, session.thread_id) catch null;
-                if (thread_id != null) {
-                    turn_id = self.allocator.dupe(u8, session.turn_id) catch null;
-                    if (turn_id == null) {
-                        self.allocator.free(thread_id.?);
-                        thread_id = null;
-                    }
-                }
+                thread_id = self.allocator.dupe(u8, session.thread_id) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
+                turn_id = self.allocator.dupe(u8, session.turn_id) catch |err| {
+                    self.allocator.free(thread_id.?);
+                    self.mutex.unlock();
+                    return err;
+                };
             }
-            session.status = .closed;
-            session.opening = false;
-            session.initial_turn_active = false;
-            self.declineApprovalsLocked(session_id, .resolved, "session-closed");
             break;
         };
         self.mutex.unlock();
@@ -695,17 +692,35 @@ pub const Registry = struct {
         defer if (thread_id) |value| self.allocator.free(value);
         defer if (turn_id) |value| self.allocator.free(value);
         if (thread_id != null and turn_id != null) {
-            if (self.actor) |*actor| {
-                const params = std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"threadId\":{f},\"turnId\":{f}}}",
-                    .{ std.json.fmt(thread_id.?, .{}), std.json.fmt(turn_id.?, .{}) },
-                ) catch return;
-                defer self.allocator.free(params);
-                const response = actor.requestJson("turn/interrupt", params, null) catch return;
-                self.allocator.free(response);
-            }
+            const actor = if (self.actor) |*value| value else return error.ActorUnavailable;
+            const params = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"threadId\":{f},\"turnId\":{f}}}",
+                .{ std.json.fmt(thread_id.?, .{}), std.json.fmt(turn_id.?, .{}) },
+            );
+            defer self.allocator.free(params);
+            const response = try actor.requestJson("turn/interrupt", params, null);
+            self.allocator.free(response);
         }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
+            session.status = .closed;
+            session.opening = false;
+            session.initial_turn_active = false;
+            self.declineApprovalsLocked(session_id, .resolved, "session-closed");
+            return;
+        };
+        return error.UnknownSession;
+    }
+
+    pub fn sessionTurnActive(self: *Registry, session_id: []const u8) ?bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |session| {
+            if (std.mem.eql(u8, session.id, session_id)) return session.turn_active;
+        }
+        return null;
     }
 
     pub fn discardOpenedSession(self: *Registry, session_id: []const u8) void {
@@ -2765,6 +2780,7 @@ test "file admission reserves capacity and closed sessions release it" {
     );
     registry.releaseFileAdmission("a.zig", "r1");
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].turn_active = false;
     try registry.closeSession("ses-1");
     const reopened = try registry.admitFile("b.zig", "r1");
     try std.testing.expect(reopened == .reserved);
@@ -2862,12 +2878,12 @@ test "unresolved-thread search rejects malformed carrier identities" {
     );
 }
 
-test "closed active session remains synchronization-visible until terminal notification" {
+test "failed active close remains synchronization-visible until terminal notification" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
-    try registry.closeSession("ses-1");
-    try std.testing.expectEqual(SessionStatus.closed, registry.sessions.items[0].status);
+    try std.testing.expectError(error.ActorUnavailable, registry.closeSession("ses-1"));
+    try std.testing.expectEqual(SessionStatus.current, registry.sessions.items[0].status);
     try std.testing.expect(registry.sessions.items[0].turn_active);
     registry.markCompletedThreadLocked(
         "{\"params\":{\"threadId\":\"file-1\",\"turn\":{\"id\":\"turn\"}}}",
@@ -3463,6 +3479,7 @@ test "command approvals timeout close and synchronization conservatively decline
     };
     const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
     try waitForApproval(&closed);
+    closed.sessions.items[0].turn_active = false;
     try closed.closeSession("ses-1");
     thread.join();
     defer if (invocation.response) |response| std.heap.page_allocator.free(response);

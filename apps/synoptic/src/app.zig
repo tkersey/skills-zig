@@ -410,6 +410,13 @@ pub const App = struct {
         }
     }
 
+    pub fn synchronizeTabTurnStates(self: *App, registry: *sessions.Registry) void {
+        for (self.tabs.items) |*tab| {
+            if (tab.status == .closed) continue;
+            if (registry.sessionTurnActive(tab.id)) |active| tab.turn_active = active;
+        }
+    }
+
     pub fn sessionOpenedPayloadAlloc(
         self: *const App,
         path: []const u8,

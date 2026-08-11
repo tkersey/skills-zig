@@ -386,6 +386,7 @@ pub const Server = struct {
                 const mutex = domainMutex(runtime);
                 mutex.lock();
                 defer mutex.unlock();
+                runtime.app.synchronizeTabTurnStates(runtime.registry);
                 break :body try runtime.app.bootstrapAlloc();
             };
             defer self.allocator.free(body);
@@ -565,10 +566,10 @@ pub const Server = struct {
             };
             defer self.allocator.free(message);
             const reply = self.handleCommandAlloc(runtime, message) catch |err| error_reply: {
-                const payload = try std.fmt.allocPrint(
+                const payload = try commandErrorPayloadAlloc(
                     self.allocator,
-                    "{{\"code\":{f}}}",
-                    .{std.json.fmt(@errorName(err), .{})},
+                    message,
+                    @errorName(err),
                 );
                 defer self.allocator.free(payload);
                 break :error_reply try runtime.app.nextEnvelope("error", payload);
@@ -828,6 +829,7 @@ pub const Server = struct {
         const mutex = domainMutex(runtime);
         mutex.lock();
         defer mutex.unlock();
+        runtime.app.synchronizeTabTurnStates(runtime.registry);
         const body = try runtime.app.bootstrapAlloc();
         defer self.allocator.free(body);
         return runtime.app.nextEnvelope("snapshot", body);
@@ -1416,6 +1418,30 @@ fn definitiveActionValidationFailure(err: anyerror) bool {
     };
 }
 
+fn commandErrorPayloadAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    code: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return std.fmt.allocPrint(allocator, "{{\"code\":{f}}}", .{std.json.fmt(code, .{})});
+    };
+    defer parsed.deinit();
+    const request_id = switch (parsed.value) {
+        .object => |root| switch (root.get("requestId") orelse .null) {
+            .string => |value| if (value.len > 0 and value.len <= 128) value else null,
+            else => null,
+        },
+        else => null,
+    };
+    if (request_id) |value| return std.fmt.allocPrint(
+        allocator,
+        "{{\"code\":{f},\"requestId\":{f}}}",
+        .{ std.json.fmt(code, .{}), std.json.fmt(value, .{}) },
+    );
+    return std.fmt.allocPrint(allocator, "{{\"code\":{f}}}", .{std.json.fmt(code, .{})});
+}
+
 pub fn queueExclusionEvents(
     registry: *sessions.Registry,
     outcomes: []const @import("app.zig").ExclusionOutcome,
@@ -1864,6 +1890,27 @@ test "token parsing is exact and unique" {
     try std.testing.expectEqualStrings("abc", queryToken("/ws?token=abc").?);
     try std.testing.expect(queryToken("/ws?x=1&token=abc") == null);
     try std.testing.expect(queryToken("/ws?token=abc&token=abc") == null);
+}
+
+test "command errors preserve only bounded request correlation" {
+    const allocator = std.testing.allocator;
+    const correlated = try commandErrorPayloadAlloc(
+        allocator,
+        "{\"requestId\":\"msg-1\",\"type\":\"session.message\",\"payload\":{}}",
+        "RequestFailed",
+    );
+    defer allocator.free(correlated);
+    try std.testing.expectEqualStrings(
+        "{\"code\":\"RequestFailed\",\"requestId\":\"msg-1\"}",
+        correlated,
+    );
+    const uncorrelated = try commandErrorPayloadAlloc(
+        allocator,
+        "{\"requestId\":7}",
+        "InvalidUiCommand",
+    );
+    defer allocator.free(uncorrelated);
+    try std.testing.expectEqualStrings("{\"code\":\"InvalidUiCommand\"}", uncorrelated);
 }
 
 test "static assets are not state-bearing authorization targets" {

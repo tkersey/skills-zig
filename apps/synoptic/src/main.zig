@@ -830,13 +830,13 @@ fn serveHttpRuntime(
         stop_request_path,
     );
     const tool_domain = runtime.tool_domain.?;
-    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
     registry.setExclusionsPending(true);
     errdefer registry.setExclusionsPending(false);
     var exclusion_work: LaunchExclusionWork = undefined;
     const exclusion_thread = try startLaunchExclusionWork(
         &exclusion_work,
         allocator,
+        io,
         context,
         pull_request_id,
         review_cwd,
@@ -849,6 +849,8 @@ fn serveHttpRuntime(
         exclusion_work.cancelled.store(true, .release);
         exclusion_thread.join();
     };
+    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
+    exclusion_work.started.store(true, .release);
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
     exclusion_thread.join();
@@ -906,6 +908,7 @@ fn makeServingRuntime(
 fn startLaunchExclusionWork(
     work: *LaunchExclusionWork,
     allocator: std.mem.Allocator,
+    io: std.Io,
     context: GenerationContext,
     pull_request_id: []const u8,
     review_cwd: []const u8,
@@ -915,6 +918,7 @@ fn startLaunchExclusionWork(
 ) !std.Thread {
     work.* = LaunchExclusionWork.init(
         allocator,
+        io,
         context.settings,
         context.broker,
         context.identity,
@@ -954,6 +958,7 @@ fn configureToolDomain(
 
 const LaunchExclusionWork = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     settings: *config.Settings,
     broker: github.Broker,
     identity: pr.Identity,
@@ -963,9 +968,11 @@ const LaunchExclusionWork = struct {
     registry: *sessions.Registry,
     tool_domain: *http.ToolDomainContext,
     cancelled: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(bool) = .init(false),
 
     fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         settings: *config.Settings,
         broker: github.Broker,
         identity: pr.Identity,
@@ -977,6 +984,7 @@ const LaunchExclusionWork = struct {
     ) LaunchExclusionWork {
         return .{
             .allocator = allocator,
+            .io = io,
             .settings = settings,
             .broker = broker,
             .identity = identity,
@@ -990,6 +998,10 @@ const LaunchExclusionWork = struct {
 
     fn run(self: *LaunchExclusionWork) void {
         defer self.registry.setExclusionsPending(false);
+        while (!self.started.load(.acquire)) {
+            if (self.cancelled.load(.acquire)) return;
+            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch return;
+        }
         if (self.cancelled.load(.acquire)) return;
         var broker = self.broker;
         broker.cancelled = &self.cancelled;

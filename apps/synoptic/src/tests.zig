@@ -2431,7 +2431,7 @@ test "session context refresh injects changed thread evidence into every open si
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "T-new"));
 }
 
-test "local close finalizes when best-effort turn interruption fails" {
+test "local close remains open when turn interruption fails" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2461,9 +2461,9 @@ test "local close finalizes when best-effort turn interruption fails" {
     registry.sessions.items[0].turn_id = try allocator.dupe(u8, "fail-interrupt");
     registry.sessions.items[0].turn_active = true;
 
-    try registry.closeSession(opened.session_id);
+    try std.testing.expectError(error.RequestFailed, registry.closeSession(opened.session_id));
     try std.testing.expectEqual(
-        sessions.SessionStatus.closed,
+        sessions.SessionStatus.current,
         registry.sessions.items[0].status,
     );
     try std.testing.expect(registry.sessions.items[0].turn_active);
