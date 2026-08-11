@@ -118,7 +118,8 @@ pub const AuthoritativeToolHandler = struct {
         event_kind: []const u8,
         raw_json: []const u8,
         session_id: []const u8,
-    ) anyerror!void,
+        result_allocator: std.mem.Allocator,
+    ) anyerror![]u8,
     deinit: ?*const fn (context: *anyopaque) void = null,
 };
 pub const OpenResult = struct {
@@ -1864,15 +1865,18 @@ pub const Registry = struct {
         var event = visible_event;
         var event_transferred = false;
         defer if (!event_transferred) event.deinit(self.allocator);
-        handler.handle(
+        const receipt_json = handler.handle(
             handler.context,
             event_kind,
             raw_json,
             session_id,
+            self.allocator,
         ) catch |err| {
             self.releaseAuthoritativeReservation();
             return authoritativeFailureAlloc(allocator, err);
         };
+        self.allocator.free(event.raw_json);
+        event.raw_json = receipt_json;
         self.mutex.lock();
         defer self.mutex.unlock();
         self.visible_events.appendAssumeCapacity(event);
@@ -3115,12 +3119,14 @@ fn acceptTestAuthoritativeTool(
     event_kind: []const u8,
     raw_json: []const u8,
     session_id: []const u8,
-) !void {
+    allocator: std.mem.Allocator,
+) ![]u8 {
     _ = event_kind;
     _ = raw_json;
     _ = session_id;
     const calls: *usize = @ptrCast(@alignCast(raw_context));
     calls.* += 1;
+    return allocator.dupe(u8, "{\"cardId\":\"act-test\"}");
 }
 
 test "dynamic tool dispatch binds the exact parsed tool name" {
@@ -3138,6 +3144,10 @@ test "dynamic tool dispatch binds the exact parsed tool name" {
     try std.testing.expectEqualStrings(accepted_domain_response, response);
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqualStrings("action.prepared", registry.visible_events.items[0].method);
+    try std.testing.expectEqualStrings(
+        "{\"cardId\":\"act-test\"}",
+        registry.visible_events.items[0].raw_json,
+    );
 }
 
 test "authoritative tools fail closed without a domain handler" {

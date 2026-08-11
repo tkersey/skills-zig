@@ -675,6 +675,7 @@ fn applyLaunchExclusions(
         identity.repository,
         identity.number,
         pull_request_id,
+        batch.base_oid,
         batch.head_oid,
         requests,
     );

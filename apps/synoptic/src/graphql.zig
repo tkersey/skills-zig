@@ -25,13 +25,13 @@ pub const thread_comments_query =
 pub const file_state_query =
     "query SynopticFileState($owner:String!,$name:String!,$" ++
     "number:Int!,$after:String){repository(owner:$owner,nam" ++
-    "e:$name){pullRequest(number:$number){headRefOid files(" ++
+    "e:$name){pullRequest(number:$number){baseRefOid headRefOid files(" ++
     "first:100,after:$after){nodes{path viewerViewedState}p" ++
     "ageInfo{hasNextPage endCursor}}}}}";
 pub const anchor_query =
     "query SynopticAnchor($owner:String!,$name:String!,$num" ++
     "ber:Int!,$after:String){repository(owner:$owner,name:$" ++
-    "name){pullRequest(number:$number){headRefOid files(fir" ++
+    "name){pullRequest(number:$number){baseRefOid headRefOid files(fir" ++
     "st:100,after:$after){nodes{path}pageInfo{hasNextPage e" ++
     "ndCursor}}}}}";
 pub const mark_viewed_mutation =
@@ -68,13 +68,13 @@ pub const unmark_viewed_mutation =
     "est{id}}}";
 pub const action_authority_query =
     "query SynopticActionAuthority($owner:String!,$name:String!,$number:Int!,$after:String){" ++
-    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path viewerCanReply viewerCanResolve " ++
     "viewerCanUnresolve comments(first:100){nodes{id body viewerDidAuthor}" ++
     "pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}";
 pub const reconcile_query =
     "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
-    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path line isResolved comments(first:100){" ++
     "nodes{id body createdAt viewerDidAuthor}pageInfo{hasNextPage endCursor}}}" ++
     "pageInfo{hasNextPage endCursor}}}}}";

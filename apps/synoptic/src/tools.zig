@@ -29,6 +29,7 @@ pub const ActionTarget = struct {
     repository: []const u8,
     pull_request: u64,
     pull_request_id: []const u8,
+    base_oid: []const u8,
     head_oid: []const u8,
     path: ?[]const u8 = null,
     line: ?u32 = null,
@@ -104,6 +105,7 @@ pub const AuthoritativeTarget = struct {
     repository: []const u8,
     pull_request: u64,
     pull_request_id: []const u8,
+    base_oid: []const u8,
     head_oid: []const u8,
     session_path: []const u8,
     resolved_path: ?[]const u8 = null,
@@ -262,6 +264,7 @@ pub const ActionStore = struct {
                 .repository = try self.allocator.dupe(u8, authoritative.repository),
                 .pull_request = authoritative.pull_request,
                 .pull_request_id = try self.allocator.dupe(u8, authoritative.pull_request_id),
+                .base_oid = try self.allocator.dupe(u8, authoritative.base_oid),
                 .head_oid = try self.allocator.dupe(u8, authoritative.head_oid),
                 .path = try dupeOptional(self.allocator, resolved_path),
                 .line = input.line,
@@ -330,6 +333,10 @@ pub const ActionStore = struct {
         };
         return error.UnknownAction;
     }
+    pub fn byId(self: *ActionStore, id: []const u8) !*ActionCard {
+        for (self.cards.items) |*card| if (std.mem.eql(u8, card.id, id)) return card;
+        return error.UnknownAction;
+    }
     pub fn beginExecute(self: *ActionStore, id: []const u8) !*ActionCard {
         const card = try self.pendingById(id);
         card.status = .executing;
@@ -364,6 +371,7 @@ pub const ActionStore = struct {
                 card.effect_summary,
                 card.target.repository,
                 card.target.pull_request_id,
+                card.target.base_oid,
                 card.target.head_oid,
                 card.payload_json,
             },
@@ -399,13 +407,14 @@ pub fn cardJsonAlloc(allocator: std.mem.Allocator, card: ActionCard) ![]u8 {
         std.json.fmt(card.effect_summary, .{}),
         std.json.fmt(card.target.repository, .{}),
         card.target.pull_request,
+        std.json.fmt(card.target.base_oid, .{}),
         std.json.fmt(card.target.head_oid, .{}),
     };
     try out.writer.print("{{\"schema\":\"synoptic-github-action/v1\",\"id\":{f}," ++
         "\"sessionId\":{f},\"sourceTurnId\":{f},\"slot\":{f},\"" ++
         "status\":{f},\"kind\":{f},\"effectSummary\":{f},\"targ" ++
-        "et\":{{\"repository\":{f},\"pullRequest\":{d},\"headOi" ++
-        "d\":{f},\"path\":", header_arguments);
+        "et\":{{\"repository\":{f},\"pullRequest\":{d},\"baseOi" ++
+        "d\":{f},\"headOid\":{f},\"path\":", header_arguments);
     try writeOptionalString(&out.writer, card.target.path);
     try out.writer.writeAll(",\"line\":");
     try writeOptionalInt(&out.writer, card.target.line);
@@ -493,6 +502,7 @@ test "same session slot supersedes immutably and execution is once" {
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a",
     };
@@ -542,6 +552,7 @@ test "inline comment card owns the default RIGHT side" {
             .repository = "o/r",
             .pull_request = 1,
             .pull_request_id = "PR_1",
+            .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
         },
@@ -573,6 +584,7 @@ test "transparent validation runs before immutable card creation" {
                 .repository = "o/r",
                 .pull_request = 1,
                 .pull_request_id = "PR_1",
+                .base_oid = "unknown-base",
                 .head_oid = "h",
                 .session_path = "a",
             },

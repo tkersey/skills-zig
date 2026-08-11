@@ -421,6 +421,7 @@ pub const App = struct {
                 .repository = repository,
                 .pull_request = pull_request,
                 .pull_request_id = pull_request_id,
+                .base_oid = self.generation.base_oid,
                 .head_oid = self.generation.head_oid,
                 .session_path = session_path,
                 .resolved_path = resolved_path,
@@ -560,6 +561,7 @@ pub const App = struct {
             owner,
             name,
             number,
+            card.target.base_oid,
             card.target.head_oid,
             card.target.path.?,
             expected_viewed,
@@ -622,6 +624,7 @@ pub const App = struct {
             owner,
             name,
             number,
+            self.generation.base_oid,
             self.generation.head_oid,
             path,
         );
@@ -630,6 +633,7 @@ pub const App = struct {
             owner,
             name,
             number,
+            self.generation.base_oid,
             self.generation.head_oid,
             path,
         )) return error.MarkViewedReadbackFailed;
@@ -656,6 +660,7 @@ pub const App = struct {
             owner,
             name,
             number,
+            self.generation.base_oid,
             self.generation.head_oid,
             path,
         );
@@ -666,6 +671,7 @@ pub const App = struct {
             owner,
             name,
             number,
+            self.generation.base_oid,
             self.generation.head_oid,
             path,
         )) return error.MarkViewedReadbackFailed;
@@ -726,6 +732,7 @@ pub const App = struct {
             name,
             number,
             pull_request_id,
+            batch.base_oid,
             batch.head_oid,
             requests,
         );
@@ -988,6 +995,7 @@ test "action invalidation updates the application snapshot" {
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
     });

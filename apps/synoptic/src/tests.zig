@@ -278,6 +278,7 @@ test "action cards serialize exact effect target payload and rejection terminali
             .repository = "o/r",
             .pull_request = 2,
             .pull_request_id = "PR_2",
+            .base_oid = "base",
             .head_oid = "head",
             .session_path = "a.zig",
         },
@@ -720,12 +721,12 @@ fn fakeGhScriptAlloc(
         \\if grep -q 'SynopticMarkFileViewed' "$input"; then printf '%s\n' viewed > "$state"; printf '%s\n' '{{"data":{{"markFileAsViewed":{{"pullRequest":{{"id":"PR_1"}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticPullRequest' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"Fixture PR","body":"","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"%s"}},{{"path":"b.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
         \\if grep -q 'SynopticReviewThreads' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
-        \\if grep -q 'SynopticFileState' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","viewerViewedState":"%s"}},{{"path":"b.zig","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
-        \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig"}},{{"path":"b.zig"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticFileState' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","viewerViewedState":"%s"}},{{"path":"b.zig","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
+        \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig"}},{{"path":"b.zig"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     ,
-        .{ log_path, state_path, base, head, base, head, head, head },
+        .{ log_path, state_path, base, head, base, head, base, head, base, head },
     );
 }
 
@@ -739,13 +740,13 @@ fn fakeActionGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8) !
         \\cat > "$input"
         \\printf 'ARGV:%s\nSTDIN:' "$*" >> "$log"; cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticActionAuthority' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[{"id":"C_1","body":"old","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[{"id":"C_1","body":"old","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticAnchor' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticFileState' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig","viewerViewedState":"UNVIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","files":{"nodes":[{"path":"a.zig","viewerViewedState":"UNVIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\printf '%s\n' '{"data":{"ok":{"clientMutationId":"accepted"}}}'
         \\
@@ -762,8 +763,8 @@ fn fakeAmbiguousGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8
         \\trap 'rm -f "$input"' EXIT
         \\cat > "$input"
         \\cat "$input" >> "$log"; printf '\n' >> "$log"
-        \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi
-        \\if grep -q 'SynopticReconcile' "$input"; then now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
+        \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticReconcile' "$input"; then now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
         \\if grep -q 'SynopticAddInlineComment' "$input"; then exit 1; fi
         \\printf '%s\n' '{"data":{}}'
         \\
@@ -830,6 +831,18 @@ const action_inputs = [_]tools.PreparedActionInput{
     },
 };
 
+fn verifyStaleBaseRejected(
+    broker: github.Broker,
+    store: *tools.ActionStore,
+) !void {
+    var stale_base = store.cards.items[0];
+    stale_base.target.base_oid = "prior-base";
+    try std.testing.expectError(
+        error.PullRequestChanged,
+        broker.validateAction("o", "r", 1, "PR_1", stale_base),
+    );
+}
+
 test "action broker typed and transparent matrix uses fixed argv and exact stdin" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -858,6 +871,7 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "b",
         .head_oid = "h",
         .session_path = "a.zig",
         .resolved_path = "a.zig",
@@ -880,11 +894,13 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
             "o",
             "r",
             1,
+            "b",
             "h",
             "a.zig",
             false,
         ));
     }
+    try verifyStaleBaseRejected(broker, &store);
     var tampered = store.cards.items[store.cards.items.len - 1];
     var tampered_graphql = tampered.graphql.?;
     tampered_graphql.document =
@@ -912,10 +928,10 @@ test "comment action validation rejects a changed body found by nested paginatio
         \\trap 'rm -f "$input"' EXIT
         \\cat > "$input"
         \\if grep -q 'SynopticAnchor' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticActionAuthority' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticThreadComments' "$input"; then
         \\  printf '%s\n' '{"data":{"node":{"comments":{"nodes":[{"id":"C_1","body":"changed elsewhere","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'; exit 0
@@ -942,6 +958,7 @@ test "comment action validation rejects a changed body found by nested paginatio
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
         .resolved_path = "a.zig",
@@ -1125,6 +1142,7 @@ test "duplicate inline comment reconciliation remains unknown" {
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
     });
@@ -1149,11 +1167,13 @@ test "ambiguous complete-file mutation succeeds only through viewed readback" {
             "cat > \"$input\"\nif grep -q SynopticMarkFileViewed \"$input\"; then " ++
             "printf viewed > {s}; exit 1; fi\n" ++
             "if grep -q SynopticAnchor \"$input\"; then printf '%s\\n' '" ++
-            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"head\"," ++
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{" ++
+            "\"baseRefOid\":\"unknown-base\",\"headRefOid\":\"head\"," ++
             "\"files\":{{\"nodes\":[{{\"path\":\"a.zig\"}}],\"pageInfo\":" ++
             "{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}}}'; exit 0; fi\n" ++
             "if grep -q SynopticFileState \"$input\"; then test -f {s}; printf '%s\\n' '" ++
-            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"head\"," ++
+            "{{\"data\":{{\"repository\":{{\"pullRequest\":{{" ++
+            "\"baseRefOid\":\"unknown-base\",\"headRefOid\":\"head\"," ++
             "\"files\":{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
             "\"VIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}" ++
             "}}}}}}}}}}'; exit 0; fi\nprintf '%s\\n' '{{\"data\":{{}}}}'\n",
@@ -1222,6 +1242,7 @@ fn verifyAmbiguousActions(
             .repository = "o/r",
             .pull_request = 1,
             .pull_request_id = "PR_1",
+            .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
         },
@@ -1249,6 +1270,7 @@ fn verifyAmbiguousActions(
             .repository = "o/r",
             .pull_request = 1,
             .pull_request_id = "PR_1",
+            .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
         },
@@ -1301,6 +1323,7 @@ test "updated comment reconciliation matches identity author and body regardless
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
     });
@@ -1321,6 +1344,7 @@ test "updated comment reconciliation matches identity author and body regardless
         .repository = "o/r",
         .pull_request = 1,
         .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
     });
@@ -1521,6 +1545,7 @@ fn installExclusionGh(
     io: std.Io,
     tmp: *std.testing.TmpDir,
     root: []const u8,
+    base: []const u8,
     head: []const u8,
 ) !ExclusionGh {
     const state_path = try std.fs.path.join(allocator, &.{ root, "gh.state" });
@@ -1541,13 +1566,14 @@ fn installExclusionGh(
         " -q package {s} && package_viewed=VIEWED\n[ -f {s} ] && grep" ++
         " -q ambiguous {s} && ambiguous_viewed=VIEWED\nif printf '%s' \"$input" ++
         "\" | grep -q '\"after\":\"page-2\"'; then\n  printf '{{\"data\"" ++
-        ":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"{s}\",\"fi" ++
+        ":{{\"repository\":{{\"pullRequest\":{{\"baseRefOid\":\"{s}\"," ++
+        "\"headRefOid\":\"{s}\",\"fi" ++
         "les\":{{\"nodes\":[{{\"path\":\"vendor/ambiguous.js\",\"viewer" ++
         "ViewedState\":\"%s\"}},{{\"path\":\"src/large.zig\",\"viewerView" ++
         "edState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
         "\"endCursor\":null}}}}}}}}}}}}\\n' \"$ambiguous_viewed\"\nelse\n  " ++
-        "printf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\"" ++
-        ":\"{s}\",\"files\":{{\"nodes\":[{{\"path\":\"package-lock.json\"" ++
+        "printf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"baseRefOid\"" ++
+        ":\"{s}\",\"headRefOid\":\"{s}\",\"files\":{{\"nodes\":[{{\"path\":\"package-lock.json\"" ++
         ",\"viewerViewedState\":\"%s\"}},{{\"path\":\"vendor/fail.js\",\"v" ++
         "iewerViewedState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":" ++
         "true,\"endCursor\":\"page-2\"}}}}}}}}}}}}\\n' \"$package_viewed\"\nfi\n";
@@ -1562,7 +1588,9 @@ fn installExclusionGh(
             state_path,
             state_path,
             state_path,
+            base,
             head,
+            base,
             head,
         },
     );
@@ -1602,7 +1630,7 @@ test "exclusions config mutation readback and failure retention across generatio
     defer commits.deinit();
     const base = commits.base;
     const head = commits.head;
-    const gh = try installExclusionGh(allocator, io, &tmp, root, head);
+    const gh = try installExclusionGh(allocator, io, &tmp, root, base, head);
     defer gh.deinit();
     const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
     defer allocator.free(skill);
@@ -1638,7 +1666,7 @@ test "exclusions config mutation readback and failure retention across generatio
     );
 }
 
-test "viewed mutation crossing generation never issues an unowned inverse" {
+test "viewed mutation crossing base generation never issues an unowned inverse" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1663,13 +1691,13 @@ test "viewed mutation crossing generation never issues an unowned inverse" {
             "rm -f {s}; printf '%s\\n' '{{\"data\":{{\"unmarkFileAsViewed\":" ++
             "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
             "reads=0; [ -f {s} ] && reads=$(cat {s}); reads=$((reads + 1)); " ++
-            "printf '%s' \"$reads\" > {s}; head=old; " ++
-            "[ \"$reads\" -gt 1 ] && head=new; viewed=UNVIEWED; " ++
+            "printf '%s' \"$reads\" > {s}; base=old; " ++
+            "[ \"$reads\" -gt 1 ] && base=new; viewed=UNVIEWED; " ++
             "[ -f {s} ] && viewed=VIEWED; printf '{{\"data\":{{\"repository\":" ++
-            "{{\"pullRequest\":{{\"headRefOid\":\"%s\",\"files\":" ++
+            "{{\"pullRequest\":{{\"baseRefOid\":\"%s\",\"headRefOid\":\"head\",\"files\":" ++
             "{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
             "\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
-            "\"endCursor\":null}}}}}}}}}}}}\\n' \"$head\" \"$viewed\"\n",
+            "\"endCursor\":null}}}}}}}}}}}}\\n' \"$base\" \"$viewed\"\n",
         .{ log_path, state_path, state_path, reads_path, reads_path, reads_path, state_path },
     );
     defer allocator.free(script);
@@ -1691,6 +1719,7 @@ test "viewed mutation crossing generation never issues an unowned inverse" {
         1,
         "PR_1",
         "old",
+        "head",
         &requests,
     );
     defer allocator.free(results);
@@ -3636,9 +3665,16 @@ fn verifyWsCloseSecond(
     defer allocator.free(closed);
     try std.testing.expect(std.mem.indexOf(u8, closed, "\"sessionId\":\"ses-2\"") != null);
     const handler = tool_domain.handler();
+    const completion = handler.handle(
+        handler.context,
+        "file.complete.requested",
+        "{}",
+        "ses-2",
+        allocator,
+    );
     try std.testing.expectError(
         error.NotOfficialCurrentSession,
-        handler.handle(handler.context, "file.complete.requested", "{}", "ses-2"),
+        completion,
     );
     try std.testing.expect(state.generation.queued("b.zig"));
     try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[1].status);

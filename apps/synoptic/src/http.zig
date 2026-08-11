@@ -90,26 +90,39 @@ pub const ToolDomainContext = struct {
         event_kind: []const u8,
         raw_json: []const u8,
         session_id: []const u8,
-    ) !void {
+        result_allocator: std.mem.Allocator,
+    ) ![]u8 {
         const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
         if (std.mem.eql(u8, event_kind, "action.prepared")) {
-            return self.prepareAction(raw_json, session_id);
+            const card = try self.prepareAction(raw_json, session_id);
+            return std.fmt.allocPrint(
+                result_allocator,
+                "{{\"cardId\":{f}}}",
+                .{std.json.fmt(card.id, .{})},
+            );
         }
         if (std.mem.eql(u8, event_kind, "file.complete.requested")) {
-            return self.completeFile(session_id);
+            const receipt = try result_allocator.dupe(u8, "{\"status\":\"viewed\"}");
+            errdefer result_allocator.free(receipt);
+            try self.completeFile(session_id);
+            return receipt;
         }
         if (std.mem.eql(u8, event_kind, "session.close.requested")) {
-            return self.closeSession(session_id);
+            const receipt = try result_allocator.dupe(u8, "{\"status\":\"closed\"}");
+            errdefer result_allocator.free(receipt);
+            try self.closeSession(session_id);
+            return receipt;
         }
+        return error.UnsupportedAuthoritativeTool;
     }
 
     fn prepareAction(
         self: *ToolDomainContext,
         raw_json: []const u8,
         session_id: []const u8,
-    ) !void {
+    ) !tools.ActionCard {
         const input = try tools.decodePreparedAction(self.allocator, raw_json);
         defer input.deinit(self.allocator);
         const identity = try self.registry.sessionIdentity(session_id);
@@ -123,7 +136,7 @@ pub const ToolDomainContext = struct {
         defer self.allocator.free(repository);
         const turn_id = try toolTurnIdAlloc(self.allocator, raw_json, identity.turn_id);
         defer self.allocator.free(turn_id);
-        _ = try self.app.prepareModelAction(
+        return self.app.prepareModelAction(
             session_id,
             turn_id,
             input,
@@ -627,41 +640,11 @@ pub const Server = struct {
         event: sessions.VisibleEvent,
     ) !void {
         const session_id = event.session_id orelse return error.MissingOriginSession;
-        const input = try tools.decodePreparedAction(self.allocator, event.raw_json);
-        defer input.deinit(self.allocator);
-        const identity = try runtime.registry.sessionIdentity(session_id);
-        defer identity.deinit();
-        try tools.validateAgainstSession(input, identity.path);
-        const matching = runtime.app.action_store.pendingMatching(
-            session_id,
-            identity.turn_id,
-            input,
-        );
-        const pending_id = if (matching == null)
-            runtime.app.action_store.pendingIdForSlot(session_id, input.slot)
-        else
-            null;
-        const superseded = if (pending_id) |id| try self.allocator.dupe(u8, id) else null;
-        defer if (superseded) |id| self.allocator.free(id);
-        const repository = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ runtime.owner, runtime.name },
-        );
-        defer self.allocator.free(repository);
-        const card = if (matching) |existing|
-            existing.*
-        else
-            try runtime.app.prepareModelAction(
-                session_id,
-                identity.turn_id,
-                input,
-                repository,
-                runtime.number,
-                runtime.pull_request_id,
-                identity.path,
-            );
-        if (superseded) |id| {
+        const card_id = try receiptStringAlloc(self.allocator, event.raw_json, "cardId");
+        defer self.allocator.free(card_id);
+        const card = (try runtime.app.action_store.byId(card_id)).*;
+        if (!std.mem.eql(u8, card.session_id, session_id)) return error.ActionTargetMismatch;
+        if (card.supersedes) |id| {
             const superseded_payload = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"sessionId\":{f},\"id\":{f}}}",
@@ -689,36 +672,11 @@ pub const Server = struct {
         event: sessions.VisibleEvent,
     ) !void {
         const session_id = event.session_id orelse return error.MissingOriginSession;
-        const identity = try runtime.registry.sessionIdentity(session_id);
-        defer identity.deinit();
-        if (identity.status != .completed) {
-            runtime.app.completeRevision(
-                runtime.broker,
-                runtime.owner,
-                runtime.name,
-                runtime.number,
-                runtime.pull_request_id,
-                identity.path,
-                identity.revision,
-            ) catch |err| {
-                const failed = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"status\":\"failed\",\"reason\":{f}}}",
-                    .{std.json.fmt(@errorName(err), .{})},
-                );
-                defer self.allocator.free(failed);
-                const warning = try runtime.app.nextEnvelope("warning", failed);
-                defer self.allocator.free(warning);
-                try writeServerText(self.io, stream, warning);
-                return;
-            };
-            try runtime.registry.markCompleted(session_id);
-        }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
             session_id,
             event.method,
-            "{\"status\":\"viewed\"}",
+            event.raw_json,
         );
         defer self.allocator.free(payload);
         const envelope = try runtime.app.nextEnvelope("file.completed", payload);
@@ -733,17 +691,11 @@ pub const Server = struct {
         event: sessions.VisibleEvent,
     ) !void {
         const session_id = event.session_id orelse return error.MissingOriginSession;
-        const identity = try runtime.registry.sessionIdentity(session_id);
-        defer identity.deinit();
-        if (identity.status != .closed) {
-            try runtime.registry.closeSession(session_id);
-            try runtime.app.closeTabById(session_id);
-        }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
             session_id,
             event.method,
-            "{\"status\":\"closed\"}",
+            event.raw_json,
         );
         defer self.allocator.free(payload);
         const envelope = try runtime.app.nextEnvelope("session.closed", payload);
@@ -1416,6 +1368,19 @@ fn toolTurnIdAlloc(
         };
     };
     return allocator.dupe(u8, fallback);
+}
+
+fn receiptStringAlloc(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    key: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidAuthoritativeReceipt;
+    const value = parsed.value.object.get(key) orelse return error.InvalidAuthoritativeReceipt;
+    if (value != .string) return error.InvalidAuthoritativeReceipt;
+    return allocator.dupe(u8, value.string);
 }
 
 fn appendUniquePath(

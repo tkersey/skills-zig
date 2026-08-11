@@ -356,6 +356,7 @@ pub const Broker = struct {
         name: []const u8,
         number: u64,
         pull_request_id: []const u8,
+        expected_base: []const u8,
         expected_head: []const u8,
         requests: []const ViewedBatchRequest,
     ) ![]ViewedBatchResult {
@@ -375,6 +376,7 @@ pub const Broker = struct {
         try validateBatchPaths(
             self.allocator,
             validation_pages.items,
+            expected_base,
             expected_head,
             requests,
             null,
@@ -384,6 +386,7 @@ pub const Broker = struct {
             owner,
             name,
             number,
+            expected_base,
             expected_head,
             requests,
             results,
@@ -411,6 +414,7 @@ pub const Broker = struct {
         owner: []const u8,
         name: []const u8,
         number: u64,
+        expected_base: []const u8,
         expected_head: []const u8,
         requests: []const ViewedBatchRequest,
         results: []ViewedBatchResult,
@@ -431,6 +435,7 @@ pub const Broker = struct {
         validateBatchPaths(
             self.allocator,
             readback_pages.items,
+            expected_base,
             expected_head,
             requests,
             results,
@@ -453,11 +458,19 @@ pub const Broker = struct {
         name: []const u8,
         number: u64,
         pull_request_id: []const u8,
+        expected_base: []const u8,
         expected_head: []const u8,
         path: []const u8,
         client_id: []const u8,
     ) ViewedSync {
-        self.validateCurrentPath(owner, name, number, expected_head, path) catch |err| {
+        self.validateCurrentPath(
+            owner,
+            name,
+            number,
+            expected_base,
+            expected_head,
+            path,
+        ) catch |err| {
             return .{ .viewed = false, .error_name = @errorName(err) };
         };
         var reconciliation = self;
@@ -470,6 +483,7 @@ pub const Broker = struct {
             owner,
             name,
             number,
+            expected_base,
             expected_head,
             path,
         ) catch |err| {
@@ -552,18 +566,26 @@ pub const Broker = struct {
             owner,
             name,
             number,
+            card.target.base_oid,
             card.target.head_oid,
             path,
-        ) else try self.validateCurrentHead(owner, name, number, card.target.head_oid);
+        ) else try self.validateCurrentGeneration(
+            owner,
+            name,
+            number,
+            card.target.base_oid,
+            card.target.head_oid,
+        );
         const review_target = card.target.thread_id != null or card.target.comment_id != null;
         if (review_target) try self.validateReviewAuthority(owner, name, number, card);
     }
 
-    pub fn validateCurrentHead(
+    pub fn validateCurrentGeneration(
         self: Broker,
         owner: []const u8,
         name: []const u8,
         number: u64,
+        expected_base: []const u8,
         expected_head: []const u8,
     ) !void {
         var pages = try self.callPages(graphql.anchor_query, "files", owner, name, number);
@@ -573,11 +595,7 @@ pub const Broker = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            if (!std.mem.eql(
-                u8,
-                pull.get("headRefOid").?.string,
-                expected_head,
-            )) return error.PullRequestChanged;
+            try validateGenerationObject(pull, expected_base, expected_head);
         }
     }
 
@@ -605,11 +623,11 @@ pub const Broker = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            if (!std.mem.eql(
-                u8,
-                pull.get("headRefOid").?.string,
+            try validateGenerationObject(
+                pull,
+                card.target.base_oid,
                 card.target.head_oid,
-            )) return error.PullRequestChanged;
+            );
             const threads = pull.get("reviewThreads").?.object.get("nodes").?.array.items;
             try self.validateAuthorityThreads(owner, name, number, threads, card, &found);
         }
@@ -713,6 +731,7 @@ pub const Broker = struct {
                 owner,
                 name,
                 number,
+                card.target.base_oid,
                 card.target.head_oid,
                 card.target.path.?,
                 card.kind == .mark_viewed,
@@ -921,10 +940,11 @@ pub const Broker = struct {
     ) !void {
         switch (card.kind) {
             .mark_viewed, .unmark_viewed => return,
-            .add_inline_comment, .graphql => return self.validateCurrentHead(
+            .add_inline_comment, .graphql => return self.validateCurrentGeneration(
                 owner,
                 name,
                 number,
+                card.target.base_oid,
                 card.target.head_oid,
             ),
             .reply_thread, .resolve_thread, .unresolve_thread, .update_comment, .delete_comment => {
@@ -946,11 +966,11 @@ pub const Broker = struct {
                     );
                     defer parsed.deinit();
                     const pull = try pullObject(parsed.value);
-                    if (!std.mem.eql(
-                        u8,
-                        pull.get("headRefOid").?.string,
+                    try validateGenerationObject(
+                        pull,
+                        card.target.base_oid,
                         card.target.head_oid,
-                    )) return error.PullRequestChanged;
+                    );
                 }
             },
         }
@@ -1001,16 +1021,26 @@ pub const Broker = struct {
         owner: []const u8,
         name: []const u8,
         number: u64,
+        expected_base: []const u8,
         expected_head: []const u8,
         path: []const u8,
     ) !bool {
-        return self.viewedStateAfterMutation(owner, name, number, expected_head, path, true);
+        return self.viewedStateAfterMutation(
+            owner,
+            name,
+            number,
+            expected_base,
+            expected_head,
+            path,
+            true,
+        );
     }
     pub fn viewedStateAfterMutation(
         self: Broker,
         owner: []const u8,
         name: []const u8,
         number: u64,
+        expected_base: []const u8,
         expected_head: []const u8,
         path: []const u8,
         expected_viewed: bool,
@@ -1024,11 +1054,7 @@ pub const Broker = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            if (!std.mem.eql(
-                u8,
-                pull.get("headRefOid").?.string,
-                expected_head,
-            )) return error.PullRequestChanged;
+            try validateGenerationObject(pull, expected_base, expected_head);
             for (pull.get("files").?.object.get("nodes").?.array.items) |node| if (std.mem.eql(
                 u8,
                 node.object.get("path").?.string,
@@ -1046,6 +1072,7 @@ pub const Broker = struct {
         owner: []const u8,
         name: []const u8,
         number: u64,
+        expected_base: []const u8,
         expected_head: []const u8,
         path: []const u8,
     ) !void {
@@ -1059,11 +1086,7 @@ pub const Broker = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            if (!std.mem.eql(
-                u8,
-                pull.get("headRefOid").?.string,
-                expected_head,
-            )) return error.PullRequestChanged;
+            try validateGenerationObject(pull, expected_base, expected_head);
             for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
                 if (std.mem.eql(u8, node.object.get("path").?.string, path)) found = true;
             }
@@ -1075,6 +1098,7 @@ pub const Broker = struct {
 fn validateBatchPaths(
     allocator: std.mem.Allocator,
     pages: []const []const u8,
+    expected_base: []const u8,
     expected_head: []const u8,
     requests: []const Broker.ViewedBatchRequest,
     results: ?[]Broker.ViewedBatchResult,
@@ -1086,8 +1110,7 @@ fn validateBatchPaths(
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
         defer parsed.deinit();
         const pull = try pullObject(parsed.value);
-        if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head))
-            return error.PullRequestChanged;
+        try validateGenerationObject(pull, expected_base, expected_head);
         for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
             const path = node.object.get("path").?.string;
             for (requests, 0..) |request, index| {
@@ -1102,6 +1125,18 @@ fn validateBatchPaths(
         }
     }
     for (found) |present| if (!present) return error.ExclusionPathNotCurrent;
+}
+
+fn validateGenerationObject(
+    pull: std.json.ObjectMap,
+    expected_base: []const u8,
+    expected_head: []const u8,
+) !void {
+    const base = pull.get("baseRefOid") orelse return error.InvalidSnapshot;
+    const head = pull.get("headRefOid") orelse return error.InvalidSnapshot;
+    if (base != .string or head != .string) return error.InvalidSnapshot;
+    if (!std.mem.eql(u8, base.string, expected_base) or
+        !std.mem.eql(u8, head.string, expected_head)) return error.PullRequestChanged;
 }
 
 fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
@@ -1821,7 +1856,8 @@ test "cancelled viewed mutation is still reconciled" {
             "  printf viewed > {s}\n  printf started > {s}\n  sleep 30\nfi\n" ++
             "state=UNVIEWED\n[ -f {s} ] && state=VIEWED\n" ++
             "printf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{" ++
-            "\"headRefOid\":\"head\",\"files\":{{\"nodes\":[{{\"path\":\"a\"," ++
+            "\"baseRefOid\":\"base\",\"headRefOid\":\"head\"," ++
+            "\"files\":{{\"nodes\":[{{\"path\":\"a\"," ++
             "\"viewerViewedState\":\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":" ++
             "false,\"endCursor\":null}}}}}}}}}}}}\\n' \"$state\"\n",
         .{ state_path, started_path, state_path },
@@ -1849,7 +1885,16 @@ test "cancelled viewed mutation is still reconciled" {
         .gh_path = script_path,
         .cancelled = &cancelled,
     };
-    const sync = broker.synchronizeViewed("o", "r", 1, "PR_1", "head", "a", "client");
+    const sync = broker.synchronizeViewed(
+        "o",
+        "r",
+        1,
+        "PR_1",
+        "base",
+        "head",
+        "a",
+        "client",
+    );
     try std.testing.expect(sync.viewed);
     try std.testing.expect(sync.error_name == null);
 }
