@@ -75,7 +75,7 @@ case "$mode" in
         dependency_import=1
       fi
       if [[ "$dependency_import" -eq 0 ]] &&
-         grep -Eqi 'cas_runtime|cas-runtime' <<<"$raw"; then
+         grep -Eqi 'cas_runtime|cas-runtime|cas_hook_policy|cas-hook-policy' <<<"$raw"; then
         mark_cas_runtime_consumers
         matched=0
       fi

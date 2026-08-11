@@ -157,6 +157,10 @@ write_cas_runtime_only_build() {
   printf 'const img_meta = "apps/img/VERSION";\nconst cas_runtime = b.createModule(.{});\npub fn build() void {}\n' >build.zig
 }
 
+write_cas_hook_policy_only_build() {
+  printf 'const img_meta = "apps/img/VERSION";\nconst cas_hook_policy_root = b.createModule(.{});\npub fn build() void {}\n' >build.zig
+}
+
 write_synoptic_cas_runtime_build() {
   cat >build.zig <<'EOF'
 const img_meta = "apps/img/VERSION";
@@ -295,6 +299,7 @@ assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
 assert_affected cas write_cas_control_plane_build
 assert_affected cas,synoptic write_cas_runtime_only_build
+assert_affected cas,synoptic write_cas_hook_policy_only_build
 assert_affected cas,synoptic write_synoptic_cas_runtime_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
