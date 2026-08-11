@@ -1506,12 +1506,14 @@ const ActorPending = struct {
     done: bool = false,
     is_error: bool = false,
     response_json: ?[]u8 = null,
+    transmission_started: bool = false,
 };
 
 const ActorOutbound = struct {
     payload: []u8,
     deadline_ms: i64,
     poison_on_expiry: bool,
+    request_id: ?i64 = null,
 };
 
 const ActorServerRequest = struct {
@@ -1769,7 +1771,7 @@ pub const Actor = struct {
             method,
             params_json,
         );
-        try actorEnqueueOwned(self.state, payload, deadline, false);
+        try actorEnqueueOwned(self.state, payload, deadline, false, request_id);
 
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.state.mutex.lock();
@@ -1789,8 +1791,11 @@ pub const Actor = struct {
                 return actorTerminalError(terminal);
             }
             if (monotonicMillis() >= deadline) {
+                const transmission_started = pending.transmission_started;
                 _ = self.state.pending.remove(request_id);
+                if (transmission_started) self.state.terminal = .poisoned;
                 self.state.mutex.unlock();
+                if (transmission_started) actorCloseTransportOnce(self.state);
                 return error.RequestDeadlineExceeded;
             }
             self.state.mutex.unlock();
@@ -1834,11 +1839,16 @@ fn actorWriterMain(state: *ActorState) void {
             null
         else
             state.outbound.orderedRemove(0);
+        const transmission_claimed = if (maybe_item) |item|
+            actorClaimOutboundTransmissionLocked(state, item)
+        else
+            false;
         state.mutex.unlock();
 
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
-            if (actorOutboundExpired(item)) {
+            if (!transmission_claimed) continue;
+            if (item.request_id == null and actorOutboundExpired(item)) {
                 if (item.poison_on_expiry) {
                     actorSetTerminal(state, .poisoned);
                     actorCloseTransportOnce(state);
@@ -1863,6 +1873,19 @@ fn actorWriterMain(state: *ActorState) void {
 
 fn actorOutboundExpired(item: ActorOutbound) bool {
     return monotonicMillis() >= item.deadline_ms;
+}
+
+/// Claims the request's transport lease while the actor mutex still owns both
+/// queue membership and response correlation. A missing or expired request was
+/// withdrawn before transmission and is safe to drop without poisoning the
+/// connection. Once claimed, every timeout is transport-ambiguous and the
+/// caller must poison the actor before returning.
+fn actorClaimOutboundTransmissionLocked(state: *ActorState, item: ActorOutbound) bool {
+    const request_id = item.request_id orelse return true;
+    const pending = state.pending.get(request_id) orelse return false;
+    if (monotonicMillis() >= item.deadline_ms) return false;
+    pending.transmission_started = true;
+    return true;
 }
 
 fn actorHandlerMain(state: *ActorState) void {
@@ -2189,7 +2212,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         parsed_id.value,
         result_json,
     );
-    try actorEnqueueOwned(state, payload, work.deadline_ms, true);
+    try actorEnqueueOwned(state, payload, work.deadline_ms, true, null);
 }
 
 fn actorEnqueueServerError(
@@ -2213,6 +2236,7 @@ fn actorEnqueueServerError(
         try state.allocator.dupe(u8, output.written()),
         deadline_ms,
         true,
+        null,
     );
 }
 
@@ -2259,6 +2283,7 @@ fn actorEnqueueOwned(
     payload: []u8,
     deadline_ms: i64,
     poison_on_expiry: bool,
+    request_id: ?i64,
 ) !void {
     const owned = payload;
     errdefer state.allocator.free(owned);
@@ -2278,6 +2303,7 @@ fn actorEnqueueOwned(
                 .payload = owned,
                 .deadline_ms = deadline_ms,
                 .poison_on_expiry = poison_on_expiry,
+                .request_id = request_id,
             }) catch |err| {
                 state.mutex.unlock();
                 return err;
@@ -4344,6 +4370,7 @@ test "actor falsifier retries only structured overload and honors per-request de
         error.RequestDeadlineExceeded,
         deadline_actor.requestJson("actor/deadline", null, 20),
     );
+    try std.testing.expectEqual(protocol.TerminalState.poisoned, deadline_actor.terminalState());
 }
 
 test "actor falsifier malformed envelope poisons instead of losing correlation" {
@@ -4403,6 +4430,53 @@ test "actor falsifier saturated stalled writer consumes the request deadline" {
     );
     try std.testing.expect(monotonicMillis() - started < 500);
     try std.testing.expectEqual(@as(usize, 0), state.pending.count());
+}
+
+test "actor request lease drops expired unsent work and admits the next request" {
+    const allocator = std.testing.allocator;
+    var expired_pending = ActorPending{};
+    var next_pending = ActorPending{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+
+    try state.pending.put(7, &expired_pending);
+    state.mutex.lock();
+    const expired_claimed = actorClaimOutboundTransmissionLocked(&state, .{
+        .payload = @constCast("expired"),
+        .deadline_ms = monotonicMillis() - 1,
+        .poison_on_expiry = false,
+        .request_id = 7,
+    });
+    _ = state.pending.remove(7);
+    state.mutex.unlock();
+    try std.testing.expect(!expired_claimed);
+    try std.testing.expect(!expired_pending.transmission_started);
+    try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
+
+    try state.pending.put(8, &next_pending);
+    state.mutex.lock();
+    const next_claimed = actorClaimOutboundTransmissionLocked(&state, .{
+        .payload = @constCast("next"),
+        .deadline_ms = monotonicMillis() + 1_000,
+        .poison_on_expiry = false,
+        .request_id = 8,
+    });
+    _ = state.pending.remove(8);
+    state.mutex.unlock();
+    try std.testing.expect(next_claimed);
+    try std.testing.expect(next_pending.transmission_started);
+    try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
 }
 
 test "actor falsifier expired outbound work is never eligible for transport" {
