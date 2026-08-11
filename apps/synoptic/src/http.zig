@@ -137,6 +137,7 @@ pub const ToolDomainContext = struct {
     fn completeFile(self: *ToolDomainContext, session_id: []const u8) !void {
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
+        if (identity.status != .current) return error.NotOfficialCurrentSession;
         try self.app.completeRevision(
             self.broker,
             self.owner,
@@ -912,10 +913,10 @@ pub const Server = struct {
     fn closeSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
-        try runtime.registry.closeSession(session_id);
         const mutex = domainMutex(runtime);
         mutex.lock();
         defer mutex.unlock();
+        try runtime.registry.closeSession(session_id);
         try runtime.app.closeTabById(session_id);
         const body = try sessionStatusPayloadAlloc(self.allocator, session_id, "closed");
         defer self.allocator.free(body);

@@ -3618,6 +3618,7 @@ fn verifyWsCloseSecond(
     stream: *std.Io.net.Stream,
     state: *app.App,
     gh_log: []const u8,
+    tool_domain: *http.ToolDomainContext,
 ) !void {
     try sendMaskedText(io, stream, "{\"type\":\"file.open\",\"payload\":{\"path\":\"b.zig\"}}");
     const opened = try wsRead(allocator, io, stream, "ses-2");
@@ -3634,6 +3635,11 @@ fn verifyWsCloseSecond(
     const closed = try wsRead(allocator, io, stream, "\"type\":\"session.closed\"");
     defer allocator.free(closed);
     try std.testing.expect(std.mem.indexOf(u8, closed, "\"sessionId\":\"ses-2\"") != null);
+    const handler = tool_domain.handler();
+    try std.testing.expectError(
+        error.NotOfficialCurrentSession,
+        handler.handle(handler.context, "file.complete.requested", "{}", "ses-2"),
+    );
     try std.testing.expect(state.generation.queued("b.zig"));
     try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[1].status);
     const log = try std.Io.Dir.cwd().readFileAlloc(io, gh_log, allocator, .limited(1024 * 1024));
@@ -3834,7 +3840,14 @@ test "e2e masked websocket streams normalized review and action events" {
         tool_domain,
     );
     try verifyWsCompletion(allocator, io, &connection.stream, &state, tool_domain);
-    try verifyWsCloseSecond(allocator, io, &connection.stream, &state, programs.gh_log);
+    try verifyWsCloseSecond(
+        allocator,
+        io,
+        &connection.stream,
+        &state,
+        programs.gh_log,
+        tool_domain,
+    );
     try verifyWsRefresh(allocator, io, &connection.stream, &state, &registry);
     try verifyWsRound(allocator, io, &connection.stream, &state);
     const close_payload = [_]u8{ 0x03, 0xE8, 'b', 'y', 'e' };
