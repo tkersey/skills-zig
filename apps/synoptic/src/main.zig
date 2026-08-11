@@ -1203,7 +1203,7 @@ fn status(
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     var out = std.Io.File.stdout().writer(io, &.{});
-    var record = readLifecycleRecord(allocator, io, current_path) catch {
+    var record = (try readCurrentForLaunch(allocator, io, current_path)) orelse {
         if (json) {
             try out.interface.writeAll(stopped_status);
         } else try out.interface.writeAll("stopped\n");
@@ -1237,7 +1237,7 @@ fn stop(
     defer allocator.free(runtime_root);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
-    var record = readLifecycleRecord(allocator, io, current_path) catch
+    var record = (try readCurrentForLaunch(allocator, io, current_path)) orelse
         return printStopResult(io, json, null, false);
     defer record.deinit();
     if (!try verifiedProcess(allocator, io, record)) {
@@ -1968,7 +1968,7 @@ test "stop cannot report success after a terminal cleanup error" {
         requireNoTerminalError(io, path),
     );
 }
-test "launch distinguishes missing and unreadable lifecycle records" {
+test "lifecycle commands distinguish missing and unreadable ownership records" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
