@@ -400,27 +400,43 @@ pub fn requestAlloc(
 pub fn pageCursor(allocator: std.mem.Allocator, raw: []const u8, connection: []const u8) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGraphqlResponse;
     const data = parsed.value.object.get("data") orelse return error.InvalidGraphqlResponse;
+    if (data != .object) return error.InvalidGraphqlResponse;
     const repository = data.object.get("repository") orelse return error.InvalidGraphqlResponse;
+    if (repository != .object) return error.InvalidGraphqlResponse;
     const pr_value = repository.object.get("pullRequest") orelse
         return error.InvalidGraphqlResponse;
+    if (pr_value != .object) return error.InvalidGraphqlResponse;
     const conn = pr_value.object.get(connection) orelse return error.InvalidGraphqlResponse;
+    if (conn != .object) return error.InvalidGraphqlResponse;
     const info = conn.object.get("pageInfo") orelse return error.InvalidGraphqlResponse;
-    if (!(info.object.get("hasNextPage") orelse return error.InvalidGraphqlResponse).bool)
-        return null;
-    return @as(
-        ?[]u8,
-        try allocator.dupe(
-            u8,
-            (info.object.get("endCursor") orelse return error.InvalidGraphqlResponse).string,
-        ),
-    );
+    if (info != .object) return error.InvalidGraphqlResponse;
+    const has_next = info.object.get("hasNextPage") orelse return error.InvalidGraphqlResponse;
+    if (has_next != .bool) return error.InvalidGraphqlResponse;
+    if (!has_next.bool) return null;
+    const cursor = info.object.get("endCursor") orelse return error.InvalidGraphqlResponse;
+    if (cursor != .string) return error.InvalidGraphqlResponse;
+    return @as(?[]u8, try allocator.dupe(u8, cursor.string));
 }
 
 test "GraphQL request owns document and variables" {
     const out = try requestAlloc(std.testing.allocator, "query X{viewer{login}}", "{}");
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"variables\":{}") != null);
+}
+
+test "pagination rejects nullable GraphQL targets" {
+    const nullable_repository = "{\"data\":{\"repository\":null}}";
+    try std.testing.expectError(
+        error.InvalidGraphqlResponse,
+        pageCursor(std.testing.allocator, nullable_repository, "files"),
+    );
+    const nullable_pull = "{\"data\":{\"repository\":{\"pullRequest\":null}}}";
+    try std.testing.expectError(
+        error.InvalidGraphqlResponse,
+        pageCursor(std.testing.allocator, nullable_pull, "files"),
+    );
 }
 
 test "operation identity remains inspectable in fake gh stdin" {

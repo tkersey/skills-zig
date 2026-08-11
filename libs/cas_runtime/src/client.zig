@@ -919,7 +919,7 @@ pub const Client = struct {
             capabilities,
         );
         defer self.allocator.free(initialize);
-        try self.sendPayload(initialize, null, null);
+        try self.sendPayload(initialize, null, null, true);
 
         while (monotonicMillis() < self.request_deadline_ms.?) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
@@ -1016,7 +1016,7 @@ pub const Client = struct {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
-        try self.sendPayload(payload_writer.written(), send_observer, null);
+        try self.sendPayload(payload_writer.written(), send_observer, null, true);
     }
 
     fn sendPayload(
@@ -1024,6 +1024,7 @@ pub const Client = struct {
         payload: []const u8,
         send_observer: ?RequestSendObserver,
         send_deadline_ms: ?i64,
+        close_on_failure: bool,
     ) !void {
         if (payload.len > websocket_transport.max_message_bytes) {
             return error.AppServerMessageTooLarge;
@@ -1035,11 +1036,11 @@ pub const Client = struct {
                 const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
                     monotonicMillis() + default_request_timeout_ms;
                 writeFileAllUntil(self.stdin_file.?, payload, deadline_ms) catch |err| {
-                    self.close();
+                    if (close_on_failure) self.close();
                     return err;
                 };
                 writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms) catch |err| {
-                    self.close();
+                    if (close_on_failure) self.close();
                     return err;
                 };
             },
@@ -1512,6 +1513,7 @@ const ActorState = struct {
     allocator: std.mem.Allocator,
     client: Client,
     mutex: ActorMutex = .{},
+    transport_mutex: ActorMutex = .{},
     terminal: protocol.TerminalState = .running,
     transport_closed: bool = false,
     outbound: std.ArrayList(ActorOutbound) = .empty,
@@ -1801,7 +1803,7 @@ fn actorWriterMain(state: *ActorState) void {
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
             if (actorOutboundExpired(item)) continue;
-            state.client.sendPayload(item.payload, null, item.deadline_ms) catch {
+            actorSendPayload(state, item.payload, item.deadline_ms) catch {
                 actorSetTerminal(state, .poisoned);
                 actorCloseTransportOnce(state);
                 return;
@@ -2193,14 +2195,24 @@ fn actorSetTerminal(state: *ActorState, terminal: protocol.TerminalState) void {
 }
 
 fn actorCloseTransportOnce(state: *ActorState) void {
-    state.mutex.lock();
+    state.transport_mutex.lock();
+    defer state.transport_mutex.unlock();
     if (state.transport_closed) {
-        state.mutex.unlock();
         return;
     }
     state.transport_closed = true;
-    state.mutex.unlock();
     state.client.close();
+}
+
+fn actorSendPayload(state: *ActorState, payload: []const u8, deadline_ms: i64) !void {
+    state.transport_mutex.lock();
+    defer state.transport_mutex.unlock();
+    if (state.transport_closed) return error.ActorDisconnected;
+    state.client.sendPayload(payload, null, deadline_ms, false) catch |err| {
+        state.client.close();
+        state.transport_closed = true;
+        return err;
+    };
 }
 
 fn actorTerminalError(terminal: protocol.TerminalState) anyerror {
@@ -4316,7 +4328,7 @@ test "transport kinds preserve unix identity and frame behavior" {
         try std.testing.expectError(error.ConnectionTimedOut, client.readLineAlloc());
         try std.testing.expectError(
             error.ConnectionTimedOut,
-            client.sendPayload("{}", null, null),
+            client.sendPayload("{}", null, null, true),
         );
         try std.testing.expectError(
             error.ConnectionTimedOut,

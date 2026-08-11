@@ -610,18 +610,23 @@ fn applyLaunchExclusions(
         for (seeds.items) |seed| seed.deinit();
         seeds.deinit(allocator);
     }
-    for (seeds.items) |seed| try applyLaunchExclusion(
-        allocator,
-        settings,
-        broker,
-        identity,
-        pull_request_id,
-        review_cwd,
-        state,
-        registry,
-        tool_domain,
-        seed,
-    );
+    for (seeds.items) |seed| {
+        if (broker.cancelled) |cancelled| {
+            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
+        }
+        try applyLaunchExclusion(
+            allocator,
+            settings,
+            broker,
+            identity,
+            pull_request_id,
+            review_cwd,
+            state,
+            registry,
+            tool_domain,
+            seed,
+        );
+    }
 }
 
 const LaunchExclusionSeed = struct {
@@ -702,30 +707,22 @@ fn applyLaunchExclusion(
         seed.revision,
     );
     defer allocator.free(client_id);
-    var mutation_error: ?[]const u8 = null;
-    broker.markViewedWithId(pull_request_id, seed.path, client_id) catch |err| {
-        mutation_error = @errorName(err);
-    };
-    var readback_error: ?[]const u8 = null;
-    const viewed = broker.viewedAfterMutation(
+    const sync = broker.synchronizeViewed(
         identity.owner,
         identity.repository,
         identity.number,
+        pull_request_id,
         seed.head,
         seed.path,
-    ) catch |err| blk: {
-        readback_error = @errorName(err);
-        break :blk false;
-    };
-    const sync_error = if (viewed) null else readback_error orelse
-        mutation_error orelse "MarkViewedReadbackFailed";
+        client_id,
+    );
     tool_domain.lock();
     const applied = state.recordAutomaticExclusion(
         seed.path,
         seed.revision,
         reason,
-        sync_error,
-        viewed,
+        sync.error_name,
+        sync.viewed,
     ) catch |err| {
         tool_domain.unlock();
         return err;
@@ -736,7 +733,7 @@ fn applyLaunchExclusion(
         allocator,
         seed.path,
         reason,
-        sync_error,
+        sync.error_name,
     );
     defer outcome.deinit();
     try http.queueExclusionEvents(registry, &.{outcome});
@@ -764,6 +761,7 @@ fn configureAppState(
         .repository = repository,
         .number = identity.number,
         .title = snapshot.title,
+        .body = snapshot.body,
         .url = snapshot.pull_url,
         .base_ref_name = snapshot.base_ref,
         .base_ref_oid = snapshot.base,
@@ -834,6 +832,7 @@ fn serveHttpRuntime(
     );
     const exclusion_thread = try std.Thread.spawn(.{}, LaunchExclusionWork.run, .{&exclusion_work});
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
+    exclusion_work.cancelled.store(true, .release);
     exclusion_thread.join();
     try finishHttpRuntime(
         allocator,
@@ -881,6 +880,7 @@ const LaunchExclusionWork = struct {
     state: *App,
     registry: *sessions.Registry,
     tool_domain: *http.ToolDomainContext,
+    cancelled: std.atomic.Value(bool) = .init(false),
 
     fn init(
         allocator: std.mem.Allocator,
@@ -907,10 +907,12 @@ const LaunchExclusionWork = struct {
     }
 
     fn run(self: *LaunchExclusionWork) void {
+        var broker = self.broker;
+        broker.cancelled = &self.cancelled;
         queueLaunchExclusionFailures(
             self.allocator,
             self.settings,
-            self.broker,
+            broker,
             self.identity,
             self.pull_request_id,
             self.review_cwd,

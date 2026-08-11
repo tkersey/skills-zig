@@ -592,16 +592,6 @@ pub const App = struct {
             file.revision_key,
         );
         defer self.allocator.free(client_id);
-        if (try self.staleExclusionOutcome(
-            broker,
-            owner,
-            name,
-            number,
-            file.path,
-            reason,
-        )) |value| {
-            return value;
-        }
         const sync = self.synchronizeExclusion(
             broker,
             owner,
@@ -628,87 +618,16 @@ pub const App = struct {
         path: []const u8,
         client_id: []const u8,
     ) ExclusionSync {
-        var mutation_error: ?[]const u8 = null;
-        broker.markViewedWithId(pull_request_id, path, client_id) catch |err| {
-            mutation_error = @errorName(err);
-        };
-        const viewed = broker.viewedAfterMutation(
+        const sync = broker.synchronizeViewed(
             owner,
             name,
             number,
+            pull_request_id,
             self.generation.head_oid,
             path,
-        ) catch |err| {
-            const name_value = if (err == error.PullRequestChanged)
-                self.compensateStaleExclusion(
-                    broker,
-                    owner,
-                    name,
-                    number,
-                    pull_request_id,
-                    path,
-                    client_id,
-                ) catch |compensation_error| @errorName(compensation_error)
-            else
-                @errorName(err);
-            return .{ .viewed = false, .error_name = name_value };
-        };
-        return .{
-            .viewed = viewed,
-            .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
-        };
-    }
-
-    fn staleExclusionOutcome(
-        self: *App,
-        broker: github.Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        path: []const u8,
-        reason: []const u8,
-    ) !?ExclusionOutcome {
-        broker.validateCurrentPath(
-            owner,
-            name,
-            number,
-            self.generation.head_oid,
-            path,
-        ) catch |err| {
-            try self.generation.setExclusion(path, reason, @errorName(err));
-            return try ExclusionOutcome.init(self.allocator, path, reason, @errorName(err));
-        };
-        return null;
-    }
-
-    fn compensateStaleExclusion(
-        self: *App,
-        broker: github.Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        pull_request_id: []const u8,
-        path: []const u8,
-        prior_client_id: []const u8,
-    ) ![]const u8 {
-        const client_id = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}-compensate",
-            .{prior_client_id},
+            client_id,
         );
-        defer self.allocator.free(client_id);
-        try broker.unmarkViewedWithId(pull_request_id, path, client_id);
-        var current = try broker.readGeneration(owner, name, number);
-        defer current.deinit();
-        if (!try broker.viewedStateAfterMutation(
-            owner,
-            name,
-            number,
-            current.head_oid,
-            path,
-            false,
-        )) return error.UnmarkViewedReadbackFailed;
-        return "PullRequestChangedCompensated";
+        return .{ .viewed = sync.viewed, .error_name = sync.error_name };
     }
 
     pub fn bootstrapAlloc(self: *App) ![]u8 {

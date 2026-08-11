@@ -1108,7 +1108,13 @@ pub const Server = struct {
             return run(runtime);
         }
         runtime.app.action_state_fresh = false;
-        var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
+        var refreshed = try runtime.broker.readGenerationSnapshot(
+            runtime.owner,
+            runtime.name,
+            runtime.number,
+        );
+        defer refreshed.metadata.deinit();
+        var next = refreshed.generation;
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
         runtime.worktree_generation_valid = false;
@@ -1123,7 +1129,25 @@ pub const Server = struct {
         try github.hydrateRevisionKeys(self.allocator, self.io, runtime.cwd, &next);
         try self.refreshTabDiffs(runtime, &next);
         try self.markChangedSessions(runtime, &next);
-        try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
+        const repository = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ runtime.owner, runtime.name },
+        );
+        defer self.allocator.free(repository);
+        try runtime.app.setPullRequest(.{
+            .repository = repository,
+            .number = runtime.number,
+            .title = refreshed.metadata.title,
+            .body = refreshed.metadata.body,
+            .url = refreshed.metadata.url,
+            .base_ref_name = refreshed.metadata.base_ref_name,
+            .base_ref_oid = refreshed.metadata.base_oid,
+            .head_ref_name = refreshed.metadata.head_ref_name,
+            .head_ref_oid = refreshed.metadata.head_oid,
+            .state = refreshed.metadata.state,
+            .is_draft = refreshed.metadata.is_draft,
+        });
         runtime.app.replaceGeneration(next);
         next_owned = false;
         try self.applyRefreshExclusions(runtime);
@@ -1224,17 +1248,24 @@ pub const Server = struct {
         var files: std.Io.Writer.Allocating = .init(self.allocator);
         defer files.deinit();
         try std.json.Stringify.value(runtime.app.generation.files.items, .{}, &files.writer);
-        const update_format = "The pull request was explicitly refreshed. Authoritati" ++
-            "ve current base OID: {s}. Authoritative current head O" ++
-            "ID: {s}. Current changed files: {s}. Re-evaluate inten" ++
-            "t, invariants, and cross-file relationships from this " ++
-            "generation and the synchronized shared worktree.";
+        const header = runtime.app.pull_request orelse return error.MissingPullRequestHeader;
+        const update_format = "The pull request was explicitly refreshed. Current tit" ++
+            "le: {s}. Current body: {s}. Current state: {s}; draft: {}. Current base " ++
+            "ref: {s} at {s}. Current head ref: {s} at {s}. Current changed files: " ++
+            "{s}. Re-evaluate intent, invariants, and cross-file relationships from " ++
+            "this generation and the synchronized shared worktree.";
         return std.fmt.allocPrint(
             self.allocator,
             update_format,
             .{
-                runtime.app.generation.base_oid,
-                runtime.app.generation.head_oid,
+                header.title,
+                header.body,
+                header.state,
+                header.is_draft,
+                header.base_ref_name,
+                header.base_ref_oid,
+                header.head_ref_name,
+                header.head_ref_oid,
                 files.written(),
             },
         );

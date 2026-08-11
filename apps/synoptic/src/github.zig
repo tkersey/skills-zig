@@ -9,12 +9,18 @@ const gh_termination_grace_ms: u32 = 250;
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
     pid: std.posix.pid_t,
+    cancelled: ?*const std.atomic.Value(bool) = null,
+
+    fn shouldStop(self: *const GhWatchdog) bool {
+        return self.finished.load(.acquire) or
+            if (self.cancelled) |cancelled| cancelled.load(.acquire) else false;
+    }
 
     fn run(self: *GhWatchdog) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const watchdog_tick = std.Io.Duration.fromMilliseconds(5);
         for (0..gh_call_timeout_ms / 5) |_| {
-            if (self.finished.load(.acquire)) return;
+            if (self.shouldStop()) break;
             std.Io.sleep(io, watchdog_tick, .awake) catch |ignored_error| switch (ignored_error) {
                 else => {},
             };
@@ -73,8 +79,12 @@ pub const Broker = struct {
     io: std.Io,
     gh_path: []const u8 = "gh",
     host: []const u8 = "github.com",
+    cancelled: ?*const std.atomic.Value(bool) = null,
 
     pub fn call(self: Broker, document: []const u8, variables: []const u8) ![]u8 {
+        if (self.cancelled) |cancelled| {
+            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
+        }
         const mutation = try graphql.isMutation(self.allocator, document);
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
@@ -125,7 +135,7 @@ pub const Broker = struct {
         });
         errdefer child.kill(self.io);
         const child_id = child.id orelse return error.GitHubTransportAmbiguous;
-        var watchdog = GhWatchdog{ .pid = @intCast(child_id) };
+        var watchdog = GhWatchdog{ .pid = @intCast(child_id), .cancelled = self.cancelled };
         const watchdog_thread = try std.Thread.spawn(.{}, GhWatchdog.run, .{&watchdog});
         defer {
             watchdog.finished.store(true, .release);
@@ -167,6 +177,9 @@ pub const Broker = struct {
         const stderr = stderr_capture.bytes orelse return error.GitHubTransportAmbiguous;
         errdefer self.allocator.free(stderr);
         const term = try child.wait(self.io);
+        if (self.cancelled) |cancelled| {
+            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
+        }
         return .{ .allocator = self.allocator, .stdout = stdout, .stderr = stderr, .term = term };
     }
 
@@ -268,24 +281,37 @@ pub const Broker = struct {
         return error.PaginationLimitExceeded;
     }
 
+    pub fn readGenerationSnapshot(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+    ) !GenerationSnapshot {
+        var pages = try self.readGenerationPages(owner, name, number);
+        defer pages.deinit();
+        if (pages.files.items.len == 0) return error.InvalidSnapshot;
+        var metadata = try PullRequestMetadata.load(self.allocator, pages.files.items[0]);
+        errdefer metadata.deinit();
+        var generation = try domain.PrGeneration.initFull(
+            self.allocator,
+            metadata.base_oid,
+            metadata.head_oid,
+        );
+        errdefer generation.deinit();
+        for (pages.files.items) |page| try loadSnapshotFiles(self.allocator, page, &generation);
+        for (pages.threads.items) |page| try loadThreads(self.allocator, page, &generation);
+        return .{ .generation = generation, .metadata = metadata };
+    }
+
     pub fn readGeneration(
         self: Broker,
         owner: []const u8,
         name: []const u8,
         number: u64,
     ) !domain.PrGeneration {
-        var pages = try self.readGenerationPages(owner, name, number);
-        defer pages.deinit();
-        if (pages.files.items.len == 0) return error.InvalidSnapshot;
-        const head = try snapshotField(self.allocator, pages.files.items[0], "headRefOid");
-        defer self.allocator.free(head);
-        const base = try snapshotField(self.allocator, pages.files.items[0], "baseRefOid");
-        defer self.allocator.free(base);
-        var generation = try domain.PrGeneration.initFull(self.allocator, base, head);
-        errdefer generation.deinit();
-        for (pages.files.items) |page| try loadSnapshotFiles(self.allocator, page, &generation);
-        for (pages.threads.items) |page| try loadThreads(self.allocator, page, &generation);
-        return generation;
+        var snapshot = try self.readGenerationSnapshot(owner, name, number);
+        defer snapshot.metadata.deinit();
+        return snapshot.generation;
     }
 
     pub fn markViewed(self: Broker, pull_request_id: []const u8, path: []const u8) !void {
@@ -308,6 +334,90 @@ pub const Broker = struct {
         defer self.allocator.free(vars);
         const response = try self.call(graphql.mark_viewed_mutation, vars);
         defer self.allocator.free(response);
+    }
+
+    pub const ViewedSync = struct {
+        viewed: bool,
+        error_name: ?[]const u8,
+    };
+
+    pub fn synchronizeViewed(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        expected_head: []const u8,
+        path: []const u8,
+        client_id: []const u8,
+    ) ViewedSync {
+        self.validateCurrentPath(owner, name, number, expected_head, path) catch |err| {
+            return .{ .viewed = false, .error_name = @errorName(err) };
+        };
+        var reconciliation = self;
+        reconciliation.cancelled = null;
+        var mutation_error: ?[]const u8 = null;
+        self.markViewedWithId(pull_request_id, path, client_id) catch |err| {
+            mutation_error = @errorName(err);
+        };
+        const viewed = reconciliation.viewedAfterMutation(
+            owner,
+            name,
+            number,
+            expected_head,
+            path,
+        ) catch |err| {
+            if (err != error.PullRequestChanged) {
+                return .{ .viewed = false, .error_name = @errorName(err) };
+            }
+            const compensated = reconciliation.compensateViewed(
+                owner,
+                name,
+                number,
+                pull_request_id,
+                path,
+                client_id,
+            ) catch |compensation_error| {
+                return .{
+                    .viewed = false,
+                    .error_name = @errorName(compensation_error),
+                };
+            };
+            return .{ .viewed = false, .error_name = compensated };
+        };
+        return .{
+            .viewed = viewed,
+            .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
+        };
+    }
+
+    fn compensateViewed(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        path: []const u8,
+        prior_client_id: []const u8,
+    ) ![]const u8 {
+        const client_id = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}-compensate",
+            .{prior_client_id},
+        );
+        defer self.allocator.free(client_id);
+        try self.unmarkViewedWithId(pull_request_id, path, client_id);
+        var current = try self.readGeneration(owner, name, number);
+        defer current.deinit();
+        if (!try self.viewedStateAfterMutation(
+            owner,
+            name,
+            number,
+            current.head_oid,
+            path,
+            false,
+        )) return error.UnmarkViewedReadbackFailed;
+        return "PullRequestChangedCompensated";
     }
 
     pub fn unmarkViewedWithId(
@@ -1004,6 +1114,76 @@ pub const GenerationPages = struct {
     }
 };
 
+pub const PullRequestMetadata = struct {
+    allocator: std.mem.Allocator,
+    title: []u8,
+    body: []u8,
+    url: []u8,
+    base_ref_name: []u8,
+    base_oid: []u8,
+    head_ref_name: []u8,
+    head_oid: []u8,
+    state: []u8,
+    is_draft: bool,
+
+    fn load(allocator: std.mem.Allocator, raw: []const u8) !PullRequestMetadata {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const pull = try pullObject(parsed.value);
+        const title = try objectStringAlloc(allocator, pull, "title", false);
+        errdefer allocator.free(title);
+        const body = try objectStringAlloc(allocator, pull, "body", true);
+        errdefer allocator.free(body);
+        const url = try objectStringAlloc(allocator, pull, "url", false);
+        errdefer allocator.free(url);
+        const base_ref_name = try objectStringAlloc(allocator, pull, "baseRefName", false);
+        errdefer allocator.free(base_ref_name);
+        const base_oid = try objectStringAlloc(allocator, pull, "baseRefOid", false);
+        errdefer allocator.free(base_oid);
+        const head_ref_name = try objectStringAlloc(allocator, pull, "headRefName", false);
+        errdefer allocator.free(head_ref_name);
+        const head_oid = try objectStringAlloc(allocator, pull, "headRefOid", false);
+        errdefer allocator.free(head_oid);
+        const state = try objectStringAlloc(allocator, pull, "state", false);
+        errdefer allocator.free(state);
+        const draft_value = pull.get("isDraft") orelse return error.InvalidSnapshot;
+        if (draft_value != .bool) return error.InvalidSnapshot;
+        return .{
+            .allocator = allocator,
+            .title = title,
+            .body = body,
+            .url = url,
+            .base_ref_name = base_ref_name,
+            .base_oid = base_oid,
+            .head_ref_name = head_ref_name,
+            .head_oid = head_oid,
+            .state = state,
+            .is_draft = draft_value.bool,
+        };
+    }
+
+    pub fn deinit(self: *PullRequestMetadata) void {
+        self.allocator.free(self.title);
+        self.allocator.free(self.body);
+        self.allocator.free(self.url);
+        self.allocator.free(self.base_ref_name);
+        self.allocator.free(self.base_oid);
+        self.allocator.free(self.head_ref_name);
+        self.allocator.free(self.head_oid);
+        self.allocator.free(self.state);
+    }
+};
+
+pub const GenerationSnapshot = struct {
+    generation: domain.PrGeneration,
+    metadata: PullRequestMetadata,
+
+    pub fn deinit(self: *GenerationSnapshot) void {
+        self.generation.deinit();
+        self.metadata.deinit();
+    }
+};
+
 fn freePages(allocator: std.mem.Allocator, pages: *std.ArrayList([]u8)) void {
     for (pages.items) |page| allocator.free(page);
     pages.deinit(allocator);
@@ -1019,7 +1199,19 @@ fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const pull = try pullObject(parsed.value);
-    return allocator.dupe(u8, (pull.get(field) orelse return error.InvalidSnapshot).string);
+    return objectStringAlloc(allocator, pull, field, false);
+}
+
+fn objectStringAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field: []const u8,
+    nullable: bool,
+) ![]u8 {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    if (nullable and value == .null) return allocator.dupe(u8, "");
+    if (value != .string) return error.InvalidSnapshot;
+    return allocator.dupe(u8, value.string);
 }
 
 fn loadSnapshotFiles(
@@ -1224,11 +1416,15 @@ fn fetchObject(
 }
 
 fn pullObject(value: std.json.Value) !std.json.ObjectMap {
+    if (value != .object) return error.InvalidSnapshot;
     const data = value.object.get("data") orelse return error.InvalidSnapshot;
+    if (data != .object) return error.InvalidSnapshot;
     const repository = data.object.get("repository") orelse
         return error.InvalidSnapshot;
+    if (repository != .object) return error.InvalidSnapshot;
     const pull = repository.object.get("pullRequest") orelse
         return error.InvalidSnapshot;
+    if (pull != .object) return error.InvalidSnapshot;
     return pull.object;
 }
 
@@ -1378,6 +1574,159 @@ test "GitHub transport is a fixed argv stdin broker" {
         &.{ "gh", "api", "graphql", "--hostname", "github.com", "--input", "-" },
     ));
     try std.testing.expect(!hasFixedArgv(&.{ "sh", "-c", "gh api" }));
+}
+
+const CancelGhCall = struct {
+    cancelled: *std.atomic.Value(bool),
+    started_path: []const u8,
+
+    fn run(self: CancelGhCall) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        for (0..1_000) |_| {
+            std.Io.Dir.cwd().access(io, self.started_path, .{}) catch {
+                std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
+                continue;
+            };
+            self.cancelled.store(true, .release);
+            return;
+        }
+    }
+};
+
+test "broker cancellation terminates an in-flight gh process" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const started_path = try std.fs.path.join(std.testing.allocator, &.{ root, "started" });
+    defer std.testing.allocator.free(started_path);
+    const script = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "#!/bin/sh\ncat >/dev/null\nprintf started > {s}\nsleep 30\n",
+        .{started_path},
+    );
+    defer std.testing.allocator.free(script);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fake-gh",
+        .data = script,
+    });
+    const script_path = try tmp.dir.realPathFileAlloc(io, "fake-gh", std.testing.allocator);
+    defer std.testing.allocator.free(script_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        script_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var cancelled = std.atomic.Value(bool).init(false);
+    const cancel_thread = try std.Thread.spawn(
+        .{},
+        CancelGhCall.run,
+        .{CancelGhCall{ .cancelled = &cancelled, .started_path = started_path }},
+    );
+    defer cancel_thread.join();
+    const broker = Broker{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .gh_path = script_path,
+        .cancelled = &cancelled,
+    };
+    try std.testing.expectError(
+        error.GitHubCallCancelled,
+        broker.call("query Read{viewer{login}}", "{}"),
+    );
+}
+
+test "cancelled viewed mutation is still reconciled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const state_path = try std.fs.path.join(allocator, &.{ root, "viewed" });
+    defer allocator.free(state_path);
+    const started_path = try std.fs.path.join(allocator, &.{ root, "started" });
+    defer allocator.free(started_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(cat)\n" ++
+            "if printf '%s' \"$input\" | grep -q SynopticMarkFileViewed; then\n" ++
+            "  printf viewed > {s}\n  printf started > {s}\n  sleep 30\nfi\n" ++
+            "state=UNVIEWED\n[ -f {s} ] && state=VIEWED\n" ++
+            "printf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{" ++
+            "\"headRefOid\":\"head\",\"files\":{{\"nodes\":[{{\"path\":\"a\"," ++
+            "\"viewerViewedState\":\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":" ++
+            "false,\"endCursor\":null}}}}}}}}}}}}\\n' \"$state\"\n",
+        .{ state_path, started_path, state_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh", .data = script });
+    const script_path = try tmp.dir.realPathFileAlloc(io, "fake-gh", allocator);
+    defer allocator.free(script_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        script_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var cancelled = std.atomic.Value(bool).init(false);
+    const cancel_thread = try std.Thread.spawn(
+        .{},
+        CancelGhCall.run,
+        .{CancelGhCall{ .cancelled = &cancelled, .started_path = started_path }},
+    );
+    defer cancel_thread.join();
+    const broker = Broker{
+        .allocator = allocator,
+        .io = io,
+        .gh_path = script_path,
+        .cancelled = &cancelled,
+    };
+    const sync = broker.synchronizeViewed("o", "r", 1, "PR_1", "head", "a", "client");
+    try std.testing.expect(sync.viewed);
+    try std.testing.expect(sync.error_name == null);
+}
+
+test "pull object rejects nullable repository and pull request targets" {
+    const nullable_repository =
+        "{\"data\":{\"repository\":null}}";
+    var repository = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        nullable_repository,
+        .{},
+    );
+    defer repository.deinit();
+    try std.testing.expectError(error.InvalidSnapshot, pullObject(repository.value));
+
+    const nullable_pull =
+        "{\"data\":{\"repository\":{\"pullRequest\":null}}}";
+    var pull = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        nullable_pull,
+        .{},
+    );
+    defer pull.deinit();
+    try std.testing.expectError(error.InvalidSnapshot, pullObject(pull.value));
+}
+
+test "pull request metadata owns every refresh-visible field" {
+    const raw =
+        "{\"data\":{\"repository\":{\"pullRequest\":{" ++
+        "\"title\":\"updated\",\"body\":\"new intent\",\"url\":\"https://example/pr/1\"," ++
+        "\"baseRefName\":\"trunk\",\"baseRefOid\":\"b2\"," ++
+        "\"headRefName\":\"topic\",\"headRefOid\":\"h2\"," ++
+        "\"state\":\"OPEN\",\"isDraft\":true}}}}";
+    var metadata = try PullRequestMetadata.load(std.testing.allocator, raw);
+    defer metadata.deinit();
+    try std.testing.expectEqualStrings("updated", metadata.title);
+    try std.testing.expectEqualStrings("new intent", metadata.body);
+    try std.testing.expectEqualStrings("trunk", metadata.base_ref_name);
+    try std.testing.expectEqualStrings("h2", metadata.head_oid);
+    try std.testing.expect(metadata.is_draft);
 }
 test "canonical RIGHT anchor accepts only represented new lines" {
     try std.testing.expect(validateRightLine("@@ -1 +10,2 @@\n+x\n y\n", 10));

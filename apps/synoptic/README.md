@@ -36,14 +36,14 @@ originating session. Model preparation is rejected during the initial review;
 same-slot cards supersede immutably; completion requires mark-viewed plus an
 independent `VIEWED` read-back; close stays local.
 
-Command-execution and requested-permission approvals are bound to either the
-exact visible file session or the server-owned hidden primary thread. The
-browser receives an opaque pending approval and only the app-server-advertised
-decisions; its resolution wakes that exact server request once without exposing
-the primary transcript. Unknown, duplicate, cross-owner, expired, file-change,
-deprecated, ambiguous, and otherwise unowned requests fail closed. Pending
-approvals decline on timeout, disconnect, synchronization, session close, and
-shutdown.
+Command-execution approvals are bound to either the exact visible file session
+or the server-owned hidden primary thread. The browser receives an opaque
+pending approval and only the app-server-advertised decisions; its resolution
+wakes that exact server request once without exposing the primary transcript.
+Permission-escalation and file-change approvals fail closed. Unknown, duplicate,
+cross-owner, expired, deprecated, ambiguous, and otherwise unowned requests also
+fail closed. Pending approvals decline on timeout, disconnect, synchronization,
+session close, and shutdown.
 
 The action broker uses one immutable `synoptic-github-action/v1` carrier for
 typed review actions and bounded transparent GraphQL. Confirmation accepts only

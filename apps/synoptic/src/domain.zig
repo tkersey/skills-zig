@@ -8,6 +8,7 @@ pub const PullRequestHeader = struct {
     repository: []const u8,
     number: u64,
     title: []const u8,
+    body: []const u8,
     url: []const u8,
     base_ref_name: []const u8,
     base_ref_oid: []const u8,
@@ -22,6 +23,7 @@ pub const OwnedPullRequestHeader = struct {
     repository: []u8,
     number: u64,
     title: []u8,
+    body: []u8,
     url: []u8,
     base_ref_name: []u8,
     base_ref_oid: []u8,
@@ -35,6 +37,8 @@ pub const OwnedPullRequestHeader = struct {
         errdefer allocator.free(repository);
         const title = try allocator.dupe(u8, value.title);
         errdefer allocator.free(title);
+        const body = try allocator.dupe(u8, value.body);
+        errdefer allocator.free(body);
         const url = try allocator.dupe(u8, value.url);
         errdefer allocator.free(url);
         const base_ref_name = try allocator.dupe(u8, value.base_ref_name);
@@ -51,6 +55,7 @@ pub const OwnedPullRequestHeader = struct {
             .repository = repository,
             .number = value.number,
             .title = title,
+            .body = body,
             .url = url,
             .base_ref_name = base_ref_name,
             .base_ref_oid = base_ref_oid,
@@ -64,6 +69,7 @@ pub const OwnedPullRequestHeader = struct {
     pub fn deinit(self: *OwnedPullRequestHeader) void {
         self.allocator.free(self.repository);
         self.allocator.free(self.title);
+        self.allocator.free(self.body);
         self.allocator.free(self.url);
         self.allocator.free(self.base_ref_name);
         self.allocator.free(self.base_ref_oid);
@@ -338,8 +344,9 @@ pub const PrGeneration = struct {
 
     pub fn setRevision(self: *PrGeneration, path: []const u8, revision: []const u8) !void {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
+            const next = try self.allocator.dupe(u8, revision);
             self.allocator.free(file.revision_key);
-            file.revision_key = try self.allocator.dupe(u8, revision);
+            file.revision_key = next;
             return;
         };
         return error.UnknownFile;
@@ -513,4 +520,18 @@ test "generation replacement identifies changed and removed revisions" {
     defer next.deinit();
     try next.addFile(.{ .path = "a", .viewed = .unviewed, .revision_key = "r2" });
     try std.testing.expect(revisionChanged(&old, &next, "a"));
+}
+
+test "revision replacement keeps the current value when allocation fails" {
+    var generation = try PrGeneration.init(std.testing.allocator, "head");
+    defer generation.deinit();
+    try generation.addFile(.{ .path = "a", .viewed = .unviewed, .revision_key = "old" });
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    generation.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, generation.setRevision("a", "new"));
+    generation.allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("old", generation.files.items[0].revision_key);
 }
