@@ -643,7 +643,7 @@ const fake_codex_script =
     \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
     \\    *'"method":"initialized"'*) continue ;;
     \\    *'"id":"tool-'*) continue ;;
-    \\    *'"id":"approval-command"'*) printf '%s' "$line" | grep -q '"decision":"accept"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn","status":"completed"}}}'; continue ;;
+    \\    *'"id":"approval-command"'*) printf '%s' "$line" | grep -Eq '"decision":"(accept|acceptForSession|decline)"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn","status":"completed"}}}'; continue ;;
     \\    *'"id":"approval-file-change"'*) printf '%s' "$line" | grep -q '"decision":"decline"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"file-1","turn":{"id":"file-turn","status":"completed"}}}'; continue ;;
     \\    *'"id":"approval-primary"'*) printf '%s' "$line" | grep -Eq '"decision":"(accept|decline)"'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn","status":"completed"}}}'; continue ;;
     \\  esac
@@ -680,7 +680,7 @@ const fake_codex_script =
     \\        elif printf '%s' "$line" | grep -q 'search cross-file'; then
     \\          printf '{"id":"tool-search","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.search_unresolved_threads","arguments":{"query":"risk","paths":[],"includeWholePullRequest":true}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'run approved command'; then
-    \\          printf '{"id":"approval-command","method":"item/commandExecution/requestApproval","params":{"threadId":"%s","turnId":"file-turn","itemId":"cmd-1","startedAtMs":1,"command":"make test","availableDecisions":["accept","decline"]}}\n' "$thread_id"
+    \\          printf '{"id":"approval-command","method":"item/commandExecution/requestApproval","params":{"threadId":"%s","turnId":"file-turn","itemId":"cmd-1","startedAtMs":1,"command":"make test","availableDecisions":["accept","acceptForSession","decline"]}}\n' "$thread_id"
     \\          continue
     \\        elif printf '%s' "$line" | grep -q 'attempt file change'; then
     \\          printf '{"id":"approval-file-change","method":"item/fileChange/requestApproval","params":{"threadId":"%s","turnId":"file-turn","itemId":"patch-1","reason":"write"}}\n' "$thread_id"
@@ -4268,7 +4268,11 @@ fn verifyWsApprovals(
     defer allocator.free(started);
     const approval = try wsRead(allocator, io, stream, "\"type\":\"approval.requested\"");
     defer allocator.free(approval);
-    for ([_][]const u8{ "apr-1", "make test", "\"decisions\":[\"accept\",\"decline\"]" }) |needle| {
+    for ([_][]const u8{
+        "apr-1",
+        "make test",
+        "\"decisions\":[\"accept\",\"acceptForSession\",\"decline\"]",
+    }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, approval, needle) != null);
     }
     try resolveWsApproval(allocator, io, stream);
@@ -4564,6 +4568,126 @@ fn prepareWsRuntime(
     try registry.setAuthoritativeToolHandler(context.handler());
     runtime.tool_domain = context;
     return runtime;
+}
+
+fn requestPendingCommandApproval(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+) !void {
+    try sendMaskedText(io, stream, "{\"type\":\"session.message\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"text\":\"run approved command\",\"active\":false}}");
+    const started = try wsRead(allocator, io, stream, "turn-started");
+    defer allocator.free(started);
+    const approval = try wsRead(allocator, io, stream, "\"type\":\"approval.requested\"");
+    defer allocator.free(approval);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "acceptForSession") != null);
+}
+
+fn verifyReusedApprovalCustody(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    runtime: *http.Runtime,
+    root: []const u8,
+) !void {
+    try requestPendingCommandApproval(allocator, io, stream);
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    runtime.custody = .{ .reused_current = root };
+    runtime.baseline = &baseline;
+    const switched = try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "switch", "-q", "-c", "approval-custody-drift" },
+    );
+    allocator.free(switched);
+
+    try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"accept\"}}");
+    const accept_rejected = try wsRead(
+        allocator,
+        io,
+        stream,
+        "ReusedCheckoutRefreshRequiresManagedMigration",
+    );
+    defer allocator.free(accept_rejected);
+    try std.testing.expect(!runtime.worktree_generation_valid);
+    try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"acceptForSession\"}}");
+    const session_accept_rejected = try wsRead(
+        allocator,
+        io,
+        stream,
+        "WorktreeGenerationMismatch",
+    );
+    defer allocator.free(session_accept_rejected);
+    try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"decline\"}}");
+    const declined = try wsRead(allocator, io, stream, "\"type\":\"approval.resolved\"");
+    defer allocator.free(declined);
+    try std.testing.expect(std.mem.indexOf(u8, declined, "\"decision\":\"decline\"") != null);
+    const completed = try wsRead(allocator, io, stream, "turn/completed");
+    defer allocator.free(completed);
+}
+
+fn verifyManagedApprovalCustody(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    runtime: *http.Runtime,
+    root: []const u8,
+) !void {
+    runtime.custody = .{ .managed = root };
+    runtime.baseline = null;
+    runtime.worktree_generation_valid = true;
+    try requestPendingCommandApproval(allocator, io, stream);
+    runtime.worktree_generation_valid = false;
+    try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-2\",\"decision\":\"accept\"}}");
+    const managed_accept_rejected = try wsRead(
+        allocator,
+        io,
+        stream,
+        "WorktreeGenerationMismatch",
+    );
+    defer allocator.free(managed_accept_rejected);
+    try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
+        "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-2\",\"decision\":\"decline\"}}");
+    const managed_declined = try wsRead(allocator, io, stream, "\"type\":\"approval.resolved\"");
+    defer allocator.free(managed_declined);
+    try std.testing.expect(
+        std.mem.indexOf(u8, managed_declined, "\"decision\":\"decline\"") != null,
+    );
+}
+
+test "command approvals revalidate reused custody and retain fail-closed resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const commits = try prepareWsRepo(allocator, io, &tmp, root);
+    defer commits.deinit();
+    var state = try prepareWsState(allocator, commits.base, commits.head);
+    defer state.deinit();
+    const programs = try installWsPrograms(allocator, io, &tmp, root, commits.base, commits.head);
+    defer programs.deinit();
+    var registry: sessions.Registry = undefined;
+    try prepareWsRegistry(&registry, io, root, programs, &state);
+    defer registry.deinit();
+    var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
+    defer server.deinit();
+    var runtime = try prepareWsRuntime(allocator, io, root, programs, &state, &registry);
+    var connection = try connectWs(allocator, io, &server, &runtime);
+    defer connection.deinit();
+    try verifyWsStartup(allocator, io, &state, &connection.stream);
+    const log_path = try verifyWsOpen(allocator, io, &connection.stream, programs.codex);
+    defer allocator.free(log_path);
+    try verifyReusedApprovalCustody(allocator, io, &connection.stream, &runtime, root);
+    try verifyManagedApprovalCustody(allocator, io, &connection.stream, &runtime, root);
 }
 
 test "e2e masked websocket streams normalized review and action events" {

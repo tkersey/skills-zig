@@ -214,6 +214,15 @@ const default_header_timeout_ms: u32 = 5_000;
 const default_write_timeout_ms: u32 = 5_000;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+test "command approvals classify only exact decline and cancel as fail closed" {
+    try std.testing.expect(Server.approvalDecisionFailsClosed(.{ .string = "decline" }));
+    try std.testing.expect(Server.approvalDecisionFailsClosed(.{ .string = "cancel" }));
+    try std.testing.expect(!Server.approvalDecisionFailsClosed(.{ .string = "accept" }));
+    try std.testing.expect(!Server.approvalDecisionFailsClosed(.{
+        .object = std.json.ObjectMap.empty,
+    }));
+}
+
 fn clientConnectionError(err: anyerror) bool {
     return switch (err) {
         error.EndOfStream,
@@ -719,7 +728,10 @@ pub const Server = struct {
             .object => |o| o,
             else => return error.InvalidUiCommand,
         };
-        if (!runtime.worktree_generation_valid and !isRecoveryCommand(command)) {
+        if (!runtime.worktree_generation_valid and
+            !isRecoveryCommand(command) and
+            !std.mem.eql(u8, command, "approval.resolve"))
+        {
             return error.WorktreeGenerationMismatch;
         }
         if (std.mem.eql(u8, command, "file.open")) return self.openFile(runtime, payload);
@@ -921,6 +933,10 @@ pub const Server = struct {
         const decision = payload.get("decision") orelse return error.InvalidUiCommand;
         const choice_json = try stringifyValueAlloc(self.allocator, decision);
         defer self.allocator.free(choice_json);
+        if (!approvalDecisionFailsClosed(decision)) {
+            if (!runtime.worktree_generation_valid) return error.WorktreeGenerationMismatch;
+            try self.requireReviewWorktree(runtime);
+        }
         try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
         const mutex = domainMutex(runtime);
         mutex.lock();
@@ -929,6 +945,14 @@ pub const Server = struct {
             "session.status",
             "{\"status\":\"approval-resolving\"}",
         );
+    }
+
+    fn approvalDecisionFailsClosed(decision: std.json.Value) bool {
+        return switch (decision) {
+            .string => |choice| std.mem.eql(u8, choice, "decline") or
+                std.mem.eql(u8, choice, "cancel"),
+            else => false,
+        };
     }
 
     fn confirmAction(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
