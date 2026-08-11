@@ -2220,8 +2220,8 @@ test "file session receives every later revision and active close interrupts its
         true,
     );
     defer opened.deinit();
-    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two");
-    try registry.markPathChangedAndInject("a.zig", "r3", "+revision three");
+    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", "[]");
+    try registry.markPathChangedAndInject("a.zig", "r3", "+revision three", "[]");
     try std.testing.expectEqualStrings("r3", registry.sessions.items[0].last_injected_revision);
     registry.sessions.items[0].turn_active = true;
     try registry.closeSession(opened.session_id);
@@ -2231,6 +2231,61 @@ test "file session receives every later revision and active close interrupts its
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
+}
+
+test "session context refresh injects changed thread evidence into every open sibling" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const prior = try registry.openFile(
+        io,
+        root,
+        "a.zig",
+        "r1",
+        "base",
+        "head",
+        "+revision one",
+        "[]",
+        paths.skill,
+        false,
+    );
+    defer prior.deinit();
+    const current = try registry.openFile(
+        io,
+        root,
+        "a.zig",
+        "r2",
+        "base",
+        "head",
+        "+revision two",
+        "[]",
+        paths.skill,
+        false,
+    );
+    defer current.deinit();
+    const evidence = "[{\"id\":\"T-new\",\"path\":\"a.zig\"}]";
+    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", evidence);
+    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", evidence);
+    try std.testing.expectEqual(
+        sessions.SessionStatus.stale_origin,
+        registry.sessions.items[0].status,
+    );
+    try std.testing.expectEqual(sessions.SessionStatus.current, registry.sessions.items[1].status);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{paths.codex});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "T-new"));
 }
 
 test "local close finalizes when best-effort turn interruption fails" {
@@ -3847,7 +3902,12 @@ fn injectedRefresh(runtime: *http.Runtime) !void {
     try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
     try next.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
     try runtime.app.updateTabDiff("a.zig", "@@ -1 +1 @@\n+refreshed\n");
-    try runtime.registry.markPathChangedAndInject("a.zig", "r2", "@@ -1 +1 @@\n+refreshed\n");
+    try runtime.registry.markPathChangedAndInject(
+        "a.zig",
+        "r2",
+        "@@ -1 +1 @@\n+refreshed\n",
+        "[]",
+    );
     try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
     runtime.app.replaceGeneration(next);
     try runtime.registry.setGenerationEvidence(&runtime.app.generation);

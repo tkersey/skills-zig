@@ -1272,11 +1272,20 @@ pub const Server = struct {
             if (tab.status != .closed) try appendUniquePath(self.allocator, &paths, tab.path);
         }
         for (paths.items) |path| {
+            const threads = try next.unresolvedThreadsJsonAlloc(
+                self.allocator,
+                path,
+                null,
+                &.{},
+                false,
+            );
+            defer self.allocator.free(threads);
             const next_revision = @import("domain.zig").revisionFor(next, path) orelse {
                 try runtime.registry.markPathChangedAndInject(
                     path,
                     "deleted",
                     "This file was removed from the current pull request.",
+                    threads,
                 );
                 continue;
             };
@@ -1289,7 +1298,12 @@ pub const Server = struct {
                 path,
             );
             defer self.allocator.free(diff);
-            try runtime.registry.markPathChangedAndInject(path, next_revision, diff);
+            try runtime.registry.markPathChangedAndInject(
+                path,
+                next_revision,
+                diff,
+                threads,
+            );
         }
     }
 

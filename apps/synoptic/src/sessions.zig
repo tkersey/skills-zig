@@ -31,6 +31,12 @@ const missing_authority_response = "{\"contentItems\":[{\"type\":\"inputText\","
 const evidence_unavailable_response = "{\"contentItems\":[{\"type\":\"inputText\"," ++
     "\"text\":\"current PR evidence unavailable\"}],\"success\":false}";
 
+fn threadEvidenceDigest(threads_json: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(threads_json, &digest, .{});
+    return digest;
+}
+
 fn authoritativeToolEventKind(tool: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, tool, "synoptic.prepare_github_action")) return "action.prepared";
     if (std.mem.eql(u8, tool, "synoptic.complete_file_review")) {
@@ -92,6 +98,7 @@ pub const Session = struct {
     path: []u8,
     revision: []u8,
     last_injected_revision: []u8,
+    last_thread_evidence_digest: [32]u8 = [_]u8{0} ** 32,
     status: SessionStatus = .current,
     opening: bool = false,
     initial_turn_active: bool = true,
@@ -843,6 +850,7 @@ pub const Registry = struct {
             file_thread_id,
             path,
             revision,
+            threads_json,
             prompt,
             skill_path,
             start_immediately,
@@ -955,6 +963,7 @@ pub const Registry = struct {
         file_thread_id: []const u8,
         path: []const u8,
         revision: []const u8,
+        threads_json: []const u8,
         prompt: []const u8,
         skill_path: []const u8,
         start_immediately: bool,
@@ -999,6 +1008,7 @@ pub const Registry = struct {
             .path = owned_path,
             .revision = owned_revision,
             .last_injected_revision = injected_revision,
+            .last_thread_evidence_digest = threadEvidenceDigest(threads_json),
             .opening = start_immediately,
             .initial_turn_active = start_immediately,
             .turn_active = start_immediately,
@@ -1372,8 +1382,10 @@ pub const Registry = struct {
         path: []const u8,
         revision: []const u8,
         diff: []const u8,
+        threads_json: []const u8,
     ) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
+        const evidence_digest = threadEvidenceDigest(threads_json);
         var threads: std.ArrayList([]u8) = .empty;
         defer {
             for (threads.items) |thread| self.allocator.free(thread);
@@ -1381,12 +1393,18 @@ pub const Registry = struct {
         }
         self.mutex.lock();
         for (self.sessions.items) |*session| {
+            const revision_changed = !std.mem.eql(
+                u8,
+                session.last_injected_revision,
+                revision,
+            );
+            const evidence_changed = !std.mem.eql(
+                u8,
+                &session.last_thread_evidence_digest,
+                &evidence_digest,
+            );
             if (session.status != .closed and std.mem.eql(u8, session.path, path) and
-                !std.mem.eql(
-                    u8,
-                    session.last_injected_revision,
-                    revision,
-                ))
+                (revision_changed or evidence_changed))
             {
                 if (!std.mem.eql(u8, session.revision, revision)) {
                     session.status = .stale_origin;
@@ -1402,27 +1420,57 @@ pub const Registry = struct {
         }
         self.mutex.unlock();
         for (threads.items) |thread| {
-            const params = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"threadId\":{f},\"items\":[{{\"type\":\"text\",\"te" ++
-                    "xt\":{f}}}]}}",
-                .{ std.json.fmt(thread, .{}), std.json.fmt(diff, .{}) },
+            try self.injectPathUpdate(
+                actor,
+                thread,
+                path,
+                revision,
+                diff,
+                threads_json,
+                evidence_digest,
             );
-            defer self.allocator.free(params);
-            const response = try actor.requestJson("thread/inject_items", params, null);
-            defer self.allocator.free(response);
-            self.mutex.lock();
-            for (self.sessions.items) |*session| {
-                if (!std.mem.eql(u8, session.thread_id, thread)) continue;
-                const owned = self.allocator.dupe(u8, revision) catch {
-                    self.mutex.unlock();
-                    return error.OutOfMemory;
-                };
-                self.allocator.free(session.last_injected_revision);
-                session.last_injected_revision = owned;
-                break;
-            }
-            self.mutex.unlock();
+        }
+    }
+
+    fn injectPathUpdate(
+        self: *Registry,
+        actor: *cas_runtime.Actor,
+        thread: []const u8,
+        path: []const u8,
+        revision: []const u8,
+        diff: []const u8,
+        threads_json: []const u8,
+        evidence_digest: [32]u8,
+    ) !void {
+        const owned_revision = try self.allocator.dupe(u8, revision);
+        var revision_transferred = false;
+        defer if (!revision_transferred) self.allocator.free(owned_revision);
+        const injected_text = try std.fmt.allocPrint(
+            self.allocator,
+            "The pull request was explicitly refreshed.\n" ++
+                "Assigned path: {s}\nCurrent revision: {s}\n" ++
+                "Current diff against the pull request base:\n{s}\n" ++
+                "Current unresolved assigned-file review threads:\n{s}",
+            .{ path, revision, diff, threads_json },
+        );
+        defer self.allocator.free(injected_text);
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"threadId\":{f},\"items\":[{{\"type\":\"text\",\"text\":{f}}}]}}",
+            .{ std.json.fmt(thread, .{}), std.json.fmt(injected_text, .{}) },
+        );
+        defer self.allocator.free(params);
+        const response = try actor.requestJson("thread/inject_items", params, null);
+        defer self.allocator.free(response);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| {
+            if (!std.mem.eql(u8, session.thread_id, thread)) continue;
+            self.allocator.free(session.last_injected_revision);
+            session.last_injected_revision = owned_revision;
+            session.last_thread_evidence_digest = evidence_digest;
+            revision_transferred = true;
+            break;
         }
     }
 
@@ -2728,6 +2776,7 @@ test "opening session is mapped but not reusable until activation" {
         "file-current",
         "a.zig",
         "r2",
+        "[]",
         "prompt",
         "/skill/SKILL.md",
         true,
