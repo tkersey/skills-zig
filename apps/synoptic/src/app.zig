@@ -77,6 +77,98 @@ const ExclusionCandidate = struct {
     }
 };
 
+const ExclusionProbe = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    revision: []u8,
+    reason: ?[]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        revision: []const u8,
+        reason: ?[]const u8,
+    ) !ExclusionProbe {
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_revision = try allocator.dupe(u8, revision);
+        errdefer allocator.free(owned_revision);
+        const owned_reason = if (reason) |value| try allocator.dupe(u8, value) else null;
+        return .{
+            .allocator = allocator,
+            .path = owned_path,
+            .revision = owned_revision,
+            .reason = owned_reason,
+        };
+    }
+
+    fn deinit(self: ExclusionProbe) void {
+        self.allocator.free(self.path);
+        self.allocator.free(self.revision);
+        if (self.reason) |value| self.allocator.free(value);
+    }
+};
+
+pub const AutomaticExclusionBatch = struct {
+    allocator: std.mem.Allocator,
+    base_oid: []u8,
+    head_oid: []u8,
+    probes: std.ArrayList(ExclusionProbe) = .empty,
+    candidates: std.ArrayList(ExclusionCandidate) = .empty,
+
+    pub fn deinit(self: *AutomaticExclusionBatch) void {
+        for (self.probes.items) |probe| probe.deinit();
+        self.probes.deinit(self.allocator);
+        for (self.candidates.items) |candidate| candidate.deinit();
+        self.candidates.deinit(self.allocator);
+        self.allocator.free(self.base_oid);
+        self.allocator.free(self.head_oid);
+    }
+
+    pub fn classify(
+        self: *AutomaticExclusionBatch,
+        settings: *const config.Settings,
+        broker: github.Broker,
+        cwd: []const u8,
+    ) !void {
+        std.debug.assert(self.candidates.items.len == 0);
+        for (self.probes.items) |probe| {
+            const reason = probe.reason orelse binary: {
+                const diff = github.canonicalDiffAlloc(
+                    self.allocator,
+                    broker.io,
+                    cwd,
+                    self.base_oid,
+                    self.head_oid,
+                    probe.path,
+                ) catch continue;
+                defer self.allocator.free(diff);
+                break :binary settings.classifyDiff(diff) orelse continue;
+            };
+            var candidate = try ExclusionCandidate.init(
+                self.allocator,
+                probe.path,
+                probe.revision,
+                reason,
+            );
+            errdefer candidate.deinit();
+            try self.candidates.append(self.allocator, candidate);
+        }
+    }
+
+    pub fn requestsAlloc(self: *const AutomaticExclusionBatch) ![]github.Broker.ViewedBatchRequest {
+        const requests = try self.allocator.alloc(
+            github.Broker.ViewedBatchRequest,
+            self.candidates.items.len,
+        );
+        for (self.candidates.items, requests) |candidate, *request| request.* = .{
+            .path = candidate.path,
+            .client_id = candidate.client_id,
+        };
+        return requests;
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     generation: domain.PrGeneration,
@@ -624,70 +716,68 @@ pub const App = struct {
         pull_request_id: []const u8,
         cwd: []const u8,
     ) !std.ArrayList(ExclusionOutcome) {
-        var outcomes: std.ArrayList(ExclusionOutcome) = .empty;
-        errdefer {
-            for (outcomes.items) |outcome| outcome.deinit();
-            outcomes.deinit(self.allocator);
-        }
-        if (!settings.exclusions_enabled) return outcomes;
-        var candidates: std.ArrayList(ExclusionCandidate) = .empty;
-        defer {
-            for (candidates.items) |candidate| candidate.deinit();
-            candidates.deinit(self.allocator);
-        }
-        try self.collectExclusionCandidates(settings, broker, cwd, &candidates);
-        const requests = try self.allocator.alloc(
-            github.Broker.ViewedBatchRequest,
-            candidates.items.len,
-        );
+        var batch = try self.captureAutomaticExclusions(settings);
+        defer batch.deinit();
+        try batch.classify(settings, broker, cwd);
+        const requests = try batch.requestsAlloc();
         defer self.allocator.free(requests);
-        for (candidates.items, requests) |candidate, *request| request.* = .{
-            .path = candidate.path,
-            .client_id = candidate.client_id,
-        };
         const results = try broker.synchronizeViewedBatch(
             owner,
             name,
             number,
             pull_request_id,
-            self.generation.head_oid,
+            batch.head_oid,
             requests,
         );
         defer self.allocator.free(results);
-        try self.applyExclusionResults(candidates.items, results, &outcomes);
-        return outcomes;
+        return self.applyAutomaticExclusionResults(&batch, results);
     }
 
-    fn collectExclusionCandidates(
+    pub fn captureAutomaticExclusions(
         self: *App,
         settings: *const config.Settings,
-        broker: github.Broker,
-        cwd: []const u8,
-        candidates: *std.ArrayList(ExclusionCandidate),
-    ) !void {
+    ) !AutomaticExclusionBatch {
+        const base_oid = try self.allocator.dupe(u8, self.generation.base_oid);
+        const head_oid = self.allocator.dupe(u8, self.generation.head_oid) catch |err| {
+            self.allocator.free(base_oid);
+            return err;
+        };
+        var batch = AutomaticExclusionBatch{
+            .allocator = self.allocator,
+            .base_oid = base_oid,
+            .head_oid = head_oid,
+        };
+        errdefer batch.deinit();
+        if (!settings.exclusions_enabled) return batch;
         for (self.generation.files.items) |file| {
             if (file.viewed == .viewed) continue;
-            const reason = settings.classifyPath(file.path) orelse binary: {
-                const diff = github.canonicalDiffAlloc(
-                    self.allocator,
-                    broker.io,
-                    cwd,
-                    self.generation.base_oid,
-                    self.generation.head_oid,
-                    file.path,
-                ) catch continue;
-                defer self.allocator.free(diff);
-                break :binary settings.classifyDiff(diff) orelse continue;
-            };
-            var candidate = try ExclusionCandidate.init(
+            var probe = try ExclusionProbe.init(
                 self.allocator,
                 file.path,
                 file.revision_key,
-                reason,
+                settings.classifyPath(file.path),
             );
-            errdefer candidate.deinit();
-            try candidates.append(self.allocator, candidate);
+            errdefer probe.deinit();
+            try batch.probes.append(self.allocator, probe);
         }
+        return batch;
+    }
+
+    pub fn applyAutomaticExclusionResults(
+        self: *App,
+        batch: *const AutomaticExclusionBatch,
+        results: []const github.Broker.ViewedBatchResult,
+    ) !std.ArrayList(ExclusionOutcome) {
+        if (!std.mem.eql(u8, self.generation.head_oid, batch.head_oid)) {
+            return error.ExclusionGenerationChanged;
+        }
+        var outcomes: std.ArrayList(ExclusionOutcome) = .empty;
+        errdefer {
+            for (outcomes.items) |outcome| outcome.deinit();
+            outcomes.deinit(self.allocator);
+        }
+        try self.applyExclusionResults(batch.candidates.items, results, &outcomes);
+        return outcomes;
     }
 
     fn applyExclusionResults(

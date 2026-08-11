@@ -1638,7 +1638,7 @@ test "exclusions config mutation readback and failure retention across generatio
     );
 }
 
-test "viewed mutation crossing generation is compensated and read back" {
+test "viewed mutation crossing generation never issues an unowned inverse" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1685,19 +1685,22 @@ test "viewed mutation crossing generation is compensated and read back" {
         .path = "a.zig",
         .client_id = "mark-1",
     }};
-    try std.testing.expectError(
-        error.PullRequestChanged,
-        broker.synchronizeViewedBatch("o", "r", 1, "PR_1", "old", &requests),
+    const results = try broker.synchronizeViewedBatch(
+        "o",
+        "r",
+        1,
+        "PR_1",
+        "old",
+        &requests,
     );
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.access(io, "viewed", .{}),
-    );
+    defer allocator.free(results);
+    try std.testing.expectEqualStrings("PullRequestChanged", results[0].error_name.?);
+    try tmp.dir.access(io, "viewed", .{});
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, log, "SynopticFileState"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
 }
 
 fn verifyExclusionState(

@@ -384,7 +384,6 @@ pub const Broker = struct {
             owner,
             name,
             number,
-            pull_request_id,
             expected_head,
             requests,
             results,
@@ -412,7 +411,6 @@ pub const Broker = struct {
         owner: []const u8,
         name: []const u8,
         number: u64,
-        pull_request_id: []const u8,
         expected_head: []const u8,
         requests: []const ViewedBatchRequest,
         results: []ViewedBatchResult,
@@ -437,17 +435,6 @@ pub const Broker = struct {
             requests,
             results,
         ) catch |err| {
-            if (err == error.PullRequestChanged) {
-                try reconciliation.compensateViewedBatch(
-                    owner,
-                    name,
-                    number,
-                    pull_request_id,
-                    requests,
-                    results,
-                );
-                return err;
-            }
             for (results) |*result| result.error_name = @errorName(err);
             return;
         };
@@ -458,36 +445,6 @@ pub const Broker = struct {
                 result.error_name = "MarkViewedReadbackFailed";
             }
         }
-    }
-
-    fn compensateViewedBatch(
-        self: Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        pull_request_id: []const u8,
-        requests: []const ViewedBatchRequest,
-        results: []ViewedBatchResult,
-    ) !void {
-        for (requests, results) |request, result| {
-            const may_have_reached = result.error_name == null or std.mem.eql(
-                u8,
-                result.error_name.?,
-                "GitHubTransportAmbiguous",
-            );
-            if (!may_have_reached) continue;
-            const client_id = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}-compensate",
-                .{request.client_id},
-            );
-            defer self.allocator.free(client_id);
-            self.unmarkViewedWithId(pull_request_id, request.path, client_id) catch
-                return error.ViewedCompensationFailed;
-        }
-        var pages = try self.callPages(graphql.file_state_query, "files", owner, name, number);
-        defer freePages(self.allocator, &pages);
-        try validateUnviewedPaths(self.allocator, pages.items, requests);
     }
 
     pub fn synchronizeViewed(
@@ -516,28 +473,6 @@ pub const Broker = struct {
             expected_head,
             path,
         ) catch |err| {
-            if (err == error.PullRequestChanged and (mutation_error == null or std.mem.eql(
-                u8,
-                mutation_error.?,
-                "GitHubTransportAmbiguous",
-            ))) {
-                var requests = [_]ViewedBatchRequest{.{
-                    .path = path,
-                    .client_id = client_id,
-                }};
-                var results = [_]ViewedBatchResult{.{ .error_name = mutation_error }};
-                reconciliation.compensateViewedBatch(
-                    owner,
-                    name,
-                    number,
-                    pull_request_id,
-                    &requests,
-                    &results,
-                ) catch |compensation_error| return .{
-                    .viewed = false,
-                    .error_name = @errorName(compensation_error),
-                };
-            }
             return .{ .viewed = false, .error_name = @errorName(err) };
         };
         return .{
@@ -1167,34 +1102,6 @@ fn validateBatchPaths(
         }
     }
     for (found) |present| if (!present) return error.ExclusionPathNotCurrent;
-}
-
-fn validateUnviewedPaths(
-    allocator: std.mem.Allocator,
-    pages: []const []const u8,
-    requests: []const Broker.ViewedBatchRequest,
-) !void {
-    const found = try allocator.alloc(bool, requests.len);
-    defer allocator.free(found);
-    @memset(found, false);
-    for (pages) |page| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
-        defer parsed.deinit();
-        const pull = try pullObject(parsed.value);
-        for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
-            const path = node.object.get("path").?.string;
-            for (requests, 0..) |request, index| {
-                if (!std.mem.eql(u8, request.path, path)) continue;
-                found[index] = true;
-                if (std.mem.eql(
-                    u8,
-                    node.object.get("viewerViewedState").?.string,
-                    "VIEWED",
-                )) return error.ViewedCompensationFailed;
-            }
-        }
-    }
-    for (found) |present| if (!present) return error.ViewedCompensationFailed;
 }
 
 fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {

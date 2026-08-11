@@ -1874,7 +1874,10 @@ fn actorServerRequestWorker(state: *ActorState, work: ActorServerRequest) void {
     defer work.deinit(state.allocator);
     defer actorFinishServerHandler(state);
     actorHandleServerRequest(state, work) catch |err| switch (err) {
-        error.RequestDeadlineExceeded,
+        error.RequestDeadlineExceeded => {
+            actorSetTerminal(state, .poisoned);
+            actorCloseTransportOnce(state);
+        },
         error.ActorDisconnected,
         error.ActorPoisoned,
         error.ActorStopped,
@@ -1894,7 +1897,7 @@ fn actorFinishServerHandler(state: *ActorState) void {
 }
 
 fn actorWaitForServerHandlers(state: *ActorState) void {
-    while (true) { // tiger: event-loop -- bounded by configured handler deadlines.
+    while (true) { // tiger: event-loop -- bounded by the handler contract.
         state.mutex.lock();
         const active = state.active_server_handlers;
         state.mutex.unlock();
@@ -4089,6 +4092,19 @@ const ServerRequestProbe = struct {
     }
 };
 
+const LateServerRequestProbe = struct {
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        _ = context;
+        _ = request;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+        return allocator.dupe(u8, "{\"handled\":true}");
+    }
+};
+
 const NestedServerRequestProbe = struct {
     actor: *Actor,
     nested_completed: bool = false,
@@ -4387,6 +4403,34 @@ test "actor falsifier expired server work never invokes its handler" {
     );
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
+}
+
+test "actor closes transport when a server handler returns after deadline" {
+    const allocator = std.testing.allocator;
+    var probe = LateServerRequestProbe{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .active_server_handlers = 1,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = .{ .context = &probe, .handle = LateServerRequestProbe.handle },
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    const work = ActorServerRequest{
+        .id_json = try allocator.dupe(u8, "1"),
+        .method = try allocator.dupe(u8, "item/tool/call"),
+        .raw_json = try allocator.dupe(u8, "{}"),
+        .deadline_ms = monotonicMillis() + 1,
+    };
+    actorServerRequestWorker(&state, work);
+    try std.testing.expectEqual(protocol.TerminalState.poisoned, state.terminal);
+    try std.testing.expectEqual(@as(usize, 0), state.active_server_handlers);
 }
 
 test "actor falsifier releases an uncorrelated late response" {

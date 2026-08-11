@@ -172,6 +172,9 @@ case "$mode" in
         libs/cas_runtime/*)
           mark_cas_runtime_consumers
           ;;
+        apps/cas/scripts/cas_app_server_launch.zig|apps/cas/scripts/cas_hook_policy.zig)
+          mark_cas_runtime_consumers
+          ;;
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
           ;;

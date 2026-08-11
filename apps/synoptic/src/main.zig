@@ -661,15 +661,26 @@ fn applyLaunchExclusions(
 ) !void {
     if (!settings.exclusions_enabled) return;
     tool_domain.lock();
-    var outcomes = state.applyAutomaticExclusions(
-        settings,
-        broker,
+    var batch = state.captureAutomaticExclusions(settings) catch |err| {
+        tool_domain.unlock();
+        return err;
+    };
+    tool_domain.unlock();
+    defer batch.deinit();
+    try batch.classify(settings, broker, review_cwd);
+    const requests = try batch.requestsAlloc();
+    defer allocator.free(requests);
+    const results = try broker.synchronizeViewedBatch(
         identity.owner,
         identity.repository,
         identity.number,
         pull_request_id,
-        review_cwd,
-    ) catch |err| {
+        batch.head_oid,
+        requests,
+    );
+    defer allocator.free(results);
+    tool_domain.lock();
+    var outcomes = state.applyAutomaticExclusionResults(&batch, results) catch |err| {
         tool_domain.unlock();
         return err;
     };

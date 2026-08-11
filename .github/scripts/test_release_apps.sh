@@ -99,6 +99,16 @@ write_cas_runtime() {
   printf 'runtime\n' >libs/cas_runtime/root.zig
 }
 
+write_cas_hook_policy_source() {
+  mkdir -p apps/cas/scripts
+  printf 'hook policy\n' >apps/cas/scripts/cas_hook_policy.zig
+}
+
+write_cas_launch_source() {
+  mkdir -p apps/cas/scripts
+  printf 'launch policy\n' >apps/cas/scripts/cas_app_server_launch.zig
+}
+
 write_synoptic() {
   mkdir -p apps/synoptic/src
   printf 'synoptic\n' >apps/synoptic/src/main.zig
@@ -290,6 +300,8 @@ assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
 assert_affected cas,synoptic write_cas_runtime
+assert_affected cas,synoptic write_cas_hook_policy_source
+assert_affected cas,synoptic write_cas_launch_source
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq,cas,ledger,memory-note write_jsonl_core
 assert_affected seq,lift,cas,synoptic,ledger,memory-note,img change_shared_perf_contract
