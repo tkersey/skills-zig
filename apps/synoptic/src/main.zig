@@ -818,9 +818,7 @@ fn serveHttpRuntime(
         pull_request_id,
     );
     runtime.tool_domain = tool_domain;
-    registry.setExclusionsPending(true);
-    errdefer registry.setExclusionsPending(false);
-    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
+    try publishRuntimeReadyWithExclusionGate(&server, &runtime, context.runtime_root, registry);
     var exclusion_work = LaunchExclusionWork.init(
         allocator,
         context.settings,
@@ -845,6 +843,17 @@ fn serveHttpRuntime(
         custody_retirement,
         terminal_error,
     );
+}
+
+fn publishRuntimeReadyWithExclusionGate(
+    server: *http.Server,
+    runtime: *http.Runtime,
+    runtime_root: []const u8,
+    registry: *sessions.Registry,
+) !void {
+    registry.setExclusionsPending(true);
+    errdefer registry.setExclusionsPending(false);
+    try publishRuntimeReady(server.allocator, server.io, server, runtime, runtime_root);
 }
 
 fn configureToolDomain(

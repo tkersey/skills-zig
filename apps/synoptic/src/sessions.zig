@@ -382,30 +382,48 @@ pub const Registry = struct {
             std.Io.Clock.awake.now(io).nanoseconds,
             std.time.ns_per_ms,
         );
-        if (turns.items.len > 0) {
-            const actor = &(self.actor orelse return error.AppServerUnavailable);
-            for (turns.items) |turn| {
-                const params = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"threadId\":{f},\"turnId\":{f}}}",
-                    .{ std.json.fmt(turn.thread, .{}), std.json.fmt(turn.turn, .{}) },
-                );
-                defer self.allocator.free(params);
-                const now = @divFloor(
-                    std.Io.Clock.awake.now(io).nanoseconds,
-                    std.time.ns_per_ms,
-                );
-                if (now - started >= timeout_ms) return error.ActiveReviewCommandsTimeout;
-                const remaining: u32 = @intCast(@as(i128, timeout_ms) - (now - started));
-                const response = actor.requestJson(
-                    "turn/interrupt",
-                    params,
-                    remaining,
-                ) catch return error.TurnInterruptFailed;
-                self.allocator.free(response);
-                self.markInterruptedTurn(turn.thread, turn.turn);
-            }
+        try self.interruptSynchronizationTurns(io, turns.items, started, timeout_ms);
+        try self.waitForSynchronizationQuiescence(io, started, timeout_ms);
+    }
+
+    fn interruptSynchronizationTurns(
+        self: *Registry,
+        io: std.Io,
+        turns: []const TurnRef,
+        started: i128,
+        timeout_ms: u32,
+    ) !void {
+        if (turns.len == 0) return;
+        const actor = &(self.actor orelse return error.AppServerUnavailable);
+        for (turns) |turn| {
+            const params = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"threadId\":{f},\"turnId\":{f}}}",
+                .{ std.json.fmt(turn.thread, .{}), std.json.fmt(turn.turn, .{}) },
+            );
+            defer self.allocator.free(params);
+            const now = @divFloor(
+                std.Io.Clock.awake.now(io).nanoseconds,
+                std.time.ns_per_ms,
+            );
+            if (now - started >= timeout_ms) return error.ActiveReviewCommandsTimeout;
+            const remaining: u32 = @intCast(@as(i128, timeout_ms) - (now - started));
+            const response = actor.requestJson(
+                "turn/interrupt",
+                params,
+                remaining,
+            ) catch return error.TurnInterruptFailed;
+            self.allocator.free(response);
+            self.markInterruptedTurn(turn.thread, turn.turn);
         }
+    }
+
+    fn waitForSynchronizationQuiescence(
+        self: *Registry,
+        io: std.Io,
+        started: i128,
+        timeout_ms: u32,
+    ) !void {
         var quiet_since: ?i128 = null;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.mutex.lock();
