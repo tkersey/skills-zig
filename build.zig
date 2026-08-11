@@ -242,7 +242,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cas_hook_policy", .module = cas_hook_policy_root },
         },
     });
-    const synoptic_meta = addVersionModule(b, @embedFile("apps/synoptic/VERSION"));
+    const synoptic_version = std.mem.trim(
+        u8,
+        @embedFile("apps/synoptic/VERSION"),
+        " \t\r\n",
+    );
+    const synoptic_meta = addVersionModule(b, synoptic_version);
     const synoptic_root = b.createModule(.{
         .root_source_file = b.path("apps/synoptic/src/main.zig"),
         .target = target,
@@ -895,6 +900,14 @@ pub fn build(b: *std.Build) void {
         "Run the complete Synoptic test root once",
     );
     test_synoptic.dependOn(&run_synoptic_tests.step);
+    const synoptic_version_smoke = b.addRunArtifact(synoptic);
+    synoptic_version_smoke.addArg("--version");
+    synoptic_version_smoke.expectStdOutEqual(b.fmt(
+        "synoptic {s}\n",
+        .{synoptic_version},
+    ));
+    synoptic_version_smoke.step.dependOn(&synoptic_install.step);
+    test_synoptic.dependOn(&synoptic_version_smoke.step);
     const test_synoptic_falsifiers = b.step(
         "test-synoptic-falsifiers",
         "Run Synoptic falsifiers",
@@ -935,8 +948,6 @@ pub fn build(b: *std.Build) void {
         "Run owned browser-domain payload and diff continuity fixtures",
     );
     test_synoptic_ui_domain.dependOn(&run_synoptic_ui_domain.step);
-    const build_synoptic = b.step("build-synoptic", "Build the native Synoptic executable");
-    build_synoptic.dependOn(&synoptic_install.step);
     const release_synoptic_safe = b.step(
         "release-synoptic-safe",
         "Build Synoptic with ReleaseSafe optimization",
@@ -1102,6 +1113,13 @@ pub fn build(b: *std.Build) void {
             .build_description = "Build cas binaries",
             .build_deps = cas_build_deps,
             .test_deps = &.{test_cas},
+        },
+        .{
+            .path = b.path("apps/synoptic"),
+            .build_step_name = "build-synoptic",
+            .build_description = "Build the native Synoptic executable",
+            .build_deps = &.{&synoptic_install.step},
+            .test_deps = &.{test_synoptic},
         },
         .{
             .path = b.path("apps/ledger"),

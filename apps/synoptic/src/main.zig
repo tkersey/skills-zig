@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len < 2) return usage();
-    if (std.mem.eql(u8, argv[1], "version")) return printVersion(init.io);
+    if (isVersionCommand(argv[1..])) return printVersion(init.io);
     if (std.mem.eql(u8, argv[1], "capabilities")) return printCapabilities(init.io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "launch")) return launch(
         allocator,
@@ -51,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
         argv[2..],
     );
     return usage();
+}
+
+fn isVersionCommand(args: []const []const u8) bool {
+    if (args.len != 1) return false;
+    return std.mem.eql(u8, args[0], "version") or
+        std.mem.eql(u8, args[0], "--version");
 }
 
 fn printVersion(io: std.Io) !void {
@@ -1934,6 +1940,12 @@ test "launch argv is safe and explicit" {
         },
     );
     try std.testing.expect(options.json);
+}
+test "version command accepts documented and conventional forms only" {
+    try std.testing.expect(isVersionCommand(&.{"version"}));
+    try std.testing.expect(isVersionCommand(&.{"--version"}));
+    try std.testing.expect(!isVersionCommand(&.{}));
+    try std.testing.expect(!isVersionCommand(&.{ "version", "extra" }));
 }
 test "runtime state is owner-private and the launch claim is exclusive" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
