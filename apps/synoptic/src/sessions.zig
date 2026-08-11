@@ -1710,7 +1710,33 @@ pub const Registry = struct {
         if (std.mem.eql(u8, request.method, "item/tool/call")) {
             return self.handleToolCall(request.raw_json, allocator);
         }
-        return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        if (std.mem.eql(u8, request.method, "item/tool/requestUserInput")) {
+            return allocator.dupe(u8, "{\"answers\":{}}");
+        }
+        if (std.mem.eql(u8, request.method, "mcpServer/elicitation/request")) {
+            return allocator.dupe(
+                u8,
+                "{\"action\":\"decline\",\"content\":null,\"_meta\":null}",
+            );
+        }
+        if (std.mem.eql(u8, request.method, "currentTime/read")) {
+            const io = self.io orelse return error.AppServerUnavailable;
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"currentTimeAt\":{d}}}",
+                .{@as(i64, @intCast(@divFloor(
+                    std.Io.Clock.real.now(io).nanoseconds,
+                    std.time.ns_per_s,
+                )))},
+            );
+        }
+        if (std.mem.eql(u8, request.method, "account/chatgptAuthTokens/refresh")) {
+            return error.ChatGptAuthTokensRefreshProviderUnavailable;
+        }
+        if (std.mem.eql(u8, request.method, "attestation/generate")) {
+            return error.AttestationProviderUnavailable;
+        }
+        return error.UnsupportedServerRequest;
     }
 
     fn handleToolCall(
@@ -3406,6 +3432,70 @@ test "file change and unowned approvals decline while sandboxed commands remain 
     defer std.heap.page_allocator.free(ambiguous);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", ambiguous);
     try std.testing.expectEqual(@as(usize, 2), registry.visible_events.items.len);
+}
+
+test "non-approval server requests return method-specific fail-closed results" {
+    var registry = Registry{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer registry.deinit();
+
+    const user_input = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 1 },
+        .method = "item/tool/requestUserInput",
+        .raw_json = "{}",
+    }, std.testing.allocator);
+    defer std.testing.allocator.free(user_input);
+    try std.testing.expectEqualStrings("{\"answers\":{}}", user_input);
+
+    const elicitation = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 2 },
+        .method = "mcpServer/elicitation/request",
+        .raw_json = "{}",
+    }, std.testing.allocator);
+    defer std.testing.allocator.free(elicitation);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"decline\",\"content\":null,\"_meta\":null}",
+        elicitation,
+    );
+
+    const current_time = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 3 },
+        .method = "currentTime/read",
+        .raw_json = "{}",
+    }, std.testing.allocator);
+    defer std.testing.allocator.free(current_time);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        current_time,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("currentTimeAt").? == .integer);
+
+    try std.testing.expectError(
+        error.ChatGptAuthTokensRefreshProviderUnavailable,
+        Registry.onServerRequest(&registry, .{
+            .id = .{ .integer = 4 },
+            .method = "account/chatgptAuthTokens/refresh",
+            .raw_json = "{}",
+        }, std.testing.allocator),
+    );
+    try std.testing.expectError(
+        error.AttestationProviderUnavailable,
+        Registry.onServerRequest(&registry, .{
+            .id = .{ .integer = 5 },
+            .method = "attestation/generate",
+            .raw_json = "{}",
+        }, std.testing.allocator),
+    );
+    try std.testing.expectError(
+        error.UnsupportedServerRequest,
+        Registry.onServerRequest(&registry, .{
+            .id = .{ .integer = 6 },
+            .method = "future/serverRequest",
+            .raw_json = "{}",
+        }, std.testing.allocator),
+    );
 }
 
 test "thread construction fixes review execution to read-only" {
