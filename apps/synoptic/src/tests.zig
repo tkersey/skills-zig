@@ -3223,14 +3223,16 @@ test "worktree integrity safe boundary interrupts active turns before mutation" 
     registry.primary_thread_id = try allocator.dupe(u8, "primary");
     registry.primary_start_turn_id = try allocator.dupe(u8, "primary-turn");
     registry.primary_turn_active = true;
-    try registry.beginSynchronization(io, 200);
-    registry.endSynchronization();
     const log_path = try std.fmt.allocPrint(
         allocator,
         "{s}.log",
         .{codex_path},
     );
     defer allocator.free(log_path);
+    try std.testing.expectError(
+        error.ActiveReviewCommandsTimeout,
+        registry.beginSynchronization(io, 200),
+    );
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(log);
     try std.testing.expect(std.mem.indexOf(

@@ -468,7 +468,6 @@ pub const Registry = struct {
                 remaining,
             ) catch return error.TurnInterruptFailed;
             self.allocator.free(response);
-            self.markInterruptedTurn(turn.thread, turn.turn);
         }
     }
 
@@ -533,23 +532,6 @@ pub const Registry = struct {
         try turns.append(self.allocator, .{ .thread = owned_thread, .turn = owned_turn });
     }
 
-    fn markInterruptedTurn(self: *Registry, thread_id: []const u8, turn_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.primary_thread_id) |primary| {
-            if (std.mem.eql(u8, primary, thread_id) and self.primary_start_turn_id != null and
-                std.mem.eql(u8, self.primary_start_turn_id.?, turn_id))
-            {
-                self.primary_turn_active = false;
-            }
-        }
-        for (self.sessions.items) |*session| {
-            if (!std.mem.eql(u8, session.thread_id, thread_id) or
-                !std.mem.eql(u8, session.turn_id, turn_id)) continue;
-            session.turn_active = false;
-            session.initial_turn_active = false;
-        }
-    }
     pub fn activeCommandCount(self: *Registry) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3114,6 +3096,33 @@ test "completion notifications correlate exact active turn identity" {
             "\"id\":\"current-turn\",\"status\":\"completed\"}}}",
     });
     try std.testing.expect(!registry.sessions.items[0].turn_active);
+}
+
+test "synchronization quiescence requires the interrupted turn terminal event" {
+    const io = std.testing.io;
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.primary_thread_id = try std.testing.allocator.dupe(u8, "primary");
+    registry.primary_start_turn_id = try std.testing.allocator.dupe(u8, "turn");
+    registry.primary_turn_active = true;
+    const started = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        std.time.ns_per_ms,
+    );
+    try std.testing.expectError(
+        error.ActiveReviewCommandsTimeout,
+        registry.waitForSynchronizationQuiescence(io, started, 1),
+    );
+    Registry.onNotification(&registry, .{
+        .method = "turn/completed",
+        .raw_json = "{\"params\":{\"threadId\":\"primary\",\"turn\":{" ++
+            "\"id\":\"turn\",\"status\":\"interrupted\"}}}",
+    });
+    const terminal_started = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        std.time.ns_per_ms,
+    );
+    try registry.waitForSynchronizationQuiescence(io, terminal_started, 100);
 }
 
 test "primary completion ignores stale turn identity" {

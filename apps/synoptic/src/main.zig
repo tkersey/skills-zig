@@ -1907,6 +1907,7 @@ fn repositoryHostAlloc(
 
 fn remoteHostAlloc(allocator: std.mem.Allocator, remote: []const u8) !?[]u8 {
     if (std.mem.indexOf(u8, remote, "://")) |scheme_end| {
+        const scheme = remote[0..scheme_end];
         const authority_start = scheme_end + 3;
         const authority_end = std.mem.indexOfScalarPos(
             u8,
@@ -1915,14 +1916,15 @@ fn remoteHostAlloc(allocator: std.mem.Allocator, remote: []const u8) !?[]u8 {
             '/',
         ) orelse remote.len;
         const authority = remote[authority_start..authority_end];
-        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
-        if (host_start == authority.len) return null;
-        return @as(?[]u8, try allocator.dupe(u8, authority[host_start..]));
+        const host = worktree.normalizeAuthorityHost(authority, scheme) orelse return null;
+        return @as(?[]u8, try allocator.dupe(u8, host));
     }
     const at = std.mem.indexOfScalar(u8, remote, '@') orelse return null;
     const colon = std.mem.indexOfScalarPos(u8, remote, at + 1, ':') orelse return null;
     if (colon == at + 1) return null;
-    return @as(?[]u8, try allocator.dupe(u8, remote[at + 1 .. colon]));
+    const host = worktree.normalizeAuthorityHost(remote[at + 1 .. colon], "ssh") orelse
+        return null;
+    return @as(?[]u8, try allocator.dupe(u8, host));
 }
 fn requireGhAuthentication(
     allocator: std.mem.Allocator,
@@ -2046,6 +2048,18 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
     const ssh = (try remoteHostAlloc(allocator, "git@github.example.test:o/r.git")).?;
     defer allocator.free(ssh);
     try std.testing.expectEqualStrings("github.example.test", ssh);
+    const https_default = (try remoteHostAlloc(
+        allocator,
+        "https://github.example.test:443/o/r.git",
+    )).?;
+    defer allocator.free(https_default);
+    try std.testing.expectEqualStrings("github.example.test", https_default);
+    const ssh_default = (try remoteHostAlloc(
+        allocator,
+        "ssh://git@github.example.test:22/o/r.git",
+    )).?;
+    defer allocator.free(ssh_default);
+    try std.testing.expectEqualStrings("github.example.test", ssh_default);
     const direct = try resolveSelectorUrl(
         allocator,
         io,

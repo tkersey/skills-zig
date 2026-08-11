@@ -1070,7 +1070,7 @@ pub const Server = struct {
                     runtime.app.action_state_fresh = false;
                     return;
                 }
-                copyRevisionEvidence(runtime, &generation) catch {
+                copyRevisionEvidence(&runtime.app.generation, &generation) catch {
                     runtime.app.action_state_fresh = false;
                     return;
                 };
@@ -1200,13 +1200,17 @@ pub const Server = struct {
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         const primary_update = try self.primaryUpdateAlloc(runtime);
         defer self.allocator.free(primary_update);
+        mutex.unlock();
+        locked = false;
+        try runtime.registry.updatePrimary(primary_update);
+        mutex.lock();
+        locked = true;
         runtime.worktree_generation_valid = true;
         runtime.app.action_state_fresh = true;
         mutex.unlock();
         locked = false;
         runtime.registry.endSynchronization();
         synchronizing = false;
-        try runtime.registry.updatePrimary(primary_update);
     }
 
     fn refreshWorktree(
@@ -1528,14 +1532,24 @@ fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool {
 }
 
 fn copyRevisionEvidence(
-    runtime: *Runtime,
+    current: *const @import("domain.zig").PrGeneration,
     generation: *@import("domain.zig").PrGeneration,
 ) !void {
-    const current = &runtime.app.generation;
     for (generation.files.items) |file| {
         const revision = @import("domain.zig").revisionFor(current, file.path) orelse
             return error.MissingRevision;
         try generation.setRevision(file.path, revision);
+        for (current.files.items) |current_file| {
+            if (!std.mem.eql(u8, current_file.path, file.path)) continue;
+            if (current_file.exclusion_reason) |reason| {
+                try generation.setExclusion(
+                    file.path,
+                    reason,
+                    current_file.exclusion_sync_error,
+                );
+            }
+            break;
+        }
     }
 }
 
@@ -1815,6 +1829,41 @@ test "static assets are not state-bearing authorization targets" {
     try std.testing.expect(requiresToken("/api/bootstrap"));
     try std.testing.expect(requiresToken("/api/bootstrap?token=launch"));
     try std.testing.expect(!requiresToken("/api/bootstrap-impersonator"));
+}
+
+test "action refresh preserves local exclusion synchronization evidence" {
+    const allocator = std.testing.allocator;
+    var current = try @import("domain.zig").PrGeneration.initFull(
+        allocator,
+        "base",
+        "head",
+    );
+    defer current.deinit();
+    try current.addFile(.{
+        .path = "vendor/fail.js",
+        .viewed = .unviewed,
+        .revision_key = "revision",
+        .exclusion_reason = "vendored",
+        .exclusion_sync_error = "readback-failed",
+    });
+    var refreshed = try @import("domain.zig").PrGeneration.initFull(
+        allocator,
+        "base",
+        "head",
+    );
+    defer refreshed.deinit();
+    try refreshed.addFile(.{
+        .path = "vendor/fail.js",
+        .viewed = .unviewed,
+        .revision_key = "placeholder",
+    });
+    try copyRevisionEvidence(&current, &refreshed);
+    try std.testing.expectEqualStrings("revision", refreshed.files.items[0].revision_key);
+    try std.testing.expectEqualStrings("vendored", refreshed.files.items[0].exclusion_reason.?);
+    try std.testing.expectEqualStrings(
+        "readback-failed",
+        refreshed.files.items[0].exclusion_sync_error.?,
+    );
 }
 
 test "WebSocket close payload accepts only valid status and UTF-8 reason" {

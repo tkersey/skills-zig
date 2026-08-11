@@ -2211,15 +2211,15 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         state.allocator,
         parsed_id.value,
         result_json,
-    ) catch |err| switch (err) {
-        error.AppServerMessageTooLarge => return actorEnqueueServerError(
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return actorEnqueueServerError(
             state,
             parsed_id.value,
             -32603,
-            "server request handler result exceeds transport limit",
+            "server request handler returned an invalid result",
             work.deadline_ms,
-        ),
-        else => return err,
+        );
     };
     try actorEnqueueOwned(state, payload, work.deadline_ms, true, null);
 }
@@ -2257,7 +2257,15 @@ fn actorServerResultPayloadAlloc(
     if (result_json.len > websocket_transport.max_message_bytes) {
         return error.AppServerMessageTooLarge;
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        result_json,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidServerHandlerResult,
+    };
     defer parsed.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -2304,6 +2312,19 @@ test "server handler result limit includes the JSON-RPC frame" {
     );
 }
 
+test "actor request limit includes the JSON-RPC frame" {
+    const allocator = std.testing.allocator;
+    const raw = try allocator.alloc(u8, websocket_transport.max_message_bytes - 1);
+    defer allocator.free(raw);
+    @memset(raw, 'a');
+    raw[0] = '"';
+    raw[raw.len - 1] = '"';
+    try std.testing.expectError(
+        error.AppServerMessageTooLarge,
+        actorRequestPayloadAlloc(allocator, 1, "turn/start", raw),
+    );
+}
+
 fn actorRequestPayloadAlloc(
     allocator: std.mem.Allocator,
     id: i64,
@@ -2324,6 +2345,9 @@ fn actorRequestPayloadAlloc(
         try std.json.Stringify.value(parsed.value, .{}, &output.writer);
     }
     try output.writer.writeByte('}');
+    if (output.written().len > websocket_transport.max_message_bytes) {
+        return error.AppServerMessageTooLarge;
+    }
     return allocator.dupe(u8, output.written());
 }
 
@@ -4207,6 +4231,18 @@ const ServerRequestProbe = struct {
     }
 };
 
+const InvalidServerResultProbe = struct {
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        _ = context;
+        _ = request;
+        return allocator.dupe(u8, "not-json");
+    }
+};
+
 const LateServerRequestProbe = struct {
     fn handle(
         context: *anyopaque,
@@ -4315,6 +4351,31 @@ test "actor falsifier dispatches server requests through configured handler and 
     defer allocator.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":true") != null);
+}
+
+test "actor contains malformed handler output to the originating server request" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "server_request");
+    defer fixture.deinit();
+    var probe = InvalidServerResultProbe{};
+    var actor = try fixture.start(.{
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = InvalidServerResultProbe.handle,
+        },
+    });
+    defer actor.deinit();
+    const result = try actor.requestJson("actor/server-request", "{}", 2_000);
+    defer allocator.free(result);
+    const reply = try fixture.tmp.dir.readFileAlloc(
+        std.testing.io,
+        "reply.json",
+        allocator,
+        .limited(4 * 1024),
+    );
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"code\":-32603") != null);
 }
 
 test "actor server requests make independent bounded progress" {

@@ -811,7 +811,9 @@ pub const App = struct {
         batch: *const AutomaticExclusionBatch,
         results: []const github.Broker.ViewedBatchResult,
     ) !std.ArrayList(ExclusionOutcome) {
-        if (!std.mem.eql(u8, self.generation.head_oid, batch.head_oid)) {
+        if (!std.mem.eql(u8, self.generation.base_oid, batch.base_oid) or
+            !std.mem.eql(u8, self.generation.head_oid, batch.head_oid))
+        {
             return error.ExclusionGenerationChanged;
         }
         var outcomes: std.ArrayList(ExclusionOutcome) = .empty;
@@ -1014,6 +1016,24 @@ test "close and completion are different transitions" {
     defer std.testing.allocator.free(event);
     app.close();
     try std.testing.expect(app.generation.queued("a"));
+}
+
+test "automatic exclusion results bind the complete base head generation" {
+    const allocator = std.testing.allocator;
+    var state = try App.init(allocator, "head");
+    defer state.deinit();
+    const current = try domain.PrGeneration.initFull(allocator, "base-b", "head");
+    state.replaceGeneration(current);
+    var batch = AutomaticExclusionBatch{
+        .allocator = allocator,
+        .base_oid = try allocator.dupe(u8, "base-a"),
+        .head_oid = try allocator.dupe(u8, "head"),
+    };
+    defer batch.deinit();
+    try std.testing.expectError(
+        error.ExclusionGenerationChanged,
+        state.applyAutomaticExclusionResults(&batch, &.{}),
+    );
 }
 
 test "action invalidation updates the application snapshot" {

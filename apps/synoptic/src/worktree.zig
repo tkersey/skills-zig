@@ -106,7 +106,7 @@ fn remoteMatchesRepository(
         std.ascii.eqlIgnoreCase(path[separator + 1 ..], repository);
 }
 
-fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]const u8 {
+pub fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]const u8 {
     const start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
     const host_port = authority[start..];
     if (host_port.len == 0) return null;
@@ -993,9 +993,7 @@ fn spawnFetchProcess(
     else
         std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CONFIG_COUNT", "1");
-    try environment.put("GIT_CONFIG_KEY_0", "remote.synoptic-exact.url");
-    try environment.put("GIT_CONFIG_VALUE_0", source.url);
+    try appendFetchRemoteConfig(&environment, source.url);
     var argv_buffer: [7][]const u8 = undefined;
     const argv: []const []const u8 = switch (operation) {
         .object => |oid| argv: {
@@ -1023,6 +1021,63 @@ fn spawnFetchProcess(
         .stderr = .pipe,
         .pgid = 0,
     });
+}
+
+fn appendFetchRemoteConfig(
+    environment: *std.process.Environ.Map,
+    url: []const u8,
+) !void {
+    const count_text = environment.get("GIT_CONFIG_COUNT") orelse "0";
+    const index = std.fmt.parseInt(usize, count_text, 10) catch
+        return error.InvalidGitConfigCount;
+    if (index >= 4096) return error.InvalidGitConfigCount;
+    var key_name_buffer: [64]u8 = undefined;
+    const key_name = try std.fmt.bufPrint(
+        &key_name_buffer,
+        "GIT_CONFIG_KEY_{d}",
+        .{index},
+    );
+    var value_name_buffer: [64]u8 = undefined;
+    const value_name = try std.fmt.bufPrint(
+        &value_name_buffer,
+        "GIT_CONFIG_VALUE_{d}",
+        .{index},
+    );
+    var next_count_buffer: [32]u8 = undefined;
+    const next_count = try std.fmt.bufPrint(
+        &next_count_buffer,
+        "{d}",
+        .{index + 1},
+    );
+    try environment.put(key_name, "remote.synoptic-exact.url");
+    try environment.put(value_name, url);
+    try environment.put("GIT_CONFIG_COUNT", next_count);
+}
+
+test "fetch remote config appends after inherited Git command configuration" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("GIT_CONFIG_COUNT", "1");
+    try environment.put("GIT_CONFIG_KEY_0", "http.extraHeader");
+    try environment.put("GIT_CONFIG_VALUE_0", "Authorization: exact");
+    try appendFetchRemoteConfig(&environment, "https://github.example/o/r.git");
+    try std.testing.expectEqualStrings("2", environment.get("GIT_CONFIG_COUNT").?);
+    try std.testing.expectEqualStrings(
+        "http.extraHeader",
+        environment.get("GIT_CONFIG_KEY_0").?,
+    );
+    try std.testing.expectEqualStrings(
+        "Authorization: exact",
+        environment.get("GIT_CONFIG_VALUE_0").?,
+    );
+    try std.testing.expectEqualStrings(
+        "remote.synoptic-exact.url",
+        environment.get("GIT_CONFIG_KEY_1").?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://github.example/o/r.git",
+        environment.get("GIT_CONFIG_VALUE_1").?,
+    );
 }
 
 fn terminateFetchProcess(
