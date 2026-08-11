@@ -83,7 +83,6 @@ pub const App = struct {
     primary_ready: bool = false,
     seq: u64 = 0,
     open_path: ?[]u8 = null,
-    completed_tab_open: bool = false,
     pending: ?tools.ActionCard = null,
     official_revision: ?[]u8 = null,
     initial_review_active: bool = false,
@@ -511,7 +510,6 @@ pub const App = struct {
             path,
         )) return error.MarkViewedReadbackFailed;
         try self.generation.markViewed(path);
-        self.completed_tab_open = true;
         for (self.tabs.items) |*tab| {
             if (tab.status == .current and std.mem.eql(u8, tab.path, path)) tab.status = .completed;
         }
@@ -552,7 +550,6 @@ pub const App = struct {
             if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and
                 tab.status == .current) tab.status = .completed;
         }
-        self.completed_tab_open = true;
     }
 
     pub fn close(self: *App) void {
@@ -724,12 +721,17 @@ pub const App = struct {
         }
         try out.writer.print("],\"completedTabOpen\":{},\"actionStateFresh\":{},\"se" ++
             "q\":{d},\"round\":{d}}}", .{
-            self.completed_tab_open,
+            self.hasOpenCompletedTab(),
             self.action_state_fresh,
             self.seq,
             self.round,
         });
         return out.toOwnedSlice();
+    }
+
+    fn hasOpenCompletedTab(self: *const App) bool {
+        for (self.tabs.items) |tab| if (tab.status == .completed) return true;
+        return false;
     }
 
     fn writePullRequest(self: *const App, writer: *std.Io.Writer) !void {

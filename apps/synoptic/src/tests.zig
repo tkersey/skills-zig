@@ -1130,6 +1130,10 @@ test "ambiguous complete-file mutation succeeds only through viewed readback" {
         .viewed = .unviewed,
         .revision_key = "r1",
     });
+    state.primary_ready = true;
+    const opened = try state.openFile("a.zig");
+    allocator.free(opened);
+    try state.recordOpenedSession("a.zig", "r1", "session-1", "", false, true);
     try state.completeRevision(
         .{ .allocator = allocator, .io = io, .gh_path = gh_path },
         "o",
@@ -1140,7 +1144,13 @@ test "ambiguous complete-file mutation succeeds only through viewed readback" {
         "r1",
     );
     try std.testing.expect(!state.generation.queued("a.zig"));
-    try std.testing.expect(state.completed_tab_open);
+    const completed = try state.bootstrapAlloc();
+    defer allocator.free(completed);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\"completedTabOpen\":true") != null);
+    try state.closeTabById("session-1");
+    const closed = try state.bootstrapAlloc();
+    defer allocator.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"completedTabOpen\":false") != null);
 }
 
 fn verifyAmbiguousActions(

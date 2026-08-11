@@ -235,6 +235,7 @@ pub const Registry = struct {
     visible_events: std.ArrayList(VisibleEvent) = .empty,
     active_command_ids: std.ArrayList([]u8) = .empty,
     completed_turn_ids: std.ArrayList([]u8) = .empty,
+    primary_terminals: std.ArrayList(PrimaryTerminal) = .empty,
     approvals: std.ArrayList(PendingApproval) = .empty,
     synchronizing: bool = false,
     exclusions_pending: bool = false,
@@ -249,6 +250,11 @@ pub const Registry = struct {
     visible_overflow_session_id: ?[]u8 = null,
 
     const PrimaryFailure = enum { failed, interrupted };
+    const PrimaryTerminalStatus = enum { completed, failed, interrupted };
+    const PrimaryTerminal = struct {
+        turn_id: []u8,
+        status: PrimaryTerminalStatus,
+    };
     const Transport = enum { websocket, stdio };
 
     pub fn start(
@@ -342,6 +348,8 @@ pub const Registry = struct {
         self.active_command_ids.deinit(self.allocator);
         for (self.completed_turn_ids.items) |id| self.allocator.free(id);
         self.completed_turn_ids.deinit(self.allocator);
+        for (self.primary_terminals.items) |terminal| self.allocator.free(terminal.turn_id);
+        self.primary_terminals.deinit(self.allocator);
         for (self.approvals.items) |*approval| approval.deinit(self.allocator);
         self.approvals.deinit(self.allocator);
     }
@@ -601,12 +609,7 @@ pub const Registry = struct {
         const primary_turn = try extractString(self.allocator, turn, &.{ "turn", "id" });
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.primary_start_turn_id = primary_turn;
-        self.primary_turn_active = self.latest_primary_turn_id == null or !std.mem.eql(
-            u8,
-            self.latest_primary_turn_id.?,
-            primary_turn,
-        );
+        self.installPrimaryTurnLocked(primary_turn);
     }
 
     pub fn primaryReady(self: *Registry) bool {
@@ -1439,13 +1442,7 @@ pub const Registry = struct {
         const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.primary_start_turn_id) |old| self.allocator.free(old);
-        self.primary_start_turn_id = next_turn;
-        self.primary_turn_active = self.latest_primary_turn_id == null or !std.mem.eql(
-            u8,
-            self.latest_primary_turn_id.?,
-            next_turn,
-        );
+        self.installPrimaryTurnLocked(next_turn);
     }
 
     fn onNotification(context: *anyopaque, notification: cas_runtime.Notification) void {
@@ -1599,7 +1596,7 @@ pub const Registry = struct {
             self.allocator.free(turn_id);
             return;
         };
-        const status = extractString(
+        const status_text = extractString(
             self.allocator,
             raw_json,
             &.{ "params", "turn", "status" },
@@ -1607,34 +1604,73 @@ pub const Registry = struct {
             self.allocator.free(turn_id);
             return;
         };
-        defer self.allocator.free(status);
+        defer self.allocator.free(status_text);
         defer self.allocator.free(thread_id);
+        const status = primaryTerminalStatus(status_text);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.primary_thread_id) |primary| if (std.mem.eql(u8, primary, thread_id)) {
             if (self.primary_start_turn_id == null or
                 !std.mem.eql(u8, self.primary_start_turn_id.?, turn_id))
             {
-                self.allocator.free(turn_id);
+                self.cachePrimaryTerminalLocked(.{ .turn_id = turn_id, .status = status });
                 return;
             }
-            self.primary_turn_active = false;
-            if (!std.mem.eql(u8, status, "completed")) {
-                self.primary_failure_status = if (std.mem.eql(u8, status, "interrupted"))
-                    .interrupted
-                else
-                    .failed;
-                self.primary_failure_reported = false;
-                self.allocator.free(turn_id);
-                return;
-            }
-            if (self.latest_primary_turn_id) |old| self.allocator.free(old);
-            self.latest_primary_turn_id = turn_id;
-            self.primary_failure_status = null;
-            self.primary_failure_reported = false;
+            self.applyPrimaryTerminalLocked(.{ .turn_id = turn_id, .status = status });
             return;
         };
         self.allocator.free(turn_id);
+    }
+
+    fn primaryTerminalStatus(status: []const u8) PrimaryTerminalStatus {
+        if (std.mem.eql(u8, status, "completed")) return .completed;
+        if (std.mem.eql(u8, status, "interrupted")) return .interrupted;
+        return .failed;
+    }
+
+    fn installPrimaryTurnLocked(self: *Registry, turn_id: []u8) void {
+        if (self.primary_start_turn_id) |old| self.allocator.free(old);
+        self.primary_start_turn_id = turn_id;
+        for (self.primary_terminals.items, 0..) |terminal, index| {
+            if (!std.mem.eql(u8, terminal.turn_id, turn_id)) continue;
+            self.applyPrimaryTerminalLocked(self.primary_terminals.orderedRemove(index));
+            return;
+        }
+        self.primary_turn_active = self.latest_primary_turn_id == null or !std.mem.eql(
+            u8,
+            self.latest_primary_turn_id.?,
+            turn_id,
+        );
+    }
+
+    fn cachePrimaryTerminalLocked(self: *Registry, terminal: PrimaryTerminal) void {
+        for (self.primary_terminals.items) |*existing| {
+            if (!std.mem.eql(u8, existing.turn_id, terminal.turn_id)) continue;
+            existing.status = terminal.status;
+            self.allocator.free(terminal.turn_id);
+            return;
+        }
+        if (self.primary_terminals.items.len >= 32) {
+            self.allocator.free(self.primary_terminals.orderedRemove(0).turn_id);
+        }
+        self.primary_terminals.append(self.allocator, terminal) catch
+            self.allocator.free(terminal.turn_id);
+    }
+
+    fn applyPrimaryTerminalLocked(self: *Registry, terminal: PrimaryTerminal) void {
+        self.primary_turn_active = false;
+        self.primary_failure_reported = false;
+        if (terminal.status != .completed) {
+            self.primary_failure_status = if (terminal.status == .interrupted)
+                .interrupted
+            else
+                .failed;
+            self.allocator.free(terminal.turn_id);
+            return;
+        }
+        if (self.latest_primary_turn_id) |old| self.allocator.free(old);
+        self.latest_primary_turn_id = terminal.turn_id;
+        self.primary_failure_status = null;
     }
 
     fn sessionForNotificationLocked(self: *Registry, raw: []const u8) !?[]u8 {
@@ -2912,6 +2948,23 @@ test "failed or interrupted primary turns never advance the fork checkpoint" {
     );
     try std.testing.expect(registry.primaryReady());
     try std.testing.expectEqualStrings("t3", registry.latest_primary_turn_id.?);
+}
+
+test "primary turn installation reconciles an earlier terminal notification" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.primary_thread_id = try std.testing.allocator.dupe(u8, "primary");
+    registry.recordPrimaryCompletion(
+        "{\"params\":{\"threadId\":\"primary\",\"turn\":{" ++
+            "\"id\":\"early\",\"status\":\"completed\"}}}",
+    );
+    try std.testing.expect(!registry.primaryReady());
+    registry.mutex.lock();
+    registry.installPrimaryTurnLocked(try std.testing.allocator.dupe(u8, "early"));
+    registry.mutex.unlock();
+    try std.testing.expect(registry.primaryReady());
+    try std.testing.expectEqualStrings("early", registry.latest_primary_turn_id.?);
+    try std.testing.expect(!registry.primary_turn_active);
 }
 
 test "completion notifications correlate exact active turn identity" {
