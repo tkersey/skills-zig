@@ -319,6 +319,7 @@ pub const App = struct {
         pull_request_id: []const u8,
         session_path: []const u8,
     ) !tools.ActionCard {
+        const resolved_path = try self.actionTargetPath(input, session_path);
         const comment_body_snapshot = try self.commentBodySnapshot(input);
         const card = try self.action_store.prepare(
             session_id,
@@ -330,11 +331,42 @@ pub const App = struct {
                 .pull_request_id = pull_request_id,
                 .head_oid = self.generation.head_oid,
                 .session_path = session_path,
+                .resolved_path = resolved_path,
                 .comment_body_snapshot = comment_body_snapshot,
             },
         );
         self.pending = card.*;
         return card.*;
+    }
+
+    fn actionTargetPath(
+        self: *const App,
+        input: tools.PreparedActionInput,
+        session_path: []const u8,
+    ) !?[]const u8 {
+        if (input.thread_id) |thread_id| {
+            for (self.generation.threads.items) |thread| {
+                if (!std.mem.eql(u8, thread.id, thread_id)) continue;
+                if (!std.mem.eql(u8, thread.path, session_path)) {
+                    return error.ActionTargetsAnotherSession;
+                }
+                return thread.path;
+            }
+            return error.GitHubActionTargetMissing;
+        }
+        if (input.comment_id) |comment_id| {
+            for (self.generation.threads.items) |thread| {
+                for (thread.comments) |comment| {
+                    if (!std.mem.eql(u8, comment.id, comment_id)) continue;
+                    if (!std.mem.eql(u8, thread.path, session_path)) {
+                        return error.ActionTargetsAnotherSession;
+                    }
+                    return thread.path;
+                }
+            }
+            return error.GitHubActionTargetMissing;
+        }
+        return input.path;
     }
 
     fn commentBodySnapshot(

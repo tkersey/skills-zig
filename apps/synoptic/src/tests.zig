@@ -73,7 +73,49 @@ test "comment mutation cards own the server-observed body snapshot" {
         "observed body",
         card.target.comment_body_snapshot.?,
     );
+    try std.testing.expectEqualStrings("a.zig", card.target.path.?);
     try std.testing.expectEqualStrings("replacement body", card.body.?);
+}
+
+test "thread and comment actions bind to the originating file session" {
+    var state = try app.App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    const comments = [_]domain.ReviewComment{.{
+        .id = "C_other",
+        .body = "other",
+        .created_at = "2026-01-01T00:00:00Z",
+        .url = "https://example/C_other",
+        .author = "viewer",
+        .viewer_did_author = true,
+        .review_id = "R_1",
+        .review_state = "COMMENTED",
+    }};
+    try state.generation.addThread(.{
+        .id = "T_other",
+        .path = "b.zig",
+        .comments = &comments,
+    });
+    try std.testing.expectError(
+        error.ActionTargetsAnotherSession,
+        state.prepareModelAction("s", "t", .{
+            .slot = @constCast("reply"),
+            .kind = .reply_thread,
+            .effect_summary = @constCast("Reply"),
+            .payload_json = @constCast("{}"),
+            .thread_id = @constCast("T_other"),
+            .body = @constCast("body"),
+        }, "o/r", 1, "PR_1", "a.zig"),
+    );
+    try std.testing.expectError(
+        error.ActionTargetsAnotherSession,
+        state.prepareModelAction("s", "t", .{
+            .slot = @constCast("delete"),
+            .kind = .delete_comment,
+            .effect_summary = @constCast("Delete"),
+            .payload_json = @constCast("{}"),
+            .comment_id = @constCast("C_other"),
+        }, "o/r", 1, "PR_1", "a.zig"),
+    );
 }
 
 test "complete GitHub snapshot replacement refreshes all PR metadata" {
@@ -818,6 +860,7 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
         .pull_request_id = "PR_1",
         .head_oid = "h",
         .session_path = "a.zig",
+        .resolved_path = "a.zig",
         .comment_body_snapshot = "old",
     };
     var store = tools.ActionStore{ .allocator = allocator };
@@ -901,6 +944,7 @@ test "comment action validation rejects a changed body found by nested paginatio
         .pull_request_id = "PR_1",
         .head_oid = "h",
         .session_path = "a.zig",
+        .resolved_path = "a.zig",
         .comment_body_snapshot = "observed body",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -1592,6 +1636,68 @@ test "exclusions config mutation readback and failure retention across generatio
         base,
         head,
     );
+}
+
+test "viewed mutation crossing generation is compensated and read back" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-viewed-race" });
+    defer allocator.free(gh_path);
+    const state_path = try std.fs.path.join(allocator, &.{ root, "viewed" });
+    defer allocator.free(state_path);
+    const reads_path = try std.fs.path.join(allocator, &.{ root, "reads" });
+    defer allocator.free(reads_path);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "log" });
+    defer allocator.free(log_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(cat)\nprintf '%s\\n' \"$input\" >> {s}\n" ++
+            "if printf '%s' \"$input\" | grep -q SynopticMarkFileViewed; then " ++
+            "touch {s}; printf '%s\\n' '{{\"data\":{{\"markFileAsViewed\":" ++
+            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
+            "if printf '%s' \"$input\" | grep -q SynopticUnmarkFileViewed; then " ++
+            "rm -f {s}; printf '%s\\n' '{{\"data\":{{\"unmarkFileAsViewed\":" ++
+            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
+            "reads=0; [ -f {s} ] && reads=$(cat {s}); reads=$((reads + 1)); " ++
+            "printf '%s' \"$reads\" > {s}; head=old; " ++
+            "[ \"$reads\" -gt 1 ] && head=new; viewed=UNVIEWED; " ++
+            "[ -f {s} ] && viewed=VIEWED; printf '{{\"data\":{{\"repository\":" ++
+            "{{\"pullRequest\":{{\"headRefOid\":\"%s\",\"files\":" ++
+            "{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
+            "\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
+            "\"endCursor\":null}}}}}}}}}}}}\\n' \"$head\" \"$viewed\"\n",
+        .{ log_path, state_path, state_path, reads_path, reads_path, reads_path, state_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-viewed-race", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    const requests = [_]github.Broker.ViewedBatchRequest{.{
+        .path = "a.zig",
+        .client_id = "mark-1",
+    }};
+    try std.testing.expectError(
+        error.PullRequestChanged,
+        broker.synchronizeViewedBatch("o", "r", 1, "PR_1", "old", &requests),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "viewed", .{}),
+    );
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(64 * 1024));
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, log, "SynopticFileState"));
 }
 
 fn verifyExclusionState(

@@ -279,8 +279,8 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const node = parsed.value.object.get("data").?.object.get("node").?.object;
-            const info = node.get("comments").?.object.get("pageInfo").?.object;
+            const comments = try nodeComments(parsed.value);
+            const info = comments.get("pageInfo").?.object;
             if (!info.get("hasNextPage").?.bool) return;
             const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
             self.allocator.free(cursor);
@@ -384,6 +384,7 @@ pub const Broker = struct {
             owner,
             name,
             number,
+            pull_request_id,
             expected_head,
             requests,
             results,
@@ -411,6 +412,7 @@ pub const Broker = struct {
         owner: []const u8,
         name: []const u8,
         number: u64,
+        pull_request_id: []const u8,
         expected_head: []const u8,
         requests: []const ViewedBatchRequest,
         results: []ViewedBatchResult,
@@ -435,7 +437,17 @@ pub const Broker = struct {
             requests,
             results,
         ) catch |err| {
-            if (err == error.PullRequestChanged) return err;
+            if (err == error.PullRequestChanged) {
+                try reconciliation.compensateViewedBatch(
+                    owner,
+                    name,
+                    number,
+                    pull_request_id,
+                    requests,
+                    results,
+                );
+                return err;
+            }
             for (results) |*result| result.error_name = @errorName(err);
             return;
         };
@@ -446,6 +458,36 @@ pub const Broker = struct {
                 result.error_name = "MarkViewedReadbackFailed";
             }
         }
+    }
+
+    fn compensateViewedBatch(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        requests: []const ViewedBatchRequest,
+        results: []ViewedBatchResult,
+    ) !void {
+        for (requests, results) |request, result| {
+            const may_have_reached = result.error_name == null or std.mem.eql(
+                u8,
+                result.error_name.?,
+                "GitHubTransportAmbiguous",
+            );
+            if (!may_have_reached) continue;
+            const client_id = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-compensate",
+                .{request.client_id},
+            );
+            defer self.allocator.free(client_id);
+            self.unmarkViewedWithId(pull_request_id, request.path, client_id) catch
+                return error.ViewedCompensationFailed;
+        }
+        var pages = try self.callPages(graphql.file_state_query, "files", owner, name, number);
+        defer freePages(self.allocator, &pages);
+        try validateUnviewedPaths(self.allocator, pages.items, requests);
     }
 
     pub fn synchronizeViewed(
@@ -474,6 +516,28 @@ pub const Broker = struct {
             expected_head,
             path,
         ) catch |err| {
+            if (err == error.PullRequestChanged and (mutation_error == null or std.mem.eql(
+                u8,
+                mutation_error.?,
+                "GitHubTransportAmbiguous",
+            ))) {
+                var requests = [_]ViewedBatchRequest{.{
+                    .path = path,
+                    .client_id = client_id,
+                }};
+                var results = [_]ViewedBatchResult{.{ .error_name = mutation_error }};
+                reconciliation.compensateViewedBatch(
+                    owner,
+                    name,
+                    number,
+                    pull_request_id,
+                    &requests,
+                    &results,
+                ) catch |compensation_error| return .{
+                    .viewed = false,
+                    .error_name = @errorName(compensation_error),
+                };
+            }
             return .{ .viewed = false, .error_name = @errorName(err) };
         };
         return .{
@@ -628,6 +692,8 @@ pub const Broker = struct {
     ) !void {
         for (threads) |node| {
             const thread = node.object;
+            const target_path = card.target.path orelse return error.ActionTargetMismatch;
+            if (!std.mem.eql(u8, thread.get("path").?.string, target_path)) continue;
             const thread_action = switch (card.kind) {
                 .reply_thread, .resolve_thread, .unresolve_thread => true,
                 else => false,
@@ -808,8 +874,7 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const comments = parsed.value.object.get("data").?.object
-                .get("node").?.object.get("comments").?.object;
+            const comments = try nodeComments(parsed.value);
             for (comments.get("nodes").?.array.items) |value| {
                 const comment = value.object;
                 if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
@@ -871,8 +936,7 @@ pub const Broker = struct {
                 .{},
             );
             defer parsed.deinit();
-            const comments = parsed.value.object.get("data").?.object
-                .get("node").?.object.get("comments").?.object;
+            const comments = try nodeComments(parsed.value);
             if (try commentsObserve(
                 self.io,
                 comments.get("nodes").?.array.items,
@@ -1105,6 +1169,34 @@ fn validateBatchPaths(
     for (found) |present| if (!present) return error.ExclusionPathNotCurrent;
 }
 
+fn validateUnviewedPaths(
+    allocator: std.mem.Allocator,
+    pages: []const []const u8,
+    requests: []const Broker.ViewedBatchRequest,
+) !void {
+    const found = try allocator.alloc(bool, requests.len);
+    defer allocator.free(found);
+    @memset(found, false);
+    for (pages) |page| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
+        defer parsed.deinit();
+        const pull = try pullObject(parsed.value);
+        for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
+            const path = node.object.get("path").?.string;
+            for (requests, 0..) |request, index| {
+                if (!std.mem.eql(u8, request.path, path)) continue;
+                found[index] = true;
+                if (std.mem.eql(
+                    u8,
+                    node.object.get("viewerViewedState").?.string,
+                    "VIEWED",
+                )) return error.ViewedCompensationFailed;
+            }
+        }
+    }
+    for (found) |present| if (!present) return error.ViewedCompensationFailed;
+}
+
 fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
     const info_value = comments.get("pageInfo") orelse return null;
     if (info_value != .object) return null;
@@ -1113,6 +1205,18 @@ fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
     if (has_next != .bool or !has_next.bool) return null;
     const cursor = info.get("endCursor") orelse return null;
     return if (cursor == .string) cursor.string else null;
+}
+
+fn nodeComments(value: std.json.Value) !std.json.ObjectMap {
+    if (value != .object) return error.InvalidGitHubResponse;
+    const data = value.object.get("data") orelse return error.InvalidGitHubResponse;
+    if (data != .object) return error.InvalidGitHubResponse;
+    const node = data.object.get("node") orelse return error.InvalidGitHubResponse;
+    if (node == .null) return error.GitHubActionTargetMissing;
+    if (node != .object) return error.InvalidGitHubResponse;
+    const comments = node.object.get("comments") orelse return error.InvalidGitHubResponse;
+    if (comments != .object) return error.InvalidGitHubResponse;
+    return comments.object;
 }
 
 fn commentsObserve(
@@ -1464,6 +1568,17 @@ fn optionalU32(value: ?std.json.Value) ?u32 {
 fn optionalString(value: ?std.json.Value) ?[]const u8 {
     const v = value orelse return null;
     return if (v == .null) null else v.string;
+}
+
+test "nullable nested review thread node is a typed missing-target error" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"data\":{\"node\":null}}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(error.GitHubActionTargetMissing, nodeComments(parsed.value));
 }
 
 pub fn hydrateRevisionKeys(

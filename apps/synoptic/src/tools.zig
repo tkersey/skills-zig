@@ -106,6 +106,7 @@ pub const AuthoritativeTarget = struct {
     pull_request_id: []const u8,
     head_oid: []const u8,
     session_path: []const u8,
+    resolved_path: ?[]const u8 = null,
     comment_body_snapshot: ?[]const u8 = null,
 };
 
@@ -246,6 +247,10 @@ pub const ActionStore = struct {
         const id = try std.fmt.allocPrint(self.allocator, "act-{d}", .{self.next_id});
         errdefer self.allocator.free(id);
         self.next_id += 1;
+        const resolved_path: ?[]const u8 = if (authoritative.resolved_path) |path|
+            path
+        else
+            input.path;
         var card = ActionCard{
             .id = id,
             .session_id = try self.allocator.dupe(u8, session_id),
@@ -258,7 +263,7 @@ pub const ActionStore = struct {
                 .pull_request = authoritative.pull_request,
                 .pull_request_id = try self.allocator.dupe(u8, authoritative.pull_request_id),
                 .head_oid = try self.allocator.dupe(u8, authoritative.head_oid),
-                .path = try dupeOptional(self.allocator, input.path),
+                .path = try dupeOptional(self.allocator, resolved_path),
                 .line = input.line,
                 .start_line = input.start_line,
                 .side = if (input.kind == .add_inline_comment)
