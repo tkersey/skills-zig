@@ -1370,25 +1370,27 @@ pub const Registry = struct {
 
     pub fn interrupt(self: *Registry, session_id: []const u8) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
-        self.mutex.lock();
-        var thread_id: ?[]u8 = null;
-        var turn_id: ?[]u8 = null;
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id) and
-            session.status != .closed)
-        {
-            thread_id = try self.allocator.dupe(u8, session.thread_id);
-            turn_id = try self.allocator.dupe(u8, session.turn_id);
-            break;
+        const ids = ids: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id) and
+                session.status != .closed)
+            {
+                const thread_id = try self.allocator.dupe(u8, session.thread_id);
+                errdefer self.allocator.free(thread_id);
+                const turn_id = try self.allocator.dupe(u8, session.turn_id);
+                break :ids .{ .thread = thread_id, .turn = turn_id };
+            };
+            return error.UnknownSession;
         };
-        self.mutex.unlock();
-        defer if (thread_id) |v| self.allocator.free(v);
-        defer if (turn_id) |v| self.allocator.free(v);
+        defer self.allocator.free(ids.thread);
+        defer self.allocator.free(ids.turn);
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"threadId\":{f},\"turnId\":{f}}}",
             .{
-                std.json.fmt(thread_id orelse return error.UnknownSession, .{}),
-                std.json.fmt(turn_id orelse return error.NoActiveTurn, .{}),
+                std.json.fmt(ids.thread, .{}),
+                std.json.fmt(ids.turn, .{}),
             },
         );
         defer self.allocator.free(params);

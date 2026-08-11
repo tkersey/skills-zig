@@ -2207,11 +2207,20 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         );
     defer state.allocator.free(result_json);
     if (monotonicMillis() >= work.deadline_ms) return error.RequestDeadlineExceeded;
-    const payload = try actorServerResultPayloadAlloc(
+    const payload = actorServerResultPayloadAlloc(
         state.allocator,
         parsed_id.value,
         result_json,
-    );
+    ) catch |err| switch (err) {
+        error.AppServerMessageTooLarge => return actorEnqueueServerError(
+            state,
+            parsed_id.value,
+            -32603,
+            "server request handler result exceeds transport limit",
+            work.deadline_ms,
+        ),
+        else => return err,
+    };
     try actorEnqueueOwned(state, payload, work.deadline_ms, true, null);
 }
 
@@ -2257,6 +2266,9 @@ fn actorServerResultPayloadAlloc(
     try output.writer.writeAll(",\"result\":");
     try std.json.Stringify.value(parsed.value, .{}, &output.writer);
     try output.writer.writeByte('}');
+    if (output.written().len > websocket_transport.max_message_bytes) {
+        return error.AppServerMessageTooLarge;
+    }
     return allocator.dupe(u8, output.written());
 }
 
@@ -2275,6 +2287,21 @@ test "server handler result must be one valid JSON value before framing" {
     ) catch return;
     std.testing.allocator.free(invalid);
     return error.ExpectedInvalidJsonResult;
+}
+
+test "server handler result limit includes the JSON-RPC frame" {
+    const allocator = std.testing.allocator;
+    const raw = try allocator.alloc(u8, websocket_transport.max_message_bytes - 1);
+    defer allocator.free(raw);
+    @memset(raw, 'a');
+    raw[0] = '"';
+    raw[raw.len - 1] = '"';
+    var parsed_id = try std.json.parseFromSlice(std.json.Value, allocator, "\"tool-1\"", .{});
+    defer parsed_id.deinit();
+    try std.testing.expectError(
+        error.AppServerMessageTooLarge,
+        actorServerResultPayloadAlloc(allocator, parsed_id.value, raw),
+    );
 }
 
 fn actorRequestPayloadAlloc(

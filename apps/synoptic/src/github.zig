@@ -980,7 +980,7 @@ pub const Broker = struct {
     ) !ReconciliationBaseline {
         var baseline = ReconciliationBaseline{ .allocator = self.allocator };
         errdefer baseline.deinit();
-        if (card.kind != .add_inline_comment) return baseline;
+        if (card.kind != .add_inline_comment and card.kind != .reply_thread) return baseline;
         var pages = try self.callPages(
             graphql.reconcile_query,
             "reviewThreads",
@@ -1001,10 +1001,18 @@ pub const Broker = struct {
             for (nodes.array.items) |value| {
                 if (value != .object) return error.InvalidSnapshot;
                 const thread = value.object;
-                const path = card.target.path orelse return error.ActionTargetMismatch;
-                const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
-                if (thread_path != .string) return error.InvalidSnapshot;
-                if (!std.mem.eql(u8, thread_path.string, path)) continue;
+                if (card.kind == .reply_thread) {
+                    const target_id = card.target.thread_id orelse
+                        return error.ActionTargetMismatch;
+                    const thread_id = thread.get("id") orelse return error.InvalidSnapshot;
+                    if (thread_id != .string) return error.InvalidSnapshot;
+                    if (!std.mem.eql(u8, thread_id.string, target_id)) continue;
+                } else {
+                    const path = card.target.path orelse return error.ActionTargetMismatch;
+                    const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
+                    if (thread_path != .string) return error.InvalidSnapshot;
+                    if (!std.mem.eql(u8, thread_path.string, path)) continue;
+                }
                 if (!inlineThreadMatchesCard(thread, card)) continue;
                 try self.captureThreadCommentIds(
                     owner,
@@ -1473,7 +1481,8 @@ fn commentsObserve(
             !std.mem.eql(u8, comment.get("body").?.string, body)) continue;
         const comment_id = comment.get("id") orelse return error.InvalidSnapshot;
         if (comment_id != .string) return error.InvalidSnapshot;
-        if (card.kind == .add_inline_comment and baseline.contains(comment_id.string)) continue;
+        if ((card.kind == .add_inline_comment or card.kind == .reply_thread) and
+            baseline.contains(comment_id.string)) continue;
         const created = parseGithubTimestampSeconds(
             comment.get("createdAt").?.string,
         ) orelse continue;
@@ -1863,14 +1872,14 @@ fn hydrateRevisionKeysWithGitPath(
         error.GitObjectUnavailable => return error.GitFetchFailed,
         else => return err,
     };
-    const merge_base = try canonicalMergeBaseAlloc(
+    const merge_base = try mergeBaseWithShallowRetryAlloc(
         allocator,
         io,
         git_path,
         cwd,
         generation.base_oid,
         generation.head_oid,
-        null,
+        fetch_source,
     );
     defer allocator.free(merge_base);
     for (generation.files.items) |file| {
@@ -1902,6 +1911,51 @@ fn hydrateRevisionKeysWithGitPath(
         defer allocator.free(revision);
         try generation.setRevision(file.path, revision);
     }
+}
+
+fn mergeBaseWithShallowRetryAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    base: []const u8,
+    head: []const u8,
+    fetch_source: ?worktree.FetchSource,
+) ![]u8 {
+    return canonicalMergeBaseAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        base,
+        head,
+        null,
+    ) catch |err| switch (err) {
+        error.MergeBaseFailed => {
+            worktree.deepenShallowHistory(
+                allocator,
+                io,
+                git_path,
+                cwd,
+                fetch_source,
+                base,
+                head,
+            ) catch |deepen_error| switch (deepen_error) {
+                error.GitMergeBaseUnavailable => return error.MergeBaseFailed,
+                else => return deepen_error,
+            };
+            return canonicalMergeBaseAlloc(
+                allocator,
+                io,
+                git_path,
+                cwd,
+                base,
+                head,
+                null,
+            );
+        },
+        else => return err,
+    };
 }
 
 pub fn canonicalDiffAlloc(
@@ -2299,6 +2353,73 @@ test "revision hydration computes one merge base for a generation" {
         base,
         head,
     );
+}
+
+test "revision hydration deepens a shallow checkout before retrying merge base" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source);
+    const checkout = try std.fs.path.join(allocator, &.{ root, "checkout" });
+    defer allocator.free(checkout);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/a.zig", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, source, argv));
+    const base_raw = try runTestGit(allocator, io, source, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/a.zig", .data = "head\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, source, argv));
+    const head_raw = try runTestGit(allocator, io, source, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const source_url = try std.fmt.allocPrint(allocator, "file://{s}", .{source});
+    defer allocator.free(source_url);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "clone", "-q", "--depth=1", source_url, checkout },
+    ));
+    var generation = try domain.PrGeneration.initFull(
+        allocator,
+        std.mem.trim(u8, base_raw, "\r\n"),
+        std.mem.trim(u8, head_raw, "\r\n"),
+    );
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "a.zig",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try hydrateRevisionKeys(
+        allocator,
+        io,
+        checkout,
+        .{ .url = source_url },
+        &generation,
+    );
+    try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending"));
+    const shallow = try runTestGit(
+        allocator,
+        io,
+        checkout,
+        &.{ "git", "rev-parse", "--is-shallow-repository" },
+    );
+    defer allocator.free(shallow);
+    try std.testing.expectEqualStrings("false", std.mem.trim(u8, shallow, "\r\n"));
 }
 
 test "GitHub transport is a fixed argv stdin broker" {

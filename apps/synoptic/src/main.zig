@@ -434,6 +434,7 @@ fn serveReview(
     return serveResolvedPullRequest(
         allocator,
         io,
+        environment,
         &settings,
         options,
         gh_resolved,
@@ -447,6 +448,7 @@ fn serveReview(
 fn serveResolvedPullRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
+    environment: *const std.process.Environ.Map,
     settings: *config.Settings,
     options: config.LaunchOptions,
     gh_resolved: []const u8,
@@ -472,6 +474,7 @@ fn serveResolvedPullRequest(
     var fetch_source = worktree.FetchSource.resolve(
         allocator,
         io,
+        environment,
         options.cwd,
         identity.host,
         identity.owner,
@@ -1409,7 +1412,12 @@ fn runtimeRootAlloc(
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
 ) ![]u8 {
-    return std.fs.path.join(allocator, &.{ environment.get("TMPDIR") orelse "/tmp", "synoptic" });
+    const configured = environment.get("TMPDIR") orelse "/tmp";
+    const root = if (configured.len > 0 and std.fs.path.isAbsolute(configured))
+        configured
+    else
+        "/tmp";
+    return std.fs.path.join(allocator, &.{ root, "synoptic" });
 }
 
 fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
@@ -2075,6 +2083,21 @@ test "lifecycle commands distinguish missing and unreadable ownership records" {
         error.InvalidLifecycleRecord,
         readCurrentForLaunch(allocator, io, current_path),
     );
+}
+test "runtime root falls back when TMPDIR is empty or relative" {
+    const allocator = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "", "relative/tmp" }) |configured| {
+        try environment.put("TMPDIR", configured);
+        const root = try runtimeRootAlloc(allocator, &environment);
+        defer allocator.free(root);
+        try std.testing.expectEqualStrings("/tmp/synoptic", root);
+    }
+    try environment.put("TMPDIR", "/private/tmp/custom");
+    const configured = try runtimeRootAlloc(allocator, &environment);
+    defer allocator.free(configured);
+    try std.testing.expectEqualStrings("/private/tmp/custom/synoptic", configured);
 }
 test "terminal shutdown removes its lifecycle record before returning failure" {
     const allocator = std.testing.allocator;

@@ -6,6 +6,7 @@ const ApprovalSchema = struct {
     file: []const u8,
     properties: []const []const u8,
     required: []const []const u8,
+    value_property: ?[]const u8 = null,
     values: []const []const u8,
 };
 const approval_schemas = [_]ApprovalSchema{
@@ -19,12 +20,14 @@ const approval_schemas = [_]ApprovalSchema{
         .file = "CommandExecutionRequestApprovalResponse.json",
         .properties = &.{"decision"},
         .required = &.{"decision"},
+        .value_property = "decision",
         .values = &.{ "accept", "acceptForSession", "decline", "cancel" },
     },
     .{
         .file = "FileChangeRequestApprovalResponse.json",
         .properties = &.{"decision"},
         .required = &.{"decision"},
+        .value_property = "decision",
         .values = &.{"decline"},
     },
     .{
@@ -37,6 +40,7 @@ const approval_schemas = [_]ApprovalSchema{
         .file = "PermissionsRequestApprovalResponse.json",
         .properties = &.{ "permissions", "scope" },
         .required = &.{"permissions"},
+        .value_property = "scope",
         .values = &.{ "turn", "session" },
     },
 };
@@ -540,14 +544,16 @@ fn validateThreadSchemas(
         ),
     );
     defer allocator.free(fork);
-    for (
-        [_][]const u8{ "lastTurnId", "ephemeral", "approvalPolicy", "sandbox" },
-    ) |field| if (std.mem.indexOf(u8, fork, field) == null) return @as(
+    if (!schemaHasRootProperties(
+        allocator,
+        fork,
+        &.{ "lastTurnId", "ephemeral", "approvalPolicy", "sandbox" },
+    )) return @as(
         ?[]u8,
         try std.fmt.allocPrint(
             allocator,
-            "installed Codex {s}: thread/fork missing {s}",
-            .{ version, field },
+            "installed Codex {s}: thread/fork missing required properties",
+            .{version},
         ),
     );
     const start = readSchema(allocator, io, out_dir, "v2/ThreadStartParams.json") catch return @as(
@@ -559,17 +565,33 @@ fn validateThreadSchemas(
         ),
     );
     defer allocator.free(start);
-    for ([_][]const u8{ "dynamicTools", "approvalPolicy", "sandbox" }) |field| {
-        if (std.mem.indexOf(u8, start, field) == null) return @as(
-            ?[]u8,
-            try std.fmt.allocPrint(
-                allocator,
-                "installed Codex {s}: thread/start missing {s}",
-                .{ version, field },
-            ),
-        );
-    }
+    if (!schemaHasRootProperties(
+        allocator,
+        start,
+        &.{ "dynamicTools", "approvalPolicy", "sandbox" },
+    )) return @as(
+        ?[]u8,
+        try std.fmt.allocPrint(
+            allocator,
+            "installed Codex {s}: thread/start missing required properties",
+            .{version},
+        ),
+    );
     return null;
+}
+
+fn schemaHasRootProperties(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    required_properties: []const []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const properties = parsed.value.object.get("properties") orelse return false;
+    if (properties != .object) return false;
+    for (required_properties) |name| if (!properties.object.contains(name)) return false;
+    return true;
 }
 
 fn validateTurnSchemas(
@@ -652,6 +674,7 @@ fn validateApprovalSchemas(
             schema_json.value,
             approval.properties,
             approval.required,
+            approval.value_property,
             approval.values,
         )) return @as(
             ?[]u8,
@@ -669,6 +692,7 @@ fn approvalSchemaHas(
     value: std.json.Value,
     properties: []const []const u8,
     required: []const []const u8,
+    value_property: ?[]const u8,
     values: []const []const u8,
 ) bool {
     if (value != .object) return false;
@@ -687,29 +711,80 @@ fn approvalSchemaHas(
         }
         if (!found) return false;
     }
-    for (values) |expected| if (!containsExactString(value, expected)) return false;
+    if (values.len > 0) {
+        const property_name = value_property orelse return false;
+        const property = property_map.object.get(property_name) orelse return false;
+        for (values) |expected| {
+            if (!schemaPropertyHasEnumValue(value, property, expected, 0)) return false;
+        }
+    }
     return true;
 }
 
-fn containsExactString(value: std.json.Value, needle: []const u8) bool {
-    const Node = struct { value: std.json.Value, named_skill: bool = false };
-    var pending: [4096]Node = undefined;
+fn schemaPropertyHasEnumValue(
+    root: std.json.Value,
+    node: std.json.Value,
+    expected: []const u8,
+    initial_depth: u8,
+) bool {
+    const Pending = struct { value: std.json.Value, depth: u8 };
+    var pending: [64]Pending = undefined;
     var pending_len: usize = 1;
-    pending[0] = .{ .value = value };
+    pending[0] = .{ .value = node, .depth = initial_depth };
     while (pending_len > 0) {
         pending_len -= 1;
-        switch (pending[pending_len].value) {
+        const current = pending[pending_len];
+        if (current.depth >= 16 or current.value != .object) continue;
+        if (current.value.object.get("enum")) |enum_value| {
+            if (enum_value == .array) for (enum_value.array.items) |item| {
+                if (item == .string and std.mem.eql(u8, item.string, expected)) return true;
+            };
+        }
+        if (current.value.object.get("$ref")) |ref| {
+            if (resolveSchemaDefinition(root, ref)) |target| {
+                if (pending_len == pending.len) return false;
+                pending[pending_len] = .{ .value = target, .depth = current.depth + 1 };
+                pending_len += 1;
+            }
+        }
+        for ([_][]const u8{ "oneOf", "anyOf", "allOf" }) |keyword| {
+            const branches = current.value.object.get(keyword) orelse continue;
+            if (branches != .array) continue;
+            for (branches.array.items) |branch| {
+                if (pending_len == pending.len) return false;
+                pending[pending_len] = .{ .value = branch, .depth = current.depth + 1 };
+                pending_len += 1;
+            }
+        }
+    }
+    return false;
+}
+
+fn resolveSchemaDefinition(root: std.json.Value, ref: std.json.Value) ?std.json.Value {
+    if (ref != .string or !std.mem.startsWith(u8, ref.string, "#/definitions/")) return null;
+    const definitions = root.object.get("definitions") orelse return null;
+    if (definitions != .object) return null;
+    return definitions.object.get(ref.string["#/definitions/".len..]);
+}
+
+fn containsExactString(value: std.json.Value, needle: []const u8) bool {
+    var pending: [4096]std.json.Value = undefined;
+    var pending_len: usize = 1;
+    pending[0] = value;
+    while (pending_len > 0) {
+        pending_len -= 1;
+        switch (pending[pending_len]) {
             .string => |text| if (std.mem.eql(u8, text, needle)) return true,
             .array => |array| for (array.items) |item| {
                 if (pending_len == pending.len) return false;
-                pending[pending_len] = .{ .value = item };
+                pending[pending_len] = item;
                 pending_len += 1;
             },
             .object => |object| {
                 var iterator = object.iterator();
                 while (iterator.next()) |entry| {
                     if (pending_len == pending.len) return false;
-                    pending[pending_len] = .{ .value = entry.value_ptr.* };
+                    pending[pending_len] = entry.value_ptr.*;
                     pending_len += 1;
                 }
             },
@@ -930,13 +1005,13 @@ test "command approvals installed schema requires exact request and response sur
         \\mkdir -p "$out/v2"
         \\printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
         \\cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
-        \\printf '%s' '{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadForkParams.json"
-        \\printf '%s' '{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadStartParams.json"
+        \\printf '%s' '{"properties":{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadForkParams.json"
+        \\printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
         \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
         \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
-        \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["accept","acceptForSession","decline","cancel"]}' > "$out/CommandExecutionRequestApprovalResponse.json"
-        \\printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["decline"]}' > "$out/FileChangeRequestApprovalResponse.json"
+        \\printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"
+        \\printf '%s' '{"properties":{"decision":{"enum":["decline"]}},"required":["decision"]}' > "$out/FileChangeRequestApprovalResponse.json"
         \\printf '%s' '{"properties":{"threadId":{},"permissions":{}},"required":["threadId","permissions"]}' > "$out/PermissionsRequestApprovalParams.json"
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "codex", .data = script });
@@ -968,6 +1043,35 @@ test "empty config roots never resolve relative repository paths" {
     const path = (try configPathAlloc(std.testing.allocator, &environment)).?;
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/safe-home/.config/synoptic/config.toml", path);
+}
+
+test "schema validation ignores required field names outside root properties" {
+    const raw =
+        "{\"description\":\"lastTurnId ephemeral\"," ++
+        "\"properties\":{\"approvalPolicy\":{},\"sandbox\":{}}}";
+    try std.testing.expect(!schemaHasRootProperties(
+        std.testing.allocator,
+        raw,
+        &.{ "lastTurnId", "ephemeral", "approvalPolicy", "sandbox" },
+    ));
+}
+
+test "approval values must belong to the declared response property" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"properties\":{\"decision\":{},\"unrelated\":{\"enum\":[\"decline\"]}}," ++
+            "\"required\":[\"decision\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expect(!approvalSchemaHas(
+        parsed.value,
+        &.{"decision"},
+        &.{"decision"},
+        "decision",
+        &.{"decline"},
+    ));
 }
 
 test "globstar slash consumes only complete path segments" {

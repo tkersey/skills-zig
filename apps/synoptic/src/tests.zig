@@ -614,15 +614,15 @@ const fake_codex_script =
     \\  mkdir -p "$out/v2"
     \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
     \\  cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
-    \\  printf '%s' '{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadForkParams.json"
-    \\  printf '%s' '{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadStartParams.json"
+    \\  printf '%s' '{"properties":{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadForkParams.json"
+    \\  printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
     \\  for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
     \\  printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
-    \\  printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["accept","acceptForSession","decline","cancel"]}' > "$out/CommandExecutionRequestApprovalResponse.json"
-    \\  printf '%s' '{"properties":{"decision":{}},"required":["decision"],"values":["decline"]}' > "$out/FileChangeRequestApprovalResponse.json"
+    \\  printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"
+    \\  printf '%s' '{"properties":{"decision":{"enum":["decline"]}},"required":["decision"]}' > "$out/FileChangeRequestApprovalResponse.json"
     \\  printf '%s' '{"properties":{"threadId":{},"permissions":{}},"required":["threadId","permissions"]}' > "$out/PermissionsRequestApprovalParams.json"
-    \\  printf '%s' '{"properties":{"permissions":{},"scope":{}},"required":["permissions"],"values":["turn","session"]}' > "$out/PermissionsRequestApprovalResponse.json"
+    \\  printf '%s' '{"properties":{"permissions":{},"scope":{"allOf":[{"$ref":"#/definitions/Scope"}]}},"required":["permissions"],"definitions":{"Scope":{"enum":["turn","session"]}}}' > "$out/PermissionsRequestApprovalResponse.json"
     \\  exit 0
     \\fi
     \\case " $* " in
@@ -1218,6 +1218,60 @@ test "action broker rejects base drift during ambiguous reconciliation" {
         error.PullRequestChanged,
         broker.reconcileAction("o", "r", 1, card.*, 0, &baseline),
     );
+}
+
+test "reply reconciliation does not attribute a preexisting identical reply" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-reply-baseline" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\cat >/dev/null
+        \\now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        \\printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_existing","body":"same reply","createdAt":"%s","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-reply-baseline", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("reply"),
+        .kind = .reply_thread,
+        .effect_summary = @constCast("Reply to T_1"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T_1"),
+        .body = @constCast("same reply"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "a.zig",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    var baseline = try broker.captureReconciliationBaseline("o", "r", 1, card.*);
+    defer baseline.deinit();
+    try std.testing.expect(!try broker.reconcileAction(
+        "o",
+        "r",
+        1,
+        card.*,
+        0,
+        &baseline,
+    ));
 }
 
 test "malformed successful mutation response remains transport ambiguous" {
@@ -2661,6 +2715,8 @@ fn prepareSyncRepo(
 test "worktree integrity Git object hydration uses only the matched PR remote" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "source");
@@ -2691,6 +2747,7 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
     var fetch_source = try worktree.FetchSource.resolve(
         allocator,
         io,
+        &environment,
         consumer,
         "github.example.test",
         "owner",

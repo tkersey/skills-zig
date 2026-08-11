@@ -6,6 +6,7 @@ const fetch_output_limit: usize = 1024 * 1024;
 
 pub const FetchSource = struct {
     allocator: ?std.mem.Allocator = null,
+    environment: ?*const std.process.Environ.Map = null,
     url: []const u8,
     remote_name: ?[]const u8 = null,
     timeout_ms: u32 = fetch_timeout_ms,
@@ -14,6 +15,7 @@ pub const FetchSource = struct {
     pub fn resolve(
         allocator: std.mem.Allocator,
         io: std.Io,
+        environment: *const std.process.Environ.Map,
         cwd: []const u8,
         host: []const u8,
         owner: []const u8,
@@ -52,6 +54,7 @@ pub const FetchSource = struct {
             )) continue;
             return .{
                 .allocator = allocator,
+                .environment = environment,
                 .url = try allocator.dupe(u8, std.mem.trim(u8, url, "\r\n")),
                 .remote_name = try allocator.dupe(u8, remote),
             };
@@ -77,6 +80,7 @@ fn remoteMatchesRepository(
     var remote_host: []const u8 = undefined;
     var path: []const u8 = undefined;
     if (std.mem.indexOf(u8, url, "://")) |scheme_end| {
+        const scheme = url[0..scheme_end];
         const authority_start = scheme_end + 3;
         const path_start = std.mem.indexOfScalarPos(
             u8,
@@ -85,8 +89,7 @@ fn remoteMatchesRepository(
             '/',
         ) orelse return false;
         const authority = url[authority_start..path_start];
-        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
-        remote_host = authority[host_start..];
+        remote_host = normalizeAuthorityHost(authority, scheme) orelse return false;
         path = url[path_start + 1 ..];
     } else {
         const at = std.mem.indexOfScalar(u8, url, '@') orelse return false;
@@ -97,9 +100,39 @@ fn remoteMatchesRepository(
     path = std.mem.trimEnd(u8, path, "/");
     if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - 4];
     const separator = std.mem.indexOfScalar(u8, path, '/') orelse return false;
-    return std.ascii.eqlIgnoreCase(remote_host, host) and
+    const expected_host = normalizeAuthorityHost(host, "https") orelse return false;
+    return std.ascii.eqlIgnoreCase(remote_host, expected_host) and
         std.ascii.eqlIgnoreCase(path[0..separator], owner) and
         std.ascii.eqlIgnoreCase(path[separator + 1 ..], repository);
+}
+
+fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]const u8 {
+    const start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+    const host_port = authority[start..];
+    if (host_port.len == 0) return null;
+    if (host_port[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return null;
+        if (close + 1 == host_port.len) return host_port;
+        if (host_port[close + 1] != ':') return null;
+        const port = host_port[close + 2 ..];
+        if (port.len == 0) return null;
+        for (port) |byte| if (!std.ascii.isDigit(byte)) return null;
+        return if (stripTransportPort(scheme, port)) host_port[0 .. close + 1] else host_port;
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return host_port;
+    const port = host_port[colon + 1 ..];
+    if (port.len == 0) return null;
+    for (port) |byte| if (!std.ascii.isDigit(byte)) return host_port;
+    return if (stripTransportPort(scheme, port)) host_port[0..colon] else host_port;
+}
+
+fn stripTransportPort(scheme: []const u8, port: []const u8) bool {
+    const strip_any = std.ascii.eqlIgnoreCase(scheme, "ssh") or
+        std.ascii.eqlIgnoreCase(scheme, "git");
+    const default_port = (std.ascii.eqlIgnoreCase(scheme, "https") and
+        std.mem.eql(u8, port, "443")) or
+        (std.ascii.eqlIgnoreCase(scheme, "http") and std.mem.eql(u8, port, "80"));
+    return strip_any or default_port;
 }
 
 pub const Custody = union(enum) {
@@ -779,9 +812,46 @@ pub fn ensureObjectAvailable(
 ) !void {
     if (try commitExists(allocator, io, cwd, oid)) return;
     const exact_source = source orelse return error.GitFetchSourceUnavailable;
-    const term = try runFetchBounded(allocator, io, cwd, exact_source, oid);
+    const term = try runFetchBounded(
+        allocator,
+        io,
+        cwd,
+        exact_source,
+        .{ .object = oid },
+    );
     if (term != .exited or term.exited != 0 or
         !try commitExists(allocator, io, cwd, oid)) return error.GitObjectUnavailable;
+}
+
+pub fn deepenShallowHistory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    source: ?FetchSource,
+    base: []const u8,
+    head: []const u8,
+) !void {
+    const shallow = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ git_path, "rev-parse", "--is-shallow-repository" },
+        error.GitShallowStateUnavailable,
+    );
+    defer allocator.free(shallow);
+    if (!std.mem.eql(u8, std.mem.trim(u8, shallow, "\r\n"), "true")) {
+        return error.GitMergeBaseUnavailable;
+    }
+    const exact_source = source orelse return error.GitFetchSourceUnavailable;
+    const term = try runFetchBounded(
+        allocator,
+        io,
+        cwd,
+        exact_source,
+        .{ .unshallow = .{ .base = base, .head = head } },
+    );
+    if (term != .exited or term.exited != 0) return error.GitMergeBaseUnavailable;
 }
 
 const FetchWatchdog = struct {
@@ -842,21 +912,19 @@ const FetchPipeCapture = struct {
     }
 };
 
+const FetchOperation = union(enum) {
+    object: []const u8,
+    unshallow: struct { base: []const u8, head: []const u8 },
+};
+
 fn runFetchBounded(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     source: FetchSource,
-    oid: []const u8,
+    operation: FetchOperation,
 ) !std.process.Child.Term {
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "git", "fetch", "--no-tags", source.url, oid },
-        .cwd = .{ .path = cwd },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = 0,
-    });
+    var child = try spawnFetchProcess(allocator, io, cwd, source, operation);
     var waited = false;
     const pid: std.posix.pid_t = @intCast(child.id orelse return error.GitFetchProcessFailed);
     errdefer terminateFetchProcess(io, &child, pid, &waited);
@@ -911,6 +979,50 @@ fn runFetchBounded(
     waited = true;
     if (watchdog.expired.load(.acquire)) return error.GitFetchTimedOut;
     return term;
+}
+
+fn spawnFetchProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    source: FetchSource,
+    operation: FetchOperation,
+) !std.process.Child {
+    var environment = if (source.environment) |inherited|
+        try inherited.clone(allocator)
+    else
+        std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_CONFIG_COUNT", "1");
+    try environment.put("GIT_CONFIG_KEY_0", "remote.synoptic-exact.url");
+    try environment.put("GIT_CONFIG_VALUE_0", source.url);
+    var argv_buffer: [7][]const u8 = undefined;
+    const argv: []const []const u8 = switch (operation) {
+        .object => |oid| argv: {
+            argv_buffer[0] = "git";
+            argv_buffer[1] = "fetch";
+            argv_buffer[2] = "--no-tags";
+            argv_buffer[3] = "synoptic-exact";
+            argv_buffer[4] = oid;
+            break :argv argv_buffer[0..5];
+        },
+        .unshallow => |commits| argv: {
+            argv_buffer = .{
+                "git",        "fetch",      "--no-tags", "--unshallow", "synoptic-exact",
+                commits.base, commits.head,
+            };
+            break :argv argv_buffer[0..7];
+        },
+    };
+    return std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = &environment,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
 }
 
 fn terminateFetchProcess(
@@ -976,6 +1088,27 @@ test "custody makes destructive policy explicit" {
 }
 test "reused checkout can never be cleanup target" {
     try std.testing.expect(!cleanupAllowed(.{ .reused_current = "/user" }));
+}
+
+test "repository remote matching normalizes transport default ports" {
+    try std.testing.expect(remoteMatchesRepository(
+        "https://github.com:443/owner/repo.git",
+        "github.com",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(remoteMatchesRepository(
+        "ssh://git@github.com:22/owner/repo.git",
+        "github.com",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(remoteMatchesRepository(
+        "https://github.example.test:8443/owner/repo.git",
+        "github.example.test:8443",
+        "owner",
+        "repo",
+    ));
 }
 
 test "worktree integrity reused rollback restores exact branch and head" {
