@@ -337,6 +337,116 @@ pub const Broker = struct {
         error_name: ?[]const u8,
     };
 
+    pub const ViewedBatchRequest = struct {
+        path: []const u8,
+        client_id: []const u8,
+    };
+
+    pub const ViewedBatchResult = struct {
+        viewed: bool = false,
+        error_name: ?[]const u8 = null,
+    };
+
+    /// Reconcile one automatic-exclusion generation with two paginated reads:
+    /// one admission read before any effect, then one uncancelled readback.
+    pub fn synchronizeViewedBatch(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        expected_head: []const u8,
+        requests: []const ViewedBatchRequest,
+    ) ![]ViewedBatchResult {
+        const results = try self.allocator.alloc(ViewedBatchResult, requests.len);
+        errdefer self.allocator.free(results);
+        @memset(results, .{});
+        if (requests.len == 0) return results;
+
+        var validation_pages = try self.callPages(
+            graphql.file_state_query,
+            "files",
+            owner,
+            name,
+            number,
+        );
+        defer freePages(self.allocator, &validation_pages);
+        try validateBatchPaths(
+            self.allocator,
+            validation_pages.items,
+            expected_head,
+            requests,
+            null,
+        );
+        self.markViewedBatch(pull_request_id, requests, results);
+        try self.readbackViewedBatch(
+            owner,
+            name,
+            number,
+            expected_head,
+            requests,
+            results,
+        );
+        return results;
+    }
+
+    fn markViewedBatch(
+        self: Broker,
+        pull_request_id: []const u8,
+        requests: []const ViewedBatchRequest,
+        results: []ViewedBatchResult,
+    ) void {
+        for (requests, results) |request, *result| self.markViewedWithId(
+            pull_request_id,
+            request.path,
+            request.client_id,
+        ) catch |err| {
+            result.error_name = @errorName(err);
+        };
+    }
+
+    fn readbackViewedBatch(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        expected_head: []const u8,
+        requests: []const ViewedBatchRequest,
+        results: []ViewedBatchResult,
+    ) !void {
+        var reconciliation = self;
+        reconciliation.cancelled = null;
+        var readback_pages = reconciliation.callPages(
+            graphql.file_state_query,
+            "files",
+            owner,
+            name,
+            number,
+        ) catch |err| {
+            for (results) |*result| result.error_name = @errorName(err);
+            return;
+        };
+        defer freePages(self.allocator, &readback_pages);
+        validateBatchPaths(
+            self.allocator,
+            readback_pages.items,
+            expected_head,
+            requests,
+            results,
+        ) catch |err| {
+            if (err == error.PullRequestChanged) return err;
+            for (results) |*result| result.error_name = @errorName(err);
+            return;
+        };
+        for (results) |*result| {
+            if (result.viewed) {
+                result.error_name = null;
+            } else if (result.error_name == null) {
+                result.error_name = "MarkViewedReadbackFailed";
+            }
+        }
+    }
+
     pub fn synchronizeViewed(
         self: Broker,
         owner: []const u8,
@@ -955,6 +1065,38 @@ pub const Broker = struct {
         if (!found) return error.CommentPathNotCurrent;
     }
 };
+
+fn validateBatchPaths(
+    allocator: std.mem.Allocator,
+    pages: []const []const u8,
+    expected_head: []const u8,
+    requests: []const Broker.ViewedBatchRequest,
+    results: ?[]Broker.ViewedBatchResult,
+) !void {
+    const found = try allocator.alloc(bool, requests.len);
+    defer allocator.free(found);
+    @memset(found, false);
+    for (pages) |page| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
+        defer parsed.deinit();
+        const pull = try pullObject(parsed.value);
+        if (!std.mem.eql(u8, pull.get("headRefOid").?.string, expected_head))
+            return error.PullRequestChanged;
+        for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
+            const path = node.object.get("path").?.string;
+            for (requests, 0..) |request, index| {
+                if (!std.mem.eql(u8, request.path, path)) continue;
+                found[index] = true;
+                if (results) |batch_results| batch_results[index].viewed = std.mem.eql(
+                    u8,
+                    node.object.get("viewerViewedState").?.string,
+                    "VIEWED",
+                );
+            }
+        }
+    }
+    for (found) |present| if (!present) return error.ExclusionPathNotCurrent;
+}
 
 fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
     const info_value = comments.get("pageInfo") orelse return null;

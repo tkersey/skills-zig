@@ -1344,19 +1344,32 @@ fn installExclusionGh(
         "uest\":{{\"id\":\"PR_1\"}}}}}}}}'\n  exit 0\nfi\npackage_view" ++
         "ed=UNVIEWED\nambiguous_viewed=UNVIEWED\n[ -f {s} ] && grep" ++
         " -q package {s} && package_viewed=VIEWED\n[ -f {s} ] && grep" ++
-        " -q ambiguous {s} && ambiguous_viewed=VIEWED\nprintf '{{\"data\"" ++
+        " -q ambiguous {s} && ambiguous_viewed=VIEWED\nif printf '%s' \"$input" ++
+        "\" | grep -q '\"after\":\"page-2\"'; then\n  printf '{{\"data\"" ++
         ":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"{s}\",\"fi" ++
-        "les\":{{\"nodes\":[{{\"path\":\"package-lock.json\",\"viewerVi" ++
-        "ewedState\":\"%s\"}},{{\"path\":\"vendor/fail.js\",\"viewerVie" ++
-        "wedState\":\"UNVIEWED\"}},{{\"path\":\"vendor/ambiguous.js\"," ++
-        "\"viewerViewedState\":\"%s\"}},{{\"path\":\"src/large.zig\",\"v" ++
-        "iewerViewedState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPag" ++
-        "e\":false,\"endCursor\":null}}}}}}}}}}}}\\n' \"$package_viewe" ++
-        "d\" \"$ambiguous_viewed\"\n";
+        "les\":{{\"nodes\":[{{\"path\":\"vendor/ambiguous.js\",\"viewer" ++
+        "ViewedState\":\"%s\"}},{{\"path\":\"src/large.zig\",\"viewerView" ++
+        "edState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
+        "\"endCursor\":null}}}}}}}}}}}}\\n' \"$ambiguous_viewed\"\nelse\n  " ++
+        "printf '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\"" ++
+        ":\"{s}\",\"files\":{{\"nodes\":[{{\"path\":\"package-lock.json\"" ++
+        ",\"viewerViewedState\":\"%s\"}},{{\"path\":\"vendor/fail.js\",\"v" ++
+        "iewerViewedState\":\"UNVIEWED\"}}],\"pageInfo\":{{\"hasNextPage\":" ++
+        "true,\"endCursor\":\"page-2\"}}}}}}}}}}}}\\n' \"$package_viewed\"\nfi\n";
     const script = try std.fmt.allocPrint(
         allocator,
         format,
-        .{ log_path, state_path, state_path, state_path, state_path, state_path, state_path, head },
+        .{
+            log_path,
+            state_path,
+            state_path,
+            state_path,
+            state_path,
+            state_path,
+            state_path,
+            head,
+            head,
+        },
     );
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh", .data = script });
@@ -1470,6 +1483,14 @@ fn verifyExclusionState(
         log,
         "synoptic-auto-exclusion",
     ) != null);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        std.mem.count(u8, log, "mutation SynopticMarkFileViewed"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 4),
+        std.mem.count(u8, log, "query SynopticFileState"),
+    );
 
     var refreshed = try domain.PrGeneration.initFull(allocator, base, head);
     try refreshed.addFile(

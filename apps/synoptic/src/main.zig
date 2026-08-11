@@ -605,138 +605,25 @@ fn applyLaunchExclusions(
     tool_domain: *http.ToolDomainContext,
 ) !void {
     if (!settings.exclusions_enabled) return;
-    var seeds = try launchExclusionSeeds(allocator, state, tool_domain);
-    defer {
-        for (seeds.items) |seed| seed.deinit();
-        seeds.deinit(allocator);
-    }
-    for (seeds.items) |seed| {
-        if (broker.cancelled) |cancelled| {
-            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
-        }
-        try applyLaunchExclusion(
-            allocator,
-            settings,
-            broker,
-            identity,
-            pull_request_id,
-            review_cwd,
-            state,
-            registry,
-            tool_domain,
-            seed,
-        );
-    }
-}
-
-const LaunchExclusionSeed = struct {
-    allocator: std.mem.Allocator,
-    path: []u8,
-    revision: []u8,
-    base: []u8,
-    head: []u8,
-
-    fn deinit(self: LaunchExclusionSeed) void {
-        self.allocator.free(self.path);
-        self.allocator.free(self.revision);
-        self.allocator.free(self.base);
-        self.allocator.free(self.head);
-    }
-};
-
-fn launchExclusionSeeds(
-    allocator: std.mem.Allocator,
-    state: *App,
-    tool_domain: *http.ToolDomainContext,
-) !std.ArrayList(LaunchExclusionSeed) {
     tool_domain.lock();
-    defer tool_domain.unlock();
-    var seeds: std.ArrayList(LaunchExclusionSeed) = .empty;
-    errdefer {
-        for (seeds.items) |seed| seed.deinit();
-        seeds.deinit(allocator);
-    }
-    for (state.generation.files.items) |file| {
-        if (file.viewed == .viewed) continue;
-        var seed = LaunchExclusionSeed{
-            .allocator = allocator,
-            .path = try allocator.dupe(u8, file.path),
-            .revision = undefined,
-            .base = undefined,
-            .head = undefined,
-        };
-        errdefer allocator.free(seed.path);
-        seed.revision = try allocator.dupe(u8, file.revision_key);
-        errdefer allocator.free(seed.revision);
-        seed.base = try allocator.dupe(u8, state.generation.base_oid);
-        errdefer allocator.free(seed.base);
-        seed.head = try allocator.dupe(u8, state.generation.head_oid);
-        errdefer allocator.free(seed.head);
-        try seeds.append(allocator, seed);
-    }
-    return seeds;
-}
-
-fn applyLaunchExclusion(
-    allocator: std.mem.Allocator,
-    settings: *config.Settings,
-    broker: github.Broker,
-    identity: pr.Identity,
-    pull_request_id: []const u8,
-    review_cwd: []const u8,
-    state: *App,
-    registry: *sessions.Registry,
-    tool_domain: *http.ToolDomainContext,
-    seed: LaunchExclusionSeed,
-) !void {
-    const reason = settings.classifyPath(seed.path) orelse binary: {
-        const diff = github.canonicalDiffAlloc(
-            allocator,
-            broker.io,
-            review_cwd,
-            seed.base,
-            seed.head,
-            seed.path,
-        ) catch return;
-        defer allocator.free(diff);
-        break :binary settings.classifyDiff(diff) orelse return;
-    };
-    const client_id = try app_domain.exclusionMutationIdAlloc(
-        allocator,
-        seed.path,
-        seed.revision,
-    );
-    defer allocator.free(client_id);
-    const sync = broker.synchronizeViewed(
+    var outcomes = state.applyAutomaticExclusions(
+        settings,
+        broker,
         identity.owner,
         identity.repository,
         identity.number,
         pull_request_id,
-        seed.head,
-        seed.path,
-        client_id,
-    );
-    tool_domain.lock();
-    const applied = state.recordAutomaticExclusion(
-        seed.path,
-        seed.revision,
-        reason,
-        sync.error_name,
-        sync.viewed,
+        review_cwd,
     ) catch |err| {
         tool_domain.unlock();
         return err;
     };
     tool_domain.unlock();
-    if (!applied) return;
-    const outcome = try app_domain.ExclusionOutcome.init(
-        allocator,
-        seed.path,
-        reason,
-        sync.error_name,
-    );
-    defer outcome.deinit();
-    try http.queueExclusionEvents(registry, &.{outcome});
+    defer {
+        for (outcomes.items) |outcome| outcome.deinit();
+        outcomes.deinit(allocator);
+    }
+    try http.queueExclusionEvents(registry, outcomes.items);
 }
 
 fn configureAppState(

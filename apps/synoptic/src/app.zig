@@ -40,6 +40,43 @@ pub const ExclusionOutcome = struct {
     }
 };
 
+const ExclusionCandidate = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    revision: []u8,
+    reason: []u8,
+    client_id: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        revision: []const u8,
+        reason: []const u8,
+    ) !ExclusionCandidate {
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_revision = try allocator.dupe(u8, revision);
+        errdefer allocator.free(owned_revision);
+        const owned_reason = try allocator.dupe(u8, reason);
+        errdefer allocator.free(owned_reason);
+        const client_id = try exclusionMutationIdAlloc(allocator, path, revision);
+        return .{
+            .allocator = allocator,
+            .path = owned_path,
+            .revision = owned_revision,
+            .reason = owned_reason,
+            .client_id = client_id,
+        };
+    }
+
+    fn deinit(self: ExclusionCandidate) void {
+        self.allocator.free(self.path);
+        self.allocator.free(self.revision);
+        self.allocator.free(self.reason);
+        self.allocator.free(self.client_id);
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     generation: domain.PrGeneration,
@@ -556,21 +593,92 @@ pub const App = struct {
             for (outcomes.items) |outcome| outcome.deinit();
             outcomes.deinit(self.allocator);
         }
-        for (0..self.generation.files.items.len) |index| {
-            if (!settings.exclusions_enabled) break;
-            const outcome = try self.excludeFile(
-                settings,
-                broker,
-                owner,
-                name,
-                number,
-                pull_request_id,
-                cwd,
-                index,
-            ) orelse continue;
-            try outcomes.append(self.allocator, outcome);
+        if (!settings.exclusions_enabled) return outcomes;
+        var candidates: std.ArrayList(ExclusionCandidate) = .empty;
+        defer {
+            for (candidates.items) |candidate| candidate.deinit();
+            candidates.deinit(self.allocator);
         }
+        try self.collectExclusionCandidates(settings, broker, cwd, &candidates);
+        const requests = try self.allocator.alloc(
+            github.Broker.ViewedBatchRequest,
+            candidates.items.len,
+        );
+        defer self.allocator.free(requests);
+        for (candidates.items, requests) |candidate, *request| request.* = .{
+            .path = candidate.path,
+            .client_id = candidate.client_id,
+        };
+        const results = try broker.synchronizeViewedBatch(
+            owner,
+            name,
+            number,
+            pull_request_id,
+            self.generation.head_oid,
+            requests,
+        );
+        defer self.allocator.free(results);
+        try self.applyExclusionResults(candidates.items, results, &outcomes);
         return outcomes;
+    }
+
+    fn collectExclusionCandidates(
+        self: *App,
+        settings: *const config.Settings,
+        broker: github.Broker,
+        cwd: []const u8,
+        candidates: *std.ArrayList(ExclusionCandidate),
+    ) !void {
+        for (self.generation.files.items) |file| {
+            if (file.viewed == .viewed) continue;
+            const reason = settings.classifyPath(file.path) orelse binary: {
+                const diff = github.canonicalDiffAlloc(
+                    self.allocator,
+                    broker.io,
+                    cwd,
+                    self.generation.base_oid,
+                    self.generation.head_oid,
+                    file.path,
+                ) catch continue;
+                defer self.allocator.free(diff);
+                break :binary settings.classifyDiff(diff) orelse continue;
+            };
+            var candidate = try ExclusionCandidate.init(
+                self.allocator,
+                file.path,
+                file.revision_key,
+                reason,
+            );
+            errdefer candidate.deinit();
+            try candidates.append(self.allocator, candidate);
+        }
+    }
+
+    fn applyExclusionResults(
+        self: *App,
+        candidates: []const ExclusionCandidate,
+        results: []const github.Broker.ViewedBatchResult,
+        outcomes: *std.ArrayList(ExclusionOutcome),
+    ) !void {
+        for (candidates, results) |candidate, result| {
+            const applied = try self.recordAutomaticExclusion(
+                candidate.path,
+                candidate.revision,
+                candidate.reason,
+                result.error_name,
+                result.viewed,
+            );
+            if (!applied) return error.ExclusionGenerationChanged;
+            try outcomes.append(
+                self.allocator,
+                try ExclusionOutcome.init(
+                    self.allocator,
+                    candidate.path,
+                    candidate.reason,
+                    result.error_name,
+                ),
+            );
+        }
     }
 
     pub fn recordAutomaticExclusion(
@@ -589,75 +697,6 @@ pub const App = struct {
             return true;
         }
         return false;
-    }
-
-    fn excludeFile(
-        self: *App,
-        settings: *const config.Settings,
-        broker: github.Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        pull_request_id: []const u8,
-        cwd: []const u8,
-        index: usize,
-    ) !?ExclusionOutcome {
-        const file = self.generation.files.items[index];
-        if (file.viewed == .viewed) return null;
-        const reason = settings.classifyPath(file.path) orelse binary: {
-            const diff = github.canonicalDiffAlloc(
-                self.allocator,
-                broker.io,
-                cwd,
-                self.generation.base_oid,
-                self.generation.head_oid,
-                file.path,
-            ) catch return null;
-            defer self.allocator.free(diff);
-            break :binary settings.classifyDiff(diff) orelse return null;
-        };
-        const client_id = try exclusionMutationIdAlloc(
-            self.allocator,
-            file.path,
-            file.revision_key,
-        );
-        defer self.allocator.free(client_id);
-        const sync = self.synchronizeExclusion(
-            broker,
-            owner,
-            name,
-            number,
-            pull_request_id,
-            file.path,
-            client_id,
-        );
-        if (sync.viewed) self.generation.files.items[index].viewed = .viewed;
-        try self.generation.setExclusion(file.path, reason, sync.error_name);
-        return try ExclusionOutcome.init(self.allocator, file.path, reason, sync.error_name);
-    }
-
-    const ExclusionSync = struct { viewed: bool, error_name: ?[]const u8 };
-
-    fn synchronizeExclusion(
-        self: *App,
-        broker: github.Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-        pull_request_id: []const u8,
-        path: []const u8,
-        client_id: []const u8,
-    ) ExclusionSync {
-        const sync = broker.synchronizeViewed(
-            owner,
-            name,
-            number,
-            pull_request_id,
-            self.generation.head_oid,
-            path,
-            client_id,
-        );
-        return .{ .viewed = sync.viewed, .error_name = sync.error_name };
     }
 
     pub fn bootstrapAlloc(self: *App) ![]u8 {

@@ -1183,7 +1183,7 @@ pub const Server = struct {
         });
         runtime.app.replaceGeneration(next);
         next_owned = false;
-        try self.applyRefreshExclusions(runtime);
+        try self.applyRefreshExclusionBatch(runtime);
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         const primary_update = try self.primaryUpdateAlloc(runtime);
         defer self.allocator.free(primary_update);
@@ -1258,7 +1258,7 @@ pub const Server = struct {
         }
     }
 
-    fn applyRefreshExclusions(self: *Server, runtime: *Runtime) !void {
+    fn applyRefreshExclusionBatch(self: *Server, runtime: *Runtime) !void {
         if (runtime.settings) |settings| {
             var outcomes = try runtime.app.applyAutomaticExclusions(
                 settings,
