@@ -79,6 +79,11 @@ case "$mode" in
         mark_cas_runtime_consumers
         matched=0
       fi
+      # Dependency imports inherit the owner of their surrounding build hunk.
+      # Do not let the imported module's name classify the consuming product.
+      if [[ "$dependency_import" -eq 1 ]]; then
+        return "$matched"
+      fi
       for app in "${apps[@]}"; do
         token=${app//-/_}
         if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}_[A-Za-z0-9_]+|build-$app|test-$app|run-$app" <<<"$raw"; then
@@ -90,12 +95,6 @@ case "$mode" in
           matched=0
         fi
       done
-      # A dependency import is owned by the surrounding app-specific build
-      # hunk. Widening it to every consumer would make adding one CAS import
-      # spuriously require unrelated app releases.
-      if [[ "$dependency_import" -eq 1 ]]; then
-        return "$matched"
-      fi
       if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
         mark_definition_consumers
         matched=0

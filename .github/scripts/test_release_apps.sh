@@ -208,6 +208,20 @@ pub fn build() void {}
 EOF
 }
 
+write_synoptic_import_build() {
+  local imported_module=$1
+  printf '%s\n' \
+    'const img_meta = "apps/img/VERSION";' \
+    'const synoptic_root = b.createModule(.{' \
+    '    .root_source_file = b.path("apps/synoptic/src/main.zig"),' \
+    '    .imports = &.{' \
+    '        .{ .name = "domain", .module = domain_root },' \
+    "$imported_module" \
+    '    },' \
+    '});' \
+    'pub fn build() void {}' >build.zig
+}
+
 write_ledger_build() {
   printf 'const ledger_root = "apps/ledger/src/v2/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 }
@@ -335,6 +349,18 @@ assert_ci_affected synoptic write_synoptic
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,synoptic,ledger,memory-note,img write_ci_helper
+
+# A dependency name identifies what a product imports, not which product owns
+# the changed build hunk.
+git reset --hard -q "$base"
+write_synoptic_import_build '        .{ .name = "existing", .module = existing_root },'
+git add build.zig
+git commit -qm synoptic-import-base
+synoptic_import_base=$(git rev-parse HEAD)
+write_synoptic_import_build '        .{ .name = "cas_runtime", .module = cas_runtime_root },'
+git add build.zig
+git commit -qm synoptic-import-change
+test "$(bash "$classifier" affected "$synoptic_import_base" HEAD)" = synoptic
 
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.
