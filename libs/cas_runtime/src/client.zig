@@ -1492,6 +1492,7 @@ const ActorServerRequest = struct {
     method: []u8,
     raw_json: []u8,
     deadline_ms: i64,
+    handler: protocol.ServerRequestHandler,
 
     fn deinit(self: ActorServerRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.id_json);
@@ -1654,6 +1655,11 @@ pub const Actor = struct {
         self.state.mutex.lock();
         defer self.state.mutex.unlock();
         if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
+        if (self.state.server_requests.items.len != 0 or
+            self.state.active_server_handlers != 0)
+        {
+            return error.ServerRequestHandlerBusy;
+        }
         self.state.server_request_handler = handler;
     }
 
@@ -1871,8 +1877,8 @@ fn actorHandlerMain(state: *ActorState) void {
 }
 
 fn actorServerRequestWorker(state: *ActorState, work: ActorServerRequest) void {
-    defer work.deinit(state.allocator);
     defer actorFinishServerHandler(state);
+    defer work.deinit(state.allocator);
     actorHandleServerRequest(state, work) catch |err| switch (err) {
         error.RequestDeadlineExceeded => {
             actorSetTerminal(state, .poisoned);
@@ -2059,37 +2065,9 @@ fn actorDispatchServerRequest(
         else => return error.InvalidAppServerEnvelope,
     }
     const deadline_ms = monotonicMillis() + @as(i64, state.server_request_timeout_ms);
-    state.mutex.lock();
-    const handler = state.server_request_handler;
-    const queue_full = state.server_requests.items.len + state.active_server_handlers >=
-        state.server_request_capacity;
-    state.mutex.unlock();
-    if (handler == null) return actorEnqueueServerError(
-        state,
-        id_value,
-        -32601,
-        "server request handler unavailable",
-        deadline_ms,
-    );
-    if (queue_full) return actorEnqueueServerError(
-        state,
-        id_value,
-        -32000,
-        "server request queue is full",
-        deadline_ms,
-    );
-
-    var work = ActorServerRequest{
-        .id_json = try core_json.stringifyAlloc(state.allocator, id_value),
-        .method = undefined,
-        .raw_json = undefined,
-        .deadline_ms = deadline_ms,
-    };
-    errdefer state.allocator.free(work.id_json);
-    work.method = try state.allocator.dupe(u8, method);
-    errdefer state.allocator.free(work.method);
-    work.raw_json = try state.allocator.dupe(u8, line);
-    errdefer state.allocator.free(work.raw_json);
+    var work = try actorServerRequestAlloc(state, method, id_value, line, deadline_ms);
+    var work_owned = true;
+    defer if (work_owned) work.deinit(state.allocator);
 
     state.mutex.lock();
     if (state.terminal != .running) {
@@ -2097,11 +2075,56 @@ fn actorDispatchServerRequest(
         state.mutex.unlock();
         return actorTerminalError(terminal);
     }
+    const handler = state.server_request_handler orelse {
+        state.mutex.unlock();
+        return actorEnqueueServerError(
+            state,
+            id_value,
+            -32601,
+            "server request handler unavailable",
+            deadline_ms,
+        );
+    };
+    if (state.server_requests.items.len + state.active_server_handlers >=
+        state.server_request_capacity)
+    {
+        state.mutex.unlock();
+        return actorEnqueueServerError(
+            state,
+            id_value,
+            -32000,
+            "server request queue is full",
+            deadline_ms,
+        );
+    }
+    work.handler = handler;
     state.server_requests.append(state.allocator, work) catch |err| {
         state.mutex.unlock();
         return err;
     };
+    work_owned = false;
     state.mutex.unlock();
+}
+
+fn actorServerRequestAlloc(
+    state: *ActorState,
+    method: []const u8,
+    id_value: std.json.Value,
+    line: []const u8,
+    deadline_ms: i64,
+) !ActorServerRequest {
+    const id_json = try core_json.stringifyAlloc(state.allocator, id_value);
+    errdefer state.allocator.free(id_json);
+    const owned_method = try state.allocator.dupe(u8, method);
+    errdefer state.allocator.free(owned_method);
+    const raw_json = try state.allocator.dupe(u8, line);
+    return .{
+        .id_json = id_json,
+        .method = owned_method,
+        .raw_json = raw_json,
+        .deadline_ms = deadline_ms,
+        .handler = undefined,
+    };
 }
 
 fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void {
@@ -2118,23 +2141,13 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         .string => |value| .{ .string = value },
         else => return error.InvalidAppServerEnvelope,
     };
-    state.mutex.lock();
-    const handler = state.server_request_handler;
-    state.mutex.unlock();
-    const configured = handler orelse return actorEnqueueServerError(
-        state,
-        parsed_id.value,
-        -32601,
-        "server request handler unavailable",
-        work.deadline_ms,
-    );
     const request = protocol.ServerRequest{
         .id = request_id,
         .method = work.method,
         .raw_json = work.raw_json,
         .deadline_ms = work.deadline_ms,
     };
-    const result_json = configured.handle(configured.context, request, state.allocator) catch
+    const result_json = work.handler.handle(work.handler.context, request, state.allocator) catch
         return actorEnqueueServerError(
             state,
             parsed_id.value,
@@ -4395,6 +4408,7 @@ test "actor falsifier expired server work never invokes its handler" {
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
         .deadline_ms = monotonicMillis() - 1,
+        .handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
     };
     defer work.deinit(allocator);
     try std.testing.expectError(
@@ -4403,6 +4417,71 @@ test "actor falsifier expired server work never invokes its handler" {
     );
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
+}
+
+test "actor server work retains its admitted handler identity" {
+    const allocator = std.testing.allocator;
+    var admitted_probe = ServerRequestProbe{};
+    var replacement_probe = ServerRequestProbe{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = .{
+            .context = &replacement_probe,
+            .handle = ServerRequestProbe.handle,
+        },
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    const work = ActorServerRequest{
+        .id_json = try allocator.dupe(u8, "1"),
+        .method = try allocator.dupe(u8, "item/tool/call"),
+        .raw_json = try allocator.dupe(u8, "{}"),
+        .deadline_ms = monotonicMillis() + 100,
+        .handler = .{
+            .context = &admitted_probe,
+            .handle = ServerRequestProbe.handle,
+        },
+    };
+    defer work.deinit(allocator);
+    try actorHandleServerRequest(&state, work);
+    try std.testing.expectEqual(@as(usize, 1), admitted_probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), replacement_probe.calls);
+}
+
+test "actor rejects handler replacement while server work is live" {
+    const allocator = std.testing.allocator;
+    var probe = ServerRequestProbe{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .active_server_handlers = 1,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = ServerRequestProbe.handle,
+        },
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    var actor = Actor{ .state = &state };
+    try std.testing.expectError(
+        error.ServerRequestHandlerBusy,
+        actor.setServerRequestHandler(null),
+    );
+    state.active_server_handlers = 0;
+    try actor.setServerRequestHandler(null);
 }
 
 test "actor closes transport when a server handler returns after deadline" {
@@ -4427,6 +4506,7 @@ test "actor closes transport when a server handler returns after deadline" {
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
         .deadline_ms = monotonicMillis() + 1,
+        .handler = .{ .context = &probe, .handle = LateServerRequestProbe.handle },
     };
     actorServerRequestWorker(&state, work);
     try std.testing.expectEqual(protocol.TerminalState.poisoned, state.terminal);
