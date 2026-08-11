@@ -69,8 +69,16 @@ case "$mode" in
 
     classify_build_line() {
       local raw=$1
-      local app token
+      local app token dependency_import=0
       local matched=1
+      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
+        dependency_import=1
+      fi
+      if [[ "$dependency_import" -eq 0 ]] &&
+         grep -Eqi 'cas_runtime|cas-runtime' <<<"$raw"; then
+        mark_cas_runtime_consumers
+        matched=0
+      fi
       for app in "${apps[@]}"; do
         token=${app//-/_}
         if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}_[A-Za-z0-9_]+|build-$app|test-$app|run-$app" <<<"$raw"; then
@@ -85,7 +93,7 @@ case "$mode" in
       # A dependency import is owned by the surrounding app-specific build
       # hunk. Widening it to every consumer would make adding one CAS import
       # spuriously require unrelated app releases.
-      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
+      if [[ "$dependency_import" -eq 1 ]]; then
         return "$matched"
       fi
       if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
