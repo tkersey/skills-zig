@@ -460,6 +460,7 @@ fn expectInitialUiPayload(initial: []const u8) !void {
             "\"exclusionReason\":\"generated\"",
             "\"exclusionSyncError\":\"readback-failed\"",
             "\"state\":\"text\"",
+            "\"turnActive\":true",
             "+new",
         },
     ) |needle|
@@ -493,6 +494,7 @@ fn expectReconnectUiPayload(reconnect: []const u8) !void {
             "\"baseRefOid\":\"b2\"",
             "\"headRefOid\":\"h2\"",
             "\"status\":\"stale_origin\"",
+            "\"turnActive\":true",
             "+newer",
         },
     ) |needle| try std.testing.expect(std.mem.indexOf(
@@ -2464,7 +2466,7 @@ test "local close finalizes when best-effort turn interruption fails" {
         sessions.SessionStatus.closed,
         registry.sessions.items[0].status,
     );
-    try std.testing.expect(!registry.sessions.items[0].turn_active);
+    try std.testing.expect(registry.sessions.items[0].turn_active);
 }
 
 fn verifySessionModes(

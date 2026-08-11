@@ -359,6 +359,7 @@ pub const App = struct {
             tab.diff_state = diffDisplayState(diff);
             tab.reused = reused;
             tab.initial_review = initial_review;
+            if (!reused) tab.turn_active = initial_review;
             return;
         }
         return error.UnknownTab;
@@ -399,6 +400,14 @@ pub const App = struct {
             tab.diff = content;
             tab.diff_state = if (diff) |value| diffDisplayState(value) else .unavailable;
         };
+    }
+
+    pub fn setTabTurnActive(self: *App, session_id: []const u8, active: bool) void {
+        for (self.tabs.items) |*tab| {
+            if (!std.mem.eql(u8, tab.id, session_id) or tab.status == .closed) continue;
+            tab.turn_active = active;
+            return;
+        }
     }
 
     pub fn sessionOpenedPayloadAlloc(
@@ -959,12 +968,13 @@ pub const App = struct {
                 std.json.fmt(@tagName(tab.status), .{}),
                 tab.reused,
                 tab.initial_review,
+                tab.turn_active,
                 std.json.fmt(@tagName(tab.diff_state), .{}),
                 std.json.fmt(if (tab.diff_state == .text) tab.diff else null, .{}),
             };
             try writer.print("{{\"id\":{f},\"sessionId\":{f},\"path\":{f},\"revision" ++
                 "Key\":{f},\"status\":{f},\"reused\":{},\"initialReview" ++
-                "\":{},\"diff\":{{\"state\":{f},\"text\":{f}}}}}", arguments);
+                "\":{},\"turnActive\":{},\"diff\":{{\"state\":{f},\"text\":{f}}}}}", arguments);
         }
     }
 

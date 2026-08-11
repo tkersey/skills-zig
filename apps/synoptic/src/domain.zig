@@ -146,6 +146,7 @@ pub const Tab = struct {
     diff: []const u8,
     reused: bool = false,
     initial_review: bool = false,
+    turn_active: bool = false,
 };
 
 pub const File = struct {

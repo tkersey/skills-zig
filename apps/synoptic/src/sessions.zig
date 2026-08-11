@@ -402,8 +402,11 @@ pub const Registry = struct {
             self.mutex.unlock();
             return err;
         };
-        for (self.sessions.items) |session| if (session.turn_active and session.status !=
-            .closed) self.appendTurnRef(&turns, session.thread_id, session.turn_id) catch |err| {
+        for (self.sessions.items) |session| if (session.turn_active) self.appendTurnRef(
+            &turns,
+            session.thread_id,
+            session.turn_id,
+        ) catch |err| {
             self.synchronizing = false;
             self.mutex.unlock();
             return err;
@@ -507,8 +510,8 @@ pub const Registry = struct {
             self.authoritative_reservations + @intFromBool(self.primary_turn_active) +
             @intFromBool(self.exclusions_pending);
         for (self.sessions.items) |session| {
-            if (session.status != .closed and session.turn_active) active += 1;
-            if (session.status != .closed and session.turn_starting) active += 1;
+            if (session.turn_active) active += 1;
+            if (session.turn_starting) active += 1;
         }
         return active;
     }
@@ -683,8 +686,6 @@ pub const Registry = struct {
             }
             session.status = .closed;
             session.opening = false;
-            session.turn_active = false;
-            session.turn_starting = false;
             session.initial_turn_active = false;
             self.declineApprovalsLocked(session_id, .resolved, "session-closed");
             break;
@@ -1622,7 +1623,7 @@ pub const Registry = struct {
         ) catch return;
         defer self.allocator.free(turn);
         for (self.sessions.items) |*session| {
-            if (session.status == .closed or !std.mem.eql(u8, session.thread_id, thread) or
+            if (!std.mem.eql(u8, session.thread_id, thread) or
                 !std.mem.eql(u8, session.turn_id, turn)) continue;
             session.initial_turn_active = false;
             session.turn_active = false;
@@ -2447,8 +2448,11 @@ pub const Registry = struct {
     fn searchThreads(self: *Registry, raw: []const u8, allocator: std.mem.Allocator) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.MalformedToolCall;
         const params = parsed.value.object.get("params") orelse return error.MalformedToolCall;
+        if (params != .object) return error.MalformedToolCall;
         const thread_id = params.object.get("threadId") orelse return error.MalformedToolCall;
+        if (thread_id != .string) return error.MalformedToolCall;
         var assigned: ?[]const u8 = null;
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2843,6 +2847,32 @@ test "session context dynamic tool namespace exposes the exact authoritative sur
         dynamic_tools_json,
         needle,
     ) != null);
+}
+
+test "unresolved-thread search rejects malformed carrier identities" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    inline for (.{
+        "[]",
+        "{\"params\":false}",
+        "{\"params\":{\"threadId\":7,\"arguments\":{}}}",
+    }) |raw| try std.testing.expectError(
+        error.MalformedToolCall,
+        registry.searchThreads(raw, std.testing.allocator),
+    );
+}
+
+test "closed active session remains synchronization-visible until terminal notification" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    try registry.closeSession("ses-1");
+    try std.testing.expectEqual(SessionStatus.closed, registry.sessions.items[0].status);
+    try std.testing.expect(registry.sessions.items[0].turn_active);
+    registry.markCompletedThreadLocked(
+        "{\"params\":{\"threadId\":\"file-1\",\"turn\":{\"id\":\"turn\"}}}",
+    );
+    try std.testing.expect(!registry.sessions.items[0].turn_active);
 }
 
 test "worktree integrity synchronization waits for commands and times out bounded" {

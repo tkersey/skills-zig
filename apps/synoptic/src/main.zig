@@ -830,6 +830,7 @@ fn serveHttpRuntime(
         stop_request_path,
     );
     const tool_domain = runtime.tool_domain.?;
+    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
     registry.setExclusionsPending(true);
     errdefer registry.setExclusionsPending(false);
     var exclusion_work: LaunchExclusionWork = undefined;
@@ -848,7 +849,6 @@ fn serveHttpRuntime(
         exclusion_work.cancelled.store(true, .release);
         exclusion_thread.join();
     };
-    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
     exclusion_thread.join();

@@ -2802,9 +2802,13 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     if (value.len == 0) return error.MissingExecutable;
 
     if (std.mem.indexOfScalar(u8, value, '/') != null) {
-        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), value, .{}) catch
-            return error.ExecutableNotFound;
-        return allocator.dupe(u8, value);
+        const resolved = std.Io.Dir.cwd().realPathFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            value,
+            allocator,
+        ) catch return error.ExecutableNotFound;
+        defer allocator.free(resolved);
+        return allocator.dupe(u8, resolved);
     }
 
     const exe_dir =
@@ -2840,6 +2844,24 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     }
 
     return error.ExecutableNotFound;
+}
+
+test "slash executable resolution is absolute across later cwd changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "codex", .data = "fixture" });
+    const absolute = try tmp.dir.realPathFileAlloc(io, "codex", allocator);
+    defer allocator.free(absolute);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+    const relative = try std.fs.path.relative(allocator, cwd, null, cwd, absolute);
+    defer allocator.free(relative);
+    const resolved = try resolveExecutableAlloc(allocator, relative);
+    defer allocator.free(resolved);
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expectEqualStrings(absolute, resolved);
 }
 
 fn monotonicMillis() i64 {

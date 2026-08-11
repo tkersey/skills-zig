@@ -208,6 +208,11 @@ fn isRecoveryCommand(command: []const u8) bool {
         std.mem.eql(u8, command, "app.stop");
 }
 
+fn invalidateActionGeneration(runtime: *Runtime) void {
+    runtime.app.action_state_fresh = false;
+    runtime.worktree_generation_valid = false;
+}
+
 pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
 const default_header_timeout_ms: u32 = 5_000;
@@ -252,6 +257,34 @@ test "transient action validation preserves a pending card" {
     try std.testing.expect(!definitiveActionValidationFailure(error.InvalidGraphqlResponse));
     try std.testing.expect(definitiveActionValidationFailure(error.PullRequestChanged));
     try std.testing.expect(definitiveActionValidationFailure(error.GitHubActionTargetChanged));
+}
+
+test "generation-changing actions close both stale command surfaces" {
+    var state = try App.init(std.testing.allocator, "head");
+    defer state.deinit();
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    var runtime = Runtime{
+        .app = &state,
+        .registry = &registry,
+        .broker = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .gh_path = "gh",
+        },
+        .owner = "o",
+        .name = "r",
+        .number = 1,
+        .pull_request_id = "PR_1",
+        .cwd = ".",
+        .skill_path = "/skill",
+        .repository_cwd = ".",
+        .fetch_source = null,
+        .custody = .{ .managed = "." },
+    };
+    invalidateActionGeneration(&runtime);
+    try std.testing.expect(!state.action_state_fresh);
+    try std.testing.expect(!runtime.worktree_generation_valid);
 }
 
 test "session status payload binds its originating session" {
@@ -632,6 +665,15 @@ pub const Server = struct {
         if (std.mem.eql(u8, event.method, "session.close.requested")) {
             return self.flushClosedSession(stream, runtime, event);
         }
+        if (event.session_id) |session_id| {
+            if (std.mem.eql(u8, event.method, "turn/started")) {
+                runtime.app.setTabTurnActive(session_id, true);
+            } else if (std.mem.eql(u8, event.method, "turn/completed") or
+                std.mem.eql(u8, event.method, "turn/failed"))
+            {
+                runtime.app.setTabTurnActive(session_id, false);
+            }
+        }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
             event.session_id,
@@ -904,6 +946,7 @@ pub const Server = struct {
         try runtime.registry.message(session_id, text);
         mutex.lock();
         defer mutex.unlock();
+        runtime.app.setTabTurnActive(session_id, true);
         const body = try sessionStatusPayloadAlloc(
             self.allocator,
             session_id,
@@ -1067,7 +1110,7 @@ pub const Server = struct {
                     generation.head_oid,
                     runtime.app.generation.head_oid,
                 )) {
-                    runtime.app.action_state_fresh = false;
+                    invalidateActionGeneration(runtime);
                     return;
                 }
                 copyRevisionEvidence(&runtime.app.generation, &generation) catch {
