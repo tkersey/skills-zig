@@ -226,9 +226,13 @@ pub const Connection = struct {
 
     pub fn close(self: *Connection) void {
         if (self.usable.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.stream.shutdown(io, .both) catch |shutdown_error| switch (shutdown_error) {
+            else => {},
+        };
         while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.write_mutex.unlock();
-        self.stream.close(std.Io.Threaded.global_single_threaded.io());
+        self.stream.close(io);
     }
 
     pub fn poison(self: *Connection) void {
@@ -1785,6 +1789,85 @@ test "connection close serializes with the active frame writer" {
     writer.join();
     closer.join();
     try std.testing.expect(probe.close_finished.load(.acquire));
+}
+
+const StalledPublicWriterProbe = struct {
+    connection: *Connection,
+    payload: []const u8,
+    started: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn write(self: *StalledPublicWriterProbe) void {
+        self.started.store(true, .release);
+        self.connection.sendText(self.payload) catch |write_error| switch (write_error) {
+            else => {},
+        };
+        self.finished.store(true, .release);
+    }
+};
+
+test "connection close wakes a stalled public writer" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const peer_address = try std.Io.net.IpAddress.parse(
+        loopback_host,
+        listener.socket.address.getPort(),
+    );
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    var server_closed = false;
+    defer if (!server_closed) server_stream.close(io);
+    var send_buffer_bytes: c_int = 4096;
+    try std.posix.setsockopt(
+        client_stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.SNDBUF,
+        std.mem.asBytes(&send_buffer_bytes),
+    );
+    var connection = Connection{ .allocator = allocator, .stream = client_stream };
+    defer connection.deinit();
+    const payload = try allocator.alloc(u8, max_message_bytes);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    var writer_probe = StalledPublicWriterProbe{
+        .connection = &connection,
+        .payload = payload,
+    };
+    const writer = try std.Thread.spawn(.{}, StalledPublicWriterProbe.write, .{&writer_probe});
+    var writer_holds_lock = false;
+    var attempts: usize = 0;
+    while (attempts < 1_000) : (attempts += 1) { // tiger: bounded test wait.
+        if (writer_probe.started.load(.acquire) and !connection.write_mutex.tryLock()) {
+            writer_holds_lock = true;
+            break;
+        }
+        if (writer_probe.started.load(.acquire)) connection.write_mutex.unlock();
+        if (writer_probe.finished.load(.acquire)) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(writer_holds_lock);
+    var close_probe = ConnectionCloseProbe{ .connection = &connection };
+    const closer = try std.Thread.spawn(.{}, ConnectionCloseProbe.close, .{&close_probe});
+    var close_finished_before_peer = false;
+    attempts = 0;
+    while (attempts < 1_000) : (attempts += 1) { // tiger: bounded test wait.
+        if (close_probe.close_finished.load(.acquire)) {
+            close_finished_before_peer = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    if (!close_finished_before_peer) {
+        server_stream.close(io);
+        server_closed = true;
+    }
+    writer.join();
+    closer.join();
+    try std.testing.expect(close_finished_before_peer);
+    try std.testing.expect(writer_probe.finished.load(.acquire));
 }
 
 test "websocket endpoint parsing separates socket host from exact Host authority" {
