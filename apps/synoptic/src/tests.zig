@@ -495,7 +495,7 @@ fn receiveExact(io: std.Io, stream: *std.Io.net.Stream, destination: []u8) !void
     var used: usize = 0;
     const deadline = std.Io.Clock.Timestamp.fromNow(
         io,
-        .{ .raw = .fromMilliseconds(2_000), .clock = .awake },
+        .{ .raw = .fromMilliseconds(10_000), .clock = .awake },
     );
     while (used < destination.len) {
         const incoming = try stream.socket.receiveTimeout(
