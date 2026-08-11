@@ -288,6 +288,25 @@ pub const ActionStore = struct {
         ) and std.mem.eql(u8, card.slot, slot)) return card.id;
         return null;
     }
+
+    pub fn pendingMatching(
+        self: *ActionStore,
+        session_id: []const u8,
+        source_turn_id: []const u8,
+        input: PreparedActionInput,
+    ) ?*ActionCard {
+        for (self.cards.items) |*card| {
+            const identity_matches = card.status == .pending and
+                std.mem.eql(u8, card.session_id, session_id) and
+                std.mem.eql(u8, card.source_turn_id, source_turn_id) and
+                std.mem.eql(u8, card.slot, input.slot) and card.kind == input.kind;
+            if (identity_matches and
+                std.mem.eql(u8, card.effect_summary, input.effect_summary) and
+                std.mem.eql(u8, card.payload_json, input.payload_json)) return card;
+        }
+        return null;
+    }
+
     pub fn pendingById(self: *ActionStore, id: []const u8) !*ActionCard {
         for (self.cards.items) |*card| if (std.mem.eql(u8, card.id, id)) {
             if (card.status != .pending) return error.ActionNotPending;
@@ -478,7 +497,9 @@ test "same session slot supersedes immutably and execution is once" {
         .line = 2,
         .body = @constCast("two"),
     };
-    _ = try store.prepare("s", "t1", one, target);
+    const first = try store.prepare("s", "t1", one, target);
+    try std.testing.expect(store.pendingMatching("s", "t1", one) == first);
+    try std.testing.expect(store.pendingMatching("s", "other-turn", one) == null);
     _ = try store.prepare("s", "t2", two, target);
     try std.testing.expectEqual(ActionStatus.superseded, store.cards.items[0].status);
     try std.testing.expectEqualStrings("act-1", store.cards.items[1].supersedes.?);

@@ -8,11 +8,18 @@ pub const Identity = struct {
 };
 
 pub fn parseUrl(raw: []const u8) !Identity {
-    const prefix = "https://github.com/";
-    if (!std.mem.startsWith(u8, raw, prefix)) return error.InvalidPullRequestSelector;
+    const scheme = "https://";
+    if (!std.mem.startsWith(u8, raw, scheme)) return error.InvalidPullRequestSelector;
+    const host_end = std.mem.indexOfScalarPos(u8, raw, scheme.len, '/') orelse
+        return error.InvalidPullRequestSelector;
+    const host = raw[scheme.len..host_end];
+    if (host.len == 0 or std.mem.indexOfScalar(u8, host, '@') != null) {
+        return error.InvalidPullRequestSelector;
+    }
     const query = std.mem.indexOfAny(u8, raw, "?#") orelse raw.len;
+    if (query <= host_end) return error.InvalidPullRequestSelector;
     const canonical = std.mem.trimEnd(u8, raw[0..query], "/");
-    var parts = std.mem.splitScalar(u8, canonical[prefix.len..], '/');
+    var parts = std.mem.splitScalar(u8, canonical[host_end + 1 ..], '/');
     const owner = parts.next() orelse return error.InvalidPullRequestSelector;
     const repo = parts.next() orelse return error.InvalidPullRequestSelector;
     if (!std.mem.eql(u8, parts.next() orelse return error.InvalidPullRequestSelector, "pull"))
@@ -23,7 +30,7 @@ pub fn parseUrl(raw: []const u8) !Identity {
         10,
     );
     if (parts.next() != null) return error.InvalidPullRequestSelector;
-    return .{ .owner = owner, .repository = repo, .number = number };
+    return .{ .host = host, .owner = owner, .repository = repo, .number = number };
 }
 
 pub fn parseSelector(
@@ -52,4 +59,14 @@ test "numeric selector uses repository context" {
 test "canonical URL accepts browser query and trailing slash" {
     const id = try parseUrl("https://github.com/o/r/pull/9/?tab=files");
     try std.testing.expectEqual(@as(u64, 9), id.number);
+}
+test "enterprise PR URL retains its selected host" {
+    const id = try parseUrl("https://github.example.test/o/r/pull/9");
+    try std.testing.expectEqualStrings("github.example.test", id.host);
+}
+test "query before a complete authority and path is rejected" {
+    try std.testing.expectError(
+        error.InvalidPullRequestSelector,
+        parseUrl("https://github.example?bad/o/r/pull/9"),
+    );
 }

@@ -105,7 +105,12 @@ fn launch(
     defer settings.deinit();
     const runtime_root = try runtimeRootAlloc(allocator, environment);
     defer allocator.free(runtime_root);
-    try std.Io.Dir.cwd().createDirPath(io, runtime_root);
+    try ensurePrivateDir(io, runtime_root);
+    const claim_path = try std.fs.path.join(allocator, &.{ runtime_root, "launch.lock" });
+    defer allocator.free(claim_path);
+    var claim = try acquireLaunchClaim(io, claim_path);
+    defer claim.close(io);
+    defer claim.unlock(io);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     if (readLifecycleRecord(allocator, io, current_path)) |record_value| {
@@ -125,7 +130,7 @@ fn launch(
     const launch_id = try std.fmt.bufPrint(&launch_buf, "{x}", .{launch_bytes});
     const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
     defer allocator.free(launch_dir);
-    try std.Io.Dir.cwd().createDirPath(io, launch_dir);
+    try ensurePrivateDir(io, launch_dir);
     const ready_path = try std.fs.path.join(allocator, &.{ launch_dir, "ready.json" });
     defer allocator.free(ready_path);
     const error_path = try std.fs.path.join(allocator, &.{ launch_dir, "error.json" });
@@ -139,9 +144,8 @@ fn launch(
     if (!try verifiedProcess(allocator, io, ready)) return error.InvalidLaunchReadiness;
     try writeOperationalFile(allocator, io, current_path, ready.raw);
     if (!options.no_browser and settings.browser_open) {
-        openBrowser(allocator, io, ready.url) catch |err| {
-            removeCurrentIfLaunch(allocator, io, current_path, launch_id);
-            return err;
+        openBrowser(allocator, io, ready.url) catch |ignored_error| switch (ignored_error) {
+            else => {},
         };
     }
     var out = std.Io.File.stdout().writer(io, &.{});
@@ -274,8 +278,13 @@ fn serveReview(
         try writeLaunchProblem(allocator, io, runtime_root, launch_id, problem);
         return error.CodexSchemaIncompatible;
     }
-    const needs_auth = options.pr == null or !std.mem.startsWith(u8, options.pr.?, "https://");
-    if (needs_auth) try requireGhAuthentication(allocator, io, gh_resolved, "github.com");
+    try preflightGhAuthentication(
+        allocator,
+        io,
+        gh_resolved,
+        options.cwd,
+        options.pr,
+    );
     const selector_url = try resolveSelectorUrl(
         allocator,
         io,
@@ -440,6 +449,32 @@ fn serveGeneration(
         context.settings.worktree_prefer_current_pr_checkout,
     );
     defer allocator.free(custody.path());
+    var custody_retired = false;
+    serveSelectedGeneration(
+        allocator,
+        io,
+        context,
+        generation,
+        generation_owned,
+        custody,
+        &custody_retired,
+    ) catch |launch_error| {
+        if (!custody_retired) {
+            try worktree.retireManaged(allocator, io, custody, context.options.cwd);
+        }
+        return launch_error;
+    };
+}
+
+fn serveSelectedGeneration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: GenerationContext,
+    generation: *domain.PrGeneration,
+    generation_owned: *bool,
+    custody: worktree.Custody,
+    custody_retired: *bool,
+) !void {
     const review_cwd = custody.path();
     try github.hydrateRevisionKeys(allocator, io, review_cwd, generation);
     var worktree_baseline = try worktree.Baseline.capture(allocator, io, review_cwd);
@@ -459,11 +494,9 @@ fn serveGeneration(
     const skill_path = try initializePrimary(
         allocator,
         io,
-        context.settings,
         context.options.skill_root,
         context.identity,
         context.snapshot,
-        context.broker,
         review_cwd,
         &state,
         &registry,
@@ -485,35 +518,20 @@ fn serveGeneration(
         &registry,
         review_cwd,
         skill_path,
+        custody_retired,
     );
 }
 
 fn initializePrimary(
     allocator: std.mem.Allocator,
     io: std.Io,
-    settings: *config.Settings,
     skill_root: []const u8,
     identity: pr.Identity,
     snapshot: Snapshot,
-    broker: github.Broker,
     review_cwd: []const u8,
     state: *App,
     registry: *sessions.Registry,
 ) ![]u8 {
-    var exclusion_outcomes = try state.applyAutomaticExclusions(
-        settings,
-        broker,
-        identity.owner,
-        identity.repository,
-        identity.number,
-        snapshot.pull_request_id,
-        review_cwd,
-    );
-    defer {
-        for (exclusion_outcomes.items) |outcome| outcome.deinit();
-        exclusion_outcomes.deinit(allocator);
-    }
-    try http.queueExclusionEvents(registry, exclusion_outcomes.items);
     try registry.setGenerationEvidence(&state.generation);
     const skill_path = try std.fs.path.join(allocator, &.{ skill_root, "SKILL.md" });
     errdefer allocator.free(skill_path);
@@ -534,6 +552,32 @@ fn initializePrimary(
     try registry.createPrimary(io, review_cwd, skill_path, pr_context);
     state.primary_ready = registry.primaryReady();
     return skill_path;
+}
+
+fn applyLaunchExclusions(
+    allocator: std.mem.Allocator,
+    settings: *config.Settings,
+    broker: github.Broker,
+    identity: pr.Identity,
+    pull_request_id: []const u8,
+    review_cwd: []const u8,
+    state: *App,
+    registry: *sessions.Registry,
+) !void {
+    var outcomes = try state.applyAutomaticExclusions(
+        settings,
+        broker,
+        identity.owner,
+        identity.repository,
+        identity.number,
+        pull_request_id,
+        review_cwd,
+    );
+    defer {
+        for (outcomes.items) |outcome| outcome.deinit();
+        outcomes.deinit(allocator);
+    }
+    try http.queueExclusionEvents(registry, outcomes.items);
 }
 
 fn configureAppState(
@@ -586,25 +630,117 @@ fn serveHttpRuntime(
     registry: *sessions.Registry,
     review_cwd: []const u8,
     skill_path: []const u8,
+    custody_retired: *bool,
 ) !void {
     var server = try http.Server.bind(allocator, io, options.skill_root);
     defer server.deinit();
-    try publishReadyReceipt(
+    queueLaunchExclusionFailures(
         allocator,
-        io,
-        &server,
+        settings,
+        broker,
         identity,
-        launch_id,
-        runtime_root,
+        pull_request_id,
         review_cwd,
-        custody,
+        state,
+        registry,
     );
     const stop_request_path = try std.fs.path.join(
         allocator,
         &.{ runtime_root, launch_id, "stop.request" },
     );
     defer allocator.free(stop_request_path);
-    var runtime = http.Runtime{
+    var runtime = makeHttpRuntime(
+        settings,
+        options,
+        identity,
+        broker,
+        pull_request_id,
+        custody,
+        worktree_baseline,
+        state,
+        registry,
+        review_cwd,
+        skill_path,
+        launch_id,
+        stop_request_path,
+    );
+    try publishRuntimeReady(allocator, io, &server, &runtime, runtime_root);
+    const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
+    try finishHttpRuntime(
+        allocator,
+        io,
+        options,
+        runtime_root,
+        &runtime,
+        custody_retired,
+        terminal_error,
+    );
+}
+
+fn publishRuntimeReady(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *http.Server,
+    runtime: *http.Runtime,
+    runtime_root: []const u8,
+) !void {
+    try publishReadyReceipt(
+        allocator,
+        io,
+        server,
+        .{
+            .owner = runtime.owner,
+            .repository = runtime.name,
+            .number = runtime.number,
+        },
+        runtime.launch_id,
+        runtime_root,
+        runtime.cwd,
+        runtime.custody,
+    );
+}
+
+fn finishHttpRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: config.LaunchOptions,
+    runtime_root: []const u8,
+    runtime: *http.Runtime,
+    custody_retired: *bool,
+    terminal_error: ?anyerror,
+) !void {
+    try shutdownReview(
+        allocator,
+        io,
+        options,
+        runtime.launch_id,
+        runtime_root,
+        runtime.custody,
+        runtime.baseline orelse return error.MissingWorktreeBaseline,
+        runtime.app,
+        runtime.registry,
+        runtime.stop_request_path orelse return error.MissingStopRequestPath,
+        custody_retired,
+        terminal_error,
+    );
+}
+
+fn makeHttpRuntime(
+    settings: *config.Settings,
+    options: config.LaunchOptions,
+    identity: pr.Identity,
+    broker: github.Broker,
+    pull_request_id: []const u8,
+    custody: worktree.Custody,
+    worktree_baseline: *worktree.Baseline,
+    state: *App,
+    registry: *sessions.Registry,
+    review_cwd: []const u8,
+    skill_path: []const u8,
+    launch_id: []const u8,
+    stop_request_path: []const u8,
+) http.Runtime {
+    return .{
         .app = state,
         .registry = registry,
         .broker = broker,
@@ -621,20 +757,44 @@ fn serveHttpRuntime(
         .launch_id = launch_id,
         .stop_request_path = stop_request_path,
     };
-    const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
-    try shutdownReview(
+}
+
+fn queueLaunchExclusionFailures(
+    allocator: std.mem.Allocator,
+    settings: *config.Settings,
+    broker: github.Broker,
+    identity: pr.Identity,
+    pull_request_id: []const u8,
+    review_cwd: []const u8,
+    state: *App,
+    registry: *sessions.Registry,
+) void {
+    applyLaunchExclusions(
         allocator,
-        io,
-        options,
-        launch_id,
-        runtime_root,
-        custody,
-        worktree_baseline,
+        settings,
+        broker,
+        identity,
+        pull_request_id,
+        review_cwd,
         state,
         registry,
-        stop_request_path,
-        terminal_error,
-    );
+    ) catch |err| {
+        const payload = std.fmt.allocPrint(
+            allocator,
+            "{{\"code\":{f}}}",
+            .{std.json.fmt(@errorName(err), .{})},
+        ) catch null;
+        if (payload) |value| {
+            defer allocator.free(value);
+            queueWarning(registry, value);
+        }
+    };
+}
+
+fn queueWarning(registry: *sessions.Registry, payload: []const u8) void {
+    registry.queueSystemEvent("warning", payload) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }
 
 fn publishReadyReceipt(
@@ -703,12 +863,9 @@ fn runHttpLoop(
     var terminal_error: ?anyerror = null;
     while (!runtime.stop_requested) {
         state.primary_ready = registry.primaryReady();
-        server.serveOne(runtime) catch |err| switch (err) {
-            error.EndOfStream => continue,
-            else => {
-                terminal_error = err;
-                break;
-            },
+        server.serveOne(runtime) catch |err| {
+            terminal_error = err;
+            break;
         };
         if (std.Io.Dir.cwd().access(io, stop_request_path, .{})) |_| runtime.stop_requested =
             true else |_| {}
@@ -727,6 +884,7 @@ fn shutdownReview(
     state: *App,
     registry: *sessions.Registry,
     stop_request_path: []const u8,
+    custody_retired: *bool,
     terminal_error: ?anyerror,
 ) !void {
     try registry.beginSynchronization(io, sessions.safe_boundary_timeout_ms);
@@ -739,6 +897,7 @@ fn shutdownReview(
         worktree_baseline,
     );
     try worktree.retireManaged(allocator, io, custody, options.cwd);
+    custody_retired.* = true;
     std.Io.Dir.cwd().deleteFile(io, stop_request_path) catch |ignored_error| {
         switch (ignored_error) {
             else => {},
@@ -903,6 +1062,24 @@ fn runtimeRootAlloc(
     return std.fs.path.join(allocator, &.{ environment.get("TMPDIR") orelse "/tmp", "synoptic" });
 }
 
+fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    try dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+}
+
+fn acquireLaunchClaim(io: std.Io, path: []const u8) !std.Io.File {
+    var claim = try std.Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+    });
+    errdefer claim.close(io);
+    if (!try claim.tryLock(io, .exclusive)) return error.SynopticLaunchInProgress;
+    try claim.setPermissions(io, std.Io.File.Permissions.fromMode(0o600));
+    return claim;
+}
+
 fn readLifecycleRecord(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1015,6 +1192,12 @@ fn writeOperationalFile(
         }
     };
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = contents });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        staging,
+        std.Io.File.Permissions.fromMode(0o600),
+        .{},
+    );
     try std.Io.Dir.renameAbsolute(staging, path, io);
 }
 
@@ -1261,11 +1444,9 @@ fn resolveSelectorUrl(
     cwd: []const u8,
     selector: ?[]const u8,
 ) ![]u8 {
-    if (selector) |value| if (std.mem.startsWith(
-        u8,
-        value,
-        "https://github.com/",
-    )) return allocator.dupe(u8, value);
+    if (selector) |value| if (std.mem.startsWith(u8, value, "https://")) {
+        return allocator.dupe(u8, value);
+    };
     const argv: []const []const u8 = if (selector) |value| &.{
         gh_path,
         "pr",
@@ -1281,6 +1462,67 @@ fn resolveSelectorUrl(
     defer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.PullRequestResolutionFailed;
     return allocator.dupe(u8, std.mem.trim(u8, result.stdout, "\r\n"));
+}
+
+fn preflightGhAuthentication(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    gh_path: []const u8,
+    cwd: []const u8,
+    selector: ?[]const u8,
+) !void {
+    if (selector) |value| if (std.mem.startsWith(u8, value, "https://")) {
+        const identity = try pr.parseUrl(value);
+        return requireGhAuthentication(allocator, io, gh_path, identity.host);
+    };
+    if (try repositoryHostAlloc(allocator, io, cwd)) |host| {
+        defer allocator.free(host);
+        return requireGhAuthentication(allocator, io, gh_path, host);
+    }
+    const result = try std.process.run(
+        allocator,
+        io,
+        .{ .argv = &.{ gh_path, "auth", "status" } },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.GitHubAuthenticationFailed;
+    }
+}
+
+fn repositoryHostAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+) !?[]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "-C", cwd, "config", "--get", "remote.origin.url" },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return null;
+    return remoteHostAlloc(allocator, std.mem.trim(u8, result.stdout, "\r\n"));
+}
+
+fn remoteHostAlloc(allocator: std.mem.Allocator, remote: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, remote, "://")) |scheme_end| {
+        const authority_start = scheme_end + 3;
+        const authority_end = std.mem.indexOfScalarPos(
+            u8,
+            remote,
+            authority_start,
+            '/',
+        ) orelse remote.len;
+        const authority = remote[authority_start..authority_end];
+        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+        if (host_start == authority.len) return null;
+        return @as(?[]u8, try allocator.dupe(u8, authority[host_start..]));
+    }
+    const at = std.mem.indexOfScalar(u8, remote, '@') orelse return null;
+    const colon = std.mem.indexOfScalarPos(u8, remote, at + 1, ':') orelse return null;
+    if (colon == at + 1) return null;
+    return @as(?[]u8, try allocator.dupe(u8, remote[at + 1 .. colon]));
 }
 fn requireGhAuthentication(
     allocator: std.mem.Allocator,
@@ -1314,6 +1556,70 @@ test "launch argv is safe and explicit" {
         },
     );
     try std.testing.expect(options.json);
+}
+test "runtime state is owner-private and the launch claim is exclusive" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const runtime = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime);
+    try ensurePrivateDir(io, runtime);
+    const claim_path = try std.fs.path.join(allocator, &.{ runtime, "launch.lock" });
+    defer allocator.free(claim_path);
+    var first = try acquireLaunchClaim(io, claim_path);
+    defer first.close(io);
+    defer first.unlock(io);
+    try std.testing.expectError(
+        error.SynopticLaunchInProgress,
+        acquireLaunchClaim(io, claim_path),
+    );
+    const receipt_path = try std.fs.path.join(allocator, &.{ runtime, "current.json" });
+    defer allocator.free(receipt_path);
+    try writeOperationalFile(allocator, io, receipt_path, "{}\n");
+    var receipt = try std.Io.Dir.openFileAbsolute(io, receipt_path, .{});
+    defer receipt.close(io);
+    const stat = try receipt.stat(io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+}
+test "runtime custody rejects symlink roots and remote hosts retain identity" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "target", .default_dir);
+    try tmp.dir.symLink(io, "target", "runtime-link", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const link = try std.fs.path.join(allocator, &.{ root, "runtime-link" });
+    defer allocator.free(link);
+    var rejected = false;
+    ensurePrivateDir(io, link) catch {
+        rejected = true;
+    };
+    try std.testing.expect(rejected);
+    const https = (try remoteHostAlloc(
+        allocator,
+        "https://github.example.test/o/r.git",
+    )).?;
+    defer allocator.free(https);
+    try std.testing.expectEqualStrings("github.example.test", https);
+    const ssh = (try remoteHostAlloc(allocator, "git@github.example.test:o/r.git")).?;
+    defer allocator.free(ssh);
+    try std.testing.expectEqualStrings("github.example.test", ssh);
+    const direct = try resolveSelectorUrl(
+        allocator,
+        io,
+        "/not-executed",
+        ".",
+        "https://github.example.test/o/r/pull/9",
+    );
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("https://github.example.test/o/r/pull/9", direct);
 }
 test {
     _ = domain;

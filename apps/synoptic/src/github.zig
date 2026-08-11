@@ -11,11 +11,7 @@ pub const Broker = struct {
     host: []const u8 = "github.com",
 
     pub fn call(self: Broker, document: []const u8, variables: []const u8) ![]u8 {
-        const mutation = std.mem.startsWith(u8, std.mem.trim(
-            u8,
-            document,
-            " \t\r\n",
-        ), "mutation");
+        const mutation = try graphql.isMutation(self.allocator, document);
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
         const argv = [_][]const u8{
@@ -906,7 +902,10 @@ pub fn loadThreads(
     };
     for (nodes) |node| {
         const object = node.object;
-        if (object.get("isResolved").?.bool) continue;
+        if (object.get("isResolved").?.bool) {
+            generation.removeThread(object.get("id").?.string);
+            continue;
+        }
         var comments: std.ArrayList(domain.ReviewComment) = .empty;
         defer comments.deinit(allocator);
         for (object.get("comments").?.object.get("nodes").?.array.items) |value| {
@@ -926,6 +925,9 @@ pub fn loadThreads(
                 .review_id = review.get("id").?.string,
                 .review_state = review.get("state").?.string,
             });
+        }
+        if (try generation.appendThreadComments(object.get("id").?.string, comments.items)) {
+            continue;
         }
         try generation.addThread(
             .{
@@ -1085,9 +1087,11 @@ pub fn validateDiffAnchor(diff: []const u8, line: u32, start_line: ?u32, side: [
 fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
     var old_line: u32 = 0;
     var new_line: u32 = 0;
+    var in_hunk = false;
     var lines = std.mem.splitScalar(u8, diff, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "@@")) {
+            in_hunk = true;
             const minus = std.mem.indexOfScalar(u8, line, '-') orelse continue;
             const old_tail = line[minus + 1 ..];
             const old_end = std.mem.indexOfAny(u8, old_tail, ", ") orelse old_tail.len;
@@ -1098,9 +1102,9 @@ fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
             new_line = std.fmt.parseInt(u32, tail[0..end], 10) catch 0;
             continue;
         }
-        const metadata = line.len == 0 or std.mem.startsWith(u8, line, "---") or
-            std.mem.startsWith(u8, line, "+++");
-        if (metadata) continue;
+        if (!in_hunk or line.len == 0 or std.mem.startsWith(u8, line, "\\ No newline")) {
+            continue;
+        }
         if (std.mem.eql(u8, side, "RIGHT") and line[0] != '-' and new_line == target) return true;
         if (std.mem.eql(u8, side, "LEFT") and line[0] != '+' and old_line == target) return true;
         if (line[0] != '-') new_line += 1;
@@ -1156,6 +1160,26 @@ test "thread evidence accepts deleted authors and nested comment pages" {
         "[deleted]",
         generation.threads.items[0].comments[0].author,
     );
+    const next =
+        "{\"data\":{\"node\":{\"id\":\"T1\",\"path\":\"a.zig\"," ++
+        "\"line\":1,\"startLine\":null,\"diffSide\":\"RIGHT\"," ++
+        "\"startDiffSide\":null,\"subjectType\":\"LINE\"," ++
+        "\"isResolved\":false,\"isOutdated\":false," ++
+        "\"viewerCanReply\":true,\"viewerCanResolve\":true," ++
+        "\"viewerCanUnresolve\":false,\"comments\":{\"nodes\":[{" ++
+        "\"id\":\"C102\",\"body\":\"latest\"," ++
+        "\"createdAt\":\"2026-01-02T00:00:00Z\"," ++
+        "\"url\":\"https://example/C102\",\"author\":{\"login\":\"reviewer\"}," ++
+        "\"viewerDidAuthor\":false,\"pullRequestReview\":{" ++
+        "\"id\":\"R1\",\"state\":\"COMMENTED\"}}]}}}}";
+    try loadThreads(std.testing.allocator, next, &generation);
+    try std.testing.expectEqual(@as(usize, 1), generation.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 2), generation.threads.items[0].comments.len);
+    try std.testing.expectEqualStrings("C102", generation.threads.items[0].comments[1].id);
+    const resolved =
+        "{\"data\":{\"node\":{\"id\":\"T1\",\"isResolved\":true}}}";
+    try loadThreads(std.testing.allocator, resolved, &generation);
+    try std.testing.expectEqual(@as(usize, 0), generation.threads.items.len);
 }
 
 test "GitHub transport is a fixed argv stdin broker" {
@@ -1167,4 +1191,11 @@ test "GitHub transport is a fixed argv stdin broker" {
 test "canonical RIGHT anchor accepts only represented new lines" {
     try std.testing.expect(validateRightLine("@@ -1 +10,2 @@\n+x\n y\n", 10));
     try std.testing.expect(!validateRightLine("@@ -1 +10 @@\n+x\n", 9));
+}
+test "diff metadata never consumes anchor line identity" {
+    const diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n---source\n" ++
+        "+++source\n\\ No newline at end of file\n";
+    try std.testing.expect(validateDiffAnchor(diff, 1, null, "LEFT"));
+    try std.testing.expect(validateDiffAnchor(diff, 1, null, "RIGHT"));
+    try std.testing.expect(!validateDiffAnchor(diff, 2, null, "RIGHT"));
 }

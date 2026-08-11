@@ -1472,6 +1472,7 @@ const ActorPending = struct {
 
 const ActorOutbound = struct {
     payload: []u8,
+    deadline_ms: i64,
 };
 
 const ActorServerRequest = struct {
@@ -1757,6 +1758,9 @@ fn actorWriterMain(state: *ActorState) void {
 
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
+            if (actorOutboundExpired(item)) continue;
+            const previous_deadline = state.client.swapRequestDeadlineMs(item.deadline_ms);
+            defer _ = state.client.swapRequestDeadlineMs(previous_deadline);
             state.client.sendPayload(item.payload, null) catch {
                 actorSetTerminal(state, .poisoned);
                 actorCloseTransportOnce(state);
@@ -1770,6 +1774,10 @@ fn actorWriterMain(state: *ActorState) void {
             };
         }
     }
+}
+
+fn actorOutboundExpired(item: ActorOutbound) bool {
+    return monotonicMillis() >= item.deadline_ms;
 }
 
 fn actorHandlerMain(state: *ActorState) void {
@@ -1787,10 +1795,13 @@ fn actorHandlerMain(state: *ActorState) void {
 
         if (maybe_work) |work| {
             defer work.deinit(state.allocator);
-            actorHandleServerRequest(state, work) catch {
-                actorSetTerminal(state, .poisoned);
-                actorCloseTransportOnce(state);
-                return;
+            actorHandleServerRequest(state, work) catch |err| switch (err) {
+                error.RequestDeadlineExceeded => continue,
+                else => {
+                    actorSetTerminal(state, .poisoned);
+                    actorCloseTransportOnce(state);
+                    return;
+                },
             };
         } else {
             std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
@@ -1857,7 +1868,10 @@ fn actorRouteLine(state: *ActorState, line: []const u8) !void {
 
     state.mutex.lock();
     defer state.mutex.unlock();
-    const pending = state.pending.get(integer_id) orelse return;
+    const pending = state.pending.get(integer_id) orelse {
+        state.allocator.free(response_json);
+        return;
+    };
     pending.response_json = response_json;
     pending.is_error = object.get("error") != null;
     pending.done = true;
@@ -1938,6 +1952,7 @@ fn actorDispatchServerRequest(
 }
 
 fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void {
+    if (monotonicMillis() >= work.deadline_ms) return error.RequestDeadlineExceeded;
     var parsed_id = try std.json.parseFromSlice(
         std.json.Value,
         state.allocator,
@@ -1964,6 +1979,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         .id = request_id,
         .method = work.method,
         .raw_json = work.raw_json,
+        .deadline_ms = work.deadline_ms,
     };
     const result_json = configured.handle(configured.context, request, state.allocator) catch
         return actorEnqueueServerError(
@@ -2058,7 +2074,10 @@ fn actorEnqueueOwned(state: *ActorState, payload: []u8, deadline_ms: i64) !void 
             return error.RequestDeadlineExceeded;
         }
         if (state.outbound.items.len < state.outbound_capacity) {
-            state.outbound.append(state.allocator, .{ .payload = owned }) catch |err| {
+            state.outbound.append(state.allocator, .{
+                .payload = owned,
+                .deadline_ms = deadline_ms,
+            }) catch |err| {
                 state.mutex.unlock();
                 return err;
             };
@@ -4001,6 +4020,7 @@ test "actor falsifier saturated stalled writer consumes the request deadline" {
     defer state.deinit();
     try state.outbound.append(allocator, .{
         .payload = try allocator.dupe(u8, "stalled"),
+        .deadline_ms = monotonicMillis() + 1_000,
     });
     var actor = Actor{ .state = &state };
     const started = monotonicMillis();
@@ -4009,6 +4029,64 @@ test "actor falsifier saturated stalled writer consumes the request deadline" {
         actor.requestJson("actor/blocked", null, 20),
     );
     try std.testing.expect(monotonicMillis() - started < 500);
+    try std.testing.expectEqual(@as(usize, 0), state.pending.count());
+}
+
+test "actor falsifier expired outbound work is never eligible for transport" {
+    const item = ActorOutbound{
+        .payload = @constCast("expired"),
+        .deadline_ms = monotonicMillis() - 1,
+    };
+    try std.testing.expect(actorOutboundExpired(item));
+}
+
+test "actor falsifier expired server work never invokes its handler" {
+    const allocator = std.testing.allocator;
+    var probe = ServerRequestProbe{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    const work = ActorServerRequest{
+        .id_json = try allocator.dupe(u8, "1"),
+        .method = try allocator.dupe(u8, "item/tool/call"),
+        .raw_json = try allocator.dupe(u8, "{}"),
+        .deadline_ms = monotonicMillis() - 1,
+    };
+    defer work.deinit(allocator);
+    try std.testing.expectError(
+        error.RequestDeadlineExceeded,
+        actorHandleServerRequest(&state, work),
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
+}
+
+test "actor falsifier releases an uncorrelated late response" {
+    const allocator = std.testing.allocator;
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    try actorRouteLine(&state, "{\"id\":99,\"result\":{\"late\":true}}");
     try std.testing.expectEqual(@as(usize, 0), state.pending.count());
 }
 

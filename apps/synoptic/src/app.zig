@@ -338,7 +338,11 @@ pub const App = struct {
                     card.*,
                     started_unix_s,
                 ) catch false;
-                card.status = if (reconciled) .succeeded else .outcome_unknown;
+                if (reconciled) {
+                    self.action_state_fresh = true;
+                    return null;
+                }
+                card.status = .outcome_unknown;
             } else card.status = .failed;
             self.action_store.setTerminal(card.id, card.status) catch |terminal_err| {
                 switch (terminal_err) {

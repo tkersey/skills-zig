@@ -29,7 +29,31 @@ pub const Runtime = struct {
 
 pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
+const default_header_timeout_ms: u32 = 5_000;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+fn clientConnectionError(err: anyerror) bool {
+    return switch (err) {
+        error.EndOfStream,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.HttpHeadersTooLarge,
+        error.InvalidHttpRequest,
+        error.InvalidClientWebSocketFrame,
+        error.WebSocketMessageTooLarge,
+        error.WebSocketClosed,
+        error.Timeout,
+        => true,
+        else => false,
+    };
+}
+
+test "connection isolation never reclassifies an internal runtime failure" {
+    try std.testing.expect(clientConnectionError(error.InvalidHttpRequest));
+    try std.testing.expect(clientConnectionError(error.Timeout));
+    try std.testing.expect(!clientConnectionError(error.OutOfMemory));
+    try std.testing.expect(!clientConnectionError(error.MissingOriginSession));
+}
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -37,6 +61,7 @@ pub const Server = struct {
     listener: std.Io.net.Server,
     token: [32]u8,
     skill_root: []u8,
+    header_timeout_ms: u32 = default_header_timeout_ms,
 
     pub fn bind(allocator: std.mem.Allocator, io: std.Io, skill_root: []const u8) !Server {
         var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -67,11 +92,30 @@ pub const Server = struct {
     pub fn serveOne(self: *Server, runtime: *Runtime) !void {
         var stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
+        self.serveConnected(&stream, runtime) catch |err| {
+            if (clientConnectionError(err)) return;
+            return err;
+        };
+    }
+
+    fn serveConnected(
+        self: *Server,
+        stream: *std.Io.net.Stream,
+        runtime: *Runtime,
+    ) !void {
         var buf: [max_header_bytes]u8 = undefined;
         var used: usize = 0;
+        const deadline = std.Io.Clock.Timestamp.fromNow(
+            self.io,
+            .{ .raw = std.Io.Duration.fromMilliseconds(self.header_timeout_ms), .clock = .awake },
+        );
         while (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n") == null) {
             if (used == buf.len) return error.HttpHeadersTooLarge;
-            const got = try stream.socket.receive(self.io, buf[used..]);
+            const got = try stream.socket.receiveTimeout(
+                self.io,
+                buf[used..],
+                .{ .deadline = deadline },
+            );
             if (got.data.len == 0) return error.EndOfStream;
             used += got.data.len;
         }
@@ -80,12 +124,12 @@ pub const Server = struct {
         var token_buf: [64]u8 = undefined;
         const token = self.tokenHex(&token_buf);
         if (std.mem.startsWith(u8, target, "/ws?")) {
-            return self.upgradeWebSocket(&stream, raw, token, runtime);
+            return self.upgradeWebSocket(stream, raw, token, runtime);
         }
         if (requiresToken(target)) {
             if (!authorized(target, raw, token)) return writeResponse(
                 self.io,
-                &stream,
+                stream,
                 "403 Forbidden",
                 "text/plain",
                 "forbidden",
@@ -93,7 +137,7 @@ pub const Server = struct {
             );
             const body = try runtime.app.bootstrapAlloc();
             defer self.allocator.free(body);
-            return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
+            return writeResponse(self.io, stream, "200 OK", "application/json", body, true);
         }
         const health = std.mem.startsWith(u8, target, "/healthz") or
             std.mem.startsWith(u8, target, "/readyz");
@@ -104,9 +148,9 @@ pub const Server = struct {
                 .{ std.json.fmt(runtime.launch_id, .{}), std.c.getpid() },
             );
             defer self.allocator.free(body);
-            return writeResponse(self.io, &stream, "200 OK", "application/json", body, true);
+            return writeResponse(self.io, stream, "200 OK", "application/json", body, true);
         }
-        return self.serveAsset(&stream, target);
+        return self.serveAsset(stream, target);
     }
 
     fn serveAsset(self: *Server, stream: *std.Io.net.Stream, target: []const u8) !void {
@@ -301,12 +345,11 @@ pub const Server = struct {
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
         }
-        var visible = try runtime.registry.drainVisible(self.allocator);
-        defer {
-            for (visible.items) |event| event.deinit(self.allocator);
-            visible.deinit(self.allocator);
+        while (try runtime.registry.peekVisible(self.allocator)) |event| {
+            defer event.deinit(self.allocator);
+            try self.flushVisibleEvent(stream, runtime, event);
+            try runtime.registry.acknowledgeVisible();
         }
-        for (visible.items) |event| try self.flushVisibleEvent(stream, runtime, event);
     }
 
     fn flushVisibleEvent(
@@ -362,14 +405,16 @@ pub const Server = struct {
         const identity = try runtime.registry.sessionIdentity(session_id);
         defer identity.deinit();
         try tools.validateAgainstSession(input, identity.path);
-        const pending_id = runtime.app.action_store.pendingIdForSlot(
+        const matching = runtime.app.action_store.pendingMatching(
             session_id,
-            input.slot,
+            identity.turn_id,
+            input,
         );
-        const superseded = if (pending_id) |id|
-            try self.allocator.dupe(u8, id)
+        const pending_id = if (matching == null)
+            runtime.app.action_store.pendingIdForSlot(session_id, input.slot)
         else
             null;
+        const superseded = if (pending_id) |id| try self.allocator.dupe(u8, id) else null;
         defer if (superseded) |id| self.allocator.free(id);
         const repository = try std.fmt.allocPrint(
             self.allocator,
@@ -377,15 +422,18 @@ pub const Server = struct {
             .{ runtime.owner, runtime.name },
         );
         defer self.allocator.free(repository);
-        const card = try runtime.app.prepareModelAction(
-            session_id,
-            identity.turn_id,
-            input,
-            repository,
-            runtime.number,
-            runtime.pull_request_id,
-            identity.path,
-        );
+        const card = if (matching) |existing|
+            existing.*
+        else
+            try runtime.app.prepareModelAction(
+                session_id,
+                identity.turn_id,
+                input,
+                repository,
+                runtime.number,
+                runtime.pull_request_id,
+                identity.path,
+            );
         if (superseded) |id| {
             const superseded_payload = try std.fmt.allocPrint(
                 self.allocator,
@@ -416,27 +464,29 @@ pub const Server = struct {
         const session_id = event.session_id orelse return error.MissingOriginSession;
         const identity = try runtime.registry.sessionIdentity(session_id);
         defer identity.deinit();
-        runtime.app.completeRevision(
-            runtime.broker,
-            runtime.owner,
-            runtime.name,
-            runtime.number,
-            runtime.pull_request_id,
-            identity.path,
-            identity.revision,
-        ) catch |err| {
-            const failed = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"status\":\"failed\",\"reason\":{f}}}",
-                .{std.json.fmt(@errorName(err), .{})},
-            );
-            defer self.allocator.free(failed);
-            const warning = try runtime.app.nextEnvelope("warning", failed);
-            defer self.allocator.free(warning);
-            try writeServerText(self.io, stream, warning);
-            return;
-        };
-        try runtime.registry.markCompleted(session_id);
+        if (identity.status != .completed) {
+            runtime.app.completeRevision(
+                runtime.broker,
+                runtime.owner,
+                runtime.name,
+                runtime.number,
+                runtime.pull_request_id,
+                identity.path,
+                identity.revision,
+            ) catch |err| {
+                const failed = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"status\":\"failed\",\"reason\":{f}}}",
+                    .{std.json.fmt(@errorName(err), .{})},
+                );
+                defer self.allocator.free(failed);
+                const warning = try runtime.app.nextEnvelope("warning", failed);
+                defer self.allocator.free(warning);
+                try writeServerText(self.io, stream, warning);
+                return;
+            };
+            try runtime.registry.markCompleted(session_id);
+        }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
             session_id,
@@ -458,8 +508,10 @@ pub const Server = struct {
         const session_id = event.session_id orelse return error.MissingOriginSession;
         const identity = try runtime.registry.sessionIdentity(session_id);
         defer identity.deinit();
-        try runtime.registry.closeSession(session_id);
-        try runtime.app.closeTab(identity.path, identity.revision);
+        if (identity.status != .closed) {
+            try runtime.registry.closeSession(session_id);
+            try runtime.app.closeTab(identity.path, identity.revision);
+        }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
             session_id,
@@ -1009,23 +1061,15 @@ pub fn readClientTextAllocTimeout(
     stream: *std.Io.net.Stream,
     timeout_ms: ?u32,
 ) ![]u8 {
-    var head: [2]u8 = undefined;
-    if (timeout_ms) |milliseconds| {
-        const deadline = std.Io.Clock.Timestamp.fromNow(
+    const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms) |milliseconds|
+        std.Io.Clock.Timestamp.fromNow(
             io,
             .{ .raw = std.Io.Duration.fromMilliseconds(milliseconds), .clock = .awake },
-        );
-        var offset: usize = 0;
-        while (offset < head.len) {
-            const received = try stream.socket.receiveTimeout(
-                io,
-                head[offset..],
-                .{ .deadline = deadline },
-            );
-            if (received.data.len == 0) return error.EndOfStream;
-            offset += received.data.len;
-        }
-    } else try readExact(io, stream, &head);
+        )
+    else
+        null;
+    var head: [2]u8 = undefined;
+    try readExactUntil(io, stream, &head, deadline);
     const opcode = head[0] & 0x0f;
     if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or
         (opcode != 1 and opcode != 8) or (head[1] & 0x80) == 0)
@@ -1035,21 +1079,21 @@ pub fn readClientTextAllocTimeout(
     var len: u64 = head[1] & 0x7f;
     if (len == 126) {
         var b: [2]u8 = undefined;
-        try readExact(io, stream, &b);
+        try readExactUntil(io, stream, &b, deadline);
         len = std.mem.readInt(u16, &b, .big);
         if (len < 126) return error.InvalidClientWebSocketFrame;
     } else if (len == 127) {
         var b: [8]u8 = undefined;
-        try readExact(io, stream, &b);
+        try readExactUntil(io, stream, &b, deadline);
         len = std.mem.readInt(u64, &b, .big);
         if (len <= 65535) return error.InvalidClientWebSocketFrame;
     }
     if (len > max_ws_message_bytes) return error.WebSocketMessageTooLarge;
     var mask: [4]u8 = undefined;
-    try readExact(io, stream, &mask);
+    try readExactUntil(io, stream, &mask, deadline);
     const payload = try allocator.alloc(u8, @intCast(len));
     errdefer allocator.free(payload);
-    try readExact(io, stream, payload);
+    try readExactUntil(io, stream, payload, deadline);
     for (payload, 0..) |*byte, i| byte.* ^= mask[i % 4];
     if (opcode == 8) {
         allocator.free(payload);
@@ -1058,10 +1102,18 @@ pub fn readClientTextAllocTimeout(
     if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidClientWebSocketFrame;
     return payload;
 }
-fn readExact(io: std.Io, stream: *std.Io.net.Stream, dest: []u8) !void {
+fn readExactUntil(
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    dest: []u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
     var off: usize = 0;
     while (off < dest.len) {
-        const got = try stream.socket.receive(io, dest[off..]);
+        const got = if (deadline) |limit|
+            try stream.socket.receiveTimeout(io, dest[off..], .{ .deadline = limit })
+        else
+            try stream.socket.receive(io, dest[off..]);
         if (got.data.len == 0) return error.EndOfStream;
         off += got.data.len;
     }

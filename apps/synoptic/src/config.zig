@@ -530,7 +530,7 @@ fn validateThreadSchemas(
     );
     defer allocator.free(fork);
     for (
-        [_][]const u8{ "lastTurnId", "ephemeral" },
+        [_][]const u8{ "lastTurnId", "ephemeral", "approvalPolicy", "sandbox" },
     ) |field| if (std.mem.indexOf(u8, fork, field) == null) return @as(
         ?[]u8,
         try std.fmt.allocPrint(
@@ -548,14 +548,16 @@ fn validateThreadSchemas(
         ),
     );
     defer allocator.free(start);
-    if (std.mem.indexOf(u8, start, "dynamicTools") == null) return @as(
-        ?[]u8,
-        try std.fmt.allocPrint(
-            allocator,
-            "installed Codex {s}: thread/start missing dynamicTools",
-            .{version},
-        ),
-    );
+    for ([_][]const u8{ "dynamicTools", "approvalPolicy", "sandbox" }) |field| {
+        if (std.mem.indexOf(u8, start, field) == null) return @as(
+            ?[]u8,
+            try std.fmt.allocPrint(
+                allocator,
+                "installed Codex {s}: thread/start missing {s}",
+                .{ version, field },
+            ),
+        );
+    }
     return null;
 }
 
@@ -854,8 +856,8 @@ test "command approvals installed schema requires exact request and response sur
         \\mkdir -p "$out/v2"
         \\printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
         \\cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
-        \\printf '%s' '{"lastTurnId":{},"ephemeral":{}}' > "$out/v2/ThreadForkParams.json"
-        \\printf '%s' '{"dynamicTools":{}}' > "$out/v2/ThreadStartParams.json"
+        \\printf '%s' '{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadForkParams.json"
+        \\printf '%s' '{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
         \\for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
         \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"

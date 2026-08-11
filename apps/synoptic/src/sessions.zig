@@ -1,15 +1,20 @@
 const std = @import("std");
+const app_meta = @import("app_meta");
 const cas_runtime = @import("cas_runtime");
 const action_tools = @import("tools.zig");
+const config = @import("config.zig");
 const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
 pub const safe_boundary_timeout_ms: u32 = 5_000;
 pub const approval_timeout_ms: u32 = 25_000;
+const approval_response_margin_ms: i64 = 50;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
 const safe_boundary_quiescence_ms: u32 = 50;
+const review_execution_fields =
+    "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"";
 const missing_origin_response = "{\"contentItems\":[{\"type\":\"inputText\"," ++
     "\"text\":\"missing originating thread\"}],\"success\":false}";
 const unsupported_action_response = "{\"contentItems\":[{\"type\":\"inputText\"," ++
@@ -24,6 +29,16 @@ const missing_authority_response = "{\"contentItems\":[{\"type\":\"inputText\","
     "\"success\":false}";
 const evidence_unavailable_response = "{\"contentItems\":[{\"type\":\"inputText\"," ++
     "\"text\":\"current PR evidence unavailable\"}],\"success\":false}";
+
+fn authoritativeToolEventKind(tool: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, tool, "synoptic.prepare_github_action")) return "action.prepared";
+    if (std.mem.eql(u8, tool, "synoptic.complete_file_review")) {
+        return "file.complete.requested";
+    }
+    if (std.mem.eql(u8, tool, "synoptic.close_session")) return "session.close.requested";
+    return null;
+}
+
 pub const dynamic_tools_json =
     "[{\"type\":\"namespace\",\"name\":\"synoptic\",\"descr" ++
     "iption\":\"Human-directed Synoptic review operations\"" ++
@@ -132,6 +147,21 @@ const RegistryMutex = struct {
 };
 const TurnRef = struct { thread: []u8, turn: []u8 };
 
+const FileAdmission = struct {
+    path: []u8,
+    revision: []u8,
+
+    fn deinit(self: FileAdmission, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.revision);
+    }
+};
+
+const OpenAdmission = union(enum) {
+    reused: []u8,
+    reserved,
+};
+
 const ApprovalState = enum { pending, resolved, expired };
 const OfferedDecision = struct {
     choice_json: []u8,
@@ -178,6 +208,7 @@ pub const Registry = struct {
     notification_count: u64 = 0,
     mutex: RegistryMutex = .{},
     sessions: std.ArrayList(Session) = .empty,
+    file_admissions: std.ArrayList(FileAdmission) = .empty,
     visible_events: std.ArrayList(VisibleEvent) = .empty,
     active_command_ids: std.ArrayList([]u8) = .empty,
     completed_turn_ids: std.ArrayList([]u8) = .empty,
@@ -186,6 +217,7 @@ pub const Registry = struct {
     next_session_id: u64 = 1,
     next_approval_id: u64 = 1,
     approval_wait_timeout_ms: u32 = approval_timeout_ms,
+    max_sessions: usize = config.max_open_sessions,
     io: ?std.Io = null,
 
     pub fn start(
@@ -203,7 +235,7 @@ pub const Registry = struct {
             .file_approval = "decline",
             .client_name = "synoptic",
             .client_title = "Synoptic",
-            .client_version = "0.1.0",
+            .client_version = app_meta.version,
         }, .{});
         return registry;
     }
@@ -217,6 +249,8 @@ pub const Registry = struct {
         if (self.evidence) |*value| value.deinit();
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
+        for (self.file_admissions.items) |admission| admission.deinit(self.allocator);
+        self.file_admissions.deinit(self.allocator);
         for (self.visible_events.items) |event| event.deinit(self.allocator);
         self.visible_events.deinit(self.allocator);
         for (self.active_command_ids.items) |id| self.allocator.free(id);
@@ -282,7 +316,7 @@ pub const Registry = struct {
         var quiet_since: ?i128 = null;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.mutex.lock();
-            const active = self.active_command_ids.items.len;
+            const active = self.active_command_ids.items.len + self.file_admissions.items.len;
             self.mutex.unlock();
             const now = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
             if (active == 0) {
@@ -342,9 +376,8 @@ pub const Registry = struct {
         try actor.setServerRequestHandler(.{ .context = self, .handle = onServerRequest });
         const params = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"cwd\":{f},\"ephemeral\":true,\"dynamicTools\":{s}}" ++
-                "}",
-            .{ std.json.fmt(cwd, .{}), dynamic_tools_json },
+            "{{\"cwd\":{f},\"ephemeral\":true,{s},\"dynamicTools\":{s}}}",
+            .{ std.json.fmt(cwd, .{}), review_execution_fields, dynamic_tools_json },
         );
         defer self.allocator.free(params);
         const response = try actor.requestJson("thread/start", params, null);
@@ -429,6 +462,14 @@ pub const Registry = struct {
         };
         return error.UnknownSession;
     }
+    fn clearHumanInstruction(self: *Registry, session_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
+            session.human_authority = null;
+            return;
+        };
+    }
     pub fn closeSession(self: *Registry, session_id: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -466,24 +507,30 @@ pub const Registry = struct {
         return error.UnknownSession;
     }
 
-    pub fn drainVisible(
+    pub fn peekVisible(
         self: *Registry,
         allocator: std.mem.Allocator,
-    ) !std.ArrayList(VisibleEvent) {
+    ) !?VisibleEvent {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var result: std.ArrayList(VisibleEvent) = .empty;
-        for (self.visible_events.items) |event| try result.append(
-            allocator,
-            .{
-                .session_id = if (event.session_id) |v| try allocator.dupe(u8, v) else null,
-                .method = try allocator.dupe(u8, event.method),
-                .raw_json = try allocator.dupe(u8, event.raw_json),
-            },
-        );
-        for (self.visible_events.items) |event| event.deinit(self.allocator);
-        self.visible_events.clearRetainingCapacity();
-        return result;
+        if (self.visible_events.items.len == 0) return null;
+        const event = self.visible_events.items[0];
+        const session_id = if (event.session_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (session_id) |value| allocator.free(value);
+        const method = try allocator.dupe(u8, event.method);
+        errdefer allocator.free(method);
+        return .{
+            .session_id = session_id,
+            .method = method,
+            .raw_json = try allocator.dupe(u8, event.raw_json),
+        };
+    }
+
+    pub fn acknowledgeVisible(self: *Registry) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.visible_events.items.len == 0) return error.NoVisibleEvent;
+        self.visible_events.orderedRemove(0).deinit(self.allocator);
     }
 
     pub fn queueSystemEvent(self: *Registry, method: []const u8, raw_json: []const u8) !void {
@@ -560,22 +607,15 @@ pub const Registry = struct {
         skill_path: []const u8,
         start_immediately: bool,
     ) !OpenResult {
-        self.mutex.lock();
-        if (self.synchronizing) {
-            self.mutex.unlock();
-            return error.WorktreeSynchronizationActive;
+        switch (try self.admitFile(path, revision)) {
+            .reused => |id| return .{
+                .reused = true,
+                .session_id = id,
+                .allocator = self.allocator,
+            },
+            .reserved => {},
         }
-        for (self.sessions.items) |session| if (session.status == .current and
-            std.mem.eql(u8, session.path, path) and std.mem.eql(
-            u8,
-            session.revision,
-            revision,
-        )) {
-            const id = try self.allocator.dupe(u8, session.id);
-            self.mutex.unlock();
-            return .{ .reused = true, .session_id = id, .allocator = self.allocator };
-        };
-        self.mutex.unlock();
+        defer self.releaseFileAdmission(path, revision);
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         const file_thread_id = try self.forkFileThread(actor);
         defer self.allocator.free(file_thread_id);
@@ -614,6 +654,52 @@ pub const Registry = struct {
         return .{ .reused = false, .session_id = result_id, .allocator = self.allocator };
     }
 
+    fn admitFile(self: *Registry, path: []const u8, revision: []const u8) !OpenAdmission {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.synchronizing) return error.WorktreeSynchronizationActive;
+        var live_sessions: usize = 0;
+        for (self.sessions.items) |session| {
+            if (session.status == .closed) continue;
+            live_sessions += 1;
+            if (session.status == .current and std.mem.eql(u8, session.path, path) and
+                std.mem.eql(u8, session.revision, revision))
+            {
+                return .{ .reused = try self.allocator.dupe(u8, session.id) };
+            }
+        }
+        for (self.file_admissions.items) |admission| if (std.mem.eql(
+            u8,
+            admission.path,
+            path,
+        ) and std.mem.eql(u8, admission.revision, revision)) {
+            return error.SessionOpenInProgress;
+        };
+        if (live_sessions + self.file_admissions.items.len >= self.max_sessions) {
+            return error.SessionLimitExceeded;
+        }
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_revision = try self.allocator.dupe(u8, revision);
+        errdefer self.allocator.free(owned_revision);
+        try self.file_admissions.append(self.allocator, .{
+            .path = owned_path,
+            .revision = owned_revision,
+        });
+        return .reserved;
+    }
+
+    fn releaseFileAdmission(self: *Registry, path: []const u8, revision: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.file_admissions.items, 0..) |admission, index| {
+            if (!std.mem.eql(u8, admission.path, path) or
+                !std.mem.eql(u8, admission.revision, revision)) continue;
+            self.file_admissions.orderedRemove(index).deinit(self.allocator);
+            return;
+        }
+    }
+
     fn forkFileThread(self: *Registry, actor: *cas_runtime.Actor) ![]u8 {
         self.mutex.lock();
         const primary_thread = self.allocator.dupe(u8, self.primary_thread_id orelse {
@@ -638,8 +724,12 @@ pub const Registry = struct {
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"threadId\":{f},\"lastTurnId\":{f},\"ephemeral\":tr" ++
-                "ue}}",
-            .{ std.json.fmt(primary_thread, .{}), std.json.fmt(primary_turn, .{}) },
+                "ue,{s}}}",
+            .{
+                std.json.fmt(primary_thread, .{}),
+                std.json.fmt(primary_turn, .{}),
+                review_execution_fields,
+            },
         );
         defer self.allocator.free(params);
         const response = try actor.requestJson("thread/fork", params, null);
@@ -834,30 +924,22 @@ pub const Registry = struct {
                 ), std.json.fmt(target.turn_id, .{}), std.json.fmt(combined, .{}) },
             );
         defer self.allocator.free(params);
-        const response = try actor.requestJson(method, params, null);
+        try self.markHumanInstruction(session_id, text);
+        const response = actor.requestJson(method, params, null) catch |err| {
+            self.clearHumanInstruction(session_id);
+            return err;
+        };
         defer self.allocator.free(response);
-        const authority = classifyHumanInstruction(text);
         if (!target.active or first_turn) return self.recordStartedTurn(
             session_id,
             response,
-            authority,
         );
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.sessions.items) |*session| {
-            if (std.mem.eql(u8, session.id, session_id)) {
-                session.human_authority = authority;
-                return;
-            }
-        }
-        return error.UnknownSession;
     }
 
     fn recordStartedTurn(
         self: *Registry,
         session_id: []const u8,
         response: []const u8,
-        authority: ?HumanAuthority,
     ) !void {
         const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
         self.mutex.lock();
@@ -871,7 +953,6 @@ pub const Registry = struct {
             if (session.pending_skill_path) |value| self.allocator.free(value);
             session.pending_initial_prompt = null;
             session.pending_skill_path = null;
-            session.human_authority = authority;
             return;
         }
         self.allocator.free(next_turn);
@@ -1179,66 +1260,65 @@ pub const Registry = struct {
         raw_json: []const u8,
         allocator: std.mem.Allocator,
     ) ![]u8 {
-        if (std.mem.indexOf(
-            u8,
-            raw_json,
-            "search_unresolved_threads",
-        ) != null)
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch
+            return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        defer parsed.deinit();
+        if (parsed.value != .object) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        const params = parsed.value.object.get("params") orelse
+            return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        if (params != .object) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        const tool = params.object.get("tool") orelse
+            return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        if (tool != .string) return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        if (std.mem.eql(u8, tool.string, "synoptic.search_unresolved_threads"))
             return self.searchThreads(raw_json, allocator);
-        const kind: ?[]const u8 = if (std.mem.indexOf(
-            u8,
+        const event_kind = authoritativeToolEventKind(tool.string) orelse
+            return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+        return self.handleAuthoritativeTool(raw_json, event_kind, allocator);
+    }
+
+    fn handleAuthoritativeTool(
+        self: *Registry,
+        raw_json: []const u8,
+        event_kind: []const u8,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const origin_thread = extractString(
+            self.allocator,
             raw_json,
-            "prepare_github_action",
-        ) != null) "action.prepared" else if (std.mem.indexOf(
-            u8,
+            &.{ "params", "threadId" },
+        ) catch return allocator.dupe(u8, missing_origin_response);
+        defer self.allocator.free(origin_thread);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const requested = requestedAuthority(
+            self.allocator,
+            event_kind,
             raw_json,
-            "complete_file_review",
-        ) != null) "file.complete.requested" else if (std.mem.indexOf(
+        ) orelse return allocator.dupe(u8, unsupported_action_response);
+        for (self.sessions.items) |*session| if (std.mem.eql(
             u8,
-            raw_json,
-            "close_session",
-        ) != null)
-            "session.close.requested"
-        else
-            null;
-        if (kind) |event_kind| {
-            const origin_thread = extractString(
-                self.allocator,
-                raw_json,
-                &.{ "params", "threadId" },
-            ) catch return allocator.dupe(u8, missing_origin_response);
-            defer self.allocator.free(origin_thread);
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const requested = requestedAuthority(
-                self.allocator,
-                event_kind,
-                raw_json,
-            ) orelse return allocator.dupe(u8, unsupported_action_response);
-            for (self.sessions.items) |*session| if (std.mem.eql(
+            session.thread_id,
+            origin_thread,
+        ) and session.status != .closed and
+            !session.initial_turn_active and authorityCovers(
+            session.human_authority,
+            requested,
+        )) {
+            const stale_completion = std.mem.eql(
                 u8,
-                session.thread_id,
-                origin_thread,
-            ) and session.status != .closed and
-                !session.initial_turn_active and authorityCovers(
-                session.human_authority,
-                requested,
-            )) {
-                const stale_completion = std.mem.eql(
-                    u8,
-                    event_kind,
-                    "file.complete.requested",
-                ) and session.status != .current;
-                if (stale_completion) return allocator.dupe(u8, stale_completion_response);
-                session.human_authority = null;
-                if (self.visible_events.items.len < max_visible_events) {
-                    try self.appendVisibleLocked(session.id, event_kind, raw_json);
-                }
-                return allocator.dupe(u8, accepted_domain_response);
-            };
-            return allocator.dupe(u8, missing_authority_response);
-        }
-        return allocator.dupe(u8, "{\"decision\":\"decline\"}");
+                event_kind,
+                "file.complete.requested",
+            ) and session.status != .current;
+            if (stale_completion) return allocator.dupe(u8, stale_completion_response);
+            if (self.visible_events.items.len >= max_visible_events) {
+                return allocator.dupe(u8, evidence_unavailable_response);
+            }
+            try self.appendVisibleLocked(session.id, event_kind, raw_json);
+            session.human_authority = null;
+            return allocator.dupe(u8, accepted_domain_response);
+        };
+        return allocator.dupe(u8, missing_authority_response);
     }
 
     fn handleApprovalRequest(
@@ -1249,9 +1329,7 @@ pub const Registry = struct {
         if (request.raw_json.len > max_approval_request_bytes) {
             return declineAlloc(allocator, request.method);
         }
-        if (std.mem.eql(u8, request.method, "item/commandExecution/requestApproval") and
-            commandMayEditSource(request.raw_json))
-        {
+        if (!std.mem.eql(u8, request.method, "item/commandExecution/requestApproval")) {
             return declineAlloc(allocator, request.method);
         }
         const io = self.io orelse return declineAlloc(allocator, request.method);
@@ -1277,7 +1355,13 @@ pub const Registry = struct {
             params.object,
         );
         defer self.allocator.free(approval_id);
-        return self.waitForApproval(io, allocator, approval_id, request.method);
+        return self.waitForApproval(
+            io,
+            allocator,
+            approval_id,
+            request.method,
+            request.deadline_ms,
+        );
     }
 
     fn enqueueApproval(
@@ -1379,8 +1463,13 @@ pub const Registry = struct {
         allocator: std.mem.Allocator,
         approval_id: []const u8,
         method: []const u8,
+        request_deadline_ms: i64,
     ) ![]u8 {
         const started = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        const local_deadline = @min(
+            request_deadline_ms -| approval_response_margin_ms,
+            started + @as(i64, self.approval_wait_timeout_ms),
+        );
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.mutex.lock();
             var found = false;
@@ -1395,7 +1484,7 @@ pub const Registry = struct {
                     return owned;
                 }
                 const now = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-                if (now - started >= self.approval_wait_timeout_ms) {
+                if (now >= local_deadline) {
                     pending.result_json = self.allocator.dupe(
                         u8,
                         pending.decline_result_json,
@@ -1432,31 +1521,6 @@ pub const Registry = struct {
                 return allocator.dupe(u8, declineResult(method));
             }
         }
-    }
-
-    fn commandMayEditSource(raw: []const u8) bool {
-        const edit_markers = [_][]const u8{
-            "apply_patch",
-            "git apply",
-            "\"git\",\"apply\"",
-            "sed -i",
-            "perl -pi",
-            "truncate ",
-            "tee ",
-            "rm ",
-            "mv ",
-            "cp ",
-            " > ",
-            " >> ",
-        };
-        for (edit_markers) |marker| {
-            if (std.mem.indexOf(
-                u8,
-                raw,
-                marker,
-            ) != null) return true;
-        }
-        return false;
     }
 
     fn makeApprovalLocked(
@@ -1923,6 +1987,53 @@ test "file selection remains gated without completed primary" {
     try std.testing.expect(registry.latest_primary_turn_id == null);
 }
 
+test "session capacity is enforced before any app-server fork" {
+    var registry = Registry{
+        .allocator = std.testing.allocator,
+        .max_sessions = 0,
+    };
+    defer registry.deinit();
+    try std.testing.expectError(
+        error.SessionLimitExceeded,
+        registry.openFile(
+            std.testing.io,
+            ".",
+            "a.zig",
+            "r1",
+            "base",
+            "head",
+            "@@ -1 +1 @@\n-a\n+b\n",
+            "[]",
+            "/tmp/SKILL.md",
+            true,
+        ),
+    );
+}
+
+test "file admission reserves capacity and closed sessions release it" {
+    var registry = Registry{
+        .allocator = std.testing.allocator,
+        .max_sessions = 1,
+    };
+    defer registry.deinit();
+    const first = try registry.admitFile("a.zig", "r1");
+    try std.testing.expect(first == .reserved);
+    try std.testing.expectError(
+        error.SessionOpenInProgress,
+        registry.admitFile("a.zig", "r1"),
+    );
+    try std.testing.expectError(
+        error.SessionLimitExceeded,
+        registry.admitFile("b.zig", "r1"),
+    );
+    registry.releaseFileAdmission("a.zig", "r1");
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    try registry.closeSession("ses-1");
+    const reopened = try registry.admitFile("b.zig", "r1");
+    try std.testing.expect(reopened == .reserved);
+    registry.releaseFileAdmission("b.zig", "r1");
+}
+
 test "session context dynamic tool namespace exposes the exact authoritative surface" {
     const expected = [_][]const u8{
         "search_unresolved_threads",
@@ -2071,6 +2182,53 @@ fn appendApprovalTestSession(registry: *Registry, id: []const u8, thread: []cons
     });
 }
 
+const exact_tool_test_request =
+    "{\"params\":{\"threadId\":\"file-1\",\"tool\":" ++
+    "\"synoptic.prepare_github_action\",\"arguments\":{\"slot\":\"finding\"," ++
+    "\"kind\":\"add_inline_comment\",\"effectSummary\":" ++
+    "\"mentions synoptic.search_unresolved_threads only as text\"," ++
+    "\"payload\":{\"path\":\"a.zig\",\"line\":1,\"side\":\"RIGHT\"," ++
+    "\"body\":\"body\"}}}}";
+
+test "dynamic tool dispatch binds the exact parsed tool name" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].human_authority = .github_any;
+    const response = try registry.handleToolCall(exact_tool_test_request, std.testing.allocator);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(accepted_domain_response, response);
+    try std.testing.expectEqualStrings("action.prepared", registry.visible_events.items[0].method);
+}
+
+test "authoritative tool backpressure preserves human authority" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].human_authority = .github_any;
+    for (0..max_visible_events) |_| try registry.queueSystemEvent("status", "{}");
+    const response = try registry.handleToolCall(exact_tool_test_request, std.testing.allocator);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(evidence_unavailable_response, response);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        registry.sessions.items[0].human_authority.?,
+    );
+}
+
+test "visible events remain retained until delivery is acknowledged" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try registry.queueSystemEvent("warning", "{\"code\":\"retry\"}");
+    const first = (try registry.peekVisible(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    const retry = (try registry.peekVisible(std.testing.allocator)).?;
+    defer retry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(first.raw_json, retry.raw_json);
+    try registry.acknowledgeVisible();
+    try std.testing.expect((try registry.peekVisible(std.testing.allocator)) == null);
+}
+
 fn waitForApproval(registry: *Registry) !void {
     for (0..200) |_| {
         registry.mutex.lock();
@@ -2120,38 +2278,26 @@ test "command approvals accept exact offered decisions only" {
     );
 }
 
-test "command approvals permissions grant only the exact requested carrier and scope" {
+test "filesystem and permission escalation requests decline before browser routing" {
     var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
     defer registry.deinit();
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
-    var invocation = ApprovalInvocation{
-        .registry = &registry,
-        .method = "item/permissions/requestApproval",
-        .raw = "{\"id\":8,\"method\":\"item/permissions/requestApprova" ++
-            "l\",\"params\":{\"threadId\":\"file-1\",\"turnId\":\"t" ++
-            "urn\",\"itemId\":\"permission\",\"startedAtMs\":1,\"cw" ++
-            "d\":\"/repo\",\"permissions\":{\"network\":{\"enabled" ++
-            "\":true}}}}",
-    };
-    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
-    try waitForApproval(&registry);
-    try registry.resolveApproval("ses-1", "apr-1", "\"acceptForSession\"");
-    thread.join();
-    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
-    try std.testing.expectEqualStrings("{\"permissions\":{\"network\":{\"enabled\":true}},\"sc" ++
-        "ope\":\"session\"}", invocation.response.?);
-    registry.approval_wait_timeout_ms = 5;
+    const raw = "{\"id\":8,\"method\":\"item/permissions/requestApproval\"," ++
+        "\"params\":{\"threadId\":\"file-1\",\"permissions\":{" ++
+        "\"fsWrite\":[\"/repo\"]}}}";
     const decline = try Registry.onServerRequest(
         &registry,
         .{
             .id = .{ .integer = 9 },
-            .method = invocation.method,
-            .raw_json = invocation.raw,
+            .method = "item/permissions/requestApproval",
+            .raw_json = raw,
         },
         std.heap.page_allocator,
     );
     defer std.heap.page_allocator.free(decline);
     try std.testing.expectEqualStrings("{\"permissions\":{},\"scope\":\"turn\"}", decline);
+    try std.testing.expectEqual(@as(usize, 0), registry.approvals.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
 }
 
 test "command approvals timeout close and synchronization conservatively decline" {
@@ -2212,7 +2358,35 @@ test "command approvals timeout close and synchronization conservatively decline
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", sync_invocation.response.?);
 }
 
-test "file change and unowned approvals decline without browser events" {
+test "approval wait is capped by the original actor request deadline" {
+    var registry = Registry{
+        .allocator = std.heap.page_allocator,
+        .io = std.testing.io,
+        .approval_wait_timeout_ms = 25_000,
+    };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    const now_ms: i64 = @intCast(@divFloor(
+        std.Io.Clock.awake.now(std.testing.io).nanoseconds,
+        std.time.ns_per_ms,
+    ));
+    const response = try Registry.onServerRequest(&registry, .{
+        .id = .{ .integer = 44 },
+        .method = "item/commandExecution/requestApproval",
+        .raw_json = "{\"params\":{\"threadId\":\"file-1\"," ++
+            "\"availableDecisions\":[\"accept\",\"decline\"]}}",
+        .deadline_ms = now_ms + 5,
+    }, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", response);
+    const finished_ms: i64 = @intCast(@divFloor(
+        std.Io.Clock.awake.now(std.testing.io).nanoseconds,
+        std.time.ns_per_ms,
+    ));
+    try std.testing.expect(finished_ms - now_ms < 250);
+}
+
+test "file change and unowned approvals decline while sandboxed commands remain reviewable" {
     var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
     defer registry.deinit();
     const file = try Registry.onServerRequest(
@@ -2270,17 +2444,12 @@ test "file change and unowned approvals decline without browser events" {
     }, std.heap.page_allocator);
     defer std.heap.page_allocator.free(ambiguous);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", ambiguous);
-    try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), registry.visible_events.items.len);
 }
 
-test "source editing command approvals are never browser confirmable" {
-    try std.testing.expect(Registry.commandMayEditSource(
-        "{\"params\":{\"command\":\"sed -i s/old/new/ src/a.zig\"}}",
-    ));
-    try std.testing.expect(Registry.commandMayEditSource(
-        "{\"params\":{\"command\":[\"git\",\"apply\",\"change.patch\"]}}",
-    ));
-    try std.testing.expect(!Registry.commandMayEditSource(
-        "{\"params\":{\"command\":[\"zig\",\"build\",\"test\"]}}",
-    ));
+test "thread construction fixes review execution to read-only" {
+    try std.testing.expectEqualStrings(
+        "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"",
+        review_execution_fields,
+    );
 }

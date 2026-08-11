@@ -356,10 +356,7 @@ const NetworkFixture = struct {
     failed: std.atomic.Value(bool) = .init(false),
 
     fn serve(self: *NetworkFixture) void {
-        self.server.serveOne(self.runtime) catch |err| switch (err) {
-            error.EndOfStream, error.ConnectionResetByPeer => {},
-            else => self.failed.store(true, .release),
-        };
+        self.server.serveOne(self.runtime) catch self.failed.store(true, .release);
     }
 };
 
@@ -437,8 +434,8 @@ const fake_codex_script =
     \\  mkdir -p "$out/v2"
     \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
     \\  cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
-    \\  printf '%s' '{"lastTurnId":{},"ephemeral":{}}' > "$out/v2/ThreadForkParams.json"
-    \\  printf '%s' '{"dynamicTools":{}}' > "$out/v2/ThreadStartParams.json"
+    \\  printf '%s' '{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadForkParams.json"
+    \\  printf '%s' '{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
     \\  for f in ThreadStartedNotification TurnStartedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
     \\  printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
@@ -477,10 +474,11 @@ const fake_codex_script =
     \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn"}}}'
     \\      else
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
-    \\        printf '{"id":%s,"result":{"turn":{"id":"file-turn"}}}\n' "$id"
     \\        if printf '%s' "$line" | grep -q 'prepare the comment'; then
     \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"slot":"finding-1","kind":"add_inline_comment","effectSummary":"Add an inline comment on a.zig line 1","payload":{"path":"a.zig","line":1,"side":"RIGHT","body":"Could this fail?"}}}}\n' "$thread_id"
-    \\        elif printf '%s' "$line" | grep -q 'complete this file'; then
+    \\        fi
+    \\        printf '{"id":%s,"result":{"turn":{"id":"file-turn"}}}\n' "$id"
+    \\        if printf '%s' "$line" | grep -q 'complete this file'; then
     \\          printf '{"id":"tool-complete","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.complete_file_review","arguments":{}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'close this session'; then
     \\          printf '{"id":"tool-close","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.close_session","arguments":{}}}\n' "$thread_id"
@@ -2612,6 +2610,24 @@ fn connectWs(
     };
 }
 
+fn verifySlowHeaderIsolation(
+    io: std.Io,
+    server: *http.Server,
+    runtime: *http.Runtime,
+) !void {
+    server.header_timeout_ms = 10;
+    var fixture = NetworkFixture{ .server = server, .runtime = runtime };
+    const thread = try std.Thread.spawn(.{}, NetworkFixture.serve, .{&fixture});
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", server.port());
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll("GET /");
+    try writer.interface.flush();
+    thread.join();
+    try std.testing.expect(!fixture.failed.load(.acquire));
+}
+
 fn wsRead(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2683,6 +2699,8 @@ fn verifyWsOpen(
         "prepare_github_action",
         "complete_file_review",
         "close_session",
+        "\"approvalPolicy\":\"on-request\"",
+        "\"sandbox\":\"read-only\"",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, log, needle) != null);
     }
@@ -3025,6 +3043,7 @@ test "e2e masked websocket streams normalized review and action events" {
         .custody = .{ .managed = root },
         .refresh_override = injectedRefresh,
     };
+    try verifySlowHeaderIsolation(io, &server, &runtime);
     var connection = try connectWs(allocator, io, &server, &runtime);
     defer connection.deinit();
     try verifyWsStartup(allocator, io, &state, &connection.stream);

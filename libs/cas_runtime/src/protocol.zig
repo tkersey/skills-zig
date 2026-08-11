@@ -29,6 +29,7 @@ pub const ServerRequest = struct {
     id: RequestId,
     method: []const u8,
     raw_json: []const u8,
+    deadline_ms: i64 = std.math.maxInt(i64),
 };
 
 /// A handler returns an owned exact JSON result. The actor serializes the

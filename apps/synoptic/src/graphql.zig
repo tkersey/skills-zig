@@ -270,6 +270,15 @@ fn tokenize(allocator: std.mem.Allocator, document: []const u8) !std.ArrayList(T
     return result;
 }
 
+pub fn isMutation(allocator: std.mem.Allocator, document: []const u8) !bool {
+    var tokens = try tokenize(allocator, document);
+    defer tokens.deinit(allocator);
+    if (tokens.items.len == 0 or tokens.items[0].kind != .name) {
+        return error.InvalidGraphqlDocument;
+    }
+    return std.mem.eql(u8, tokens.items[0].text, "mutation");
+}
+
 fn skipSelection(tokens: []const Token, start: usize) !usize {
     var i = start;
     var parens: usize = 0;
@@ -417,6 +426,17 @@ test "operation identity remains inspectable in fake gh stdin" {
         "SynopticMarkFileViewed",
         operationName(mark_viewed_mutation).?,
     );
+}
+
+test "operation kind ignores legal leading GraphQL comments" {
+    try std.testing.expect(try isMutation(
+        std.testing.allocator,
+        "# exact requested effect\nmutation Change($input:Input!){change(input:$input){id}}",
+    ));
+    try std.testing.expect(!try isMutation(
+        std.testing.allocator,
+        "# read only\nquery Read{viewer{login}}",
+    ));
 }
 
 test "transparent GraphQL binds broad mutations to exact PR" {

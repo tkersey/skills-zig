@@ -227,6 +227,44 @@ pub const PrGeneration = struct {
         try self.threads.append(self.allocator, owned);
     }
 
+    pub fn appendThreadComments(
+        self: *PrGeneration,
+        thread_id: []const u8,
+        additions: []const ReviewComment,
+    ) !bool {
+        for (self.threads.items) |*thread| if (std.mem.eql(u8, thread.id, thread_id)) {
+            const combined = try self.allocator.alloc(
+                ReviewComment,
+                thread.comments.len + additions.len,
+            );
+            @memcpy(combined[0..thread.comments.len], thread.comments);
+            var initialized: usize = 0;
+            errdefer {
+                for (combined[thread.comments.len .. thread.comments.len + initialized]) |item| {
+                    freeComment(self.allocator, item);
+                }
+                self.allocator.free(combined);
+            }
+            for (additions, thread.comments.len..) |comment, index| {
+                combined[index] = try dupeComment(self.allocator, comment);
+                initialized += 1;
+            }
+            self.allocator.free(thread.comments);
+            thread.comments = combined;
+            return true;
+        };
+        return false;
+    }
+
+    pub fn removeThread(self: *PrGeneration, thread_id: []const u8) void {
+        for (self.threads.items, 0..) |thread, index| {
+            if (!std.mem.eql(u8, thread.id, thread_id)) continue;
+            const removed = self.threads.orderedRemove(index);
+            freeThread(self.allocator, removed);
+            return;
+        }
+    }
+
     pub fn clone(self: *const PrGeneration, allocator: std.mem.Allocator) !PrGeneration {
         var copy = try PrGeneration.initFull(allocator, self.base_oid, self.head_oid);
         errdefer copy.deinit();
