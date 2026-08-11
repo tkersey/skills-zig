@@ -592,26 +592,123 @@ pub const App = struct {
             file.revision_key,
         );
         defer self.allocator.free(client_id);
+        if (try self.staleExclusionOutcome(
+            broker,
+            owner,
+            name,
+            number,
+            file.path,
+            reason,
+        )) |value| {
+            return value;
+        }
+        const sync = self.synchronizeExclusion(
+            broker,
+            owner,
+            name,
+            number,
+            pull_request_id,
+            file.path,
+            client_id,
+        );
+        if (sync.viewed) self.generation.files.items[index].viewed = .viewed;
+        try self.generation.setExclusion(file.path, reason, sync.error_name);
+        return try ExclusionOutcome.init(self.allocator, file.path, reason, sync.error_name);
+    }
+
+    const ExclusionSync = struct { viewed: bool, error_name: ?[]const u8 };
+
+    fn synchronizeExclusion(
+        self: *App,
+        broker: github.Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        path: []const u8,
+        client_id: []const u8,
+    ) ExclusionSync {
         var mutation_error: ?[]const u8 = null;
-        broker.markViewedWithId(pull_request_id, file.path, client_id) catch |err| {
+        broker.markViewedWithId(pull_request_id, path, client_id) catch |err| {
             mutation_error = @errorName(err);
         };
-        var readback_error: ?[]const u8 = null;
         const viewed = broker.viewedAfterMutation(
             owner,
             name,
             number,
             self.generation.head_oid,
-            file.path,
-        ) catch |err| blk: {
-            readback_error = @errorName(err);
-            break :blk false;
+            path,
+        ) catch |err| {
+            const name_value = if (err == error.PullRequestChanged)
+                self.compensateStaleExclusion(
+                    broker,
+                    owner,
+                    name,
+                    number,
+                    pull_request_id,
+                    path,
+                    client_id,
+                ) catch |compensation_error| @errorName(compensation_error)
+            else
+                @errorName(err);
+            return .{ .viewed = false, .error_name = name_value };
         };
-        const sync_error: ?[]const u8 = if (viewed) null else readback_error orelse
-            mutation_error orelse "MarkViewedReadbackFailed";
-        if (viewed) self.generation.files.items[index].viewed = .viewed;
-        try self.generation.setExclusion(file.path, reason, sync_error);
-        return try ExclusionOutcome.init(self.allocator, file.path, reason, sync_error);
+        return .{
+            .viewed = viewed,
+            .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
+        };
+    }
+
+    fn staleExclusionOutcome(
+        self: *App,
+        broker: github.Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        path: []const u8,
+        reason: []const u8,
+    ) !?ExclusionOutcome {
+        broker.validateCurrentPath(
+            owner,
+            name,
+            number,
+            self.generation.head_oid,
+            path,
+        ) catch |err| {
+            try self.generation.setExclusion(path, reason, @errorName(err));
+            return try ExclusionOutcome.init(self.allocator, path, reason, @errorName(err));
+        };
+        return null;
+    }
+
+    fn compensateStaleExclusion(
+        self: *App,
+        broker: github.Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        path: []const u8,
+        prior_client_id: []const u8,
+    ) ![]const u8 {
+        const client_id = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}-compensate",
+            .{prior_client_id},
+        );
+        defer self.allocator.free(client_id);
+        try broker.unmarkViewedWithId(pull_request_id, path, client_id);
+        var current = try broker.readGeneration(owner, name, number);
+        defer current.deinit();
+        if (!try broker.viewedStateAfterMutation(
+            owner,
+            name,
+            number,
+            current.head_oid,
+            path,
+            false,
+        )) return error.UnmarkViewedReadbackFailed;
+        return "PullRequestChangedCompensated";
     }
 
     pub fn bootstrapAlloc(self: *App) ![]u8 {

@@ -762,17 +762,17 @@ pub const Server = struct {
         if (std.mem.eql(u8, command, "action.reject")) return self.rejectAction(runtime, payload);
         if (std.mem.eql(u8, command, "snapshot.get")) return self.snapshot(runtime);
         if (std.mem.eql(u8, command, "pr.refresh")) {
+            try self.refresh(runtime);
             const mutex = domainMutex(runtime);
             mutex.lock();
             defer mutex.unlock();
-            try self.refresh(runtime);
             return runtime.app.nextEnvelope("pr.refreshed", "{\"status\":\"reconciled\"}");
         }
         if (std.mem.eql(u8, command, "round.finish")) {
+            try self.refresh(runtime);
             const mutex = domainMutex(runtime);
             mutex.lock();
             defer mutex.unlock();
-            try self.refresh(runtime);
             const round = runtime.app.finishRound();
             const body = try std.fmt.allocPrint(self.allocator, "{{\"round\":{d}}}", .{round});
             defer self.allocator.free(body);
@@ -1018,6 +1018,7 @@ pub const Server = struct {
         runtime: *Runtime,
         terminal: tools.ActionStatus,
     ) !void {
+        _ = self;
         if (terminal == .succeeded) {
             if (runtime.broker.readGeneration(
                 runtime.owner,
@@ -1027,7 +1028,19 @@ pub const Server = struct {
                 var generation = generation_value;
                 var generation_owned = true;
                 defer if (generation_owned) generation.deinit();
-                refreshRevisionEvidence(self, runtime, &generation) catch {
+                if (!std.mem.eql(
+                    u8,
+                    generation.base_oid,
+                    runtime.app.generation.base_oid,
+                ) or !std.mem.eql(
+                    u8,
+                    generation.head_oid,
+                    runtime.app.generation.head_oid,
+                )) {
+                    runtime.app.action_state_fresh = false;
+                    return;
+                }
+                copyRevisionEvidence(runtime, &generation) catch {
                     runtime.app.action_state_fresh = false;
                     return;
                 };
@@ -1080,9 +1093,20 @@ pub const Server = struct {
     }
 
     fn refresh(self: *Server, runtime: *Runtime) !void {
-        if (runtime.refresh_override) |run| return run(runtime);
         try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
-        defer runtime.registry.endSynchronization();
+        var synchronizing = true;
+        defer if (synchronizing) runtime.registry.endSynchronization();
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        var locked = true;
+        defer if (locked) mutex.unlock();
+        if (runtime.refresh_override) |run| {
+            mutex.unlock();
+            locked = false;
+            runtime.registry.endSynchronization();
+            synchronizing = false;
+            return run(runtime);
+        }
         runtime.app.action_state_fresh = false;
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         var next_owned = true;
@@ -1104,9 +1128,15 @@ pub const Server = struct {
         next_owned = false;
         try self.applyRefreshExclusions(runtime);
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
-        try self.updatePrimaryContext(runtime);
+        const primary_update = try self.primaryUpdateAlloc(runtime);
+        defer self.allocator.free(primary_update);
         runtime.worktree_generation_valid = true;
         runtime.app.action_state_fresh = true;
+        mutex.unlock();
+        locked = false;
+        runtime.registry.endSynchronization();
+        synchronizing = false;
+        try runtime.registry.updatePrimary(primary_update);
     }
 
     fn refreshTabDiffs(
@@ -1190,7 +1220,7 @@ pub const Server = struct {
         }
     }
 
-    fn updatePrimaryContext(self: *Server, runtime: *Runtime) !void {
+    fn primaryUpdateAlloc(self: *Server, runtime: *Runtime) ![]u8 {
         var files: std.Io.Writer.Allocating = .init(self.allocator);
         defer files.deinit();
         try std.json.Stringify.value(runtime.app.generation.files.items, .{}, &files.writer);
@@ -1199,7 +1229,7 @@ pub const Server = struct {
             "ID: {s}. Current changed files: {s}. Re-evaluate inten" ++
             "t, invariants, and cross-file relationships from this " ++
             "generation and the synchronized shared worktree.";
-        const update = try std.fmt.allocPrint(
+        return std.fmt.allocPrint(
             self.allocator,
             update_format,
             .{
@@ -1208,8 +1238,6 @@ pub const Server = struct {
                 files.written(),
             },
         );
-        defer self.allocator.free(update);
-        try runtime.registry.updatePrimary(update);
     }
 };
 
@@ -1346,28 +1374,16 @@ fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool {
     return false;
 }
 
-fn refreshRevisionEvidence(
-    server: *Server,
+fn copyRevisionEvidence(
     runtime: *Runtime,
     generation: *@import("domain.zig").PrGeneration,
 ) !void {
     const current = &runtime.app.generation;
-    if (std.mem.eql(u8, current.base_oid, generation.base_oid) and
-        std.mem.eql(u8, current.head_oid, generation.head_oid))
-    {
-        for (generation.files.items) |file| {
-            const revision = @import("domain.zig").revisionFor(current, file.path) orelse
-                return error.MissingRevision;
-            try generation.setRevision(file.path, revision);
-        }
-        return;
+    for (generation.files.items) |file| {
+        const revision = @import("domain.zig").revisionFor(current, file.path) orelse
+            return error.MissingRevision;
+        try generation.setRevision(file.path, revision);
     }
-    try github.hydrateRevisionKeys(
-        server.allocator,
-        server.io,
-        runtime.cwd,
-        generation,
-    );
 }
 
 pub fn readClientTextAlloc(

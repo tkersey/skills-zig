@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
+const synoptic_server_request_timeout_ms: u32 = 5 * 60 * 1000;
 pub const safe_boundary_timeout_ms: u32 = 5_000;
 pub const approval_timeout_ms: u32 = 25_000;
 const approval_response_margin_ms: i64 = 50;
@@ -241,6 +242,8 @@ pub const Registry = struct {
     io: ?std.Io = null,
     authoritative_tool_handler: ?AuthoritativeToolHandler = null,
     authoritative_reservations: usize = 0,
+    visible_overflow_count: u64 = 0,
+    visible_overflow_session_id: ?[]u8 = null,
 
     const PrimaryFailure = enum { failed, interrupted };
     const Transport = enum { websocket, stdio };
@@ -261,7 +264,7 @@ pub const Registry = struct {
             .client_name = "synoptic",
             .client_title = "Synoptic",
             .client_version = app_meta.version,
-        }, .{});
+        }, .{ .server_request_timeout_ms = synoptic_server_request_timeout_ms });
         return registry;
     }
 
@@ -291,7 +294,7 @@ pub const Registry = struct {
             .client_title = "Synoptic",
             .client_version = app_meta.version,
             .transport = .{ .explicit_websocket = managed.listen_url },
-        }, .{}) catch {
+        }, .{ .server_request_timeout_ms = synoptic_server_request_timeout_ms }) catch {
             managed.deinit(allocator);
             return start(allocator, io, cwd, codex_path);
         };
@@ -331,6 +334,7 @@ pub const Registry = struct {
         self.file_admissions.deinit(self.allocator);
         for (self.visible_events.items) |event| event.deinit(self.allocator);
         self.visible_events.deinit(self.allocator);
+        if (self.visible_overflow_session_id) |value| self.allocator.free(value);
         for (self.active_command_ids.items) |id| self.allocator.free(id);
         self.active_command_ids.deinit(self.allocator);
         for (self.completed_turn_ids.items) |id| self.allocator.free(id);
@@ -655,6 +659,7 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         if (self.visible_events.items.len == 0) return error.NoVisibleEvent;
         self.visible_events.orderedRemove(0).deinit(self.allocator);
+        self.queueOverflowWarningLocked();
     }
 
     pub fn queueSystemEvent(self: *Registry, method: []const u8, raw_json: []const u8) !void {
@@ -1257,14 +1262,17 @@ pub const Registry = struct {
         self: *Registry,
         notification: cas_runtime.Notification,
     ) bool {
-        if (!visibleMethod(notification.method) or
-            self.visible_events.items.len + self.authoritative_reservations >= max_visible_events)
-        {
-            return false;
-        }
+        if (!visibleMethod(notification.method)) return false;
         const maybe_session = self.sessionForNotificationLocked(notification.raw_json) catch
             return true;
         const session_id = maybe_session orelse return true;
+        if (self.visible_events.items.len + self.authoritative_reservations >=
+            max_visible_events)
+        {
+            self.recordVisibleOverflowLocked(session_id);
+            self.allocator.free(session_id);
+            return false;
+        }
         const method = self.allocator.dupe(u8, notification.method) catch {
             self.allocator.free(session_id);
             return false;
@@ -1289,6 +1297,38 @@ pub const Registry = struct {
             .raw_json = raw_json,
         });
         return false;
+    }
+
+    fn recordVisibleOverflowLocked(self: *Registry, session_id: []const u8) void {
+        self.visible_overflow_count +|= 1;
+        if (self.visible_overflow_session_id != null) return;
+        self.visible_overflow_session_id = self.allocator.dupe(u8, session_id) catch null;
+    }
+
+    fn queueOverflowWarningLocked(self: *Registry) void {
+        const session_id = self.visible_overflow_session_id orelse return;
+        if (self.visible_events.items.len + self.authoritative_reservations >=
+            max_visible_events) return;
+        const raw = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"reason\":\"VisibleEventOverflow\",\"dropped\":{d}}}",
+            .{self.visible_overflow_count},
+        ) catch return;
+        const method = self.allocator.dupe(u8, "warning") catch {
+            self.allocator.free(raw);
+            return;
+        };
+        self.visible_events.append(self.allocator, .{
+            .session_id = session_id,
+            .method = method,
+            .raw_json = raw,
+        }) catch {
+            self.allocator.free(method);
+            self.allocator.free(raw);
+            return;
+        };
+        self.visible_overflow_session_id = null;
+        self.visible_overflow_count = 0;
     }
 
     fn recordCompletedTurnLocked(self: *Registry, raw_json: []const u8) void {
@@ -2154,13 +2194,12 @@ fn visibleMethod(method: []const u8) bool {
 fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (startsAnyIgnoreCase(trimmed, &.{
-        "do not ",      "don't ", "please do not ", "please don't ",
-        "should ",      "could ", "would ",         "can ",
-        "may ",         "how ",   "what ",          "which ",
-        "why ",         "when ",  "where ",         "tell me how ",
-        "explain how ",
-    }) or std.mem.endsWith(u8, trimmed, "?")) return null;
-    if (exactDirective(trimmed, &.{
+        "do not ", "don't ", "please do not ", "please don't ", "never ",
+    }) or containsAnyIgnoreCase(trimmed, &.{
+        "i don't want you to ", "i do not want you to ",
+    })) return null;
+    const directive = directiveBody(trimmed);
+    if (exactDirective(directive, &.{
         "complete this file",
         "complete the file review",
         "mark this file reviewed",
@@ -2168,24 +2207,52 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         "mark this file as reviewed",
         "mark the file as reviewed",
     })) return .complete;
-    if (exactDirective(trimmed, &.{
+    if (exactDirective(directive, &.{
         "close this session", "close the session", "close session",
         "close this tab",     "close the tab",
     })) return .close;
-    if (containsIgnoreCase(text, "take the action") or
-        containsIgnoreCase(text, "prepare the action")) return .github_any;
-    const action_verb = containsAnyIgnoreCase(text, &.{
+    if (exactDirective(directive, &.{ "take the action", "prepare the action" })) {
+        return .github_any;
+    }
+    const action_verb = startsWordAnyIgnoreCase(directive, &.{
         "add",    "remove", "set",     "request", "submit",  "dismiss", "change", "execute",
         "update", "close",  "reopen",  "merge",   "resolve", "reply",   "delete", "unmark",
         "mark",   "post",   "publish", "prepare",
     });
-    const github_target = containsAnyIgnoreCase(text, &.{
+    const github_target = containsAnyIgnoreCase(directive, &.{
         "label",   "reviewer", "assignee", "milestone", "pull request",  "this pr",
         "the pr",  " pr #",    "comment",  "thread",    "github review", "mark viewed",
         "graphql",
     });
     if (action_verb and github_target) return .github_any;
     return null;
+}
+
+fn directiveBody(text: []const u8) []const u8 {
+    var candidate = std.mem.trim(u8, text, " \t\r\n.!;?");
+    const prefixes = [_][]const u8{
+        "please ", "can you ", "could you ", "would you ", "will you ",
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (prefixes) |prefix| if (candidate.len >= prefix.len and
+            std.ascii.eqlIgnoreCase(candidate[0..prefix.len], prefix))
+        {
+            candidate = std.mem.trim(u8, candidate[prefix.len..], " \t\r\n.!;?");
+            changed = true;
+            break;
+        };
+    }
+    return candidate;
+}
+
+fn startsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
+    for (words) |word| {
+        if (text.len < word.len or !std.ascii.eqlIgnoreCase(text[0..word.len], word)) continue;
+        if (text.len == word.len or !std.ascii.isAlphanumeric(text[word.len])) return true;
+    }
+    return false;
 }
 
 fn exactDirective(text: []const u8, directives: []const []const u8) bool {
@@ -2466,6 +2533,10 @@ test "explicit broad GitHub operation grants generic action authority without or
         "I don't want you to mark this file reviewed",
     ) == null);
     try std.testing.expect(classifyHumanInstruction(
+        "I don't want you to delete this comment",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction("Summarize changes in this PR") == null);
+    try std.testing.expect(classifyHumanInstruction(
         "Explain the findings, then complete this file",
     ) == null);
     try std.testing.expectEqual(
@@ -2476,6 +2547,35 @@ test "explicit broad GitHub operation grants generic action authority without or
         HumanAuthority.github_any,
         classifyHumanInstruction("Add the comment, but do not close this session").?,
     );
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        classifyHumanInstruction("Could you add this label?").?,
+    );
+}
+
+test "visible notification overflow becomes an explicit warning after capacity drains" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try registry.sessions.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "s"),
+        .thread_id = try std.testing.allocator.dupe(u8, "t"),
+        .turn_id = try std.testing.allocator.dupe(u8, "u"),
+        .path = try std.testing.allocator.dupe(u8, "a"),
+        .revision = try std.testing.allocator.dupe(u8, "r"),
+        .last_injected_revision = try std.testing.allocator.dupe(u8, "r"),
+    });
+    for (0..max_visible_events) |_| try registry.queueSystemEvent("status", "{}");
+    const notification = cas_runtime.Notification{
+        .method = "item/agentMessage/delta",
+        .raw_json = "{\"params\":{\"threadId\":\"t\"}}",
+    };
+    Registry.onNotification(&registry, notification);
+    try std.testing.expectEqual(@as(u64, 1), registry.visible_overflow_count);
+    try registry.acknowledgeVisible();
+    try std.testing.expectEqual(@as(usize, max_visible_events), registry.visible_events.items.len);
+    const warning = registry.visible_events.items[max_visible_events - 1];
+    try std.testing.expectEqualStrings("warning", warning.method);
+    try std.testing.expect(std.mem.indexOf(u8, warning.raw_json, "VisibleEventOverflow") != null);
 }
 
 test "failed or interrupted primary turns never advance the fork checkpoint" {

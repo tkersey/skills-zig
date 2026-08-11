@@ -132,7 +132,7 @@ pub const Connection = struct {
     stream: std.Io.net.Stream,
     read_buf: std.ArrayList(u8) = .empty,
     write_mutex: std.atomic.Mutex = .unlocked,
-    usable: bool = true,
+    usable: std.atomic.Value(bool) = .init(true),
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -225,14 +225,12 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        if (!self.usable) return;
-        self.usable = false;
+        if (self.usable.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return;
         self.stream.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     pub fn poison(self: *Connection) void {
         self.close();
-        self.read_buf.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *Connection) void {
@@ -240,7 +238,7 @@ pub const Connection = struct {
     }
 
     pub fn sendText(self: *Connection, payload: []const u8) !void {
-        if (!self.usable) return error.ConnectionPoisoned;
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
         writeClientFrame(self, 0x1, payload, null) catch |err| {
             self.poison();
@@ -249,7 +247,7 @@ pub const Connection = struct {
     }
 
     pub fn sendTextTimeout(self: *Connection, payload: []const u8, timeout_ms: u32) !void {
-        if (!self.usable) return error.ConnectionPoisoned;
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
         const io = std.Io.Threaded.global_single_threaded.io();
         const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
@@ -263,12 +261,12 @@ pub const Connection = struct {
     }
 
     pub fn readTextAlloc(self: *Connection) !?[]u8 {
-        if (!self.usable) return error.ConnectionPoisoned;
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         return self.readTextAllocUntil(null);
     }
 
     pub fn readTextAllocTimeout(self: *Connection, timeout_ms: u32) !?[]u8 {
-        if (!self.usable) return error.ConnectionPoisoned;
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         const io = std.Io.Threaded.global_single_threaded.io();
         const duration = std.Io.Clock.Duration{
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
@@ -1499,8 +1497,22 @@ fn writeClientFrame(
     payload: []const u8,
     deadline: ?std.Io.Clock.Timestamp,
 ) !void {
-    while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    while (!self.write_mutex.tryLock()) {
+        if (deadline) |limit| {
+            if (limit.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
+        }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch |ignored_error| {
+            switch (ignored_error) {
+                else => {},
+            }
+        };
+    }
     defer self.write_mutex.unlock();
+    if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
+    if (deadline) |limit| {
+        if (limit.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
+    }
     const payload_len = payload.len;
     const masked = if (payload_len == 0) null else try self.allocator.dupe(u8, payload);
     defer if (masked) |owned| self.allocator.free(owned);
@@ -1642,7 +1654,7 @@ fn expectRawServerFrameError(comptime expected: anyerror, bytes: []const u8) !vo
     var connection = Connection{ .allocator = std.testing.allocator, .stream = client_stream };
     defer connection.deinit();
     try std.testing.expectError(expected, connection.readTextAllocTimeout(500));
-    try std.testing.expect(!connection.usable);
+    try std.testing.expect(!connection.usable.load(.acquire));
 }
 
 fn expectRawServerClose(bytes: []const u8) !void {
@@ -1661,7 +1673,7 @@ fn expectRawServerClose(bytes: []const u8) !void {
     var connection = Connection{ .allocator = std.testing.allocator, .stream = client_stream };
     defer connection.deinit();
     try std.testing.expect((try connection.readTextAllocTimeout(500)) == null);
-    try std.testing.expect(!connection.usable);
+    try std.testing.expect(!connection.usable.load(.acquire));
     try std.testing.expectError(error.ConnectionPoisoned, connection.sendText("after-close"));
 }
 
@@ -1701,6 +1713,26 @@ test "server frame protocol violations poison before allocation" {
     }
     try expectRawServerFrameError(error.WebSocketTooManyFragments, &fragments);
     try expectRawServerClose(&.{ 0x88, 0x02, 0x03, 0xE8 });
+}
+
+test "client write mutex acquisition obeys the caller deadline" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const peer_address = try std.Io.net.IpAddress.parse(
+        loopback_host,
+        listener.socket.address.getPort(),
+    );
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+    var connection = Connection{ .allocator = std.testing.allocator, .stream = client_stream };
+    defer connection.deinit();
+    while (!connection.write_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer connection.write_mutex.unlock();
+    try std.testing.expectError(error.Timeout, connection.sendTextTimeout("blocked", 5));
+    try std.testing.expect(!connection.usable.load(.acquire));
 }
 
 test "websocket endpoint parsing separates socket host from exact Host authority" {

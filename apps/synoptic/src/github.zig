@@ -4,6 +4,7 @@ const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
 const max_pages: usize = 10_000;
 const gh_call_timeout_ms: u32 = 30_000;
+const gh_termination_grace_ms: u32 = 250;
 
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
@@ -20,6 +21,16 @@ const GhWatchdog = struct {
         }
         if (self.finished.load(.acquire)) return;
         std.posix.kill(-self.pid, std.posix.SIG.TERM) catch |ignored_error| switch (ignored_error) {
+            else => {},
+        };
+        for (0..gh_termination_grace_ms / 5) |_| {
+            if (self.finished.load(.acquire)) return;
+            std.Io.sleep(io, watchdog_tick, .awake) catch |ignored_error| switch (ignored_error) {
+                else => {},
+            };
+        }
+        if (self.finished.load(.acquire)) return;
+        std.posix.kill(-self.pid, std.posix.SIG.KILL) catch |ignored_error| switch (ignored_error) {
             else => {},
         };
     }
@@ -299,6 +310,24 @@ pub const Broker = struct {
         defer self.allocator.free(response);
     }
 
+    pub fn unmarkViewedWithId(
+        self: Broker,
+        pull_request_id: []const u8,
+        path: []const u8,
+        client_mutation_id: []const u8,
+    ) !void {
+        const format = "{{\"input\":{{\"pullRequestId\":{f},\"path\":{f},\"cli" ++
+            "entMutationId\":{f}}}}}";
+        const vars = try std.fmt.allocPrint(self.allocator, format, .{
+            std.json.fmt(pull_request_id, .{}),
+            std.json.fmt(path, .{}),
+            std.json.fmt(client_mutation_id, .{}),
+        });
+        defer self.allocator.free(vars);
+        const response = try self.call(graphql.unmark_viewed_mutation, vars);
+        defer self.allocator.free(response);
+    }
+
     pub fn executeAction(self: Broker, card: tools.ActionCard) !void {
         if (card.kind == .graphql) try graphql.validateTransparent(
             card.graphql.?.document,
@@ -407,20 +436,27 @@ pub const Broker = struct {
                 card.target.head_oid,
             )) return error.PullRequestChanged;
             const threads = pull.get("reviewThreads").?.object.get("nodes").?.array.items;
-            try self.validateAuthorityThreads(threads, card, &found);
+            try self.validateAuthorityThreads(owner, name, number, threads, card, &found);
         }
         if (!found) return error.GitHubActionTargetMissing;
     }
 
     fn validateAuthorityThreads(
         self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
         threads: []const std.json.Value,
         card: tools.ActionCard,
         found: *bool,
     ) !void {
         for (threads) |node| {
             const thread = node.object;
-            if (card.target.thread_id) |thread_id| if (std.mem.eql(
+            const thread_action = switch (card.kind) {
+                .reply_thread, .resolve_thread, .unresolve_thread => true,
+                else => false,
+            };
+            if (thread_action) if (card.target.thread_id) |thread_id| if (std.mem.eql(
                 u8,
                 thread.get("id").?.string,
                 thread_id,
@@ -429,28 +465,34 @@ pub const Broker = struct {
                     .reply_thread => thread.get("viewerCanReply").?.bool,
                     .resolve_thread => thread.get("viewerCanResolve").?.bool,
                     .unresolve_thread => thread.get("viewerCanUnresolve").?.bool,
-                    else => true,
+                    else => unreachable,
                 };
                 if (!allowed) return error.GitHubActionNotAuthorized;
                 found.* = true;
             };
-            if (card.target.comment_id) |comment_id| {
-                const comments = thread.get("comments").?.object.get("nodes").?.array.items;
-                for (comments) |comment| if (std.mem.eql(
-                    u8,
-                    comment.object.get("id").?.string,
-                    comment_id,
-                )) {
-                    if (!comment.object.get("viewerDidAuthor").?.bool) {
-                        return error.GitHubActionNotAuthorized;
-                    }
-                    found.* = true;
-                };
+            const comment_action = card.kind == .update_comment or card.kind == .delete_comment;
+            if (comment_action) {
+                if (card.target.comment_id) |comment_id| {
+                    const comments = thread.get("comments").?.object.get("nodes").?.array.items;
+                    for (comments) |comment| if (std.mem.eql(
+                        u8,
+                        comment.object.get("id").?.string,
+                        comment_id,
+                    )) {
+                        if (!comment.object.get("viewerDidAuthor").?.bool) {
+                            return error.GitHubActionNotAuthorized;
+                        }
+                        found.* = true;
+                    };
+                }
             }
-            if (!found.*) if (card.target.comment_id) |comment_id| {
+            if (comment_action and !found.*) if (card.target.comment_id) |comment_id| {
                 const comments = thread.get("comments").?.object;
                 const next = nextCursor(comments) orelse continue;
                 if (try self.commentById(
+                    owner,
+                    name,
+                    number,
                     thread.get("id").?.string,
                     comment_id,
                     next,
@@ -517,6 +559,9 @@ pub const Broker = struct {
                 if (card.target.line) |line| if (thread.object.get("line").? != .null and
                     thread.object.get("line").?.integer != line) continue;
                 const observed = try self.commentMutationObserved(
+                    owner,
+                    name,
+                    number,
                     thread.object,
                     card,
                     started_unix_s,
@@ -535,6 +580,9 @@ pub const Broker = struct {
 
     fn commentById(
         self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
         thread_id: []const u8,
         comment_id: []const u8,
         first_cursor: []const u8,
@@ -542,7 +590,7 @@ pub const Broker = struct {
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
         for (0..max_pages) |_| {
-            const page = try self.threadCommentPage(thread_id, cursor);
+            const page = try self.threadCommentPage(owner, name, number, thread_id, cursor);
             defer self.allocator.free(page);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
@@ -572,6 +620,9 @@ pub const Broker = struct {
 
     fn commentMutationObserved(
         self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
         thread: std.json.ObjectMap,
         card: tools.ActionCard,
         started_unix_s: i64,
@@ -590,6 +641,9 @@ pub const Broker = struct {
         defer if (cursor) |value| self.allocator.free(value);
         for (0..max_pages) |_| {
             const page = try self.threadCommentPage(
+                owner,
+                name,
+                number,
                 thread.get("id").?.string,
                 cursor,
             );
@@ -621,13 +675,22 @@ pub const Broker = struct {
 
     fn threadCommentPage(
         self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
         thread_id: []const u8,
         cursor: ?[]const u8,
     ) ![]u8 {
         const vars = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"threadId\":{f},\"after\":{f}}}",
-            .{ std.json.fmt(thread_id, .{}), std.json.fmt(cursor, .{}) },
+            "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"threadId\":{f},\"after\":{f}}}",
+            .{
+                std.json.fmt(owner, .{}),
+                std.json.fmt(name, .{}),
+                number,
+                std.json.fmt(thread_id, .{}),
+                std.json.fmt(cursor, .{}),
+            },
         );
         defer self.allocator.free(vars);
         return self.call(graphql.thread_comments_query, vars);

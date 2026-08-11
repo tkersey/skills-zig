@@ -1137,16 +1137,17 @@ fn shutdownReview(
     custody_retirement: *CustodyRetirement,
     terminal_error: ?anyerror,
 ) !void {
+    _ = state;
+    custody_retirement.* = .preserve;
     try registry.beginSynchronization(io, sessions.safe_boundary_timeout_ms);
     defer registry.endSynchronization();
     worktree.reconcileShutdown(
         allocator,
         io,
         custody,
-        state.generation.head_oid,
+        worktree_baseline.head_oid,
         worktree_baseline,
     ) catch |err| {
-        custody_retirement.* = .preserve;
         return err;
     };
     try worktree.retireManaged(allocator, io, custody, options.cwd);
@@ -1224,7 +1225,6 @@ fn stop(
         };
         return printStopResult(io, json, null, false);
     }
-    const pid = std.math.cast(std.posix.pid_t, record.pid) orelse return error.InvalidRuntimePid;
     const stop_request_path = try std.fs.path.join(
         allocator,
         &.{ record.runtime_root, record.launch_id, "stop.request" },
@@ -1240,23 +1240,8 @@ fn stop(
     while (try verifiedProcess(allocator, io, record)) {
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
         if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
-            std.posix.kill(pid, std.posix.SIG.TERM) catch |ignored_error| {
-                switch (ignored_error) {
-                    else => {},
-                }
-            };
-            break;
+            return error.SynopticStopTimeout;
         }
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
-        };
-    }
-    const killed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcess(allocator, io, record)) {
-        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-        if (now_ms - killed_ms >= 1_000) return error.SynopticStopTimeout;
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |ignored_error| {
             switch (ignored_error) {
                 else => {},
