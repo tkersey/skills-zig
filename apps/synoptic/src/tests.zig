@@ -2244,6 +2244,7 @@ test "worktree integrity managed synchronization cleans then advances detached h
         &.{ "git", "worktree", "add", "--detach", managed, base },
     );
     allocator.free(output);
+    try installPostCheckoutWitness(allocator, io, source);
     var baseline = try worktree.Baseline.capture(allocator, io, managed);
     defer baseline.deinit();
     const managed_tracked = try std.fs.path.join(allocator, &.{ managed, "tracked.txt" });
@@ -2264,6 +2265,15 @@ test "worktree integrity managed synchronization cleans then advances detached h
     try worktree.synchronize(allocator, io, .{ .managed = managed }, source, head, &baseline);
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, artifact, .{}));
+    const checkout_witness = try std.fs.path.join(
+        allocator,
+        &.{ managed, "post-checkout-ran" },
+    );
+    defer allocator.free(checkout_witness);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, checkout_witness, .{}),
+    );
 }
 
 fn installPostMergeWitness(
@@ -2278,6 +2288,25 @@ fn installPostMergeWitness(
     });
     const hook_path = try std.fs.path.join(allocator, &.{ root, ".git/hooks/post-merge" });
     defer allocator.free(hook_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        hook_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+}
+
+fn installPostCheckoutWitness(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    const hook_path = try std.fs.path.join(allocator, &.{ root, ".git/hooks/post-checkout" });
+    defer allocator.free(hook_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = hook_path,
+        .data = "#!/bin/sh\nprintf hook > post-checkout-ran\n",
+    });
     try std.Io.Dir.cwd().setFilePermissions(
         io,
         hook_path,
@@ -2430,6 +2459,7 @@ test "worktree integrity dirty launch selects managed custody" {
         io,
         .{ .sub_path = "repo/tracked.txt", .data = "dirty\n" },
     );
+    try installPostCheckoutWitness(allocator, io, repo);
     const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_root);
     const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
@@ -2437,6 +2467,15 @@ test "worktree integrity dirty launch selects managed custody" {
     const custody = try worktree.select(allocator, io, repo, "feature", head, managed, true);
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
+    const checkout_witness = try std.fs.path.join(
+        allocator,
+        &.{ managed, "post-checkout-ran" },
+    );
+    defer allocator.free(checkout_witness);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, checkout_witness, .{}),
+    );
     var baseline = try worktree.Baseline.capture(allocator, io, custody.path());
     defer baseline.deinit();
     try worktree.reconcileShutdown(allocator, io, custody, head, &baseline);
@@ -2454,6 +2493,45 @@ test "worktree integrity dirty launch selects managed custody" {
     );
     defer allocator.free(worktree_list);
     try std.testing.expect(std.mem.indexOf(u8, worktree_list, managed) == null);
+}
+
+test "worktree integrity missing managed path does not prune unrelated registrations" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "head\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const missing = try std.fs.path.join(allocator, &.{ tmp_root, "missing-managed" });
+    defer allocator.free(missing);
+    const unrelated = try std.fs.path.join(allocator, &.{ tmp_root, "unrelated" });
+    defer allocator.free(unrelated);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "add", "--detach", unrelated, "HEAD" },
+    ));
+    try worktree.retireManaged(allocator, io, .{ .managed = missing }, repo);
+    const worktree_list = try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "list", "--porcelain" },
+    );
+    defer allocator.free(worktree_list);
+    try std.testing.expect(std.mem.indexOf(u8, worktree_list, unrelated) != null);
 }
 
 test "worktree integrity ignored launch artifact selects managed custody" {
