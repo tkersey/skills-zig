@@ -83,6 +83,9 @@ const LifecycleRecord = struct {
     runtime_root: []u8,
     executable: []u8,
     url: []u8,
+    worktree: ?[]u8,
+    worktree_kind: ?[]u8,
+    repository_cwd: ?[]u8,
     pid: u64,
 
     fn deinit(self: *LifecycleRecord) void {
@@ -91,6 +94,9 @@ const LifecycleRecord = struct {
         self.allocator.free(self.runtime_root);
         self.allocator.free(self.executable);
         self.allocator.free(self.url);
+        if (self.worktree) |value| self.allocator.free(value);
+        if (self.worktree_kind) |value| self.allocator.free(value);
+        if (self.repository_cwd) |value| self.allocator.free(value);
     }
 };
 
@@ -119,6 +125,7 @@ fn launch(
         var record = record_value;
         defer record.deinit();
         if (try verifiedProcess(allocator, io, record)) return error.SynopticAlreadyRunning;
+        try retireDeadLaunch(allocator, io, runtime_root, record);
         std.Io.Dir.cwd().deleteFile(io, current_path) catch |ignored_error| {
             switch (ignored_error) {
                 else => {},
@@ -185,6 +192,36 @@ fn cleanupFailedLaunch(
     ) catch |ignored_error| switch (ignored_error) {
         else => {},
     };
+}
+
+fn retireDeadLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    record: LifecycleRecord,
+) !void {
+    const kind = record.worktree_kind orelse return;
+    if (!std.mem.eql(u8, kind, "managed")) return;
+    const recorded_path = record.worktree orelse return error.IncompleteManagedLaunchRecord;
+    const repository_cwd = record.repository_cwd orelse
+        return error.IncompleteManagedLaunchRecord;
+    if (!std.fs.path.isAbsolute(repository_cwd)) return error.InvalidLifecycleRecord;
+    const expected_path = try std.fs.path.join(
+        allocator,
+        &.{ runtime_root, record.launch_id, "worktree" },
+    );
+    defer allocator.free(expected_path);
+    if (!std.mem.eql(u8, recorded_path, expected_path) or
+        !std.mem.eql(u8, record.runtime_root, runtime_root))
+    {
+        return error.InvalidLifecycleRecord;
+    }
+    try worktree.retireManaged(
+        allocator,
+        io,
+        .{ .managed = recorded_path },
+        repository_cwd,
+    );
 }
 
 fn retireLaunchProcessGroup(io: std.Io, child: *std.process.Child) bool {
@@ -716,7 +753,8 @@ fn serveHttpRuntime(
         pull_request_id,
     );
     runtime.tool_domain = tool_domain;
-    try publishRuntimeReadyWithExclusionGate(&server, &runtime, context.runtime_root, registry);
+    registry.setExclusionsPending(true);
+    errdefer registry.setExclusionsPending(false);
     var exclusion_work = LaunchExclusionWork.init(
         allocator,
         context.settings,
@@ -729,9 +767,22 @@ fn serveHttpRuntime(
         tool_domain,
     );
     const exclusion_thread = try std.Thread.spawn(.{}, LaunchExclusionWork.run, .{&exclusion_work});
+    var exclusion_thread_owned = true;
+    errdefer if (exclusion_thread_owned) {
+        exclusion_work.cancelled.store(true, .release);
+        exclusion_thread.join();
+    };
+    try publishRuntimeReady(
+        allocator,
+        io,
+        &server,
+        &runtime,
+        context.runtime_root,
+    );
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
     exclusion_thread.join();
+    exclusion_thread_owned = false;
     try finishHttpRuntime(
         allocator,
         io,
@@ -741,17 +792,6 @@ fn serveHttpRuntime(
         custody_retirement,
         terminal_error,
     );
-}
-
-fn publishRuntimeReadyWithExclusionGate(
-    server: *http.Server,
-    runtime: *http.Runtime,
-    runtime_root: []const u8,
-    registry: *sessions.Registry,
-) !void {
-    registry.setExclusionsPending(true);
-    errdefer registry.setExclusionsPending(false);
-    try publishRuntimeReady(server.allocator, server.io, server, runtime, runtime_root);
 }
 
 fn configureToolDomain(
@@ -854,6 +894,7 @@ fn publishRuntimeReady(
         runtime.cwd,
         runtime.custody,
         runtime.registry.transportName(),
+        runtime.repository_cwd,
     );
 }
 
@@ -966,6 +1007,7 @@ fn publishReadyReceipt(
     review_cwd: []const u8,
     custody: worktree.Custody,
     transport: []const u8,
+    repository_cwd: []const u8,
 ) !void {
     var token_buf: [64]u8 = undefined;
     const token = server.tokenHex(&token_buf);
@@ -988,7 +1030,8 @@ fn publishReadyReceipt(
         ":\"ready\",\"lifecycle\":\"detached\",\"launchId\":{f}" ++
         ",\"runtimeRoot\":{f},\"executable\":{f},\"pid\":{d},\"" ++
         "url\":{f},\"repository\":{f},\"pullRequest\":{d},\"wor" ++
-        "ktree\":{f},\"worktreeKind\":{f},\"transport\":{f}}}";
+        "ktree\":{f},\"worktreeKind\":{f},\"transport\":{f}," ++
+        "\"repositoryCwd\":{f}}}";
     const receipt = try std.fmt.allocPrint(
         allocator,
         receipt_format,
@@ -1004,6 +1047,7 @@ fn publishReadyReceipt(
             std.json.fmt(review_cwd, .{}),
             std.json.fmt(custody.kind(), .{}),
             std.json.fmt(transport, .{}),
+            std.json.fmt(repository_cwd, .{}),
         },
     );
     defer allocator.free(receipt);
@@ -1096,11 +1140,6 @@ fn status(
     };
     defer record.deinit();
     if (!try verifiedProcess(allocator, io, record)) {
-        std.Io.Dir.cwd().deleteFile(io, current_path) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
-        };
         if (json) {
             try out.interface.writeAll(stopped_status);
         } else try out.interface.writeAll("stopped\n");
@@ -1130,11 +1169,6 @@ fn stop(
         return printStopResult(io, json, null, false);
     defer record.deinit();
     if (!try verifiedProcess(allocator, io, record)) {
-        std.Io.Dir.cwd().deleteFile(io, current_path) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
-        };
         return printStopResult(io, json, null, false);
     }
     const stop_request_path = try std.fs.path.join(
@@ -1160,8 +1194,20 @@ fn stop(
             }
         };
     }
+    const terminal_error_path = try std.fs.path.join(
+        allocator,
+        &.{ record.runtime_root, record.launch_id, "error.json" },
+    );
+    defer allocator.free(terminal_error_path);
+    try requireNoTerminalError(io, terminal_error_path);
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
     return printStopResult(io, json, record.launch_id, true);
+}
+
+fn requireNoTerminalError(io: std.Io, path: []const u8) !void {
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
+        return error.SynopticChildShutdownFailed;
+    } else |_| {}
 }
 
 fn wakeLoopback(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !void {
@@ -1276,6 +1322,12 @@ fn readLifecycleRecord(
     errdefer allocator.free(executable);
     const url = try lifecycleStringAlloc(allocator, object, "url");
     errdefer allocator.free(url);
+    const worktree_path = try lifecycleOptionalStringAlloc(allocator, object, "worktree");
+    errdefer if (worktree_path) |value| allocator.free(value);
+    const worktree_kind = try lifecycleOptionalStringAlloc(allocator, object, "worktreeKind");
+    errdefer if (worktree_kind) |value| allocator.free(value);
+    const repository_cwd = try lifecycleOptionalStringAlloc(allocator, object, "repositoryCwd");
+    errdefer if (repository_cwd) |value| allocator.free(value);
     const pid_value = object.get("pid") orelse return error.InvalidLifecycleRecord;
     if (pid_value != .integer or pid_value.integer <= 0) return error.InvalidLifecycleRecord;
     return .{
@@ -1285,6 +1337,9 @@ fn readLifecycleRecord(
         .runtime_root = runtime_root,
         .executable = executable,
         .url = url,
+        .worktree = worktree_path,
+        .worktree_kind = worktree_kind,
+        .repository_cwd = repository_cwd,
         .pid = @intCast(pid_value.integer),
     };
 }
@@ -1297,6 +1352,16 @@ fn lifecycleStringAlloc(
     const value = object.get(key) orelse return error.InvalidLifecycleRecord;
     if (value != .string or value.string.len == 0) return error.InvalidLifecycleRecord;
     return allocator.dupe(u8, value.string);
+}
+
+fn lifecycleOptionalStringAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidLifecycleRecord;
+    return @as(?[]u8, try allocator.dupe(u8, value.string));
 }
 
 fn verifiedProcess(allocator: std.mem.Allocator, io: std.Io, record: LifecycleRecord) !bool {
@@ -1818,6 +1883,82 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
     );
     defer allocator.free(direct);
     try std.testing.expectEqualStrings("https://github.example.test/o/r/pull/9", direct);
+}
+test "stop cannot report success after a terminal cleanup error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "error.json", .data = "{}" });
+    const path = try tmp.dir.realPathFileAlloc(io, "error.json", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(
+        error.SynopticChildShutdownFailed,
+        requireNoTerminalError(io, path),
+    );
+}
+test "dead launch recovery retires managed custody" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked", .data = "head\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
+    defer allocator.free(repo);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| {
+        const output = try runTestCommand(allocator, io, repo, argv);
+        allocator.free(output);
+    }
+    const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime_root);
+    const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
+    defer allocator.free(launch_dir);
+    try std.Io.Dir.cwd().createDirPath(io, launch_dir);
+    const managed = try std.fs.path.join(allocator, &.{ launch_dir, "worktree" });
+    defer allocator.free(managed);
+    const head_raw = try runTestCommand(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const added = try runTestCommand(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "add", "--detach", managed, head },
+    );
+    allocator.free(added);
+    var record = LifecycleRecord{
+        .allocator = allocator,
+        .raw = try allocator.dupe(u8, "{}"),
+        .launch_id = try allocator.dupe(u8, launch_id),
+        .runtime_root = try allocator.dupe(u8, runtime_root),
+        .executable = try allocator.dupe(u8, "/tmp/synoptic"),
+        .url = try allocator.dupe(u8, "http://127.0.0.1:1/"),
+        .worktree = try allocator.dupe(u8, managed),
+        .worktree_kind = try allocator.dupe(u8, "managed"),
+        .repository_cwd = try allocator.dupe(u8, repo),
+        .pid = 999_999,
+    };
+    defer record.deinit();
+    try retireDeadLaunch(allocator, io, runtime_root, record);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, managed, .{}),
+    );
 }
 test "failed launch retires descendants before managed custody and preserves error" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;

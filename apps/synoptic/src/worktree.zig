@@ -186,6 +186,18 @@ pub fn reconcileShutdown(
     }
 }
 
+pub fn requireReviewAdmission(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    baseline: *const Baseline,
+) !void {
+    switch (custody) {
+        .managed => {},
+        .reused_current => |cwd| try requireReusedUnchanged(allocator, io, cwd, baseline),
+    }
+}
+
 pub fn retireManaged(
     allocator: std.mem.Allocator,
     io: std.Io,

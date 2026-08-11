@@ -947,6 +947,95 @@ test "action broker reconciles an ambiguous mutation once without retry" {
     try verifyAmbiguousActions(allocator, io, broker, &state, log_path);
 }
 
+test "malformed successful mutation response remains transport ambiguous" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-malformed" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\cat >/dev/null
+        \\printf '{'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-malformed", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try std.testing.expectError(
+        error.GitHubTransportAmbiguous,
+        broker.call(graphql.add_inline_comment_mutation, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidGraphqlResponse,
+        broker.call(graphql.anchor_query, "{}"),
+    );
+}
+
+test "duplicate inline comment reconciliation remains unknown" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-duplicate" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        \\json='{"data":{"repository":{"pullRequest":{"headRefOid":"h",'
+        \\json=$json'"reviewThreads":{"nodes":[{"id":"T","path":"a.zig",'
+        \\json=$json'"line":1,"startLine":null,"diffSide":"RIGHT",'
+        \\json=$json'"startDiffSide":null,"comments":{"nodes":['
+        \\json=$json'{"id":"C1","body":"body","createdAt":"%s",'
+        \\json=$json'"viewerDidAuthor":true},{"id":"C2","body":"body",'
+        \\json=$json'"createdAt":"%s","viewerDidAuthor":true}],'
+        \\json=$json'"pageInfo":{"hasNextPage":false,"endCursor":null}}}],'
+        \\json=$json'"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+        \\printf "$json\\n" "$now" "$now"
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-duplicate", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("finding"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("comment"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("a.zig"),
+        .line = 1,
+        .body = @constCast("body"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .head_oid = "h",
+        .session_path = "a.zig",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, card.*, 0));
+}
+
 test "ambiguous complete-file mutation succeeds only through viewed readback" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1991,6 +2080,18 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     allocator.free(output);
     var baseline = try worktree.Baseline.capture(allocator, io, root);
     defer baseline.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "drift\n" });
+    try std.testing.expectError(
+        error.ReusedCheckoutRefreshRequiresManagedMigration,
+        worktree.requireReviewAdmission(
+            allocator,
+            io,
+            .{ .reused_current = root },
+            &baseline,
+        ),
+    );
+    output = try runGit(allocator, io, root, &.{ "git", "restore", "tracked.txt" });
+    allocator.free(output);
     try worktree.synchronize(allocator, io, .{ .reused_current = root }, root, head, &baseline);
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectEqualStrings("feature", baseline.branch.?);

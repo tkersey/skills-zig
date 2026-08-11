@@ -261,7 +261,10 @@ pub const ActionStore = struct {
                 .path = try dupeOptional(self.allocator, input.path),
                 .line = input.line,
                 .start_line = input.start_line,
-                .side = try dupeOptional(self.allocator, input.side),
+                .side = if (input.kind == .add_inline_comment)
+                    try self.allocator.dupe(u8, input.side orelse "RIGHT")
+                else
+                    try dupeOptional(self.allocator, input.side),
                 .thread_id = try dupeOptional(self.allocator, input.thread_id),
                 .comment_id = try dupeOptional(self.allocator, input.comment_id),
                 .comment_body_snapshot = try dupeOptional(
@@ -514,6 +517,31 @@ test "same session slot supersedes immutably and execution is once" {
     try std.testing.expectEqualStrings("act-1", store.cards.items[1].supersedes.?);
     _ = try store.beginExecute("act-2");
     try std.testing.expectError(error.ActionNotPending, store.beginExecute("act-2"));
+}
+test "inline comment card owns the default RIGHT side" {
+    var store = ActionStore{ .allocator = std.testing.allocator };
+    defer store.deinit();
+    const card = try store.prepare(
+        "s",
+        "t",
+        .{
+            .slot = @constCast("finding"),
+            .kind = .add_inline_comment,
+            .effect_summary = @constCast("comment"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("a.zig"),
+            .line = 1,
+            .body = @constCast("body"),
+        },
+        .{
+            .repository = "o/r",
+            .pull_request = 1,
+            .pull_request_id = "PR_1",
+            .head_oid = "h",
+            .session_path = "a.zig",
+        },
+    );
+    try std.testing.expectEqualStrings("RIGHT", card.target.side.?);
 }
 test "transparent validation runs before immutable card creation" {
     var store = ActionStore{ .allocator = std.testing.allocator };

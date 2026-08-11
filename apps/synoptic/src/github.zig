@@ -114,7 +114,7 @@ pub const Broker = struct {
                 output.stdout,
                 .{},
             ) catch {
-                if (output.term != .exited or output.term.exited != 0) {
+                if (mutation or output.term != .exited or output.term.exited != 0) {
                     return error.GitHubTransportAmbiguous;
                 }
                 return error.InvalidGraphqlResponse;
@@ -726,6 +726,7 @@ pub const Broker = struct {
         );
         defer freePages(self.allocator, &pages);
         var target_comment_found = false;
+        var matching_comments: u32 = 0;
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
@@ -757,10 +758,12 @@ pub const Broker = struct {
                     card,
                     started_unix_s,
                     &target_comment_found,
+                    &matching_comments,
                 );
                 if (observed) return true;
             }
         }
+        if (card.kind == .add_inline_comment) return matching_comments == 1;
         if (card.kind == .delete_comment) return !target_comment_found;
         return false;
     }
@@ -837,6 +840,7 @@ pub const Broker = struct {
         card: tools.ActionCard,
         started_unix_s: i64,
         target_found: *bool,
+        matching_comments: *u32,
     ) !bool {
         const initial = thread.get("comments").?.object;
         if (try commentsObserve(
@@ -845,6 +849,7 @@ pub const Broker = struct {
             card,
             started_unix_s,
             target_found,
+            matching_comments,
         )) return true;
         const first_cursor = nextCursor(initial) orelse return false;
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
@@ -873,6 +878,7 @@ pub const Broker = struct {
                 card,
                 started_unix_s,
                 target_found,
+                matching_comments,
             )) return true;
             const info = comments.get("pageInfo").?.object;
             if (!info.get("hasNextPage").?.bool) return false;
@@ -1114,6 +1120,7 @@ fn commentsObserve(
     card: tools.ActionCard,
     started_unix_s: i64,
     target_found: *bool,
+    matching_comments: *u32,
 ) !bool {
     for (values) |value| {
         const comment = value.object;
@@ -1139,7 +1146,12 @@ fn commentsObserve(
             std.Io.Clock.real.now(io).nanoseconds,
             std.time.ns_per_s,
         ));
-        if (created >= started_unix_s - 5 and created <= now + 60) return true;
+        if (created < started_unix_s or created > now + 60) continue;
+        if (card.kind == .add_inline_comment) {
+            matching_comments.* += 1;
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -1597,18 +1609,25 @@ pub fn validateRightLine(diff: []const u8, target: u32) bool {
 }
 pub fn validateDiffAnchor(diff: []const u8, line: u32, start_line: ?u32, side: []const u8) bool {
     if (!std.mem.eql(u8, side, "RIGHT") and !std.mem.eql(u8, side, "LEFT")) return false;
-    if (!validateLine(diff, line, side)) return false;
-    if (start_line) |start| return start <= line and validateLine(diff, start, side);
+    const end_hunk = lineHunk(diff, line, side) orelse return false;
+    if (start_line) |start| {
+        const start_hunk = lineHunk(diff, start, side) orelse return false;
+        return start <= line and start_hunk == end_hunk;
+    }
     return true;
 }
 fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
+    return lineHunk(diff, target, side) != null;
+}
+
+fn lineHunk(diff: []const u8, target: u32, side: []const u8) ?u32 {
     var old_line: u32 = 0;
     var new_line: u32 = 0;
-    var in_hunk = false;
+    var hunk: u32 = 0;
     var lines = std.mem.splitScalar(u8, diff, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "@@")) {
-            in_hunk = true;
+            hunk += 1;
             const minus = std.mem.indexOfScalar(u8, line, '-') orelse continue;
             const old_tail = line[minus + 1 ..];
             const old_end = std.mem.indexOfAny(u8, old_tail, ", ") orelse old_tail.len;
@@ -1619,15 +1638,15 @@ fn validateLine(diff: []const u8, target: u32, side: []const u8) bool {
             new_line = std.fmt.parseInt(u32, tail[0..end], 10) catch 0;
             continue;
         }
-        if (!in_hunk or line.len == 0 or std.mem.startsWith(u8, line, "\\ No newline")) {
+        if (hunk == 0 or line.len == 0 or std.mem.startsWith(u8, line, "\\ No newline")) {
             continue;
         }
-        if (std.mem.eql(u8, side, "RIGHT") and line[0] != '-' and new_line == target) return true;
-        if (std.mem.eql(u8, side, "LEFT") and line[0] != '+' and old_line == target) return true;
+        if (std.mem.eql(u8, side, "RIGHT") and line[0] != '-' and new_line == target) return hunk;
+        if (std.mem.eql(u8, side, "LEFT") and line[0] != '+' and old_line == target) return hunk;
         if (line[0] != '-') new_line += 1;
         if (line[0] != '+') old_line += 1;
     }
-    return false;
+    return null;
 }
 
 pub fn hasFixedArgv(argv: []const []const u8) bool {
@@ -1870,4 +1889,10 @@ test "diff metadata never consumes anchor line identity" {
     try std.testing.expect(validateDiffAnchor(diff, 1, null, "LEFT"));
     try std.testing.expect(validateDiffAnchor(diff, 1, null, "RIGHT"));
     try std.testing.expect(!validateDiffAnchor(diff, 2, null, "RIGHT"));
+}
+test "multiline comment range cannot cross diff hunks" {
+    const diff = "@@ -1,2 +1,2 @@\n a\n+b\n@@ -10,2 +10,2 @@\n c\n+d\n";
+    try std.testing.expect(validateDiffAnchor(diff, 2, 1, "RIGHT"));
+    try std.testing.expect(validateDiffAnchor(diff, 11, 10, "RIGHT"));
+    try std.testing.expect(!validateDiffAnchor(diff, 11, 1, "RIGHT"));
 }

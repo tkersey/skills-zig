@@ -463,10 +463,20 @@ pub const App = struct {
 
     pub fn rejectAction(self: *App, card_id: []const u8) !void {
         try self.action_store.reject(card_id);
+        try self.synchronizePendingCard(card_id);
+    }
+
+    pub fn invalidateAction(self: *App, card_id: []const u8) !void {
+        try self.action_store.invalidate(card_id);
+        try self.synchronizePendingCard(card_id);
+    }
+
+    fn synchronizePendingCard(self: *App, card_id: []const u8) !void {
         for (self.action_store.cards.items) |card| if (std.mem.eql(u8, card.id, card_id)) {
             self.pending = card;
             return;
         };
+        return error.UnknownAction;
     }
 
     pub fn complete(
@@ -840,6 +850,29 @@ test "close and completion are different transitions" {
     defer std.testing.allocator.free(event);
     app.close();
     try std.testing.expect(app.generation.queued("a"));
+}
+
+test "action invalidation updates the application snapshot" {
+    var state = try App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    const card = try state.action_store.prepare("s", "t", .{
+        .slot = @constCast("finding"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("comment"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("a.zig"),
+        .line = 1,
+        .body = @constCast("body"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .head_oid = "h",
+        .session_path = "a.zig",
+    });
+    state.pending = card.*;
+    try state.invalidateAction(card.id);
+    try std.testing.expectEqual(tools.ActionStatus.invalidated, state.pending.?.status);
 }
 
 test {

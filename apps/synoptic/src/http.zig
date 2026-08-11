@@ -225,6 +225,13 @@ test "connection isolation never reclassifies an internal runtime failure" {
     try std.testing.expect(!clientConnectionError(error.MissingOriginSession));
 }
 
+test "transient action validation preserves a pending card" {
+    try std.testing.expect(!definitiveActionValidationFailure(error.GitHubTransportAmbiguous));
+    try std.testing.expect(!definitiveActionValidationFailure(error.InvalidGraphqlResponse));
+    try std.testing.expect(definitiveActionValidationFailure(error.PullRequestChanged));
+    try std.testing.expect(definitiveActionValidationFailure(error.GitHubActionTargetChanged));
+}
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -816,6 +823,7 @@ pub const Server = struct {
         defer mutex.unlock();
         if (!runtime.app.primary_ready) return error.PrimaryNotReady;
         if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
+        try self.requireReviewWorktree(runtime);
         const revision = @import("domain.zig").revisionFor(
             &runtime.app.generation,
             path,
@@ -905,12 +913,15 @@ pub const Server = struct {
     }
 
     fn messageSession(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
-        _ = self;
         const text = payloadString(payload, "text") orelse return error.InvalidUiCommand;
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
         const mutex = domainMutex(runtime);
         mutex.lock();
+        self.requireReviewWorktree(runtime) catch |err| {
+            mutex.unlock();
+            return err;
+        };
         runtime.app.initial_review_active = false;
         mutex.unlock();
         try runtime.registry.message(session_id, text);
@@ -963,7 +974,8 @@ pub const Server = struct {
             runtime.pull_request_id,
             card,
         ) catch |err| {
-            try runtime.app.action_store.invalidate(card_id);
+            if (!definitiveActionValidationFailure(err)) return err;
+            try runtime.app.invalidateAction(card_id);
             const format = "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}";
             const status = try std.fmt.allocPrint(
                 self.allocator,
@@ -975,7 +987,7 @@ pub const Server = struct {
         };
         if (card.kind == .add_inline_comment) {
             if (!try self.commentAnchorValid(runtime, card)) {
-                try runtime.app.action_store.invalidate(card_id);
+                try runtime.app.invalidateAction(card_id);
                 const format = "{{\"id\":{f},\"status\":\"invalidated\"," ++
                     "\"reason\":\"StaleCommentAnchor\"}}";
                 const status = try std.fmt.allocPrint(
@@ -996,6 +1008,19 @@ pub const Server = struct {
         );
         try self.refreshActionEvidence(runtime, terminal);
         return self.actionStatusEnvelope(runtime, card_id, terminal);
+    }
+
+    fn requireReviewWorktree(self: *Server, runtime: *Runtime) !void {
+        if (runtime.custody == .managed) return;
+        worktree.requireReviewAdmission(
+            self.allocator,
+            self.io,
+            runtime.custody,
+            runtime.baseline orelse return error.MissingWorktreeBaseline,
+        ) catch |err| {
+            runtime.worktree_generation_valid = false;
+            return err;
+        };
     }
 
     fn commentAnchorValid(
@@ -1304,6 +1329,20 @@ pub const Server = struct {
         );
     }
 };
+
+fn definitiveActionValidationFailure(err: anyerror) bool {
+    return switch (err) {
+        error.ActionTargetMismatch,
+        error.PullRequestChanged,
+        error.CommentPathNotCurrent,
+        error.GitHubActionTargetMissing,
+        error.GitHubActionNotAuthorized,
+        error.GitHubActionTargetChanged,
+        error.ActionCommentSnapshotMissing,
+        => true,
+        else => false,
+    };
+}
 
 pub fn queueExclusionEvents(
     registry: *sessions.Registry,
