@@ -208,6 +208,23 @@ pub fn build() void {}
 EOF
 }
 
+write_synoptic_formatted_build() {
+  cat >build.zig <<'EOF'
+const img_meta = "apps/img/VERSION";
+const synoptic_version = std.mem.trim(
+    u8,
+    @embedFile("apps/synoptic/VERSION"),
+    " \t\r\n",
+);
+const synoptic_usage =
+    \\Usage:
+    \\  synoptic version
+    \\
+;
+pub fn build() void {}
+EOF
+}
+
 write_synoptic_import_build() {
   local imported_module=$1
   printf '%s\n' \
@@ -327,6 +344,7 @@ assert_affected cas write_cas_control_plane_build
 assert_affected cas,synoptic write_cas_runtime_only_build
 assert_affected cas,synoptic write_cas_hook_policy_only_build
 assert_affected cas,synoptic write_synoptic_cas_runtime_build
+assert_affected synoptic write_synoptic_formatted_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_universalist_build
