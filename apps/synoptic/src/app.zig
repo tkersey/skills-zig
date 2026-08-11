@@ -567,18 +567,6 @@ pub const App = struct {
             ))) tab.status = .closed;
         }
     }
-    pub fn closeTab(self: *App, path: []const u8, revision: []const u8) !void {
-        for (self.tabs.items) |*tab| {
-            if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and
-                tab.status != .closed)
-            {
-                tab.status = .closed;
-                return;
-            }
-        }
-        return error.UnknownTab;
-    }
-
     pub fn closeTabById(self: *App, session_id: []const u8) !void {
         for (self.tabs.items) |*tab| {
             if (!std.mem.eql(u8, tab.id, session_id) or tab.status == .closed) continue;
