@@ -93,6 +93,7 @@ pub const Session = struct {
     revision: []u8,
     last_injected_revision: []u8,
     status: SessionStatus = .current,
+    opening: bool = false,
     initial_turn_active: bool = true,
     turn_active: bool = true,
     human_authority: ?HumanAuthority = null,
@@ -623,19 +624,23 @@ pub const Registry = struct {
         var thread_id: ?[]u8 = null;
         var turn_id: ?[]u8 = null;
         var found = false;
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id)) {
+        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
             found = true;
             if (session.turn_active and session.turn_id.len > 0) {
-                thread_id = self.allocator.dupe(u8, session.thread_id) catch |err| {
-                    self.mutex.unlock();
-                    return err;
-                };
-                turn_id = self.allocator.dupe(u8, session.turn_id) catch |err| {
-                    self.allocator.free(thread_id.?);
-                    self.mutex.unlock();
-                    return err;
-                };
+                thread_id = self.allocator.dupe(u8, session.thread_id) catch null;
+                if (thread_id != null) {
+                    turn_id = self.allocator.dupe(u8, session.turn_id) catch null;
+                    if (turn_id == null) {
+                        self.allocator.free(thread_id.?);
+                        thread_id = null;
+                    }
+                }
             }
+            session.status = .closed;
+            session.opening = false;
+            session.turn_active = false;
+            session.initial_turn_active = false;
+            self.declineApprovalsLocked(session_id, .resolved, "session-closed");
             break;
         };
         self.mutex.unlock();
@@ -644,26 +649,16 @@ pub const Registry = struct {
         defer if (turn_id) |value| self.allocator.free(value);
         if (thread_id != null and turn_id != null) {
             if (self.actor) |*actor| {
-                const params = try std.fmt.allocPrint(
+                const params = std.fmt.allocPrint(
                     self.allocator,
                     "{{\"threadId\":{f},\"turnId\":{f}}}",
                     .{ std.json.fmt(thread_id.?, .{}), std.json.fmt(turn_id.?, .{}) },
-                );
+                ) catch return;
                 defer self.allocator.free(params);
-                const response = try actor.requestJson("turn/interrupt", params, null);
-                defer self.allocator.free(response);
+                const response = actor.requestJson("turn/interrupt", params, null) catch return;
+                self.allocator.free(response);
             }
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
-            session.status = .closed;
-            session.turn_active = false;
-            session.initial_turn_active = false;
-            self.declineApprovalsLocked(session_id, .resolved, "session-closed");
-            return;
-        };
-        return error.UnknownSession;
     }
 
     pub fn discardOpenedSession(self: *Registry, session_id: []const u8) void {
@@ -806,11 +801,6 @@ pub const Registry = struct {
             threads_json,
         );
         defer self.allocator.free(prompt);
-        const file_turn_id = if (start_immediately)
-            try self.startFileTurn(actor, cwd, file_thread_id, skill_path, prompt)
-        else
-            null;
-        defer if (file_turn_id) |value| self.allocator.free(value);
         const session_id = try self.registerFileSession(
             file_thread_id,
             path,
@@ -818,8 +808,22 @@ pub const Registry = struct {
             prompt,
             skill_path,
             start_immediately,
-            file_turn_id,
         );
+        errdefer {
+            self.removeSession(session_id);
+            self.allocator.free(session_id);
+        }
+        if (start_immediately) {
+            const file_turn_id = try self.startFileTurn(
+                actor,
+                cwd,
+                file_thread_id,
+                skill_path,
+                prompt,
+            );
+            defer self.allocator.free(file_turn_id);
+            try self.activateOpeningSession(session_id, file_turn_id);
+        }
         return .{ .reused = false, .session_id = session_id, .allocator = self.allocator };
     }
 
@@ -832,7 +836,8 @@ pub const Registry = struct {
         for (self.sessions.items) |session| {
             if (session.status == .closed) continue;
             live_sessions += 1;
-            if (session.status == .current and std.mem.eql(u8, session.path, path) and
+            if (!session.opening and session.status == .current and
+                std.mem.eql(u8, session.path, path) and
                 std.mem.eql(u8, session.revision, revision))
             {
                 return .{ .reused = try self.allocator.dupe(u8, session.id) };
@@ -915,7 +920,6 @@ pub const Registry = struct {
         prompt: []const u8,
         skill_path: []const u8,
         start_immediately: bool,
-        started_turn_id: ?[]const u8,
     ) ![]u8 {
         var session_fields_transferred = false;
         const session_id = try std.fmt.allocPrint(
@@ -926,7 +930,7 @@ pub const Registry = struct {
         errdefer if (!session_fields_transferred) self.allocator.free(session_id);
         const thread_id = try self.allocator.dupe(u8, file_thread_id);
         errdefer if (!session_fields_transferred) self.allocator.free(thread_id);
-        const turn_id = try self.allocator.dupe(u8, started_turn_id orelse "");
+        const turn_id = try self.allocator.dupe(u8, "");
         errdefer if (!session_fields_transferred) self.allocator.free(turn_id);
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer if (!session_fields_transferred) self.allocator.free(owned_path);
@@ -957,9 +961,9 @@ pub const Registry = struct {
             .path = owned_path,
             .revision = owned_revision,
             .last_injected_revision = injected_revision,
-            .initial_turn_active = start_immediately and
-                !self.turnCompletedLocked(turn_id),
-            .turn_active = start_immediately and !self.turnCompletedLocked(turn_id),
+            .opening = start_immediately,
+            .initial_turn_active = start_immediately,
+            .turn_active = start_immediately,
             .pending_initial_prompt = pending_prompt,
             .pending_skill_path = pending_skill,
         }) catch |err| {
@@ -967,13 +971,52 @@ pub const Registry = struct {
             return err;
         };
         session_fields_transferred = true;
-        for (self.sessions.items[0 .. self.sessions.items.len - 1]) |*session| {
+        if (!start_immediately) self.markPriorPathSessionsStaleLocked(
+            session_id,
+            path,
+        );
+        self.mutex.unlock();
+        return self.allocator.dupe(u8, session_id);
+    }
+
+    fn activateOpeningSession(
+        self: *Registry,
+        session_id: []const u8,
+        turn_id: []const u8,
+    ) !void {
+        const owned_turn = try self.allocator.dupe(u8, turn_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| {
+            if (!std.mem.eql(u8, session.id, session_id)) continue;
+            if (!session.opening) {
+                self.allocator.free(owned_turn);
+                return error.SessionNotOpening;
+            }
+            self.allocator.free(session.turn_id);
+            session.turn_id = owned_turn;
+            session.opening = false;
+            const completed = self.turnCompletedLocked(turn_id);
+            session.initial_turn_active = !completed;
+            session.turn_active = !completed;
+            self.markPriorPathSessionsStaleLocked(session_id, session.path);
+            return;
+        }
+        self.allocator.free(owned_turn);
+        return error.UnknownSession;
+    }
+
+    fn markPriorPathSessionsStaleLocked(
+        self: *Registry,
+        current_session_id: []const u8,
+        path: []const u8,
+    ) void {
+        for (self.sessions.items) |*session| {
+            if (std.mem.eql(u8, session.id, current_session_id)) continue;
             if (session.status == .current and std.mem.eql(u8, session.path, path)) {
                 session.status = .stale_origin;
             }
         }
-        self.mutex.unlock();
-        return self.allocator.dupe(u8, session_id);
     }
 
     fn startFileTurn(
@@ -1441,8 +1484,13 @@ pub const Registry = struct {
             &.{ "params", "turn", "id" },
         ) catch return;
         defer self.allocator.free(completed);
-        if (self.turnCompletedLocked(completed) or self.completed_turn_ids.items.len >= 512) return;
+        if (self.turnCompletedLocked(completed)) return;
         const owned = self.allocator.dupe(u8, completed) catch return;
+        if (self.completed_turn_ids.items.len >= 512) {
+            self.allocator.free(self.completed_turn_ids.orderedRemove(0));
+            self.completed_turn_ids.appendAssumeCapacity(owned);
+            return;
+        }
         self.completed_turn_ids.append(self.allocator, owned) catch self.allocator.free(owned);
     }
 
@@ -2511,6 +2559,68 @@ test "file admission reserves capacity and closed sessions release it" {
     const reopened = try registry.admitFile("b.zig", "r1");
     try std.testing.expect(reopened == .reserved);
     registry.releaseFileAdmission("b.zig", "r1");
+}
+
+test "opening session is mapped but not reusable until activation" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-prior", "file-prior");
+    registry.sessions.items[0].turn_active = false;
+    const admission = try registry.admitFile("a.zig", "r2");
+    try std.testing.expect(admission == .reserved);
+    defer registry.releaseFileAdmission("a.zig", "r2");
+    const opening_id = try registry.registerFileSession(
+        "file-current",
+        "a.zig",
+        "r2",
+        "prompt",
+        "/skill/SKILL.md",
+        true,
+    );
+    defer std.testing.allocator.free(opening_id);
+    try std.testing.expect(registry.sessions.items[1].opening);
+    try std.testing.expectEqual(SessionStatus.current, registry.sessions.items[0].status);
+    Registry.onNotification(&registry, .{
+        .method = "item/agentMessage/delta",
+        .raw_json = "{\"params\":{\"threadId\":\"file-current\",\"delta\":\"opening visible\"}}",
+    });
+    const opening_event = (try registry.peekVisible(std.testing.allocator)).?;
+    defer opening_event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(opening_id, opening_event.session_id.?);
+    try std.testing.expectEqualStrings("item/agentMessage/delta", opening_event.method);
+    try registry.acknowledgeVisible();
+    try std.testing.expectError(
+        error.SessionOpenInProgress,
+        registry.admitFile("a.zig", "r2"),
+    );
+
+    registry.recordCompletedTurnLocked(
+        "{\"params\":{\"threadId\":\"file-current\",\"turn\":{\"id\":\"turn-current\"}}}",
+    );
+    try registry.activateOpeningSession(opening_id, "turn-current");
+    try std.testing.expect(!registry.sessions.items[1].opening);
+    try std.testing.expect(!registry.sessions.items[1].turn_active);
+    try std.testing.expectEqual(SessionStatus.stale_origin, registry.sessions.items[0].status);
+    const reused = try registry.admitFile("a.zig", "r2");
+    try std.testing.expect(reused == .reused);
+    std.testing.allocator.free(reused.reused);
+}
+
+test "completed turn identity cache rolls after its bounded capacity" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    for (0..513) |index| {
+        const raw = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"params\":{{\"turn\":{{\"id\":\"turn-{d}\"}}}}}}",
+            .{index},
+        );
+        defer std.testing.allocator.free(raw);
+        registry.recordCompletedTurnLocked(raw);
+    }
+    try std.testing.expectEqual(@as(usize, 512), registry.completed_turn_ids.items.len);
+    try std.testing.expect(!registry.turnCompletedLocked("turn-0"));
+    try std.testing.expect(registry.turnCompletedLocked("turn-512"));
 }
 
 test "session context dynamic tool namespace exposes the exact authoritative surface" {

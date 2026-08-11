@@ -473,7 +473,12 @@ const fake_codex_script =
     \\    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"primary"}}}\n' "$id" ;;
     \\    *'"method":"thread/fork"'*) forks=$((forks + 1)); printf '{"id":%s,"result":{"thread":{"id":"file-%s"}}}\n' "$id" "$forks" ;;
     \\    *'"method":"thread/inject_items"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
-    \\    *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    \\    *'"method":"turn/interrupt"'*)
+    \\      if printf '%s' "$line" | grep -q 'fail-interrupt'; then
+    \\        printf '{"id":%s,"error":{"code":-32000,"message":"interrupt failed"}}\n' "$id"
+    \\        continue
+    \\      fi
+    \\      printf '{"id":%s,"result":{}}\n' "$id" ;;
     \\    *'"method":"turn/start"'*)
     \\      if printf '%s' "$line" | grep -q '"threadId":"primary"'; then
     \\        primary_turns=$((primary_turns + 1))
@@ -1441,6 +1446,44 @@ test "file session receives every later revision and active close interrupts its
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
+}
+
+test "local close finalizes when best-effort turn interruption fails" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const opened = try registry.openFile(
+        io,
+        root,
+        "close.zig",
+        "r1",
+        "base",
+        "head",
+        "canonical close diff",
+        "[]",
+        paths.skill,
+        false,
+    );
+    defer opened.deinit();
+    allocator.free(registry.sessions.items[0].turn_id);
+    registry.sessions.items[0].turn_id = try allocator.dupe(u8, "fail-interrupt");
+    registry.sessions.items[0].turn_active = true;
+
+    try registry.closeSession(opened.session_id);
+    try std.testing.expectEqual(
+        sessions.SessionStatus.closed,
+        registry.sessions.items[0].status,
+    );
+    try std.testing.expect(!registry.sessions.items[0].turn_active);
 }
 
 fn verifySessionModes(
