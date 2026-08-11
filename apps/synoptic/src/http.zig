@@ -150,10 +150,8 @@ pub const ToolDomainContext = struct {
     }
 
     fn closeSession(self: *ToolDomainContext, session_id: []const u8) !void {
-        const identity = try self.registry.sessionIdentity(session_id);
-        defer identity.deinit();
         try self.registry.closeSession(session_id);
-        try self.app.closeTab(identity.path, identity.revision);
+        try self.app.closeTabById(session_id);
     }
 };
 
@@ -725,7 +723,7 @@ pub const Server = struct {
         defer identity.deinit();
         if (identity.status != .closed) {
             try runtime.registry.closeSession(session_id);
-            try runtime.app.closeTab(identity.path, identity.revision);
+            try runtime.app.closeTabById(session_id);
         }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
@@ -902,13 +900,11 @@ pub const Server = struct {
         _ = self;
         const session_id = payloadString(payload, "sessionId") orelse
             return error.InvalidUiCommand;
-        const identity = try runtime.registry.sessionIdentity(session_id);
-        defer identity.deinit();
         try runtime.registry.closeSession(session_id);
         const mutex = domainMutex(runtime);
         mutex.lock();
         defer mutex.unlock();
-        try runtime.app.closeTab(identity.path, identity.revision);
+        try runtime.app.closeTabById(session_id);
         return runtime.app.nextEnvelope("session.closed", "{}");
     }
 
@@ -1546,11 +1542,28 @@ pub fn readClientTextAllocTimeout(
                     return fragmented.toOwnedSlice(allocator);
                 }
             },
-            0x8 => return error.WebSocketClosed,
+            0x8 => {
+                try validateClosePayload(frame.payload);
+                try writeServerFrame(io, stream, 0x8, true, frame.payload);
+                return error.WebSocketClosed;
+            },
             0x9 => try writeServerFrame(io, stream, 0xA, true, frame.payload),
             0xA => {},
             else => return error.InvalidClientWebSocketFrame,
         }
+    }
+}
+
+fn validateClosePayload(payload: []const u8) !void {
+    if (payload.len == 1) return error.InvalidClientWebSocketFrame;
+    if (payload.len == 0) return;
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (code < 1000 or code >= 5000 or switch (code) {
+        1004, 1005, 1006, 1015 => true,
+        else => false,
+    }) return error.InvalidClientWebSocketFrame;
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) {
+        return error.InvalidClientWebSocketFrame;
     }
 }
 
@@ -1748,4 +1761,21 @@ test "static assets are not state-bearing authorization targets" {
     try std.testing.expect(requiresToken("/api/bootstrap"));
     try std.testing.expect(requiresToken("/api/bootstrap?token=launch"));
     try std.testing.expect(!requiresToken("/api/bootstrap-impersonator"));
+}
+
+test "WebSocket close payload accepts only valid status and UTF-8 reason" {
+    try validateClosePayload(&.{});
+    try validateClosePayload(&.{ 0x03, 0xE8, 'o', 'k' });
+    try std.testing.expectError(
+        error.InvalidClientWebSocketFrame,
+        validateClosePayload(&.{0x03}),
+    );
+    try std.testing.expectError(
+        error.InvalidClientWebSocketFrame,
+        validateClosePayload(&.{ 0x03, 0xED }),
+    );
+    try std.testing.expectError(
+        error.InvalidClientWebSocketFrame,
+        validateClosePayload(&.{ 0x03, 0xE8, 0xFF }),
+    );
 }

@@ -470,15 +470,24 @@ const NetworkFixture = struct {
 };
 
 fn sendMaskedText(io: std.Io, stream: *std.Io.net.Stream, text: []const u8) !void {
-    if (text.len > 125) return error.TestFrameTooLarge;
+    return sendMaskedFrame(io, stream, 0x1, text);
+}
+
+fn sendMaskedFrame(
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    opcode: u8,
+    payload_bytes: []const u8,
+) !void {
+    if (payload_bytes.len > 125) return error.TestFrameTooLarge;
     const mask = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
-    var header = [2]u8{ 0x81, 0x80 | @as(u8, @intCast(text.len)) };
+    var header = [2]u8{ 0x80 | opcode, 0x80 | @as(u8, @intCast(payload_bytes.len)) };
     var payload: [125]u8 = undefined;
-    for (text, 0..) |byte, i| payload[i] = byte ^ mask[i % mask.len];
+    for (payload_bytes, 0..) |byte, i| payload[i] = byte ^ mask[i % mask.len];
     var writer = stream.writer(io, &.{});
     try writer.interface.writeAll(&header);
     try writer.interface.writeAll(&mask);
-    try writer.interface.writeAll(payload[0..text.len]);
+    try writer.interface.writeAll(payload[0..payload_bytes.len]);
     try writer.interface.flush();
 }
 
@@ -513,6 +522,25 @@ fn readServerText(allocator: std.mem.Allocator, io: std.Io, stream: *std.Io.net.
     errdefer allocator.free(payload);
     try receiveExact(io, stream, payload);
     return payload;
+}
+
+fn expectServerCloseEcho(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    expected: []const u8,
+) !void {
+    var header: [2]u8 = undefined;
+    try receiveExact(io, stream, &header);
+    if (header[0] != 0x88 or header[1] & 0x80 != 0 or
+        @as(usize, header[1]) != expected.len)
+    {
+        return error.InvalidServerFrame;
+    }
+    const payload = try allocator.alloc(u8, expected.len);
+    defer allocator.free(payload);
+    try receiveExact(io, stream, payload);
+    try std.testing.expectEqualSlices(u8, expected, payload);
 }
 
 fn readUntil(
@@ -3679,7 +3707,9 @@ test "e2e masked websocket streams normalized review and action events" {
     try verifyWsCloseSecond(allocator, io, &connection.stream, &state, programs.gh_log);
     try verifyWsRefresh(allocator, io, &connection.stream, &state, &registry);
     try verifyWsRound(allocator, io, &connection.stream, &state);
-    connection.stream.close(io);
+    const close_payload = [_]u8{ 0x03, 0xE8, 'b', 'y', 'e' };
+    try sendMaskedFrame(io, &connection.stream, 0x8, &close_payload);
+    try expectServerCloseEcho(allocator, io, &connection.stream, &close_payload);
     connection.thread.join();
     connection.joined = true;
     try waitWsDisconnectDecline(allocator, io, log_path);

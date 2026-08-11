@@ -736,6 +736,65 @@ fn serveHttpRuntime(
         &.{ context.runtime_root, context.launch_id, "stop.request" },
     );
     defer allocator.free(stop_request_path);
+    var runtime = try makeServingRuntime(
+        allocator,
+        context,
+        pull_request_id,
+        custody,
+        worktree_baseline,
+        state,
+        registry,
+        review_cwd,
+        skill_path,
+        stop_request_path,
+    );
+    const tool_domain = runtime.tool_domain.?;
+    registry.setExclusionsPending(true);
+    errdefer registry.setExclusionsPending(false);
+    var exclusion_work: LaunchExclusionWork = undefined;
+    const exclusion_thread = try startLaunchExclusionWork(
+        &exclusion_work,
+        allocator,
+        context,
+        pull_request_id,
+        review_cwd,
+        state,
+        registry,
+        tool_domain,
+    );
+    var exclusion_thread_owned = true;
+    errdefer if (exclusion_thread_owned) {
+        exclusion_work.cancelled.store(true, .release);
+        exclusion_thread.join();
+    };
+    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
+    const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
+    exclusion_work.cancelled.store(true, .release);
+    exclusion_thread.join();
+    exclusion_thread_owned = false;
+    try finishHttpRuntime(
+        allocator,
+        io,
+        context.options,
+        context.runtime_root,
+        &runtime,
+        custody_retirement,
+        terminal_error,
+    );
+}
+
+fn makeServingRuntime(
+    allocator: std.mem.Allocator,
+    context: GenerationContext,
+    pull_request_id: []const u8,
+    custody: worktree.Custody,
+    worktree_baseline: *worktree.Baseline,
+    state: *App,
+    registry: *sessions.Registry,
+    review_cwd: []const u8,
+    skill_path: []const u8,
+    stop_request_path: []const u8,
+) !http.Runtime {
     var runtime = makeHttpRuntime(
         context.settings,
         context.options,
@@ -751,7 +810,7 @@ fn serveHttpRuntime(
         context.launch_id,
         stop_request_path,
     );
-    const tool_domain = try configureToolDomain(
+    runtime.tool_domain = try configureToolDomain(
         allocator,
         state,
         registry,
@@ -759,10 +818,20 @@ fn serveHttpRuntime(
         context.identity,
         pull_request_id,
     );
-    runtime.tool_domain = tool_domain;
-    registry.setExclusionsPending(true);
-    errdefer registry.setExclusionsPending(false);
-    var exclusion_work = LaunchExclusionWork.init(
+    return runtime;
+}
+
+fn startLaunchExclusionWork(
+    work: *LaunchExclusionWork,
+    allocator: std.mem.Allocator,
+    context: GenerationContext,
+    pull_request_id: []const u8,
+    review_cwd: []const u8,
+    state: *App,
+    registry: *sessions.Registry,
+    tool_domain: *http.ToolDomainContext,
+) !std.Thread {
+    work.* = LaunchExclusionWork.init(
         allocator,
         context.settings,
         context.broker,
@@ -773,32 +842,7 @@ fn serveHttpRuntime(
         registry,
         tool_domain,
     );
-    const exclusion_thread = try std.Thread.spawn(.{}, LaunchExclusionWork.run, .{&exclusion_work});
-    var exclusion_thread_owned = true;
-    errdefer if (exclusion_thread_owned) {
-        exclusion_work.cancelled.store(true, .release);
-        exclusion_thread.join();
-    };
-    try publishRuntimeReady(
-        allocator,
-        io,
-        &server,
-        &runtime,
-        context.runtime_root,
-    );
-    const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
-    exclusion_work.cancelled.store(true, .release);
-    exclusion_thread.join();
-    exclusion_thread_owned = false;
-    try finishHttpRuntime(
-        allocator,
-        io,
-        context.options,
-        context.runtime_root,
-        &runtime,
-        custody_retirement,
-        terminal_error,
-    );
+    return std.Thread.spawn(.{}, LaunchExclusionWork.run, .{work});
 }
 
 fn configureToolDomain(

@@ -1472,7 +1472,12 @@ pub fn hydrateRevisionKeys(
     cwd: []const u8,
     generation: *domain.PrGeneration,
 ) !void {
-    worktree.ensureObjectAvailable(allocator, io, cwd, generation.base_oid) catch |err| switch (err) {
+    worktree.ensureObjectAvailable(
+        allocator,
+        io,
+        cwd,
+        generation.base_oid,
+    ) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.GitFetchFailed,
         else => return err,
     };
