@@ -208,6 +208,21 @@ pub fn retireManaged(
     repository_cwd: []const u8,
 ) !void {
     if (custody != .managed) return;
+    _ = std.Io.Dir.cwd().statFile(io, custody.path(), .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            const prune = try std.process.run(allocator, io, .{
+                .argv = &.{ "git", "worktree", "prune", "--expire", "now" },
+                .cwd = .{ .path = repository_cwd },
+            });
+            defer allocator.free(prune.stdout);
+            defer allocator.free(prune.stderr);
+            if (prune.term != .exited or prune.term.exited != 0) {
+                return error.ManagedWorktreeRetirementFailed;
+            }
+            return;
+        },
+        else => return err,
+    };
     const remove = try std.process.run(allocator, io, .{
         .argv = &.{ "git", "worktree", "remove", "--force", custody.path() },
         .cwd = .{ .path = repository_cwd },

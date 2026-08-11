@@ -2416,6 +2416,15 @@ test "worktree integrity dirty launch selects managed custody" {
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, managed, .{}),
     );
+    try worktree.retireManaged(allocator, io, custody, repo);
+    const worktree_list = try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "list", "--porcelain" },
+    );
+    defer allocator.free(worktree_list);
+    try std.testing.expect(std.mem.indexOf(u8, worktree_list, managed) == null);
 }
 
 test "worktree integrity ignored launch artifact selects managed custody" {
