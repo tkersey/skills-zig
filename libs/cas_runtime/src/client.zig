@@ -1,10 +1,37 @@
 const core_json = @import("core_json");
-pub const hooks = @import("cas_hook_policy");
+const legacy_hooks = @import("cas_hook_policy");
 pub const app_server_launch = @import("transport.zig");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const std = @import("std");
 pub const websocket_transport = @import("websocket.zig");
+
+pub const hooks = struct {
+    pub const HookPolicy = legacy_hooks.HookPolicy;
+    pub const FailureCode = legacy_hooks.FailureCode;
+    pub const HookSummary = legacy_hooks.HookSummary;
+    pub const HookAccumulator = legacy_hooks.HookAccumulator;
+    pub const unsupportedSummary = legacy_hooks.unsupportedSummary;
+    pub const isHookNotificationLine = legacy_hooks.isHookNotificationLine;
+    pub const ensureLaunchSupportsPolicy = legacy_hooks.ensureLaunchSupportsPolicy;
+    pub const defaultHookLogPathAlloc = legacy_hooks.defaultHookLogPathAlloc;
+
+    pub fn appendAppServerArgs(
+        allocator: std.mem.Allocator,
+        argv: *std.ArrayList([]const u8),
+        policy: HookPolicy,
+        listen_url: ?[]const u8,
+        code_mode_host: ?*const app_server_launch.CodeModeHost,
+    ) !void {
+        try app_server_launch.appendAppServerArgs(
+            allocator,
+            argv,
+            policy == .off,
+            listen_url,
+            code_mode_host,
+        );
+    }
+};
 
 const max_interleaved_messages: usize = 4096;
 const max_captured_notifications: usize = 1024;
@@ -4708,6 +4735,20 @@ test "code mode host cannot be silently ignored by existing endpoint transports"
             .transport = .stdio,
         }),
     );
+}
+
+test "public hooks accept the canonical launch CodeModeHost" {
+    const allocator = std.testing.allocator;
+    var host = try app_server_launch.CodeModeHost.init(
+        allocator,
+        "ws://127.0.0.1:9911",
+    );
+    defer host.deinit();
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try hooks.appendAppServerArgs(allocator, &argv, .inherit, null, &host);
+    try std.testing.expectEqualStrings("--code-mode-host", argv.items[1]);
+    try std.testing.expectEqualStrings(host.raw, argv.items[2]);
 }
 
 test "diagnostic Codex feature arguments are bounded and stdio-only" {
