@@ -543,6 +543,24 @@ pub const App = struct {
         return outcomes;
     }
 
+    pub fn recordAutomaticExclusion(
+        self: *App,
+        path: []const u8,
+        revision: []const u8,
+        reason: []const u8,
+        sync_error: ?[]const u8,
+        viewed: bool,
+    ) !bool {
+        for (self.generation.files.items, 0..) |file, index| {
+            if (!std.mem.eql(u8, file.path, path) or
+                !std.mem.eql(u8, file.revision_key, revision)) continue;
+            try self.generation.setExclusion(path, reason, sync_error);
+            if (viewed) self.generation.files.items[index].viewed = .viewed;
+            return true;
+        }
+        return false;
+    }
+
     fn excludeFile(
         self: *App,
         settings: *const config.Settings,
@@ -714,7 +732,7 @@ fn viewedStateName(state: domain.ViewedState) []const u8 {
     };
 }
 
-fn exclusionMutationIdAlloc(
+pub fn exclusionMutationIdAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
     revision: []const u8,

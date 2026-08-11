@@ -8,14 +8,16 @@ pub const snapshot_query =
     "pageInfo{hasNextPage endCursor}}}}}";
 pub const threads_query =
     "query SynopticReviewThreads($owner:String!,$name:String!,$number:Int!,$after:String){" ++
-    "repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid " ++
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide " ++
     "subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve " ++
     "comments(first:100){nodes{id body createdAt url author{login} viewerDidAuthor " ++
     "pullRequestReview{id state}}pageInfo{hasNextPage endCursor}}}" ++
     "pageInfo{hasNextPage endCursor}}}}}";
 pub const thread_comments_query =
-    "query SynopticThreadComments($threadId:ID!,$after:String){node(id:$threadId){" ++
+    "query SynopticThreadComments($owner:String!,$name:String!,$number:Int!," ++
+    "$threadId:ID!,$after:String){repository(owner:$owner,name:$name){" ++
+    "pullRequest(number:$number){baseRefOid headRefOid}}node(id:$threadId){" ++
     "... on PullRequestReviewThread{id path line startLine diffSide startDiffSide subjectType " ++
     "isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve " ++
     "comments(first:100,after:$after){nodes{id body createdAt url author{login} " ++

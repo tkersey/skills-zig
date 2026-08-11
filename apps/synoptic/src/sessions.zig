@@ -394,7 +394,7 @@ pub const Registry = struct {
         var quiet_since: ?i128 = null;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.mutex.lock();
-            const active = self.active_command_ids.items.len + self.file_admissions.items.len;
+            const active = self.activeSynchronizationWorkLocked();
             self.mutex.unlock();
             const now = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
             if (active == 0) {
@@ -414,6 +414,11 @@ pub const Registry = struct {
         self.mutex.lock();
         self.synchronizing = false;
         self.mutex.unlock();
+    }
+
+    fn activeSynchronizationWorkLocked(self: *const Registry) usize {
+        return self.active_command_ids.items.len + self.file_admissions.items.len +
+            self.authoritative_reservations;
     }
 
     fn appendTurnRef(
@@ -1475,6 +1480,7 @@ pub const Registry = struct {
         raw_json: []const u8,
         allocator: std.mem.Allocator,
     ) !?ReservedAuthoritative {
+        if (self.synchronizing) return error.WorktreeSynchronizationActive;
         for (self.sessions.items) |*session| {
             const eligible = std.mem.eql(u8, session.thread_id, origin_thread) and
                 session.status != .closed and !session.initial_turn_active and
@@ -1809,9 +1815,12 @@ pub const Registry = struct {
         if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
             const available = params.get("availableDecisions");
             if (available) |choices| switch (choices) {
-                .null => inline for (
-                    .{ "accept", "acceptForSession", "decline", "cancel" },
-                ) |choice| try self.appendStringDecision(&approval.decisions, choice, true, null),
+                .null => try self.appendStringDecision(
+                    &approval.decisions,
+                    "decline",
+                    true,
+                    null,
+                ),
                 .array => |array| {
                     if (array.items.len == 0 or array.items.len > max_approval_decisions)
                         return error.MalformedApprovalRequest;
@@ -1820,8 +1829,12 @@ pub const Registry = struct {
                     }
                 },
                 else => return error.MalformedApprovalRequest,
-            } else inline for (.{ "accept", "acceptForSession", "decline", "cancel" }) |choice|
-                try self.appendStringDecision(&approval.decisions, choice, true, null);
+            } else try self.appendStringDecision(
+                &approval.decisions,
+                "decline",
+                true,
+                null,
+            );
         } else {
             const requested = params.get("permissions") orelse
                 return error.MalformedApprovalRequest;
@@ -2147,24 +2160,18 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         "why ",         "when ",  "where ",         "tell me how ",
         "explain how ",
     }) or std.mem.endsWith(u8, trimmed, "?")) return null;
-    const negates_completion = containsAnyIgnoreCase(text, &.{
-        "do not complete", "don't complete", "do not mark", "don't mark",
-    });
-    const completion = containsIgnoreCase(text, "complete this file") or containsIgnoreCase(
-        text,
+    if (exactDirective(trimmed, &.{
+        "complete this file",
         "complete the file review",
-    ) or containsIgnoreCase(text, "mark this file reviewed") or
-        containsIgnoreCase(text, "mark the file reviewed") or
-        containsIgnoreCase(text, "mark this file as reviewed") or
-        containsIgnoreCase(text, "mark the file as reviewed");
-    if (completion and !negates_completion) return .complete;
-    const close = containsAnyIgnoreCase(text, &.{
+        "mark this file reviewed",
+        "mark the file reviewed",
+        "mark this file as reviewed",
+        "mark the file as reviewed",
+    })) return .complete;
+    if (exactDirective(trimmed, &.{
         "close this session", "close the session", "close session",
         "close this tab",     "close the tab",
-    });
-    const negates_close = containsIgnoreCase(text, "do not close") or
-        containsIgnoreCase(text, "don't close");
-    if (close and !negates_close) return .close;
+    })) return .close;
     if (containsIgnoreCase(text, "take the action") or
         containsIgnoreCase(text, "prepare the action")) return .github_any;
     const action_verb = containsAnyIgnoreCase(text, &.{
@@ -2179,6 +2186,19 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
     });
     if (action_verb and github_target) return .github_any;
     return null;
+}
+
+fn exactDirective(text: []const u8, directives: []const []const u8) bool {
+    var candidate = std.mem.trim(u8, text, " \t\r\n.!;");
+    if (candidate.len >= "please ".len and
+        std.ascii.eqlIgnoreCase(candidate[0.."please ".len], "please "))
+    {
+        candidate = std.mem.trim(u8, candidate["please ".len..], " \t\r\n.!;");
+    }
+    for (directives) |directive| {
+        if (std.ascii.eqlIgnoreCase(candidate, directive)) return true;
+    }
+    return false;
 }
 
 fn startsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
@@ -2441,6 +2461,17 @@ test "explicit broad GitHub operation grants generic action authority without or
     );
     try std.testing.expect(label_help == null);
     try std.testing.expect(classifyHumanInstruction("Should we mark this file reviewed?") == null);
+    try std.testing.expect(classifyHumanInstruction("Never mark this file reviewed") == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "I don't want you to mark this file reviewed",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Explain the findings, then complete this file",
+    ) == null);
+    try std.testing.expectEqual(
+        HumanAuthority.complete,
+        classifyHumanInstruction("Please complete this file.").?,
+    );
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         classifyHumanInstruction("Add the comment, but do not close this session").?,
@@ -2634,6 +2665,39 @@ test "command approvals accept exact offered decisions only" {
         error.ApprovalAlreadyResolved,
         registry.resolveApproval("ses-1", "apr-1", "\"accept\""),
     );
+}
+
+test "command approval without offered decisions fails closed to decline" {
+    var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    var invocation = ApprovalInvocation{
+        .registry = &registry,
+        .method = "item/commandExecution/requestApproval",
+        .raw = "{\"id\":7,\"method\":\"item/commandExecution/requestApproval\"," ++
+            "\"params\":{\"threadId\":\"file-1\",\"turnId\":\"turn\"," ++
+            "\"itemId\":\"cmd\",\"startedAtMs\":1,\"command\":\"make test\"}}",
+    };
+    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
+    try waitForApproval(&registry);
+    registry.mutex.lock();
+    const decision_count = registry.approvals.items[0].decisions.items.len;
+    const decline_only = decision_count == 1 and std.mem.eql(
+        u8,
+        registry.approvals.items[0].decisions.items[0].choice_json,
+        "\"decline\"",
+    );
+    registry.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), decision_count);
+    try std.testing.expect(decline_only);
+    try std.testing.expectError(
+        error.ApprovalDecisionNotOffered,
+        registry.resolveApproval("ses-1", "apr-1", "\"acceptForSession\""),
+    );
+    try registry.resolveApproval("ses-1", "apr-1", "\"decline\"");
+    thread.join();
+    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
+    try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", invocation.response.?);
 }
 
 test "filesystem and permission escalation requests decline before browser routing" {

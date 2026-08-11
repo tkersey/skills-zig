@@ -254,14 +254,13 @@ fn configPathAlloc(
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
 ) !?[]u8 {
-    if (environment.get("XDG_CONFIG_HOME")) |root| return try std.fs.path.join(
-        allocator,
-        &.{ root, "synoptic", "config.toml" },
-    );
-    if (environment.get("HOME")) |home| return try std.fs.path.join(
-        allocator,
-        &.{ home, ".config", "synoptic", "config.toml" },
-    );
+    if (environment.get("XDG_CONFIG_HOME")) |root| if (root.len > 0)
+        return try std.fs.path.join(allocator, &.{ root, "synoptic", "config.toml" });
+    if (environment.get("HOME")) |home| if (home.len > 0)
+        return try std.fs.path.join(
+            allocator,
+            &.{ home, ".config", "synoptic", "config.toml" },
+        );
     return null;
 }
 
@@ -944,4 +943,16 @@ test "command approvals installed schema requires exact request and response sur
         problem,
         "PermissionsRequestApprovalResponse.json",
     ) != null);
+}
+
+test "empty config roots never resolve relative repository paths" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("XDG_CONFIG_HOME", "");
+    try environment.put("HOME", "");
+    try std.testing.expect(try configPathAlloc(std.testing.allocator, &environment) == null);
+    try environment.put("HOME", "/safe-home");
+    const path = (try configPathAlloc(std.testing.allocator, &environment)).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/safe-home/.config/synoptic/config.toml", path);
 }

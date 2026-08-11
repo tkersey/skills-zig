@@ -170,6 +170,7 @@ pub const Runtime = struct {
     launch_id: []const u8 = "embedded-test",
     stop_request_path: ?[]const u8 = null,
     stop_requested: bool = false,
+    worktree_generation_valid: bool = true,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
     tool_domain: ?*ToolDomainContext = null,
     local_domain_mutex: DomainMutex = .{},
@@ -178,6 +179,13 @@ pub const Runtime = struct {
 fn domainMutex(runtime: *Runtime) *DomainMutex {
     if (runtime.tool_domain) |context| return &context.mutex;
     return &runtime.local_domain_mutex;
+}
+
+fn isRecoveryCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "snapshot.get") or
+        std.mem.eql(u8, command, "pr.refresh") or
+        std.mem.eql(u8, command, "round.finish") or
+        std.mem.eql(u8, command, "app.stop");
 }
 
 pub const max_header_bytes = 32 * 1024;
@@ -197,6 +205,7 @@ fn clientConnectionError(err: anyerror) bool {
         error.WebSocketMessageTooLarge,
         error.WebSocketClosed,
         error.Timeout,
+        error.PartialFrameTimeout,
         => true,
         else => false,
     };
@@ -731,6 +740,9 @@ pub const Server = struct {
             .object => |o| o,
             else => return error.InvalidUiCommand,
         };
+        if (!runtime.worktree_generation_valid and !isRecoveryCommand(command)) {
+            return error.WorktreeGenerationMismatch;
+        }
         if (std.mem.eql(u8, command, "file.open")) return self.openFile(runtime, payload);
         if (std.mem.eql(u8, command, "session.close")) {
             return self.closeSession(runtime, payload);
@@ -748,14 +760,7 @@ pub const Server = struct {
             return self.confirmAction(runtime, payload);
         }
         if (std.mem.eql(u8, command, "action.reject")) return self.rejectAction(runtime, payload);
-        if (std.mem.eql(u8, command, "snapshot.get")) {
-            const mutex = domainMutex(runtime);
-            mutex.lock();
-            defer mutex.unlock();
-            const snapshot = try runtime.app.bootstrapAlloc();
-            defer self.allocator.free(snapshot);
-            return runtime.app.nextEnvelope("snapshot", snapshot);
-        }
+        if (std.mem.eql(u8, command, "snapshot.get")) return self.snapshot(runtime);
         if (std.mem.eql(u8, command, "pr.refresh")) {
             const mutex = domainMutex(runtime);
             mutex.lock();
@@ -783,6 +788,15 @@ pub const Server = struct {
             return runtime.app.nextEnvelope("app.stopped", "{\"status\":\"stopping\"}");
         }
         return error.UnsupportedUiCommand;
+    }
+
+    fn snapshot(self: *Server, runtime: *Runtime) ![]u8 {
+        const mutex = domainMutex(runtime);
+        mutex.lock();
+        defer mutex.unlock();
+        const body = try runtime.app.bootstrapAlloc();
+        defer self.allocator.free(body);
+        return runtime.app.nextEnvelope("snapshot", body);
     }
 
     fn openFile(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
@@ -1004,7 +1018,6 @@ pub const Server = struct {
         runtime: *Runtime,
         terminal: tools.ActionStatus,
     ) !void {
-        _ = self;
         if (terminal == .succeeded) {
             if (runtime.broker.readGeneration(
                 runtime.owner,
@@ -1012,8 +1025,18 @@ pub const Server = struct {
                 runtime.number,
             )) |generation_value| {
                 var generation = generation_value;
-                defer generation.deinit();
-                try runtime.registry.setGenerationEvidence(&generation);
+                var generation_owned = true;
+                defer if (generation_owned) generation.deinit();
+                refreshRevisionEvidence(self, runtime, &generation) catch {
+                    runtime.app.action_state_fresh = false;
+                    return;
+                };
+                runtime.registry.setGenerationEvidence(&generation) catch {
+                    runtime.app.action_state_fresh = false;
+                    return;
+                };
+                runtime.app.replaceGeneration(generation);
+                generation_owned = false;
                 runtime.app.action_state_fresh = true;
             } else |_| {
                 runtime.app.action_state_fresh = false;
@@ -1064,6 +1087,7 @@ pub const Server = struct {
         var next = try runtime.broker.readGeneration(runtime.owner, runtime.name, runtime.number);
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
+        runtime.worktree_generation_valid = false;
         try worktree.synchronize(
             self.allocator,
             self.io,
@@ -1081,6 +1105,7 @@ pub const Server = struct {
         try self.applyRefreshExclusions(runtime);
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         try self.updatePrimaryContext(runtime);
+        runtime.worktree_generation_valid = true;
         runtime.app.action_state_fresh = true;
     }
 
@@ -1321,6 +1346,30 @@ fn headerToken(raw: []const u8, name: []const u8, token: []const u8) bool {
     return false;
 }
 
+fn refreshRevisionEvidence(
+    server: *Server,
+    runtime: *Runtime,
+    generation: *@import("domain.zig").PrGeneration,
+) !void {
+    const current = &runtime.app.generation;
+    if (std.mem.eql(u8, current.base_oid, generation.base_oid) and
+        std.mem.eql(u8, current.head_oid, generation.head_oid))
+    {
+        for (generation.files.items) |file| {
+            const revision = @import("domain.zig").revisionFor(current, file.path) orelse
+                return error.MissingRevision;
+            try generation.setRevision(file.path, revision);
+        }
+        return;
+    }
+    try github.hydrateRevisionKeys(
+        server.allocator,
+        server.io,
+        runtime.cwd,
+        generation,
+    );
+}
+
 pub fn readClientTextAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1341,12 +1390,64 @@ pub fn readClientTextAllocTimeout(
         )
     else
         null;
+    var fragmented: std.ArrayList(u8) = .empty;
+    defer fragmented.deinit(allocator);
+    var fragment_count: usize = 0;
+    while (true) { // tiger: event-loop -- bounded by deadline and message limit.
+        const frame = readClientFrameAlloc(allocator, io, stream, deadline) catch |err| {
+            if (fragment_count > 0 and err == error.Timeout) return error.PartialFrameTimeout;
+            return err;
+        };
+        defer allocator.free(frame.payload);
+        switch (frame.opcode) {
+            0x1 => {
+                if (fragment_count != 0) return error.InvalidClientWebSocketFrame;
+                if (frame.fin) {
+                    if (!std.unicode.utf8ValidateSlice(frame.payload)) {
+                        return error.InvalidClientWebSocketFrame;
+                    }
+                    return allocator.dupe(u8, frame.payload);
+                }
+                fragment_count = 1;
+                try fragmented.appendSlice(allocator, frame.payload);
+            },
+            0x0 => {
+                if (fragment_count == 0) return error.InvalidClientWebSocketFrame;
+                fragment_count += 1;
+                if (fragment_count > 1024 or
+                    fragmented.items.len > max_ws_message_bytes - frame.payload.len)
+                {
+                    return error.WebSocketMessageTooLarge;
+                }
+                try fragmented.appendSlice(allocator, frame.payload);
+                if (frame.fin) {
+                    if (!std.unicode.utf8ValidateSlice(fragmented.items)) {
+                        return error.InvalidClientWebSocketFrame;
+                    }
+                    return fragmented.toOwnedSlice(allocator);
+                }
+            },
+            0x8 => return error.WebSocketClosed,
+            0x9 => try writeServerFrame(io, stream, 0xA, true, frame.payload),
+            0xA => {},
+            else => return error.InvalidClientWebSocketFrame,
+        }
+    }
+}
+
+const ClientFrame = struct { fin: bool, opcode: u8, payload: []u8 };
+
+fn readClientFrameAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    deadline: ?std.Io.Clock.Timestamp,
+) !ClientFrame {
     var head: [2]u8 = undefined;
     try readExactUntil(io, stream, &head, deadline);
+    const fin = (head[0] & 0x80) != 0;
     const opcode = head[0] & 0x0f;
-    if ((head[0] & 0x80) == 0 or (head[0] & 0x70) != 0 or
-        (opcode != 1 and opcode != 8) or (head[1] & 0x80) == 0)
-    {
+    if ((head[0] & 0x70) != 0 or (head[1] & 0x80) == 0) {
         return error.InvalidClientWebSocketFrame;
     }
     var len: u64 = head[1] & 0x7f;
@@ -1361,6 +1462,8 @@ pub fn readClientTextAllocTimeout(
         len = std.mem.readInt(u64, &b, .big);
         if (len <= 65535) return error.InvalidClientWebSocketFrame;
     }
+    const control = (opcode & 0x08) != 0;
+    if (control and (!fin or len > 125)) return error.InvalidClientWebSocketFrame;
     if (len > max_ws_message_bytes) return error.WebSocketMessageTooLarge;
     var mask: [4]u8 = undefined;
     try readExactUntil(io, stream, &mask, deadline);
@@ -1368,12 +1471,7 @@ pub fn readClientTextAllocTimeout(
     errdefer allocator.free(payload);
     try readExactUntil(io, stream, payload, deadline);
     for (payload, 0..) |*byte, i| byte.* ^= mask[i % 4];
-    if (opcode == 8) {
-        allocator.free(payload);
-        return error.WebSocketClosed;
-    }
-    if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidClientWebSocketFrame;
-    return payload;
+    return .{ .fin = fin, .opcode = opcode, .payload = payload };
 }
 fn readExactUntil(
     io: std.Io,
@@ -1384,7 +1482,10 @@ fn readExactUntil(
     var off: usize = 0;
     while (off < dest.len) {
         const got = if (deadline) |limit|
-            try stream.socket.receiveTimeout(io, dest[off..], .{ .deadline = limit })
+            stream.socket.receiveTimeout(io, dest[off..], .{ .deadline = limit }) catch |err| {
+                if (err == error.Timeout and off > 0) return error.PartialFrameTimeout;
+                return err;
+            }
         else
             try stream.socket.receive(io, dest[off..]);
         if (got.data.len == 0) return error.EndOfStream;
@@ -1392,9 +1493,32 @@ fn readExactUntil(
     }
 }
 fn writeServerText(io: std.Io, stream: *std.Io.net.Stream, body: []const u8) !void {
-    if (body.len > max_ws_message_bytes) return error.FrameTooLarge;
+    if (body.len == 0) return writeServerFrame(io, stream, 0x1, true, body);
+    var offset: usize = 0;
+    var first = true;
+    while (offset < body.len) {
+        const end = @min(offset + max_ws_message_bytes, body.len);
+        try writeServerFrame(
+            io,
+            stream,
+            if (first) 0x1 else 0x0,
+            end == body.len,
+            body[offset..end],
+        );
+        first = false;
+        offset = end;
+    }
+}
+
+fn writeServerFrame(
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    opcode: u8,
+    fin: bool,
+    body: []const u8,
+) !void {
     var header: [10]u8 = undefined;
-    header[0] = 0x81;
+    header[0] = (if (fin) @as(u8, 0x80) else 0) | opcode;
     const header_len: usize = if (body.len <= 125) blk: {
         header[1] = @intCast(body.len);
         break :blk 2;

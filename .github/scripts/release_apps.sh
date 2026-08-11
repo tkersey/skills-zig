@@ -123,7 +123,7 @@ case "$mode" in
         mark_app cas
         matched=0
       fi
-      if grep -Eqi '(^|[^[:alnum:]_])synoptic([^[:alnum:]_]|$)|synoptic[_\.]' <<<"$raw"; then
+      if grep -Eqi '(^|[^[:alnum:]])synoptic([^[:alnum:]]|$)' <<<"$raw"; then
         mark_app synoptic
         matched=0
       fi

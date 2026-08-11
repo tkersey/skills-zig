@@ -518,6 +518,7 @@ fn fakeGhScriptAlloc(
     allocator: std.mem.Allocator,
     log_path: []const u8,
     state_path: []const u8,
+    base: []const u8,
     head: []const u8,
 ) ![]u8 {
     return std.fmt.allocPrint(
@@ -533,14 +534,14 @@ fn fakeGhScriptAlloc(
         \\printf 'STDIN:' >> "$log"; cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticAddInlineComment' "$input"; then printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"review-1","url":"https://example/review"}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticMarkFileViewed' "$input"; then printf '%s\n' viewed > "$state"; printf '%s\n' '{{"data":{{"markFileAsViewed":{{"pullRequest":{{"id":"PR_1"}}}}}}}}'; exit 0; fi
-        \\if grep -q 'SynopticPullRequest' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"Fixture PR","body":"","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"base","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"%s"}},{{"path":"b.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
-        \\if grep -q 'SynopticReviewThreads' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
+        \\if grep -q 'SynopticPullRequest' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"Fixture PR","body":"","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"%s"}},{{"path":"b.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
+        \\if grep -q 'SynopticReviewThreads' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\if grep -q 'SynopticFileState' "$input"; then viewed=UNVIEWED; [ -f "$state" ] && viewed=VIEWED; printf '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","viewerViewedState":"%s"}},{{"path":"b.zig","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}\n' "$viewed"; exit 0; fi
         \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig"}},{{"path":"b.zig"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0; fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     ,
-        .{ log_path, state_path, head, head, head, head },
+        .{ log_path, state_path, base, head, base, head, head, head },
     );
 }
 
@@ -1897,14 +1898,14 @@ fn fakeLifecycleGhScriptAlloc(
         \\  printf '%s\n' '{{"data":{{"repository":{{"id":"R_1","nameWithOwner":"o/r","pullRequest":{{"id":"PR_1","number":1,"url":"https://github.com/o/r/pull/1","title":"fixture","body":"body","state":"OPEN","isDraft":false,"baseRefName":"main","baseRefOid":"{s}","headRefName":"feature","headRefOid":"{s}","files":{{"nodes":[{{"path":"a.zig","additions":1,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"UNVIEWED"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticReviewThreads' "$input"; then
-        \\  printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{s}",'
+        \\  printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefOid":"{s}","headRefOid":"{s}",'
         \\  printf '%s' '"reviewThreads":{{"nodes":[],"pageInfo":'
         \\  printf '%s\n' '{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'; exit 0
         \\fi
         \\printf '%s\n' '{{"data":{{}}}}'
         \\
     ,
-        .{ base, head, head },
+        .{ base, head, base, head },
     );
 }
 
@@ -2562,6 +2563,7 @@ fn installWsPrograms(
     io: std.Io,
     tmp: *std.testing.TmpDir,
     root: []const u8,
+    base: []const u8,
     head: []const u8,
 ) !WsPrograms {
     const codex = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
@@ -2573,7 +2575,7 @@ fn installWsPrograms(
     const gh_state = try std.fs.path.join(allocator, &.{ root, "gh.state" });
     defer allocator.free(gh_state);
     try tmp.dir.writeFile(io, .{ .sub_path = "fake-codex", .data = fakeCodexScript() });
-    const gh_script = try fakeGhScriptAlloc(allocator, gh_log, gh_state, head);
+    const gh_script = try fakeGhScriptAlloc(allocator, gh_log, gh_state, base, head);
     defer allocator.free(gh_script);
     try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh", .data = gh_script });
     for ([_][]const u8{ codex, gh }) |path| {
@@ -3210,7 +3212,14 @@ test "e2e masked websocket streams normalized review and action events" {
     defer commits.deinit();
     var state = try prepareWsState(allocator, commits.base, commits.head);
     defer state.deinit();
-    const programs = try installWsPrograms(allocator, io, &tmp, root, commits.head);
+    const programs = try installWsPrograms(
+        allocator,
+        io,
+        &tmp,
+        root,
+        commits.base,
+        commits.head,
+    );
     defer programs.deinit();
     var registry: sessions.Registry = undefined;
     try prepareWsRegistry(&registry, io, root, programs, &state);

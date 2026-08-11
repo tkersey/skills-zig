@@ -131,6 +131,7 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     read_buf: std.ArrayList(u8) = .empty,
+    write_mutex: std.atomic.Mutex = .unlocked,
     usable: bool = true,
 
     pub fn connect(
@@ -1498,6 +1499,8 @@ fn writeClientFrame(
     payload: []const u8,
     deadline: ?std.Io.Clock.Timestamp,
 ) !void {
+    while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.write_mutex.unlock();
     const payload_len = payload.len;
     const masked = if (payload_len == 0) null else try self.allocator.dupe(u8, payload);
     defer if (masked) |owned| self.allocator.free(owned);

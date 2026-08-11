@@ -673,6 +673,15 @@ pub const Client = struct {
         return self.blocking_server_request_count;
     }
 
+    /// Configures the absolute deadline for synchronous calls until restored.
+    /// Client is single-owner; concurrent callers must use Actor, whose writer
+    /// carries immutable per-request deadlines and never calls this method.
+    pub fn swapRequestDeadlineMs(self: *Client, deadline_ms: ?i64) ?i64 {
+        const previous = self.request_deadline_ms;
+        self.request_deadline_ms = deadline_ms;
+        return previous;
+    }
+
     pub fn lastUnsupportedServerRequest(self: *const Client) ?[]const u8 {
         return self.last_unsupported_server_request;
     }
@@ -1441,6 +1450,7 @@ pub const Client = struct {
 pub const max_actor_outbound_queue: usize = 1024;
 pub const max_actor_subscriptions: usize = 64;
 pub const max_actor_server_request_queue: usize = 128;
+pub const max_actor_notification_queue: usize = 1024;
 
 pub const ActorOptions = struct {
     outbound_queue_capacity: usize = 128,
@@ -1488,6 +1498,16 @@ const ActorServerRequest = struct {
     }
 };
 
+const ActorNotification = struct {
+    method: []u8,
+    raw_json: []u8,
+
+    fn deinit(self: ActorNotification, allocator: std.mem.Allocator) void {
+        allocator.free(self.method);
+        allocator.free(self.raw_json);
+    }
+};
+
 const ActorState = struct {
     allocator: std.mem.Allocator,
     client: Client,
@@ -1497,6 +1517,7 @@ const ActorState = struct {
     outbound: std.ArrayList(ActorOutbound) = .empty,
     outbound_capacity: usize,
     server_requests: std.ArrayList(ActorServerRequest) = .empty,
+    notifications: std.ArrayList(ActorNotification) = .empty,
     server_request_capacity: usize,
     server_request_timeout_ms: u32,
     pending: std.AutoHashMap(i64, *ActorPending),
@@ -1509,12 +1530,15 @@ const ActorState = struct {
     reader_thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
     handler_thread: ?std.Thread = null,
+    notification_thread: ?std.Thread = null,
 
     fn deinit(self: *ActorState) void {
         for (self.outbound.items) |item| self.allocator.free(item.payload);
         self.outbound.deinit(self.allocator);
         for (self.server_requests.items) |item| item.deinit(self.allocator);
         self.server_requests.deinit(self.allocator);
+        for (self.notifications.items) |item| item.deinit(self.allocator);
+        self.notifications.deinit(self.allocator);
         self.pending.deinit();
         self.subscriptions.deinit(self.allocator);
         self.client.deinit();
@@ -1581,14 +1605,7 @@ pub const Actor = struct {
             state.deinit();
             return err;
         };
-        state.reader_thread = std.Thread.spawn(.{}, actorReaderMain, .{state}) catch |err| {
-            actorSetTerminal(state, .stopped);
-            actorCloseTransportOnce(state);
-            state.writer_thread.?.join();
-            state.handler_thread.?.join();
-            state.deinit();
-            return err;
-        };
+        try startActorDispatchThreads(state);
         return .{ .state = state };
     }
 
@@ -1600,6 +1617,7 @@ pub const Actor = struct {
         if (state.writer_thread) |thread| thread.join();
         if (state.reader_thread) |thread| thread.join();
         if (state.handler_thread) |thread| thread.join();
+        if (state.notification_thread) |thread| thread.join();
         state.deinit();
         state.allocator.destroy(state);
         self.* = undefined;
@@ -1743,6 +1761,30 @@ pub const Actor = struct {
     }
 };
 
+fn startActorDispatchThreads(state: *ActorState) !void {
+    state.notification_thread = std.Thread.spawn(
+        .{},
+        actorNotificationMain,
+        .{state},
+    ) catch |err| {
+        actorSetTerminal(state, .stopped);
+        actorCloseTransportOnce(state);
+        state.writer_thread.?.join();
+        state.handler_thread.?.join();
+        state.deinit();
+        return err;
+    };
+    state.reader_thread = std.Thread.spawn(.{}, actorReaderMain, .{state}) catch |err| {
+        actorSetTerminal(state, .stopped);
+        actorCloseTransportOnce(state);
+        state.writer_thread.?.join();
+        state.handler_thread.?.join();
+        state.notification_thread.?.join();
+        state.deinit();
+        return err;
+    };
+}
+
 fn actorWriterMain(state: *ActorState) void {
     while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
@@ -1794,7 +1836,11 @@ fn actorHandlerMain(state: *ActorState) void {
         if (maybe_work) |work| {
             defer work.deinit(state.allocator);
             actorHandleServerRequest(state, work) catch |err| switch (err) {
-                error.RequestDeadlineExceeded => continue,
+                error.RequestDeadlineExceeded => {
+                    actorSetTerminal(state, .poisoned);
+                    actorCloseTransportOnce(state);
+                    return;
+                },
                 else => {
                     actorSetTerminal(state, .poisoned);
                     actorCloseTransportOnce(state);
@@ -1830,6 +1876,37 @@ fn actorReaderMain(state: *ActorState) void {
         };
         defer state.allocator.free(line);
         actorRouteLine(state, line) catch {
+            actorSetTerminal(state, .poisoned);
+            actorCloseTransportOnce(state);
+            return;
+        };
+    }
+}
+
+fn actorNotificationMain(state: *ActorState) void {
+    while (true) { // tiger: event-loop -- bounded by owner state.
+        state.mutex.lock();
+        if (state.terminal != .running and state.notifications.items.len == 0) {
+            state.mutex.unlock();
+            return;
+        }
+        const maybe_notification: ?ActorNotification = if (state.notifications.items.len == 0)
+            null
+        else
+            state.notifications.orderedRemove(0);
+        state.mutex.unlock();
+        if (maybe_notification) |notification| {
+            defer notification.deinit(state.allocator);
+            actorInvokeNotificationHandlers(
+                state,
+                notification.method,
+                notification.raw_json,
+            ) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        } else std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
             actorSetTerminal(state, .poisoned);
             actorCloseTransportOnce(state);
             return;
@@ -1876,6 +1953,27 @@ fn actorRouteLine(state: *ActorState, line: []const u8) !void {
 }
 
 fn actorDispatchNotification(
+    state: *ActorState,
+    method: []const u8,
+    line: []const u8,
+) !void {
+    var notification = ActorNotification{
+        .method = try state.allocator.dupe(u8, method),
+        .raw_json = undefined,
+    };
+    errdefer state.allocator.free(notification.method);
+    notification.raw_json = try state.allocator.dupe(u8, line);
+    errdefer state.allocator.free(notification.raw_json);
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (state.terminal != .running) return actorTerminalError(state.terminal);
+    if (state.notifications.items.len >= max_actor_notification_queue) {
+        return error.NotificationQueueFull;
+    }
+    try state.notifications.append(state.allocator, notification);
+}
+
+fn actorInvokeNotificationHandlers(
     state: *ActorState,
     method: []const u8,
     line: []const u8,
@@ -1988,6 +2086,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
             work.deadline_ms,
         );
     defer state.allocator.free(result_json);
+    if (monotonicMillis() >= work.deadline_ms) return error.RequestDeadlineExceeded;
     const payload = try actorServerResultPayloadAlloc(
         state.allocator,
         parsed_id.value,
@@ -3692,7 +3791,13 @@ fn actorFakeCodexScriptAlloc(
         "#!/bin/sh\nset -eu\nmode='{s}'\nreply_log='{s}'\n",
         .{ mode, reply_log_path },
     );
-    try writer.writer.writeAll(
+    try writeActorFakeCodexInteractiveModes(&writer.writer);
+    try writeActorFakeCodexTerminalModes(&writer.writer);
+    return writer.toOwnedSlice();
+}
+
+fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         \\while IFS= read -r line; do
         \\  case "$line" in
         \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
@@ -3712,6 +3817,17 @@ fn actorFakeCodexScriptAlloc(
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+        \\if [ "$mode" = nested_notification ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"method":"turn/started","params":{}}'
+        \\  IFS= read -r nested
+        \\  nested_id=$(printf '%s\n' "$nested" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '{"id":%s,"result":{"nested":true}}\n' "$nested_id"
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
         \\if [ "$mode" = nested_server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -3725,6 +3841,12 @@ fn actorFakeCodexScriptAlloc(
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+    );
+    try writer.writeAll("\n");
+}
+
+fn writeActorFakeCodexTerminalModes(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         \\if [ "$mode" = server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -3749,7 +3871,6 @@ fn actorFakeCodexScriptAlloc(
         \\done
         \\
     );
-    return writer.toOwnedSlice();
 }
 
 const ActorFixture = struct {
@@ -3828,6 +3949,46 @@ const NotificationProbe = struct {
         defer self.mutex.unlock();
         self.count += 1;
     }
+
+    fn waitForCount(self: *NotificationProbe, expected: usize) !void {
+        for (0..1_000) |_| {
+            self.mutex.lock();
+            const complete = self.count >= expected;
+            self.mutex.unlock();
+            if (complete) return;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+        }
+        return error.NotificationDeadlineExceeded;
+    }
+};
+
+const NestedNotificationProbe = struct {
+    actor: *Actor,
+    allocator: std.mem.Allocator,
+    mutex: ActorMutex = .{},
+    completed: bool = false,
+    failure: ?anyerror = null,
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *NestedNotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        const nested = self.actor.requestJson("actor/nested", "{}", 2_000) catch |err| {
+            self.mutex.lock();
+            self.failure = err;
+            self.mutex.unlock();
+            return;
+        };
+        defer self.allocator.free(nested);
+        if (std.mem.indexOf(u8, nested, "\"nested\":true") == null) {
+            self.mutex.lock();
+            self.failure = error.InvalidAppServerResponse;
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.lock();
+        self.completed = true;
+        self.mutex.unlock();
+    }
 };
 
 const ServerRequestProbe = struct {
@@ -3886,6 +4047,7 @@ test "actor falsifier permanent reader correlates concurrent reversed responses 
     defer allocator.free(second.result.?);
     try std.testing.expect(std.mem.indexOf(u8, first.result.?, "actor/first") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.result.?, "actor/second") != null);
+    try notifications.waitForCount(1);
     notifications.mutex.lock();
     defer notifications.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 1), notifications.count);
@@ -3914,6 +4076,31 @@ test "actor falsifier dispatches server requests through configured handler and 
     defer allocator.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":true") != null);
+}
+
+test "actor falsifier notification callbacks may issue nested requests" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "nested_notification");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{ .outbound_queue_capacity = 2 });
+    defer actor.deinit();
+    var probe = NestedNotificationProbe{ .actor = &actor, .allocator = allocator };
+    try actor.subscribe(.{ .context = &probe, .handle = NestedNotificationProbe.observe });
+    const result = try actor.requestJson("actor/original", "{}", 3_000);
+    defer allocator.free(result);
+    for (0..1_000) |_| {
+        probe.mutex.lock();
+        const done = probe.completed or probe.failure != null;
+        probe.mutex.unlock();
+        if (done) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake) catch |err| return err;
+    }
+    probe.mutex.lock();
+    defer probe.mutex.unlock();
+    try std.testing.expect(probe.failure == null);
+    try std.testing.expect(probe.completed);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
 }
 
 test "actor falsifier nested request in server handler cannot deadlock permanent reader" {

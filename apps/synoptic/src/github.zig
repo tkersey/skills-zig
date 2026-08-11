@@ -3,6 +3,59 @@ const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
 const tools = @import("tools.zig");
 const max_pages: usize = 10_000;
+const gh_call_timeout_ms: u32 = 30_000;
+
+const GhWatchdog = struct {
+    finished: std.atomic.Value(bool) = .init(false),
+    pid: std.posix.pid_t,
+
+    fn run(self: *GhWatchdog) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const watchdog_tick = std.Io.Duration.fromMilliseconds(5);
+        for (0..gh_call_timeout_ms / 5) |_| {
+            if (self.finished.load(.acquire)) return;
+            std.Io.sleep(io, watchdog_tick, .awake) catch |ignored_error| switch (ignored_error) {
+                else => {},
+            };
+        }
+        if (self.finished.load(.acquire)) return;
+        std.posix.kill(-self.pid, std.posix.SIG.TERM) catch |ignored_error| switch (ignored_error) {
+            else => {},
+        };
+    }
+};
+
+const PipeCapture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    limit: usize,
+    bytes: ?[]u8 = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *PipeCapture) void {
+        var reader = self.file.reader(self.io, &.{});
+        self.bytes = reader.interface.allocRemaining(
+            self.allocator,
+            .limited(self.limit),
+        ) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+const GhOutput = struct {
+    allocator: std.mem.Allocator,
+    stdout: []u8,
+    stderr: []u8,
+    term: std.process.Child.Term,
+
+    fn deinit(self: GhOutput) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self.stderr);
+    }
+};
 
 pub const Broker = struct {
     allocator: std.mem.Allocator,
@@ -24,37 +77,18 @@ pub const Broker = struct {
             "-",
         };
         if (!hasFixedArgv(&argv)) return error.InvalidGitHubBrokerArgv;
-        var child = try std.process.spawn(self.io, .{
-            .argv = &argv,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        });
-        errdefer child.kill(self.io);
-        var writer = child.stdin.?.writer(self.io, &.{});
-        try writer.interface.writeAll(input);
-        try writer.interface.flush();
-        child.stdin.?.close(self.io);
-        child.stdin = null;
-        var stdout_reader = child.stdout.?.reader(self.io, &.{});
-        const stdout = try stdout_reader.interface.allocRemaining(self.allocator, .limited(16 *
-            1024 * 1024));
-        errdefer self.allocator.free(stdout);
-        var stderr_reader = child.stderr.?.reader(self.io, &.{});
-        const stderr = try stderr_reader.interface.allocRemaining(
-            self.allocator,
-            .limited(1024 * 1024),
-        );
-        defer self.allocator.free(stderr);
-        const term = try child.wait(self.io);
-        if (stdout.len > 0) {
+        var output = try self.run(input, &argv);
+        defer output.deinit();
+        if (output.stdout.len > 0) {
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
                 self.allocator,
-                stdout,
+                output.stdout,
                 .{},
             ) catch {
-                if (term != .exited or term.exited != 0) return error.GitHubTransportAmbiguous;
+                if (output.term != .exited or output.term.exited != 0) {
+                    return error.GitHubTransportAmbiguous;
+                }
                 return error.InvalidGraphqlResponse;
             };
             defer parsed.deinit();
@@ -64,9 +98,65 @@ pub const Broker = struct {
             }
             if (parsed.value != .object) return error.InvalidGraphqlResponse;
         }
-        const failed = term != .exited or term.exited != 0 or stdout.len == 0;
+        const failed = output.term != .exited or output.term.exited != 0 or
+            output.stdout.len == 0;
         if (failed) return error.GitHubTransportAmbiguous;
-        return stdout;
+        return self.allocator.dupe(u8, output.stdout);
+    }
+
+    fn run(self: Broker, input: []const u8, argv: []const []const u8) !GhOutput {
+        var child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .pgid = 0,
+        });
+        errdefer child.kill(self.io);
+        const child_id = child.id orelse return error.GitHubTransportAmbiguous;
+        var watchdog = GhWatchdog{ .pid = @intCast(child_id) };
+        const watchdog_thread = try std.Thread.spawn(.{}, GhWatchdog.run, .{&watchdog});
+        defer {
+            watchdog.finished.store(true, .release);
+            watchdog_thread.join();
+        }
+        var writer = child.stdin.?.writer(self.io, &.{});
+        try writer.interface.writeAll(input);
+        try writer.interface.flush();
+        child.stdin.?.close(self.io);
+        child.stdin = null;
+        var stdout_capture = PipeCapture{
+            .allocator = self.allocator,
+            .io = self.io,
+            .file = child.stdout.?,
+            .limit = 16 * 1024 * 1024,
+        };
+        var stderr_capture = PipeCapture{
+            .allocator = self.allocator,
+            .io = self.io,
+            .file = child.stderr.?,
+            .limit = 1024 * 1024,
+        };
+        const stdout_thread = try std.Thread.spawn(.{}, PipeCapture.run, .{&stdout_capture});
+        const stderr_thread = std.Thread.spawn(
+            .{},
+            PipeCapture.run,
+            .{&stderr_capture},
+        ) catch |err| {
+            child.kill(self.io);
+            stdout_thread.join();
+            return err;
+        };
+        stdout_thread.join();
+        stderr_thread.join();
+        if (stdout_capture.failure) |err| return err;
+        if (stderr_capture.failure) |err| return err;
+        const stdout = stdout_capture.bytes orelse return error.GitHubTransportAmbiguous;
+        errdefer self.allocator.free(stdout);
+        const stderr = stderr_capture.bytes orelse return error.GitHubTransportAmbiguous;
+        errdefer self.allocator.free(stderr);
+        const term = try child.wait(self.io);
+        return .{ .allocator = self.allocator, .stdout = stdout, .stderr = stderr, .term = term };
     }
 
     pub fn readGenerationPages(
@@ -85,12 +175,18 @@ pub const Broker = struct {
             number,
         );
         errdefer freePages(self.allocator, &threads);
-        try self.appendNestedThreadPages(&threads);
-        try validateGenerationHeads(self.allocator, files.items, threads.items);
+        try self.appendNestedThreadPages(&threads, owner, name, number);
+        try validateGenerationIdentity(self.allocator, files.items, threads.items);
         return .{ .allocator = self.allocator, .files = files, .threads = threads };
     }
 
-    fn appendNestedThreadPages(self: Broker, pages: *std.ArrayList([]u8)) !void {
+    fn appendNestedThreadPages(
+        self: Broker,
+        pages: *std.ArrayList([]u8),
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+    ) !void {
         const outer_count = pages.items.len;
         for (pages.items[0..outer_count]) |page| {
             var parsed = try std.json.parseFromSlice(
@@ -107,6 +203,9 @@ pub const Broker = struct {
                 const cursor = nextCursor(comments) orelse continue;
                 try self.appendThreadComments(
                     pages,
+                    owner,
+                    name,
+                    number,
                     node.object.get("id").?.string,
                     cursor,
                 );
@@ -117,6 +216,9 @@ pub const Broker = struct {
     fn appendThreadComments(
         self: Broker,
         pages: *std.ArrayList([]u8),
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
         thread_id: []const u8,
         first_cursor: []const u8,
     ) !void {
@@ -125,8 +227,15 @@ pub const Broker = struct {
         for (0..max_pages) |_| {
             const vars = try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"threadId\":{f},\"after\":{f}}}",
-                .{ std.json.fmt(thread_id, .{}), std.json.fmt(cursor, .{}) },
+                "{{\"owner\":{f},\"name\":{f},\"number\":{d}," ++
+                    "\"threadId\":{f},\"after\":{f}}}",
+                .{
+                    std.json.fmt(owner, .{}),
+                    std.json.fmt(name, .{}),
+                    number,
+                    std.json.fmt(thread_id, .{}),
+                    std.json.fmt(cursor, .{}),
+                },
             );
             defer self.allocator.free(vars);
             const page = try self.call(graphql.thread_comments_query, vars);
@@ -894,7 +1003,7 @@ pub fn loadThreads(
     defer parsed.deinit();
     const data = (parsed.value.object.get("data") orelse return error.InvalidSnapshot).object;
     const nodes: []const std.json.Value = if (data.get("node")) |node|
-        &.{node}
+        if (node == .null) return else &.{node}
     else blk: {
         const pull = try pullObject(parsed.value);
         break :blk (pull.get("reviewThreads") orelse
@@ -1015,7 +1124,16 @@ pub fn canonicalDiffAlloc(
         allocator,
         io,
         .{
-            .argv = &.{ "git", "diff", "--no-ext-diff", "--no-color", range, "--", path },
+            .argv = &.{
+                "git",
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                range,
+                "--",
+                path,
+            },
             .cwd = .{ .path = cwd },
         },
     );
@@ -1051,26 +1169,34 @@ fn pullObject(value: std.json.Value) !std.json.ObjectMap {
     return pull.object;
 }
 
-fn validateGenerationHeads(
+fn validateGenerationIdentity(
     allocator: std.mem.Allocator,
     files: []const []const u8,
     threads: []const []const u8,
 ) !void {
     if (files.len == 0) return error.InvalidSnapshot;
-    const expected = try snapshotField(allocator, files[0], "headRefOid");
-    defer allocator.free(expected);
+    const expected_head = try snapshotField(allocator, files[0], "headRefOid");
+    defer allocator.free(expected_head);
+    const expected_base = try snapshotField(allocator, files[0], "baseRefOid");
+    defer allocator.free(expected_base);
     for (files) |page| {
         const head = try snapshotField(allocator, page, "headRefOid");
         defer allocator.free(head);
-        if (!std.mem.eql(u8, expected, head)) return error.MixedGenerationPages;
+        const base = try snapshotField(allocator, page, "baseRefOid");
+        defer allocator.free(base);
+        if (!std.mem.eql(u8, expected_head, head) or
+            !std.mem.eql(u8, expected_base, base)) return error.MixedGenerationPages;
     }
     for (threads) |page| {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
         defer parsed.deinit();
-        const data = parsed.value.object.get("data").?.object;
-        if (data.get("node") != null) continue;
         const pull = try pullObject(parsed.value);
-        if (!std.mem.eql(u8, expected, pull.get("headRefOid").?.string)) {
+        const head_value = pull.get("headRefOid") orelse return error.InvalidSnapshot;
+        const base_value = pull.get("baseRefOid") orelse return error.InvalidSnapshot;
+        if (head_value != .string or base_value != .string) return error.InvalidSnapshot;
+        if (!std.mem.eql(u8, expected_head, head_value.string) or
+            !std.mem.eql(u8, expected_base, base_value.string))
+        {
             return error.MixedGenerationPages;
         }
     }
@@ -1122,12 +1248,14 @@ pub fn hasFixedArgv(argv: []const []const u8) bool {
 
 test "generation pages reject mixed heads" {
     const first =
-        "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"h1\"}}}}";
+        "{\"data\":{\"repository\":{\"pullRequest\":{" ++
+        "\"baseRefOid\":\"b\",\"headRefOid\":\"h1\"}}}}";
     const second =
-        "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"h2\"}}}}";
+        "{\"data\":{\"repository\":{\"pullRequest\":{" ++
+        "\"baseRefOid\":\"b\",\"headRefOid\":\"h2\"}}}}";
     try std.testing.expectError(
         error.MixedGenerationPages,
-        validateGenerationHeads(
+        validateGenerationIdentity(
             std.testing.allocator,
             &.{ first, second },
             &.{},

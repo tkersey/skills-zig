@@ -6,7 +6,8 @@ const fetch_remediation = "Ensure the PR base and head objects are fetchable fro
 const skill_remediation = "Install valid synoptic-ui/v1 and synoptic-exclusions/v1 skill assets.";
 const builtin = @import("builtin");
 const app_meta = @import("app_meta");
-const App = @import("app.zig").App;
+const app_domain = @import("app.zig");
+const App = app_domain.App;
 const config = @import("config.zig");
 const domain = @import("domain.zig");
 const graphql = @import("graphql.zig");
@@ -137,7 +138,13 @@ fn launch(
     defer allocator.free(error_path);
     var child = try spawnServeChild(allocator, io, environment, args, launch_id, runtime_root);
     var child_owned = true;
-    errdefer if (child_owned) child.kill(io);
+    errdefer if (child_owned) cleanupFailedLaunch(
+        allocator,
+        io,
+        &child,
+        launch_dir,
+        options.cwd,
+    );
     const child_pid: u64 = @intCast(child.id orelse return error.ChildMissingPid);
     var ready = try awaitChildReady(allocator, io, ready_path, error_path, launch_id, child_pid);
     defer ready.deinit();
@@ -154,6 +161,29 @@ fn launch(
     } else try out.interface.print("{s}\n", .{ready.url});
     try out.interface.flush();
     child_owned = false;
+}
+
+fn cleanupFailedLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    launch_dir: []const u8,
+    repository_cwd: []const u8,
+) void {
+    child.kill(io);
+    const managed_path = std.fs.path.join(
+        allocator,
+        &.{ launch_dir, "worktree" },
+    ) catch return;
+    defer allocator.free(managed_path);
+    worktree.retireManaged(
+        allocator,
+        io,
+        .{ .managed = managed_path },
+        repository_cwd,
+    ) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }
 
 fn spawnServeChild(
@@ -449,7 +479,7 @@ fn serveGeneration(
         context.settings.worktree_prefer_current_pr_checkout,
     );
     defer allocator.free(custody.path());
-    var custody_retired = false;
+    var custody_retirement: CustodyRetirement = .pending;
     serveSelectedGeneration(
         allocator,
         io,
@@ -457,15 +487,17 @@ fn serveGeneration(
         generation,
         generation_owned,
         custody,
-        &custody_retired,
+        &custody_retirement,
     ) catch |launch_error| {
-        if (!custody_retired) {
-            custody_retired = true;
+        if (custody_retirement == .pending) {
             try worktree.retireManaged(allocator, io, custody, context.options.cwd);
+            custody_retirement = .retired;
         }
         return launch_error;
     };
 }
+
+const CustodyRetirement = enum { pending, preserve, retired };
 
 fn serveSelectedGeneration(
     allocator: std.mem.Allocator,
@@ -474,7 +506,7 @@ fn serveSelectedGeneration(
     generation: *domain.PrGeneration,
     generation_owned: *bool,
     custody: worktree.Custody,
-    custody_retired: *bool,
+    custody_retirement: *CustodyRetirement,
 ) !void {
     const review_cwd = custody.path();
     try github.hydrateRevisionKeys(allocator, io, review_cwd, generation);
@@ -525,7 +557,7 @@ fn serveSelectedGeneration(
         &registry,
         review_cwd,
         skill_path,
-        custody_retired,
+        custody_retirement,
     );
 }
 
@@ -570,21 +602,144 @@ fn applyLaunchExclusions(
     review_cwd: []const u8,
     state: *App,
     registry: *sessions.Registry,
+    tool_domain: *http.ToolDomainContext,
 ) !void {
-    var outcomes = try state.applyAutomaticExclusions(
+    if (!settings.exclusions_enabled) return;
+    var seeds = try launchExclusionSeeds(allocator, state, tool_domain);
+    defer {
+        for (seeds.items) |seed| seed.deinit();
+        seeds.deinit(allocator);
+    }
+    for (seeds.items) |seed| try applyLaunchExclusion(
+        allocator,
         settings,
         broker,
+        identity,
+        pull_request_id,
+        review_cwd,
+        state,
+        registry,
+        tool_domain,
+        seed,
+    );
+}
+
+const LaunchExclusionSeed = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    revision: []u8,
+    base: []u8,
+    head: []u8,
+
+    fn deinit(self: LaunchExclusionSeed) void {
+        self.allocator.free(self.path);
+        self.allocator.free(self.revision);
+        self.allocator.free(self.base);
+        self.allocator.free(self.head);
+    }
+};
+
+fn launchExclusionSeeds(
+    allocator: std.mem.Allocator,
+    state: *App,
+    tool_domain: *http.ToolDomainContext,
+) !std.ArrayList(LaunchExclusionSeed) {
+    tool_domain.lock();
+    defer tool_domain.unlock();
+    var seeds: std.ArrayList(LaunchExclusionSeed) = .empty;
+    errdefer {
+        for (seeds.items) |seed| seed.deinit();
+        seeds.deinit(allocator);
+    }
+    for (state.generation.files.items) |file| {
+        if (file.viewed == .viewed) continue;
+        var seed = LaunchExclusionSeed{
+            .allocator = allocator,
+            .path = try allocator.dupe(u8, file.path),
+            .revision = undefined,
+            .base = undefined,
+            .head = undefined,
+        };
+        errdefer allocator.free(seed.path);
+        seed.revision = try allocator.dupe(u8, file.revision_key);
+        errdefer allocator.free(seed.revision);
+        seed.base = try allocator.dupe(u8, state.generation.base_oid);
+        errdefer allocator.free(seed.base);
+        seed.head = try allocator.dupe(u8, state.generation.head_oid);
+        errdefer allocator.free(seed.head);
+        try seeds.append(allocator, seed);
+    }
+    return seeds;
+}
+
+fn applyLaunchExclusion(
+    allocator: std.mem.Allocator,
+    settings: *config.Settings,
+    broker: github.Broker,
+    identity: pr.Identity,
+    pull_request_id: []const u8,
+    review_cwd: []const u8,
+    state: *App,
+    registry: *sessions.Registry,
+    tool_domain: *http.ToolDomainContext,
+    seed: LaunchExclusionSeed,
+) !void {
+    const reason = settings.classifyPath(seed.path) orelse binary: {
+        const diff = github.canonicalDiffAlloc(
+            allocator,
+            broker.io,
+            review_cwd,
+            seed.base,
+            seed.head,
+            seed.path,
+        ) catch return;
+        defer allocator.free(diff);
+        break :binary settings.classifyDiff(diff) orelse return;
+    };
+    const client_id = try app_domain.exclusionMutationIdAlloc(
+        allocator,
+        seed.path,
+        seed.revision,
+    );
+    defer allocator.free(client_id);
+    var mutation_error: ?[]const u8 = null;
+    broker.markViewedWithId(pull_request_id, seed.path, client_id) catch |err| {
+        mutation_error = @errorName(err);
+    };
+    var readback_error: ?[]const u8 = null;
+    const viewed = broker.viewedAfterMutation(
         identity.owner,
         identity.repository,
         identity.number,
-        pull_request_id,
-        review_cwd,
+        seed.head,
+        seed.path,
+    ) catch |err| blk: {
+        readback_error = @errorName(err);
+        break :blk false;
+    };
+    const sync_error = if (viewed) null else readback_error orelse
+        mutation_error orelse "MarkViewedReadbackFailed";
+    tool_domain.lock();
+    const applied = state.recordAutomaticExclusion(
+        seed.path,
+        seed.revision,
+        reason,
+        sync_error,
+        viewed,
+    ) catch |err| {
+        tool_domain.unlock();
+        return err;
+    };
+    tool_domain.unlock();
+    if (!applied) return;
+    const outcome = try app_domain.ExclusionOutcome.init(
+        allocator,
+        seed.path,
+        reason,
+        sync_error,
     );
-    defer {
-        for (outcomes.items) |outcome| outcome.deinit();
-        outcomes.deinit(allocator);
-    }
-    try http.queueExclusionEvents(registry, outcomes.items);
+    defer outcome.deinit();
+    try http.queueExclusionEvents(registry, &.{outcome});
 }
 
 fn configureAppState(
@@ -632,7 +787,7 @@ fn serveHttpRuntime(
     registry: *sessions.Registry,
     review_cwd: []const u8,
     skill_path: []const u8,
-    custody_retired: *bool,
+    custody_retirement: *CustodyRetirement,
 ) !void {
     var server = try http.Server.bind(allocator, io, context.options.skill_root);
     defer server.deinit();
@@ -686,7 +841,7 @@ fn serveHttpRuntime(
         context.options,
         context.runtime_root,
         &runtime,
-        custody_retired,
+        custody_retirement,
         terminal_error,
     );
 }
@@ -752,8 +907,6 @@ const LaunchExclusionWork = struct {
     }
 
     fn run(self: *LaunchExclusionWork) void {
-        self.tool_domain.lock();
-        defer self.tool_domain.unlock();
         queueLaunchExclusionFailures(
             self.allocator,
             self.settings,
@@ -763,6 +916,7 @@ const LaunchExclusionWork = struct {
             self.review_cwd,
             self.state,
             self.registry,
+            self.tool_domain,
         );
     }
 };
@@ -797,7 +951,7 @@ fn finishHttpRuntime(
     options: config.LaunchOptions,
     runtime_root: []const u8,
     runtime: *http.Runtime,
-    custody_retired: *bool,
+    custody_retirement: *CustodyRetirement,
     terminal_error: ?anyerror,
 ) !void {
     try shutdownReview(
@@ -811,7 +965,7 @@ fn finishHttpRuntime(
         runtime.app,
         runtime.registry,
         runtime.stop_request_path orelse return error.MissingStopRequestPath,
-        custody_retired,
+        custody_retirement,
         terminal_error,
     );
 }
@@ -859,6 +1013,7 @@ fn queueLaunchExclusionFailures(
     review_cwd: []const u8,
     state: *App,
     registry: *sessions.Registry,
+    tool_domain: *http.ToolDomainContext,
 ) void {
     applyLaunchExclusions(
         allocator,
@@ -869,6 +1024,7 @@ fn queueLaunchExclusionFailures(
         review_cwd,
         state,
         registry,
+        tool_domain,
     ) catch |err| {
         const payload = std.fmt.allocPrint(
             allocator,
@@ -978,20 +1134,23 @@ fn shutdownReview(
     state: *App,
     registry: *sessions.Registry,
     stop_request_path: []const u8,
-    custody_retired: *bool,
+    custody_retirement: *CustodyRetirement,
     terminal_error: ?anyerror,
 ) !void {
     try registry.beginSynchronization(io, sessions.safe_boundary_timeout_ms);
     defer registry.endSynchronization();
-    try worktree.reconcileShutdown(
+    worktree.reconcileShutdown(
         allocator,
         io,
         custody,
         state.generation.head_oid,
         worktree_baseline,
-    );
-    custody_retired.* = true;
+    ) catch |err| {
+        custody_retirement.* = .preserve;
+        return err;
+    };
     try worktree.retireManaged(allocator, io, custody, options.cwd);
+    custody_retirement.* = .retired;
     std.Io.Dir.cwd().deleteFile(io, stop_request_path) catch |ignored_error| {
         switch (ignored_error) {
             else => {},
