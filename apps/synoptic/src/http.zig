@@ -1027,12 +1027,14 @@ pub const Server = struct {
     ) !void {
         _ = self;
         if (terminal == .succeeded) {
-            if (runtime.broker.readGeneration(
+            if (runtime.broker.readGenerationSnapshot(
                 runtime.owner,
                 runtime.name,
                 runtime.number,
-            )) |generation_value| {
-                var generation = generation_value;
+            )) |snapshot_value| {
+                var refreshed = snapshot_value;
+                defer refreshed.metadata.deinit();
+                var generation = refreshed.generation;
                 var generation_owned = true;
                 defer if (generation_owned) generation.deinit();
                 if (!std.mem.eql(
@@ -1055,7 +1057,31 @@ pub const Server = struct {
                     runtime.app.action_state_fresh = false;
                     return;
                 };
-                runtime.app.replaceGeneration(generation);
+                const repository = std.fmt.allocPrint(
+                    runtime.app.allocator,
+                    "{s}/{s}",
+                    .{ runtime.owner, runtime.name },
+                ) catch {
+                    runtime.app.action_state_fresh = false;
+                    return;
+                };
+                defer runtime.app.allocator.free(repository);
+                runtime.app.replaceGithubSnapshot(generation, .{
+                    .repository = repository,
+                    .number = runtime.number,
+                    .title = refreshed.metadata.title,
+                    .body = refreshed.metadata.body,
+                    .url = refreshed.metadata.url,
+                    .base_ref_name = refreshed.metadata.base_ref_name,
+                    .base_ref_oid = refreshed.metadata.base_oid,
+                    .head_ref_name = refreshed.metadata.head_ref_name,
+                    .head_ref_oid = refreshed.metadata.head_oid,
+                    .state = refreshed.metadata.state,
+                    .is_draft = refreshed.metadata.is_draft,
+                }) catch {
+                    runtime.app.action_state_fresh = false;
+                    return;
+                };
                 generation_owned = false;
                 runtime.app.action_state_fresh = true;
             } else |_| {

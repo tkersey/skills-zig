@@ -98,6 +98,20 @@ pub const App = struct {
         self.pull_request = owned;
     }
 
+    /// Install one complete GitHub snapshot as a single app-owned state change.
+    /// Ownership is acquired before the prior header or generation is retired.
+    pub fn replaceGithubSnapshot(
+        self: *App,
+        next: domain.PrGeneration,
+        header: domain.PullRequestHeader,
+    ) !void {
+        var owned = try domain.OwnedPullRequestHeader.init(self.allocator, header);
+        errdefer owned.deinit();
+        if (self.pull_request) |*old| old.deinit();
+        self.pull_request = owned;
+        self.replaceGeneration(next);
+    }
+
     pub fn updatePullRequestGeneration(
         self: *App,
         base_oid: []const u8,
@@ -269,6 +283,7 @@ pub const App = struct {
         pull_request_id: []const u8,
         session_path: []const u8,
     ) !tools.ActionCard {
+        const comment_body_snapshot = try self.commentBodySnapshot(input);
         const card = try self.action_store.prepare(
             session_id,
             source_turn_id,
@@ -279,10 +294,25 @@ pub const App = struct {
                 .pull_request_id = pull_request_id,
                 .head_oid = self.generation.head_oid,
                 .session_path = session_path,
+                .comment_body_snapshot = comment_body_snapshot,
             },
         );
         self.pending = card.*;
         return card.*;
+    }
+
+    fn commentBodySnapshot(
+        self: *const App,
+        input: tools.PreparedActionInput,
+    ) !?[]const u8 {
+        if (input.kind != .update_comment and input.kind != .delete_comment) return null;
+        const comment_id = input.comment_id orelse return error.InvalidCommentAction;
+        for (self.generation.threads.items) |thread| {
+            for (thread.comments) |comment| {
+                if (std.mem.eql(u8, comment.id, comment_id)) return comment.body;
+            }
+        }
+        return error.GitHubActionTargetMissing;
     }
 
     pub fn confirmAction(

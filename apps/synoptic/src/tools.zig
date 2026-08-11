@@ -36,6 +36,9 @@ pub const ActionTarget = struct {
     side: ?[]const u8 = null,
     thread_id: ?[]const u8 = null,
     comment_id: ?[]const u8 = null,
+    /// Server-observed body at preparation time for destructive comment actions.
+    /// This is intentionally omitted from the browser card representation.
+    comment_body_snapshot: ?[]const u8 = null,
 };
 
 pub const TransparentAction = struct {
@@ -103,6 +106,7 @@ pub const AuthoritativeTarget = struct {
     pull_request_id: []const u8,
     head_oid: []const u8,
     session_path: []const u8,
+    comment_body_snapshot: ?[]const u8 = null,
 };
 
 pub fn authorizeTool(phase: ToolPhase, human_directed: bool) !void {
@@ -260,6 +264,10 @@ pub const ActionStore = struct {
                 .side = try dupeOptional(self.allocator, input.side),
                 .thread_id = try dupeOptional(self.allocator, input.thread_id),
                 .comment_id = try dupeOptional(self.allocator, input.comment_id),
+                .comment_body_snapshot = try dupeOptional(
+                    self.allocator,
+                    authoritative.comment_body_snapshot,
+                ),
             },
             .body = try dupeOptional(self.allocator, input.body),
             .payload_json = try self.allocator.dupe(u8, input.payload_json),
@@ -358,6 +366,7 @@ pub const ActionStore = struct {
                 card.target.side,
                 card.target.thread_id,
                 card.target.comment_id,
+                card.target.comment_body_snapshot,
                 card.body,
                 card.supersedes,
             },

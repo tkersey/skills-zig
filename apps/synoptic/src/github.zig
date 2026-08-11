@@ -310,17 +310,6 @@ pub const Broker = struct {
         return .{ .generation = generation, .metadata = metadata };
     }
 
-    pub fn readGeneration(
-        self: Broker,
-        owner: []const u8,
-        name: []const u8,
-        number: u64,
-    ) !domain.PrGeneration {
-        var snapshot = try self.readGenerationSnapshot(owner, name, number);
-        defer snapshot.metadata.deinit();
-        return snapshot.generation;
-    }
-
     pub fn markViewed(self: Broker, pull_request_id: []const u8, path: []const u8) !void {
         return self.markViewedWithId(pull_request_id, path, "synoptic-complete");
     }
@@ -489,6 +478,10 @@ pub const Broker = struct {
         number: u64,
         card: tools.ActionCard,
     ) !void {
+        const comment_action = card.kind == .update_comment or card.kind == .delete_comment;
+        if (comment_action and card.target.comment_body_snapshot == null) {
+            return error.ActionCommentSnapshotMissing;
+        }
         var pages = try self.callPages(
             graphql.action_authority_query,
             "reviewThreads",
@@ -543,39 +536,56 @@ pub const Broker = struct {
                 found.* = true;
             };
             const comment_action = card.kind == .update_comment or card.kind == .delete_comment;
-            if (comment_action) {
-                if (card.target.comment_id) |comment_id| {
-                    const comments = thread.get("comments").?.object.get("nodes").?.array.items;
-                    for (comments) |comment| if (std.mem.eql(
-                        u8,
-                        comment.object.get("id").?.string,
-                        comment_id,
-                    )) {
-                        if (!comment.object.get("viewerDidAuthor").?.bool) {
-                            return error.GitHubActionNotAuthorized;
-                        }
-                        found.* = true;
-                    };
-                }
-            }
-            if (comment_action and !found.*) if (card.target.comment_id) |comment_id| {
-                const comments = thread.get("comments").?.object;
-                const next = nextCursor(comments) orelse continue;
-                if (try self.commentById(
-                    owner,
-                    name,
-                    number,
-                    thread.get("id").?.string,
-                    comment_id,
-                    next,
-                )) |comment| {
-                    if (!comment.viewer_did_author) {
-                        return error.GitHubActionNotAuthorized;
-                    }
-                    found.* = true;
-                }
-            };
+            if (comment_action) try self.validateCommentAuthority(
+                owner,
+                name,
+                number,
+                thread,
+                card,
+                found,
+            );
         }
+    }
+
+    fn validateCommentAuthority(
+        self: Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        thread: std.json.ObjectMap,
+        card: tools.ActionCard,
+        found: *bool,
+    ) !void {
+        if (found.*) return;
+        const comment_id = card.target.comment_id orelse return;
+        const comments = thread.get("comments").?.object;
+        for (comments.get("nodes").?.array.items) |value| {
+            const comment = value.object;
+            if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
+            if (!comment.get("viewerDidAuthor").?.bool) {
+                return error.GitHubActionNotAuthorized;
+            }
+            if (!std.mem.eql(
+                u8,
+                comment.get("body").?.string,
+                card.target.comment_body_snapshot.?,
+            )) return error.GitHubActionTargetChanged;
+            found.* = true;
+            return;
+        }
+        const next = nextCursor(comments) orelse return;
+        const comment = (try self.commentById(
+            owner,
+            name,
+            number,
+            thread.get("id").?.string,
+            comment_id,
+            next,
+            card.target.comment_body_snapshot.?,
+        )) orelse return;
+        if (!comment.viewer_did_author) return error.GitHubActionNotAuthorized;
+        if (!comment.body_matches) return error.GitHubActionTargetChanged;
+        found.* = true;
     }
 
     pub fn reconcileAction(
@@ -647,6 +657,7 @@ pub const Broker = struct {
 
     const CommentSnapshot = struct {
         viewer_did_author: bool,
+        body_matches: bool,
     };
 
     fn inlineThreadMatchesCard(thread: std.json.ObjectMap, card: tools.ActionCard) bool {
@@ -669,6 +680,7 @@ pub const Broker = struct {
         thread_id: []const u8,
         comment_id: []const u8,
         first_cursor: []const u8,
+        expected_body: []const u8,
     ) !?CommentSnapshot {
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
@@ -689,6 +701,11 @@ pub const Broker = struct {
                 if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
                     return .{
                         .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
+                        .body_matches = std.mem.eql(
+                            u8,
+                            comment.get("body").?.string,
+                            expected_body,
+                        ),
                     };
                 }
             }

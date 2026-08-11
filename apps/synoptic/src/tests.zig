@@ -43,6 +43,90 @@ test "vertical state path gates primary, streams session, and retains completed 
     try std.testing.expect(state.generation.queued("src/a.zig"));
 }
 
+test "comment mutation cards own the server-observed body snapshot" {
+    var state = try app.App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    const comments = [_]domain.ReviewComment{.{
+        .id = "C_1",
+        .body = "observed body",
+        .created_at = "2026-01-01T00:00:00Z",
+        .url = "https://example/C_1",
+        .author = "viewer",
+        .viewer_did_author = true,
+        .review_id = "R_1",
+        .review_state = "COMMENTED",
+    }};
+    try state.generation.addThread(.{
+        .id = "T_1",
+        .path = "a.zig",
+        .comments = &comments,
+    });
+    const card = try state.prepareModelAction("s", "t", .{
+        .slot = @constCast("update"),
+        .kind = .update_comment,
+        .effect_summary = @constCast("Update C_1"),
+        .payload_json = @constCast("{}"),
+        .comment_id = @constCast("C_1"),
+        .body = @constCast("replacement body"),
+    }, "o/r", 1, "PR_1", "a.zig");
+    try std.testing.expectEqualStrings(
+        "observed body",
+        card.target.comment_body_snapshot.?,
+    );
+    try std.testing.expectEqualStrings("replacement body", card.body.?);
+}
+
+test "complete GitHub snapshot replacement refreshes all PR metadata" {
+    var state = try app.App.init(std.testing.allocator, "old-head");
+    defer state.deinit();
+    try state.setPullRequest(.{
+        .repository = "o/r",
+        .number = 1,
+        .title = "Old title",
+        .body = "Old body",
+        .url = "https://example/old",
+        .base_ref_name = "old-base",
+        .base_ref_oid = "old-base-oid",
+        .head_ref_name = "old-head",
+        .head_ref_oid = "old-head",
+        .state = "OPEN",
+        .is_draft = false,
+    });
+    var next = try domain.PrGeneration.initFull(
+        std.testing.allocator,
+        "new-base-oid",
+        "new-head-oid",
+    );
+    var next_owned = true;
+    errdefer if (next_owned) next.deinit();
+    try next.addFile(.{ .path = "new.zig", .viewed = .unviewed, .revision_key = "r2" });
+    try state.replaceGithubSnapshot(next, .{
+        .repository = "o/r",
+        .number = 1,
+        .title = "New title",
+        .body = "New body",
+        .url = "https://example/new",
+        .base_ref_name = "main",
+        .base_ref_oid = "new-base-oid",
+        .head_ref_name = "feature",
+        .head_ref_oid = "new-head-oid",
+        .state = "CLOSED",
+        .is_draft = true,
+    });
+    next_owned = false;
+    const header = state.pull_request.?;
+    try std.testing.expectEqualStrings("New title", header.title);
+    try std.testing.expectEqualStrings("New body", header.body);
+    try std.testing.expectEqualStrings("https://example/new", header.url);
+    try std.testing.expectEqualStrings("main", header.base_ref_name);
+    try std.testing.expectEqualStrings("new-base-oid", header.base_ref_oid);
+    try std.testing.expectEqualStrings("feature", header.head_ref_name);
+    try std.testing.expectEqualStrings("new-head-oid", header.head_ref_oid);
+    try std.testing.expectEqualStrings("CLOSED", header.state);
+    try std.testing.expect(header.is_draft);
+    try std.testing.expect(state.generation.queued("new.zig"));
+}
+
 test "session context unresolved assigned-file evidence preserves complete comments" {
     const raw =
         "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewTh" ++
@@ -682,6 +766,7 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
         .pull_request_id = "PR_1",
         .head_oid = "h",
         .session_path = "a.zig",
+        .comment_body_snapshot = "old",
     };
     var store = tools.ActionStore{ .allocator = allocator };
     defer store.deinit();
@@ -714,6 +799,63 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
     try std.testing.expectError(error.GraphqlAliasForbidden, broker.executeAction(tampered));
     try verifyActionLog(allocator, io, log_path);
     try verifyUnmarkAction(allocator, broker, authoritative);
+}
+
+test "comment action validation rejects a changed body found by nested pagination" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-comment-change" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\if grep -q 'SynopticAnchor' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticActionAuthority' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticThreadComments' "$input"; then
+        \\  printf '%s\n' '{"data":{"node":{"comments":{"nodes":[{"id":"C_1","body":"changed elsewhere","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'; exit 0
+        \\fi
+        \\printf '%s\n' '{"data":{}}'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-comment-change", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("delete"),
+        .kind = .delete_comment,
+        .effect_summary = @constCast("Delete C_1"),
+        .payload_json = @constCast("{}"),
+        .comment_id = @constCast("C_1"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .head_oid = "h",
+        .session_path = "a.zig",
+        .comment_body_snapshot = "observed body",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try std.testing.expectError(
+        error.GitHubActionTargetChanged,
+        broker.validateAction("o", "r", 1, "PR_1", card.*),
+    );
 }
 
 fn verifyActionLog(allocator: std.mem.Allocator, io: std.Io, log_path: []const u8) !void {
