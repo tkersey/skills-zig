@@ -13,6 +13,9 @@ const review_diff_bytes_max: usize = 512 * 1024;
 pub const generation_file_count_max: usize = 3_000;
 pub const generation_review_diff_bytes_max: usize = 128 * 1024 * 1024;
 const rename_metadata_bytes_max: usize = 16 * 1024 * 1024;
+const canonical_git_env_path = "/usr/bin/env";
+const canonical_git_attributes_env = "GIT_ATTR_NOSYSTEM=1";
+const canonical_git_attributes_config = "core.attributesFile=/dev/null";
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
 const GhWatchdog = struct {
@@ -2411,7 +2414,11 @@ fn canonicalRenameEntries(
         allocator,
         io,
         &.{
+            canonical_git_env_path,
+            canonical_git_attributes_env,
             git_path,
+            "-c",
+            canonical_git_attributes_config,
             "diff",
             "--name-status",
             "-z",
@@ -2692,7 +2699,11 @@ fn runCanonicalBlobDiff(
     output_limit: usize,
 ) !GhOutput {
     const argv = [_][]const u8{
+        canonical_git_env_path,
+        canonical_git_attributes_env,
         git_path,
+        "-c",
+        canonical_git_attributes_config,
         "--literal-pathspecs",
         "diff",
         "--no-textconv",
@@ -2731,7 +2742,11 @@ fn runCanonicalPathDiff(
     output_limit: usize,
 ) !GhOutput {
     const argv = [_][]const u8{
+        canonical_git_env_path,
+        canonical_git_attributes_env,
         git_path,
+        "-c",
+        canonical_git_attributes_config,
         "--literal-pathspecs",
         "diff",
         "--no-textconv",
@@ -3044,6 +3059,12 @@ fn expectSingleMergeBaseHydration(
         @as(usize, 1),
         std.mem.count(u8, log, "--find-copies-harder"),
     );
+    try std.testing.expect(std.mem.count(u8, log, "attrs=1") >= 3);
+    try std.testing.expect(std.mem.count(
+        u8,
+        log,
+        canonical_git_attributes_config,
+    ) >= 3);
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending-a"));
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[1].revision_key, "pending-b"));
 }
@@ -3137,7 +3158,8 @@ test "revision hydration computes one merge base for a generation" {
     defer allocator.free(wrapper_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {s}\nexec /usr/bin/git \"$@\"\n",
+        "#!/bin/sh\nprintf 'attrs=%s %s\\n' \"${{GIT_ATTR_NOSYSTEM:-}}\" \"$*\"" ++
+            " >> {s}\nexec /usr/bin/git \"$@\"\n",
         .{log_path},
     );
     defer allocator.free(script);
@@ -3236,6 +3258,18 @@ test "renamed file identity and review diff include the source path" {
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
     try configureNonCanonicalDiffDefaults(allocator, io, root);
+    const ambient_attributes = try std.fs.path.join(allocator, &.{ root, "ambient-attributes" });
+    defer allocator.free(ambient_attributes);
+    try tmp.dir.writeFile(
+        io,
+        .{ .sub_path = "ambient-attributes", .data = "*.zig -diff\n" },
+    );
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "core.attributesFile", ambient_attributes },
+    ));
     allocator.free(try runTestGit(
         allocator,
         io,
