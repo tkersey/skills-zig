@@ -1479,10 +1479,14 @@ pub const max_actor_outbound_queue: usize = 1024;
 pub const max_actor_subscriptions: usize = 64;
 pub const max_actor_server_request_queue: usize = 128;
 pub const max_actor_notification_queue: usize = 1024;
+pub const max_actor_queue_bytes: usize = 64 * 1024 * 1024;
 
 pub const ActorOptions = struct {
     outbound_queue_capacity: usize = 128,
+    outbound_queue_bytes: usize = 16 * 1024 * 1024,
     server_request_queue_capacity: usize = 32,
+    server_request_queue_bytes: usize = 16 * 1024 * 1024,
+    notification_queue_bytes: usize = 16 * 1024 * 1024,
     default_request_timeout_ms: u32 = 30_000,
     server_request_timeout_ms: u32 = 30_000,
     overload_retry_policy: OverloadRetryPolicy = .{},
@@ -1524,6 +1528,10 @@ const ActorServerRequest = struct {
     deadline_ms: i64,
     handler: protocol.ServerRequestHandler,
 
+    fn byteSize(self: ActorServerRequest) usize {
+        return self.id_json.len + self.method.len + self.raw_json.len;
+    }
+
     fn deinit(self: ActorServerRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.id_json);
         allocator.free(self.method);
@@ -1534,6 +1542,10 @@ const ActorServerRequest = struct {
 const ActorNotification = struct {
     method: []u8,
     raw_json: []u8,
+
+    fn byteSize(self: ActorNotification) usize {
+        return self.method.len + self.raw_json.len;
+    }
 
     fn deinit(self: ActorNotification, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
@@ -1553,9 +1565,15 @@ const ActorState = struct {
     active_calls: usize = 0,
     outbound: std.ArrayList(ActorOutbound) = .empty,
     outbound_capacity: usize,
+    outbound_bytes: usize = 0,
+    outbound_byte_capacity: usize = 16 * 1024 * 1024,
     server_requests: std.ArrayList(ActorServerRequest) = .empty,
+    server_request_bytes: usize = 0,
+    server_request_byte_capacity: usize = 16 * 1024 * 1024,
     active_server_handlers: usize = 0,
     notifications: std.ArrayList(ActorNotification) = .empty,
+    notification_bytes: usize = 0,
+    notification_byte_capacity: usize = 16 * 1024 * 1024,
     server_request_capacity: usize,
     server_request_timeout_ms: u32,
     pending: std.AutoHashMap(i64, *ActorPending),
@@ -1606,8 +1624,14 @@ pub const Actor = struct {
         };
         if (options.outbound_queue_capacity == 0 or
             options.outbound_queue_capacity > max_actor_outbound_queue or
+            options.outbound_queue_bytes == 0 or
+            options.outbound_queue_bytes > max_actor_queue_bytes or
             options.server_request_queue_capacity == 0 or
             options.server_request_queue_capacity > max_actor_server_request_queue or
+            options.server_request_queue_bytes == 0 or
+            options.server_request_queue_bytes > max_actor_queue_bytes or
+            options.notification_queue_bytes == 0 or
+            options.notification_queue_bytes > max_actor_queue_bytes or
             options.default_request_timeout_ms == 0 or
             options.server_request_timeout_ms == 0)
         {
@@ -1622,7 +1646,10 @@ pub const Actor = struct {
             .allocator = allocator,
             .client = owned_client,
             .outbound_capacity = options.outbound_queue_capacity,
+            .outbound_byte_capacity = options.outbound_queue_bytes,
             .server_request_capacity = options.server_request_queue_capacity,
+            .server_request_byte_capacity = options.server_request_queue_bytes,
+            .notification_byte_capacity = options.notification_queue_bytes,
             .server_request_timeout_ms = options.server_request_timeout_ms,
             .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
             .server_request_handler = options.server_request_handler,
@@ -1969,10 +1996,11 @@ fn actorWriterMain(state: *ActorState) void {
             state.mutex.unlock();
             return;
         }
-        const maybe_item: ?ActorOutbound = if (state.outbound.items.len == 0)
-            null
-        else
-            state.outbound.orderedRemove(0);
+        const maybe_item: ?ActorOutbound = if (state.outbound.items.len == 0) null else blk: {
+            const item = state.outbound.orderedRemove(0);
+            state.outbound_bytes -= item.payload.len;
+            break :blk item;
+        };
         const transmission_claimed = if (maybe_item) |item|
             actorClaimOutboundTransmissionLocked(state, item)
         else
@@ -2034,7 +2062,9 @@ fn actorHandlerMain(state: *ActorState) void {
             null
         else blk: {
             state.active_server_handlers += 1;
-            break :blk state.server_requests.orderedRemove(0);
+            const work = state.server_requests.orderedRemove(0);
+            state.server_request_bytes -= work.byteSize();
+            break :blk work;
         };
         state.mutex.unlock();
 
@@ -2137,6 +2167,7 @@ fn actorNotificationMain(state: *ActorState) void {
         if (state.terminal == .stopped) {
             var abandoned = state.notifications;
             state.notifications = .empty;
+            state.notification_bytes = 0;
             state.mutex.unlock();
             for (abandoned.items) |notification| notification.deinit(state.allocator);
             abandoned.deinit(state.allocator);
@@ -2145,8 +2176,11 @@ fn actorNotificationMain(state: *ActorState) void {
         const transport_terminal = state.terminal != .running;
         const maybe_notification: ?ActorNotification = if (state.notifications.items.len == 0)
             null
-        else
-            state.notifications.orderedRemove(0);
+        else blk: {
+            const notification = state.notifications.orderedRemove(0);
+            state.notification_bytes -= notification.byteSize();
+            break :blk notification;
+        };
         state.mutex.unlock();
         if (maybe_notification) |notification| {
             defer notification.deinit(state.allocator);
@@ -2237,7 +2271,14 @@ fn actorDispatchNotification(
     if (state.notifications.items.len >= max_actor_notification_queue) {
         return error.NotificationQueueFull;
     }
+    const notification_bytes = notification.byteSize();
+    if (notification_bytes > state.notification_byte_capacity or
+        state.notification_bytes > state.notification_byte_capacity - notification_bytes)
+    {
+        return error.NotificationQueueFull;
+    }
     try state.notifications.append(state.allocator, notification);
+    state.notification_bytes += notification_bytes;
 }
 
 fn actorInvokeNotificationHandlers(
@@ -2308,12 +2349,26 @@ fn actorDispatchServerRequest(
             deadline_ms,
         );
     }
+    const work_bytes = work.byteSize();
+    if (work_bytes > state.server_request_byte_capacity or
+        state.server_request_bytes > state.server_request_byte_capacity - work_bytes)
+    {
+        state.mutex.unlock();
+        return actorEnqueueServerError(
+            state,
+            id_value,
+            -32000,
+            "server request queue byte budget is full",
+            deadline_ms,
+        );
+    }
     work.handler = handler;
     state.server_requests.append(state.allocator, work) catch |err| {
         state.mutex.unlock();
         return err;
     };
     work_owned = false;
+    state.server_request_bytes += work_bytes;
     state.mutex.unlock();
 }
 
@@ -2549,6 +2604,7 @@ fn actorEnqueueOwned(
 ) !void {
     const owned = payload;
     errdefer state.allocator.free(owned);
+    if (owned.len > state.outbound_byte_capacity) return error.ActorQueuePayloadTooLarge;
     while (true) { // tiger: event-loop -- bounded by owner state or deadline.
         state.mutex.lock();
         if (state.terminal != .running) {
@@ -2560,7 +2616,9 @@ fn actorEnqueueOwned(
             state.mutex.unlock();
             return error.RequestDeadlineExceeded;
         }
-        if (state.outbound.items.len < state.outbound_capacity) {
+        if (state.outbound.items.len < state.outbound_capacity and
+            state.outbound_bytes <= state.outbound_byte_capacity - owned.len)
+        {
             state.outbound.append(state.allocator, .{
                 .payload = owned,
                 .deadline_ms = deadline_ms,
@@ -2570,6 +2628,7 @@ fn actorEnqueueOwned(
                 state.mutex.unlock();
                 return err;
             };
+            state.outbound_bytes += owned.len;
             state.mutex.unlock();
             return;
         }
@@ -4928,6 +4987,36 @@ test "actor falsifier rejects zero and unbounded queues before ownership transfe
             .outbound_queue_capacity = max_actor_outbound_queue + 1,
         }),
     );
+    client = serverRequestTestClient();
+    try std.testing.expectError(
+        error.InvalidActorOptions,
+        Actor.initOwned(std.testing.allocator, client, .{ .outbound_queue_bytes = 0 }),
+    );
+}
+
+test "actor queue byte budget rejects one oversized payload below item capacity" {
+    const allocator = std.testing.allocator;
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 8,
+        .outbound_byte_capacity = 4,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    const payload = try allocator.dupe(u8, "12345");
+    try std.testing.expectError(
+        error.ActorQueuePayloadTooLarge,
+        actorEnqueueOwned(&state, payload, monotonicMillis() + 100, false, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.outbound.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.outbound_bytes);
 }
 
 test "actor falsifier saturated stalled writer consumes the request deadline" {
