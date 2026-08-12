@@ -529,7 +529,16 @@ pub const Broker = struct {
             null,
         );
         self.markViewedBatch(pull_request_id, requests, results);
-        try self.readbackViewedBatch(
+        const mutation_may_have_reached = try self.allocator.alloc(bool, results.len);
+        defer self.allocator.free(mutation_may_have_reached);
+        for (results, mutation_may_have_reached) |result, *may_have_reached| {
+            may_have_reached.* = result.error_name == null or std.mem.eql(
+                u8,
+                result.error_name.?,
+                @errorName(error.ProcessOutcomeUnknown),
+            );
+        }
+        const readback = try self.readbackViewedBatch(
             owner,
             name,
             number,
@@ -538,6 +547,14 @@ pub const Broker = struct {
             requests,
             results,
         );
+        if (readback == .generation_changed) {
+            self.compensateViewedBatchGeneration(
+                pull_request_id,
+                requests,
+                mutation_may_have_reached,
+                results,
+            );
+        }
         return results;
     }
 
@@ -586,6 +603,8 @@ pub const Broker = struct {
         self.allocator.free(response);
     }
 
+    const ViewedBatchReadback = enum { current, generation_changed };
+
     fn readbackViewedBatch(
         self: Broker,
         owner: []const u8,
@@ -595,7 +614,7 @@ pub const Broker = struct {
         expected_head: []const u8,
         requests: []const ViewedBatchRequest,
         results: []ViewedBatchResult,
-    ) !void {
+    ) !ViewedBatchReadback {
         var reconciliation = self;
         reconciliation.cancelled = null;
         var readback_pages = reconciliation.callPages(
@@ -606,7 +625,7 @@ pub const Broker = struct {
             number,
         ) catch |err| {
             for (results) |*result| result.error_name = @errorName(err);
-            return;
+            return .current;
         };
         defer freePages(self.allocator, &readback_pages);
         validateBatchPaths(
@@ -618,7 +637,8 @@ pub const Broker = struct {
             results,
         ) catch |err| {
             for (results) |*result| result.error_name = @errorName(err);
-            return;
+            if (err == error.PullRequestChanged) return .generation_changed;
+            return .current;
         };
         for (results) |*result| {
             if (result.viewed) {
@@ -626,6 +646,39 @@ pub const Broker = struct {
             } else if (result.error_name == null) {
                 result.error_name = "MarkViewedReadbackFailed";
             }
+        }
+        return .current;
+    }
+
+    fn compensateViewedBatchGeneration(
+        self: Broker,
+        pull_request_id: []const u8,
+        requests: []const ViewedBatchRequest,
+        mutation_may_have_reached: []const bool,
+        results: []ViewedBatchResult,
+    ) void {
+        var compensation = self;
+        compensation.cancelled = null;
+        for (requests, mutation_may_have_reached, results) |request, may_have_reached, *result| {
+            result.viewed = false;
+            result.error_name = @errorName(error.PullRequestChanged);
+            if (!may_have_reached) continue;
+            const client_id = std.fmt.allocPrint(
+                self.allocator,
+                "{s}-generation-compensation",
+                .{request.client_id},
+            ) catch |err| {
+                result.error_name = @errorName(err);
+                continue;
+            };
+            defer self.allocator.free(client_id);
+            compensation.unmarkViewedWithId(
+                pull_request_id,
+                request.path,
+                client_id,
+            ) catch |err| {
+                result.error_name = @errorName(err);
+            };
         }
     }
 
@@ -664,6 +717,25 @@ pub const Broker = struct {
             expected_head,
             path,
         ) catch |err| {
+            if (err == error.PullRequestChanged) {
+                const request = [_]ViewedBatchRequest{.{
+                    .path = path,
+                    .client_id = client_id,
+                }};
+                var result = [_]ViewedBatchResult{.{ .error_name = mutation_error }};
+                const mutation_may_have_reached = [_]bool{mutation_error == null or std.mem.eql(
+                    u8,
+                    mutation_error.?,
+                    @errorName(error.ProcessOutcomeUnknown),
+                )};
+                self.compensateViewedBatchGeneration(
+                    pull_request_id,
+                    &request,
+                    &mutation_may_have_reached,
+                    &result,
+                );
+                return .{ .viewed = false, .error_name = result[0].error_name };
+            }
             return .{ .viewed = false, .error_name = @errorName(err) };
         };
         return .{

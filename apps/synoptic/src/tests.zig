@@ -2762,7 +2762,7 @@ test "exclusions config mutation readback and failure retention across generatio
     );
 }
 
-test "viewed mutation crossing base generation never issues an unowned inverse" {
+test "viewed mutation crossing base generation compensates its owned effect" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2820,11 +2820,12 @@ test "viewed mutation crossing base generation never issues an unowned inverse" 
     );
     defer allocator.free(results);
     try std.testing.expectEqualStrings("PullRequestChanged", results[0].error_name.?);
-    try tmp.dir.access(io, "viewed", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "viewed", .{}));
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expect(std.mem.indexOf(u8, log, "mark-1-generation-compensation") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
 }
 
