@@ -2015,6 +2015,7 @@ fn actorOutboundExpired(item: ActorOutbound) bool {
 /// connection. Once claimed, every timeout is transport-ambiguous and the
 /// caller must poison the actor before returning.
 fn actorClaimOutboundTransmissionLocked(state: *ActorState, item: ActorOutbound) bool {
+    if (state.terminal != .running) return false;
     const request_id = item.request_id orelse return true;
     const pending = state.pending.get(request_id) orelse return false;
     if (monotonicMillis() >= item.deadline_ms) return false;
@@ -5004,6 +5005,44 @@ test "actor request lease drops expired unsent work and admits the next request"
     try std.testing.expect(next_claimed);
     try std.testing.expect(next_pending.transmission_started);
     try std.testing.expectEqual(protocol.TerminalState.running, state.terminal);
+}
+
+test "actor terminal state rejects every queued outbound transport claim" {
+    const allocator = std.testing.allocator;
+    var pending = ActorPending{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 2,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+        .terminal = .poisoned,
+    };
+    defer state.deinit();
+    try state.pending.put(9, &pending);
+
+    state.mutex.lock();
+    const request_claimed = actorClaimOutboundTransmissionLocked(&state, .{
+        .payload = @constCast("queued-request"),
+        .deadline_ms = monotonicMillis() + 1_000,
+        .poison_on_expiry = false,
+        .request_id = 9,
+    });
+    const reply_claimed = actorClaimOutboundTransmissionLocked(&state, .{
+        .payload = @constCast("queued-reply"),
+        .deadline_ms = monotonicMillis() + 1_000,
+        .poison_on_expiry = true,
+    });
+    state.mutex.unlock();
+
+    try std.testing.expect(!request_claimed);
+    try std.testing.expect(!reply_claimed);
+    try std.testing.expect(!pending.transmission_started);
 }
 
 test "actor falsifier expired outbound work is never eligible for transport" {
