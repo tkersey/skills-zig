@@ -124,12 +124,11 @@ fn captureChildPipes(
         .limit = stderr_limit,
     };
     child.stderr = null;
-    const stdout_thread = try std.Thread.spawn(.{}, PipeCapture.run, .{&stdout_capture});
-    const stderr_thread = std.Thread.spawn(
-        .{},
-        PipeCapture.run,
-        .{&stderr_capture},
-    ) catch |err| {
+    const stdout_thread = spawnPipeCapture(&stdout_capture) catch |err| {
+        stderr_capture.file.close(io);
+        return err;
+    };
+    const stderr_thread = spawnPipeCapture(&stderr_capture) catch |err| {
         child.kill(io);
         stdout_thread.join();
         return err;
@@ -144,6 +143,11 @@ fn captureChildPipes(
     errdefer allocator.free(stdout);
     const stderr = stderr_capture.bytes orelse return error.ProcessTransportFailed;
     return .{ .stdout = stdout, .stderr = stderr };
+}
+
+fn spawnPipeCapture(capture: *PipeCapture) !std.Thread {
+    errdefer capture.file.close(capture.io);
+    return std.Thread.spawn(.{}, PipeCapture.run, .{capture});
 }
 
 fn runCapturedProcess(
