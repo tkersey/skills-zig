@@ -222,6 +222,11 @@ pub const ActionStore = struct {
     cards: std.ArrayList(ActionCard) = .empty,
     next_id: u64 = 1,
 
+    const PendingSlot = struct {
+        index: ?usize = null,
+        id: ?[]const u8 = null,
+    };
+
     pub fn deinit(self: *ActionStore) void {
         for (self.cards.items) |card| self.freeCard(card);
         self.cards.deinit(self.allocator);
@@ -241,14 +246,7 @@ pub const ActionStore = struct {
             input.variables.?,
             authoritative.pull_request_id,
         );
-        var superseded_index: ?usize = null;
-        var supersedes: ?[]const u8 = null;
-        for (self.cards.items, 0..) |card, index| if (card.status == .pending and
-            std.mem.eql(u8, card.session_id, session_id) and std.mem.eql(u8, card.slot, input.slot))
-        {
-            superseded_index = index;
-            supersedes = card.id;
-        };
+        const pending_slot = self.pendingSlot(session_id, input.slot);
         const id = try std.fmt.allocPrint(self.allocator, "act-{d}", .{self.next_id});
         errdefer self.allocator.free(id);
         self.next_id += 1;
@@ -286,7 +284,7 @@ pub const ActionStore = struct {
             },
             .body = try dupeOptional(self.allocator, input.body),
             .payload_json = try self.allocator.dupe(u8, input.payload_json),
-            .supersedes = try dupeOptional(self.allocator, supersedes),
+            .supersedes = try dupeOptional(self.allocator, pending_slot.id),
         };
         errdefer self.freeCard(card);
         if (input.kind == .graphql) card.graphql = .{
@@ -295,8 +293,19 @@ pub const ActionStore = struct {
             .variables = try self.allocator.dupe(u8, input.variables.?),
         };
         try self.cards.append(self.allocator, card);
-        if (superseded_index) |index| self.cards.items[index].status = .superseded;
+        if (pending_slot.index) |index| self.cards.items[index].status = .superseded;
         return &self.cards.items[self.cards.items.len - 1];
+    }
+
+    fn pendingSlot(self: *const ActionStore, session_id: []const u8, slot: []const u8) PendingSlot {
+        var result = PendingSlot{};
+        for (self.cards.items, 0..) |card, index| if (card.status == .pending and
+            std.mem.eql(u8, card.session_id, session_id) and std.mem.eql(u8, card.slot, slot))
+        {
+            result.index = index;
+            result.id = card.id;
+        };
+        return result;
     }
 
     pub fn pendingIdForSlot(
