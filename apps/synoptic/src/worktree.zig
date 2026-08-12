@@ -1012,22 +1012,31 @@ fn deleteConfined(io: std.Io, root: []const u8, relative: []const u8) !void {
             return error.UnsafeManagedArtifactPath;
         }
     }
-    var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
+    var dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer dir.close(io);
-    dir.deleteFile(io, relative) catch |err| switch (err) {
-        error.IsDir => try dir.deleteTree(io, relative),
+    if (std.fs.path.dirname(relative)) |parent| {
+        var parents = std.mem.splitScalar(u8, parent, std.fs.path.sep);
+        while (parents.next()) |component| {
+            const next = dir.openDir(
+                io,
+                component,
+                .{ .follow_symlinks = false },
+            ) catch return error.UnsafeManagedArtifactPath;
+            dir.close(io);
+            dir = next;
+        }
+    }
+    const leaf = std.fs.path.basename(relative);
+    const stat = dir.statFile(io, leaf, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .directory) {
+        try dir.deleteTree(io, leaf);
+    } else dir.deleteFile(io, leaf) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    var parent = std.fs.path.dirname(relative);
-    while (parent) |value| {
-        if (value.len == 0 or std.mem.eql(u8, value, ".")) break;
-        dir.deleteDir(io, value) catch |err| switch (err) {
-            error.DirNotEmpty, error.FileNotFound => break,
-            else => return err,
-        };
-        parent = std.fs.path.dirname(value);
-    }
 }
 
 pub fn ensureObjectAvailable(
@@ -1364,6 +1373,33 @@ test "worktree integrity authoritative git child receives no repository selector
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     try std.testing.expectEqualStrings("unset", result.stdout);
+}
+
+test "worktree integrity cleanup rejects an intermediate symlink" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "managed");
+    try tmp.dir.createDirPath(io, "outside");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/sentinel", .data = "keep\n" });
+    const managed = try tmp.dir.realPathFileAlloc(io, "managed", allocator);
+    defer allocator.free(managed);
+    const outside = try tmp.dir.realPathFileAlloc(io, "outside", allocator);
+    defer allocator.free(outside);
+    try tmp.dir.symLink(io, outside, "managed/escape", .{ .is_directory = true });
+    try std.testing.expectError(
+        error.UnsafeManagedArtifactPath,
+        deleteConfined(io, managed, "escape/sentinel"),
+    );
+    const sentinel = try tmp.dir.readFileAlloc(
+        io,
+        "outside/sentinel",
+        allocator,
+        .limited(32),
+    );
+    defer allocator.free(sentinel);
+    try std.testing.expectEqualStrings("keep\n", sentinel);
 }
 
 test "repository remote matching normalizes transport default ports" {
