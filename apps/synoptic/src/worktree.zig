@@ -312,17 +312,18 @@ pub const RefreshLease = struct {
                     self.previous = null;
                     return error.ReusedCheckoutRollbackFailed;
                 };
-                requireReusedUnchanged(
+                rollbackReused(
                     self.allocator,
                     self.io,
                     cwd,
-                    self.baseline,
+                    branch,
+                    self.baseline.head_oid,
+                    &previous,
                 ) catch {
                     previous.deinit();
                     self.previous = null;
                     return error.ReusedCheckoutRollbackFailed;
                 };
-                try rollbackReused(self.allocator, self.io, cwd, branch, &previous);
                 self.baseline.replace(previous);
                 self.previous = null;
             },
@@ -785,13 +786,13 @@ fn synchronizeReused(
     defer allocator.free(merge.stderr);
     const merge_failed = merge.term != .exited or merge.term.exited != 0;
     if (merge_failed) {
-        rollbackReused(allocator, io, cwd, branch, baseline) catch {
+        rollbackReused(allocator, io, cwd, branch, next_head, baseline) catch {
             return error.ReusedCheckoutRollbackFailed;
         };
         return error.ReusedCheckoutFastForwardFailed;
     }
     const next = Baseline.capture(allocator, io, cwd) catch |capture_error| {
-        try rollbackReused(allocator, io, cwd, branch, baseline);
+        try rollbackReused(allocator, io, cwd, branch, next_head, baseline);
         return capture_error;
     };
     if (!std.mem.eql(u8, next.head_oid, next_head) or
@@ -802,7 +803,7 @@ fn synchronizeReused(
     {
         var invalid = next;
         invalid.deinit();
-        try rollbackReused(allocator, io, cwd, branch, baseline);
+        try rollbackReused(allocator, io, cwd, branch, next_head, baseline);
         return error.ReusedCheckoutRefreshRequiresManagedMigration;
     }
     baseline.replace(next);
@@ -813,6 +814,7 @@ fn rollbackReused(
     io: std.Io,
     cwd: []const u8,
     branch: []const u8,
+    transition_head: []const u8,
     baseline: *const Baseline,
 ) !void {
     const status = try statusAlloc(allocator, io, cwd);
@@ -826,6 +828,20 @@ fn rollbackReused(
     if (status.len != 0 or !samePaths(artifacts.items, baseline.artifacts.items)) {
         return error.ReusedCheckoutRollbackUnsafe;
     }
+    const current_head_raw = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.WorktreeHeadReadFailed,
+    );
+    defer allocator.free(current_head_raw);
+    const current_head = std.mem.trim(u8, current_head_raw, "\r\n");
+    if (!std.mem.eql(u8, current_head, baseline.head_oid) and
+        !std.mem.eql(u8, current_head, transition_head))
+    {
+        return error.ReusedCheckoutRollbackUnsafe;
+    }
     const current_branch = try gitOutput(
         allocator,
         io,
@@ -835,14 +851,10 @@ fn rollbackReused(
     );
     defer allocator.free(current_branch);
     if (!std.mem.eql(u8, std.mem.trim(u8, current_branch, "\r\n"), branch)) {
-        const restore_branch = try runGitCommand(allocator, io, cwd, &.{
-            "git", "-c", "core.hooksPath=/dev/null", "switch", branch,
-        });
-        defer allocator.free(restore_branch.stdout);
-        defer allocator.free(restore_branch.stderr);
-        if (restore_branch.term != .exited or restore_branch.term.exited != 0) {
-            return error.ReusedCheckoutRollbackFailed;
-        }
+        return error.ReusedCheckoutRollbackUnsafe;
+    }
+    if (std.mem.eql(u8, current_head, baseline.head_oid)) {
+        return requireReusedUnchanged(allocator, io, cwd, baseline);
     }
     const reset = try runGitCommand(allocator, io, cwd, &.{
         "git",
