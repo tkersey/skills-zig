@@ -1257,16 +1257,45 @@ pub const Server = struct {
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
         runtime.worktree_generation_valid = false;
-        try self.refreshWorktree(runtime, &next);
+        var refresh_lease = try self.beginRefreshWorktree(runtime, &next);
+        self.finishRefresh(
+            runtime,
+            &refreshed,
+            &next,
+            &next_owned,
+            mutex,
+            &locked,
+        ) catch |err| {
+            if (locked) {
+                mutex.unlock();
+                locked = false;
+            }
+            refresh_lease.rollback() catch return error.ReusedCheckoutRollbackFailed;
+            return err;
+        };
+        refresh_lease.commit();
+        runtime.registry.endSynchronization();
+        synchronizing = false;
+    }
+
+    fn finishRefresh(
+        self: *Server,
+        runtime: *Runtime,
+        refreshed: *github.GenerationSnapshot,
+        next: *@import("domain.zig").PrGeneration,
+        next_owned: *bool,
+        mutex: *DomainMutex,
+        locked: *bool,
+    ) !void {
         try github.rebindGenerationLineage(
             self.allocator,
             self.io,
             runtime.cwd,
             &runtime.app.generation,
-            &next,
+            next,
         );
-        try self.refreshTabDiffs(runtime, &next);
-        try self.markChangedSessions(runtime, &next);
+        try self.refreshTabDiffs(runtime, next);
+        try self.markChangedSessions(runtime, next);
         const repository = try std.fmt.allocPrint(
             self.allocator,
             "{s}/{s}",
@@ -1286,8 +1315,8 @@ pub const Server = struct {
             .state = refreshed.metadata.state,
             .is_draft = refreshed.metadata.is_draft,
         });
-        runtime.app.replaceGeneration(next);
-        next_owned = false;
+        runtime.app.replaceGeneration(next.*);
+        next_owned.* = false;
         try self.applyRefreshExclusionBatch(runtime);
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         const primary_update = try self.primaryUpdateAlloc(runtime);
@@ -1297,24 +1326,22 @@ pub const Server = struct {
         );
         defer file_metadata_pages.deinit();
         mutex.unlock();
-        locked = false;
+        locked.* = false;
         try runtime.registry.updatePrimary(primary_update, file_metadata_pages.items.items);
         mutex.lock();
-        locked = true;
+        locked.* = true;
         runtime.worktree_generation_valid = true;
         runtime.app.action_state_fresh = true;
         mutex.unlock();
-        locked = false;
-        runtime.registry.endSynchronization();
-        synchronizing = false;
+        locked.* = false;
     }
 
-    fn refreshWorktree(
+    fn beginRefreshWorktree(
         self: *Server,
         runtime: *Runtime,
         next: *@import("domain.zig").PrGeneration,
-    ) !void {
-        try worktree.synchronize(
+    ) !worktree.RefreshLease {
+        var lease = try worktree.beginRefresh(
             self.allocator,
             self.io,
             runtime.custody,
@@ -1323,13 +1350,17 @@ pub const Server = struct {
             runtime.baseline orelse return error.MissingWorktreeBaseline,
             runtime.fetch_source,
         );
-        try github.hydrateRevisionKeys(
+        github.hydrateRevisionKeys(
             self.allocator,
             self.io,
             runtime.cwd,
             runtime.fetch_source,
             next,
-        );
+        ) catch |err| {
+            try lease.rollback();
+            return err;
+        };
+        return lease;
     }
 
     fn refreshTabDiffs(

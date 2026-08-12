@@ -3681,6 +3681,54 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
     );
 }
 
+test "refresh lease restores reused checkout after a downstream failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    const original_head = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(original_head);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "next\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "next" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const next_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(next_raw);
+    const next_head = std.mem.trim(u8, next_raw, "\r\n");
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "reset", "--hard", original_head },
+    ));
+    var lease = try worktree.beginRefresh(
+        allocator,
+        io,
+        .{ .reused_current = root },
+        root,
+        next_head,
+        &baseline,
+        null,
+    );
+    try std.testing.expectEqualStrings(next_head, baseline.head_oid);
+    try lease.rollback();
+    try std.testing.expectEqualStrings(original_head, baseline.head_oid);
+}
+
 fn verifyReusedCustodyDrift(
     allocator: std.mem.Allocator,
     io: std.Io,

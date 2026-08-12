@@ -224,11 +224,117 @@ pub const Baseline = struct {
         self.artifacts.deinit(self.allocator);
     }
 
+    pub fn clone(self: *const Baseline) !Baseline {
+        var copy = Baseline{
+            .allocator = self.allocator,
+            .head_oid = try self.allocator.dupe(u8, self.head_oid),
+            .branch = null,
+            .porcelain_v2 = undefined,
+            .tracked_digest = self.tracked_digest,
+        };
+        errdefer self.allocator.free(copy.head_oid);
+        copy.branch = if (self.branch) |branch|
+            try self.allocator.dupe(u8, branch)
+        else
+            null;
+        errdefer if (copy.branch) |branch| self.allocator.free(branch);
+        copy.porcelain_v2 = try self.allocator.dupe(u8, self.porcelain_v2);
+        errdefer self.allocator.free(copy.porcelain_v2);
+        errdefer {
+            for (copy.artifacts.items) |path| self.allocator.free(path);
+            copy.artifacts.deinit(self.allocator);
+        }
+        for (self.artifacts.items) |path| {
+            try appendArtifactClone(self.allocator, &copy.artifacts, path);
+        }
+        return copy;
+    }
+
     fn replace(self: *Baseline, next: Baseline) void {
         self.deinit();
         self.* = next;
     }
 };
+
+fn appendArtifactClone(
+    allocator: std.mem.Allocator,
+    artifacts: *std.ArrayList([]u8),
+    path: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned);
+    try artifacts.append(allocator, owned);
+}
+
+pub const RefreshLease = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+    baseline: *Baseline,
+    previous: ?Baseline,
+
+    pub fn commit(self: *RefreshLease) void {
+        if (self.previous) |*previous| previous.deinit();
+        self.previous = null;
+    }
+
+    pub fn rollback(self: *RefreshLease) !void {
+        var previous = self.previous orelse return error.RefreshLeaseAlreadyFinished;
+        switch (self.custody) {
+            .reused_current => |cwd| {
+                const branch = previous.branch orelse
+                    return error.ReusedCheckoutRollbackFailed;
+                try rollbackReused(self.allocator, self.io, cwd, branch, &previous);
+                self.baseline.replace(previous);
+                self.previous = null;
+            },
+            .managed => {
+                try synchronizeManaged(
+                    self.allocator,
+                    self.io,
+                    self.custody,
+                    self.repository_cwd,
+                    previous.head_oid,
+                    self.baseline,
+                    null,
+                );
+                previous.deinit();
+                self.previous = null;
+            },
+        }
+    }
+};
+
+pub fn beginRefresh(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+    next_head: []const u8,
+    baseline: *Baseline,
+    fetch_source: ?FetchSource,
+) !RefreshLease {
+    var previous = try baseline.clone();
+    errdefer previous.deinit();
+    try synchronize(
+        allocator,
+        io,
+        custody,
+        repository_cwd,
+        next_head,
+        baseline,
+        fetch_source,
+    );
+    return .{
+        .allocator = allocator,
+        .io = io,
+        .custody = custody,
+        .repository_cwd = repository_cwd,
+        .baseline = baseline,
+        .previous = previous,
+    };
+}
 
 pub fn isClean(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !bool {
     const status = try statusAlloc(allocator, io, cwd);
@@ -1200,6 +1306,8 @@ test "worktree integrity reused rollback restores exact branch and head" {
     );
     defer allocator.free(next_raw);
     const next_head = std.mem.trim(u8, next_raw, "\r\n");
+    const original_head = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(original_head);
     allocator.free(try gitOutput(
         allocator,
         io,
@@ -1207,13 +1315,17 @@ test "worktree integrity reused rollback restores exact branch and head" {
         &.{ "git", "switch", "feature" },
         error.TestGitFailed,
     ));
-    allocator.free(try gitOutput(
+    var lease = try beginRefresh(
         allocator,
         io,
+        .{ .reused_current = root },
         root,
-        &.{ "git", "merge", "--ff-only", next_head },
-        error.TestGitFailed,
-    ));
-    try rollbackReused(allocator, io, root, baseline.branch.?, &baseline);
+        next_head,
+        &baseline,
+        null,
+    );
+    try std.testing.expectEqualStrings(next_head, baseline.head_oid);
+    try lease.rollback();
+    try std.testing.expectEqualStrings(original_head, baseline.head_oid);
     try requireReusedUnchanged(allocator, io, root, &baseline);
 }
