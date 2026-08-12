@@ -696,29 +696,48 @@ pub fn synchronizeManaged(
     defer allocator.free(checkout.stdout);
     defer allocator.free(checkout.stderr);
     const checkout_failed = checkout.term != .exited or checkout.term.exited != 0;
-    if (checkout_failed) return error.ManagedWorktreeRefreshFailed;
-    const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
-        const rollback = try runGitCommand(
-            allocator,
-            io,
-            custody.path(),
-            &.{
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "checkout",
-                "--detach",
-                baseline.head_oid,
-            },
-        );
-        defer allocator.free(rollback.stdout);
-        defer allocator.free(rollback.stderr);
-        if (rollback.term != .exited or rollback.term.exited != 0) {
+    if (checkout_failed) {
+        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
-        }
+        };
+        return error.ManagedWorktreeRefreshFailed;
+    }
+    const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
+        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
+            return error.ManagedWorktreeRollbackFailed;
+        };
         return capture_error;
     };
     baseline.replace(next);
+}
+
+fn rollbackManagedTransition(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    baseline: *const Baseline,
+) !void {
+    const rollback = try runGitCommand(
+        allocator,
+        io,
+        root,
+        &.{
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "--detach",
+            baseline.head_oid,
+        },
+    );
+    defer allocator.free(rollback.stdout);
+    defer allocator.free(rollback.stderr);
+    if (rollback.term != .exited or rollback.term.exited != 0) {
+        return error.ManagedWorktreeRollbackFailed;
+    }
+    cleanManaged(allocator, io, root, baseline.head_oid, baseline) catch {
+        return error.ManagedWorktreeRollbackFailed;
+    };
 }
 
 fn synchronizeReused(
@@ -765,7 +784,12 @@ fn synchronizeReused(
     defer allocator.free(merge.stdout);
     defer allocator.free(merge.stderr);
     const merge_failed = merge.term != .exited or merge.term.exited != 0;
-    if (merge_failed) return error.ReusedCheckoutFastForwardFailed;
+    if (merge_failed) {
+        rollbackReused(allocator, io, cwd, branch, baseline) catch {
+            return error.ReusedCheckoutRollbackFailed;
+        };
+        return error.ReusedCheckoutFastForwardFailed;
+    }
     const next = Baseline.capture(allocator, io, cwd) catch |capture_error| {
         try rollbackReused(allocator, io, cwd, branch, baseline);
         return capture_error;
@@ -1654,6 +1678,77 @@ test "worktree integrity reused rollback restores exact branch and head" {
     try requireReusedUnchanged(allocator, io, root, &baseline);
 
     try expectRollbackRefusesExternalCommit(allocator, io, root, next_head, &baseline);
+}
+
+fn testHeadAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]u8 {
+    return gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+}
+
+test "worktree integrity managed transition rollback restores partial state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    const base_raw = try testHeadAlloc(allocator, io, repo);
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "worktree", "add", "--detach", managed, base },
+        error.TestGitFailed,
+    ));
+    var baseline = try Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "next\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "next" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    const next_raw = try testHeadAlloc(allocator, io, repo);
+    defer allocator.free(next_raw);
+    const next = std.mem.trim(u8, next_raw, "\r\n");
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "checkout", "--detach", next },
+        error.TestGitFailed,
+    ));
+    const artifact_path = try std.fs.path.join(allocator, &.{ managed, "artifact.tmp" });
+    defer allocator.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = artifact_path,
+        .data = "artifact\n",
+    });
+    try rollbackManagedTransition(allocator, io, managed, &baseline);
+    var observed = try Baseline.capture(allocator, io, managed);
+    defer observed.deinit();
+    try std.testing.expectEqualStrings(base, observed.head_oid);
+    try std.testing.expectEqual(@as(usize, 0), observed.porcelain_v2.len);
+    try std.testing.expect(samePaths(observed.artifacts.items, baseline.artifacts.items));
 }
 
 test "managed worktree checkout ignores local replacement objects" {
