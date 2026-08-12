@@ -7,8 +7,10 @@ const fetch_output_limit: usize = 1024 * 1024;
 pub const FetchSource = struct {
     allocator: ?std.mem.Allocator = null,
     environment: ?*const std.process.Environ.Map = null,
-    url: []const u8,
-    remote_name: ?[]const u8 = null,
+    remote_name: []const u8,
+    repository_host: []const u8 = "",
+    repository_owner: []const u8 = "",
+    repository_name: []const u8 = "",
     timeout_ms: u32 = fetch_timeout_ms,
     termination_grace_ms: u32 = fetch_termination_grace_ms,
 
@@ -52,11 +54,21 @@ pub const FetchSource = struct {
                 owner,
                 repository,
             )) continue;
+            const remote_name = try allocator.dupe(u8, remote);
+            errdefer allocator.free(remote_name);
+            const repository_host = try allocator.dupe(u8, host);
+            errdefer allocator.free(repository_host);
+            const repository_owner = try allocator.dupe(u8, owner);
+            errdefer allocator.free(repository_owner);
+            const repository_name = try allocator.dupe(u8, repository);
+            errdefer allocator.free(repository_name);
             return .{
                 .allocator = allocator,
                 .environment = environment,
-                .url = try allocator.dupe(u8, std.mem.trim(u8, url, "\r\n")),
-                .remote_name = try allocator.dupe(u8, remote),
+                .remote_name = remote_name,
+                .repository_host = repository_host,
+                .repository_owner = repository_owner,
+                .repository_name = repository_name,
             };
         }
         return error.GitFetchSourceUnavailable;
@@ -64,8 +76,10 @@ pub const FetchSource = struct {
 
     pub fn deinit(self: *FetchSource) void {
         if (self.allocator) |allocator| {
-            allocator.free(self.url);
-            if (self.remote_name) |name| allocator.free(name);
+            allocator.free(self.remote_name);
+            allocator.free(self.repository_host);
+            allocator.free(self.repository_owner);
+            allocator.free(self.repository_name);
         }
         self.* = undefined;
     }
@@ -133,12 +147,12 @@ pub fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]cons
 }
 
 fn stripTransportPort(scheme: []const u8, port: []const u8) bool {
-    const strip_any = std.ascii.eqlIgnoreCase(scheme, "ssh") or
-        std.ascii.eqlIgnoreCase(scheme, "git");
     const default_port = (std.ascii.eqlIgnoreCase(scheme, "https") and
         std.mem.eql(u8, port, "443")) or
-        (std.ascii.eqlIgnoreCase(scheme, "http") and std.mem.eql(u8, port, "80"));
-    return strip_any or default_port;
+        (std.ascii.eqlIgnoreCase(scheme, "http") and std.mem.eql(u8, port, "80")) or
+        (std.ascii.eqlIgnoreCase(scheme, "ssh") and std.mem.eql(u8, port, "22")) or
+        (std.ascii.eqlIgnoreCase(scheme, "git") and std.mem.eql(u8, port, "9418"));
+    return default_port;
 }
 
 pub const Custody = union(enum) {
@@ -1005,13 +1019,13 @@ fn spawnFetchProcess(
             argv_buffer[0] = "git";
             argv_buffer[1] = "fetch";
             argv_buffer[2] = "--no-tags";
-            argv_buffer[3] = source.url;
+            argv_buffer[3] = source.remote_name;
             argv_buffer[4] = oid;
             break :argv argv_buffer[0..5];
         },
         .unshallow => |commits| argv: {
             argv_buffer = .{
-                "git",        "fetch",      "--no-tags", "--unshallow", source.url,
+                "git",        "fetch",      "--no-tags", "--unshallow", source.remote_name,
                 commits.base, commits.head,
             };
             break :argv argv_buffer[0..7];
@@ -1109,6 +1123,18 @@ test "repository remote matching normalizes transport default ports" {
     try std.testing.expect(remoteMatchesRepository(
         "https://github.example.test:8443/owner/repo.git",
         "github.example.test:8443",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(remoteMatchesRepository(
+        "ssh://token:secret@github.example.test:2222/owner/repo.git",
+        "github.example.test:2222",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(!remoteMatchesRepository(
+        "ssh://git@github.example.test:2223/owner/repo.git",
+        "github.example.test:2222",
         "owner",
         "repo",
     ));
