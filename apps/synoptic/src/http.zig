@@ -753,14 +753,8 @@ pub const Server = struct {
         if (std.mem.eql(u8, event.method, "session.close.requested")) {
             return self.flushClosedSession(stream, runtime, event);
         }
-        if (event.session_id) |session_id| {
-            if (std.mem.eql(u8, event.method, "turn/started")) {
-                runtime.app.setTabTurnActive(session_id, true);
-            } else if (std.mem.eql(u8, event.method, "turn/completed") or
-                std.mem.eql(u8, event.method, "turn/failed"))
-            {
-                runtime.app.setTabTurnActive(session_id, false);
-            }
+        if (event.session_id != null and isTurnProjectionEvent(event.method)) {
+            runtime.app.synchronizeTabTurnStates(runtime.registry);
         }
         const payload = try ui.visibleEventPayloadAlloc(
             self.allocator,
@@ -772,6 +766,12 @@ pub const Server = struct {
         const envelope = try runtime.app.nextEnvelope("session.item.delta", payload);
         defer self.allocator.free(envelope);
         try writeServerText(self.io, stream, envelope);
+    }
+
+    fn isTurnProjectionEvent(method: []const u8) bool {
+        return std.mem.eql(u8, method, "turn/started") or
+            std.mem.eql(u8, method, "turn/completed") or
+            std.mem.eql(u8, method, "turn/failed");
     }
 
     fn flushPreparedAction(
@@ -2059,6 +2059,13 @@ test "command errors preserve only bounded request correlation" {
     );
     defer allocator.free(uncorrelated);
     try std.testing.expectEqualStrings("{\"code\":\"InvalidUiCommand\"}", uncorrelated);
+}
+
+test "turn projection events always re-read registry-authoritative turn state" {
+    try std.testing.expect(Server.isTurnProjectionEvent("turn/started"));
+    try std.testing.expect(Server.isTurnProjectionEvent("turn/completed"));
+    try std.testing.expect(Server.isTurnProjectionEvent("turn/failed"));
+    try std.testing.expect(!Server.isTurnProjectionEvent("item/completed"));
 }
 
 test "static assets are not state-bearing authorization targets" {
