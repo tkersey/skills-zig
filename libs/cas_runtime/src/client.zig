@@ -1548,6 +1548,8 @@ const ActorState = struct {
     transport_mutex: ActorMutex = .{},
     terminal: protocol.TerminalState = .running,
     transport_closed: bool = false,
+    teardown_started: bool = false,
+    active_calls: usize = 0,
     outbound: std.ArrayList(ActorOutbound) = .empty,
     outbound_capacity: usize,
     server_requests: std.ArrayList(ActorServerRequest) = .empty,
@@ -1579,6 +1581,8 @@ const ActorState = struct {
         self.client.deinit();
     }
 };
+
+threadlocal var actor_callback_state: ?*ActorState = null;
 
 /// Owner-lived app-server actor. Exactly one reader owns response routing;
 /// callers may issue concurrent requests while the bounded writer queue owns
@@ -1646,6 +1650,14 @@ pub const Actor = struct {
 
     pub fn deinit(self: *Actor) void {
         const state = self.state;
+        state.mutex.lock();
+        if (state.teardown_started) {
+            state.mutex.unlock();
+            self.* = undefined;
+            return;
+        }
+        state.teardown_started = true;
+        state.mutex.unlock();
         actorSetTerminal(state, .stopped);
         state.mutex.lock();
         const active_handler = if (state.active_server_handlers > 0)
@@ -1656,17 +1668,20 @@ pub const Actor = struct {
         if (active_handler) |handler| handler.cancel(handler.context);
         // Closing the underlying transport releases a reader blocked in I/O.
         actorCloseTransportOnce(state);
-        if (state.writer_thread) |thread| thread.join();
-        if (state.reader_thread) |thread| thread.join();
-        if (state.handler_thread) |thread| thread.join();
-        actorWaitForServerHandlers(state);
-        if (state.notification_thread) |thread| thread.join();
-        state.deinit();
-        state.allocator.destroy(state);
+        if (actor_callback_state == state) {
+            const reaper = std.Thread.spawn(.{}, actorDestroyState, .{state}) catch {
+                return;
+            };
+            reaper.detach();
+            return;
+        }
+        actorDestroyState(state);
         self.* = undefined;
     }
 
     pub fn terminalState(self: *const Actor) protocol.TerminalState {
+        actorAcquireCall(self.state) catch return .stopped;
+        defer actorReleaseCall(self.state);
         self.state.mutex.lock();
         defer self.state.mutex.unlock();
         return self.state.terminal;
@@ -1676,6 +1691,8 @@ pub const Actor = struct {
         self: *Actor,
         subscription: protocol.NotificationHandler,
     ) !void {
+        try actorAcquireCall(self.state);
+        defer actorReleaseCall(self.state);
         self.state.mutex.lock();
         defer self.state.mutex.unlock();
         if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
@@ -1689,6 +1706,8 @@ pub const Actor = struct {
         self: *Actor,
         handler: ?protocol.ServerRequestHandler,
     ) !void {
+        try actorAcquireCall(self.state);
+        defer actorReleaseCall(self.state);
         self.state.mutex.lock();
         defer self.state.mutex.unlock();
         if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
@@ -1706,6 +1725,8 @@ pub const Actor = struct {
         params_json: ?[]const u8,
         timeout_ms: ?u32,
     ) ![]u8 {
+        try actorAcquireCall(self.state);
+        defer actorReleaseCall(self.state);
         const budget_ms = timeout_ms orelse self.state.default_request_timeout_ms;
         if (budget_ms == 0) return error.InvalidRequestDeadline;
         const deadline = monotonicMillis() + @as(i64, budget_ms);
@@ -1805,6 +1826,46 @@ pub const Actor = struct {
         }
     }
 };
+
+fn actorAcquireCall(state: *ActorState) !void {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (state.teardown_started) return error.ActorStopped;
+    state.active_calls += 1;
+}
+
+fn actorReleaseCall(state: *ActorState) void {
+    state.mutex.lock();
+    std.debug.assert(state.active_calls > 0);
+    state.active_calls -= 1;
+    state.mutex.unlock();
+}
+
+fn actorWaitForCalls(state: *ActorState) void {
+    while (true) { // tiger: event-loop -- bounded by admitted public calls.
+        state.mutex.lock();
+        const active = state.active_calls;
+        state.mutex.unlock();
+        if (active == 0) return;
+        std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch |ignored_error| {
+            switch (ignored_error) {
+                else => {},
+            }
+        };
+    }
+}
+
+fn actorDestroyState(state: *ActorState) void {
+    if (state.writer_thread) |thread| thread.join();
+    if (state.reader_thread) |thread| thread.join();
+    if (state.handler_thread) |thread| thread.join();
+    actorWaitForServerHandlers(state);
+    if (state.notification_thread) |thread| thread.join();
+    actorWaitForCalls(state);
+    const allocator = state.allocator;
+    state.deinit();
+    allocator.destroy(state);
+}
 
 fn startActorDispatchThreads(state: *ActorState) !void {
     state.notification_thread = std.Thread.spawn(
@@ -1958,6 +2019,9 @@ fn actorHandlerMain(state: *ActorState) void {
 fn actorServerRequestWorker(state: *ActorState, work: ActorServerRequest) void {
     defer actorFinishServerHandler(state);
     defer work.deinit(state.allocator);
+    const previous_callback_state = actor_callback_state;
+    actor_callback_state = state;
+    defer actor_callback_state = previous_callback_state;
     actorHandleServerRequest(state, work) catch |err| switch (err) {
         error.RequestDeadlineExceeded => {
             actorSetTerminal(state, .poisoned);
@@ -2036,6 +2100,9 @@ fn actorNotificationMain(state: *ActorState) void {
         state.mutex.unlock();
         if (maybe_notification) |notification| {
             defer notification.deinit(state.allocator);
+            const previous_callback_state = actor_callback_state;
+            actor_callback_state = state;
+            defer actor_callback_state = previous_callback_state;
             actorInvokeNotificationHandlers(
                 state,
                 notification.method,
@@ -2136,7 +2203,13 @@ fn actorInvokeNotificationHandlers(
     state.mutex.unlock();
     defer state.allocator.free(subscriptions);
     const notification = protocol.Notification{ .method = method, .raw_json = line };
-    for (subscriptions) |subscription| subscription.handle(subscription.context, notification);
+    for (subscriptions) |subscription| {
+        subscription.handle(subscription.context, notification);
+        state.mutex.lock();
+        const teardown_started = state.teardown_started;
+        state.mutex.unlock();
+        if (teardown_started) break;
+    }
 }
 
 fn actorDispatchServerRequest(
@@ -4302,6 +4375,18 @@ const NestedNotificationProbe = struct {
     }
 };
 
+const TeardownNotificationProbe = struct {
+    actor: *Actor,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *TeardownNotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        self.actor.deinit();
+        self.completed.store(true, .release);
+    }
+};
+
 const ServerRequestProbe = struct {
     calls: usize = 0,
 
@@ -4567,6 +4652,49 @@ test "actor falsifier notification callbacks may issue nested requests" {
     try std.testing.expect(probe.failure == null);
     try std.testing.expect(probe.completed);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+}
+
+test "actor teardown waits for an admitted external request" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "deadline");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+    var call = ActorCall{ .actor = &actor, .method = "actor/deadline", .timeout_ms = 5_000 };
+    const thread = try std.Thread.spawn(.{}, ActorCall.run, .{&call});
+    var request_observed = false;
+    for (0..500) |_| {
+        if (std.Io.Dir.cwd().access(std.testing.io, fixture.reply_log, .{})) |_| {
+            request_observed = true;
+            break;
+        } else |_| {}
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(request_observed);
+    actor.deinit();
+    thread.join();
+    if (call.result) |result| allocator.free(result);
+    try std.testing.expect(call.failure != null);
+}
+
+test "actor callback teardown defers destruction instead of self joining" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "nested_notification");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+    var probe = TeardownNotificationProbe{ .actor = &actor };
+    try actor.subscribe(.{ .context = &probe, .handle = TeardownNotificationProbe.observe });
+    var call = ActorCall{ .actor = &actor, .method = "actor/original", .timeout_ms = 2_000 };
+    const thread = try std.Thread.spawn(.{}, ActorCall.run, .{&call});
+    for (0..1_000) |_| {
+        if (probe.completed.load(.acquire)) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(probe.completed.load(.acquire));
+    thread.join();
+    if (call.result) |result| allocator.free(result);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
 }
 
 test "actor falsifier nested request in server handler cannot deadlock permanent reader" {
