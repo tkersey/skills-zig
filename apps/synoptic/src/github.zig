@@ -341,7 +341,8 @@ pub const Broker = struct {
         number: u64,
     ) !void {
         const outer_count = pages.items.len;
-        for (pages.items[0..outer_count]) |page| {
+        for (0..outer_count) |index| {
+            const page = pages.items[index];
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
                 self.allocator,
