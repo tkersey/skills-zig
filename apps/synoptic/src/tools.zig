@@ -250,55 +250,130 @@ pub const ActionStore = struct {
             authoritative.pull_request_id,
         );
         const pending_slot = self.pendingSlot(session_id, input.slot);
-        const id = try std.fmt.allocPrint(self.allocator, "act-{d}", .{self.next_id});
-        errdefer self.allocator.free(id);
-        self.next_id += 1;
         const github_path: ?[]const u8 = if (authoritative.github_path) |path|
             path
         else
             input.path;
-        var card = ActionCard{
-            .id = id,
-            .session_id = try self.allocator.dupe(u8, session_id),
-            .source_turn_id = try self.allocator.dupe(u8, source_turn_id),
-            .slot = try self.allocator.dupe(u8, input.slot),
-            .kind = input.kind,
-            .effect_summary = try self.allocator.dupe(u8, input.effect_summary),
-            .target = .{
-                .repository = try self.allocator.dupe(u8, authoritative.repository),
-                .pull_request = authoritative.pull_request,
-                .pull_request_id = try self.allocator.dupe(u8, authoritative.pull_request_id),
-                .base_oid = try self.allocator.dupe(u8, authoritative.base_oid),
-                .head_oid = try self.allocator.dupe(u8, authoritative.head_oid),
-                .session_path = try self.allocator.dupe(u8, authoritative.session_path),
-                .current_path = try self.allocator.dupe(u8, authoritative.current_path),
-                .path = try dupeOptional(self.allocator, github_path),
-                .line = input.line,
-                .start_line = input.start_line,
-                .side = if (input.kind == .add_inline_comment)
-                    try self.allocator.dupe(u8, input.side orelse "RIGHT")
-                else
-                    try dupeOptional(self.allocator, input.side),
-                .thread_id = try dupeOptional(self.allocator, input.thread_id),
-                .comment_id = try dupeOptional(self.allocator, input.comment_id),
-                .comment_body_snapshot = try dupeOptional(
-                    self.allocator,
-                    authoritative.comment_body_snapshot,
-                ),
-            },
-            .body = try dupeOptional(self.allocator, input.body),
-            .payload_json = try self.allocator.dupe(u8, input.payload_json),
-            .supersedes = try dupeOptional(self.allocator, pending_slot.id),
-        };
+        const card = try self.buildCard(
+            session_id,
+            source_turn_id,
+            input,
+            authoritative,
+            github_path,
+            pending_slot.id,
+        );
         errdefer self.freeCard(card);
-        if (input.kind == .graphql) card.graphql = .{
-            .operation_name = try self.allocator.dupe(u8, input.operation_name.?),
-            .document = try self.allocator.dupe(u8, input.document.?),
-            .variables = try self.allocator.dupe(u8, input.variables.?),
-        };
         try self.cards.append(self.allocator, card);
+        self.next_id += 1;
         if (pending_slot.index) |index| self.cards.items[index].status = .superseded;
         return &self.cards.items[self.cards.items.len - 1];
+    }
+
+    fn buildCard(
+        self: *ActionStore,
+        session_id: []const u8,
+        source_turn_id: []const u8,
+        input: PreparedActionInput,
+        authoritative: AuthoritativeTarget,
+        github_path: ?[]const u8,
+        supersedes: ?[]const u8,
+    ) !ActionCard {
+        const id = try std.fmt.allocPrint(self.allocator, "act-{d}", .{self.next_id});
+        errdefer self.allocator.free(id);
+        const owned_session_id = try self.allocator.dupe(u8, session_id);
+        errdefer self.allocator.free(owned_session_id);
+        const owned_turn_id = try self.allocator.dupe(u8, source_turn_id);
+        errdefer self.allocator.free(owned_turn_id);
+        const slot = try self.allocator.dupe(u8, input.slot);
+        errdefer self.allocator.free(slot);
+        const effect_summary = try self.allocator.dupe(u8, input.effect_summary);
+        errdefer self.allocator.free(effect_summary);
+        const repository = try self.allocator.dupe(u8, authoritative.repository);
+        errdefer self.allocator.free(repository);
+        const pull_request_id = try self.allocator.dupe(u8, authoritative.pull_request_id);
+        errdefer self.allocator.free(pull_request_id);
+        const base_oid = try self.allocator.dupe(u8, authoritative.base_oid);
+        errdefer self.allocator.free(base_oid);
+        const head_oid = try self.allocator.dupe(u8, authoritative.head_oid);
+        errdefer self.allocator.free(head_oid);
+        const session_path = try self.allocator.dupe(u8, authoritative.session_path);
+        errdefer self.allocator.free(session_path);
+        const current_path = try self.allocator.dupe(u8, authoritative.current_path);
+        errdefer self.allocator.free(current_path);
+        const path = try dupeOptional(self.allocator, github_path);
+        errdefer if (path) |value| self.allocator.free(value);
+        const side: ?[]u8 = if (input.kind == .add_inline_comment)
+            try self.allocator.dupe(u8, input.side orelse "RIGHT")
+        else
+            try dupeOptional(self.allocator, input.side);
+        errdefer if (side) |value| self.allocator.free(value);
+        const thread_id = try dupeOptional(self.allocator, input.thread_id);
+        errdefer if (thread_id) |value| self.allocator.free(value);
+        const comment_id = try dupeOptional(self.allocator, input.comment_id);
+        errdefer if (comment_id) |value| self.allocator.free(value);
+        const snapshot = try dupeOptional(self.allocator, authoritative.comment_body_snapshot);
+        errdefer if (snapshot) |value| self.allocator.free(value);
+        const body = try dupeOptional(self.allocator, input.body);
+        errdefer if (body) |value| self.allocator.free(value);
+        const payload_json = try self.allocator.dupe(u8, input.payload_json);
+        errdefer self.allocator.free(payload_json);
+        const owned_supersedes = try dupeOptional(self.allocator, supersedes);
+        errdefer if (owned_supersedes) |value| self.allocator.free(value);
+        const transparent = if (input.kind == .graphql)
+            try self.buildTransparentAction(input)
+        else
+            null;
+        errdefer if (transparent) |action| self.freeTransparent(action);
+        return .{
+            .id = id,
+            .session_id = owned_session_id,
+            .source_turn_id = owned_turn_id,
+            .slot = slot,
+            .kind = input.kind,
+            .effect_summary = effect_summary,
+            .target = .{
+                .repository = repository,
+                .pull_request = authoritative.pull_request,
+                .pull_request_id = pull_request_id,
+                .base_oid = base_oid,
+                .head_oid = head_oid,
+                .session_path = session_path,
+                .current_path = current_path,
+                .path = path,
+                .line = input.line,
+                .start_line = input.start_line,
+                .side = side,
+                .thread_id = thread_id,
+                .comment_id = comment_id,
+                .comment_body_snapshot = snapshot,
+            },
+            .body = body,
+            .payload_json = payload_json,
+            .graphql = transparent,
+            .supersedes = owned_supersedes,
+        };
+    }
+
+    fn buildTransparentAction(
+        self: *ActionStore,
+        input: PreparedActionInput,
+    ) !TransparentAction {
+        const operation_name = try self.allocator.dupe(u8, input.operation_name.?);
+        errdefer self.allocator.free(operation_name);
+        const document = try self.allocator.dupe(u8, input.document.?);
+        errdefer self.allocator.free(document);
+        const variables = try self.allocator.dupe(u8, input.variables.?);
+        return .{
+            .operation_name = operation_name,
+            .document = document,
+            .variables = variables,
+        };
+    }
+
+    fn freeTransparent(self: *ActionStore, action: TransparentAction) void {
+        inline for (.{ action.operation_name, action.document, action.variables }) |value| {
+            self.allocator.free(value);
+        }
     }
 
     fn pendingSlot(self: *const ActionStore, session_id: []const u8, slot: []const u8) PendingSlot {

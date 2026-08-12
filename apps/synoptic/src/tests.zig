@@ -2063,6 +2063,76 @@ test "primary file metadata cannot serialize canonical patch bytes" {
     try std.testing.expect(std.mem.indexOf(u8, metadata, "sha256:revision") == null);
 }
 
+test "action broker construction releases every partial allocation" {
+    var successes: usize = 0;
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var store = tools.ActionStore{ .allocator = failing.allocator() };
+        defer store.deinit();
+        const result = store.prepare("session", "turn", .{
+            .slot = @constCast("finding"),
+            .kind = .add_inline_comment,
+            .effect_summary = @constCast("Add an inline comment"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("src/a.zig"),
+            .line = 12,
+            .start_line = 10,
+            .side = @constCast("RIGHT"),
+            .body = @constCast("Could this fail?"),
+        }, .{
+            .repository = "o/r",
+            .pull_request = 1,
+            .pull_request_id = "PR_1",
+            .base_oid = "base",
+            .head_oid = "head",
+            .session_path = "src/a.zig",
+            .current_path = "src/a.zig",
+            .github_path = "src/a.zig",
+            .comment_body_snapshot = "previous body",
+        });
+        if (result) |_| {
+            successes += 1;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(successes > 0);
+    var graphql_successes: usize = 0;
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var store = tools.ActionStore{ .allocator = failing.allocator() };
+        defer store.deinit();
+        const result = store.prepare("session", "turn", .{
+            .slot = @constCast("transparent"),
+            .kind = .graphql,
+            .effect_summary = @constCast("Add a PR note"),
+            .payload_json = @constCast("{}"),
+            .operation_name = @constCast("AddReviewNote"),
+            .document = @constCast(
+                "mutation AddReviewNote($input:AddCommentInput!){" ++
+                    "addComment(input:$input){clientMutationId}}",
+            ),
+            .variables = @constCast("{\"input\":{\"subjectId\":\"PR_1\",\"body\":\"note\"}}"),
+        }, .{
+            .repository = "o/r",
+            .pull_request = 1,
+            .pull_request_id = "PR_1",
+            .base_oid = "base",
+            .head_oid = "head",
+            .session_path = "src/a.zig",
+            .current_path = "src/a.zig",
+        });
+        if (result) |_| {
+            graphql_successes += 1;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(graphql_successes > 0);
+}
+
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
