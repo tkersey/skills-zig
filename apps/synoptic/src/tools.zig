@@ -159,14 +159,13 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
         return error.InvalidToolPayload;
     const payload_value = arguments.get("payload") orelse rootPayload(arguments, kind);
     const payload = object(payload_value) orelse return error.InvalidToolPayload;
-    const payload_json = try stringifyAlloc(allocator, payload_value);
-    errdefer allocator.free(payload_json);
-    var result = PreparedActionInput{
-        .slot = try allocator.dupe(u8, slot_value),
-        .kind = kind,
-        .effect_summary = try allocator.dupe(u8, effect),
-        .payload_json = payload_json,
-    };
+    var result = try initPreparedActionInput(
+        allocator,
+        slot_value,
+        kind,
+        effect,
+        payload_value,
+    );
     errdefer result.deinit(allocator);
     result.path = try dupeOptional(allocator, string(payload.get("path")));
     result.line = uint32(payload.get("line"));
@@ -580,6 +579,26 @@ fn uint32(value: ?std.json.Value) ?u32 {
 fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |v| try allocator.dupe(u8, v) else null;
 }
+fn initPreparedActionInput(
+    allocator: std.mem.Allocator,
+    slot: []const u8,
+    kind: ActionKind,
+    effect_summary: []const u8,
+    payload: std.json.Value,
+) !PreparedActionInput {
+    const owned_slot = try allocator.dupe(u8, slot);
+    errdefer allocator.free(owned_slot);
+    const owned_effect = try allocator.dupe(u8, effect_summary);
+    errdefer allocator.free(owned_effect);
+    const payload_json = try stringifyAlloc(allocator, payload);
+    errdefer allocator.free(payload_json);
+    return .{
+        .slot = owned_slot,
+        .kind = kind,
+        .effect_summary = owned_effect,
+        .payload_json = payload_json,
+    };
+}
 fn stringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -592,6 +611,26 @@ test "initial tool call is rejected even with plausible payload" {
         error.InitialReviewActionForbidden,
         authorizeTool(.initial_review, true),
     );
+}
+test "prepared action input decoding releases every partial allocation" {
+    const raw =
+        \\{"arguments":{"slot":"finding","kind":"add_inline_comment",
+        \\"effectSummary":"Add an inline comment","payload":{"path":"a.zig",
+        \\"line":1,"body":"Could this fail?"}}}
+    ;
+    var successes: usize = 0;
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const decoded = decodePreparedAction(failing.allocator(), raw);
+        if (decoded) |input| {
+            input.deinit(failing.allocator());
+            successes += 1;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(successes > 0);
 }
 test "same session slot supersedes immutably and execution is once" {
     var store = ActionStore{ .allocator = std.testing.allocator };
