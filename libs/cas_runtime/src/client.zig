@@ -2133,7 +2133,7 @@ fn actorReaderMain(state: *ActorState) void {
 fn actorNotificationMain(state: *ActorState) void {
     while (true) { // tiger: event-loop -- bounded by owner state.
         state.mutex.lock();
-        if (state.terminal != .running) {
+        if (state.terminal == .stopped) {
             var abandoned = state.notifications;
             state.notifications = .empty;
             state.mutex.unlock();
@@ -2141,6 +2141,7 @@ fn actorNotificationMain(state: *ActorState) void {
             abandoned.deinit(state.allocator);
             return;
         }
+        const transport_terminal = state.terminal != .running;
         const maybe_notification: ?ActorNotification = if (state.notifications.items.len == 0)
             null
         else
@@ -2160,11 +2161,14 @@ fn actorNotificationMain(state: *ActorState) void {
                 actorCloseTransportOnce(state);
                 return;
             };
-        } else std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
-            actorSetTerminal(state, .poisoned);
-            actorCloseTransportOnce(state);
-            return;
-        };
+        } else {
+            if (transport_terminal) return;
+            std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
+                actorSetTerminal(state, .poisoned);
+                actorCloseTransportOnce(state);
+                return;
+            };
+        }
     }
 }
 
@@ -4256,6 +4260,12 @@ fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+        \\if [ "$mode" = transport_notifications ]; then
+        \\  IFS= read -r request
+        \\  printf '%s\n' '{"method":"turn/started","params":{"index":1}}'
+        \\  printf '%s\n' '{"method":"turn/started","params":{"index":2}}'
+        \\  exit 0
+        \\fi
         \\if [ "$mode" = nested_server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -4449,6 +4459,23 @@ const TeardownNotificationProbe = struct {
         };
         self.actor.deinit();
         self.completed.store(true, .release);
+    }
+};
+
+const TransportTerminalNotificationProbe = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *TransportTerminalNotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        const prior = self.calls.fetchAdd(1, .acq_rel);
+        if (prior == 0) {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch |sleep_error| {
+                switch (sleep_error) {
+                    else => {},
+                }
+            };
+        }
     }
 };
 
@@ -4761,6 +4788,29 @@ test "actor callback teardown drops notifications admitted behind terminal teard
     if (call.result) |result| allocator.free(result);
     try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
     try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+}
+
+test "actor transport terminality drains notifications admitted before disconnect" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "transport_notifications");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+    defer actor.deinit();
+    var probe = TransportTerminalNotificationProbe{};
+    try actor.subscribe(.{
+        .context = &probe,
+        .handle = TransportTerminalNotificationProbe.observe,
+    });
+    try std.testing.expectError(
+        error.ActorDisconnected,
+        actor.requestJson("actor/original", "{}", 2_000),
+    );
+    for (0..1_000) |_| {
+        if (probe.calls.load(.acquire) == 2) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls.load(.acquire));
 }
 
 test "actor falsifier nested request in server handler cannot deadlock permanent reader" {
