@@ -4136,6 +4136,99 @@ test "worktree integrity dirty launch selects managed custody" {
     );
 }
 
+test "worktree integrity authoritative Git identity ignores replacement refs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
+    const base_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "intended\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "intended" },
+    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "switch", "--detach", base },
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "replacement" },
+    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
+    const replacement_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(replacement_raw);
+    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "switch", "--detach", head },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "replace", head, replacement },
+    ));
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
+    defer allocator.free(managed);
+    const custody = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        managed,
+        false,
+        null,
+    );
+    defer allocator.free(custody.path());
+    defer worktree.retireManaged(allocator, io, custody, repo) catch {};
+    const tracked_path = try std.fs.path.join(allocator, &.{ managed, "tracked.txt" });
+    defer allocator.free(tracked_path);
+    const tracked = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        tracked_path,
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(tracked);
+    try std.testing.expectEqualStrings("intended\n", tracked);
+    const diff = try github.canonicalDiffAlloc(
+        allocator,
+        io,
+        repo,
+        base,
+        head,
+        "tracked.txt",
+    );
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+intended") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+replacement") == null);
+}
+
 fn verifyManagedCustodyLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,

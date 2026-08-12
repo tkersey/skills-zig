@@ -17,6 +17,7 @@ const canonical_git_env_path = "/usr/bin/env";
 const canonical_git_attributes_env = "GIT_ATTR_NOSYSTEM=1";
 const canonical_git_global_config_env = "GIT_CONFIG_GLOBAL=/dev/null";
 const canonical_git_system_config_env = "GIT_CONFIG_NOSYSTEM=1";
+const canonical_git_no_replace_env = "GIT_NO_REPLACE_OBJECTS=1";
 const canonical_git_attributes_config = "core.attributesFile=/dev/null";
 const canonical_git_rename_limit_config = "diff.renameLimit=0";
 const canonical_git_context_arg = "--unified=3";
@@ -41,7 +42,14 @@ const CanonicalGitEvidenceView = struct {
         var objects = try runCapturedProcess(
             allocator,
             io,
-            &.{ git_path, "rev-parse", "--path-format=absolute", "--git-path", "objects" },
+            &.{
+                git_path,
+                "--no-replace-objects",
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            },
             .{ .path = cwd },
             null,
             null,
@@ -2470,7 +2478,10 @@ fn blobOidAtAlloc(
     const result = try std.process.run(
         allocator,
         io,
-        .{ .argv = &.{ git_path, "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
+        .{
+            .argv = &.{ git_path, "--no-replace-objects", "rev-parse", "--verify", spec },
+            .cwd = .{ .path = cwd },
+        },
     );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -2577,6 +2588,7 @@ fn canonicalRenameEntries(
             canonical_git_attributes_env,
             canonical_git_global_config_env,
             canonical_git_system_config_env,
+            canonical_git_no_replace_env,
             git_path,
             "-c",
             canonical_git_attributes_config,
@@ -2749,7 +2761,7 @@ pub fn canonicalMergeBaseAlloc(
     var merge = runCapturedProcess(
         allocator,
         io,
-        &.{ git_path, "merge-base", base, head },
+        &.{ git_path, "--no-replace-objects", "merge-base", base, head },
         .{ .path = cwd },
         null,
         cancelled,
@@ -2908,7 +2920,7 @@ fn ensureRevisionPathObjectAvailable(
     var result = try runCapturedProcess(
         allocator,
         io,
-        &.{ git_path, "cat-file", "-e", oid },
+        &.{ git_path, "--no-replace-objects", "cat-file", "-e", oid },
         .{ .path = cwd },
         null,
         null,
@@ -2938,6 +2950,7 @@ fn runCanonicalBlobDiff(
         canonical_git_attributes_env,
         canonical_git_global_config_env,
         canonical_git_system_config_env,
+        canonical_git_no_replace_env,
         evidence_view.git_dir_env,
         evidence_view.object_dir_env,
         git_path,
@@ -2989,6 +3002,7 @@ fn runCanonicalPathDiff(
         canonical_git_attributes_env,
         canonical_git_global_config_env,
         canonical_git_system_config_env,
+        canonical_git_no_replace_env,
         evidence_view.git_dir_env,
         evidence_view.object_dir_env,
         git_path,
@@ -3633,6 +3647,69 @@ test "canonical diff preserves committed attributes while excluding local info a
     defer allocator.free(diff);
     try std.testing.expect(std.mem.indexOf(u8, diff, "Binary files") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+head") == null);
+}
+
+test "canonical diff ignores local replacement objects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "evidence.zig", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "evidence.zig", .data = "intended\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "evidence.zig" },
+        &.{ "git", "commit", "-qm", "intended" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "switch", "--detach", base },
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "evidence.zig", .data = "replacement\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "evidence.zig" },
+        &.{ "git", "commit", "-qm", "replacement" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const replacement_raw = try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(replacement_raw);
+    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "switch", "--detach", head },
+    ));
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "replace", head, replacement },
+    ));
+    const diff = try canonicalDiffAlloc(allocator, io, root, base, head, "evidence.zig");
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+intended") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+replacement") == null);
 }
 
 test "copied file identity finds an unchanged source and includes source evidence" {

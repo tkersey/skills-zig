@@ -189,10 +189,11 @@ pub const Baseline = struct {
             error.WorktreeHeadReadFailed,
         );
         defer allocator.free(head);
-        const branch_result = try std.process.run(
+        const branch_result = try runGitCommand(
             allocator,
             io,
-            .{ .argv = &.{ "git", "branch", "--show-current" }, .cwd = .{ .path = cwd } },
+            cwd,
+            &.{ "git", "branch", "--show-current" },
         );
         defer allocator.free(branch_result.stdout);
         defer allocator.free(branch_result.stderr);
@@ -403,21 +404,19 @@ pub fn select(
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
-    const add = try std.process.run(
+    const add = try runGitCommand(
         allocator,
         io,
-        .{
-            .argv = &.{
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "worktree",
-                "add",
-                "--detach",
-                managed_path,
-                head_oid,
-            },
-            .cwd = .{ .path = cwd },
+        cwd,
+        &.{
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "worktree",
+            "add",
+            "--detach",
+            managed_path,
+            head_oid,
         },
     );
     defer allocator.free(add.stdout);
@@ -499,10 +498,12 @@ pub fn retireManaged(
         error.FileNotFound => return,
         else => return err,
     };
-    const remove = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "worktree", "remove", "--force", custody.path() },
-        .cwd = .{ .path = repository_cwd },
-    });
+    const remove = try runGitCommand(
+        allocator,
+        io,
+        repository_cwd,
+        &.{ "git", "worktree", "remove", "--force", custody.path() },
+    );
     defer allocator.free(remove.stdout);
     defer allocator.free(remove.stderr);
     if (remove.term != .exited or remove.term.exited != 0) {
@@ -531,19 +532,17 @@ pub fn synchronizeManaged(
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
-    const checkout = try std.process.run(
+    const checkout = try runGitCommand(
         allocator,
         io,
-        .{
-            .argv = &.{
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "checkout",
-                "--detach",
-                head_oid,
-            },
-            .cwd = .{ .path = custody.path() },
+        custody.path(),
+        &.{
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "checkout",
+            "--detach",
+            head_oid,
         },
     );
     defer allocator.free(checkout.stdout);
@@ -551,19 +550,17 @@ pub fn synchronizeManaged(
     const checkout_failed = checkout.term != .exited or checkout.term.exited != 0;
     if (checkout_failed) return error.ManagedWorktreeRefreshFailed;
     const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
-        const rollback = try std.process.run(
+        const rollback = try runGitCommand(
             allocator,
             io,
-            .{
-                .argv = &.{
-                    "git",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "checkout",
-                    "--detach",
-                    baseline.head_oid,
-                },
-                .cwd = .{ .path = custody.path() },
+            custody.path(),
+            &.{
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "checkout",
+                "--detach",
+                baseline.head_oid,
             },
         );
         defer allocator.free(rollback.stdout);
@@ -604,23 +601,18 @@ fn synchronizeReused(
         error.GitObjectUnavailable => return error.ManagedWorktreeFetchFailed,
         else => return err,
     };
-    const ancestor = try std.process.run(
+    const ancestor = try runGitCommand(
         allocator,
         io,
-        .{
-            .argv = &.{ "git", "merge-base", "--is-ancestor", baseline.head_oid, next_head },
-            .cwd = .{ .path = cwd },
-        },
+        cwd,
+        &.{ "git", "merge-base", "--is-ancestor", baseline.head_oid, next_head },
     );
     defer allocator.free(ancestor.stdout);
     defer allocator.free(ancestor.stderr);
     const not_ancestor = ancestor.term != .exited or ancestor.term.exited != 0;
     if (not_ancestor) return error.ReusedCheckoutRefreshRequiresManagedMigration;
-    const merge = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "git", "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", next_head,
-        },
-        .cwd = .{ .path = cwd },
+    const merge = try runGitCommand(allocator, io, cwd, &.{
+        "git", "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", next_head,
     });
     defer allocator.free(merge.stdout);
     defer allocator.free(merge.stderr);
@@ -671,11 +663,8 @@ fn rollbackReused(
     );
     defer allocator.free(current_branch);
     if (!std.mem.eql(u8, std.mem.trim(u8, current_branch, "\r\n"), branch)) {
-        const restore_branch = try std.process.run(allocator, io, .{
-            .argv = &.{
-                "git", "-c", "core.hooksPath=/dev/null", "switch", branch,
-            },
-            .cwd = .{ .path = cwd },
+        const restore_branch = try runGitCommand(allocator, io, cwd, &.{
+            "git", "-c", "core.hooksPath=/dev/null", "switch", branch,
         });
         defer allocator.free(restore_branch.stdout);
         defer allocator.free(restore_branch.stderr);
@@ -683,16 +672,13 @@ fn rollbackReused(
             return error.ReusedCheckoutRollbackFailed;
         }
     }
-    const reset = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "reset",
-            "--hard",
-            baseline.head_oid,
-        },
-        .cwd = .{ .path = cwd },
+    const reset = try runGitCommand(allocator, io, cwd, &.{
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "reset",
+        "--hard",
+        baseline.head_oid,
     });
     defer allocator.free(reset.stdout);
     defer allocator.free(reset.stderr);
@@ -759,21 +745,19 @@ fn cleanManaged(
     selected_head: []const u8,
     baseline: *const Baseline,
 ) !void {
-    const restore = try std.process.run(
+    const restore = try runGitCommand(
         allocator,
         io,
-        .{
-            .argv = &.{
-                "git",
-                "restore",
-                "--source",
-                selected_head,
-                "--staged",
-                "--worktree",
-                "--",
-                ".",
-            },
-            .cwd = .{ .path = root },
+        root,
+        &.{
+            "git",
+            "restore",
+            "--source",
+            selected_head,
+            "--staged",
+            "--worktree",
+            "--",
+            ".",
         },
     );
     defer allocator.free(restore.stdout);
@@ -1132,6 +1116,7 @@ fn spawnFetchProcess(
     else
         std.process.Environ.Map.init(allocator);
     defer environment.deinit();
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
     var argv_buffer: [7][]const u8 = undefined;
     const argv: []const []const u8 = switch (operation) {
         .object => |oid| argv: {
@@ -1194,10 +1179,12 @@ fn commitExists(
 ) !bool {
     const object = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{oid});
     defer allocator.free(object);
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "cat-file", "-e", object },
-        .cwd = .{ .path = cwd },
-    });
+    const result = try runGitCommand(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "cat-file", "-e", object },
+    );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     return result.term == .exited and result.term.exited == 0;
@@ -1210,13 +1197,32 @@ fn gitOutput(
     argv: []const []const u8,
     failure: anyerror,
 ) ![]u8 {
-    const result = try std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
+    const result = try runGitCommand(allocator, io, cwd, argv);
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         allocator.free(result.stdout);
         return failure;
     }
     return result.stdout;
+}
+
+fn runGitCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+) !std.process.RunResult {
+    if (argv.len == 0) return error.InvalidGitCommand;
+    const isolated = try allocator.alloc([]const u8, argv.len + 1);
+    defer allocator.free(isolated);
+    isolated[0] = argv[0];
+    isolated[1] = "--no-replace-objects";
+    @memcpy(isolated[2..], argv[1..]);
+    return std.process.run(
+        allocator,
+        io,
+        .{ .argv = isolated, .cwd = .{ .path = cwd } },
+    );
 }
 
 test "custody makes destructive policy explicit" {
@@ -1389,4 +1395,86 @@ test "worktree integrity reused rollback restores exact branch and head" {
     try requireReusedUnchanged(allocator, io, root, &baseline);
 
     try expectRollbackRefusesExternalCommit(allocator, io, root, next_head, &baseline);
+}
+
+test "managed worktree checkout ignores local replacement objects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    const managed = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(managed);
+    const managed_path = try std.fs.path.join(allocator, &.{ managed, "managed" });
+    defer allocator.free(managed_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "original\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "original" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    const original_raw = try gitOutput(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(original_raw);
+    const original = std.mem.trim(u8, original_raw, "\r\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "replacement" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    const replacement_raw = try gitOutput(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(replacement_raw);
+    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "reset", "--hard", original },
+        error.TestGitFailed,
+    ));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "replace", original, replacement },
+        error.TestGitFailed,
+    ));
+    const custody = try select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        original,
+        managed_path,
+        false,
+        null,
+    );
+    defer allocator.free(custody.path());
+    defer retireManaged(allocator, io, custody, repo) catch {};
+    const tracked_path = try std.fs.path.join(allocator, &.{ managed_path, "tracked.txt" });
+    defer allocator.free(tracked_path);
+    const tracked = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        tracked_path,
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(tracked);
+    try std.testing.expectEqualStrings("original\n", tracked);
 }
