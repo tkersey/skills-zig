@@ -2337,45 +2337,83 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
 ) ![]u8 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
-    const source_identity = if (previous_path) |old_path|
-        try std.fmt.allocPrint(
-            allocator,
-            "Synoptic source identity: {d} bytes\n{s}\n" ++
-                "Synoptic current identity: {d} bytes\n{s}\n",
-            .{ old_path.len, old_path, path.len, path },
-        )
-    else
-        null;
+    const source_identity = try sourceIdentityAlloc(allocator, path, previous_path);
     defer if (source_identity) |prefix| allocator.free(prefix);
     const process_output_limit = if (source_identity) |prefix|
         std.math.sub(usize, diff_bytes_max, prefix.len) catch return error.FileDiffTooLarge
     else
         diff_bytes_max;
-    const argv: []const []const u8 = if (previous_path) |old_path|
-        &.{
-            git_path,
-            "--literal-pathspecs",
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            "-M",
-            range,
-            "--",
-            old_path,
-            path,
-        }
+    const result = if (previous_path) |old_path|
+        try runCanonicalDiffProcess(
+            allocator,
+            io,
+            &.{
+                git_path,
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "-M",
+                range,
+                "--",
+                old_path,
+                path,
+            },
+            cwd,
+            cancelled,
+            process_output_limit,
+        )
     else
-        &.{
-            git_path,
-            "--literal-pathspecs",
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            "-M",
-            range,
-            "--",
-            path,
-        };
+        try runCanonicalDiffProcess(
+            allocator,
+            io,
+            &.{
+                git_path,
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "-M",
+                range,
+                "--",
+                path,
+            },
+            cwd,
+            cancelled,
+            process_output_limit,
+        );
+    allocator.free(result.stderr);
+    if (source_identity) |prefix| {
+        const diff = try std.mem.concat(allocator, u8, &.{ prefix, result.stdout });
+        allocator.free(result.stdout);
+        return diff;
+    }
+    return result.stdout;
+}
+
+fn sourceIdentityAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) !?[]u8 {
+    const old_path = previous_path orelse return null;
+    const identity = try std.fmt.allocPrint(
+        allocator,
+        "Synoptic source identity: {d} bytes\n{s}\n" ++
+            "Synoptic current identity: {d} bytes\n{s}\n",
+        .{ old_path.len, old_path, path.len, path },
+    );
+    return identity;
+}
+
+fn runCanonicalDiffProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    process_output_limit: usize,
+) !GhOutput {
     var result = runCapturedProcess(
         allocator,
         io,
@@ -2395,13 +2433,7 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         result.deinit();
         return error.FileDiffFailed;
     }
-    allocator.free(result.stderr);
-    if (source_identity) |prefix| {
-        const diff = try std.mem.concat(allocator, u8, &.{ prefix, result.stdout });
-        allocator.free(result.stdout);
-        return diff;
-    }
-    return result.stdout;
+    return result;
 }
 
 fn pullObject(value: std.json.Value) !std.json.ObjectMap {
