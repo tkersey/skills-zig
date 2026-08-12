@@ -3165,6 +3165,7 @@ fn verifySessionModes(
     defer idle.deinit();
     var identity = try registry.sessionIdentity(idle.session_id);
     try std.testing.expectEqualStrings("", identity.turn_id);
+    try std.testing.expectEqual(sessions.SessionStatus.current, identity.status);
     identity.deinit();
     try registry.message(idle.session_id, "review it");
     try std.testing.expect(registry.sessions.items[0].human_authority == null);

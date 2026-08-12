@@ -193,6 +193,35 @@ pub const SessionIdentity = struct {
     }
 };
 
+fn sessionIdentityAlloc(
+    allocator: std.mem.Allocator,
+    session: Session,
+) !SessionIdentity {
+    const path = try allocator.dupe(u8, session.path);
+    errdefer allocator.free(path);
+    const revision = try allocator.dupe(u8, session.revision);
+    errdefer allocator.free(revision);
+    const turn_id = try allocator.dupe(u8, session.turn_id);
+    errdefer allocator.free(turn_id);
+    return .{
+        .path = path,
+        .revision = revision,
+        .turn_id = turn_id,
+        .status = session.status,
+        .allocator = allocator,
+    };
+}
+
+fn appendOwnedThreadId(
+    allocator: std.mem.Allocator,
+    threads: *std.ArrayList([]u8),
+    thread_id: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, thread_id);
+    errdefer allocator.free(owned);
+    try threads.append(allocator, owned);
+}
+
 pub const GenerationCommitPlan = struct {
     allocator: std.mem.Allocator,
     evidence: domain.PrGeneration,
@@ -835,12 +864,8 @@ pub const Registry = struct {
     pub fn sessionIdentity(self: *Registry, session_id: []const u8) !SessionIdentity {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id)) return .{
-            .path = try self.allocator.dupe(u8, session.path),
-            .revision = try self.allocator.dupe(u8, session.revision),
-            .turn_id = try self.allocator.dupe(u8, session.turn_id),
-            .status = session.status,
-            .allocator = self.allocator,
+        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id)) {
+            return sessionIdentityAlloc(self.allocator, session);
         };
         return error.UnknownSession;
     }
@@ -1555,10 +1580,7 @@ pub const Registry = struct {
                 if (!std.mem.eql(u8, session.revision, revision)) {
                     session.status = .stale_origin;
                 }
-                threads.append(self.allocator, self.allocator.dupe(u8, session.thread_id) catch {
-                    self.mutex.unlock();
-                    return error.OutOfMemory;
-                }) catch {
+                appendOwnedThreadId(self.allocator, &threads, session.thread_id) catch {
                     self.mutex.unlock();
                     return error.OutOfMemory;
                 };
@@ -1834,6 +1856,7 @@ pub const Registry = struct {
             &.{ "params", "turn", "status" },
         ) catch {
             self.allocator.free(turn_id);
+            self.allocator.free(thread_id);
             return;
         };
         defer self.allocator.free(status_text);
@@ -3294,6 +3317,46 @@ test "visible event admission accounts aggregate owned bytes" {
     );
     try registry.acknowledgeVisible();
     try std.testing.expectEqual(@as(usize, 0), registry.visible_event_bytes);
+}
+
+fn sessionIdentityAllocationHarness(allocator: std.mem.Allocator) !void {
+    var identity = try sessionIdentityAlloc(allocator, .{
+        .id = @constCast("session"),
+        .thread_id = @constCast("thread"),
+        .turn_id = @constCast("turn"),
+        .path = @constCast("a.zig"),
+        .revision = @constCast("r1"),
+        .last_injected_revision = @constCast("r1"),
+    });
+    identity.deinit();
+}
+
+fn threadListAllocationHarness(allocator: std.mem.Allocator) !void {
+    var threads: std.ArrayList([]u8) = .empty;
+    defer {
+        for (threads.items) |thread| allocator.free(thread);
+        threads.deinit(allocator);
+    }
+    try appendOwnedThreadId(allocator, &threads, "thread");
+}
+
+test "session context acquisition releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        sessionIdentityAllocationHarness,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        threadListAllocationHarness,
+        .{},
+    );
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.recordPrimaryCompletion(
+        "{\"params\":{\"threadId\":\"primary\",\"turn\":{" ++
+            "\"id\":\"turn\",\"status\":null}}}",
+    );
 }
 
 test "failed primary delivery survives a failed write and reconnect until acknowledged" {
