@@ -127,11 +127,11 @@ pub const Settings = struct {
     pub fn classifyPath(self: *const Settings, path: []const u8) ?[]const u8 {
         if (!self.exclusions_enabled) return null;
         for (self.additional_globs.items) |glob| {
-            if (globMatches(self.allocator, glob, path)) return "configured-glob";
+            if (globMatches(glob, path)) return "configured-glob";
         }
         for (self.exclusion_rules.items) |rule| for (rule.globs.items) |glob| {
             if (containsExact(self.removed_default_globs.items, glob)) continue;
-            if (globMatches(self.allocator, glob, path)) return rule.reason;
+            if (globMatches(glob, path)) return rule.reason;
         };
         return null;
     }
@@ -210,36 +210,58 @@ pub const Settings = struct {
                 return error.InvalidSynopticConfig;
             const key = std.mem.trim(u8, line[0..equal], " \t");
             const value = std.mem.trim(u8, line[equal + 1 ..], " \t");
-            switch (section) {
-                .file_review => if (std.mem.eql(u8, key, "start_mode")) {
-                    const text = try tomlString(value);
-                    self.file_review_start_mode = if (std.mem.eql(u8, text, "immediate"))
-                        .immediate
-                    else if (std.mem.eql(u8, text, "idle"))
-                        .idle
-                    else
+            var continued: std.ArrayList(u8) = .empty;
+            defer continued.deinit(self.allocator);
+            var effective_value = value;
+            if (isStringArraySetting(section, key) and !tomlArrayComplete(value)) {
+                try continued.appendSlice(self.allocator, value);
+                while (!tomlArrayComplete(continued.items)) {
+                    const continuation = lines.next() orelse
                         return error.InvalidSynopticConfig;
-                } else return error.InvalidSynopticConfig,
-                .browser => {
-                    if (std.mem.eql(u8, key, "open")) {
-                        self.browser_open = try tomlBool(value);
-                    } else return error.InvalidSynopticConfig;
-                },
-                .worktree => {
-                    if (std.mem.eql(u8, key, "prefer_current_pr_checkout"))
-                        self.worktree_prefer_current_pr_checkout = try tomlBool(value)
-                    else
-                        return error.InvalidSynopticConfig;
-                },
-                .exclusions => if (std.mem.eql(u8, key, "enabled")) {
-                    self.exclusions_enabled = try tomlBool(value);
-                } else if (std.mem.eql(u8, key, "additional_globs")) {
-                    try replaceStringArray(self.allocator, &self.additional_globs, value);
-                } else if (std.mem.eql(u8, key, "removed_default_globs")) {
-                    try replaceStringArray(self.allocator, &self.removed_default_globs, value);
-                } else return error.InvalidSynopticConfig,
-                .none => return error.InvalidSynopticConfig,
+                    const content = std.mem.trim(
+                        u8,
+                        stripTomlComment(continuation),
+                        " \t\r",
+                    );
+                    try continued.append(self.allocator, '\n');
+                    try continued.appendSlice(self.allocator, content);
+                }
+                effective_value = continued.items;
             }
+            try self.applyTomlSetting(section, key, effective_value);
+        }
+    }
+
+    fn applyTomlSetting(
+        self: *Settings,
+        section: Section,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        switch (section) {
+            .file_review => if (std.mem.eql(u8, key, "start_mode")) {
+                const text = try tomlString(value);
+                self.file_review_start_mode = if (std.mem.eql(u8, text, "immediate"))
+                    .immediate
+                else if (std.mem.eql(u8, text, "idle"))
+                    .idle
+                else
+                    return error.InvalidSynopticConfig;
+            } else return error.InvalidSynopticConfig,
+            .browser => if (std.mem.eql(u8, key, "open")) {
+                self.browser_open = try tomlBool(value);
+            } else return error.InvalidSynopticConfig,
+            .worktree => if (std.mem.eql(u8, key, "prefer_current_pr_checkout")) {
+                self.worktree_prefer_current_pr_checkout = try tomlBool(value);
+            } else return error.InvalidSynopticConfig,
+            .exclusions => if (std.mem.eql(u8, key, "enabled")) {
+                self.exclusions_enabled = try tomlBool(value);
+            } else if (std.mem.eql(u8, key, "additional_globs")) {
+                try replaceStringArray(self.allocator, &self.additional_globs, value);
+            } else if (std.mem.eql(u8, key, "removed_default_globs")) {
+                try replaceStringArray(self.allocator, &self.removed_default_globs, value);
+            } else return error.InvalidSynopticConfig,
+            .none => return error.InvalidSynopticConfig,
         }
     }
 };
@@ -279,13 +301,36 @@ fn containsExact(values: []const []u8, needle: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
     return false;
 }
+
+fn isStringArraySetting(section: Section, key: []const u8) bool {
+    return section == .exclusions and (std.mem.eql(u8, key, "additional_globs") or
+        std.mem.eql(u8, key, "removed_default_globs"));
+}
+
 fn stripTomlComment(line: []const u8) []const u8 {
-    var quoted = false;
+    var single_quoted = false;
+    var double_quoted = false;
     for (line, 0..) |byte, i| {
-        if (byte == '"' and (i == 0 or line[i - 1] != '\\')) quoted = !quoted;
-        if (byte == '#' and !quoted) return line[0..i];
+        if (byte == '\'' and !double_quoted) single_quoted = !single_quoted;
+        if (byte == '"' and !single_quoted and (i == 0 or line[i - 1] != '\\')) {
+            double_quoted = !double_quoted;
+        }
+        if (byte == '#' and !single_quoted and !double_quoted) return line[0..i];
     }
     return line;
+}
+
+fn tomlArrayComplete(value: []const u8) bool {
+    var single_quoted = false;
+    var double_quoted = false;
+    for (value, 0..) |byte, i| {
+        if (byte == '\'' and !double_quoted) single_quoted = !single_quoted;
+        if (byte == '"' and !single_quoted and (i == 0 or value[i - 1] != '\\')) {
+            double_quoted = !double_quoted;
+        }
+        if (byte == ']' and !single_quoted and !double_quoted) return true;
+    }
+    return false;
 }
 fn tomlString(value: []const u8) ![]const u8 {
     if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') {
@@ -306,14 +351,8 @@ fn replaceStringArray(
     target: *std.ArrayList([]u8),
     value: []const u8,
 ) !void {
-    var parsed = std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        value,
-        .{},
-    ) catch return error.InvalidSynopticConfig;
-    defer parsed.deinit();
-    if (parsed.value != .array or parsed.value.array.items.len > 256) {
+    const source = std.mem.trim(u8, value, " \t\r\n");
+    if (source.len < 2 or source[0] != '[' or source[source.len - 1] != ']') {
         return error.InvalidSynopticConfig;
     }
     var next: std.ArrayList([]u8) = .empty;
@@ -321,97 +360,87 @@ fn replaceStringArray(
         for (next.items) |entry| allocator.free(entry);
         next.deinit(allocator);
     }
-    for (parsed.value.array.items) |entry| {
-        if (entry != .string or !validGlob(entry.string)) return error.InvalidSynopticConfig;
-        try next.append(allocator, try allocator.dupe(u8, entry.string));
+    var index: usize = 1;
+    var completed = false;
+    for (0..257) |_| {
+        while (index + 1 < source.len and std.ascii.isWhitespace(source[index])) index += 1;
+        if (index + 1 == source.len) {
+            completed = true;
+            break;
+        }
+        if (next.items.len == 256) return error.InvalidSynopticConfig;
+        const quote = source[index];
+        if (quote != '\'' and quote != '"') return error.InvalidSynopticConfig;
+        index += 1;
+        const start = index;
+        while (index < source.len and source[index] != quote) : (index += 1) {
+            if (quote == '"' and source[index] == '\\') return error.InvalidSynopticConfig;
+        }
+        if (index >= source.len) return error.InvalidSynopticConfig;
+        const entry = source[start..index];
+        if (!validGlob(entry)) return error.InvalidSynopticConfig;
+        try next.append(allocator, try allocator.dupe(u8, entry));
+        index += 1;
+        while (index + 1 < source.len and std.ascii.isWhitespace(source[index])) index += 1;
+        if (index + 1 == source.len) {
+            completed = true;
+            break;
+        }
+        if (source[index] != ',') return error.InvalidSynopticConfig;
+        index += 1;
     }
+    if (!completed) return error.InvalidSynopticConfig;
     for (target.items) |entry| allocator.free(entry);
     target.deinit(allocator);
     target.* = next;
 }
 
-const GlobState = struct { pattern: usize, path: usize };
-
-fn appendGlobState(
-    allocator: std.mem.Allocator,
-    pending: *std.ArrayList(GlobState),
-    visited: []bool,
-    path_states: usize,
-    state: GlobState,
-) !void {
-    const index = state.pattern * path_states + state.path;
-    if (visited[index]) return;
-    visited[index] = true;
-    try pending.append(allocator, state);
+fn globMatches(pattern: []const u8, path: []const u8) bool {
+    if (pattern.len > 1024) return false;
+    var current = [_]bool{false} ** 1025;
+    var current_segment = [_]bool{false} ** 1025;
+    var next = [_]bool{false} ** 1025;
+    var next_segment = [_]bool{false} ** 1025;
+    current[0] = true;
+    globEpsilonClosure(pattern, &current);
+    for (path) |byte| {
+        @memset(&next, false);
+        @memset(&next_segment, false);
+        for (0..pattern.len) |pi| {
+            if (current[pi] and pattern[pi] != '*') {
+                if ((pattern[pi] == '?' and byte != '/') or pattern[pi] == byte) {
+                    next[pi + 1] = true;
+                }
+                continue;
+            }
+            const double = pi + 1 < pattern.len and pattern[pi + 1] == '*';
+            const slash = double and pi + 2 < pattern.len and pattern[pi + 2] == '/';
+            if (slash and (current[pi] or current_segment[pi])) {
+                if (byte == '/') {
+                    next[pi] = true;
+                } else {
+                    next_segment[pi] = true;
+                }
+                continue;
+            }
+            if (current[pi] and (double or byte != '/')) next[pi] = true;
+        }
+        current = next;
+        current_segment = next_segment;
+        globEpsilonClosure(pattern, &current);
+    }
+    return current[pattern.len];
 }
 
-fn globMatches(allocator: std.mem.Allocator, pattern: []const u8, path: []const u8) bool {
-    const pattern_states = std.math.add(usize, pattern.len, 1) catch return false;
-    const path_states = std.math.add(usize, path.len, 1) catch return false;
-    const state_count = std.math.mul(usize, pattern_states, path_states) catch return false;
-    const visited = allocator.alloc(bool, state_count) catch return false;
-    defer allocator.free(visited);
-    @memset(visited, false);
-    var pending: std.ArrayList(GlobState) = .empty;
-    defer pending.deinit(allocator);
-    appendGlobState(
-        allocator,
-        &pending,
-        visited,
-        path_states,
-        .{ .pattern = 0, .path = 0 },
-    ) catch return false;
-    while (pending.pop()) |state| {
-        var pi = state.pattern;
-        var si = state.path;
-        while (pi < pattern.len and pattern[pi] != '*') {
-            if (si == path.len) break;
-            if (pattern[pi] == '?' and path[si] == '/') break;
-            if (pattern[pi] != '?' and pattern[pi] != path[si]) break;
-            pi += 1;
-            si += 1;
-        }
-        if (pi == pattern.len) {
-            if (si == path.len) return true;
-            continue;
-        }
-        if (pattern[pi] != '*') continue;
+fn globEpsilonClosure(pattern: []const u8, states: *[1025]bool) void {
+    for (0..pattern.len) |pi| {
+        if (!states[pi] or pattern[pi] != '*') continue;
         const double = pi + 1 < pattern.len and pattern[pi + 1] == '*';
-        pi += if (double) 2 else 1;
-        if (double and pi < pattern.len and pattern[pi] == '/') {
-            pi += 1;
-            appendGlobState(
-                allocator,
-                &pending,
-                visited,
-                path_states,
-                .{ .pattern = pi, .path = si },
-            ) catch return false;
-            for (path[si..], si..) |byte, index| {
-                if (byte != '/') continue;
-                appendGlobState(
-                    allocator,
-                    &pending,
-                    visited,
-                    path_states,
-                    .{ .pattern = pi, .path = index + 1 },
-                ) catch return false;
-            }
-            continue;
-        }
-        var end = si;
-        while (end <= path.len) : (end += 1) {
-            appendGlobState(
-                allocator,
-                &pending,
-                visited,
-                path_states,
-                .{ .pattern = pi, .path = end },
-            ) catch return false;
-            if (end == path.len or (!double and path[end] == '/')) break;
-        }
+        const slash = double and pi + 2 < pattern.len and pattern[pi + 2] == '/';
+        const width: usize = if (slash) 3 else if (double) 2 else 1;
+        const next = pi + width;
+        states[next] = true;
     }
-    return false;
 }
 
 pub fn codexSchemaProblemAlloc(
@@ -1214,27 +1243,48 @@ test "approval values must belong to the declared response property" {
 
 test "globstar slash consumes only complete path segments" {
     try std.testing.expect(globMatches(
-        std.testing.allocator,
         "**/__snapshots__/**",
         "src/__snapshots__/x.snap",
     ));
     try std.testing.expect(globMatches(
-        std.testing.allocator,
         "**/__snapshots__/**",
         "__snapshots__/x.snap",
     ));
     try std.testing.expect(!globMatches(
-        std.testing.allocator,
         "**/__snapshots__/**",
         "src/not__snapshots__/ordinary.zig",
     ));
 }
 
-test "overlapping stars visit each glob state at most once" {
+test "glob matching is allocation independent and preserves overlapping stars" {
     const repeated = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
     try std.testing.expect(!globMatches(
-        std.testing.allocator,
         repeated,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ));
+    try std.testing.expect(globMatches(
+        "**/*.snap",
+        "src/deep/file.snap",
+    ));
+}
+
+test "exclusion arrays accept TOML strings comments trailing commas and lines" {
+    var settings = Settings{ .allocator = std.testing.allocator };
+    defer settings.deinit();
+    try settings.applyToml(
+        "[exclusions]\n" ++
+            "additional_globs = [\n" ++
+            "  'generated/**', # literal string\n" ++
+            "  \"**/*.snap\",\n" ++
+            "]\n" ++
+            "removed_default_globs = ['vendor/**',]\n",
+    );
+    try std.testing.expectEqual(@as(usize, 2), settings.additional_globs.items.len);
+    try std.testing.expectEqualStrings(
+        "generated/**",
+        settings.additional_globs.items[0],
+    );
+    try std.testing.expectEqualStrings("**/*.snap", settings.additional_globs.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), settings.removed_default_globs.items.len);
+    try std.testing.expectEqualStrings("vendor/**", settings.removed_default_globs.items[0]);
 }

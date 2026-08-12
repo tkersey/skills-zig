@@ -2133,8 +2133,12 @@ fn actorReaderMain(state: *ActorState) void {
 fn actorNotificationMain(state: *ActorState) void {
     while (true) { // tiger: event-loop -- bounded by owner state.
         state.mutex.lock();
-        if (state.terminal != .running and state.notifications.items.len == 0) {
+        if (state.terminal != .running) {
+            var abandoned = state.notifications;
+            state.notifications = .empty;
             state.mutex.unlock();
+            for (abandoned.items) |notification| notification.deinit(state.allocator);
+            abandoned.deinit(state.allocator);
             return;
         }
         const maybe_notification: ?ActorNotification = if (state.notifications.items.len == 0)
@@ -4243,6 +4247,15 @@ fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+        \\if [ "$mode" = teardown_notifications ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"method":"turn/started","params":{"index":1}}'
+        \\  printf '%s\n' '{"method":"turn/started","params":{"index":2}}'
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
         \\if [ "$mode" = nested_server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -4422,10 +4435,18 @@ const NestedNotificationProbe = struct {
 const TeardownNotificationProbe = struct {
     actor: *Actor,
     completed: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(usize) = .init(0),
 
     fn observe(context: *anyopaque, notification: protocol.Notification) void {
         const self: *TeardownNotificationProbe = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        const prior = self.calls.fetchAdd(1, .acq_rel);
+        if (prior != 0) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch |sleep_error| {
+            switch (sleep_error) {
+                else => {},
+            }
+        };
         self.actor.deinit();
         self.completed.store(true, .release);
     }
@@ -4721,10 +4742,10 @@ test "actor teardown waits for an admitted external request" {
     try std.testing.expect(call.failure != null);
 }
 
-test "actor callback teardown defers destruction instead of self joining" {
+test "actor callback teardown drops notifications admitted behind terminal teardown" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fixture = try ActorFixture.init(allocator, "nested_notification");
+    var fixture = try ActorFixture.init(allocator, "teardown_notifications");
     defer fixture.deinit();
     var actor = try fixture.start(.{});
     var probe = TeardownNotificationProbe{ .actor = &actor };
@@ -4739,6 +4760,7 @@ test "actor callback teardown defers destruction instead of self joining" {
     thread.join();
     if (call.result) |result| allocator.free(result);
     try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
 }
 
 test "actor falsifier nested request in server handler cannot deadlock permanent reader" {

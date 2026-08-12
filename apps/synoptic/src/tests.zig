@@ -2289,9 +2289,9 @@ test "exclusions config XDG precedence and strong classification" {
     );
     const xdg_config = "[file_review]\nstart_mode = \"idle\"\n[browser]\nopen " ++
         "= false\n[worktree]\nprefer_current_pr_checkout = fals" ++
-        "e\n[exclusions]\nenabled = true\nadditional_globs = [" ++
-        "\"docs/generated/**\"]\nremoved_default_globs = [\"pac" ++
-        "kage-lock.json\"]\n";
+        "e\n[exclusions]\nenabled = true\nadditional_globs = [\n" ++
+        "  'docs/generated/**', # valid TOML literal string\n]\n" ++
+        "removed_default_globs = ['package-lock.json',]\n";
     try tmp.dir.writeFile(
         io,
         .{ .sub_path = "xdg/synoptic/config.toml", .data = xdg_config },

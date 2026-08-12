@@ -149,15 +149,22 @@ fn generationSessionStatus(
     session: Session,
 ) !SessionStatus {
     if (session.status != .current and session.status != .completed) return session.status;
-    const current_path = (try generation.resolveSessionCurrentPath(
-        session.path,
-        session.revision,
-    )) orelse return .stale_origin;
+    const current_path = assignedCurrentPath(generation, session) catch return .stale_origin;
     const revision = domain.revisionFor(generation, current_path) orelse return .stale_origin;
     return if (std.mem.eql(u8, revision, session.revision))
         session.status
     else
         .stale_origin;
+}
+
+fn assignedCurrentPath(
+    generation: *const domain.PrGeneration,
+    session: Session,
+) ![]const u8 {
+    return (try generation.resolveSessionCurrentPath(
+        session.path,
+        session.revision,
+    )) orelse error.UnknownFile;
 }
 
 pub const AuthoritativeToolHandler = struct {
@@ -2719,7 +2726,7 @@ pub const Registry = struct {
             session.thread_id,
             thread_id.string,
         )) {
-            assigned = session.path;
+            assigned = try assignedCurrentPath(generation, session);
             break;
         };
         const assigned_path = assigned orelse return error.UnknownSession;
@@ -2845,13 +2852,24 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         positiveObjectBeforeNegation(object)
     else
         null;
-    const github_target = positive_object != null and containsAnyIgnoreCase(positive_object.?, &.{
-        "label",   "reviewer", "assignee", "milestone", "pull request",  "this pr",
-        "the pr",  "pr #",     "comment",  "thread",    "github review", "mark viewed",
-        "graphql",
-    });
+    const github_target = positive_object != null and isGithubEffectObject(positive_object.?);
     if (github_target) return .github_any;
     return null;
+}
+
+fn isGithubEffectObject(object: []const u8) bool {
+    const explicit = containsAnyIgnoreCase(object, &.{
+        "label",  "reviewer", "assignee", "milestone",   "pull request", "this pr",
+        "the pr", "pr #",     "github",   "mark viewed", "graphql",
+    });
+    if (explicit) return true;
+    if (containsAnyIgnoreCase(object, &.{
+        "from your summary",      "in your summary",      "from the summary",  "in the summary",
+        "from your response",     "in your response",     "from the response", "in the response",
+        "from your analysis",     "in your analysis",     "from your output",  "in your output",
+        "from this conversation", "in this conversation",
+    })) return false;
+    return isPreparedGithubEffect(object);
 }
 
 fn isPreparedGithubEffect(object: []const u8) bool {
@@ -2869,7 +2887,7 @@ fn isPreparedGithubEffect(object: []const u8) bool {
         if (target.len == before) break;
     }
     return startsWordAnyIgnoreCase(target, &.{
-        "comment", "inline comment", "reply", "graphql action",
+        "comment", "inline comment", "reply", "thread", "graphql action",
     });
 }
 
@@ -3351,6 +3369,12 @@ test "explicit broad GitHub operation grants generic action authority without or
 
 test "prepare authority distinguishes effects from informational artifacts" {
     try std.testing.expect(classifyHumanInstruction(
+        "Remove comments from your summary",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Delete the comment from your response",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
         "Prepare a summary of the existing comments",
     ) == null);
     try std.testing.expect(classifyHumanInstruction(
@@ -3360,6 +3384,35 @@ test "prepare authority distinguishes effects from informational artifacts" {
         HumanAuthority.github_any,
         classifyHumanInstruction("Prepare an inline comment").?,
     );
+}
+
+test "session context unresolved-thread search uses current renamed path" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "base", "head");
+    try generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "revision",
+    });
+    try generation.addThread(.{ .id = "thread-current", .path = "new.zig" });
+    registry.evidence = generation;
+    try registry.sessions.append(std.testing.allocator, .{
+        .id = try std.testing.allocator.dupe(u8, "session"),
+        .thread_id = try std.testing.allocator.dupe(u8, "thread"),
+        .turn_id = try std.testing.allocator.dupe(u8, "turn"),
+        .path = try std.testing.allocator.dupe(u8, "old.zig"),
+        .revision = try std.testing.allocator.dupe(u8, "revision"),
+        .last_injected_revision = try std.testing.allocator.dupe(u8, "revision"),
+    });
+    const result = try registry.searchThreads(
+        "{\"params\":{\"threadId\":\"thread\",\"arguments\":{}}}",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "thread-current") != null);
 }
 
 test "visible notification overflow becomes an explicit warning after capacity drains" {

@@ -1844,7 +1844,7 @@ fn validateClosePayload(payload: []const u8) !void {
     if (payload.len == 0) return;
     const code = std.mem.readInt(u16, payload[0..2], .big);
     if (code < 1000 or code >= 5000 or switch (code) {
-        1004, 1005, 1006, 1015 => true,
+        1004, 1005, 1006, 1015, 1016...1999 => true,
         else => false,
     }) return error.InvalidClientWebSocketFrame;
     if (!std.unicode.utf8ValidateSlice(payload[2..])) {
@@ -2143,6 +2143,15 @@ test "WebSocket close payload accepts only valid status and UTF-8 reason" {
         error.InvalidClientWebSocketFrame,
         validateClosePayload(&.{ 0x03, 0xED }),
     );
+    try std.testing.expectError(
+        error.InvalidClientWebSocketFrame,
+        validateClosePayload(&.{ 0x03, 0xF8 }),
+    );
+    try std.testing.expectError(
+        error.InvalidClientWebSocketFrame,
+        validateClosePayload(&.{ 0x07, 0xCF }),
+    );
+    try validateClosePayload(&.{ 0x07, 0xD0 });
     try std.testing.expectError(
         error.InvalidClientWebSocketFrame,
         validateClosePayload(&.{ 0x03, 0xE8, 0xFF }),
