@@ -172,7 +172,7 @@ pub const ToolDomainContext = struct {
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
         if (identity.status != .current) return error.NotOfficialCurrentSession;
-        try Server.requireReviewWorktree(
+        try requireReviewWorktree(
             self.runtime orelse return error.WorktreeAdmissionUnavailable,
         );
         try self.app.completeRevision(
@@ -1057,7 +1057,9 @@ pub const Server = struct {
     ) ![]u8 {
         const event = runtime.app.openFile(path) catch |err| {
             if (!opened.reused) {
-                runtime.registry.discardOpenedSession(opened.session_id);
+                runtime.registry.discardOpenedSession(opened.session_id) catch |retirement_error| {
+                    return retirement_error;
+                };
             }
             return err;
         };
@@ -1070,10 +1072,14 @@ pub const Server = struct {
             opened.reused,
             immediate and !opened.reused,
         ) catch |err| {
+            var retirement_error: ?anyerror = null;
             if (!opened.reused) {
-                runtime.registry.discardOpenedSession(opened.session_id);
+                runtime.registry.discardOpenedSession(opened.session_id) catch |failure| {
+                    retirement_error = failure;
+                };
             }
             runtime.app.rollbackOpenedFile(path, revision, opened.reused);
+            if (retirement_error) |failure| return failure;
             return err;
         };
         const body = try runtime.app.sessionOpenedPayloadAlloc(path, revision);

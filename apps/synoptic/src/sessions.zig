@@ -878,8 +878,8 @@ pub const Registry = struct {
         return null;
     }
 
-    pub fn discardOpenedSession(self: *Registry, session_id: []const u8) void {
-        self.removeSession(session_id);
+    pub fn discardOpenedSession(self: *Registry, session_id: []const u8) !void {
+        try self.closeSession(session_id);
     }
     pub fn sessionIdentity(self: *Registry, session_id: []const u8) !SessionIdentity {
         self.mutex.lock();
