@@ -255,28 +255,53 @@ fn retireDeadLaunch(
     runtime_root: []const u8,
     record: LifecycleRecord,
 ) !void {
-    const kind = record.worktree_kind orelse return;
-    if (!std.mem.eql(u8, kind, "managed")) return;
-    const recorded_path = record.worktree orelse return error.IncompleteManagedLaunchRecord;
-    const repository_cwd = record.repository_cwd orelse
-        return error.IncompleteManagedLaunchRecord;
-    if (!std.fs.path.isAbsolute(repository_cwd)) return error.InvalidLifecycleRecord;
-    const expected_path = try std.fs.path.join(
-        allocator,
-        &.{ runtime_root, record.launch_id, "worktree" },
-    );
-    defer allocator.free(expected_path);
-    if (!std.mem.eql(u8, recorded_path, expected_path) or
-        !std.mem.eql(u8, record.runtime_root, runtime_root))
+    if (!std.mem.eql(u8, record.runtime_root, runtime_root) or
+        record.launch_id.len != 48)
     {
         return error.InvalidLifecycleRecord;
     }
-    try worktree.retireManaged(
+    for (record.launch_id) |byte| {
+        if (!std.ascii.isHex(byte)) return error.InvalidLifecycleRecord;
+    }
+    const launch_dir = try std.fs.path.join(
         allocator,
-        io,
-        .{ .managed = recorded_path },
-        repository_cwd,
+        &.{ runtime_root, record.launch_id },
     );
+    defer allocator.free(launch_dir);
+    const kind = record.worktree_kind;
+    if (kind != null and std.mem.eql(u8, kind.?, "managed")) {
+        const recorded_path = record.worktree orelse
+            return error.IncompleteManagedLaunchRecord;
+        const repository_cwd = record.repository_cwd orelse
+            return error.IncompleteManagedLaunchRecord;
+        if (!std.fs.path.isAbsolute(repository_cwd)) {
+            return error.InvalidLifecycleRecord;
+        }
+        const expected_path = try std.fs.path.join(
+            allocator,
+            &.{ launch_dir, "worktree" },
+        );
+        defer allocator.free(expected_path);
+        if (!std.mem.eql(u8, recorded_path, expected_path)) {
+            return error.InvalidLifecycleRecord;
+        }
+        try worktree.retireManaged(
+            allocator,
+            io,
+            .{ .managed = recorded_path },
+            repository_cwd,
+        );
+    } else if (kind != null and !std.mem.eql(u8, kind.?, "reused-current")) {
+        return error.InvalidLifecycleRecord;
+    } else if (kind == null and
+        (record.worktree != null or record.repository_cwd != null))
+    {
+        return error.InvalidLifecycleRecord;
+    }
+    deleteLaunchDirectory(io, launch_dir) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn retireLaunchProcessGroup(io: std.Io, child: *std.process.Child) bool {
@@ -2316,6 +2341,10 @@ test "dead launch recovery retires managed custody" {
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, managed, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
     );
 }
 test "failed launch retires descendants before managed custody and preserves error" {
