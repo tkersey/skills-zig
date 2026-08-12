@@ -1461,6 +1461,7 @@ pub const Registry = struct {
     pub fn markPathChangedAndInject(
         self: *Registry,
         session_path: []const u8,
+        session_revision: []const u8,
         current_path: []const u8,
         revision: []const u8,
         diff: []const u8,
@@ -1485,7 +1486,9 @@ pub const Registry = struct {
                 &session.last_thread_evidence_digest,
                 &evidence_digest,
             );
-            if (session.status != .closed and std.mem.eql(u8, session.path, session_path) and
+            if (session.status != .closed and
+                std.mem.eql(u8, session.path, session_path) and
+                std.mem.eql(u8, session.revision, session_revision) and
                 (revision_changed or evidence_changed))
             {
                 if (!std.mem.eql(u8, session.revision, revision)) {

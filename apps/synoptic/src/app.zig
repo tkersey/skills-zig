@@ -371,9 +371,14 @@ pub const App = struct {
         self.initial_review_active = false;
     }
 
-    pub fn updateTabDiff(self: *App, path: []const u8, diff: ?[]const u8) !void {
-        for (self.tabs.items) |*tab| if (std.mem.eql(u8, tab.path, path) and tab.status !=
-            .closed)
+    pub fn updateTabDiff(
+        self: *App,
+        path: []const u8,
+        revision: []const u8,
+        diff: ?[]const u8,
+    ) !void {
+        for (self.tabs.items) |*tab| if (std.mem.eql(u8, tab.path, path) and
+            std.mem.eql(u8, tab.revision, revision) and tab.status != .closed)
         {
             const content = try self.allocator.dupe(u8, diff orelse "");
             self.allocator.free(tab.diff);
@@ -435,9 +440,12 @@ pub const App = struct {
         pull_request: u64,
         pull_request_id: []const u8,
         session_path: []const u8,
+        session_revision: []const u8,
     ) !tools.ActionCard {
-        const current_path = (try self.generation.resolveCurrentPath(session_path)) orelse
-            return error.ActionTargetChanged;
+        const current_path = (try self.generation.resolveSessionCurrentPath(
+            session_path,
+            session_revision,
+        )) orelse return error.ActionTargetChanged;
         const github_path = try self.actionTargetPath(input, current_path);
         const comment_body_snapshot = try self.commentBodySnapshot(input);
         const card = try self.action_store.prepare(

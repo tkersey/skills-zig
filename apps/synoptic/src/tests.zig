@@ -37,7 +37,16 @@ test "vertical state path gates primary, streams session, and retains completed 
         .line = 12,
         .body = @constCast("Could this fail?"),
     };
-    _ = try state.prepareModelAction("s", "t", input, "o/r", 1, "PR_1", "src/a.zig");
+    _ = try state.prepareModelAction(
+        "s",
+        "t",
+        input,
+        "o/r",
+        1,
+        "PR_1",
+        "src/a.zig",
+        "r1",
+    );
     try std.testing.expectEqual(tools.ActionStatus.pending, state.pending.?.status);
     state.close();
     try std.testing.expect(state.generation.queued("src/a.zig"));
@@ -73,7 +82,7 @@ test "comment mutation cards own the server-observed body snapshot" {
         .payload_json = @constCast("{}"),
         .comment_id = @constCast("C_1"),
         .body = @constCast("replacement body"),
-    }, "o/r", 1, "PR_1", "a.zig");
+    }, "o/r", 1, "PR_1", "a.zig", "r");
     try std.testing.expectEqualStrings(
         "observed body",
         card.target.comment_body_snapshot.?,
@@ -114,7 +123,7 @@ test "thread and comment actions bind to the originating file session" {
             .payload_json = @constCast("{}"),
             .thread_id = @constCast("T_other"),
             .body = @constCast("body"),
-        }, "o/r", 1, "PR_1", "a.zig"),
+        }, "o/r", 1, "PR_1", "a.zig", "r"),
     );
     try std.testing.expectError(
         error.ActionTargetsAnotherSession,
@@ -124,7 +133,7 @@ test "thread and comment actions bind to the originating file session" {
             .effect_summary = @constCast("Delete"),
             .payload_json = @constCast("{}"),
             .comment_id = @constCast("C_other"),
-        }, "o/r", 1, "PR_1", "a.zig"),
+        }, "o/r", 1, "PR_1", "a.zig", "r"),
     );
 }
 
@@ -146,7 +155,7 @@ test "old-path thread actions resolve to the renamed current file" {
         .payload_json = @constCast("{}"),
         .thread_id = @constCast("T_old"),
         .body = @constCast("body"),
-    }, "o/r", 1, "PR_1", "new.zig");
+    }, "o/r", 1, "PR_1", "new.zig", "r");
     try std.testing.expectEqualStrings("new.zig", card.target.session_path);
     try std.testing.expectEqualStrings("new.zig", card.target.current_path);
     try std.testing.expectEqualStrings("old.zig", card.target.path.?);
@@ -158,6 +167,57 @@ test "old-path thread actions resolve to the renamed current file" {
         "\"sessionPath\":\"new.zig\",\"currentPath\":\"new.zig\"," ++
             "\"path\":\"old.zig\"",
     ) != null);
+}
+
+test "session revision disambiguates replacement and renamed lineage actions" {
+    var state = try app.App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "old.zig",
+        .change_type = "ADDED",
+        .viewed = .unviewed,
+        .revision_key = "replacement",
+    });
+    try state.generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "renamed",
+    });
+    const input = tools.PreparedActionInput{
+        .slot = @constCast("comment"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("Comment"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("old.zig"),
+        .line = 1,
+        .body = @constCast("body"),
+    };
+    const replacement = try state.prepareModelAction(
+        "replacement-session",
+        "turn-1",
+        input,
+        "o/r",
+        1,
+        "PR_1",
+        "old.zig",
+        "replacement",
+    );
+    var historical_input = input;
+    historical_input.path = @constCast("new.zig");
+    const historical = try state.prepareModelAction(
+        "historical-session",
+        "turn-2",
+        historical_input,
+        "o/r",
+        1,
+        "PR_1",
+        "old.zig",
+        "historical",
+    );
+    try std.testing.expectEqualStrings("old.zig", replacement.target.current_path);
+    try std.testing.expectEqualStrings("new.zig", historical.target.current_path);
 }
 
 test "action broker validates renamed session identity and GitHub identity independently" {
@@ -645,8 +705,17 @@ test "e2e domain lifecycle preserves queue tabs supersession and changed revisio
         .line = 2,
         .body = @constCast("replacement"),
     };
-    _ = try state.prepareModelAction("s", "t1", first_action, "o/r", 1, "PR_1", "a");
-    _ = try state.prepareModelAction("s", "t2", replacement_action, "o/r", 1, "PR_1", "a");
+    _ = try state.prepareModelAction("s", "t1", first_action, "o/r", 1, "PR_1", "a", "r1");
+    _ = try state.prepareModelAction(
+        "s",
+        "t2",
+        replacement_action,
+        "o/r",
+        1,
+        "PR_1",
+        "a",
+        "r1",
+    );
     try std.testing.expectEqual(
         tools.ActionStatus.superseded,
         state.action_store.cards.items[0].status,
@@ -713,7 +782,7 @@ test "ui domain bootstrap owns PR queue tab diff and reconnect state" {
     defer std.testing.allocator.free(opened);
     try expectOpenedUiPayload(opened);
 
-    try state.updateTabDiff("a.zig", "@@ -1 +1 @@\n-new\n+newer\n");
+    try state.updateTabDiff("a.zig", "r1", "@@ -1 +1 @@\n-new\n+newer\n");
     var refreshed = try domain.PrGeneration.initFull(std.testing.allocator, "b2", "h2");
     try refreshed.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
     try state.updatePullRequestGeneration("b2", "h2");
@@ -722,7 +791,7 @@ test "ui domain bootstrap owns PR queue tab diff and reconnect state" {
     defer std.testing.allocator.free(reconnect);
     try expectReconnectUiPayload(reconnect);
 
-    try state.updateTabDiff("a.zig", null);
+    try state.updateTabDiff("a.zig", "r1", null);
     const removed = try domain.PrGeneration.initFull(std.testing.allocator, "b3", "h3");
     try state.updatePullRequestGeneration("b3", "h3");
     state.replaceGeneration(removed);
@@ -2872,8 +2941,22 @@ test "file session receives every later revision and active close interrupts its
         true,
     );
     defer opened.deinit();
-    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", "[]");
-    try registry.markPathChangedAndInject("a.zig", "a.zig", "r3", "+revision three", "[]");
+    try registry.markPathChangedAndInject(
+        "a.zig",
+        "r1",
+        "a.zig",
+        "r2",
+        "+revision two",
+        "[]",
+    );
+    try registry.markPathChangedAndInject(
+        "a.zig",
+        "r1",
+        "a.zig",
+        "r3",
+        "+revision three",
+        "[]",
+    );
     try std.testing.expectEqualStrings("r3", registry.sessions.items[0].last_injected_revision);
     registry.sessions.items[0].turn_active = true;
     try registry.closeSession(opened.session_id);
@@ -2925,8 +3008,22 @@ test "session context refresh injects changed thread evidence into every open si
     );
     defer current.deinit();
     const evidence = "[{\"id\":\"T-new\",\"path\":\"a.zig\"}]";
-    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", evidence);
-    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", evidence);
+    try registry.markPathChangedAndInject(
+        "a.zig",
+        "r1",
+        "a.zig",
+        "r2",
+        "+revision two",
+        evidence,
+    );
+    try registry.markPathChangedAndInject(
+        "a.zig",
+        "r2",
+        "a.zig",
+        "r2",
+        "+revision two",
+        evidence,
+    );
     try std.testing.expectEqual(
         sessions.SessionStatus.stale_origin,
         registry.sessions.items[0].status,
@@ -4650,9 +4747,10 @@ fn injectedRefresh(runtime: *http.Runtime) !void {
         .canonical_diff = "@@ -1 +1 @@\n-old b\n+new b\n",
         .diff_state = .text,
     });
-    try runtime.app.updateTabDiff("a.zig", "@@ -1 +1 @@\n+refreshed\n");
+    try runtime.app.updateTabDiff("a.zig", "r1", "@@ -1 +1 @@\n+refreshed\n");
     try runtime.registry.markPathChangedAndInject(
         "a.zig",
+        "r1",
         "a.zig",
         "r2",
         "@@ -1 +1 @@\n+refreshed\n",

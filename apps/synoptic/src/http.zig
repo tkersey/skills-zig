@@ -140,8 +140,10 @@ pub const ToolDomainContext = struct {
         defer input.deinit(self.allocator);
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
-        const current_path = (try self.app.generation.resolveCurrentPath(identity.path)) orelse
-            return error.ActionTargetsAnotherSession;
+        const current_path = (try self.app.generation.resolveSessionCurrentPath(
+            identity.path,
+            identity.revision,
+        )) orelse return error.ActionTargetsAnotherSession;
         try tools.validateAgainstSession(input, current_path);
         const repository = try std.fmt.allocPrint(
             self.allocator,
@@ -159,6 +161,7 @@ pub const ToolDomainContext = struct {
             self.number,
             self.pull_request_id,
             identity.path,
+            identity.revision,
         );
     }
 
@@ -1371,15 +1374,18 @@ pub const Server = struct {
         _ = self;
         for (runtime.app.tabs.items) |tab| {
             if (tab.status == .closed) continue;
-            const current_path = (try next.resolveCurrentPath(tab.path)) orelse {
-                try runtime.app.updateTabDiff(tab.path, null);
+            const current_path = (try next.resolveSessionCurrentPath(
+                tab.path,
+                tab.revision,
+            )) orelse {
+                try runtime.app.updateTabDiff(tab.path, tab.revision, null);
                 continue;
             };
             const current_diff = next.canonicalDiff(current_path) orelse {
-                try runtime.app.updateTabDiff(tab.path, null);
+                try runtime.app.updateTabDiff(tab.path, tab.revision, null);
                 continue;
             };
-            try runtime.app.updateTabDiff(tab.path, current_diff);
+            try runtime.app.updateTabDiff(tab.path, tab.revision, current_diff);
         }
     }
 
@@ -1388,22 +1394,24 @@ pub const Server = struct {
         runtime: *Runtime,
         next: *const @import("domain.zig").PrGeneration,
     ) !void {
-        var paths: std.ArrayList([]const u8) = .empty;
-        defer paths.deinit(self.allocator);
-        try appendLiveTabPaths(self.allocator, &paths, runtime.app.tabs.items);
-        for (paths.items) |path| {
-            const current_path = (try next.resolveCurrentPath(path)) orelse {
+        for (runtime.app.tabs.items) |tab| {
+            if (tab.status == .closed) continue;
+            const current_path = (try next.resolveSessionCurrentPath(
+                tab.path,
+                tab.revision,
+            )) orelse {
                 const threads = try next.boundedUnresolvedThreadsJsonAlloc(
                     self.allocator,
-                    path,
+                    tab.path,
                     null,
                     &.{},
                     false,
                 );
                 defer self.allocator.free(threads);
                 try runtime.registry.markPathChangedAndInject(
-                    path,
-                    path,
+                    tab.path,
+                    tab.revision,
+                    tab.path,
                     "deleted",
                     "This file was removed from the current pull request.",
                     threads,
@@ -1423,7 +1431,8 @@ pub const Server = struct {
             const diff = next.canonicalDiff(current_path) orelse
                 return error.MissingCanonicalDiff;
             try runtime.registry.markPathChangedAndInject(
-                path,
+                tab.path,
+                tab.revision,
                 current_path,
                 next_revision,
                 diff,
@@ -1597,27 +1606,6 @@ fn receiptStringAlloc(
     const value = parsed.value.object.get(key) orelse return error.InvalidAuthoritativeReceipt;
     if (value != .string) return error.InvalidAuthoritativeReceipt;
     return allocator.dupe(u8, value.string);
-}
-
-fn appendUniquePath(
-    allocator: std.mem.Allocator,
-    paths: *std.ArrayList([]const u8),
-    path: []const u8,
-) !void {
-    for (paths.items) |existing| {
-        if (std.mem.eql(u8, existing, path)) return;
-    }
-    try paths.append(allocator, path);
-}
-
-fn appendLiveTabPaths(
-    allocator: std.mem.Allocator,
-    paths: *std.ArrayList([]const u8),
-    tabs: []const domain.Tab,
-) !void {
-    for (tabs) |tab| {
-        if (tab.status != .closed) try appendUniquePath(allocator, paths, tab.path);
-    }
 }
 
 fn payloadBool(payload: std.json.ObjectMap, key: []const u8) ?bool {
@@ -2022,33 +2010,6 @@ test "static assets are not state-bearing authorization targets" {
     try std.testing.expect(requiresToken("/api/bootstrap"));
     try std.testing.expect(requiresToken("/api/bootstrap?token=launch"));
     try std.testing.expect(!requiresToken("/api/bootstrap-impersonator"));
-}
-
-test "refresh delta hydration selects only live file tabs" {
-    const tabs = [_]domain.Tab{
-        .{ .id = "s1", .path = "a.zig", .revision = "r1", .diff = "" },
-        .{
-            .id = "s2",
-            .path = "a.zig",
-            .revision = "r0",
-            .status = .stale_origin,
-            .diff = "",
-        },
-        .{
-            .id = "s3",
-            .path = "closed.zig",
-            .revision = "r1",
-            .status = .closed,
-            .diff = "",
-        },
-        .{ .id = "s4", .path = "b.zig", .revision = "r1", .diff = "" },
-    };
-    var paths: std.ArrayList([]const u8) = .empty;
-    defer paths.deinit(std.testing.allocator);
-    try appendLiveTabPaths(std.testing.allocator, &paths, &tabs);
-    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
-    try std.testing.expectEqualStrings("a.zig", paths.items[0]);
-    try std.testing.expectEqualStrings("b.zig", paths.items[1]);
 }
 
 test "tool-domain server cancellation reaches in-flight GitHub effects" {

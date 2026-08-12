@@ -735,6 +735,21 @@ pub const PrGeneration = struct {
         return null;
     }
 
+    pub fn resolveSessionCurrentPath(
+        self: *const PrGeneration,
+        review_path: []const u8,
+        review_revision: []const u8,
+    ) !?[]const u8 {
+        for (self.files.items) |file| {
+            if (std.mem.eql(u8, file.path, review_path) and
+                std.mem.eql(u8, file.revision_key, review_revision))
+            {
+                return file.path;
+            }
+        }
+        return self.resolveCurrentPath(review_path);
+    }
+
     pub fn currentPath(self: *const PrGeneration, review_path: []const u8) ?[]const u8 {
         return self.resolveCurrentPath(review_path) catch null;
     }
@@ -997,6 +1012,14 @@ test "explicit rename lineage dominates a replacement at the historical path" {
     try std.testing.expectEqualStrings(
         "new.zig",
         (try generation.resolveCurrentPath("old.zig")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "old.zig",
+        (try generation.resolveSessionCurrentPath("old.zig", "replacement")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "new.zig",
+        (try generation.resolveSessionCurrentPath("old.zig", "historical")).?,
     );
 }
 
