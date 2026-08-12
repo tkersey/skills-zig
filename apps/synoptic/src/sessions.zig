@@ -579,6 +579,7 @@ pub const Registry = struct {
         cwd: []const u8,
         skill_path: []const u8,
         pr_json: []const u8,
+        file_metadata_pages: []const []const u8,
     ) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         try actor.subscribe(.{ .context = self, .handle = onNotification });
@@ -596,6 +597,11 @@ pub const Registry = struct {
         const response = try actor.requestJson("thread/start", params, null);
         defer self.allocator.free(response);
         self.primary_thread_id = try extractString(self.allocator, response, &.{ "thread", "id" });
+        try self.injectPrimaryMetadataPages(
+            actor,
+            self.primary_thread_id.?,
+            file_metadata_pages,
+        );
         const primary_role = try readReference(
             self.allocator,
             io,
@@ -1538,14 +1544,20 @@ pub const Registry = struct {
         }
     }
 
-    pub fn updatePrimary(self: *Registry, summary: []const u8) !void {
+    pub fn updatePrimary(
+        self: *Registry,
+        summary: []const u8,
+        file_metadata_pages: []const []const u8,
+    ) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
+        const thread_id = self.primary_thread_id orelse return error.PrimaryNotReady;
+        try self.injectPrimaryMetadataPages(actor, thread_id, file_metadata_pages);
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"threadId\":{f},\"input\":[{{\"type\":\"text\",\"te" ++
                 "xt\":{f}}}]}}",
             .{ std.json.fmt(
-                self.primary_thread_id orelse return error.PrimaryNotReady,
+                thread_id,
                 .{},
             ), std.json.fmt(summary, .{}) },
         );
@@ -1556,6 +1568,30 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.installPrimaryTurnLocked(next_turn);
+    }
+
+    fn injectPrimaryMetadataPages(
+        self: *Registry,
+        actor: *cas_runtime.Actor,
+        thread_id: []const u8,
+        pages: []const []const u8,
+    ) !void {
+        for (pages, 0..) |page, index| {
+            const text = try std.fmt.allocPrint(
+                self.allocator,
+                "Current changed-file metadata page {d}/{d}; ordered JSON array:\n{s}",
+                .{ index + 1, pages.len, page },
+            );
+            defer self.allocator.free(text);
+            const params = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"threadId\":{f},\"items\":[{{\"type\":\"text\",\"text\":{f}}}]}}",
+                .{ std.json.fmt(thread_id, .{}), std.json.fmt(text, .{}) },
+            );
+            defer self.allocator.free(params);
+            const response = try actor.requestJson("thread/inject_items", params, null);
+            defer self.allocator.free(response);
+        }
     }
 
     fn onNotification(context: *anyopaque, notification: cas_runtime.Notification) void {

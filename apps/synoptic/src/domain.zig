@@ -209,7 +209,26 @@ pub const File = struct {
     exclusion_sync_error: ?[]const u8 = null,
 };
 
-pub const max_primary_file_metadata_bytes: usize = 512 * 1024;
+pub const max_primary_file_metadata_page_bytes: usize = 128 * 1024;
+
+pub const PrimaryMetadataPages = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *PrimaryMetadataPages) void {
+        for (self.items.items) |page| self.allocator.free(page);
+        self.items.deinit(self.allocator);
+    }
+};
+
+fn appendMetadataPage(
+    allocator: std.mem.Allocator,
+    pages: *std.ArrayList([]u8),
+    page: []u8,
+) !void {
+    errdefer allocator.free(page);
+    try pages.append(allocator, page);
+}
 
 const PrimaryFileMetadata = struct {
     path: []const u8,
@@ -312,29 +331,54 @@ pub const PrGeneration = struct {
         });
     }
 
-    pub fn primaryFileMetadataJsonAlloc(
+    pub fn primaryFileMetadataPagesAlloc(
         self: *const PrGeneration,
         allocator: std.mem.Allocator,
-    ) ![]u8 {
-        const storage = try allocator.alloc(u8, max_primary_file_metadata_bytes);
-        errdefer allocator.free(storage);
-        var writer = std.Io.Writer.fixed(storage);
-        writer.writeByte('[') catch return error.PrimaryFileMetadataTooLarge;
-        for (self.files.items, 0..) |file, index| {
-            if (index != 0) {
-                writer.writeByte(',') catch return error.PrimaryFileMetadataTooLarge;
-            }
-            std.json.Stringify.value(PrimaryFileMetadata{
+    ) !PrimaryMetadataPages {
+        return self.primaryFileMetadataPagesAllocWithLimit(
+            allocator,
+            max_primary_file_metadata_page_bytes,
+        );
+    }
+
+    fn primaryFileMetadataPagesAllocWithLimit(
+        self: *const PrGeneration,
+        allocator: std.mem.Allocator,
+        page_limit: usize,
+    ) !PrimaryMetadataPages {
+        if (page_limit < 3) return error.PrimaryFileMetadataPageTooSmall;
+        var pages = PrimaryMetadataPages{ .allocator = allocator };
+        errdefer pages.deinit();
+        var page: std.Io.Writer.Allocating = .init(allocator);
+        defer page.deinit();
+        try page.writer.writeByte('[');
+        for (self.files.items) |file| {
+            var encoded: std.Io.Writer.Allocating = .init(allocator);
+            defer encoded.deinit();
+            try std.json.Stringify.value(PrimaryFileMetadata{
                 .path = file.path,
                 .previousPath = file.previous_path,
                 .additions = file.additions,
                 .deletions = file.deletions,
                 .changeType = file.change_type,
                 .viewedState = file.viewed,
-            }, .{}, &writer) catch return error.PrimaryFileMetadataTooLarge;
+            }, .{}, &encoded.writer);
+            const separator_bytes: usize = if (page.written().len == 1) 0 else 1;
+            if (encoded.written().len + 2 > page_limit) {
+                return error.PrimaryFileMetadataItemTooLarge;
+            }
+            if (page.written().len + separator_bytes + encoded.written().len + 1 > page_limit) {
+                try page.writer.writeByte(']');
+                try appendMetadataPage(allocator, &pages.items, try page.toOwnedSlice());
+                page = .init(allocator);
+                try page.writer.writeByte('[');
+            }
+            if (page.written().len != 1) try page.writer.writeByte(',');
+            try page.writer.writeAll(encoded.written());
         }
-        writer.writeByte(']') catch return error.PrimaryFileMetadataTooLarge;
-        return allocator.realloc(storage, writer.end);
+        try page.writer.writeByte(']');
+        try appendMetadataPage(allocator, &pages.items, try page.toOwnedSlice());
+        return pages;
     }
 
     pub fn addThread(self: *PrGeneration, thread: ReviewThread) !void {
@@ -954,4 +998,36 @@ test "explicit rename lineage dominates a replacement at the historical path" {
         "new.zig",
         (try generation.resolveCurrentPath("old.zig")).?,
     );
+}
+
+test "primary metadata preserves order across bounded pages" {
+    const allocator = std.testing.allocator;
+    var generation = try PrGeneration.init(allocator, "head");
+    defer generation.deinit();
+    for (0..6) |index| {
+        const path = try std.fmt.allocPrint(allocator, "src/file-{d}.zig", .{index});
+        defer allocator.free(path);
+        try generation.addFile(.{
+            .path = path,
+            .viewed = .unviewed,
+            .revision_key = "revision",
+        });
+    }
+    var pages = try generation.primaryFileMetadataPagesAllocWithLimit(allocator, 256);
+    defer pages.deinit();
+    try std.testing.expect(pages.items.items.len > 1);
+    var expected: usize = 0;
+    for (pages.items.items) |page| {
+        try std.testing.expect(page.len <= 256);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, page, .{});
+        defer parsed.deinit();
+        for (parsed.value.array.items) |item| {
+            const path = item.object.get("path").?.string;
+            const wanted = try std.fmt.allocPrint(allocator, "src/file-{d}.zig", .{expected});
+            defer allocator.free(wanted);
+            try std.testing.expectEqualStrings(wanted, path);
+            expected += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), expected);
 }

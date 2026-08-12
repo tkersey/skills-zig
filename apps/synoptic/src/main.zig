@@ -716,6 +716,8 @@ fn initializePrimary(
     try registry.setGenerationEvidence(&state.generation);
     const skill_path = try std.fs.path.join(allocator, &.{ skill_root, "SKILL.md" });
     errdefer allocator.free(skill_path);
+    var file_metadata_pages = try state.generation.primaryFileMetadataPagesAlloc(allocator);
+    defer file_metadata_pages.deinit();
     const pr_context = try primaryContextAlloc(
         allocator,
         identity.owner,
@@ -727,10 +729,15 @@ fn initializePrimary(
         snapshot.base,
         snapshot.head_ref,
         snapshot.head,
-        &state.generation,
     );
     defer allocator.free(pr_context);
-    try registry.createPrimary(io, review_cwd, skill_path, pr_context);
+    try registry.createPrimary(
+        io,
+        review_cwd,
+        skill_path,
+        pr_context,
+        file_metadata_pages.items.items,
+    );
     state.primary_ready = registry.primaryReady();
     return skill_path;
 }
@@ -1691,10 +1698,7 @@ fn primaryContextAlloc(
     base_oid: []const u8,
     head_ref: []const u8,
     head_oid: []const u8,
-    generation: *const domain.PrGeneration,
 ) ![]u8 {
-    const files = try generation.primaryFileMetadataJsonAlloc(allocator);
-    defer allocator.free(files);
     const repository = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}",
@@ -1705,7 +1709,8 @@ fn primaryContextAlloc(
         allocator,
         "{{\"repository\":{f},\"pullRequest\":{d},\"title\":{f}" ++
             ",\"body\":{f},\"baseRefName\":{f},\"baseRefOid\":{f}," ++
-            "\"headRefName\":{f},\"headRefOid\":{f},\"files\":{s}}}",
+            "\"headRefName\":{f},\"headRefOid\":{f}," ++
+            "\"files\":\"injected as ordered bounded metadata pages\"}}",
         .{
             std.json.fmt(repository, .{}),
             number,
@@ -1715,7 +1720,6 @@ fn primaryContextAlloc(
             std.json.fmt(base_oid, .{}),
             std.json.fmt(head_ref, .{}),
             std.json.fmt(head_oid, .{}),
-            files,
         },
     );
 }

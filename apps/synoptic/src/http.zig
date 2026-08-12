@@ -1292,9 +1292,13 @@ pub const Server = struct {
         try runtime.registry.setGenerationEvidence(&runtime.app.generation);
         const primary_update = try self.primaryUpdateAlloc(runtime);
         defer self.allocator.free(primary_update);
+        var file_metadata_pages = try runtime.app.generation.primaryFileMetadataPagesAlloc(
+            self.allocator,
+        );
+        defer file_metadata_pages.deinit();
         mutex.unlock();
         locked = false;
-        try runtime.registry.updatePrimary(primary_update);
+        try runtime.registry.updatePrimary(primary_update, file_metadata_pages.items.items);
         mutex.lock();
         locked = true;
         runtime.worktree_generation_valid = true;
@@ -1417,13 +1421,12 @@ pub const Server = struct {
     }
 
     fn primaryUpdateAlloc(self: *Server, runtime: *Runtime) ![]u8 {
-        const files = try runtime.app.generation.primaryFileMetadataJsonAlloc(self.allocator);
-        defer self.allocator.free(files);
         const header = runtime.app.pull_request orelse return error.MissingPullRequestHeader;
         const update_format = "The pull request was explicitly refreshed. Current tit" ++
             "le: {s}. Current body: {s}. Current state: {s}; draft: {}. Current base " ++
             "ref: {s} at {s}. Current head ref: {s} at {s}. Current changed files: " ++
-            "{s}. Re-evaluate intent, invariants, and cross-file relationships from " ++
+            "the ordered bounded metadata pages injected immediately before this turn. " ++
+            "Re-evaluate intent, invariants, and cross-file relationships from " ++
             "this generation and the synchronized shared worktree.";
         return std.fmt.allocPrint(
             self.allocator,
@@ -1437,7 +1440,6 @@ pub const Server = struct {
                 header.base_ref_oid,
                 header.head_ref_name,
                 header.head_ref_oid,
-                files,
             },
         );
     }

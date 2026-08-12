@@ -2038,7 +2038,7 @@ test "canonical review diffs ignore abbreviated object-id configuration" {
 
 test "primary file metadata cannot serialize canonical patch bytes" {
     const allocator = std.testing.allocator;
-    const patch = try allocator.alloc(u8, domain.max_primary_file_metadata_bytes);
+    const patch = try allocator.alloc(u8, domain.max_primary_file_metadata_page_bytes);
     defer allocator.free(patch);
     @memset(patch, 'x');
     var generation = try domain.PrGeneration.initFull(allocator, "base", "head");
@@ -2054,8 +2054,10 @@ test "primary file metadata cannot serialize canonical patch bytes" {
         .canonical_diff = patch,
         .diff_state = .text,
     });
-    const metadata = try generation.primaryFileMetadataJsonAlloc(allocator);
-    defer allocator.free(metadata);
+    var pages = try generation.primaryFileMetadataPagesAlloc(allocator);
+    defer pages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pages.items.items.len);
+    const metadata = pages.items.items[0];
     try std.testing.expect(metadata.len < 512);
     try std.testing.expect(std.mem.indexOf(u8, metadata, "src/a.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata, "src/old-a.zig") != null);
@@ -4611,7 +4613,7 @@ fn injectedRefresh(runtime: *http.Runtime) !void {
     try runtime.app.updatePullRequestGeneration(next.base_oid, next.head_oid);
     runtime.app.replaceGeneration(next);
     try runtime.registry.setGenerationEvidence(&runtime.app.generation);
-    try runtime.registry.updatePrimary("fixture refresh");
+    try runtime.registry.updatePrimary("fixture refresh", &.{"[]"});
 }
 
 const WsPrograms = struct {
@@ -4771,7 +4773,13 @@ fn prepareWsRegistry(
     );
     errdefer registry.deinit();
     try registry.setGenerationEvidence(&state.generation);
-    try registry.createPrimary(io, root, programs.skill, "{\"title\":\"fixture\"}");
+    try registry.createPrimary(
+        io,
+        root,
+        programs.skill,
+        "{\"title\":\"fixture\"}",
+        &.{"[]"},
+    );
     state.primary_ready = false;
     try registry.visible_events.append(std.heap.page_allocator, .{
         .session_id = null,
