@@ -92,9 +92,15 @@ fn remoteMatchesRepository(
         remote_host = normalizeAuthorityHost(authority, scheme) orelse return false;
         path = url[path_start + 1 ..];
     } else {
-        const at = std.mem.indexOfScalar(u8, url, '@') orelse return false;
-        const colon = std.mem.indexOfScalarPos(u8, url, at + 1, ':') orelse return false;
-        remote_host = url[at + 1 .. colon];
+        const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
+        if (std.mem.indexOfScalar(u8, url[0..colon], '/')) |_| return false;
+        const authority = url[0..colon];
+        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at|
+            at + 1
+        else
+            0;
+        if (host_start == authority.len) return false;
+        remote_host = authority[host_start..];
         path = url[colon + 1 ..];
     }
     path = std.mem.trimEnd(u8, path, "/");
@@ -1103,6 +1109,27 @@ test "repository remote matching normalizes transport default ports" {
     try std.testing.expect(remoteMatchesRepository(
         "https://github.example.test:8443/owner/repo.git",
         "github.example.test:8443",
+        "owner",
+        "repo",
+    ));
+}
+
+test "repository remote matching accepts scp syntax without a user" {
+    try std.testing.expect(remoteMatchesRepository(
+        "github.com:owner/repo.git",
+        "github.com",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(remoteMatchesRepository(
+        "git@github.com:owner/repo.git",
+        "github.com",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(!remoteMatchesRepository(
+        "local/path:owner/repo.git",
+        "github.com",
         "owner",
         "repo",
     ));

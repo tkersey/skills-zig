@@ -118,6 +118,28 @@ test "thread and comment actions bind to the originating file session" {
     );
 }
 
+test "old-path thread actions resolve to the renamed current file" {
+    var state = try app.App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "r",
+    });
+    try state.generation.addThread(.{ .id = "T_old", .path = "old.zig" });
+    const card = try state.prepareModelAction("s", "t", .{
+        .slot = @constCast("reply"),
+        .kind = .reply_thread,
+        .effect_summary = @constCast("Reply"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T_old"),
+        .body = @constCast("body"),
+    }, "o/r", 1, "PR_1", "new.zig");
+    try std.testing.expectEqualStrings("new.zig", card.target.path.?);
+}
+
 test "complete GitHub snapshot replacement refreshes all PR metadata" {
     var state = try app.App.init(std.testing.allocator, "old-head");
     defer state.deinit();
@@ -202,6 +224,93 @@ test "session context unresolved assigned-file evidence preserves complete comme
         evidence,
         needle,
     ) != null);
+}
+
+test "renamed file identity preserves old-path thread evidence" {
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "b", "h");
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "r",
+    });
+    try generation.addThread(.{ .id = "T-old", .path = "old.zig" });
+    const evidence = try generation.unresolvedThreadsJsonAlloc(
+        std.testing.allocator,
+        "new.zig",
+        null,
+        &.{},
+        false,
+    );
+    defer std.testing.allocator.free(evidence);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "T-old") != null);
+    try std.testing.expect(generation.sameReviewFile("old.zig", "new.zig"));
+}
+
+test "unresolved thread search pages comments under a fixed byte budget" {
+    const long_body = "x" ** 512;
+    const comments = [_]domain.ReviewComment{
+        .{
+            .id = "C1",
+            .body = long_body,
+            .created_at = "2026-01-01T00:00:00Z",
+            .url = "https://example/C1",
+            .author = "reviewer",
+            .viewer_did_author = false,
+            .review_id = "R1",
+            .review_state = "COMMENTED",
+        },
+        .{
+            .id = "C2",
+            .body = long_body,
+            .created_at = "2026-01-01T00:00:01Z",
+            .url = "https://example/C2",
+            .author = "reviewer",
+            .viewer_did_author = false,
+            .review_id = "R1",
+            .review_state = "COMMENTED",
+        },
+    };
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "b", "h");
+    defer generation.deinit();
+    try generation.addThread(.{
+        .id = "T1",
+        .path = "a.zig",
+        .comments = &comments,
+    });
+    const first = try generation.unresolvedThreadsPageJsonAlloc(
+        std.testing.allocator,
+        "a.zig",
+        null,
+        &.{},
+        false,
+        0,
+        0,
+        700,
+    );
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "C1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "C2") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first,
+        "\"threadOffset\":0,\"commentOffset\":1",
+    ) != null);
+    const second = try generation.unresolvedThreadsPageJsonAlloc(
+        std.testing.allocator,
+        "a.zig",
+        null,
+        &.{},
+        false,
+        0,
+        1,
+        700,
+    );
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "C2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"next\":null") != null);
 }
 
 test "falsifier initial review cannot prepare action" {
@@ -517,6 +626,22 @@ const NetworkFixture = struct {
 
 fn sendMaskedText(io: std.Io, stream: *std.Io.net.Stream, text: []const u8) !void {
     return sendMaskedFrame(io, stream, 0x1, text);
+}
+
+fn sendSlowMaskedText(io: std.Io, stream: *std.Io.net.Stream, text: []const u8) !void {
+    if (text.len > 125) return error.TestFrameTooLarge;
+    const mask = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
+    const header = [2]u8{ 0x81, 0x80 | @as(u8, @intCast(text.len)) };
+    var payload: [125]u8 = undefined;
+    for (text, 0..) |byte, i| payload[i] = byte ^ mask[i % mask.len];
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll(header[0..1]);
+    try writer.interface.flush();
+    try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    try writer.interface.writeAll(header[1..]);
+    try writer.interface.writeAll(&mask);
+    try writer.interface.writeAll(payload[0..text.len]);
+    try writer.interface.flush();
 }
 
 fn sendMaskedFrame(
@@ -4351,7 +4476,7 @@ fn verifyWsStartup(
     const autonomous = try wsRead(allocator, io, stream, "\\\"visible\\\":true");
     defer allocator.free(autonomous);
     try std.testing.expect(std.mem.indexOf(u8, autonomous, "session.item.delta") != null);
-    try sendMaskedText(io, stream, "{\"type\":\"snapshot.get\",\"payload\":{}}");
+    try sendSlowMaskedText(io, stream, "{\"type\":\"snapshot.get\",\"payload\":{}}");
     const snapshot = try wsRead(allocator, io, stream, "\"type\":\"snapshot\"");
     defer allocator.free(snapshot);
     for ([_][]const u8{

@@ -126,11 +126,11 @@ pub const Settings = struct {
     pub fn classifyPath(self: *const Settings, path: []const u8) ?[]const u8 {
         if (!self.exclusions_enabled) return null;
         for (self.additional_globs.items) |glob| {
-            if (globMatches(glob, path)) return "configured-glob";
+            if (globMatches(self.allocator, glob, path)) return "configured-glob";
         }
         for (self.exclusion_rules.items) |rule| for (rule.globs.items) |glob| {
             if (containsExact(self.removed_default_globs.items, glob)) continue;
-            if (globMatches(glob, path)) return rule.reason;
+            if (globMatches(self.allocator, glob, path)) return rule.reason;
         };
         return null;
     }
@@ -332,15 +332,40 @@ fn replaceStringArray(
     target.* = next;
 }
 
-fn globMatches(pattern: []const u8, path: []const u8) bool {
-    const State = struct { pattern: usize, path: usize };
-    var pending: [4096]State = undefined;
-    var pending_len: usize = 1;
-    pending[0] = .{ .pattern = 0, .path = 0 };
-    while (pending_len > 0) {
-        pending_len -= 1;
-        var pi = pending[pending_len].pattern;
-        var si = pending[pending_len].path;
+const GlobState = struct { pattern: usize, path: usize };
+
+fn appendGlobState(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(GlobState),
+    visited: []bool,
+    path_states: usize,
+    state: GlobState,
+) !void {
+    const index = state.pattern * path_states + state.path;
+    if (visited[index]) return;
+    visited[index] = true;
+    try pending.append(allocator, state);
+}
+
+fn globMatches(allocator: std.mem.Allocator, pattern: []const u8, path: []const u8) bool {
+    const pattern_states = std.math.add(usize, pattern.len, 1) catch return false;
+    const path_states = std.math.add(usize, path.len, 1) catch return false;
+    const state_count = std.math.mul(usize, pattern_states, path_states) catch return false;
+    const visited = allocator.alloc(bool, state_count) catch return false;
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var pending: std.ArrayList(GlobState) = .empty;
+    defer pending.deinit(allocator);
+    appendGlobState(
+        allocator,
+        &pending,
+        visited,
+        path_states,
+        .{ .pattern = 0, .path = 0 },
+    ) catch return false;
+    while (pending.pop()) |state| {
+        var pi = state.pattern;
+        var si = state.path;
         while (pi < pattern.len and pattern[pi] != '*') {
             if (si == path.len) break;
             if (pattern[pi] == '?' and path[si] == '/') break;
@@ -357,22 +382,34 @@ fn globMatches(pattern: []const u8, path: []const u8) bool {
         pi += if (double) 2 else 1;
         if (double and pi < pattern.len and pattern[pi] == '/') {
             pi += 1;
-            if (pending_len == pending.len) return false;
-            pending[pending_len] = .{ .pattern = pi, .path = si };
-            pending_len += 1;
+            appendGlobState(
+                allocator,
+                &pending,
+                visited,
+                path_states,
+                .{ .pattern = pi, .path = si },
+            ) catch return false;
             for (path[si..], si..) |byte, index| {
                 if (byte != '/') continue;
-                if (pending_len == pending.len) return false;
-                pending[pending_len] = .{ .pattern = pi, .path = index + 1 };
-                pending_len += 1;
+                appendGlobState(
+                    allocator,
+                    &pending,
+                    visited,
+                    path_states,
+                    .{ .pattern = pi, .path = index + 1 },
+                ) catch return false;
             }
             continue;
         }
         var end = si;
         while (end <= path.len) : (end += 1) {
-            if (pending_len == pending.len) return false;
-            pending[pending_len] = .{ .pattern = pi, .path = end };
-            pending_len += 1;
+            appendGlobState(
+                allocator,
+                &pending,
+                visited,
+                path_states,
+                .{ .pattern = pi, .path = end },
+            ) catch return false;
             if (end == path.len or (!double and path[end] == '/')) break;
         }
     }
@@ -1082,10 +1119,28 @@ test "approval values must belong to the declared response property" {
 }
 
 test "globstar slash consumes only complete path segments" {
-    try std.testing.expect(globMatches("**/__snapshots__/**", "src/__snapshots__/x.snap"));
-    try std.testing.expect(globMatches("**/__snapshots__/**", "__snapshots__/x.snap"));
+    try std.testing.expect(globMatches(
+        std.testing.allocator,
+        "**/__snapshots__/**",
+        "src/__snapshots__/x.snap",
+    ));
+    try std.testing.expect(globMatches(
+        std.testing.allocator,
+        "**/__snapshots__/**",
+        "__snapshots__/x.snap",
+    ));
     try std.testing.expect(!globMatches(
+        std.testing.allocator,
         "**/__snapshots__/**",
         "src/not__snapshots__/ordinary.zig",
+    ));
+}
+
+test "overlapping stars visit each glob state at most once" {
+    const repeated = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+    try std.testing.expect(!globMatches(
+        std.testing.allocator,
+        repeated,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ));
 }

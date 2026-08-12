@@ -137,6 +137,36 @@ pub const ReviewThread = struct {
     viewer_can_unresolve: bool = false,
     comments: []const ReviewComment = &.{},
 };
+
+const ReviewThreadHeader = struct {
+    id: []const u8,
+    path: []const u8,
+    line: ?u32,
+    start_line: ?u32,
+    diff_side: ?[]const u8,
+    start_diff_side: ?[]const u8,
+    subject_type: []const u8,
+    outdated: bool,
+    viewer_can_reply: bool,
+    viewer_can_resolve: bool,
+    viewer_can_unresolve: bool,
+};
+
+fn threadHeader(thread: ReviewThread) ReviewThreadHeader {
+    return .{
+        .id = thread.id,
+        .path = thread.path,
+        .line = thread.line,
+        .start_line = thread.start_line,
+        .diff_side = thread.diff_side,
+        .start_diff_side = thread.start_diff_side,
+        .subject_type = thread.subject_type,
+        .outdated = thread.outdated,
+        .viewer_can_reply = thread.viewer_can_reply,
+        .viewer_can_resolve = thread.viewer_can_resolve,
+        .viewer_can_unresolve = thread.viewer_can_unresolve,
+    };
+}
 pub const Tab = struct {
     id: []const u8,
     path: []const u8,
@@ -301,12 +331,12 @@ pub const PrGeneration = struct {
         try out.writer.writeByte('[');
         var first = true;
         for (0..2) |pass| for (self.threads.items) |thread| {
-            const assigned = std.mem.eql(u8, thread.path, assigned_path);
+            const assigned = self.sameReviewFile(thread.path, assigned_path);
             if ((pass == 0) != assigned) continue;
             if (pass == 1 and !whole_pr) continue;
             if (paths.len > 0) {
                 var matched = false;
-                for (paths) |path| if (std.mem.eql(u8, path, thread.path)) {
+                for (paths) |path| if (self.sameReviewFile(path, thread.path)) {
                     matched = true;
                     break;
                 };
@@ -331,6 +361,117 @@ pub const PrGeneration = struct {
         };
         try out.writer.writeByte(']');
         return out.toOwnedSlice();
+    }
+
+    pub fn unresolvedThreadsPageJsonAlloc(
+        self: *const PrGeneration,
+        allocator: std.mem.Allocator,
+        assigned_path: []const u8,
+        query: ?[]const u8,
+        paths: []const []const u8,
+        whole_pr: bool,
+        thread_offset: usize,
+        comment_offset: usize,
+        max_bytes: usize,
+    ) ![]u8 {
+        const thread = self.searchThreadAt(
+            assigned_path,
+            query,
+            paths,
+            whole_pr,
+            thread_offset,
+        ) orelse return allocator.dupe(
+            u8,
+            "{\"thread\":null,\"comments\":[],\"next\":null}",
+        );
+        const start = @min(comment_offset, thread.comments.len);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try out.writer.writeAll("{\"thread\":");
+        try std.json.Stringify.value(threadHeader(thread.*), .{}, &out.writer);
+        try out.writer.writeAll(",\"comments\":[");
+        var comment_index = start;
+        var first = true;
+        while (comment_index < thread.comments.len) {
+            var encoded: std.Io.Writer.Allocating = .init(allocator);
+            defer encoded.deinit();
+            try std.json.Stringify.value(thread.comments[comment_index], .{}, &encoded.writer);
+            const separator_bytes: usize = @intFromBool(!first);
+            const suffix_reserve: usize = 128;
+            const projected = out.written().len + separator_bytes +
+                encoded.written().len + suffix_reserve;
+            if (!first and projected > max_bytes) break;
+            if (!first) try out.writer.writeByte(',');
+            first = false;
+            try out.writer.writeAll(encoded.written());
+            comment_index += 1;
+        }
+        try out.writer.writeAll("],\"next\":");
+        if (comment_index < thread.comments.len) {
+            try out.writer.print(
+                "{{\"threadOffset\":{d},\"commentOffset\":{d}}}",
+                .{ thread_offset, comment_index },
+            );
+        } else if (self.searchThreadAt(
+            assigned_path,
+            query,
+            paths,
+            whole_pr,
+            thread_offset + 1,
+        ) != null) {
+            try out.writer.print(
+                "{{\"threadOffset\":{d},\"commentOffset\":0}}",
+                .{thread_offset + 1},
+            );
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
+    fn searchThreadAt(
+        self: *const PrGeneration,
+        assigned_path: []const u8,
+        query: ?[]const u8,
+        paths: []const []const u8,
+        whole_pr: bool,
+        offset: usize,
+    ) ?*const ReviewThread {
+        var matched_index: usize = 0;
+        for (0..2) |pass| for (self.threads.items) |*thread| {
+            const assigned = self.sameReviewFile(thread.path, assigned_path);
+            if ((pass == 0) != assigned) continue;
+            if (pass == 1 and !whole_pr) continue;
+            if (!self.threadMatchesSearch(thread.*, query, paths)) continue;
+            if (matched_index == offset) return thread;
+            matched_index += 1;
+        };
+        return null;
+    }
+
+    fn threadMatchesSearch(
+        self: *const PrGeneration,
+        thread: ReviewThread,
+        query: ?[]const u8,
+        paths: []const []const u8,
+    ) bool {
+        if (paths.len > 0) {
+            var path_matched = false;
+            for (paths) |path| if (self.sameReviewFile(path, thread.path)) {
+                path_matched = true;
+                break;
+            };
+            if (!path_matched) return false;
+        }
+        if (query) |needle| {
+            if (needle.len == 0 or std.mem.indexOf(u8, thread.path, needle) != null) return true;
+            for (thread.comments) |comment| {
+                if (std.mem.indexOf(u8, comment.body, needle) != null) return true;
+            }
+            return false;
+        }
+        return true;
     }
 
     pub fn queued(self: *const PrGeneration, path: []const u8) bool {
@@ -380,6 +521,24 @@ pub const PrGeneration = struct {
             return file.previous_path;
         };
         return null;
+    }
+
+    pub fn sameReviewFile(
+        self: *const PrGeneration,
+        left: []const u8,
+        right: []const u8,
+    ) bool {
+        if (std.mem.eql(u8, left, right)) return true;
+        for (self.files.items) |file| {
+            if (!std.mem.eql(u8, file.change_type, "RENAMED")) continue;
+            const previous = file.previous_path orelse continue;
+            const direct = std.mem.eql(u8, file.path, left) and
+                std.mem.eql(u8, previous, right);
+            const reverse = std.mem.eql(u8, file.path, right) and
+                std.mem.eql(u8, previous, left);
+            if (direct or reverse) return true;
+        }
+        return false;
     }
 
     pub fn setExclusion(

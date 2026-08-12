@@ -841,6 +841,7 @@ fn serveHttpRuntime(
     );
     const tool_domain = runtime.tool_domain.?;
     registry.setExclusionsPending(true);
+    state.primary_ready = false;
     errdefer registry.setExclusionsPending(false);
     var exclusion_work: LaunchExclusionWork = undefined;
     const exclusion_thread = try startLaunchExclusionWork(

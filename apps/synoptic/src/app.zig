@@ -492,10 +492,10 @@ pub const App = struct {
         if (input.thread_id) |thread_id| {
             for (self.generation.threads.items) |thread| {
                 if (!std.mem.eql(u8, thread.id, thread_id)) continue;
-                if (!std.mem.eql(u8, thread.path, session_path)) {
+                if (!self.generation.sameReviewFile(thread.path, session_path)) {
                     return error.ActionTargetsAnotherSession;
                 }
-                return thread.path;
+                return session_path;
             }
             return error.GitHubActionTargetMissing;
         }
@@ -503,10 +503,10 @@ pub const App = struct {
             for (self.generation.threads.items) |thread| {
                 for (thread.comments) |comment| {
                     if (!std.mem.eql(u8, comment.id, comment_id)) continue;
-                    if (!std.mem.eql(u8, thread.path, session_path)) {
+                    if (!self.generation.sameReviewFile(thread.path, session_path)) {
                         return error.ActionTargetsAnotherSession;
                     }
-                    return thread.path;
+                    return session_path;
                 }
             }
             return error.GitHubActionTargetMissing;

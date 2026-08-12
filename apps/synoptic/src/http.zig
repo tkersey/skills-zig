@@ -230,6 +230,7 @@ pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
 const default_header_timeout_ms: u32 = 5_000;
 const default_write_timeout_ms: u32 = 5_000;
+const default_ws_frame_timeout_ms: u32 = 5_000;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 test "command approvals classify only exact decline and cancel as fail closed" {
@@ -590,12 +591,7 @@ pub const Server = struct {
     ) !void {
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             try self.servePendingConnection(runtime);
-            const message = readClientTextAllocTimeout(
-                self.allocator,
-                self.io,
-                stream,
-                config.visible_event_flush_ms,
-            ) catch |err| switch (err) {
+            waitClientReadable(stream, config.visible_event_flush_ms) catch |err| switch (err) {
                 error.Timeout => {
                     try self.flushVisible(stream, runtime);
                     if (runtime.stop_request_path) |path| {
@@ -606,6 +602,15 @@ pub const Server = struct {
                     }
                     continue;
                 },
+                error.EndOfStream => return,
+                else => return err,
+            };
+            const message = readClientTextAllocTimeout(
+                self.allocator,
+                self.io,
+                stream,
+                default_ws_frame_timeout_ms,
+            ) catch |err| switch (err) {
                 error.EndOfStream => return,
                 error.WebSocketClosed => return,
                 else => return err,
@@ -1461,6 +1466,22 @@ fn definitiveActionValidationFailure(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+fn waitClientReadable(stream: *std.Io.net.Stream, timeout_ms: u32) !void {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN | std.posix.POLL.ERR,
+        .revents = 0,
+    }};
+    const timeout: i32 = @intCast(@min(timeout_ms, std.math.maxInt(i32)));
+    if (try std.posix.poll(&fds, timeout) == 0) return error.Timeout;
+    if ((fds[0].revents & std.posix.POLL.ERR) != 0) return error.ConnectionResetByPeer;
+    if ((fds[0].revents & std.posix.POLL.HUP) != 0 and
+        (fds[0].revents & std.posix.POLL.IN) == 0)
+    {
+        return error.EndOfStream;
+    }
 }
 
 fn commandErrorPayloadAlloc(

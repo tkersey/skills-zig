@@ -2117,7 +2117,16 @@ fn canonicalRenameEntries(
     var result = try runCapturedProcess(
         allocator,
         io,
-        &.{ git_path, "diff", "--name-status", "-z", "-M", "-C", range },
+        &.{
+            git_path,
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "-C",
+            "--find-copies-harder",
+            range,
+        },
         .{ .path = cwd },
         null,
         null,
@@ -2338,6 +2347,9 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             "diff",
             "--no-ext-diff",
             "--no-color",
+            "-M",
+            "-C",
+            "--find-copies-harder",
             range,
             "--",
             old_path,
@@ -2350,6 +2362,9 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             "diff",
             "--no-ext-diff",
             "--no-color",
+            "-M",
+            "-C",
+            "--find-copies-harder",
             range,
             "--",
             path,
@@ -2790,6 +2805,57 @@ test "renamed file identity and review diff include the source path" {
     try std.testing.expect(std.mem.indexOf(u8, diff, "rename from old.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "rename to new.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
+}
+
+test "copied file identity finds an unchanged source and includes source evidence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = "const copied = 1;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.zig", .data = source });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy.zig", .data = source });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "copy" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    var generation = try domain.PrGeneration.initFull(allocator, base, head);
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "copy.zig",
+        .change_type = "COPIED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try hydrateRevisionKeys(allocator, io, root, null, &generation);
+    try std.testing.expectEqualStrings("source.zig", generation.previousPath("copy.zig").?);
+    const diff = try canonicalReviewDiffAlloc(
+        allocator,
+        io,
+        root,
+        base,
+        head,
+        "copy.zig",
+        generation.previousPath("copy.zig"),
+    );
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "copy from source.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "copy to copy.zig") != null);
 }
 
 test "oversized review diff becomes bounded inspectable evidence" {

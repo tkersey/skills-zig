@@ -1506,6 +1506,7 @@ const ActorPending = struct {
     done: bool = false,
     is_error: bool = false,
     response_json: ?[]u8 = null,
+    response_received_ms: i64 = 0,
     transmission_started: bool = false,
 };
 
@@ -1783,13 +1784,7 @@ pub const Actor = struct {
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             self.state.mutex.lock();
             if (pending.done) {
-                _ = self.state.pending.remove(request_id);
-                const result = Response{
-                    .json = pending.response_json.?,
-                    .is_error = pending.is_error,
-                };
-                self.state.mutex.unlock();
-                return result;
+                return actorCompletedResponse(self.state, &pending, request_id, deadline);
             }
             if (self.state.terminal != .running) {
                 _ = self.state.pending.remove(request_id);
@@ -1833,6 +1828,33 @@ fn startActorDispatchThreads(state: *ActorState) !void {
         state.deinit();
         return err;
     };
+}
+
+fn actorResponseMissedDeadline(pending: *const ActorPending, deadline_ms: i64) bool {
+    return pending.done and pending.response_received_ms >= deadline_ms;
+}
+
+fn actorCompletedResponse(
+    state: *ActorState,
+    pending: *ActorPending,
+    request_id: i64,
+    deadline_ms: i64,
+) !Actor.Response {
+    _ = state.pending.remove(request_id);
+    if (actorResponseMissedDeadline(pending, deadline_ms)) {
+        const transmission_started = pending.transmission_started;
+        state.allocator.free(pending.response_json.?);
+        if (transmission_started) state.terminal = .poisoned;
+        state.mutex.unlock();
+        if (transmission_started) actorCloseTransportOnce(state);
+        return error.RequestDeadlineExceeded;
+    }
+    const result = Actor.Response{
+        .json = pending.response_json.?,
+        .is_error = pending.is_error,
+    };
+    state.mutex.unlock();
+    return result;
 }
 
 fn actorWriterMain(state: *ActorState) void {
@@ -1990,8 +2012,9 @@ fn actorReaderMain(state: *ActorState) void {
             actorCloseTransportOnce(state);
             return;
         };
+        const received_ms = monotonicMillis();
         defer state.allocator.free(line);
-        actorRouteLine(state, line) catch {
+        actorRouteLineAt(state, line, received_ms) catch {
             actorSetTerminal(state, .poisoned);
             actorCloseTransportOnce(state);
             return;
@@ -2031,6 +2054,10 @@ fn actorNotificationMain(state: *ActorState) void {
 }
 
 fn actorRouteLine(state: *ActorState, line: []const u8) !void {
+    return actorRouteLineAt(state, line, monotonicMillis());
+}
+
+fn actorRouteLineAt(state: *ActorState, line: []const u8, received_ms: i64) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, state.allocator, line, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -2068,6 +2095,7 @@ fn actorRouteLine(state: *ActorState, line: []const u8) !void {
     }
     pending.response_json = response_json;
     pending.is_error = object.get("error") != null;
+    pending.response_received_ms = received_ms;
     pending.done = true;
 }
 
@@ -5044,6 +5072,36 @@ test "request send ownership survives deadline expiry after durable observer" {
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(client.lastRequestSendStarted());
+}
+
+test "actor rejects a response recorded at or after its request deadline" {
+    const allocator = std.testing.allocator;
+    var pending = ActorPending{
+        .done = true,
+        .response_json = try allocator.dupe(u8, "{}"),
+        .response_received_ms = 101,
+    };
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    try state.pending.put(7, &pending);
+    state.mutex.lock();
+    try std.testing.expectError(
+        error.RequestDeadlineExceeded,
+        actorCompletedResponse(&state, &pending, 7, 101),
+    );
+    pending.response_json = null;
+    try std.testing.expectEqual(@as(usize, 0), state.pending.count());
 }
 
 test "code mode host cannot be silently ignored by existing endpoint transports" {

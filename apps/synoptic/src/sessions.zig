@@ -10,6 +10,7 @@ const synoptic_server_request_timeout_ms: u32 = 5 * 60 * 1000;
 pub const safe_boundary_timeout_ms: u32 = 5_000;
 pub const approval_timeout_ms: u32 = 25_000;
 const approval_response_margin_ms: i64 = 50;
+const unresolved_thread_page_bytes_max: usize = 1024 * 1024;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
@@ -71,12 +72,15 @@ pub const dynamic_tools_json =
     ",\"tools\":[" ++
     "{\"name\":\"search_unresolved_threads\",\"description" ++
     "\":\"Search server-owned unresolved current-PR review " ++
-    "evidence; use whole-PR only for cross-file concerns or" ++
-    " when the initial prompt reports bounded thread evidence\"," ++
+    "evidence in bounded pages; follow the returned next offs" ++
+    "ets until null; use whole-PR only for cross-file concerns" ++
+    " or when initial evidence is bounded\"," ++
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
     "\"query\":{\"type\":\"string\"},\"paths\":{\"type\":\"" ++
     "array\",\"items\":{\"type\":\"string\"}},\"includeWhol" ++
-    "ePullRequest\":{\"type\":\"boolean\"}}}}," ++
+    "ePullRequest\":{\"type\":\"boolean\"},\"threadOffs" ++
+    "et\":{\"type\":\"integer\",\"minimum\":0},\"comment" ++
+    "Offset\":{\"type\":\"integer\",\"minimum\":0}}}}," ++
     "{\"name\":\"prepare_github_action\",\"description\":\"" ++
     "Only after explicit human instruction, prepare an immu" ++
     "table confirmable GitHub action; forbidden during init" ++
@@ -639,7 +643,7 @@ pub const Registry = struct {
     pub fn primaryReady(self: *Registry) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.latest_primary_turn_id != null;
+        return self.latest_primary_turn_id != null and !self.exclusions_pending;
     }
 
     pub fn peekPrimaryFailure(self: *Registry) ?PrimaryFailureNotice {
@@ -2546,6 +2550,8 @@ pub const Registry = struct {
         else
             null;
         const whole = whole_value != null and whole_value.? == .bool and whole_value.?.bool;
+        const thread_offset = try searchOffset(args, "threadOffset");
+        const comment_offset = try searchOffset(args, "commentOffset");
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(allocator);
         if (args == .object) if (args.object.get("paths")) |value| {
@@ -2553,12 +2559,15 @@ pub const Registry = struct {
                 if (path == .string) try paths.append(allocator, path.string);
             };
         };
-        const evidence = try generation.unresolvedThreadsJsonAlloc(
+        const evidence = try generation.unresolvedThreadsPageJsonAlloc(
             allocator,
             assigned_path,
             query,
             paths.items,
             whole,
+            thread_offset,
+            comment_offset,
+            unresolved_thread_page_bytes_max,
         );
         defer allocator.free(evidence);
         return std.fmt.allocPrint(
@@ -2567,6 +2576,13 @@ pub const Registry = struct {
                 "{f}}}],\"success\":true}}",
             .{std.json.fmt(evidence, .{})},
         );
+    }
+
+    fn searchOffset(args: std.json.Value, field: []const u8) !usize {
+        if (args != .object) return 0;
+        const value = args.object.get(field) orelse return 0;
+        if (value != .integer) return error.MalformedToolCall;
+        return std.math.cast(usize, value.integer) orelse error.MalformedToolCall;
     }
 
     fn extractString(
