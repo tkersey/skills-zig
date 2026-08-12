@@ -359,6 +359,7 @@ pub const Registry = struct {
     visible_event_bytes: usize = 0,
     visible_overflow_count: u64 = 0,
     visible_overflow_session_id: ?[]u8 = null,
+    pending_system_event: ?VisibleEvent = null,
 
     const PrimaryFailure = enum { failed, interrupted, poisoned, disconnected, stopped };
     pub const PrimaryFailureNotice = struct {
@@ -459,6 +460,7 @@ pub const Registry = struct {
         for (self.visible_events.items) |event| event.deinit(self.allocator);
         self.visible_events.deinit(self.allocator);
         if (self.visible_overflow_session_id) |value| self.allocator.free(value);
+        if (self.pending_system_event) |event| event.deinit(self.allocator);
         for (self.active_command_ids.items) |id| self.allocator.free(id);
         self.active_command_ids.deinit(self.allocator);
         for (self.completed_turn_ids.items) |id| self.allocator.free(id);
@@ -926,6 +928,7 @@ pub const Registry = struct {
         const event = self.visible_events.orderedRemove(0);
         self.visible_event_bytes -|= event.byteSize();
         event.deinit(self.allocator);
+        self.queuePendingSystemEventLocked();
         self.queueOverflowWarningLocked();
     }
 
@@ -933,6 +936,23 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.appendVisibleLocked(null, method, raw_json);
+    }
+
+    pub fn queueSystemEventEventually(
+        self: *Registry,
+        method: []const u8,
+        raw_json: []const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const event = try self.makeVisibleEvent(null, method, raw_json);
+        errdefer event.deinit(self.allocator);
+        if (event.byteSize() > max_visible_event_bytes) {
+            return error.VisibleEventLimitExceeded;
+        }
+        if (self.pending_system_event) |pending| pending.deinit(self.allocator);
+        self.pending_system_event = event;
+        self.queuePendingSystemEventLocked();
     }
 
     pub fn resolveApproval(
@@ -1844,6 +1864,18 @@ pub const Registry = struct {
         self.visible_event_bytes += event_bytes;
         self.visible_overflow_session_id = null;
         self.visible_overflow_count = 0;
+    }
+
+    fn queuePendingSystemEventLocked(self: *Registry) void {
+        const event = self.pending_system_event orelse return;
+        if (!self.visibleCapacityAvailableLocked(1, event.byteSize())) return;
+        self.visible_events.ensureTotalCapacity(
+            self.allocator,
+            self.visible_events.items.len + self.authoritative_reservations + 1,
+        ) catch return;
+        self.visible_events.appendAssumeCapacity(event);
+        self.visible_event_bytes += event.byteSize();
+        self.pending_system_event = null;
     }
 
     fn recordCompletedTurnLocked(self: *Registry, raw_json: []const u8) void {

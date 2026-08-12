@@ -1586,6 +1586,11 @@ pub const Server = struct {
                 outcomes.deinit(self.allocator);
             }
             try queueExclusionEvents(runtime.registry, outcomes.items);
+            if (outcomes.items.len > 0) {
+                const current_snapshot = try runtime.app.bootstrapAlloc();
+                defer self.allocator.free(current_snapshot);
+                try runtime.registry.queueSystemEventEventually("snapshot", current_snapshot);
+            }
         }
     }
 
@@ -2236,6 +2241,13 @@ test "exclusion notification capacity cannot fail committed reconciliation" {
         sessions.max_visible_events,
         registry.visible_events.items.len,
     );
+    try registry.queueSystemEventEventually("snapshot", "{\"queue\":[]}");
+    try std.testing.expect(registry.pending_system_event != null);
+    try registry.acknowledgeVisible();
+    try std.testing.expect(registry.pending_system_event == null);
+    const last = registry.visible_events.items[registry.visible_events.items.len - 1];
+    try std.testing.expectEqualStrings("snapshot", last.method);
+    try std.testing.expectEqualStrings("{\"queue\":[]}", last.raw_json);
 }
 
 test "WebSocket close payload accepts only valid status and UTF-8 reason" {
