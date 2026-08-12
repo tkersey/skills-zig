@@ -2828,13 +2828,30 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         "update", "close",  "reopen",  "merge",   "resolve", "reply",   "delete", "unmark",
         "mark",   "post",   "publish", "prepare",
     });
-    const github_target = action_object != null and containsAnyIgnoreCase(action_object.?, &.{
+    const positive_object = if (action_object) |object| positiveObjectBeforeNegation(object) else null;
+    const github_target = positive_object != null and containsAnyIgnoreCase(positive_object.?, &.{
         "label",   "reviewer", "assignee", "milestone", "pull request",  "this pr",
         "the pr",  "pr #",     "comment",  "thread",    "github review", "mark viewed",
         "graphql",
     });
     if (github_target) return .github_any;
     return null;
+}
+
+fn positiveObjectBeforeNegation(object: []const u8) ?[]const u8 {
+    if (startsAnyIgnoreCase(object, &.{
+        "not ", "no ", "never ", "do not ", "don't ", "without ", "except ",
+    })) return null;
+    var end = object.len;
+    for ([_][]const u8{
+        " but do not ", " but don't ", " without ", " except ",
+        " not ",        " no ",        " never ",   " do not ",
+        " don't ",
+    }) |marker| {
+        if (indexOfIgnoreCase(object, marker)) |index| end = @min(end, index);
+    }
+    const positive = std.mem.trim(u8, object[0..end], " \t\r\n,;.!?");
+    return if (positive.len == 0) null else positive;
 }
 
 fn actionObjectAfterVerb(text: []const u8, verbs: []const []const u8) ?[]const u8 {
@@ -2951,10 +2968,16 @@ fn stringifyValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u
     return out.toOwnedSlice();
 }
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(haystack[i .. i +
-        needle.len], needle)) return true;
-    return false;
+    return indexOfIgnoreCase(haystack, needle) != null;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    for (0..haystack.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(
+        haystack[i .. i + needle.len],
+        needle,
+    )) return i;
+    return null;
 }
 
 fn authoritativeFailureAlloc(allocator: std.mem.Allocator, err: anyerror) ![]u8 {
@@ -3271,6 +3294,19 @@ test "explicit broad GitHub operation grants generic action authority without or
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         classifyHumanInstruction("Add the comment, but do not close this session").?,
+    );
+    try std.testing.expect(classifyHumanInstruction(
+        "Add the local note, but do not post a GitHub comment",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Update details without changing the pull request",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Add no comment to this pull request",
+    ) == null);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        classifyHumanInstruction("Add the label, but do not close this session").?,
     );
     try std.testing.expectEqual(
         HumanAuthority.github_any,
