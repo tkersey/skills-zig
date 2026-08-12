@@ -463,7 +463,7 @@ pub const App = struct {
         pull_request_id: []const u8,
         session_path: []const u8,
     ) !tools.ActionCard {
-        const resolved_path = try self.actionTargetPath(input, session_path);
+        const github_path = try self.actionTargetPath(input, session_path);
         const comment_body_snapshot = try self.commentBodySnapshot(input);
         const card = try self.action_store.prepare(
             session_id,
@@ -476,7 +476,7 @@ pub const App = struct {
                 .base_oid = self.generation.base_oid,
                 .head_oid = self.generation.head_oid,
                 .session_path = session_path,
-                .resolved_path = resolved_path,
+                .github_path = github_path,
                 .comment_body_snapshot = comment_body_snapshot,
             },
         );
@@ -495,7 +495,7 @@ pub const App = struct {
                 if (!self.generation.sameReviewFile(thread.path, session_path)) {
                     return error.ActionTargetsAnotherSession;
                 }
-                return session_path;
+                return thread.path;
             }
             return error.GitHubActionTargetMissing;
         }
@@ -506,7 +506,7 @@ pub const App = struct {
                     if (!self.generation.sameReviewFile(thread.path, session_path)) {
                         return error.ActionTargetsAnotherSession;
                     }
-                    return session_path;
+                    return thread.path;
                 }
             }
             return error.GitHubActionTargetMissing;

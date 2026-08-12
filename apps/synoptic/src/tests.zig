@@ -137,7 +137,79 @@ test "old-path thread actions resolve to the renamed current file" {
         .thread_id = @constCast("T_old"),
         .body = @constCast("body"),
     }, "o/r", 1, "PR_1", "new.zig");
-    try std.testing.expectEqualStrings("new.zig", card.target.path.?);
+    try std.testing.expectEqualStrings("new.zig", card.target.session_path);
+    try std.testing.expectEqualStrings("old.zig", card.target.path.?);
+    const json = try tools.cardJsonAlloc(std.testing.allocator, card);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"sessionPath\":\"new.zig\",\"path\":\"old.zig\"",
+    ) != null);
+}
+
+test "action broker validates renamed session identity and GitHub identity independently" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-renamed-thread" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\input=$(mktemp)
+        \\trap 'rm -f "$input"' EXIT
+        \\cat > "$input"
+        \\if grep -q 'SynopticAnchor' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","files":{"nodes":[{"path":"new.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticActionAuthority' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","reviewThreads":{"nodes":[{"id":"T_old","path":"old.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\if grep -q 'SynopticReconcile' "$input"; then
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","reviewThreads":{"nodes":[{"id":"T_old","path":"old.zig","isResolved":true,"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\fi
+        \\printf '%s\n' '{"data":{}}'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-renamed-thread", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var store = tools.ActionStore{ .allocator = allocator };
+    defer store.deinit();
+    const card = try store.prepare("ses", "turn", .{
+        .slot = @constCast("resolve"),
+        .kind = .resolve_thread,
+        .effect_summary = @constCast("Resolve old-path thread"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T_old"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "new.zig",
+        .github_path = "old.zig",
+    });
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try broker.validateAction("o", "r", 1, "PR_1", card.*);
+    const baseline = github.ReconciliationBaseline{ .allocator = allocator };
+    try std.testing.expect(try broker.reconcileAction("o", "r", 1, card.*, 0, &baseline));
+
+    var wrong_github_identity = card.*;
+    wrong_github_identity.target.path = "new.zig";
+    try std.testing.expectError(
+        error.GitHubActionTargetMissing,
+        broker.validateAction("o", "r", 1, "PR_1", wrong_github_identity),
+    );
 }
 
 test "complete GitHub snapshot replacement refreshes all PR metadata" {
@@ -1004,7 +1076,7 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
         .base_oid = "b",
         .head_oid = "h",
         .session_path = "a.zig",
-        .resolved_path = "a.zig",
+        .github_path = "a.zig",
         .comment_body_snapshot = "old",
     };
     var store = tools.ActionStore{ .allocator = allocator };
@@ -1091,7 +1163,7 @@ test "comment action validation rejects a changed body found by nested paginatio
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
-        .resolved_path = "a.zig",
+        .github_path = "a.zig",
         .comment_body_snapshot = "observed body",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -1150,7 +1222,7 @@ test "action broker rejects generation drift on nested comment pagination" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
-        .resolved_path = "a.zig",
+        .github_path = "a.zig",
         .comment_body_snapshot = "body",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -1338,7 +1410,7 @@ test "action broker rejects base drift during ambiguous reconciliation" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
-        .resolved_path = "a.zig",
+        .github_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
     const baseline = github.ReconciliationBaseline{ .allocator = allocator };

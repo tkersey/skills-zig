@@ -1127,8 +1127,8 @@ pub const Server = struct {
             runtime.cwd,
             runtime.app.generation.base_oid,
             runtime.app.generation.head_oid,
-            card.target.path.?,
-            runtime.app.generation.previousPath(card.target.path.?),
+            card.target.session_path,
+            runtime.app.generation.previousPath(card.target.session_path),
         );
         defer self.allocator.free(diff);
         return github.validateDiffAnchor(

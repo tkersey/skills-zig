@@ -720,7 +720,9 @@ pub const Broker = struct {
             card.graphql.?.variables,
             card.target.pull_request_id,
         );
-        if (card.target.path) |path| try self.validateCurrentPath(
+        const review_target = card.target.thread_id != null or card.target.comment_id != null;
+        const current_path = if (review_target) card.target.session_path else card.target.path;
+        if (current_path) |path| try self.validateCurrentPath(
             owner,
             name,
             number,
@@ -734,7 +736,6 @@ pub const Broker = struct {
             card.target.base_oid,
             card.target.head_oid,
         );
-        const review_target = card.target.thread_id != null or card.target.comment_id != null;
         if (review_target) try self.validateReviewAuthority(owner, name, number, card);
     }
 
@@ -945,6 +946,8 @@ pub const Broker = struct {
         const pull = try pullObject(parsed.value);
         try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
         for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
+            const path = card.target.path orelse return error.ActionTargetMismatch;
+            if (!std.mem.eql(u8, thread.object.get("path").?.string, path)) continue;
             if (card.target.thread_id) |thread_id| if (!std.mem.eql(
                 u8,
                 thread.object.get("id").?.string,
@@ -952,11 +955,6 @@ pub const Broker = struct {
             )) continue;
             if (card.kind == .resolve_thread) return thread.object.get("isResolved").?.bool;
             if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
-            if (card.target.path) |path| if (!std.mem.eql(
-                u8,
-                thread.object.get("path").?.string,
-                path,
-            )) continue;
             if (!inlineThreadMatchesCard(thread.object, card)) continue;
             if (try self.commentMutationObserved(
                 owner,
@@ -1003,17 +1001,16 @@ pub const Broker = struct {
             for (nodes.array.items) |value| {
                 if (value != .object) return error.InvalidSnapshot;
                 const thread = value.object;
+                const path = card.target.path orelse return error.ActionTargetMismatch;
+                const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
+                if (thread_path != .string) return error.InvalidSnapshot;
+                if (!std.mem.eql(u8, thread_path.string, path)) continue;
                 if (card.kind == .reply_thread) {
                     const target_id = card.target.thread_id orelse
                         return error.ActionTargetMismatch;
                     const thread_id = thread.get("id") orelse return error.InvalidSnapshot;
                     if (thread_id != .string) return error.InvalidSnapshot;
                     if (!std.mem.eql(u8, thread_id.string, target_id)) continue;
-                } else {
-                    const path = card.target.path orelse return error.ActionTargetMismatch;
-                    const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
-                    if (thread_path != .string) return error.InvalidSnapshot;
-                    if (!std.mem.eql(u8, thread_path.string, path)) continue;
                 }
                 if (!inlineThreadMatchesCard(thread, card)) continue;
                 try self.captureThreadCommentIds(
