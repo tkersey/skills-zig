@@ -1687,7 +1687,10 @@ pub fn queueExclusionEvents(
             },
         );
         defer registry.allocator.free(payload);
-        try registry.queueSystemEvent("file.excluded", payload);
+        registry.queueSystemEvent("file.excluded", payload) catch |err| switch (err) {
+            error.VisibleEventLimitExceeded => return,
+            else => return err,
+        };
     }
 }
 
@@ -2211,6 +2214,27 @@ test "action refresh preserves local exclusion synchronization evidence" {
     try std.testing.expectEqualStrings(
         "readback-failed",
         refreshed.files.items[0].exclusion_sync_error.?,
+    );
+}
+
+test "exclusion notification capacity cannot fail committed reconciliation" {
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    for (0..sessions.max_visible_events) |_| {
+        try registry.queueSystemEvent("status", "{}");
+    }
+    const outcome = try @import("app.zig").ExclusionOutcome.init(
+        std.testing.allocator,
+        "vendor/generated.js",
+        "vendored",
+        null,
+    );
+    defer outcome.deinit();
+
+    try queueExclusionEvents(&registry, &.{outcome});
+    try std.testing.expectEqual(
+        sessions.max_visible_events,
+        registry.visible_events.items.len,
     );
 }
 
