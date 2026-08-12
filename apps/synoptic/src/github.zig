@@ -19,6 +19,114 @@ const canonical_git_attributes_config = "core.attributesFile=/dev/null";
 const canonical_git_rename_limit_config = "diff.renameLimit=0";
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
+const CanonicalGitEvidenceView = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_path: []u8,
+    name: []u8,
+    git_dir_env: []u8,
+    object_dir_env: []u8,
+    attr_tree_config: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        git_path: []const u8,
+        cwd: []const u8,
+        head: []const u8,
+    ) !CanonicalGitEvidenceView {
+        var objects = try runCapturedProcess(
+            allocator,
+            io,
+            &.{ git_path, "rev-parse", "--path-format=absolute", "--git-path", "objects" },
+            .{ .path = cwd },
+            null,
+            null,
+            4096,
+            git_stderr_bytes_max,
+            false,
+        );
+        defer objects.deinit();
+        if (objects.term != .exited or objects.term.exited != 0) {
+            return error.GitEvidenceViewUnavailable;
+        }
+        const object_path = std.mem.trim(u8, objects.stdout, "\r\n");
+        if (!std.fs.path.isAbsolute(object_path)) return error.GitEvidenceViewUnavailable;
+        const parent = std.fs.path.dirname(object_path) orelse
+            return error.GitEvidenceViewUnavailable;
+        const parent_path = try allocator.dupe(u8, parent);
+        errdefer allocator.free(parent_path);
+
+        var random_bytes: [16]u8 = undefined;
+        io.random(&random_bytes);
+        var name_buffer: [64]u8 = undefined;
+        const name_value = try std.fmt.bufPrint(
+            &name_buffer,
+            "synoptic-evidence-{x}",
+            .{random_bytes},
+        );
+        const name = try allocator.dupe(u8, name_value);
+        errdefer allocator.free(name);
+        var parent_dir = try std.Io.Dir.openDirAbsolute(
+            io,
+            parent_path,
+            .{ .follow_symlinks = false },
+        );
+        defer parent_dir.close(io);
+        try parent_dir.createDir(io, name, .default_dir);
+        var directory_owned = true;
+        errdefer if (directory_owned) parent_dir.deleteTree(io, name) catch {};
+        var directory = try parent_dir.openDir(io, name, .{ .follow_symlinks = false });
+        defer directory.close(io);
+        try directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+        try directory.createDir(io, "refs", .default_dir);
+        try directory.writeFile(io, .{
+            .sub_path = "HEAD",
+            .data = "ref: refs/heads/synoptic-evidence\n",
+        });
+
+        const git_dir = try std.fs.path.join(allocator, &.{ parent_path, name });
+        defer allocator.free(git_dir);
+        const git_dir_env = try std.fmt.allocPrint(allocator, "GIT_DIR={s}", .{git_dir});
+        errdefer allocator.free(git_dir_env);
+        const object_dir_env = try std.fmt.allocPrint(
+            allocator,
+            "GIT_OBJECT_DIRECTORY={s}",
+            .{object_path},
+        );
+        errdefer allocator.free(object_dir_env);
+        const attr_tree_config = try std.fmt.allocPrint(allocator, "attr.tree={s}", .{head});
+        errdefer allocator.free(attr_tree_config);
+        directory_owned = false;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .parent_path = parent_path,
+            .name = name,
+            .git_dir_env = git_dir_env,
+            .object_dir_env = object_dir_env,
+            .attr_tree_config = attr_tree_config,
+        };
+    }
+
+    fn deinit(self: *CanonicalGitEvidenceView) void {
+        if (std.Io.Dir.openDirAbsolute(
+            self.io,
+            self.parent_path,
+            .{ .follow_symlinks = false },
+        )) |parent_value| {
+            var parent = parent_value;
+            defer parent.close(self.io);
+            parent.deleteTree(self.io, self.name) catch {};
+        } else |_| {}
+        self.allocator.free(self.attr_tree_config);
+        self.allocator.free(self.object_dir_env);
+        self.allocator.free(self.git_dir_env);
+        self.allocator.free(self.name);
+        self.allocator.free(self.parent_path);
+    }
+};
+
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
     pid: std.posix.pid_t,
@@ -2230,6 +2338,14 @@ fn hydrateRevisionKeysWithGitPathLimit(
         generation.head_oid,
     );
     defer renames.deinit();
+    var evidence_view = try CanonicalGitEvidenceView.init(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        generation.head_oid,
+    );
+    defer evidence_view.deinit();
     for (generation.files.items) |*file| {
         const renamed = std.mem.eql(u8, file.change_type, "RENAMED") or
             std.mem.eql(u8, file.change_type, "COPIED");
@@ -2243,6 +2359,7 @@ fn hydrateRevisionKeysWithGitPathLimit(
             cwd,
             git_path,
             merge_base,
+            &evidence_view,
             generation,
             file.*,
             diff_bytes_max,
@@ -2257,6 +2374,7 @@ fn hydrateFileRevision(
     cwd: []const u8,
     git_path: []const u8,
     merge_base: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
     generation: *domain.PrGeneration,
     file: domain.File,
     diff_bytes_max: usize,
@@ -2283,6 +2401,7 @@ fn hydrateFileRevision(
         file.previous_path,
         null,
         diff_bytes_max,
+        evidence_view,
     ) catch |err| switch (err) {
         error.FileDiffTooLarge => null,
         else => return err,
@@ -2636,6 +2755,7 @@ pub fn canonicalReviewDiffAlloc(
         previous_path,
         null,
         review_diff_bytes_max,
+        null,
     ) catch |err| switch (err) {
         error.FileDiffTooLarge => std.fmt.allocPrint(
             allocator,
@@ -2699,6 +2819,7 @@ pub fn canonicalDiffFromMergeBaseAlloc(
         previous_path,
         cancelled,
         canonical_diff_bytes_max,
+        null,
     );
 }
 
@@ -2713,7 +2834,22 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
     previous_path: ?[]const u8,
     cancelled: ?*const std.atomic.Value(bool),
     diff_bytes_max: usize,
+    provided_view: ?*const CanonicalGitEvidenceView,
 ) ![]u8 {
+    var local_view: CanonicalGitEvidenceView = undefined;
+    var owns_view = false;
+    const evidence_view = provided_view orelse blk: {
+        local_view = try CanonicalGitEvidenceView.init(
+            allocator,
+            io,
+            git_path,
+            cwd,
+            head,
+        );
+        owns_view = true;
+        break :blk &local_view;
+    };
+    defer if (owns_view) local_view.deinit();
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
     const source_identity = try sourceIdentityAlloc(allocator, path, previous_path);
@@ -2738,6 +2874,7 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             io,
             git_path,
             cwd,
+            evidence_view,
             base_spec.?,
             head_spec.?,
             cancelled,
@@ -2749,6 +2886,7 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             io,
             git_path,
             cwd,
+            evidence_view,
             range,
             path,
             cancelled,
@@ -2768,6 +2906,7 @@ fn runCanonicalBlobDiff(
     io: std.Io,
     git_path: []const u8,
     cwd: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
     base_spec: []const u8,
     head_spec: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
@@ -2776,9 +2915,13 @@ fn runCanonicalBlobDiff(
     const argv = [_][]const u8{
         canonical_git_env_path,
         canonical_git_attributes_env,
+        evidence_view.git_dir_env,
+        evidence_view.object_dir_env,
         git_path,
         "-c",
         canonical_git_attributes_config,
+        "-c",
+        evidence_view.attr_tree_config,
         "--literal-pathspecs",
         "diff",
         "--no-textconv",
@@ -2811,6 +2954,7 @@ fn runCanonicalPathDiff(
     io: std.Io,
     git_path: []const u8,
     cwd: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
     range: []const u8,
     path: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
@@ -2819,9 +2963,13 @@ fn runCanonicalPathDiff(
     const argv = [_][]const u8{
         canonical_git_env_path,
         canonical_git_attributes_env,
+        evidence_view.git_dir_env,
+        evidence_view.object_dir_env,
         git_path,
         "-c",
         canonical_git_attributes_config,
+        "-c",
+        evidence_view.attr_tree_config,
         "--literal-pathspecs",
         "diff",
         "--no-textconv",
@@ -3293,6 +3441,10 @@ fn configureCanonicalDiffAdversaries(
         io,
         .{ .sub_path = "ambient-attributes", .data = "*.zig -diff\n" },
     );
+    try tmp.dir.writeFile(
+        io,
+        .{ .sub_path = ".git/info/attributes", .data = "*.zig -diff\n" },
+    );
     allocator.free(try runTestGit(
         allocator,
         io,
@@ -3399,6 +3551,46 @@ test "renamed file identity and review diff include the source path" {
     defer allocator.free(diff);
     try std.testing.expectEqualStrings(diff, generation.canonicalDiff("new.zig").?);
     try expectRenamedReviewDiff(diff);
+}
+
+test "canonical diff preserves committed attributes while excluding local info attributes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = "*.zig -diff\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "evidence.zig", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "evidence.zig", .data = "head\n" });
+    allocator.free(try runTestGit(allocator, io, root, &.{ "git", "add", "." }));
+    allocator.free(try runTestGit(allocator, io, root, &.{ "git", "commit", "-qm", "head" }));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    try tmp.dir.writeFile(
+        io,
+        .{ .sub_path = ".git/info/attributes", .data = "*.zig diff\n" },
+    );
+    const diff = try canonicalDiffAlloc(
+        allocator,
+        io,
+        root,
+        std.mem.trim(u8, base_raw, "\r\n"),
+        std.mem.trim(u8, head_raw, "\r\n"),
+        "evidence.zig",
+    );
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "Binary files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+head") == null);
 }
 
 test "copied file identity finds an unchanged source and includes source evidence" {
