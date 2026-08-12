@@ -3,6 +3,18 @@ const std = @import("std");
 const fetch_timeout_ms: u32 = 30_000;
 const fetch_termination_grace_ms: u32 = 250;
 const fetch_output_limit: usize = 1024 * 1024;
+const git_selector_environment_keys = [_][]const u8{
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_WORK_TREE",
+};
+
+fn sanitizeGitEnvironment(environment: *std.process.Environ.Map) void {
+    inline for (git_selector_environment_keys) |key| _ = environment.swapRemove(key);
+}
 
 pub const FetchSource = struct {
     allocator: ?std.mem.Allocator = null,
@@ -1125,6 +1137,7 @@ fn spawnFetchProcess(
     else
         std.process.Environ.Map.init(allocator);
     defer environment.deinit();
+    sanitizeGitEnvironment(&environment);
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
     var argv_buffer: [7][]const u8 = undefined;
     const argv: []const []const u8 = switch (operation) {
@@ -1222,6 +1235,9 @@ fn runGitCommand(
     argv: []const []const u8,
 ) !std.process.RunResult {
     if (argv.len == 0) return error.InvalidGitCommand;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
     const isolated = try allocator.alloc([]const u8, argv.len + 1);
     defer allocator.free(isolated);
     isolated[0] = argv[0];
@@ -1230,7 +1246,11 @@ fn runGitCommand(
     return std.process.run(
         allocator,
         io,
-        .{ .argv = isolated, .cwd = .{ .path = cwd } },
+        .{
+            .argv = isolated,
+            .cwd = .{ .path = cwd },
+            .environ_map = &environment,
+        },
     );
 }
 
@@ -1239,6 +1259,28 @@ test "custody makes destructive policy explicit" {
 }
 test "reused checkout can never be cleanup target" {
     try std.testing.expect(!cleanupAllowed(.{ .reused_current = "/user" }));
+}
+
+test "worktree integrity authoritative git child receives no repository selector environment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const script = try std.fs.path.join(allocator, &.{ root, "git-probe" });
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "git-probe",
+        .data = "#!/bin/sh\nprintf '%s' \"${GIT_DIR-unset}\"\n",
+    });
+    var probe = try tmp.dir.openFile(io, "git-probe", .{ .mode = .read_write });
+    defer probe.close(io);
+    try probe.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    const result = try runGitCommand(allocator, io, root, &.{ script, "status" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqualStrings("unset", result.stdout);
 }
 
 test "repository remote matching normalizes transport default ports" {

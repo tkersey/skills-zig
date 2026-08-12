@@ -23,6 +23,16 @@ const canonical_git_rename_limit_config = "diff.renameLimit=0";
 const canonical_git_context_arg = "--unified=3";
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
+fn authoritativeGitEnvironment(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    try environment.put("GIT_ATTR_NOSYSTEM", "1");
+    try environment.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try environment.put("GIT_CONFIG_NOSYSTEM", "1");
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    return environment;
+}
+
 const CanonicalGitEvidenceView = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -39,7 +49,7 @@ const CanonicalGitEvidenceView = struct {
         cwd: []const u8,
         head: []const u8,
     ) !CanonicalGitEvidenceView {
-        var objects = try runCapturedProcess(
+        var objects = try runCapturedGitProcess(
             allocator,
             io,
             &.{
@@ -287,9 +297,63 @@ fn runCapturedProcess(
     stderr_limit: usize,
     effectful: bool,
 ) !GhOutput {
+    return runCapturedProcessWithEnvironment(
+        allocator,
+        io,
+        argv,
+        cwd,
+        input,
+        cancelled,
+        stdout_limit,
+        stderr_limit,
+        effectful,
+        null,
+    );
+}
+
+fn runCapturedGitProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
+    input: ?[]const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    stdout_limit: usize,
+    stderr_limit: usize,
+    effectful: bool,
+) !GhOutput {
+    var environment = try authoritativeGitEnvironment(allocator);
+    defer environment.deinit();
+    return runCapturedProcessWithEnvironment(
+        allocator,
+        io,
+        argv,
+        cwd,
+        input,
+        cancelled,
+        stdout_limit,
+        stderr_limit,
+        effectful,
+        &environment,
+    );
+}
+
+fn runCapturedProcessWithEnvironment(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
+    input: ?[]const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    stdout_limit: usize,
+    stderr_limit: usize,
+    effectful: bool,
+    environment: ?*const std.process.Environ.Map,
+) !GhOutput {
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = cwd,
+        .environ_map = environment,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -2580,7 +2644,7 @@ fn canonicalRenameEntries(
 ) !RenameEntries {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
-    var result = try runCapturedProcess(
+    var result = try runCapturedGitProcess(
         allocator,
         io,
         &.{
@@ -2758,7 +2822,7 @@ pub fn canonicalMergeBaseAlloc(
     head: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
 ) ![]u8 {
-    var merge = runCapturedProcess(
+    var merge = runCapturedGitProcess(
         allocator,
         io,
         &.{ git_path, "--no-replace-objects", "merge-base", base, head },
@@ -2917,7 +2981,7 @@ fn ensureRevisionPathObjectAvailable(
     );
     defer allocator.free(oid);
     if (oid.len == 0) return;
-    var result = try runCapturedProcess(
+    var result = try runCapturedGitProcess(
         allocator,
         io,
         &.{ git_path, "--no-replace-objects", "cat-file", "-e", oid },
@@ -3063,7 +3127,7 @@ fn runCanonicalDiffProcess(
     cancelled: ?*const std.atomic.Value(bool),
     process_output_limit: usize,
 ) !GhOutput {
-    var result = runCapturedProcess(
+    var result = runCapturedGitProcess(
         allocator,
         io,
         argv,
