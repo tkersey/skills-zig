@@ -598,7 +598,10 @@ test "transparent GraphQL binds broad mutations to exact PR" {
             "HEAD_1",
         ),
     );
+    try expectTransparentMergeHeadBinding();
+}
 
+fn expectTransparentMergeHeadBinding() !void {
     const merge = "mutation Merge($input:MergePullRequestInput!){mergePullRequest" ++
         "(input:$input){pullRequest{id}}}";
     try validateTransparentAtHead(

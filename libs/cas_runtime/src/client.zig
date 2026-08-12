@@ -4266,6 +4266,14 @@ fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
         \\  printf '%s\n' '{"method":"turn/started","params":{"index":2}}'
         \\  exit 0
         \\fi
+    );
+    try writer.writeAll("\n");
+    try writeActorFakeCodexInteractiveServerModes(writer);
+    try writer.writeAll("\n");
+}
+
+fn writeActorFakeCodexInteractiveServerModes(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         \\if [ "$mode" = nested_server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -4292,7 +4300,6 @@ fn writeActorFakeCodexInteractiveModes(writer: *std.Io.Writer) !void {
         \\  exit 0
         \\fi
     );
-    try writer.writeAll("\n");
 }
 
 fn writeActorFakeCodexTerminalModes(writer: *std.Io.Writer) !void {

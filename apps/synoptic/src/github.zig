@@ -3274,6 +3274,39 @@ fn configureNonCanonicalDiffDefaults(
     }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
 }
 
+fn configureCanonicalDiffAdversaries(
+    tmp: *std.testing.TmpDir,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    try configureNonCanonicalDiffDefaults(allocator, io, root);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "diff.renameLimit", "1" },
+    ));
+    const ambient_attributes = try std.fs.path.join(allocator, &.{ root, "ambient-attributes" });
+    defer allocator.free(ambient_attributes);
+    try tmp.dir.writeFile(
+        io,
+        .{ .sub_path = "ambient-attributes", .data = "*.zig -diff\n" },
+    );
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "core.attributesFile", ambient_attributes },
+    ));
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "core.abbrev", "4" },
+    ));
+}
+
 fn expectRenamedReviewDiff(diff: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -3336,31 +3369,7 @@ test "renamed file identity and review diff include the source path" {
     }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
-    try configureNonCanonicalDiffDefaults(allocator, io, root);
-    allocator.free(try runTestGit(
-        allocator,
-        io,
-        root,
-        &.{ "git", "config", "diff.renameLimit", "1" },
-    ));
-    const ambient_attributes = try std.fs.path.join(allocator, &.{ root, "ambient-attributes" });
-    defer allocator.free(ambient_attributes);
-    try tmp.dir.writeFile(
-        io,
-        .{ .sub_path = "ambient-attributes", .data = "*.zig -diff\n" },
-    );
-    allocator.free(try runTestGit(
-        allocator,
-        io,
-        root,
-        &.{ "git", "config", "core.attributesFile", ambient_attributes },
-    ));
-    allocator.free(try runTestGit(
-        allocator,
-        io,
-        root,
-        &.{ "git", "config", "core.abbrev", "4" },
-    ));
+    try configureCanonicalDiffAdversaries(&tmp, allocator, io, root);
     const base = std.mem.trim(u8, base_raw, "\r\n");
     const head = std.mem.trim(u8, head_raw, "\r\n");
     var generation = try domain.PrGeneration.initFull(allocator, base, head);
