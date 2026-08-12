@@ -2436,7 +2436,7 @@ fn hydrateFileRevision(
     diff_bytes_max: usize,
     budget: *GenerationHydrationBudget,
 ) !void {
-    const blob = try blobOidAtAlloc(
+    const tree_entry = try treeEntryIdentityAtAlloc(
         allocator,
         io,
         git_path,
@@ -2445,7 +2445,7 @@ fn hydrateFileRevision(
         file.path,
         "DELETION",
     );
-    defer allocator.free(blob);
+    defer allocator.free(tree_entry);
     const diff = canonicalDiffFromMergeBaseWithLimitAlloc(
         allocator,
         io,
@@ -2486,7 +2486,7 @@ fn hydrateFileRevision(
         allocator,
         file.path,
         file.change_type,
-        blob,
+        tree_entry,
         diff_identity,
     );
     defer allocator.free(revision);
@@ -2532,7 +2532,7 @@ fn oversizedDiffIdentityAlloc(
     merge_base: []const u8,
     path: []const u8,
 ) ![]u8 {
-    const base_blob = try blobOidAtAlloc(
+    const base_entry = try treeEntryIdentityAtAlloc(
         allocator,
         io,
         git_path,
@@ -2541,11 +2541,33 @@ fn oversizedDiffIdentityAlloc(
         path,
         "MISSING",
     );
-    defer allocator.free(base_blob);
-    return std.fmt.allocPrint(allocator, "oversized-diff:{s}", .{base_blob});
+    defer allocator.free(base_entry);
+    return std.fmt.allocPrint(allocator, "oversized-diff:{s}", .{base_entry});
 }
 
-fn blobOidAtAlloc(
+const TreeEntry = struct {
+    allocator: std.mem.Allocator,
+    mode: []u8,
+    object_type: []u8,
+    oid: []u8,
+
+    fn deinit(self: *TreeEntry) void {
+        self.allocator.free(self.mode);
+        self.allocator.free(self.object_type);
+        self.allocator.free(self.oid);
+        self.* = undefined;
+    }
+
+    fn identityAlloc(self: TreeEntry) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "tree-entry:{s}:{s}:{s}",
+            .{ self.mode, self.object_type, self.oid },
+        );
+    }
+};
+
+fn treeEntryIdentityAtAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
     git_path: []const u8,
@@ -2554,22 +2576,73 @@ fn blobOidAtAlloc(
     path: []const u8,
     missing: []const u8,
 ) ![]u8 {
-    const spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ revision, path });
-    defer allocator.free(spec);
+    var entry = (try treeEntryAtAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        revision,
+        path,
+    )) orelse return allocator.dupe(u8, missing);
+    defer entry.deinit();
+    return entry.identityAlloc();
+}
+
+fn treeEntryAtAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    revision: []const u8,
+    path: []const u8,
+) !?TreeEntry {
     const result = try std.process.run(
         allocator,
         io,
         .{
-            .argv = &.{ git_path, "--no-replace-objects", "rev-parse", "--verify", spec },
+            .argv = &.{
+                git_path,
+                "--no-replace-objects",
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--full-name",
+                revision,
+                "--",
+                path,
+            },
             .cwd = .{ .path = cwd },
         },
     );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        return allocator.dupe(u8, missing);
+    if (result.term != .exited or result.term.exited != 0) return error.GitTreeEntryFailed;
+    if (result.stdout.len == 0) return null;
+    if (result.stdout[result.stdout.len - 1] != 0 or
+        std.mem.indexOfScalar(u8, result.stdout[0 .. result.stdout.len - 1], 0) != null)
+    {
+        return error.InvalidGitTreeEntry;
     }
-    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, "\r\n"));
+    const record = result.stdout[0 .. result.stdout.len - 1];
+    const first_space = std.mem.indexOfScalar(u8, record, ' ') orelse
+        return error.InvalidGitTreeEntry;
+    const second_space = std.mem.indexOfScalarPos(u8, record, first_space + 1, ' ') orelse
+        return error.InvalidGitTreeEntry;
+    const tab = std.mem.indexOfScalarPos(u8, record, second_space + 1, '\t') orelse
+        return error.InvalidGitTreeEntry;
+    if (!std.mem.eql(u8, record[tab + 1 ..], path)) return error.InvalidGitTreeEntry;
+    const mode = try allocator.dupe(u8, record[0..first_space]);
+    errdefer allocator.free(mode);
+    const object_type = try allocator.dupe(u8, record[first_space + 1 .. second_space]);
+    errdefer allocator.free(object_type);
+    const oid = try allocator.dupe(u8, record[second_space + 1 .. tab]);
+    errdefer allocator.free(oid);
+    return .{
+        .allocator = allocator,
+        .mode = mode,
+        .object_type = object_type,
+        .oid = oid,
+    };
 }
 
 fn mergeBaseWithShallowRetryAlloc(
@@ -2969,25 +3042,22 @@ fn runCanonicalDiff(
     cancelled: ?*const std.atomic.Value(bool),
     output_limit: usize,
 ) !GhOutput {
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
+    defer allocator.free(range);
     if (previous_path) |old_path| {
-        const base_spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ merge_base, old_path });
-        defer allocator.free(base_spec);
-        const head_spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ head, path });
-        defer allocator.free(head_spec);
-        return runCanonicalBlobDiff(
+        return runCanonicalRenamedPathDiff(
             allocator,
             io,
             git_path,
             cwd,
             evidence_view,
-            base_spec,
-            head_spec,
+            range,
+            old_path,
+            path,
             cancelled,
             output_limit,
         );
     }
-    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
-    defer allocator.free(range);
     return runCanonicalPathDiff(
         allocator,
         io,
@@ -3009,21 +3079,24 @@ fn ensureRevisionPathObjectAvailable(
     revision: []const u8,
     path: []const u8,
 ) !void {
-    const oid = try blobOidAtAlloc(
+    var entry = (try treeEntryAtAlloc(
         allocator,
         io,
         git_path,
         cwd,
         revision,
         path,
-        "",
-    );
-    defer allocator.free(oid);
-    if (oid.len == 0) return;
+    )) orelse return;
+    defer entry.deinit();
+    if (std.mem.eql(u8, entry.mode, "160000") and
+        std.mem.eql(u8, entry.object_type, "commit")) return;
+    if (!std.mem.eql(u8, entry.object_type, "blob")) {
+        return error.UnsupportedGitTreeEntry;
+    }
     var result = try runCapturedGitProcess(
         allocator,
         io,
-        &.{ git_path, "--no-replace-objects", "cat-file", "-e", oid },
+        &.{ git_path, "--no-replace-objects", "cat-file", "-e", entry.oid },
         .{ .path = cwd },
         null,
         null,
@@ -3037,14 +3110,15 @@ fn ensureRevisionPathObjectAvailable(
     }
 }
 
-fn runCanonicalBlobDiff(
+fn runCanonicalRenamedPathDiff(
     allocator: std.mem.Allocator,
     io: std.Io,
     git_path: []const u8,
     cwd: []const u8,
     evidence_view: *const CanonicalGitEvidenceView,
-    base_spec: []const u8,
-    head_spec: []const u8,
+    range: []const u8,
+    old_path: []const u8,
+    path: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
     output_limit: usize,
 ) !GhOutput {
@@ -3076,8 +3150,11 @@ fn runCanonicalBlobDiff(
         "--output-indicator-new=+",
         "--output-indicator-old=-",
         "--output-indicator-context= ",
-        base_spec,
-        head_spec,
+        "-M",
+        range,
+        "--",
+        old_path,
+        path,
     };
     return runCanonicalDiffProcess(
         allocator,
@@ -3477,7 +3554,7 @@ fn expectOversizedDiffHydration(
         git_path,
         1,
     );
-    const head_blob = try blobOidAtAlloc(
+    const head_entry = try treeEntryIdentityAtAlloc(
         allocator,
         io,
         git_path,
@@ -3486,7 +3563,7 @@ fn expectOversizedDiffHydration(
         "a.zig",
         "DELETION",
     );
-    defer allocator.free(head_blob);
+    defer allocator.free(head_entry);
     const diff_identity = try oversizedDiffIdentityAlloc(
         allocator,
         io,
@@ -3500,7 +3577,7 @@ fn expectOversizedDiffHydration(
         allocator,
         "a.zig",
         "MODIFIED",
-        head_blob,
+        head_entry,
         diff_identity,
     );
     defer allocator.free(expected);
@@ -3676,6 +3753,7 @@ test "renamed file identity and review diff include the source path" {
     );
     for ([_][]const []const u8{
         &.{ "git", "add", "." },
+        &.{ "git", "update-index", "--chmod=+x", "new.zig" },
         &.{ "git", "commit", "-qm", "rename" },
     }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
@@ -3710,6 +3788,72 @@ test "renamed file identity and review diff include the source path" {
     defer allocator.free(diff);
     try std.testing.expectEqualStrings(diff, generation.canonicalDiff("new.zig").?);
     try expectRenamedReviewDiff(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "old mode 100644") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "new mode 100755") != null);
+}
+
+test "gitlink evidence does not require the target commit object" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{
+            "git",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,submodule",
+        },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    for ([_][]const []const u8{
+        &.{
+            "git",
+            "update-index",
+            "--cacheinfo",
+            "160000,2222222222222222222222222222222222222222,submodule",
+        },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    var generation = try domain.PrGeneration.initFull(allocator, base, head);
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "submodule",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try hydrateRevisionKeys(allocator, io, root, null, &generation);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        generation.files.items[0].revision_key,
+        "pending",
+    ));
+    const diff = generation.canonicalDiff("submodule") orelse
+        return error.MissingCanonicalDiff;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diff,
+        "index 1111111111111111111111111111111111111111.." ++
+            "2222222222222222222222222222222222222222 160000",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diff,
+        "+Subproject commit 2222222222222222222222222222222222222222",
+    ) != null);
 }
 
 test "canonical diff preserves committed attributes while excluding local info attributes" {
