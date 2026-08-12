@@ -143,6 +143,23 @@ pub const Session = struct {
         if (self.pending_skill_path) |value| allocator.free(value);
     }
 };
+
+fn generationSessionStatus(
+    generation: *const domain.PrGeneration,
+    session: Session,
+) !SessionStatus {
+    if (session.status != .current and session.status != .completed) return session.status;
+    const current_path = (try generation.resolveSessionCurrentPath(
+        session.path,
+        session.revision,
+    )) orelse return .stale_origin;
+    const revision = domain.revisionFor(generation, current_path) orelse return .stale_origin;
+    return if (std.mem.eql(u8, revision, session.revision))
+        session.status
+    else
+        .stale_origin;
+}
+
 pub const AuthoritativeToolHandler = struct {
     context: *anyopaque,
     handle: *const fn (
@@ -173,6 +190,18 @@ pub const SessionIdentity = struct {
         self.allocator.free(self.path);
         self.allocator.free(self.revision);
         self.allocator.free(self.turn_id);
+    }
+};
+
+pub const GenerationCommitPlan = struct {
+    allocator: std.mem.Allocator,
+    evidence: domain.PrGeneration,
+    statuses: []SessionStatus,
+    committed: bool = false,
+
+    pub fn deinit(self: *GenerationCommitPlan) void {
+        if (!self.committed) self.evidence.deinit();
+        self.allocator.free(self.statuses);
     }
 };
 pub const VisibleEvent = struct {
@@ -581,6 +610,38 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         if (self.evidence) |*old| old.deinit();
         self.evidence = next;
+    }
+
+    pub fn prepareGenerationCommit(
+        self: *Registry,
+        generation: *const domain.PrGeneration,
+    ) !GenerationCommitPlan {
+        var evidence = try generation.clone(self.allocator);
+        errdefer evidence.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const statuses = try self.allocator.alloc(SessionStatus, self.sessions.items.len);
+        errdefer self.allocator.free(statuses);
+        for (self.sessions.items, statuses) |session, *status| {
+            status.* = try generationSessionStatus(generation, session);
+        }
+        return .{
+            .allocator = self.allocator,
+            .evidence = evidence,
+            .statuses = statuses,
+        };
+    }
+
+    pub fn commitGeneration(self: *Registry, plan: *GenerationCommitPlan) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(plan.statuses.len == self.sessions.items.len);
+        if (self.evidence) |*old| old.deinit();
+        self.evidence = plan.evidence;
+        for (self.sessions.items, plan.statuses) |*session, status| {
+            session.status = status;
+        }
+        plan.committed = true;
     }
 
     pub fn createPrimary(
@@ -3433,6 +3494,26 @@ fn appendApprovalTestSession(registry: *Registry, id: []const u8, thread: []cons
         .initial_turn_active = false,
         .turn_active = true,
     });
+}
+
+test "generation commit plan publishes evidence and status together" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "session", "thread");
+    registry.sessions.items[0].turn_active = false;
+    var old = try domain.PrGeneration.init(std.testing.allocator, "old-head");
+    try old.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r1" });
+    registry.evidence = old;
+    var next = try domain.PrGeneration.init(std.testing.allocator, "new-head");
+    defer next.deinit();
+    try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
+    var plan = try registry.prepareGenerationCommit(&next);
+    defer plan.deinit();
+    try std.testing.expectEqual(SessionStatus.current, registry.sessions.items[0].status);
+    try std.testing.expectEqualStrings("old-head", registry.evidence.?.head_oid);
+    registry.commitGeneration(&plan);
+    try std.testing.expectEqual(SessionStatus.stale_origin, registry.sessions.items[0].status);
+    try std.testing.expectEqualStrings("new-head", registry.evidence.?.head_oid);
 }
 
 const exact_tool_test_request =

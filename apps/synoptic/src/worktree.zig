@@ -283,8 +283,21 @@ pub const RefreshLease = struct {
         var previous = self.previous orelse return error.RefreshLeaseAlreadyFinished;
         switch (self.custody) {
             .reused_current => |cwd| {
-                const branch = previous.branch orelse
+                const branch = previous.branch orelse {
+                    previous.deinit();
+                    self.previous = null;
                     return error.ReusedCheckoutRollbackFailed;
+                };
+                requireReusedUnchanged(
+                    self.allocator,
+                    self.io,
+                    cwd,
+                    self.baseline,
+                ) catch {
+                    previous.deinit();
+                    self.previous = null;
+                    return error.ReusedCheckoutRollbackFailed;
+                };
                 try rollbackReused(self.allocator, self.io, cwd, branch, &previous);
                 self.baseline.replace(previous);
                 self.previous = null;
@@ -1267,6 +1280,52 @@ test "repository remote matching accepts scp syntax without a user" {
     ));
 }
 
+fn expectRollbackRefusesExternalCommit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    next_head: []const u8,
+    baseline: *Baseline,
+) !void {
+    var guarded = try beginRefresh(
+        allocator,
+        io,
+        .{ .reused_current = root },
+        root,
+        next_head,
+        baseline,
+        null,
+    );
+    const external_path = try std.fs.path.join(allocator, &.{ root, "external.txt" });
+    defer allocator.free(external_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = external_path, .data = "external\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "external.txt" },
+        &.{ "git", "commit", "-qm", "external" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
+    const external_raw = try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(external_raw);
+    try std.testing.expectError(error.ReusedCheckoutRollbackFailed, guarded.rollback());
+    const observed_raw = try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(observed_raw);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, external_raw, "\r\n"),
+        std.mem.trim(u8, observed_raw, "\r\n"),
+    );
+}
+
 test "worktree integrity reused rollback restores exact branch and head" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1328,4 +1387,6 @@ test "worktree integrity reused rollback restores exact branch and head" {
     try lease.rollback();
     try std.testing.expectEqualStrings(original_head, baseline.head_oid);
     try requireReusedUnchanged(allocator, io, root, &baseline);
+
+    try expectRollbackRefusesExternalCommit(allocator, io, root, next_head, &baseline);
 }

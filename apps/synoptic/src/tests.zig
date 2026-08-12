@@ -52,6 +52,44 @@ test "vertical state path gates primary, streams session, and retains completed 
     try std.testing.expect(state.generation.queued("src/a.zig"));
 }
 
+test "refresh composite plans publish app and registry only at commit" {
+    var state = try app.App.init(std.testing.allocator, "old-head");
+    defer state.deinit();
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    registry.evidence = try state.generation.clone(std.testing.allocator);
+    var next = try domain.PrGeneration.initFull(
+        std.testing.allocator,
+        "new-base",
+        "new-head",
+    );
+    var next_owned = true;
+    defer if (next_owned) next.deinit();
+    var app_plan = try state.prepareRefresh(&next, .{
+        .repository = "o/r",
+        .number = 1,
+        .title = "new title",
+        .body = "new body",
+        .url = "https://example/1",
+        .base_ref_name = "main",
+        .base_ref_oid = "new-base",
+        .head_ref_name = "feature",
+        .head_ref_oid = "new-head",
+        .state = "OPEN",
+        .is_draft = false,
+    });
+    defer app_plan.deinit();
+    var registry_plan = try registry.prepareGenerationCommit(&next);
+    defer registry_plan.deinit();
+    try std.testing.expectEqualStrings("old-head", state.generation.head_oid);
+    try std.testing.expectEqualStrings("old-head", registry.evidence.?.head_oid);
+    state.commitRefresh(&app_plan, next);
+    next_owned = false;
+    registry.commitGeneration(&registry_plan);
+    try std.testing.expectEqualStrings("new-head", state.generation.head_oid);
+    try std.testing.expectEqualStrings("new-head", registry.evidence.?.head_oid);
+}
+
 test "comment mutation cards own the server-observed body snapshot" {
     var state = try app.App.init(std.testing.allocator, "h");
     defer state.deinit();

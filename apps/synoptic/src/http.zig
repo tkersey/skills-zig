@@ -1249,7 +1249,6 @@ pub const Server = struct {
             synchronizing = false;
             return run(runtime);
         }
-        runtime.app.action_state_fresh = false;
         var refreshed = try runtime.broker.readGenerationSnapshot(
             runtime.owner,
             runtime.name,
@@ -1259,27 +1258,44 @@ pub const Server = struct {
         var next = refreshed.generation;
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
-        runtime.worktree_generation_valid = false;
         var refresh_lease = try self.beginRefreshWorktree(runtime, &next);
-        self.finishRefresh(
+        const committed = self.finishRefresh(
             runtime,
             &refreshed,
             &next,
             &next_owned,
-            mutex,
-            &locked,
         ) catch |err| {
             if (locked) {
                 mutex.unlock();
                 locked = false;
             }
-            refresh_lease.rollback() catch return error.ReusedCheckoutRollbackFailed;
+            refresh_lease.rollback() catch {
+                runtime.worktree_generation_valid = false;
+                runtime.app.action_state_fresh = false;
+                return error.ReusedCheckoutRollbackFailed;
+            };
             return err;
         };
         refresh_lease.commit();
+        runtime.worktree_generation_valid = true;
+        runtime.app.action_state_fresh = true;
+        mutex.unlock();
+        locked = false;
         runtime.registry.endSynchronization();
         synchronizing = false;
+        self.reconcileCommittedRefresh(runtime, committed);
     }
+
+    const CommittedRefresh = struct {
+        allocator: std.mem.Allocator,
+        primary_update: []u8,
+        file_metadata_pages: @import("domain.zig").PrimaryMetadataPages,
+
+        fn deinit(self: *CommittedRefresh) void {
+            self.allocator.free(self.primary_update);
+            self.file_metadata_pages.deinit();
+        }
+    };
 
     fn finishRefresh(
         self: *Server,
@@ -1287,9 +1303,7 @@ pub const Server = struct {
         refreshed: *github.GenerationSnapshot,
         next: *@import("domain.zig").PrGeneration,
         next_owned: *bool,
-        mutex: *DomainMutex,
-        locked: *bool,
-    ) !void {
+    ) !CommittedRefresh {
         try github.rebindGenerationLineage(
             self.allocator,
             self.io,
@@ -1297,15 +1311,13 @@ pub const Server = struct {
             &runtime.app.generation,
             next,
         );
-        try self.refreshTabDiffs(runtime, next);
-        try self.markChangedSessions(runtime, next);
         const repository = try std.fmt.allocPrint(
             self.allocator,
             "{s}/{s}",
             .{ runtime.owner, runtime.name },
         );
         defer self.allocator.free(repository);
-        try runtime.app.setPullRequest(.{
+        var app_plan = try runtime.app.prepareRefresh(next, .{
             .repository = repository,
             .number = runtime.number,
             .title = refreshed.metadata.title,
@@ -1318,25 +1330,58 @@ pub const Server = struct {
             .state = refreshed.metadata.state,
             .is_draft = refreshed.metadata.is_draft,
         });
-        runtime.app.replaceGeneration(next.*);
+        defer app_plan.deinit();
+        var registry_plan = try runtime.registry.prepareGenerationCommit(next);
+        defer registry_plan.deinit();
+        const primary_update = try self.primaryUpdateForMetadataAlloc(refreshed.metadata);
+        errdefer self.allocator.free(primary_update);
+        var file_metadata_pages = try next.primaryFileMetadataPagesAlloc(self.allocator);
+        errdefer file_metadata_pages.deinit();
+        runtime.app.commitRefresh(&app_plan, next.*);
         next_owned.* = false;
-        try self.applyRefreshExclusionBatch(runtime);
-        try runtime.registry.setGenerationEvidence(&runtime.app.generation);
-        const primary_update = try self.primaryUpdateAlloc(runtime);
-        defer self.allocator.free(primary_update);
-        var file_metadata_pages = try runtime.app.generation.primaryFileMetadataPagesAlloc(
+        runtime.registry.commitGeneration(&registry_plan);
+        return .{
+            .allocator = self.allocator,
+            .primary_update = primary_update,
+            .file_metadata_pages = file_metadata_pages,
+        };
+    }
+
+    fn reconcileCommittedRefresh(
+        self: *Server,
+        runtime: *Runtime,
+        committed_value: CommittedRefresh,
+    ) void {
+        var committed = committed_value;
+        defer committed.deinit();
+        self.applyRefreshExclusionBatch(runtime) catch |err| {
+            self.queueRefreshWarning(runtime, "github-exclusions", err);
+        };
+        runtime.registry.setGenerationEvidence(&runtime.app.generation) catch |err| {
+            self.queueRefreshWarning(runtime, "registry-evidence", err);
+        };
+        self.markChangedSessions(runtime, &runtime.app.generation) catch |err| {
+            self.queueRefreshWarning(runtime, "file-session-update", err);
+        };
+        runtime.registry.updatePrimary(
+            committed.primary_update,
+            committed.file_metadata_pages.items.items,
+        ) catch |err| self.queueRefreshWarning(runtime, "primary-update", err);
+    }
+
+    fn queueRefreshWarning(
+        self: *Server,
+        runtime: *Runtime,
+        stage: []const u8,
+        err: anyerror,
+    ) void {
+        const payload = std.fmt.allocPrint(
             self.allocator,
-        );
-        defer file_metadata_pages.deinit();
-        mutex.unlock();
-        locked.* = false;
-        try runtime.registry.updatePrimary(primary_update, file_metadata_pages.items.items);
-        mutex.lock();
-        locked.* = true;
-        runtime.worktree_generation_valid = true;
-        runtime.app.action_state_fresh = true;
-        mutex.unlock();
-        locked.* = false;
+            "{{\"stage\":{f},\"error\":{f}}}",
+            .{ std.json.fmt(stage, .{}), std.json.fmt(@errorName(err), .{}) },
+        ) catch return;
+        defer self.allocator.free(payload);
+        runtime.registry.queueSystemEvent("warning", payload) catch return;
     }
 
     fn beginRefreshWorktree(
@@ -1364,29 +1409,6 @@ pub const Server = struct {
             return err;
         };
         return lease;
-    }
-
-    fn refreshTabDiffs(
-        self: *Server,
-        runtime: *Runtime,
-        next: *const @import("domain.zig").PrGeneration,
-    ) !void {
-        _ = self;
-        for (runtime.app.tabs.items) |tab| {
-            if (tab.status == .closed) continue;
-            const current_path = (try next.resolveSessionCurrentPath(
-                tab.path,
-                tab.revision,
-            )) orelse {
-                try runtime.app.updateTabDiff(tab.path, tab.revision, null);
-                continue;
-            };
-            const current_diff = next.canonicalDiff(current_path) orelse {
-                try runtime.app.updateTabDiff(tab.path, tab.revision, null);
-                continue;
-            };
-            try runtime.app.updateTabDiff(tab.path, tab.revision, current_diff);
-        }
     }
 
     fn markChangedSessions(
@@ -1460,8 +1482,10 @@ pub const Server = struct {
         }
     }
 
-    fn primaryUpdateAlloc(self: *Server, runtime: *Runtime) ![]u8 {
-        const header = runtime.app.pull_request orelse return error.MissingPullRequestHeader;
+    fn primaryUpdateForMetadataAlloc(
+        self: *Server,
+        metadata: github.PullRequestMetadata,
+    ) ![]u8 {
         const update_format = "The pull request was explicitly refreshed. Current tit" ++
             "le: {s}. Current body: {s}. Current state: {s}; draft: {}. Current base " ++
             "ref: {s} at {s}. Current head ref: {s} at {s}. Current changed files: " ++
@@ -1472,14 +1496,14 @@ pub const Server = struct {
             self.allocator,
             update_format,
             .{
-                header.title,
-                header.body,
-                header.state,
-                header.is_draft,
-                header.base_ref_name,
-                header.base_ref_oid,
-                header.head_ref_name,
-                header.head_ref_oid,
+                metadata.title,
+                metadata.body,
+                metadata.state,
+                metadata.is_draft,
+                metadata.base_ref_name,
+                metadata.base_oid,
+                metadata.head_ref_name,
+                metadata.head_oid,
             },
         );
     }

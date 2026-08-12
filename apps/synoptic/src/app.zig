@@ -121,6 +121,26 @@ const ExclusionProbe = struct {
     }
 };
 
+const TabRefresh = struct {
+    index: usize,
+    diff: ?[]u8,
+    diff_state: domain.DiffDisplayState,
+    status: domain.SessionStatus,
+};
+
+pub const RefreshPlan = struct {
+    allocator: std.mem.Allocator,
+    header: domain.OwnedPullRequestHeader,
+    tabs: std.ArrayList(TabRefresh) = .empty,
+    committed: bool = false,
+
+    pub fn deinit(self: *RefreshPlan) void {
+        if (!self.committed) self.header.deinit();
+        for (self.tabs.items) |tab| if (tab.diff) |diff| self.allocator.free(diff);
+        self.tabs.deinit(self.allocator);
+    }
+};
+
 pub const AutomaticExclusionBatch = struct {
     allocator: std.mem.Allocator,
     base_oid: []u8,
@@ -244,6 +264,56 @@ pub const App = struct {
         if (self.pull_request) |*old| old.deinit();
         self.pull_request = owned;
         self.replaceGeneration(next);
+    }
+
+    pub fn prepareRefresh(
+        self: *const App,
+        next: *const domain.PrGeneration,
+        header: domain.PullRequestHeader,
+    ) !RefreshPlan {
+        var plan = RefreshPlan{
+            .allocator = self.allocator,
+            .header = try domain.OwnedPullRequestHeader.init(self.allocator, header),
+        };
+        errdefer plan.deinit();
+        for (self.tabs.items, 0..) |tab, index| {
+            if (tab.status == .closed) continue;
+            const current_path = try next.resolveSessionCurrentPath(tab.path, tab.revision);
+            const diff = if (current_path) |path| next.canonicalDiff(path) else null;
+            const owned_diff = try self.allocator.dupe(u8, diff orelse "");
+            errdefer self.allocator.free(owned_diff);
+            const next_status = refreshTabStatus(next, tab, current_path);
+            try plan.tabs.append(self.allocator, .{
+                .index = index,
+                .diff = owned_diff,
+                .diff_state = if (diff) |value|
+                    domain.diffDisplayState(value)
+                else
+                    .unavailable,
+                .status = next_status,
+            });
+        }
+        return plan;
+    }
+
+    pub fn commitRefresh(
+        self: *App,
+        plan: *RefreshPlan,
+        next: domain.PrGeneration,
+    ) void {
+        if (self.pull_request) |*old| old.deinit();
+        self.pull_request = plan.header;
+        plan.committed = true;
+        self.generation.deinit();
+        self.generation = next;
+        for (plan.tabs.items) |*update| {
+            const tab = &self.tabs.items[update.index];
+            self.allocator.free(tab.diff);
+            tab.diff = update.diff.?;
+            update.diff = null;
+            tab.diff_state = update.diff_state;
+            tab.status = update.status;
+        }
     }
 
     pub fn updatePullRequestGeneration(
@@ -995,6 +1065,17 @@ pub const App = struct {
     }
 };
 
+fn refreshTabStatus(
+    next: *const domain.PrGeneration,
+    tab: domain.Tab,
+    current_path: ?[]const u8,
+) domain.SessionStatus {
+    if (tab.status != .current and tab.status != .completed) return tab.status;
+    const path = current_path orelse return .stale_origin;
+    const revision = domain.revisionFor(next, path) orelse return .stale_origin;
+    return if (std.mem.eql(u8, revision, tab.revision)) tab.status else .stale_origin;
+}
+
 fn viewedStateName(state: domain.ViewedState) []const u8 {
     return switch (state) {
         .viewed => "VIEWED",
@@ -1044,6 +1125,79 @@ test "automatic exclusion results bind the complete base head generation" {
         error.ExclusionGenerationChanged,
         state.applyAutomaticExclusionResults(&batch, &.{}),
     );
+}
+
+test "refresh preparation is non-mutating across allocation failure" {
+    var successes: usize = 0;
+    for (0..48) |fail_index| {
+        var state = try App.init(std.testing.allocator, "old-head");
+        defer state.deinit();
+        try state.generation.addFile(.{
+            .path = "a.zig",
+            .viewed = .unviewed,
+            .revision_key = "r1",
+        });
+        try state.setPullRequest(.{
+            .repository = "o/r",
+            .number = 1,
+            .title = "old title",
+            .body = "old body",
+            .url = "https://example/1",
+            .base_ref_name = "main",
+            .base_ref_oid = "old-base",
+            .head_ref_name = "feature",
+            .head_ref_oid = "old-head",
+            .state = "OPEN",
+            .is_draft = false,
+        });
+        try state.tabs.append(std.testing.allocator, .{
+            .id = try std.testing.allocator.dupe(u8, "session"),
+            .path = try std.testing.allocator.dupe(u8, "a.zig"),
+            .revision = try std.testing.allocator.dupe(u8, "r1"),
+            .diff = try std.testing.allocator.dupe(u8, "+old"),
+        });
+        var next = try domain.PrGeneration.initFull(
+            std.testing.allocator,
+            "new-base",
+            "new-head",
+        );
+        defer next.deinit();
+        try next.addFile(.{
+            .path = "a.zig",
+            .viewed = .unviewed,
+            .revision_key = "r2",
+            .canonical_diff = "+new",
+        });
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        state.allocator = failing.allocator();
+        const prepared = state.prepareRefresh(&next, .{
+            .repository = "o/r",
+            .number = 1,
+            .title = "new title",
+            .body = "new body",
+            .url = "https://example/1",
+            .base_ref_name = "main",
+            .base_ref_oid = "new-base",
+            .head_ref_name = "feature",
+            .head_ref_oid = "new-head",
+            .state = "OPEN",
+            .is_draft = false,
+        });
+        if (prepared) |plan_value| {
+            var plan = plan_value;
+            plan.deinit();
+            successes += 1;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        state.allocator = std.testing.allocator;
+        try std.testing.expectEqualStrings("old-head", state.generation.head_oid);
+        try std.testing.expectEqualStrings("old title", state.pull_request.?.title);
+        try std.testing.expectEqualStrings("+old", state.tabs.items[0].diff);
+        try std.testing.expectEqual(domain.SessionStatus.current, state.tabs.items[0].status);
+    }
+    try std.testing.expect(successes > 0);
 }
 
 test "action invalidation updates the application snapshot" {
