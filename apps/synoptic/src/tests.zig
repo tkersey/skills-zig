@@ -1137,6 +1137,10 @@ const fake_codex_script =
     \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn","status":"completed"}}}'
     \\      else
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+    \\        if printf '%s' "$line" | grep -q 'fail-initial-file-turn'; then
+    \\          printf '{"id":%s,"error":{"code":-32000,"message":"turn failed"}}\n' "$id"
+    \\          continue
+    \\        fi
     \\        if printf '%s' "$line" | grep -q 'prepare the comment'; then
     \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"slot":"finding-1","kind":"add_inline_comment","effectSummary":"Add an inline comment on a.zig line 1","payload":{"path":"a.zig","line":1,"side":"RIGHT","body":"Could this fail?"}}}}\n' "$thread_id"
     \\        fi
@@ -3077,6 +3081,50 @@ test "file session receives every later revision and active close interrupts its
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
+}
+
+test "file session fork custody deletes every failed initial turn" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    for (0..2) |_| {
+        try std.testing.expectError(
+            error.RequestFailed,
+            registry.openFile(
+                io,
+                root,
+                "failed.zig",
+                "r1",
+                "base",
+                "head",
+                "fail-initial-file-turn",
+                "[]",
+                paths.skill,
+                true,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 0), registry.sessionCount());
+    }
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{paths.codex});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        log_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/fork"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/delete"));
 }
 
 test "session context refresh injects changed thread evidence into every open sibling" {

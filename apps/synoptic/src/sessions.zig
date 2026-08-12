@@ -1002,8 +1002,6 @@ pub const Registry = struct {
         }
         defer self.releaseFileAdmission(path, revision);
         const actor = &(self.actor orelse return error.AppServerUnavailable);
-        const file_thread_id = try self.forkFileThread(actor);
-        defer self.allocator.free(file_thread_id);
         const prompt = try self.filePromptAlloc(
             io,
             skill_path,
@@ -1015,7 +1013,9 @@ pub const Registry = struct {
             threads_json,
         );
         defer self.allocator.free(prompt);
-        const session_id = try self.registerFileSession(
+        const file_thread_id = try self.forkFileThread(actor);
+        defer self.allocator.free(file_thread_id);
+        const session_id = self.registerFileSession(
             file_thread_id,
             path,
             revision,
@@ -1023,23 +1023,52 @@ pub const Registry = struct {
             prompt,
             skill_path,
             start_immediately,
-        );
+        ) catch |err| return self.retireForkAfterError(actor, file_thread_id, err);
         errdefer {
             self.removeSession(session_id);
             self.allocator.free(session_id);
         }
         if (start_immediately) {
-            const file_turn_id = try self.startFileTurn(
+            const file_turn_id = self.startFileTurn(
                 actor,
                 cwd,
                 file_thread_id,
                 skill_path,
                 prompt,
-            );
+            ) catch |err| return self.retireForkAfterError(actor, file_thread_id, err);
             defer self.allocator.free(file_turn_id);
-            try self.activateOpeningSession(session_id, file_turn_id);
+            self.activateOpeningSession(session_id, file_turn_id) catch |err| {
+                return self.retireForkAfterError(actor, file_thread_id, err);
+            };
         }
         return .{ .reused = false, .session_id = session_id, .allocator = self.allocator };
+    }
+
+    fn retireForkAfterError(
+        self: *Registry,
+        actor: *cas_runtime.Actor,
+        thread_id: []const u8,
+        original_error: anyerror,
+    ) anyerror {
+        self.deleteFileThread(actor, thread_id) catch |retirement_error| {
+            return retirement_error;
+        };
+        return original_error;
+    }
+
+    fn deleteFileThread(
+        self: *Registry,
+        actor: *cas_runtime.Actor,
+        thread_id: []const u8,
+    ) !void {
+        const params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"threadId\":{f}}}",
+            .{std.json.fmt(thread_id, .{})},
+        );
+        defer self.allocator.free(params);
+        const response = try actor.requestJson("thread/delete", params, null);
+        self.allocator.free(response);
     }
 
     fn admitFile(self: *Registry, path: []const u8, revision: []const u8) !OpenAdmission {
@@ -1144,6 +1173,8 @@ pub const Registry = struct {
             .{self.next_session_id},
         );
         errdefer if (!session_fields_transferred) self.allocator.free(session_id);
+        const result_id = try self.allocator.dupe(u8, session_id);
+        errdefer if (!session_fields_transferred) self.allocator.free(result_id);
         const thread_id = try self.allocator.dupe(u8, file_thread_id);
         errdefer if (!session_fields_transferred) self.allocator.free(thread_id);
         const turn_id = try self.allocator.dupe(u8, "");
@@ -1193,7 +1224,7 @@ pub const Registry = struct {
             path,
         );
         self.mutex.unlock();
-        return self.allocator.dupe(u8, session_id);
+        return result_id;
     }
 
     fn activateOpeningSession(
