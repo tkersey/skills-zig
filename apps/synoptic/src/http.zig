@@ -407,6 +407,45 @@ pub const Server = struct {
     }
 
     fn serveAsset(self: *Server, stream: *std.Io.net.Stream, target: []const u8) !void {
+        const real = self.assetRealPathAlloc(target) catch |err| switch (err) {
+            error.AssetNotFound => return writeResponse(
+                self.io,
+                stream,
+                "404 Not Found",
+                "text/plain",
+                "not found",
+                false,
+            ),
+            else => return err,
+        };
+        defer self.allocator.free(real);
+        const body = self.readAssetAlloc(real) catch |err| switch (err) {
+            error.AssetNotFound => return writeResponse(
+                self.io,
+                stream,
+                "404 Not Found",
+                "text/plain",
+                "not found",
+                false,
+            ),
+            error.AssetTooLarge => return writeResponse(
+                self.io,
+                stream,
+                "413 Content Too Large",
+                "text/plain",
+                "asset too large",
+                false,
+            ),
+            else => return err,
+        };
+        defer self.allocator.free(body);
+        const content_type = if (std.mem.endsWith(u8, real, ".html"))
+            "text/html; charset=utf-8"
+        else if (std.mem.endsWith(u8, real, ".css")) "text/css" else "text/javascript";
+        try writeResponse(self.io, stream, "200 OK", content_type, body, true);
+    }
+
+    fn assetRealPathAlloc(self: *Server, target: []const u8) ![]u8 {
         const clean = if (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/?"))
             "index.html"
         else blk: {
@@ -416,19 +455,16 @@ pub const Server = struct {
                 std.mem.indexOf(u8, p, "..") != null or
                 std.mem.indexOfScalar(u8, p, '\\') != null or
                 std.mem.indexOfScalar(u8, p, '%') != null;
-            if (invalid) return writeResponse(
-                self.io,
-                stream,
-                "404 Not Found",
-                "text/plain",
-                "not found",
-                false,
-            );
+            if (invalid) return error.AssetNotFound;
             break :blk p["/assets/".len..];
         };
         const root = try std.fs.path.join(self.allocator, &.{ self.skill_root, "assets", "ui" });
         defer self.allocator.free(root);
-        const root_real = try std.Io.Dir.cwd().realPathFileAlloc(self.io, root, self.allocator);
+        const root_real = std.Io.Dir.cwd().realPathFileAlloc(
+            self.io,
+            root,
+            self.allocator,
+        ) catch return error.AssetNotFound;
         defer self.allocator.free(root_real);
         const candidate = try std.fs.path.join(self.allocator, &.{ root_real, clean });
         defer self.allocator.free(candidate);
@@ -436,34 +472,31 @@ pub const Server = struct {
             self.io,
             candidate,
             self.allocator,
-        ) catch return writeResponse(
+        ) catch return error.AssetNotFound;
+        if (!pathConfined(root_real, real)) {
+            self.allocator.free(real);
+            return error.AssetNotFound;
+        }
+        return real;
+    }
+
+    fn readAssetAlloc(self: *Server, path: []const u8) ![]u8 {
+        const stat = std.Io.Dir.cwd().statFile(
             self.io,
-            stream,
-            "404 Not Found",
-            "text/plain",
-            "not found",
-            false,
-        );
-        defer self.allocator.free(real);
-        if (!pathConfined(root_real, real)) return writeResponse(
+            path,
+            .{ .follow_symlinks = false },
+        ) catch return error.AssetNotFound;
+        if (stat.kind != .file) return error.AssetNotFound;
+        if (stat.size > 8 * 1024 * 1024) return error.AssetTooLarge;
+        return std.Io.Dir.cwd().readFileAlloc(
             self.io,
-            stream,
-            "404 Not Found",
-            "text/plain",
-            "not found",
-            false,
-        );
-        const body = try std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            real,
+            path,
             self.allocator,
             .limited(8 * 1024 * 1024),
-        );
-        defer self.allocator.free(body);
-        const content_type = if (std.mem.endsWith(u8, real, ".html"))
-            "text/html; charset=utf-8"
-        else if (std.mem.endsWith(u8, real, ".css")) "text/css" else "text/javascript";
-        try writeResponse(self.io, stream, "200 OK", content_type, body, true);
+        ) catch |err| switch (err) {
+            error.StreamTooLong => error.AssetTooLarge,
+            else => err,
+        };
     }
 
     fn upgradeWebSocket(

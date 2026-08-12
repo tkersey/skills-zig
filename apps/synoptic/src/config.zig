@@ -60,7 +60,7 @@ pub const max_visible_events: usize = 1024;
 /// Keeps the browser event stream live without requiring a client command.
 pub const visible_event_flush_ms: u32 = 50;
 pub const lifecycle_schema = "synoptic-runtime/v1";
-pub const lifecycle_ready_timeout_ms: u32 = 30_000;
+pub const lifecycle_ready_timeout_ms: u32 = 300_000;
 pub const lifecycle_stop_timeout_ms: u32 = 45_000;
 
 pub const FileReviewStartMode = enum { immediate, idle };

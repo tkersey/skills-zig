@@ -1862,6 +1862,26 @@ fn hydrateRevisionKeysWithGitPath(
     generation: *domain.PrGeneration,
     git_path: []const u8,
 ) !void {
+    return hydrateRevisionKeysWithGitPathLimit(
+        allocator,
+        io,
+        cwd,
+        fetch_source,
+        generation,
+        git_path,
+        canonical_diff_bytes_max,
+    );
+}
+
+fn hydrateRevisionKeysWithGitPathLimit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    fetch_source: ?worktree.FetchSource,
+    generation: *domain.PrGeneration,
+    git_path: []const u8,
+    diff_bytes_max: usize,
+) !void {
     worktree.ensureObjectAvailable(
         allocator,
         io,
@@ -1883,34 +1903,117 @@ fn hydrateRevisionKeysWithGitPath(
     );
     defer allocator.free(merge_base);
     for (generation.files.items) |file| {
-        const spec = try std.fmt.allocPrint(allocator, "HEAD:{s}", .{file.path});
-        defer allocator.free(spec);
-        const blob_result = try std.process.run(
+        try hydrateFileRevision(
             allocator,
             io,
-            .{ .argv = &.{ git_path, "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
-        );
-        defer allocator.free(blob_result.stdout);
-        defer allocator.free(blob_result.stderr);
-        const blob = if (blob_result.term == .exited and blob_result.term.exited == 0)
-            std.mem.trim(u8, blob_result.stdout, "\r\n")
-        else
-            "DELETION";
-        const diff = try canonicalDiffFromMergeBaseAlloc(
-            allocator,
-            io,
-            git_path,
             cwd,
+            git_path,
             merge_base,
-            generation.head_oid,
-            file.path,
-            null,
+            generation,
+            file,
+            diff_bytes_max,
         );
-        defer allocator.free(diff);
-        const revision = try domain.revisionKey(allocator, file.path, file.change_type, blob, diff);
-        defer allocator.free(revision);
-        try generation.setRevision(file.path, revision);
     }
+}
+
+fn hydrateFileRevision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    git_path: []const u8,
+    merge_base: []const u8,
+    generation: *domain.PrGeneration,
+    file: domain.File,
+    diff_bytes_max: usize,
+) !void {
+    const blob = try blobOidAtAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        generation.head_oid,
+        file.path,
+        "DELETION",
+    );
+    defer allocator.free(blob);
+    const diff = canonicalDiffFromMergeBaseWithLimitAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        generation.head_oid,
+        file.path,
+        null,
+        diff_bytes_max,
+    ) catch |err| switch (err) {
+        error.FileDiffTooLarge => null,
+        else => return err,
+    };
+    defer if (diff) |value| allocator.free(value);
+    const diff_identity = if (diff) |value| value else try oversizedDiffIdentityAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        file.path,
+    );
+    defer if (diff == null) allocator.free(diff_identity);
+    const revision = try domain.revisionKey(
+        allocator,
+        file.path,
+        file.change_type,
+        blob,
+        diff_identity,
+    );
+    defer allocator.free(revision);
+    try generation.setRevision(file.path, revision);
+}
+
+fn oversizedDiffIdentityAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    merge_base: []const u8,
+    path: []const u8,
+) ![]u8 {
+    const base_blob = try blobOidAtAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        path,
+        "MISSING",
+    );
+    defer allocator.free(base_blob);
+    return std.fmt.allocPrint(allocator, "oversized-diff:{s}", .{base_blob});
+}
+
+fn blobOidAtAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    revision: []const u8,
+    path: []const u8,
+    missing: []const u8,
+) ![]u8 {
+    const spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ revision, path });
+    defer allocator.free(spec);
+    const result = try std.process.run(
+        allocator,
+        io,
+        .{ .argv = &.{ git_path, "rev-parse", "--verify", spec }, .cwd = .{ .path = cwd } },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return allocator.dupe(u8, missing);
+    }
+    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, "\r\n"));
 }
 
 fn mergeBaseWithShallowRetryAlloc(
@@ -2027,6 +2130,30 @@ pub fn canonicalDiffFromMergeBaseAlloc(
     path: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
 ) ![]u8 {
+    return canonicalDiffFromMergeBaseWithLimitAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        head,
+        path,
+        cancelled,
+        canonical_diff_bytes_max,
+    );
+}
+
+fn canonicalDiffFromMergeBaseWithLimitAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    diff_bytes_max: usize,
+) ![]u8 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
     var result = runCapturedProcess(
@@ -2045,7 +2172,7 @@ pub fn canonicalDiffFromMergeBaseAlloc(
         .{ .path = cwd },
         null,
         cancelled,
-        canonical_diff_bytes_max,
+        diff_bytes_max,
         git_stderr_bytes_max,
         false,
     ) catch |err| switch (err) {
@@ -2299,6 +2426,61 @@ fn expectSingleMergeBaseHydration(
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[1].revision_key, "pending-b"));
 }
 
+fn expectOversizedDiffHydration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    git_path: []const u8,
+    base: []const u8,
+    head: []const u8,
+) !void {
+    var bounded = try domain.PrGeneration.initFull(allocator, base, head);
+    defer bounded.deinit();
+    try bounded.addFile(.{
+        .path = "a.zig",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending-oversized",
+    });
+    try hydrateRevisionKeysWithGitPathLimit(
+        allocator,
+        io,
+        root,
+        null,
+        &bounded,
+        git_path,
+        1,
+    );
+    const head_blob = try blobOidAtAlloc(
+        allocator,
+        io,
+        git_path,
+        root,
+        head,
+        "a.zig",
+        "DELETION",
+    );
+    defer allocator.free(head_blob);
+    const diff_identity = try oversizedDiffIdentityAlloc(
+        allocator,
+        io,
+        git_path,
+        root,
+        base,
+        "a.zig",
+    );
+    defer allocator.free(diff_identity);
+    const expected = try domain.revisionKey(
+        allocator,
+        "a.zig",
+        "MODIFIED",
+        head_blob,
+        diff_identity,
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, bounded.files.items[0].revision_key);
+}
+
 test "revision hydration computes one merge base for a generation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2353,6 +2535,7 @@ test "revision hydration computes one merge base for a generation" {
         base,
         head,
     );
+    try expectOversizedDiffHydration(allocator, io, root, wrapper_path, base, head);
 }
 
 test "revision hydration deepens a shallow checkout before retrying merge base" {

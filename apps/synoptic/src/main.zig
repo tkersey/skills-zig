@@ -1275,6 +1275,9 @@ fn finishLifecycleRecord(
     defer allocator.free(current_path);
     removeCurrentIfLaunch(allocator, io, current_path, launch_id);
     if (terminal_error) |err| return err;
+    var root = try std.Io.Dir.openDirAbsolute(io, runtime_root, .{});
+    defer root.close(io);
+    try root.deleteTree(io, launch_id);
 }
 
 fn readCurrentForLaunch(
@@ -1425,10 +1428,13 @@ fn runtimeRootAlloc(
     environment: *const std.process.Environ.Map,
 ) ![]u8 {
     const configured = environment.get("TMPDIR") orelse "/tmp";
-    const root = if (configured.len > 0 and std.fs.path.isAbsolute(configured))
-        configured
-    else
-        "/tmp";
+    const normalized = std.mem.trimEnd(u8, configured, "/");
+    const shared = std.mem.eql(u8, normalized, "/tmp") or
+        std.mem.eql(u8, normalized, "/private/tmp");
+    if (configured.len == 0 or !std.fs.path.isAbsolute(configured) or shared) {
+        return std.fmt.allocPrint(allocator, "/tmp/synoptic-{d}", .{std.c.getuid()});
+    }
+    const root = configured;
     return std.fs.path.join(allocator, &.{ root, "synoptic" });
 }
 
@@ -2118,8 +2124,24 @@ test "runtime root falls back when TMPDIR is empty or relative" {
         try environment.put("TMPDIR", configured);
         const root = try runtimeRootAlloc(allocator, &environment);
         defer allocator.free(root);
-        try std.testing.expectEqualStrings("/tmp/synoptic", root);
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/synoptic-{d}",
+            .{std.c.getuid()},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, root);
     }
+    try environment.put("TMPDIR", "/private/tmp");
+    const shared = try runtimeRootAlloc(allocator, &environment);
+    defer allocator.free(shared);
+    const shared_expected = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/synoptic-{d}",
+        .{std.c.getuid()},
+    );
+    defer allocator.free(shared_expected);
+    try std.testing.expectEqualStrings(shared_expected, shared);
     try environment.put("TMPDIR", "/private/tmp/custom");
     const configured = try runtimeRootAlloc(allocator, &environment);
     defer allocator.free(configured);
@@ -2155,6 +2177,37 @@ test "terminal shutdown removes its lifecycle record before returning failure" {
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, current_path, .{}),
+    );
+}
+test "successful shutdown retires its complete launch directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(runtime);
+    try tmp.dir.createDirPath(io, "launch/codex-schema");
+    try tmp.dir.writeFile(io, .{ .sub_path = "launch/ready.json", .data = "{}" });
+    const current_path = try std.fs.path.join(allocator, &.{ runtime, "current.json" });
+    defer allocator.free(current_path);
+    try writeOperationalFile(
+        allocator,
+        io,
+        current_path,
+        "{\"runtimeSchema\":\"synoptic-runtime/v1\",\"launchId\":\"launch\"," ++
+            "\"runtimeRoot\":\"/tmp/runtime\",\"executable\":\"/bin/false\"," ++
+            "\"url\":\"http://127.0.0.1:1/\",\"pid\":1}",
+    );
+    try finishLifecycleRecord(allocator, io, runtime, "launch", null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, current_path, .{}),
+    );
+    const launch_path = try std.fs.path.join(allocator, &.{ runtime, "launch" });
+    defer allocator.free(launch_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, launch_path, .{}),
     );
 }
 test "dead launch recovery retires managed custody" {

@@ -704,13 +704,14 @@ pub const Registry = struct {
         }
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
-            session.status = .closed;
-            session.opening = false;
-            session.initial_turn_active = false;
+        for (self.sessions.items, 0..) |session, index| {
+            if (!std.mem.eql(u8, session.id, session_id)) continue;
             self.declineApprovalsLocked(session_id, .resolved, "session-closed");
+            self.removeVisibleEventsLocked(session_id);
+            var removed = self.sessions.orderedRemove(index);
+            removed.deinit(self.allocator);
             return;
-        };
+        }
         return error.UnknownSession;
     }
 
@@ -1358,11 +1359,22 @@ pub const Registry = struct {
     fn removeSession(self: *Registry, session_id: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.removeVisibleEventsLocked(session_id);
         for (self.sessions.items, 0..) |session, index| {
             if (!std.mem.eql(u8, session.id, session_id)) continue;
             var removed = self.sessions.orderedRemove(index);
             removed.deinit(self.allocator);
             return;
+        }
+    }
+
+    fn removeVisibleEventsLocked(self: *Registry, session_id: []const u8) void {
+        var index = self.visible_events.items.len;
+        while (index > 0) {
+            index -= 1;
+            const event_session = self.visible_events.items[index].session_id orelse continue;
+            if (!std.mem.eql(u8, event_session, session_id)) continue;
+            self.visible_events.orderedRemove(index).deinit(self.allocator);
         }
     }
 
@@ -2970,8 +2982,14 @@ test "session authority is immediately governing and close is local" {
         HumanAuthority.github_any,
         registry.sessions.items[0].human_authority.?,
     );
+    try registry.visible_events.append(std.testing.allocator, .{
+        .session_id = try std.testing.allocator.dupe(u8, "s"),
+        .method = try std.testing.allocator.dupe(u8, "status"),
+        .raw_json = try std.testing.allocator.dupe(u8, "{}"),
+    });
     try registry.closeSession("s");
-    try std.testing.expectEqual(SessionStatus.closed, registry.sessions.items[0].status);
+    try std.testing.expectEqual(@as(usize, 0), registry.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
 }
 
 test "explicit broad GitHub operation grants generic action authority without ordinary questions" {

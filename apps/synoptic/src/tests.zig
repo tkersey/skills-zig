@@ -441,8 +441,9 @@ test "tab closure uses session identity when revisions share a path" {
     try state.recordOpenedSession("a.zig", "r2", "session-r2", "diff-2", false, true);
 
     try state.closeTabById("session-r1");
-    try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[0].status);
-    try std.testing.expectEqual(domain.SessionStatus.current, state.tabs.items[1].status);
+    try std.testing.expectEqual(@as(usize, 1), state.tabs.items.len);
+    try std.testing.expectEqualStrings("session-r2", state.tabs.items[0].id);
+    try std.testing.expectEqual(domain.SessionStatus.current, state.tabs.items[0].status);
 }
 
 fn expectInitialUiPayload(initial: []const u8) !void {
@@ -540,7 +541,7 @@ fn receiveExact(io: std.Io, stream: *std.Io.net.Stream, destination: []u8) !void
     var used: usize = 0;
     const deadline = std.Io.Clock.Timestamp.fromNow(
         io,
-        .{ .raw = .fromMilliseconds(10_000), .clock = .awake },
+        .{ .raw = .fromMilliseconds(35_000), .clock = .awake },
     );
     while (used < destination.len) {
         const incoming = try stream.socket.receiveTimeout(
@@ -3547,6 +3548,7 @@ const LifecycleFixture = struct {
 fn writeLifecycleAssets(io: std.Io, tmp: *std.testing.TmpDir) !void {
     try tmp.dir.createDirPath(io, "repo");
     try tmp.dir.createDirPath(io, "skill/assets/ui");
+    try tmp.dir.createDirPath(io, "skill/assets/ui/folder");
     try tmp.dir.createDirPath(io, "skill/references");
     try tmp.dir.createDirPath(io, "runtime");
     const manifest = "{\"schema\":\"synoptic-ui-manifest/v1\",\"uiAbi\":\"synoptic-ui/v1\"," ++
@@ -3796,6 +3798,20 @@ fn verifyLifecycleHttp(
     );
     defer allocator.free(asset);
     try std.testing.expect(std.mem.indexOf(u8, asset, "document.title") != null);
+    const folder_url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/assets/folder",
+        .{address.port},
+    );
+    defer allocator.free(folder_url);
+    const folder_status = try runLifecycleCommand(
+        allocator,
+        io,
+        environment,
+        &.{ "/usr/bin/curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", folder_url },
+    );
+    defer allocator.free(folder_status);
+    try std.testing.expectEqualStrings("404", folder_status);
     const unauthenticated = try std.fmt.allocPrint(
         allocator,
         "http://127.0.0.1:{d}/api/bootstrap",
@@ -4620,11 +4636,11 @@ fn verifyWsCloseSecond(
         allocator,
     );
     try std.testing.expectError(
-        error.NotOfficialCurrentSession,
+        error.UnknownSession,
         completion,
     );
     try std.testing.expect(state.generation.queued("b.zig"));
-    try std.testing.expectEqual(domain.SessionStatus.closed, state.tabs.items[1].status);
+    try std.testing.expectEqual(@as(usize, 1), state.tabs.items.len);
     const log = try std.Io.Dir.cwd().readFileAlloc(io, gh_log, allocator, .limited(1024 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(

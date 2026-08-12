@@ -747,9 +747,13 @@ pub const App = struct {
         }
     }
     pub fn closeTabById(self: *App, session_id: []const u8) !void {
-        for (self.tabs.items) |*tab| {
+        for (self.tabs.items, 0..) |tab, index| {
             if (!std.mem.eql(u8, tab.id, session_id) or tab.status == .closed) continue;
-            tab.status = .closed;
+            const removed = self.tabs.orderedRemove(index);
+            self.allocator.free(removed.id);
+            self.allocator.free(removed.path);
+            self.allocator.free(removed.revision);
+            self.allocator.free(removed.diff);
             return;
         }
         return error.UnknownTab;
