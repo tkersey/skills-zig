@@ -1549,6 +1549,7 @@ const ActorState = struct {
     terminal: protocol.TerminalState = .running,
     transport_closed: bool = false,
     teardown_started: bool = false,
+    teardown_ready: bool = false,
     active_calls: usize = 0,
     outbound: std.ArrayList(ActorOutbound) = .empty,
     outbound_capacity: usize,
@@ -1568,6 +1569,7 @@ const ActorState = struct {
     writer_thread: ?std.Thread = null,
     handler_thread: ?std.Thread = null,
     notification_thread: ?std.Thread = null,
+    reaper_thread: ?std.Thread = null,
 
     fn deinit(self: *ActorState) void {
         for (self.outbound.items) |item| self.allocator.free(item.payload);
@@ -1645,6 +1647,12 @@ pub const Actor = struct {
             return err;
         };
         try startActorDispatchThreads(state);
+        state.reaper_thread = std.Thread.spawn(.{}, actorReaperMain, .{state}) catch |err| {
+            actorSetTerminal(state, .stopped);
+            actorCloseTransportOnce(state);
+            actorJoinAndDeinitState(state);
+            return err;
+        };
         return .{ .state = state };
     }
 
@@ -1668,14 +1676,13 @@ pub const Actor = struct {
         if (active_handler) |handler| handler.cancel(handler.context);
         // Closing the underlying transport releases a reader blocked in I/O.
         actorCloseTransportOnce(state);
-        if (actor_callback_state == state) {
-            const reaper = std.Thread.spawn(.{}, actorDestroyState, .{state}) catch {
-                return;
-            };
-            reaper.detach();
-            return;
-        }
-        actorDestroyState(state);
+        const callback_teardown = actor_callback_state == state;
+        const reaper = state.reaper_thread.?;
+        state.mutex.lock();
+        state.teardown_ready = true;
+        state.mutex.unlock();
+        if (callback_teardown) return;
+        reaper.join();
         self.* = undefined;
     }
 
@@ -1856,15 +1863,34 @@ fn actorWaitForCalls(state: *ActorState) void {
 }
 
 fn actorDestroyState(state: *ActorState) void {
+    const allocator = state.allocator;
+    actorJoinAndDeinitState(state);
+    allocator.destroy(state);
+}
+
+fn actorJoinAndDeinitState(state: *ActorState) void {
     if (state.writer_thread) |thread| thread.join();
     if (state.reader_thread) |thread| thread.join();
     if (state.handler_thread) |thread| thread.join();
     actorWaitForServerHandlers(state);
     if (state.notification_thread) |thread| thread.join();
     actorWaitForCalls(state);
-    const allocator = state.allocator;
     state.deinit();
-    allocator.destroy(state);
+}
+
+fn actorReaperMain(state: *ActorState) void {
+    while (true) { // tiger: event-loop -- bounded by owner teardown.
+        state.mutex.lock();
+        const ready = state.teardown_ready;
+        state.mutex.unlock();
+        if (ready) break;
+        std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch |ignored_error| {
+            switch (ignored_error) {
+                else => {},
+            }
+        };
+    }
+    actorDestroyState(state);
 }
 
 fn startActorDispatchThreads(state: *ActorState) !void {
