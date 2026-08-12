@@ -268,6 +268,19 @@ fn invalidateActionGeneration(runtime: *Runtime) void {
     runtime.worktree_generation_valid = false;
 }
 
+fn requireReviewWorktree(runtime: *Runtime) !void {
+    if (runtime.custody == .managed) return;
+    worktree.requireReviewAdmission(
+        runtime.broker.allocator,
+        runtime.broker.io,
+        runtime.custody,
+        runtime.baseline orelse return error.MissingWorktreeBaseline,
+    ) catch |err| {
+        runtime.worktree_generation_valid = false;
+        return err;
+    };
+}
+
 pub const max_header_bytes = 32 * 1024;
 pub const max_ws_message_bytes = 1024 * 1024;
 const default_header_timeout_ms: u32 = 5_000;
@@ -340,6 +353,67 @@ test "generation-changing actions close both stale command surfaces" {
     };
     invalidateActionGeneration(&runtime);
     try std.testing.expect(!state.action_state_fresh);
+    try std.testing.expect(!runtime.worktree_generation_valid);
+}
+
+test "action broker confirmation admission rejects reused worktree drift" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q", root },
+        &.{ "git", "-C", root, "add", "tracked" },
+        &.{
+            "git",
+            "-C",
+            root,
+            "-c",
+            "user.name=Synoptic",
+            "-c",
+            "user.email=synoptic@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        },
+    }, 0..) |argv, index| {
+        if (index == 1) try tmp.dir.writeFile(io, .{
+            .sub_path = "tracked",
+            .data = "base\n",
+        });
+        const result = try std.process.run(allocator, io, .{ .argv = argv });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(result.term == .exited and result.term.exited == 0);
+    }
+    var baseline = try worktree.Baseline.capture(allocator, io, root);
+    defer baseline.deinit();
+    var state = try App.init(allocator, "head");
+    defer state.deinit();
+    var registry = sessions.Registry{ .allocator = allocator };
+    defer registry.deinit();
+    var runtime = Runtime{
+        .app = &state,
+        .registry = &registry,
+        .broker = .{ .allocator = allocator, .io = io },
+        .owner = "o",
+        .name = "r",
+        .number = 1,
+        .pull_request_id = "PR_1",
+        .cwd = root,
+        .skill_path = "/skill",
+        .repository_cwd = root,
+        .fetch_source = null,
+        .custody = .{ .reused_current = root },
+        .baseline = &baseline,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "drift", .data = "unexpected\n" });
+    try std.testing.expectError(
+        error.ReusedCheckoutRefreshRequiresManagedMigration,
+        requireReviewWorktree(&runtime),
+    );
     try std.testing.expect(!runtime.worktree_generation_valid);
 }
 
@@ -1095,6 +1169,7 @@ pub const Server = struct {
         defer mutex.unlock();
         const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
         const card = (try runtime.app.action_store.pendingById(card_id)).*;
+        try requireReviewWorktree(runtime);
         runtime.broker.validateAction(
             runtime.owner,
             runtime.name,
@@ -1136,19 +1211,6 @@ pub const Server = struct {
         );
         try self.refreshActionEvidence(runtime, terminal);
         return self.actionStatusEnvelope(runtime, card_id, terminal);
-    }
-
-    fn requireReviewWorktree(runtime: *Runtime) !void {
-        if (runtime.custody == .managed) return;
-        worktree.requireReviewAdmission(
-            runtime.broker.allocator,
-            runtime.broker.io,
-            runtime.custody,
-            runtime.baseline orelse return error.MissingWorktreeBaseline,
-        ) catch |err| {
-            runtime.worktree_generation_valid = false;
-            return err;
-        };
     }
 
     fn commentAnchorValid(
