@@ -2583,6 +2583,49 @@ test "config can force managed worktree without weakening cleanliness" {
     try std.testing.expect(managed == .managed);
 }
 
+test "worktree integrity admission never adopts drift after reused selection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/a.zig", .data = "clean\n" });
+    const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
+    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    const custody = try worktree.select(
+        allocator,
+        io,
+        repo,
+        "feature",
+        head,
+        managed,
+        true,
+        null,
+    );
+    defer allocator.free(custody.path());
+    try std.testing.expect(custody == .reused_current);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/a.zig", .data = "drift\n" });
+    try std.testing.expectError(
+        error.WorktreeAdmissionChanged,
+        worktree.captureAdmitted(allocator, io, custody, "feature", head),
+    );
+}
+
 const CommitPair = struct {
     allocator: std.mem.Allocator,
     base: []u8,

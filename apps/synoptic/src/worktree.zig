@@ -269,6 +269,17 @@ pub const Baseline = struct {
     }
 };
 
+pub const Selection = struct {
+    allocator: std.mem.Allocator,
+    custody: Custody,
+    baseline: Baseline,
+
+    pub fn deinit(self: *Selection) void {
+        self.baseline.deinit();
+        self.allocator.free(self.custody.path());
+    }
+};
+
 fn appendArtifactClone(
     allocator: std.mem.Allocator,
     artifacts: *std.ArrayList([]u8),
@@ -435,6 +446,78 @@ pub fn select(
     defer allocator.free(add.stderr);
     if (add.term != .exited or add.term.exited != 0) return error.ManagedWorktreeCreationFailed;
     return .{ .managed = try allocator.dupe(u8, managed_path) };
+}
+
+pub fn selectWithBaseline(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    head_ref: []const u8,
+    head_oid: []const u8,
+    managed_path: []const u8,
+    prefer_current_pr_checkout: bool,
+    fetch_source: ?FetchSource,
+) !Selection {
+    var custody = try select(
+        allocator,
+        io,
+        cwd,
+        head_ref,
+        head_oid,
+        managed_path,
+        prefer_current_pr_checkout,
+        fetch_source,
+    );
+    var custody_path_owned = true;
+    errdefer if (custody_path_owned) allocator.free(custody.path());
+    var baseline = captureAdmitted(allocator, io, custody, head_ref, head_oid) catch |err| {
+        if (custody != .reused_current) return err;
+        allocator.free(custody.path());
+        custody_path_owned = false;
+        custody = try select(
+            allocator,
+            io,
+            cwd,
+            head_ref,
+            head_oid,
+            managed_path,
+            false,
+            fetch_source,
+        );
+        custody_path_owned = true;
+        return .{
+            .allocator = allocator,
+            .custody = custody,
+            .baseline = try captureAdmitted(allocator, io, custody, head_ref, head_oid),
+        };
+    };
+    errdefer baseline.deinit();
+    return .{ .allocator = allocator, .custody = custody, .baseline = baseline };
+}
+
+pub fn captureAdmitted(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    head_ref: []const u8,
+    head_oid: []const u8,
+) !Baseline {
+    var baseline = try Baseline.capture(allocator, io, custody.path());
+    errdefer baseline.deinit();
+    const branch_matches = switch (custody) {
+        .reused_current => baseline.branch != null and
+            std.mem.eql(u8, baseline.branch.?, head_ref),
+        .managed => baseline.branch == null,
+    };
+    if (!branch_matches or !std.mem.eql(u8, baseline.head_oid, head_oid) or
+        baseline.porcelain_v2.len != 0 or baseline.artifacts.items.len != 0)
+    {
+        return error.WorktreeAdmissionChanged;
+    }
+    requireReusedUnchanged(allocator, io, custody.path(), &baseline) catch {
+        return error.WorktreeAdmissionChanged;
+    };
+    return baseline;
 }
 
 pub fn cleanupAllowed(custody: Custody) bool {

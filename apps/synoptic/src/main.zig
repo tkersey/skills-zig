@@ -647,7 +647,7 @@ fn serveGeneration(
         &.{ context.runtime_root, context.launch_id, "worktree" },
     );
     defer allocator.free(managed_path);
-    var custody = try worktree.select(
+    var selection = try worktree.selectWithBaseline(
         allocator,
         io,
         context.options.cwd,
@@ -657,7 +657,7 @@ fn serveGeneration(
         context.settings.worktree_prefer_current_pr_checkout,
         context.fetch_source,
     );
-    defer allocator.free(custody.path());
+    defer selection.deinit();
     var custody_retirement: CustodyRetirement = .pending;
     try serveSelectedGeneration(
         allocator,
@@ -665,7 +665,8 @@ fn serveGeneration(
         context,
         generation,
         generation_owned,
-        custody,
+        selection.custody,
+        &selection.baseline,
         &custody_retirement,
     );
 }
@@ -679,6 +680,7 @@ fn serveSelectedGeneration(
     generation: *domain.PrGeneration,
     generation_owned: *bool,
     custody: worktree.Custody,
+    worktree_baseline: *worktree.Baseline,
     custody_retirement: *CustodyRetirement,
 ) !void {
     const review_cwd = custody.path();
@@ -689,8 +691,6 @@ fn serveSelectedGeneration(
         context.fetch_source,
         generation,
     );
-    var worktree_baseline = try worktree.Baseline.capture(allocator, io, review_cwd);
-    defer worktree_baseline.deinit();
     var state = try configureAppState(
         allocator,
         context.settings,
@@ -731,7 +731,7 @@ fn serveSelectedGeneration(
         context,
         context.snapshot.pull_request_id,
         custody,
-        &worktree_baseline,
+        worktree_baseline,
         &state,
         &registry,
         review_cwd,
