@@ -6,6 +6,8 @@ const config = @import("config.zig");
 const domain = @import("domain.zig");
 
 pub const max_visible_events: usize = 1024;
+pub const max_visible_event_bytes: usize = 16 * 1024 * 1024;
+const max_authoritative_receipt_bytes: usize = 64 * 1024;
 const synoptic_server_request_timeout_ms: u32 = 5 * 60 * 1000;
 pub const safe_boundary_timeout_ms: u32 = 5_000;
 pub const approval_timeout_ms: u32 = 25_000;
@@ -182,6 +184,11 @@ pub const VisibleEvent = struct {
         allocator.free(self.method);
         allocator.free(self.raw_json);
     }
+
+    fn byteSize(self: VisibleEvent) usize {
+        return (if (self.session_id) |value| value.len else 0) +
+            self.method.len + self.raw_json.len;
+    }
 };
 const RegistryMutex = struct {
     state: std.atomic.Mutex = .unlocked,
@@ -196,6 +203,7 @@ const TurnRef = struct { thread: []u8, turn: []u8 };
 const ReservedAuthoritative = struct {
     session_id: []u8,
     visible_event: VisibleEvent,
+    reserved_bytes: usize,
     handler: AuthoritativeToolHandler,
 };
 
@@ -279,6 +287,8 @@ pub const Registry = struct {
     io: ?std.Io = null,
     authoritative_tool_handler: ?AuthoritativeToolHandler = null,
     authoritative_reservations: usize = 0,
+    authoritative_reserved_bytes: usize = 0,
+    visible_event_bytes: usize = 0,
     visible_overflow_count: u64 = 0,
     visible_overflow_session_id: ?[]u8 = null,
 
@@ -807,7 +817,9 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.visible_events.items.len == 0) return error.NoVisibleEvent;
-        self.visible_events.orderedRemove(0).deinit(self.allocator);
+        const event = self.visible_events.orderedRemove(0);
+        self.visible_event_bytes -|= event.byteSize();
+        event.deinit(self.allocator);
         self.queueOverflowWarningLocked();
     }
 
@@ -1410,7 +1422,9 @@ pub const Registry = struct {
             index -= 1;
             const event_session = self.visible_events.items[index].session_id orelse continue;
             if (!std.mem.eql(u8, event_session, session_id)) continue;
-            self.visible_events.orderedRemove(index).deinit(self.allocator);
+            const event = self.visible_events.orderedRemove(index);
+            self.visible_event_bytes -|= event.byteSize();
+            event.deinit(self.allocator);
         }
     }
 
@@ -1623,9 +1637,8 @@ pub const Registry = struct {
         const maybe_session = self.sessionForNotificationLocked(notification.raw_json) catch
             return true;
         const session_id = maybe_session orelse return true;
-        if (self.visible_events.items.len + self.authoritative_reservations >=
-            max_visible_events)
-        {
+        const event_bytes = session_id.len + notification.method.len + notification.raw_json.len;
+        if (!self.visibleCapacityAvailableLocked(1, event_bytes)) {
             self.recordVisibleOverflowLocked(session_id);
             self.allocator.free(session_id);
             return false;
@@ -1653,6 +1666,7 @@ pub const Registry = struct {
             .method = method,
             .raw_json = raw_json,
         });
+        self.visible_event_bytes += event_bytes;
         return false;
     }
 
@@ -1664,8 +1678,6 @@ pub const Registry = struct {
 
     fn queueOverflowWarningLocked(self: *Registry) void {
         const session_id = self.visible_overflow_session_id orelse return;
-        if (self.visible_events.items.len + self.authoritative_reservations >=
-            max_visible_events) return;
         const raw = std.fmt.allocPrint(
             self.allocator,
             "{{\"reason\":\"VisibleEventOverflow\",\"dropped\":{d}}}",
@@ -1675,6 +1687,12 @@ pub const Registry = struct {
             self.allocator.free(raw);
             return;
         };
+        const event_bytes = session_id.len + method.len + raw.len;
+        if (!self.visibleCapacityAvailableLocked(1, event_bytes)) {
+            self.allocator.free(method);
+            self.allocator.free(raw);
+            return;
+        }
         self.visible_events.append(self.allocator, .{
             .session_id = session_id,
             .method = method,
@@ -1684,6 +1702,7 @@ pub const Registry = struct {
             self.allocator.free(raw);
             return;
         };
+        self.visible_event_bytes += event_bytes;
         self.visible_overflow_session_id = null;
         self.visible_overflow_count = 0;
     }
@@ -1954,6 +1973,7 @@ pub const Registry = struct {
         return self.executeAuthoritative(
             admission.handler,
             admission.visible_event,
+            admission.reserved_bytes,
             event_kind,
             raw_json,
             admission.session_id,
@@ -1981,19 +2001,31 @@ pub const Registry = struct {
                 self.validatePreparedAction(allocator, raw_json) catch
                     return error.UnsupportedAction;
             }
-            if (self.visible_events.items.len + self.authoritative_reservations >=
-                max_visible_events) return error.EvidenceUnavailable;
             const handler = self.authoritative_tool_handler orelse
                 return error.EvidenceUnavailable;
             const event = try self.makeVisibleEvent(session.id, event_kind, raw_json);
             errdefer event.deinit(self.allocator);
+            const event_prefix_bytes = event.byteSize() - event.raw_json.len;
+            const reserved_bytes = @max(
+                event.byteSize(),
+                event_prefix_bytes + max_authoritative_receipt_bytes,
+            );
+            if (!self.visibleCapacityAvailableLocked(1, reserved_bytes)) {
+                return error.EvidenceUnavailable;
+            }
             try self.visible_events.ensureTotalCapacity(
                 self.allocator,
                 self.visible_events.items.len + self.authoritative_reservations + 1,
             );
             const session_id = try self.allocator.dupe(u8, session.id);
             self.authoritative_reservations += 1;
-            return .{ .session_id = session_id, .visible_event = event, .handler = handler };
+            self.authoritative_reserved_bytes += reserved_bytes;
+            return .{
+                .session_id = session_id,
+                .visible_event = event,
+                .reserved_bytes = reserved_bytes,
+                .handler = handler,
+            };
         }
         return null;
     }
@@ -2013,6 +2045,7 @@ pub const Registry = struct {
         self: *Registry,
         handler: AuthoritativeToolHandler,
         visible_event: VisibleEvent,
+        reserved_bytes: usize,
         event_kind: []const u8,
         raw_json: []const u8,
         session_id: []const u8,
@@ -2028,16 +2061,23 @@ pub const Registry = struct {
             session_id,
             self.allocator,
         ) catch |err| {
-            self.releaseAuthoritativeReservation();
+            self.releaseAuthoritativeReservation(reserved_bytes);
             return authoritativeFailureAlloc(allocator, err);
         };
+        if (receipt_json.len > max_authoritative_receipt_bytes) {
+            self.allocator.free(receipt_json);
+            self.releaseAuthoritativeReservation(reserved_bytes);
+            return authoritativeFailureAlloc(allocator, error.EvidenceUnavailable);
+        }
         self.allocator.free(event.raw_json);
         event.raw_json = receipt_json;
         self.mutex.lock();
         defer self.mutex.unlock();
         self.visible_events.appendAssumeCapacity(event);
+        self.visible_event_bytes += event.byteSize();
         event_transferred = true;
         self.authoritative_reservations -= 1;
+        self.authoritative_reserved_bytes -= reserved_bytes;
         if (std.mem.eql(u8, event_kind, "session.close.requested")) {
             return allocator.dupe(u8, accepted_domain_response);
         }
@@ -2052,9 +2092,10 @@ pub const Registry = struct {
         return allocator.dupe(u8, missing_origin_response);
     }
 
-    fn releaseAuthoritativeReservation(self: *Registry) void {
+    fn releaseAuthoritativeReservation(self: *Registry, reserved_bytes: usize) void {
         self.mutex.lock();
         self.authoritative_reservations -= 1;
+        self.authoritative_reserved_bytes -= reserved_bytes;
         self.mutex.unlock();
     }
 
@@ -2145,6 +2186,7 @@ pub const Registry = struct {
         };
         self.approvals.append(self.allocator, approval) catch |err| {
             const event = self.visible_events.pop().?;
+            self.visible_event_bytes -|= event.byteSize();
             event.deinit(self.allocator);
             self.mutex.unlock();
             return err;
@@ -2488,17 +2530,28 @@ pub const Registry = struct {
         method: []const u8,
         raw_json: []const u8,
     ) !void {
-        if (self.visible_events.items.len + self.authoritative_reservations >=
-            max_visible_events)
-        {
+        const event = try self.makeVisibleEvent(session_id, method, raw_json);
+        errdefer event.deinit(self.allocator);
+        if (!self.visibleCapacityAvailableLocked(1, event.byteSize())) {
             return error.VisibleEventLimitExceeded;
         }
         try self.visible_events.ensureTotalCapacity(
             self.allocator,
             self.visible_events.items.len + self.authoritative_reservations + 1,
         );
-        const event = try self.makeVisibleEvent(session_id, method, raw_json);
         self.visible_events.appendAssumeCapacity(event);
+        self.visible_event_bytes += event.byteSize();
+    }
+
+    fn visibleCapacityAvailableLocked(
+        self: *const Registry,
+        additional_events: usize,
+        additional_bytes: usize,
+    ) bool {
+        if (additional_events > max_visible_events -|
+            self.visible_events.items.len -| self.authoritative_reservations) return false;
+        return additional_bytes <= max_visible_event_bytes -|
+            self.visible_event_bytes -| self.authoritative_reserved_bytes;
     }
 
     fn makeVisibleEvent(
@@ -3074,11 +3127,11 @@ test "session authority is immediately governing and close is local" {
         HumanAuthority.github_any,
         registry.sessions.items[0].human_authority.?,
     );
-    try registry.visible_events.append(std.testing.allocator, .{
-        .session_id = try std.testing.allocator.dupe(u8, "s"),
-        .method = try std.testing.allocator.dupe(u8, "status"),
-        .raw_json = try std.testing.allocator.dupe(u8, "{}"),
-    });
+    {
+        registry.mutex.lock();
+        defer registry.mutex.unlock();
+        try registry.appendVisibleLocked("s", "status", "{}");
+    }
     try registry.closeSession("s");
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
@@ -3161,6 +3214,22 @@ test "visible notification overflow becomes an explicit warning after capacity d
     const warning = registry.visible_events.items[max_visible_events - 1];
     try std.testing.expectEqualStrings("warning", warning.method);
     try std.testing.expect(std.mem.indexOf(u8, warning.raw_json, "VisibleEventOverflow") != null);
+}
+
+test "visible event admission accounts aggregate owned bytes" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    const payload = try std.testing.allocator.alloc(u8, max_visible_event_bytes / 2);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    try registry.queueSystemEvent("status", payload);
+    try std.testing.expectEqual(payload.len + "status".len, registry.visible_event_bytes);
+    try std.testing.expectError(
+        error.VisibleEventLimitExceeded,
+        registry.queueSystemEvent("status", payload),
+    );
+    try registry.acknowledgeVisible();
+    try std.testing.expectEqual(@as(usize, 0), registry.visible_event_bytes);
 }
 
 test "failed primary delivery survives a failed write and reconnect until acknowledged" {
