@@ -3091,6 +3091,45 @@ test "file session receives every later revision and active close interrupts its
     try std.testing.expect(std.mem.indexOf(u8, log, "thread/delete") != null);
 }
 
+test "file session interrupt revokes governing action authority before RPC" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const opened = try registry.openFile(
+        io,
+        root,
+        "interrupt.zig",
+        "r1",
+        "base",
+        "head",
+        "canonical interrupt diff",
+        "[]",
+        paths.skill,
+        false,
+    );
+    defer opened.deinit();
+    allocator.free(registry.sessions.items[0].turn_id);
+    registry.sessions.items[0].turn_id = try allocator.dupe(u8, "fail-interrupt");
+    registry.sessions.items[0].turn_active = true;
+    registry.sessions.items[0].human_authority = .github_any;
+    try std.testing.expectError(error.RequestFailed, registry.interrupt(opened.session_id));
+    try std.testing.expect(registry.sessions.items[0].human_authority == null);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{paths.codex});
+    defer allocator.free(log_path);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
+}
+
 test "file session fork custody deletes every failed initial turn" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -1566,13 +1566,14 @@ pub const Registry = struct {
     }
 
     pub fn interrupt(self: *Registry, session_id: []const u8) !void {
-        const actor = &(self.actor orelse return error.AppServerUnavailable);
         const ids = ids: {
             self.mutex.lock();
             defer self.mutex.unlock();
-            for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, session_id) and
+            for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id) and
                 session.status != .closed)
             {
+                session.human_authority = null;
+                self.declineApprovalsLocked(session_id, .resolved, "turn-interrupted");
                 const thread_id = try self.allocator.dupe(u8, session.thread_id);
                 errdefer self.allocator.free(thread_id);
                 const turn_id = try self.allocator.dupe(u8, session.turn_id);
@@ -1582,6 +1583,7 @@ pub const Registry = struct {
         };
         defer self.allocator.free(ids.thread);
         defer self.allocator.free(ids.turn);
+        const actor = &(self.actor orelse return error.AppServerUnavailable);
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"threadId\":{f},\"turnId\":{f}}}",
