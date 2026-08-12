@@ -295,7 +295,7 @@ fn streamReplaySupported(
     for (rows, 0..) |row, index| {
         const resolved = resolveEffect(cache, slot, row) catch return false;
         if (row.kind == .existing_store_binding) {
-            if (index != 0 or resolved.effect.kind != .bind_existing) {
+            if (index != 0 or !resolved.effect.kind.isBinding()) {
                 return false;
             }
             continue;
@@ -303,7 +303,7 @@ fn streamReplaySupported(
         switch (resolved.effect.kind) {
             .compare_append => {},
             .create_new => if (index != 0) return false,
-            .compare_replace, .bind_existing => return false,
+            .compare_replace, .bind_existing, .rebind_existing => return false,
         }
     }
     return true;
@@ -530,7 +530,7 @@ const StreamEventValidator = struct {
                 self.row_hash.update(record.payload);
                 self.row_hash.update("\n");
             },
-            .bind_existing => if (row.kind != .existing_store_binding or
+            .bind_existing, .rebind_existing => if (row.kind != .existing_store_binding or
                 self.row_index != 0 or start != 0)
             {
                 return error.HistoricalEffectKindMismatch;
@@ -550,7 +550,7 @@ const StreamEventValidator = struct {
         {
             return error.StoreBindingExtentMismatch;
         }
-        if (resolved.effect.kind == .bind_existing) {
+        if (resolved.effect.kind.isBinding()) {
             self.advanceRow();
             return;
         }
@@ -842,7 +842,7 @@ fn validateDocumentEpoch(
     const resolved = try resolveEffect(cache, current_slot, row);
     switch (row.kind) {
         .existing_store_binding => {
-            if (resolved.effect.kind != .bind_existing) {
+            if (!resolved.effect.kind.isBinding()) {
                 return error.HistoricalEffectKindMismatch;
             }
         },
@@ -1011,7 +1011,7 @@ fn validateExistingEvents(
     protocol_state: *?protocol.ReplayState,
     observer: anytype,
 ) !void {
-    if (index != 0 or resolved.effect.kind != .bind_existing) {
+    if (index != 0 or !resolved.effect.kind.isBinding()) {
         return error.HistoricalEffectKindMismatch;
     }
     for (records) |record| {
@@ -1076,7 +1076,7 @@ fn validateAdmittedEvents(
                 return error.ProtocolHistoryMustBeAppendOnly;
             }
         },
-        .bind_existing => return error.HistoricalEffectKindMismatch,
+        .bind_existing, .rebind_existing => return error.HistoricalEffectKindMismatch,
     }
 }
 

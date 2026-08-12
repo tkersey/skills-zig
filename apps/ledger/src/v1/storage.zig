@@ -66,6 +66,11 @@ pub const EffectKind = enum {
     compare_append,
     compare_replace,
     bind_existing,
+    rebind_existing,
+
+    pub fn isBinding(self: EffectKind) bool {
+        return self == .bind_existing or self == .rebind_existing;
+    }
 
     fn fromOperator(operator: definition.Operator) !EffectKind {
         return switch (operator) {
@@ -73,6 +78,7 @@ pub const EffectKind = enum {
             .compare_append => .compare_append,
             .compare_replace => .compare_replace,
             .bind_existing => .bind_existing,
+            .rebind_existing => .rebind_existing,
             else => error.UnsupportedStorageEffect,
         };
     }
@@ -930,6 +936,7 @@ fn validateCacheEffect(
         .compare_append => .compare_append,
         .compare_replace => .compare_replace,
         .bind_existing => .bind_existing,
+        .rebind_existing => .rebind_existing,
     };
     if (!definition_plan.requires(required_operator)) {
         return error.CacheStoragePlanMismatch;
@@ -960,7 +967,7 @@ fn validateCacheEffectCodec(
     input: definition.Input,
 ) !void {
     const event_log_append = effect.kind == .compare_append or
-        (effect.kind == .bind_existing and slot.kind == .event_log);
+        (effect.kind.isBinding() and slot.kind == .event_log);
     if (event_log_append and input.codec != .json) {
         return error.CacheStoragePlanMismatch;
     }
@@ -1022,9 +1029,7 @@ fn validateCacheEvent(
     event: *const EventMaterialization,
     definition_plan: *const definition.Plan,
 ) !void {
-    if (effect.kind != .compare_append and
-        effect.kind != .bind_existing)
-    {
+    if (effect.kind != .compare_append and !effect.kind.isBinding()) {
         return error.CacheStoragePlanMismatch;
     }
     try validateCachedEventMaterialization(event);
@@ -1334,15 +1339,13 @@ fn validateDecodedEffect(
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
-    if (kind == .bind_existing and
+    if (kind.isBinding() and
         (expected_revision_parameter != null or
             idempotency_parameter != null))
     {
         return error.BindingEffectHasAdmissionParameter;
     }
-    if (event != null and kind != .compare_append and
-        kind != .bind_existing)
-    {
+    if (event != null and kind != .compare_append and !kind.isBinding()) {
         return error.EventMaterializationRequiresAppend;
     }
     if (idempotency_parameter != null and
@@ -2149,7 +2152,7 @@ fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
     if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
     var binding_effects: usize = 0;
     for (effects, 0..) |left, index| {
-        if (left.kind == .bind_existing) binding_effects += 1;
+        if (left.kind.isBinding()) binding_effects += 1;
         for (effects[index + 1 ..]) |right| {
             if (left.slot_index == right.slot_index) {
                 return error.DuplicateOperationSlot;
@@ -2563,12 +2566,12 @@ fn compileEffectTarget(
     }
     const input_codec = definition_plan.inputs[input_index].codec;
     const event_log_append = kind == .compare_append or
-        (kind == .bind_existing and slots[slot_index].kind == .event_log);
+        (kind.isBinding() and slots[slot_index].kind == .event_log);
     if (event_log_append and input_codec != .json) {
         return error.AppendInputMustBeJson;
     }
     if (kind != .compare_append and object.get("document") == null and
-        !(kind == .bind_existing and slots[slot_index].kind == .event_log) and
+        !(kind.isBinding() and slots[slot_index].kind == .event_log) and
         input_codec != slots[slot_index].codec)
     {
         return error.StorageInputCodecMismatch;
@@ -2654,15 +2657,13 @@ fn validateCompiledEffectSources(
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
-    if (kind == .bind_existing and
+    if (kind.isBinding() and
         (expected_revision_parameter != null or
             idempotency_parameter != null))
     {
         return error.BindingEffectHasAdmissionParameter;
     }
-    if (event != null and kind != .compare_append and
-        kind != .bind_existing)
-    {
+    if (event != null and kind != .compare_append and !kind.isBinding()) {
         return error.EventMaterializationRequiresAppend;
     }
     if (idempotency_parameter != null and
