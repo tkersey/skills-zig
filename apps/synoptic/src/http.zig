@@ -140,7 +140,9 @@ pub const ToolDomainContext = struct {
         defer input.deinit(self.allocator);
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
-        try tools.validateAgainstSession(input, identity.path);
+        const current_path = self.app.generation.currentPath(identity.path) orelse
+            return error.ActionTargetsAnotherSession;
+        try tools.validateAgainstSession(input, current_path);
         const repository = try std.fmt.allocPrint(
             self.allocator,
             "{s}/{s}",
@@ -1256,6 +1258,13 @@ pub const Server = struct {
         errdefer if (next_owned) next.deinit();
         runtime.worktree_generation_valid = false;
         try self.refreshWorktree(runtime, &next);
+        try github.rebindGenerationLineage(
+            self.allocator,
+            self.io,
+            runtime.cwd,
+            &runtime.app.generation,
+            &next,
+        );
         try self.refreshTabDiffs(runtime, &next);
         try self.markChangedSessions(runtime, &next);
         const repository = try std.fmt.allocPrint(
@@ -1669,8 +1678,9 @@ fn copyRevisionEvidence(
         const canonical_diff = current.canonicalDiff(file.path) orelse
             return error.MissingCanonicalDiff;
         try generation.setCanonicalDiff(file.path, canonical_diff);
-        for (current.files.items) |current_file| {
+        for (current.files.items) |*current_file| {
             if (!std.mem.eql(u8, current_file.path, file.path)) continue;
+            try generation.inheritLineage(file.path, current_file);
             if (current_file.exclusion_reason) |reason| {
                 try generation.setExclusion(
                     file.path,

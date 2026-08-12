@@ -197,6 +197,7 @@ pub const Tab = struct {
 pub const File = struct {
     path: []const u8,
     previous_path: ?[]const u8 = null,
+    lineage_aliases: std.ArrayList([]u8) = .empty,
     additions: u32 = 0,
     deletions: u32 = 0,
     change_type: []const u8 = "MODIFIED",
@@ -234,6 +235,7 @@ pub const PrGeneration = struct {
         for (self.files.items) |file| {
             self.allocator.free(file.path);
             if (file.previous_path) |value| self.allocator.free(value);
+            freeLineageAliases(self.allocator, file.lineage_aliases);
             self.allocator.free(file.revision_key);
             self.allocator.free(file.canonical_diff);
             self.allocator.free(file.change_type);
@@ -257,6 +259,16 @@ pub const PrGeneration = struct {
         else
             null;
         errdefer if (previous_path) |value| self.allocator.free(value);
+        var lineage_aliases: std.ArrayList([]u8) = .empty;
+        errdefer freeLineageAliases(self.allocator, lineage_aliases);
+        for (file.lineage_aliases.items) |alias| {
+            try appendLineageAlias(self.allocator, &lineage_aliases, alias);
+        }
+        if (std.mem.eql(u8, file.change_type, "RENAMED")) {
+            if (file.previous_path) |value| {
+                try appendLineageAlias(self.allocator, &lineage_aliases, value);
+            }
+        }
         const change_type = try self.allocator.dupe(u8, file.change_type);
         errdefer self.allocator.free(change_type);
         const revision_key = try self.allocator.dupe(u8, file.revision_key);
@@ -276,6 +288,7 @@ pub const PrGeneration = struct {
         try self.files.append(self.allocator, .{
             .path = path,
             .previous_path = previous_path,
+            .lineage_aliases = lineage_aliases,
             .additions = file.additions,
             .deletions = file.deletions,
             .change_type = change_type,
@@ -600,6 +613,12 @@ pub const PrGeneration = struct {
     ) !void {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
             const next = if (previous_path) |value| try self.allocator.dupe(u8, value) else null;
+            errdefer if (next) |value| self.allocator.free(value);
+            if (std.mem.eql(u8, file.change_type, "RENAMED")) {
+                if (previous_path) |value| {
+                    try appendLineageAlias(self.allocator, &file.lineage_aliases, value);
+                }
+            }
             if (file.previous_path) |value| self.allocator.free(value);
             file.previous_path = next;
             return;
@@ -619,11 +638,33 @@ pub const PrGeneration = struct {
             return file.path;
         };
         for (self.files.items) |file| {
-            if (!std.mem.eql(u8, file.change_type, "RENAMED")) continue;
-            const previous = file.previous_path orelse continue;
-            if (std.mem.eql(u8, previous, review_path)) return file.path;
+            for (file.lineage_aliases.items) |alias| {
+                if (std.mem.eql(u8, alias, review_path)) return file.path;
+            }
         }
         return null;
+    }
+
+    pub fn inheritLineage(
+        self: *PrGeneration,
+        current_path: []const u8,
+        previous_file: *const File,
+    ) !void {
+        for (self.files.items) |*file| if (std.mem.eql(u8, file.path, current_path)) {
+            var merged: std.ArrayList([]u8) = .empty;
+            errdefer freeLineageAliases(self.allocator, merged);
+            for (file.lineage_aliases.items) |alias| {
+                try appendLineageAlias(self.allocator, &merged, alias);
+            }
+            try appendLineageAlias(self.allocator, &merged, previous_file.path);
+            for (previous_file.lineage_aliases.items) |alias| {
+                try appendLineageAlias(self.allocator, &merged, alias);
+            }
+            freeLineageAliases(self.allocator, file.lineage_aliases);
+            file.lineage_aliases = merged;
+            return;
+        };
+        return error.UnknownFile;
     }
 
     pub fn sameReviewFile(
@@ -632,16 +673,9 @@ pub const PrGeneration = struct {
         right: []const u8,
     ) bool {
         if (std.mem.eql(u8, left, right)) return true;
-        for (self.files.items) |file| {
-            if (!std.mem.eql(u8, file.change_type, "RENAMED")) continue;
-            const previous = file.previous_path orelse continue;
-            const direct = std.mem.eql(u8, file.path, left) and
-                std.mem.eql(u8, previous, right);
-            const reverse = std.mem.eql(u8, file.path, right) and
-                std.mem.eql(u8, previous, left);
-            if (direct or reverse) return true;
-        }
-        return false;
+        const current_left = self.currentPath(left) orelse return false;
+        const current_right = self.currentPath(right) orelse return false;
+        return std.mem.eql(u8, current_left, current_right);
     }
 
     pub fn setExclusion(
@@ -745,6 +779,28 @@ fn freeThread(allocator: std.mem.Allocator, thread: ReviewThread) void {
     allocator.free(thread.subject_type);
     for (thread.comments) |comment| freeComment(allocator, comment);
     allocator.free(thread.comments);
+}
+
+fn appendLineageAlias(
+    allocator: std.mem.Allocator,
+    aliases: *std.ArrayList([]u8),
+    candidate: []const u8,
+) !void {
+    for (aliases.items) |alias| {
+        if (std.mem.eql(u8, alias, candidate)) return;
+    }
+    const owned = try allocator.dupe(u8, candidate);
+    errdefer allocator.free(owned);
+    try aliases.append(allocator, owned);
+}
+
+fn freeLineageAliases(
+    allocator: std.mem.Allocator,
+    aliases: std.ArrayList([]u8),
+) void {
+    for (aliases.items) |alias| allocator.free(alias);
+    var owned = aliases;
+    owned.deinit(allocator);
 }
 
 pub fn revisionKey(

@@ -1856,6 +1856,43 @@ pub fn hydrateRevisionKeys(
     );
 }
 
+pub fn rebindGenerationLineage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    previous: *const domain.PrGeneration,
+    next: *domain.PrGeneration,
+) !void {
+    var transitions = RenameEntries{ .allocator = allocator };
+    defer transitions.deinit();
+    if (!std.mem.eql(u8, previous.head_oid, next.head_oid)) {
+        transitions = try canonicalRenameEntries(
+            allocator,
+            io,
+            "git",
+            cwd,
+            previous.head_oid,
+            next.head_oid,
+        );
+    }
+    for (previous.files.items) |*previous_file| {
+        const direct = directGenerationPath(next, previous_file.path);
+        const current_path = direct orelse transitions.renamedPath(previous_file.path) orelse
+            continue;
+        try next.inheritLineage(current_path, previous_file);
+    }
+}
+
+fn directGenerationPath(
+    generation: *const domain.PrGeneration,
+    path: []const u8,
+) ?[]const u8 {
+    for (generation.files.items) |file| {
+        if (std.mem.eql(u8, file.path, path)) return file.path;
+    }
+    return null;
+}
+
 fn hydrateRevisionKeysWithGitPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2122,6 +2159,7 @@ fn mergeBaseWithShallowRetryAlloc(
 const RenameEntry = struct {
     previous_path: []u8,
     path: []u8,
+    is_copy: bool,
 };
 
 const RenameEntries = struct {
@@ -2139,6 +2177,14 @@ const RenameEntries = struct {
     fn previousPath(self: *const RenameEntries, path: []const u8) ?[]const u8 {
         for (self.items.items) |entry| {
             if (std.mem.eql(u8, entry.path, path)) return entry.previous_path;
+        }
+        return null;
+    }
+
+    fn renamedPath(self: *const RenameEntries, previous_path: []const u8) ?[]const u8 {
+        for (self.items.items) |entry| {
+            if (entry.is_copy) continue;
+            if (std.mem.eql(u8, entry.previous_path, previous_path)) return entry.path;
         }
         return null;
     }
@@ -2192,6 +2238,7 @@ fn canonicalRenameEntries(
         try entries.items.append(allocator, .{
             .previous_path = previous_path,
             .path = path,
+            .is_copy = status[0] == 'C',
         });
     }
     return entries;

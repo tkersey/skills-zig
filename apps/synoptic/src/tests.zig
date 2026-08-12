@@ -334,6 +334,89 @@ test "renamed file identity preserves old-path thread evidence" {
     try std.testing.expect(generation.sameReviewFile("old.zig", "new.zig"));
 }
 
+test "file lineage composes across more than one ephemeral generation" {
+    const allocator = std.testing.allocator;
+    var previous = try domain.PrGeneration.initFull(allocator, "base", "head-1");
+    defer previous.deinit();
+    try previous.addFile(.{
+        .path = "middle.zig",
+        .previous_path = "original.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    var current = try domain.PrGeneration.initFull(allocator, "base", "head-2");
+    defer current.deinit();
+    try current.addFile(.{
+        .path = "current.zig",
+        .previous_path = "middle.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "r2",
+    });
+    try current.inheritLineage("current.zig", &previous.files.items[0]);
+    inline for (.{ "original.zig", "middle.zig", "current.zig" }) |path| {
+        try std.testing.expectEqualStrings("current.zig", current.currentPath(path).?);
+    }
+    try std.testing.expect(current.sameReviewFile("original.zig", "current.zig"));
+}
+
+test "refresh lineage follows a file added after the PR base through a rename" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const base_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "middle.zig", .data = "const value = 1;\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "add review file" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const first_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(first_raw);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "mv", "middle.zig", "current.zig" },
+    ));
+    allocator.free(try runGit(allocator, io, root, &.{ "git", "commit", "-qm", "rename" }));
+    const second_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(second_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    const first = std.mem.trim(u8, first_raw, "\r\n");
+    const second = std.mem.trim(u8, second_raw, "\r\n");
+    var previous = try domain.PrGeneration.initFull(allocator, base, first);
+    defer previous.deinit();
+    try previous.addFile(.{
+        .path = "middle.zig",
+        .change_type = "ADDED",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    var current = try domain.PrGeneration.initFull(allocator, base, second);
+    defer current.deinit();
+    try current.addFile(.{
+        .path = "current.zig",
+        .change_type = "ADDED",
+        .viewed = .unviewed,
+        .revision_key = "r2",
+    });
+    try github.rebindGenerationLineage(allocator, io, root, &previous, &current);
+    try std.testing.expectEqualStrings("current.zig", current.currentPath("middle.zig").?);
+}
+
 test "thread evidence is bounded while the generation serializes it" {
     const allocator = std.testing.allocator;
     var generation = try domain.PrGeneration.initFull(allocator, "b", "h");
