@@ -2491,6 +2491,7 @@ fn runCanonicalBlobDiff(
         "--no-textconv",
         "--no-ext-diff",
         "--no-color",
+        "--full-index",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--line-prefix=",
@@ -2529,6 +2530,7 @@ fn runCanonicalPathDiff(
         "--no-textconv",
         "--no-ext-diff",
         "--no-color",
+        "--full-index",
         "-M",
         "--src-prefix=a/",
         "--dst-prefix=b/",
@@ -2974,6 +2976,23 @@ fn expectRenamedReviewDiff(diff: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, diff, "--- a/old.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+++ b/new.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
+    try expectFullIndexRecord(diff);
+}
+
+fn expectFullIndexRecord(diff: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, diff, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "index ")) continue;
+        const separator = std.mem.indexOf(u8, line, "..") orelse
+            return error.InvalidGitIndexRecord;
+        const old_oid = line["index ".len..separator];
+        const mode = std.mem.indexOfScalarPos(u8, line, separator + 2, ' ') orelse line.len;
+        const new_oid = line[separator + 2 .. mode];
+        try std.testing.expectEqual(@as(usize, 40), old_oid.len);
+        try std.testing.expectEqual(@as(usize, 40), new_oid.len);
+        return;
+    }
+    return error.MissingGitIndexRecord;
 }
 
 test "renamed file identity and review diff include the source path" {
@@ -3010,6 +3029,12 @@ test "renamed file identity and review diff include the source path" {
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
     try configureNonCanonicalDiffDefaults(allocator, io, root);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "core.abbrev", "4" },
+    ));
     const base = std.mem.trim(u8, base_raw, "\r\n");
     const head = std.mem.trim(u8, head_raw, "\r\n");
     var generation = try domain.PrGeneration.initFull(allocator, base, head);

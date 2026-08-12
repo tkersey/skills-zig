@@ -1994,6 +1994,48 @@ fn runGit(
     return result.stdout;
 }
 
+test "canonical review diffs ignore abbreviated object-id configuration" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "const value = 1;\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const base_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "const value = 2;\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+        &.{ "git", "config", "core.abbrev", "4" },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const head_raw = try runGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const diff = try github.canonicalReviewDiffAlloc(
+        allocator,
+        io,
+        root,
+        std.mem.trim(u8, base_raw, "\r\n"),
+        std.mem.trim(u8, head_raw, "\r\n"),
+        "a.zig",
+        null,
+    );
+    defer allocator.free(diff);
+    const index = std.mem.indexOf(u8, diff, "index ") orelse
+        return error.MissingGitIndexRecord;
+    const separator = std.mem.indexOfPos(u8, diff, index, "..") orelse
+        return error.InvalidGitIndexRecord;
+    try std.testing.expectEqual(@as(usize, 40), separator - index - "index ".len);
+}
+
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
