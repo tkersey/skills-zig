@@ -1084,6 +1084,7 @@ const fake_codex_script =
     \\  printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
     \\  for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+    \\  printf '%s' '{"required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}},"definitions":{"Turn":{"required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}}}}' > "$out/v2/TurnCompletedNotification.json"
     \\  printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
     \\  printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"
     \\  printf '%s' '{"properties":{"decision":{"enum":["decline"]}},"required":["decision"]}' > "$out/FileChangeRequestApprovalResponse.json"

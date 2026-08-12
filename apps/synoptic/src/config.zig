@@ -661,7 +661,6 @@ fn validateTurnSchemas(
     const notification_files = [_][]const u8{
         "v2/ThreadStartedNotification.json",
         "v2/TurnStartedNotification.json",
-        "v2/TurnCompletedNotification.json",
         "v2/ItemStartedNotification.json",
         "v2/AgentMessageDeltaNotification.json",
     };
@@ -676,7 +675,82 @@ fn validateTurnSchemas(
         );
         allocator.free(bytes);
     }
+    const completed_file = "v2/TurnCompletedNotification.json";
+    const completed = readSchema(allocator, io, out_dir, completed_file) catch return @as(
+        ?[]u8,
+        try std.fmt.allocPrint(
+            allocator,
+            "installed Codex {s}: missing notification family {s}",
+            .{ version, completed_file },
+        ),
+    );
+    defer allocator.free(completed);
+    if (!turnCompletedSchemaHasConsumedFields(allocator, completed)) {
+        return @as(
+            ?[]u8,
+            try std.fmt.allocPrint(
+                allocator,
+                "installed Codex {s}: TurnCompletedNotification must require " ++
+                    "threadId, turn.id, and turn.status",
+                .{version},
+            ),
+        );
+    }
     return null;
+}
+
+fn turnCompletedSchemaHasConsumedFields(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const root = parsed.value.object;
+    if (!requiredContains(root, "threadId") or !requiredContains(root, "turn")) return false;
+    const properties = objectField(root, "properties") orelse return false;
+    if (!stringTypeProperty(properties, "threadId")) return false;
+    const turn_property = objectField(properties, "turn") orelse return false;
+    const turn_ref = stringField(turn_property, "$ref") orelse return false;
+    if (!std.mem.eql(u8, turn_ref, "#/definitions/Turn")) return false;
+    const definitions = objectField(root, "definitions") orelse return false;
+    const turn = objectField(definitions, "Turn") orelse return false;
+    if (!requiredContains(turn, "id") or !requiredContains(turn, "status")) return false;
+    const turn_properties = objectField(turn, "properties") orelse return false;
+    return stringTypeProperty(turn_properties, "id") and
+        stringOrReferenceProperty(turn_properties, "status");
+}
+
+fn requiredContains(object: std.json.ObjectMap, name: []const u8) bool {
+    const required = object.get("required") orelse return false;
+    if (required != .array) return false;
+    for (required.array.items) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, name)) return true;
+    }
+    return false;
+}
+
+fn objectField(object: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
+    const value = object.get(name) orelse return null;
+    return if (value == .object) value.object else null;
+}
+
+fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn stringTypeProperty(properties: std.json.ObjectMap, name: []const u8) bool {
+    const property = objectField(properties, name) orelse return false;
+    const value_type = stringField(property, "type") orelse return false;
+    return std.mem.eql(u8, value_type, "string");
+}
+
+fn stringOrReferenceProperty(properties: std.json.ObjectMap, name: []const u8) bool {
+    const property = objectField(properties, name) orelse return false;
+    if (stringField(property, "$ref")) |reference| return reference.len > 0;
+    const value_type = stringField(property, "type") orelse return false;
+    return std.mem.eql(u8, value_type, "string");
 }
 
 fn validateApprovalSchemas(
@@ -1044,6 +1118,7 @@ test "command approvals installed schema requires exact request and response sur
         \\printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
         \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+        \\printf '%s' '{"required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}},"definitions":{"Turn":{"required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}}}}' > "$out/v2/TurnCompletedNotification.json"
         \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
         \\printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"
         \\printf '%s' '{"properties":{"decision":{"enum":["decline"]}},"required":["decision"]}' > "$out/FileChangeRequestApprovalResponse.json"
@@ -1066,6 +1141,27 @@ test "command approvals installed schema requires exact request and response sur
         problem,
         "PermissionsRequestApprovalResponse.json",
     ) != null);
+}
+
+test "completed-turn schema requires every consumed completion field" {
+    const valid =
+        "{\"required\":[\"threadId\",\"turn\"],\"properties\":{" ++
+        "\"threadId\":{\"type\":\"string\"},\"turn\":{\"$ref\":" ++
+        "\"#/definitions/Turn\"}},\"definitions\":{\"Turn\":{" ++
+        "\"required\":[\"id\",\"status\"],\"properties\":{" ++
+        "\"id\":{\"type\":\"string\"},\"status\":{" ++
+        "\"$ref\":\"#/definitions/TurnStatus\"}}}}}";
+    try std.testing.expect(turnCompletedSchemaHasConsumedFields(std.testing.allocator, valid));
+    const missing_status =
+        "{\"required\":[\"threadId\",\"turn\"],\"properties\":{" ++
+        "\"threadId\":{\"type\":\"string\"},\"turn\":{\"$ref\":" ++
+        "\"#/definitions/Turn\"}},\"definitions\":{\"Turn\":{" ++
+        "\"required\":[\"id\"],\"properties\":{" ++
+        "\"id\":{\"type\":\"string\"}}}}}";
+    try std.testing.expect(!turnCompletedSchemaHasConsumedFields(
+        std.testing.allocator,
+        missing_status,
+    ));
 }
 
 test "empty config roots never resolve relative repository paths" {
