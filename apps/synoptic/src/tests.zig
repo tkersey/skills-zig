@@ -4500,6 +4500,9 @@ fn fakeLifecycleGhScriptAlloc(
         \\#!/bin/sh
         \\set -eu
         \\if [ "${{1:-}}" = auth ]; then exit 0; fi
+        \\if [ -n "${{SYNOPTIC_TEST_GH_GATE:-}}" ]; then
+        \\  while [ -e "$SYNOPTIC_TEST_GH_GATE" ]; do sleep 0.01; done
+        \\fi
         \\input=$(mktemp)
         \\trap 'rm -f "$input"' EXIT
         \\cat > "$input"
@@ -4757,6 +4760,79 @@ fn lifecycleLaunch(
             "--no-browser",
             "--json",
         },
+    );
+}
+
+fn verifyLifecycleInterruptedStartingLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *std.process.Environ.Map,
+    fixture: LifecycleFixture,
+) !void {
+    const gate = try std.fs.path.join(allocator, &.{ fixture.runtime_tmp, "gh.gate" });
+    defer allocator.free(gate);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gate, .data = "hold\n" });
+    defer std.Io.Dir.cwd().deleteFile(io, gate) catch {};
+    try environment.put("SYNOPTIC_TEST_GH_GATE", gate);
+    defer _ = environment.swapRemove("SYNOPTIC_TEST_GH_GATE");
+    var launcher = try std.process.spawn(io, .{
+        .argv = &.{
+            fixture.binary,
+            "launch",
+            "--cwd",
+            fixture.repo,
+            "--skill-root",
+            fixture.skill,
+            "--pr",
+            "https://github.com/o/r/pull/1",
+            "--no-browser",
+            "--json",
+        },
+        .environ_map = environment,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer launcher.kill(io);
+    const current_path = try std.fs.path.join(
+        allocator,
+        &.{ fixture.runtime_tmp, "synoptic", "current.json" },
+    );
+    defer allocator.free(current_path);
+    for (0..400) |_| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            current_path,
+            allocator,
+            .limited(64 * 1024),
+        ) catch {
+            std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
+            continue;
+        };
+        const published = std.mem.indexOf(u8, raw, "\"status\":\"starting\"") != null;
+        allocator.free(raw);
+        if (published) break;
+    } else return error.StartingRecordNotPublished;
+    launcher.kill(io);
+    const status = try runLifecycleCommand(
+        allocator,
+        io,
+        environment,
+        &.{ fixture.binary, "status", "--json" },
+    );
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"status\":\"starting\"") != null);
+    const stopped = try runLifecycleCommand(
+        allocator,
+        io,
+        environment,
+        &.{ fixture.binary, "stop", "--json" },
+    );
+    defer allocator.free(stopped);
+    try std.testing.expect(std.mem.indexOf(u8, stopped, "\"status\":\"stopped\"") != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, current_path, .{}),
     );
 }
 
@@ -5097,6 +5173,12 @@ test "e2e child lifecycle reconstructs without semantic recovery" {
     try environment.put("SYNOPTIC_GH", fixture.gh);
     try environment.put("SYNOPTIC_CODEX", fixture.codex);
     defer bestEffortLifecycleStop(allocator, io, &environment, fixture.binary);
+    try verifyLifecycleInterruptedStartingLaunch(
+        allocator,
+        io,
+        &environment,
+        fixture,
+    );
     const first = try lifecycleLaunch(fixture, io, &environment);
     defer allocator.free(first);
     var address = try receiptAddress(allocator, first);

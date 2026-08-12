@@ -121,13 +121,16 @@ fn printCapabilities(io: std.Io, args: []const []const u8) !void {
     try out.interface.flush();
 }
 
+const LifecyclePhase = enum { starting, ready };
+
 const LifecycleRecord = struct {
     allocator: std.mem.Allocator,
     raw: []u8,
     launch_id: []u8,
     runtime_root: []u8,
     executable: []u8,
-    url: []u8,
+    phase: LifecyclePhase,
+    url: ?[]u8,
     worktree: ?[]u8,
     worktree_kind: ?[]u8,
     repository_cwd: ?[]u8,
@@ -138,7 +141,7 @@ const LifecycleRecord = struct {
         self.allocator.free(self.launch_id);
         self.allocator.free(self.runtime_root);
         self.allocator.free(self.executable);
-        self.allocator.free(self.url);
+        if (self.url) |value| self.allocator.free(value);
         if (self.worktree) |value| self.allocator.free(value);
         if (self.worktree_kind) |value| self.allocator.free(value);
         if (self.repository_cwd) |value| self.allocator.free(value);
@@ -197,21 +200,24 @@ fn launch(
         &child,
         launch_dir,
         options.cwd,
+        current_path,
+        launch_id,
     );
     const child_pid: u64 = @intCast(child.id orelse return error.ChildMissingPid);
     var ready = try awaitChildReady(allocator, io, ready_path, error_path, launch_id, child_pid);
     defer ready.deinit();
     if (!try verifiedProcess(allocator, io, ready)) return error.InvalidLaunchReadiness;
     try writeOperationalFile(allocator, io, current_path, ready.raw);
+    const ready_url = ready.url orelse return error.InvalidLaunchReadiness;
     if (!options.no_browser and settings.browser_open) {
-        openBrowser(allocator, io, ready.url) catch |ignored_error| switch (ignored_error) {
+        openBrowser(allocator, io, ready_url) catch |ignored_error| switch (ignored_error) {
             else => {},
         };
     }
     var out = std.Io.File.stdout().writer(io, &.{});
     if (options.json) {
         try out.interface.print("{s}\n", .{ready.raw});
-    } else try out.interface.print("{s}\n", .{ready.url});
+    } else try out.interface.print("{s}\n", .{ready_url});
     try out.interface.flush();
     child_owned = false;
 }
@@ -222,6 +228,8 @@ fn cleanupFailedLaunch(
     child: *std.process.Child,
     launch_dir: []const u8,
     repository_cwd: []const u8,
+    current_path: []const u8,
+    launch_id: []const u8,
 ) void {
     if (!retireLaunchProcessGroup(io, child)) return;
     const managed_path = std.fs.path.join(
@@ -236,6 +244,42 @@ fn cleanupFailedLaunch(
         repository_cwd,
     ) catch return;
     deleteLaunchDirectory(io, launch_dir) catch return;
+    removeCurrentIfLaunch(allocator, io, current_path, launch_id);
+}
+
+fn writeStartingLifecycle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    current_path: []const u8,
+    launch_dir: []const u8,
+    runtime_root: []const u8,
+    launch_id: []const u8,
+    repository_cwd: []const u8,
+    pid: u64,
+) !void {
+    const executable = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable);
+    const worktree_path = try std.fs.path.join(allocator, &.{ launch_dir, "worktree" });
+    defer allocator.free(worktree_path);
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"synoptic-launch-starting/v1\",\"runtimeSchema\":\"{s}\"," ++
+            "\"status\":\"starting\",\"capabilityState\":\"starting\"," ++
+            "\"lifecycle\":\"detached\",\"launchId\":{f},\"runtimeRoot\":{f}," ++
+            "\"executable\":{f},\"pid\":{d},\"worktree\":{f}," ++
+            "\"worktreeKind\":\"starting\",\"repositoryCwd\":{f}}}",
+        .{
+            config.lifecycle_schema,
+            std.json.fmt(launch_id, .{}),
+            std.json.fmt(runtime_root, .{}),
+            std.json.fmt(executable, .{}),
+            pid,
+            std.json.fmt(worktree_path, .{}),
+            std.json.fmt(repository_cwd, .{}),
+        },
+    );
+    defer allocator.free(receipt);
+    try writeOperationalFile(allocator, io, current_path, receipt);
 }
 
 fn deleteLaunchDirectory(io: std.Io, launch_dir: []const u8) !void {
@@ -269,7 +313,9 @@ fn retireDeadLaunch(
     );
     defer allocator.free(launch_dir);
     const kind = record.worktree_kind;
-    if (kind != null and std.mem.eql(u8, kind.?, "managed")) {
+    if (kind != null and (std.mem.eql(u8, kind.?, "managed") or
+        std.mem.eql(u8, kind.?, "starting")))
+    {
         const recorded_path = record.worktree orelse
             return error.IncompleteManagedLaunchRecord;
         const repository_cwd = record.repository_cwd orelse
@@ -345,7 +391,6 @@ fn spawnServeChild(
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = 0,
     });
 }
 
@@ -432,6 +477,21 @@ fn serveReview(
     );
     defer allocator.free(repository_cwd);
     options.cwd = repository_cwd;
+    const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
+    defer allocator.free(launch_dir);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    try writeStartingLifecycle(
+        allocator,
+        io,
+        current_path,
+        launch_dir,
+        runtime_root,
+        launch_id,
+        repository_cwd,
+        @intCast(std.c.getpid()),
+    );
+    if (std.c.setpgid(0, 0) != 0) return error.SynopticProcessGroupDetachFailed;
     const canonical_skill_root = try canonicalPathFromDirAlloc(
         allocator,
         io,
@@ -1365,14 +1425,26 @@ fn status(
         if (json) {
             try out.interface.writeAll(stopped_status);
         } else try out.interface.writeAll("stopped\n");
+    } else if (record.phase == .starting) {
+        if (json) {
+            try out.interface.print(
+                "{{\"schema\":\"synoptic-status/v1\",\"status\":\"starting\"," ++
+                    "\"launchId\":{f},\"pid\":{d}}}\n",
+                .{ std.json.fmt(record.launch_id, .{}), record.pid },
+            );
+        } else try out.interface.print("starting {d}\n", .{record.pid});
     } else if (json) {
+        const url = record.url orelse return error.InvalidLifecycleRecord;
         try out.interface.print("{{\"schema\":\"synoptic-status/v1\",\"status\":\"runni" ++
             "ng\",\"launchId\":{f},\"pid\":{d},\"url\":{f}}}\n", .{
             std.json.fmt(record.launch_id, .{}),
             record.pid,
-            std.json.fmt(record.url, .{}),
+            std.json.fmt(url, .{}),
         });
-    } else try out.interface.print("running {d} {s}\n", .{ record.pid, record.url });
+    } else try out.interface.print(
+        "running {d} {s}\n",
+        .{ record.pid, record.url orelse return error.InvalidLifecycleRecord },
+    );
     try out.interface.flush();
 }
 
@@ -1394,13 +1466,22 @@ fn stop(
         try retireDeadStop(allocator, io, runtime_root, current_path, record);
         return printStopResult(io, json, null, false);
     }
+    if (record.phase == .starting) {
+        try stopStartingProcess(allocator, io, record);
+        try retireDeadStop(allocator, io, runtime_root, current_path, record);
+        return printStopResult(io, json, record.launch_id, true);
+    }
     const stop_request_path = try std.fs.path.join(
         allocator,
         &.{ record.runtime_root, record.launch_id, "stop.request" },
     );
     defer allocator.free(stop_request_path);
     try writeOperationalFile(allocator, io, stop_request_path, "{}\n");
-    wakeLoopback(allocator, io, record.url) catch |ignored_error| {
+    wakeLoopback(
+        allocator,
+        io,
+        record.url orelse return error.InvalidLifecycleRecord,
+    ) catch |ignored_error| {
         switch (ignored_error) {
             else => {},
         }
@@ -1425,6 +1506,44 @@ fn stop(
     try requireNoTerminalError(io, terminal_error_path);
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
     return printStopResult(io, json, record.launch_id, true);
+}
+
+fn stopStartingProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record: LifecycleRecord,
+) !void {
+    const group = std.math.cast(std.posix.pid_t, record.pid) orelse
+        return error.InvalidLifecycleRecord;
+    std.posix.kill(-group, std.posix.SIG.TERM) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => return err,
+    };
+    std.posix.kill(group, std.posix.SIG.TERM) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => return err,
+    };
+    const websocket = @import("cas_runtime").websocket;
+    if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
+        websocket.forceKillProcessGroup(record.pid);
+    }
+    if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
+        return error.SynopticStopTimeout;
+    }
+    if (try verifiedProcess(allocator, io, record)) {
+        std.posix.kill(group, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => return err,
+        };
+    }
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (try verifiedProcess(allocator, io, record)) {
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms >= launch_shutdown_grace_ms) {
+            return error.SynopticStopTimeout;
+        }
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
 }
 
 fn retireDeadStop(
@@ -1562,8 +1681,15 @@ fn readLifecycleRecord(
     errdefer allocator.free(runtime_root);
     const executable = try lifecycleStringAlloc(allocator, object, "executable");
     errdefer allocator.free(executable);
-    const url = try lifecycleStringAlloc(allocator, object, "url");
-    errdefer allocator.free(url);
+    const phase: LifecyclePhase = if (object.get("status")) |value| blk: {
+        if (value != .string) return error.InvalidLifecycleRecord;
+        if (std.mem.eql(u8, value.string, "starting")) break :blk .starting;
+        if (std.mem.eql(u8, value.string, "ready")) break :blk .ready;
+        return error.InvalidLifecycleRecord;
+    } else .ready;
+    const url = try lifecycleOptionalStringAlloc(allocator, object, "url");
+    errdefer if (url) |value| allocator.free(value);
+    if (phase == .ready and url == null) return error.InvalidLifecycleRecord;
     const worktree_path = try lifecycleOptionalStringAlloc(allocator, object, "worktree");
     errdefer if (worktree_path) |value| allocator.free(value);
     const worktree_kind = try lifecycleOptionalStringAlloc(allocator, object, "worktreeKind");
@@ -1578,6 +1704,7 @@ fn readLifecycleRecord(
         .launch_id = launch_id,
         .runtime_root = runtime_root,
         .executable = executable,
+        .phase = phase,
         .url = url,
         .worktree = worktree_path,
         .worktree_kind = worktree_kind,
@@ -1986,7 +2113,18 @@ fn failLaunchForTest(
     launch_dir: []const u8,
     repository_cwd: []const u8,
 ) !void {
-    errdefer cleanupFailedLaunch(allocator, io, child, launch_dir, repository_cwd);
+    const runtime_root = std.fs.path.dirname(launch_dir) orelse return error.InvalidLaunchDirectory;
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    errdefer cleanupFailedLaunch(
+        allocator,
+        io,
+        child,
+        launch_dir,
+        repository_cwd,
+        current_path,
+        std.fs.path.basename(launch_dir),
+    );
     return error.OriginalLaunchFailure;
 }
 
@@ -2270,6 +2408,7 @@ test "explicit dead stop retires managed custody" {
         .launch_id = try allocator.dupe(u8, launch_id),
         .runtime_root = try allocator.dupe(u8, runtime_root),
         .executable = try allocator.dupe(u8, "/tmp/synoptic"),
+        .phase = .ready,
         .url = try allocator.dupe(u8, "http://127.0.0.1:1/"),
         .worktree = try allocator.dupe(u8, managed),
         .worktree_kind = try allocator.dupe(u8, "managed"),
@@ -2344,6 +2483,7 @@ test "worktree integrity dead managed launch retirement survives a missing repos
         .launch_id = try allocator.dupe(u8, launch_id),
         .runtime_root = try allocator.dupe(u8, runtime_root),
         .executable = try allocator.dupe(u8, "/tmp/synoptic"),
+        .phase = .ready,
         .url = try allocator.dupe(u8, "http://127.0.0.1:1/"),
         .worktree = try allocator.dupe(u8, managed),
         .worktree_kind = try allocator.dupe(u8, "managed"),
