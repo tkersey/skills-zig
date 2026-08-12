@@ -428,6 +428,15 @@ pub fn select(
 pub fn cleanupAllowed(custody: Custody) bool {
     return custody == .managed;
 }
+
+pub fn repositoryPathExists(io: std.Io, path: []const u8) !bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub fn requireManagedRefresh(custody: Custody) !void {
     if (custody != .managed) return error.ReusedCheckoutRefreshRequiresManagedMigration;
 }

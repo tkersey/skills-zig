@@ -4387,6 +4387,19 @@ test "worktree integrity missing managed path does not prune unrelated registrat
     try std.testing.expect(std.mem.indexOf(u8, worktree_list, unrelated) != null);
 }
 
+test "worktree integrity distinguishes an unavailable repository path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const missing = try std.fs.path.join(allocator, &.{ root, "missing-repository" });
+    defer allocator.free(missing);
+    try std.testing.expect(try worktree.repositoryPathExists(io, root));
+    try std.testing.expect(!try worktree.repositoryPathExists(io, missing));
+}
+
 test "worktree integrity ignored launch artifact selects managed custody" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

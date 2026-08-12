@@ -285,12 +285,14 @@ fn retireDeadLaunch(
         if (!std.mem.eql(u8, recorded_path, expected_path)) {
             return error.InvalidLifecycleRecord;
         }
-        try worktree.retireManaged(
-            allocator,
-            io,
-            .{ .managed = recorded_path },
-            repository_cwd,
-        );
+        if (try worktree.repositoryPathExists(io, repository_cwd)) {
+            try worktree.retireManaged(
+                allocator,
+                io,
+                .{ .managed = recorded_path },
+                repository_cwd,
+            );
+        }
     } else if (kind != null and !std.mem.eql(u8, kind.?, "reused-current")) {
         return error.InvalidLifecycleRecord;
     } else if (kind == null and
@@ -2287,6 +2289,76 @@ test "explicit dead stop retires managed custody" {
         std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
     );
 }
+
+test "worktree integrity dead managed launch retirement survives a missing repository" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked", .data = "head\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
+    defer allocator.free(repo);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestCommand(allocator, io, repo, argv));
+    const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime_root);
+    const launch_id = "abcdef0123456789abcdef0123456789abcdef0123456789";
+    const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
+    defer allocator.free(launch_dir);
+    try std.Io.Dir.cwd().createDirPath(io, launch_dir);
+    const managed = try std.fs.path.join(allocator, &.{ launch_dir, "worktree" });
+    defer allocator.free(managed);
+    const head_raw = try runTestCommand(
+        allocator,
+        io,
+        repo,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(head_raw);
+    allocator.free(try runTestCommand(
+        allocator,
+        io,
+        repo,
+        &.{
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            managed,
+            std.mem.trim(u8, head_raw, "\r\n"),
+        },
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "runtime/unrelated", .data = "keep\n" });
+    try tmp.dir.deleteTree(io, "repo");
+    var record = LifecycleRecord{
+        .allocator = allocator,
+        .raw = try allocator.dupe(u8, "{}"),
+        .launch_id = try allocator.dupe(u8, launch_id),
+        .runtime_root = try allocator.dupe(u8, runtime_root),
+        .executable = try allocator.dupe(u8, "/tmp/synoptic"),
+        .url = try allocator.dupe(u8, "http://127.0.0.1:1/"),
+        .worktree = try allocator.dupe(u8, managed),
+        .worktree_kind = try allocator.dupe(u8, "managed"),
+        .repository_cwd = try allocator.dupe(u8, repo),
+        .pid = 999_999,
+    };
+    defer record.deinit();
+    try retireDeadLaunch(allocator, io, runtime_root, record);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
+    );
+    _ = try tmp.dir.statFile(io, "runtime/unrelated", .{});
+}
+
 test "failed launch retires descendants before managed custody and preserves error" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
