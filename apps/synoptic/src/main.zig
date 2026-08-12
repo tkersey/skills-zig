@@ -440,6 +440,7 @@ fn spawnServeChild(
     return std.process.spawn(io, .{
         .argv = child_argv.items,
         .environ_map = environment,
+        .pgid = 0,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -582,7 +583,6 @@ fn publishStartingReview(
         repository_identity,
         @intCast(std.c.getpid()),
     );
-    if (std.c.setpgid(0, 0) != 0) return error.SynopticProcessGroupDetachFailed;
 }
 
 fn serveValidatedReview(
@@ -1618,6 +1618,12 @@ fn stop(
     const json = try parseJsonOnly(args);
     const runtime_root = try runtimeRootAlloc(allocator, environment);
     defer allocator.free(runtime_root);
+    try ensurePrivateDir(io, runtime_root);
+    const claim_path = try std.fs.path.join(allocator, &.{ runtime_root, "launch.lock" });
+    defer allocator.free(claim_path);
+    var claim = try acquireLaunchClaim(io, claim_path);
+    defer claim.close(io);
+    defer claim.unlock(io);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     var record = (try readCurrentForLaunch(allocator, io, current_path)) orelse
