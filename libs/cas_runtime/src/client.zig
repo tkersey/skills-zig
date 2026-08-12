@@ -1590,7 +1590,8 @@ threadlocal var actor_callback_state: ?*ActorState = null;
 /// callers may issue concurrent requests while the bounded writer queue owns
 /// all transport writes.
 pub const Actor = struct {
-    state: *ActorState,
+    handle_mutex: ActorMutex = .{},
+    state: ?*ActorState,
 
     fn initOwned(
         allocator: std.mem.Allocator,
@@ -1657,11 +1658,16 @@ pub const Actor = struct {
     }
 
     pub fn deinit(self: *Actor) void {
-        const state = self.state;
+        self.handle_mutex.lock();
+        const state = self.state orelse {
+            self.handle_mutex.unlock();
+            return;
+        };
+        self.state = null;
+        self.handle_mutex.unlock();
         state.mutex.lock();
         if (state.teardown_started) {
             state.mutex.unlock();
-            self.* = undefined;
             return;
         }
         state.teardown_started = true;
@@ -1681,49 +1687,51 @@ pub const Actor = struct {
         state.mutex.lock();
         state.teardown_ready = true;
         state.mutex.unlock();
-        if (callback_teardown) return;
+        if (callback_teardown) {
+            reaper.detach();
+            return;
+        }
         reaper.join();
-        self.* = undefined;
     }
 
     pub fn terminalState(self: *const Actor) protocol.TerminalState {
-        actorAcquireCall(self.state) catch return .stopped;
-        defer actorReleaseCall(self.state);
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
-        return self.state.terminal;
+        const state = self.acquireState() catch return .stopped;
+        defer actorReleaseCall(state);
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        return state.terminal;
     }
 
     pub fn subscribe(
         self: *Actor,
         subscription: protocol.NotificationHandler,
     ) !void {
-        try actorAcquireCall(self.state);
-        defer actorReleaseCall(self.state);
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
-        if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
-        if (self.state.subscriptions.items.len >= max_actor_subscriptions) {
+        const state = try self.acquireState();
+        defer actorReleaseCall(state);
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        if (state.terminal != .running) return actorTerminalError(state.terminal);
+        if (state.subscriptions.items.len >= max_actor_subscriptions) {
             return error.NotificationSubscriptionLimitExceeded;
         }
-        try self.state.subscriptions.append(self.state.allocator, subscription);
+        try state.subscriptions.append(state.allocator, subscription);
     }
 
     pub fn setServerRequestHandler(
         self: *Actor,
         handler: ?protocol.ServerRequestHandler,
     ) !void {
-        try actorAcquireCall(self.state);
-        defer actorReleaseCall(self.state);
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
-        if (self.state.terminal != .running) return actorTerminalError(self.state.terminal);
-        if (self.state.server_requests.items.len != 0 or
-            self.state.active_server_handlers != 0)
+        const state = try self.acquireState();
+        defer actorReleaseCall(state);
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        if (state.terminal != .running) return actorTerminalError(state.terminal);
+        if (state.server_requests.items.len != 0 or
+            state.active_server_handlers != 0)
         {
             return error.ServerRequestHandlerBusy;
         }
-        self.state.server_request_handler = handler;
+        state.server_request_handler = handler;
     }
 
     pub fn requestJson(
@@ -1732,37 +1740,38 @@ pub const Actor = struct {
         params_json: ?[]const u8,
         timeout_ms: ?u32,
     ) ![]u8 {
-        try actorAcquireCall(self.state);
-        defer actorReleaseCall(self.state);
-        const budget_ms = timeout_ms orelse self.state.default_request_timeout_ms;
+        const state = try self.acquireState();
+        defer actorReleaseCall(state);
+        const budget_ms = timeout_ms orelse state.default_request_timeout_ms;
         if (budget_ms == 0) return error.InvalidRequestDeadline;
         const deadline = monotonicMillis() + @as(i64, budget_ms);
         var retry_index: u32 = 0;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const remaining_ms = deadline - monotonicMillis();
             if (remaining_ms <= 0) return error.RequestDeadlineExceeded;
-            const response = try self.requestOnce(
+            const response = try requestOnce(
+                state,
                 method,
                 params_json,
                 @intCast(remaining_ms),
             );
             if (!response.is_error) return response.json;
 
-            const retryable = actorResponseIsOverload(self.state.allocator, response.json);
-            if (!retryable or retry_index >= self.state.overload_retry_policy.max_retries) {
-                self.state.allocator.free(response.json);
+            const retryable = actorResponseIsOverload(state.allocator, response.json);
+            if (!retryable or retry_index >= state.overload_retry_policy.max_retries) {
+                state.allocator.free(response.json);
                 return error.RequestFailed;
             }
-            self.state.allocator.free(response.json);
+            state.allocator.free(response.json);
             const delay_ms = overloadRetryDelayMs(
-                self.state.overload_retry_policy,
+                state.overload_retry_policy,
                 retry_index,
-                self.state.overload_retry_seed,
+                state.overload_retry_seed,
             );
             if (@as(i64, delay_ms) >= deadline - monotonicMillis()) {
                 return error.RequestDeadlineExceeded;
             }
-            try std.Io.sleep(self.state.client.io, .fromMilliseconds(delay_ms), .awake);
+            try std.Io.sleep(state.client.io, .fromMilliseconds(delay_ms), .awake);
             retry_index += 1;
         }
     }
@@ -1773,7 +1782,7 @@ pub const Actor = struct {
     };
 
     fn requestOnce(
-        self: *Actor,
+        state: *ActorState,
         method: []const u8,
         params_json: ?[]const u8,
         timeout_ms: u32,
@@ -1782,55 +1791,64 @@ pub const Actor = struct {
         const deadline = monotonicMillis() + @as(i64, timeout_ms);
         var pending: ActorPending = .{};
 
-        self.state.mutex.lock();
-        if (self.state.terminal != .running) {
-            const terminal = self.state.terminal;
-            self.state.mutex.unlock();
+        state.mutex.lock();
+        if (state.terminal != .running) {
+            const terminal = state.terminal;
+            state.mutex.unlock();
             return actorTerminalError(terminal);
         }
-        const request_id = self.state.next_request_id;
-        self.state.next_request_id += 1;
-        self.state.pending.put(request_id, &pending) catch |err| {
-            self.state.mutex.unlock();
+        const request_id = state.next_request_id;
+        state.next_request_id += 1;
+        state.pending.put(request_id, &pending) catch |err| {
+            state.mutex.unlock();
             return err;
         };
-        self.state.mutex.unlock();
+        state.mutex.unlock();
         errdefer {
-            self.state.mutex.lock();
-            _ = self.state.pending.remove(request_id);
-            self.state.mutex.unlock();
+            state.mutex.lock();
+            _ = state.pending.remove(request_id);
+            state.mutex.unlock();
         }
 
         const payload = try actorRequestPayloadAlloc(
-            self.state.allocator,
+            state.allocator,
             request_id,
             method,
             params_json,
         );
-        try actorEnqueueOwned(self.state, payload, deadline, false, request_id);
+        try actorEnqueueOwned(state, payload, deadline, false, request_id);
 
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
-            self.state.mutex.lock();
+            state.mutex.lock();
             if (pending.done) {
-                return actorCompletedResponse(self.state, &pending, request_id, deadline);
+                return actorCompletedResponse(state, &pending, request_id, deadline);
             }
-            if (self.state.terminal != .running) {
-                _ = self.state.pending.remove(request_id);
-                const terminal = self.state.terminal;
-                self.state.mutex.unlock();
+            if (state.terminal != .running) {
+                _ = state.pending.remove(request_id);
+                const terminal = state.terminal;
+                state.mutex.unlock();
                 return actorTerminalError(terminal);
             }
             if (monotonicMillis() >= deadline) {
                 const transmission_started = pending.transmission_started;
-                _ = self.state.pending.remove(request_id);
-                if (transmission_started) self.state.terminal = .poisoned;
-                self.state.mutex.unlock();
-                if (transmission_started) actorCloseTransportOnce(self.state);
+                _ = state.pending.remove(request_id);
+                if (transmission_started) state.terminal = .poisoned;
+                state.mutex.unlock();
+                if (transmission_started) actorCloseTransportOnce(state);
                 return error.RequestDeadlineExceeded;
             }
-            self.state.mutex.unlock();
-            try std.Io.sleep(self.state.client.io, .fromMilliseconds(2), .awake);
+            state.mutex.unlock();
+            try std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake);
         }
+    }
+
+    fn acquireState(self: *const Actor) !*ActorState {
+        const mutable: *Actor = @constCast(self);
+        mutable.handle_mutex.lock();
+        defer mutable.handle_mutex.unlock();
+        const state = mutable.state orelse return error.ActorStopped;
+        try actorAcquireCall(state);
+        return state;
     }
 };
 
