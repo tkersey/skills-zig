@@ -572,6 +572,7 @@ fn validateCodexMethods(
         "initialized",
         "thread/start",
         "thread/fork",
+        "thread/delete",
         "turn/start",
         "turn/steer",
         "turn/interrupt",
@@ -620,6 +621,24 @@ fn validateThreadSchemas(
             .{version},
         ),
     );
+    const delete = readSchema(allocator, io, out_dir, "v2/ThreadDeleteParams.json") catch
+        return @as(
+            ?[]u8,
+            try std.fmt.allocPrint(
+                allocator,
+                "installed Codex {s}: missing thread/delete schema",
+                .{version},
+            ),
+        );
+    defer allocator.free(delete);
+    if (!threadDeleteSchemaHasConsumedFields(allocator, delete)) return @as(
+        ?[]u8,
+        try std.fmt.allocPrint(
+            allocator,
+            "installed Codex {s}: thread/delete must require string threadId",
+            .{version},
+        ),
+    );
     const start = readSchema(allocator, io, out_dir, "v2/ThreadStartParams.json") catch return @as(
         ?[]u8,
         try std.fmt.allocPrint(
@@ -656,6 +675,19 @@ fn schemaHasRootProperties(
     if (properties != .object) return false;
     for (required_properties) |name| if (!properties.object.contains(name)) return false;
     return true;
+}
+
+fn threadDeleteSchemaHasConsumedFields(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const root = parsed.value.object;
+    if (!requiredContains(root, "threadId")) return false;
+    const properties = objectField(root, "properties") orelse return false;
+    return stringTypeProperty(properties, "threadId");
 }
 
 fn validateTurnSchemas(
@@ -1141,9 +1173,10 @@ test "command approvals installed schema requires exact request and response sur
         \\out=''
         \\while [ $# -gt 0 ]; do if [ "$1" = --out ]; then shift; out="$1"; fi; shift; done
         \\mkdir -p "$out/v2"
-        \\printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
+        \\printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","thread/delete","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
         \\cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
         \\printf '%s' '{"properties":{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadForkParams.json"
+        \\printf '%s' '{"required":["threadId"],"properties":{"threadId":{"type":"string"}}}' > "$out/v2/ThreadDeleteParams.json"
         \\printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
         \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
@@ -1190,6 +1223,22 @@ test "completed-turn schema requires every consumed completion field" {
     try std.testing.expect(!turnCompletedSchemaHasConsumedFields(
         std.testing.allocator,
         missing_status,
+    ));
+}
+
+test "thread delete schema requires the consumed string identity" {
+    const valid =
+        "{\"required\":[\"threadId\"],\"properties\":{" ++
+        "\"threadId\":{\"type\":\"string\"}}}";
+    try std.testing.expect(threadDeleteSchemaHasConsumedFields(std.testing.allocator, valid));
+    try std.testing.expect(!threadDeleteSchemaHasConsumedFields(
+        std.testing.allocator,
+        "{\"properties\":{\"threadId\":{\"type\":\"string\"}}}",
+    ));
+    try std.testing.expect(!threadDeleteSchemaHasConsumedFields(
+        std.testing.allocator,
+        "{\"required\":[\"threadId\"],\"properties\":{" ++
+            "\"threadId\":{\"type\":\"number\"}}}",
     ));
 }
 

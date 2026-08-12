@@ -827,11 +827,11 @@ pub const Registry = struct {
         var found = false;
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
             found = true;
+            thread_id = self.allocator.dupe(u8, session.thread_id) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
             if (session.turn_active and session.turn_id.len > 0) {
-                thread_id = self.allocator.dupe(u8, session.thread_id) catch |err| {
-                    self.mutex.unlock();
-                    return err;
-                };
                 turn_id = self.allocator.dupe(u8, session.turn_id) catch |err| {
                     self.allocator.free(thread_id.?);
                     self.mutex.unlock();
@@ -844,8 +844,8 @@ pub const Registry = struct {
         if (!found) return error.UnknownSession;
         defer if (thread_id) |value| self.allocator.free(value);
         defer if (turn_id) |value| self.allocator.free(value);
-        if (thread_id != null and turn_id != null) {
-            const actor = if (self.actor) |*value| value else return error.ActorUnavailable;
+        const actor = if (self.actor) |*value| value else return error.ActorUnavailable;
+        if (turn_id != null) {
             const params = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"threadId\":{f},\"turnId\":{f}}}",
@@ -855,6 +855,7 @@ pub const Registry = struct {
             const response = try actor.requestJson("turn/interrupt", params, null);
             self.allocator.free(response);
         }
+        try self.deleteFileThread(actor, thread_id.?);
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items, 0..) |session, index| {
@@ -3168,7 +3169,7 @@ test "file admission reserves capacity and closed sessions release it" {
     registry.releaseFileAdmission("a.zig", "r1");
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
     registry.sessions.items[0].turn_active = false;
-    try registry.closeSession("ses-1");
+    registry.removeSession("ses-1");
     const reopened = try registry.admitFile("b.zig", "r1");
     try std.testing.expect(reopened == .reserved);
     registry.releaseFileAdmission("b.zig", "r1");
@@ -3388,7 +3389,7 @@ test "turn start response alone never opens primary gate" {
     defer registry.deinit();
     try std.testing.expect(!registry.primaryReady());
 }
-test "session authority is immediately governing and close is local" {
+test "session authority is immediately governing and finalization is local" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
     try registry.sessions.append(
@@ -3414,7 +3415,7 @@ test "session authority is immediately governing and close is local" {
         defer registry.mutex.unlock();
         try registry.appendVisibleLocked("s", "status", "{}");
     }
-    try registry.closeSession("s");
+    registry.removeSession("s");
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
 }
@@ -4127,7 +4128,10 @@ test "command approvals timeout close and synchronization conservatively decline
     const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
     try waitForApproval(&closed);
     closed.sessions.items[0].turn_active = false;
-    try closed.closeSession("ses-1");
+    closed.mutex.lock();
+    closed.declineApprovalsLocked("ses-1", .resolved, "session-closed");
+    closed.mutex.unlock();
+    closed.removeSession("ses-1");
     thread.join();
     defer if (invocation.response) |response| std.heap.page_allocator.free(response);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", invocation.response.?);

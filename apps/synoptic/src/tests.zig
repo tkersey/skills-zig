@@ -1079,9 +1079,10 @@ const fake_codex_script =
     \\  out=''
     \\  while [ "$#" -gt 0 ]; do if [ "$1" = "--out" ] || [ "$1" = "-o" ]; then shift; out="$1"; fi; shift; done
     \\  mkdir -p "$out/v2"
-    \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
+    \\  printf '%s' '{"methods":["initialize","initialized","thread/start","thread/fork","thread/delete","turn/start","turn/steer","turn/interrupt","thread/inject_items","item/tool/call","item/commandExecution/requestApproval","item/fileChange/requestApproval","item/permissions/requestApproval"]}' > "$out/codex_app_server_protocol.schemas.json"
     \\  cp "$out/codex_app_server_protocol.schemas.json" "$out/codex_app_server_protocol.v2.schemas.json"
     \\  printf '%s' '{"properties":{"lastTurnId":{},"ephemeral":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadForkParams.json"
+    \\  printf '%s' '{"required":["threadId"],"properties":{"threadId":{"type":"string"}}}' > "$out/v2/ThreadDeleteParams.json"
     \\  printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
     \\  for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
@@ -1120,6 +1121,12 @@ const fake_codex_script =
     \\    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"primary"}}}\n' "$id" ;;
     \\    *'"method":"thread/fork"'*) forks=$((forks + 1)); printf '{"id":%s,"result":{"thread":{"id":"file-%s"}}}\n' "$id" "$forks" ;;
     \\    *'"method":"thread/inject_items"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    \\    *'"method":"thread/delete"'*)
+    \\      if printf '%s' "$line" | grep -q 'fail-delete'; then
+    \\        printf '{"id":%s,"error":{"code":-32000,"message":"delete failed"}}\n' "$id"
+    \\        continue
+    \\      fi
+    \\      printf '{"id":%s,"result":{}}\n' "$id" ;;
     \\    *'"method":"turn/interrupt"'*)
     \\      if printf '%s' "$line" | grep -q 'fail-interrupt'; then
     \\        printf '{"id":%s,"error":{"code":-32000,"message":"interrupt failed"}}\n' "$id"
@@ -3081,6 +3088,7 @@ test "file session receives every later revision and active close interrupts its
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "thread/delete") != null);
 }
 
 test "file session fork custody deletes every failed initial turn" {
@@ -3232,6 +3240,42 @@ test "local close remains open when turn interruption fails" {
         registry.sessions.items[0].status,
     );
     try std.testing.expect(registry.sessions.items[0].turn_active);
+}
+
+test "local close retains session custody when thread deletion fails" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try installSessionFixture(allocator, io, &tmp, root);
+    defer paths.deinit();
+    var registry = try sessions.Registry.start(allocator, io, root, paths.codex);
+    defer registry.deinit();
+    registry.primary_thread_id = try allocator.dupe(u8, "primary");
+    registry.latest_primary_turn_id = try allocator.dupe(u8, "primary-turn");
+    const opened = try registry.openFile(
+        io,
+        root,
+        "close.zig",
+        "r1",
+        "base",
+        "head",
+        "canonical close diff",
+        "[]",
+        paths.skill,
+        false,
+    );
+    defer opened.deinit();
+    allocator.free(registry.sessions.items[0].thread_id);
+    registry.sessions.items[0].thread_id = try allocator.dupe(u8, "fail-delete");
+    try std.testing.expectError(error.RequestFailed, registry.closeSession(opened.session_id));
+    try std.testing.expectEqual(@as(usize, 1), registry.sessionCount());
+    try std.testing.expectEqual(
+        sessions.SessionStatus.current,
+        registry.sessions.items[0].status,
+    );
 }
 
 fn verifySessionModes(
