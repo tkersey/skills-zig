@@ -15,8 +15,11 @@ pub const generation_review_diff_bytes_max: usize = 128 * 1024 * 1024;
 const rename_metadata_bytes_max: usize = 16 * 1024 * 1024;
 const canonical_git_env_path = "/usr/bin/env";
 const canonical_git_attributes_env = "GIT_ATTR_NOSYSTEM=1";
+const canonical_git_global_config_env = "GIT_CONFIG_GLOBAL=/dev/null";
+const canonical_git_system_config_env = "GIT_CONFIG_NOSYSTEM=1";
 const canonical_git_attributes_config = "core.attributesFile=/dev/null";
 const canonical_git_rename_limit_config = "diff.renameLimit=0";
+const canonical_git_context_arg = "--unified=3";
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
 const CanonicalGitEvidenceView = struct {
@@ -2572,6 +2575,8 @@ fn canonicalRenameEntries(
         &.{
             canonical_git_env_path,
             canonical_git_attributes_env,
+            canonical_git_global_config_env,
+            canonical_git_system_config_env,
             git_path,
             "-c",
             canonical_git_attributes_config,
@@ -2800,6 +2805,22 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
     diff_bytes_max: usize,
     provided_view: ?*const CanonicalGitEvidenceView,
 ) ![]u8 {
+    try ensureRevisionPathObjectAvailable(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        previous_path orelse path,
+    );
+    try ensureRevisionPathObjectAvailable(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        head,
+        path,
+    );
     var local_view: CanonicalGitEvidenceView = undefined;
     var owns_view = false;
     const evidence_view = provided_view orelse blk: {
@@ -2865,6 +2886,42 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
     return result.stdout;
 }
 
+fn ensureRevisionPathObjectAvailable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    revision: []const u8,
+    path: []const u8,
+) !void {
+    const oid = try blobOidAtAlloc(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        revision,
+        path,
+        "",
+    );
+    defer allocator.free(oid);
+    if (oid.len == 0) return;
+    var result = try runCapturedProcess(
+        allocator,
+        io,
+        &.{ git_path, "cat-file", "-e", oid },
+        .{ .path = cwd },
+        null,
+        null,
+        4096,
+        git_stderr_bytes_max,
+        false,
+    );
+    defer result.deinit();
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.GitEvidenceObjectUnavailable;
+    }
+}
+
 fn runCanonicalBlobDiff(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2879,6 +2936,8 @@ fn runCanonicalBlobDiff(
     const argv = [_][]const u8{
         canonical_git_env_path,
         canonical_git_attributes_env,
+        canonical_git_global_config_env,
+        canonical_git_system_config_env,
         evidence_view.git_dir_env,
         evidence_view.object_dir_env,
         git_path,
@@ -2896,6 +2955,7 @@ fn runCanonicalBlobDiff(
         "--dst-prefix=b/",
         "--line-prefix=",
         "--diff-algorithm=myers",
+        canonical_git_context_arg,
         "--no-indent-heuristic",
         "--output-indicator-new=+",
         "--output-indicator-old=-",
@@ -2927,6 +2987,8 @@ fn runCanonicalPathDiff(
     const argv = [_][]const u8{
         canonical_git_env_path,
         canonical_git_attributes_env,
+        canonical_git_global_config_env,
+        canonical_git_system_config_env,
         evidence_view.git_dir_env,
         evidence_view.object_dir_env,
         git_path,
@@ -2945,6 +3007,7 @@ fn runCanonicalPathDiff(
         "--dst-prefix=b/",
         "--line-prefix=",
         "--diff-algorithm=myers",
+        canonical_git_context_arg,
         "--no-indent-heuristic",
         "--output-indicator-new=+",
         "--output-indicator-old=-",
@@ -3251,11 +3314,23 @@ fn expectSingleMergeBaseHydration(
         std.mem.count(u8, log, canonical_git_rename_limit_config),
     );
     try std.testing.expect(std.mem.count(u8, log, "attrs=1") >= 3);
+    try std.testing.expect(std.mem.count(u8, log, "global=/dev/null") >= 3);
+    try std.testing.expect(std.mem.count(u8, log, "nosystem=1") >= 3);
     try std.testing.expect(std.mem.count(
         u8,
         log,
         canonical_git_attributes_config,
     ) >= 3);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, log, "cat-file -e "));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, log, canonical_git_context_arg),
+    );
+    const hydration = std.mem.indexOf(u8, log, "cat-file -e ") orelse
+        return error.MissingObjectHydration;
+    const interpretation = std.mem.indexOf(u8, log, canonical_git_context_arg) orelse
+        return error.MissingCanonicalInterpretation;
+    try std.testing.expect(hydration < interpretation);
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending-a"));
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[1].revision_key, "pending-b"));
 }
@@ -3349,8 +3424,10 @@ test "revision hydration computes one merge base for a generation" {
     defer allocator.free(wrapper_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nprintf 'attrs=%s %s\\n' \"${{GIT_ATTR_NOSYSTEM:-}}\" \"$*\"" ++
-            " >> {s}\nexec /usr/bin/git \"$@\"\n",
+        "#!/bin/sh\nprintf 'attrs=%s global=%s nosystem=%s %s\\n' " ++
+            "\"${{GIT_ATTR_NOSYSTEM:-}}\" \"${{GIT_CONFIG_GLOBAL:-}}\" " ++
+            "\"${{GIT_CONFIG_NOSYSTEM:-}}\" \"$*\" >> {s}\n" ++
+            "exec /usr/bin/git \"$@\"\n",
         .{log_path},
     );
     defer allocator.free(script);
@@ -3382,6 +3459,7 @@ fn configureNonCanonicalDiffDefaults(
         &.{ "git", "config", "diff.noprefix", "true" },
         &.{ "git", "config", "diff.mnemonicPrefix", "true" },
         &.{ "git", "config", "diff.algorithm", "histogram" },
+        &.{ "git", "config", "diff.context", "0" },
         &.{ "git", "config", "diff.indentHeuristic", "true" },
     }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
 }
