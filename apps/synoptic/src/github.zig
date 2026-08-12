@@ -811,7 +811,7 @@ pub const Broker = struct {
         found: *bool,
     ) !void {
         for (threads) |node| {
-            const thread = node.object;
+            const thread = try requiredObject(node);
             const target_path = card.target.path orelse return error.ActionTargetMismatch;
             if (!std.mem.eql(u8, thread.get("path").?.string, target_path)) continue;
             const thread_action = switch (card.kind) {
@@ -857,7 +857,7 @@ pub const Broker = struct {
         const comment_id = card.target.comment_id orelse return;
         const comments = thread.get("comments").?.object;
         for (comments.get("nodes").?.array.items) |value| {
-            const comment = value.object;
+            const comment = try requiredObject(value);
             if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
             if (!comment.get("viewerDidAuthor").?.bool) {
                 return error.GitHubActionNotAuthorized;
@@ -953,22 +953,23 @@ pub const Broker = struct {
         defer parsed.deinit();
         const pull = try pullObject(parsed.value);
         try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
-        for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |thread| {
+        for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |value| {
+            const thread = try requiredObject(value);
             const path = card.target.path orelse return error.ActionTargetMismatch;
-            if (!std.mem.eql(u8, thread.object.get("path").?.string, path)) continue;
+            if (!std.mem.eql(u8, thread.get("path").?.string, path)) continue;
             if (card.target.thread_id) |thread_id| if (!std.mem.eql(
                 u8,
-                thread.object.get("id").?.string,
+                thread.get("id").?.string,
                 thread_id,
             )) continue;
-            if (card.kind == .resolve_thread) return thread.object.get("isResolved").?.bool;
-            if (card.kind == .unresolve_thread) return !thread.object.get("isResolved").?.bool;
-            if (!inlineThreadMatchesCard(thread.object, card)) continue;
+            if (card.kind == .resolve_thread) return thread.get("isResolved").?.bool;
+            if (card.kind == .unresolve_thread) return !thread.get("isResolved").?.bool;
+            if (!inlineThreadMatchesCard(thread, card)) continue;
             if (try self.commentMutationObserved(
                 owner,
                 name,
                 number,
-                thread.object,
+                thread,
                 card,
                 started_unix_s,
                 baseline,
@@ -1117,7 +1118,7 @@ pub const Broker = struct {
                 expected_head,
             );
             for (comments.get("nodes").?.array.items) |value| {
-                const comment = value.object;
+                const comment = try requiredObject(value);
                 if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
                     return .{
                         .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
@@ -1831,6 +1832,15 @@ fn optionalU32(value: ?std.json.Value) ?u32 {
 fn optionalString(value: ?std.json.Value) ?[]const u8 {
     const v = value orelse return null;
     return if (v == .null) null else v.string;
+}
+
+fn requiredObject(value: std.json.Value) !std.json.ObjectMap {
+    if (value != .object) return error.InvalidSnapshot;
+    return value.object;
+}
+
+test "action consumers reject nullable review thread nodes" {
+    try std.testing.expectError(error.InvalidSnapshot, requiredObject(.null));
 }
 
 test "nullable nested review thread node is a typed missing-target error" {
