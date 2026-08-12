@@ -1542,10 +1542,10 @@ fn finishLifecycleRecord(
     launch_id: []const u8,
     terminal_error: ?anyerror,
 ) !void {
+    if (terminal_error) |err| return err;
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
     removeCurrentIfLaunch(allocator, io, current_path, launch_id);
-    if (terminal_error) |err| return err;
     var root = try std.Io.Dir.openDirAbsolute(io, runtime_root, .{});
     defer root.close(io);
     try root.deleteTree(io, launch_id);
@@ -1659,14 +1659,36 @@ fn stop(
             }
         };
     }
+    try finalizeStoppedLaunch(allocator, io, runtime_root, current_path, record);
+    return printStopResult(io, json, record.launch_id, true);
+}
+
+fn finalizeStoppedLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    current_path: []const u8,
+    record: LifecycleRecord,
+) !void {
+    const launch_dir = try std.fs.path.join(
+        allocator,
+        &.{ record.runtime_root, record.launch_id },
+    );
+    defer allocator.free(launch_dir);
     const terminal_error_path = try std.fs.path.join(
         allocator,
-        &.{ record.runtime_root, record.launch_id, "error.json" },
+        &.{ launch_dir, "error.json" },
     );
     defer allocator.free(terminal_error_path);
     try requireNoTerminalError(io, terminal_error_path);
+    if (std.Io.Dir.cwd().access(io, launch_dir, .{})) |_| {
+        try retireDeadStop(allocator, io, runtime_root, current_path, record);
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
-    return printStopResult(io, json, record.launch_id, true);
 }
 
 fn stopStartingProcess(
@@ -2469,7 +2491,7 @@ test "runtime root falls back when TMPDIR is empty or relative" {
     defer allocator.free(configured);
     try std.testing.expectEqualStrings("/private/tmp/custom/synoptic", configured);
 }
-test "terminal shutdown removes its lifecycle record before returning failure" {
+test "terminal shutdown retains its lifecycle record for later retirement" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2495,6 +2517,50 @@ test "terminal shutdown removes its lifecycle record before returning failure" {
             "launch",
             error.SyntheticTerminalFailure,
         ),
+    );
+    _ = try std.Io.Dir.cwd().statFile(io, current_path, .{});
+}
+test "dead stopped launch retires its directory before lifecycle pointer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(runtime);
+    const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const launch_dir = try std.fs.path.join(allocator, &.{ runtime, launch_id });
+    defer allocator.free(launch_dir);
+    try std.Io.Dir.cwd().createDirPath(io, launch_dir);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime, "current.json" });
+    defer allocator.free(current_path);
+    const raw = try std.fmt.allocPrint(
+        allocator,
+        "{{\"runtimeSchema\":\"synoptic-runtime/v1\",\"launchId\":{f}," ++
+            "\"runtimeRoot\":{f},\"executable\":\"/bin/false\"," ++
+            "\"url\":\"http://127.0.0.1:1/\",\"pid\":999999}}",
+        .{ std.json.fmt(launch_id, .{}), std.json.fmt(runtime, .{}) },
+    );
+    defer allocator.free(raw);
+    try writeOperationalFile(allocator, io, current_path, raw);
+    var record = LifecycleRecord{
+        .allocator = allocator,
+        .raw = try allocator.dupe(u8, raw),
+        .launch_id = try allocator.dupe(u8, launch_id),
+        .runtime_root = try allocator.dupe(u8, runtime),
+        .executable = try allocator.dupe(u8, "/bin/false"),
+        .phase = .ready,
+        .url = try allocator.dupe(u8, "http://127.0.0.1:1/"),
+        .worktree = null,
+        .worktree_kind = null,
+        .repository_cwd = null,
+        .repository_identity = null,
+        .pid = 999_999,
+    };
+    defer record.deinit();
+    try finalizeStoppedLaunch(allocator, io, runtime, current_path, record);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
     );
     try std.testing.expectError(
         error.FileNotFound,
