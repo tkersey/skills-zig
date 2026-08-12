@@ -405,6 +405,14 @@ fn serveReview(
     );
     defer allocator.free(repository_cwd);
     options.cwd = repository_cwd;
+    const canonical_skill_root = try canonicalPathFromDirAlloc(
+        allocator,
+        io,
+        std.Io.Dir.cwd(),
+        options.skill_root,
+    );
+    defer allocator.free(canonical_skill_root);
+    options.skill_root = canonical_skill_root;
     try config.validateManifest(allocator, io, options.skill_root);
     var settings = try config.Settings.load(allocator, io, environment, options.skill_root);
     defer settings.deinit();
@@ -1973,6 +1981,17 @@ fn usage() error{InvalidArguments} {
     return error.InvalidArguments;
 }
 
+fn canonicalPathFromDirAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+) ![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute_len = try dir.realPathFile(io, path, &buffer);
+    return allocator.dupe(u8, buffer[0..absolute_len]);
+}
+
 fn runTestCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2015,6 +2034,17 @@ test "launch argv is safe and explicit" {
         },
     );
     try std.testing.expect(options.json);
+}
+test "relative skill roots become absolute before cwd jurisdiction changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "skill", .default_dir);
+    const resolved = try canonicalPathFromDirAlloc(allocator, io, tmp.dir, "skill");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "/skill"));
 }
 test "version command accepts documented and conventional forms only" {
     try std.testing.expect(isVersionCommand(&.{"version"}));
