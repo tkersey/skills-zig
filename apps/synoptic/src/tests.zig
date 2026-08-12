@@ -5581,7 +5581,7 @@ fn prepareWsRuntime(
     state: *app.App,
     registry: *sessions.Registry,
 ) !http.Runtime {
-    var runtime = http.Runtime{
+    return http.Runtime{
         .app = state,
         .registry = registry,
         .broker = .{ .allocator = allocator, .io = io, .gh_path = programs.gh },
@@ -5596,19 +5596,25 @@ fn prepareWsRuntime(
         .custody = .{ .managed = root },
         .refresh_override = injectedRefresh,
     };
+}
+
+fn attachWsToolDomain(
+    allocator: std.mem.Allocator,
+    runtime: *http.Runtime,
+) !void {
     const context = try http.ToolDomainContext.create(
         allocator,
-        state,
-        registry,
+        runtime.app,
+        runtime.registry,
         runtime.broker,
         runtime.owner,
         runtime.name,
         runtime.number,
         runtime.pull_request_id,
+        runtime,
     );
-    try registry.setAuthoritativeToolHandler(context.handler());
+    try runtime.registry.setAuthoritativeToolHandler(context.handler());
     runtime.tool_domain = context;
-    return runtime;
 }
 
 fn requestPendingCommandApproval(
@@ -5631,6 +5637,8 @@ fn verifyReusedApprovalCustody(
     stream: *std.Io.net.Stream,
     runtime: *http.Runtime,
     root: []const u8,
+    codex_log_path: []const u8,
+    gh_log_path: []const u8,
 ) !void {
     try requestPendingCommandApproval(allocator, io, stream);
     var baseline = try worktree.Baseline.capture(allocator, io, root);
@@ -5671,6 +5679,44 @@ fn verifyReusedApprovalCustody(
     try std.testing.expect(std.mem.indexOf(u8, declined, "\"decision\":\"decline\"") != null);
     const completed = try wsRead(allocator, io, stream, "turn/completed");
     defer allocator.free(completed);
+
+    try runtime.registry.message("ses-1", "complete this file");
+    for (0..200) |_| {
+        const log = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            codex_log_path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(log);
+        if (std.mem.indexOf(u8, log, "ReusedCheckoutRefreshRequiresManagedMigration") != null) {
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(5), .awake) catch |sleep_error| {
+            switch (sleep_error) {
+                else => {},
+            }
+        };
+    }
+    const codex_log = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        codex_log_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(codex_log);
+    try std.testing.expect(
+        std.mem.indexOf(u8, codex_log, "ReusedCheckoutRefreshRequiresManagedMigration") != null,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openFileAbsolute(
+            io,
+            gh_log_path,
+            .{ .allow_directory = false },
+        ),
+    );
+    try std.testing.expect(runtime.app.generation.queued("a.zig"));
 }
 
 fn verifyManagedApprovalCustody(
@@ -5703,7 +5749,7 @@ fn verifyManagedApprovalCustody(
     );
 }
 
-test "command approvals revalidate reused custody and retain fail-closed resolution" {
+test "worktree integrity commands and tool completion revalidate reused custody" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -5722,12 +5768,21 @@ test "command approvals revalidate reused custody and retain fail-closed resolut
     var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
     defer server.deinit();
     var runtime = try prepareWsRuntime(allocator, io, root, programs, &state, &registry);
+    try attachWsToolDomain(allocator, &runtime);
     var connection = try connectWs(allocator, io, &server, &runtime);
     defer connection.deinit();
     try verifyWsStartup(allocator, io, &state, &connection.stream);
     const log_path = try verifyWsOpen(allocator, io, &connection.stream, programs.codex);
     defer allocator.free(log_path);
-    try verifyReusedApprovalCustody(allocator, io, &connection.stream, &runtime, root);
+    try verifyReusedApprovalCustody(
+        allocator,
+        io,
+        &connection.stream,
+        &runtime,
+        root,
+        log_path,
+        programs.gh_log,
+    );
     try verifyManagedApprovalCustody(allocator, io, &connection.stream, &runtime, root);
 }
 
@@ -5757,6 +5812,7 @@ test "e2e masked websocket streams normalized review and action events" {
     var server = try http.Server.bind(allocator, io, "/does-not-serve-assets-in-this-test");
     defer server.deinit();
     var runtime = try prepareWsRuntime(allocator, io, root, programs, &state, &registry);
+    try attachWsToolDomain(allocator, &runtime);
     const tool_domain = runtime.tool_domain.?;
     try verifySlowHeaderIsolation(io, &server, &runtime);
     var connection = try connectWs(allocator, io, &server, &runtime);

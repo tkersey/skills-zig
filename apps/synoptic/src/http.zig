@@ -32,6 +32,7 @@ pub const ToolDomainContext = struct {
     pull_request_id: []const u8,
     mutex: DomainMutex,
     cancelled: std.atomic.Value(bool) = .init(false),
+    runtime: ?*Runtime,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -42,6 +43,7 @@ pub const ToolDomainContext = struct {
         name: []const u8,
         number: u64,
         pull_request_id: []const u8,
+        runtime: ?*Runtime,
     ) !*ToolDomainContext {
         const context = try allocator.create(ToolDomainContext);
         context.* = .{
@@ -54,6 +56,7 @@ pub const ToolDomainContext = struct {
             .number = number,
             .pull_request_id = pull_request_id,
             .mutex = .{ .io = broker.io },
+            .runtime = runtime,
         };
         context.broker.cancelled = &context.cancelled;
         return context;
@@ -169,6 +172,9 @@ pub const ToolDomainContext = struct {
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
         if (identity.status != .current) return error.NotOfficialCurrentSession;
+        try Server.requireReviewWorktree(
+            self.runtime orelse return error.WorktreeAdmissionUnavailable,
+        );
         try self.app.completeRevision(
             self.broker,
             self.owner,
@@ -933,7 +939,7 @@ pub const Server = struct {
         defer mutex.unlock();
         if (!runtime.app.primary_ready) return error.PrimaryNotReady;
         if (!runtime.app.generation.queued(path)) return error.FileNotQueued;
-        try self.requireReviewWorktree(runtime);
+        try requireReviewWorktree(runtime);
         const revision = @import("domain.zig").revisionFor(
             &runtime.app.generation,
             path,
@@ -1020,7 +1026,7 @@ pub const Server = struct {
             return error.InvalidUiCommand;
         const mutex = domainMutex(runtime);
         mutex.lock();
-        self.requireReviewWorktree(runtime) catch |err| {
+        requireReviewWorktree(runtime) catch |err| {
             mutex.unlock();
             return err;
         };
@@ -1062,7 +1068,7 @@ pub const Server = struct {
         defer self.allocator.free(choice_json);
         if (!approvalDecisionFailsClosed(decision)) {
             if (!runtime.worktree_generation_valid) return error.WorktreeGenerationMismatch;
-            try self.requireReviewWorktree(runtime);
+            try requireReviewWorktree(runtime);
         }
         try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
         const mutex = domainMutex(runtime);
@@ -1132,11 +1138,11 @@ pub const Server = struct {
         return self.actionStatusEnvelope(runtime, card_id, terminal);
     }
 
-    fn requireReviewWorktree(self: *Server, runtime: *Runtime) !void {
+    fn requireReviewWorktree(runtime: *Runtime) !void {
         if (runtime.custody == .managed) return;
         worktree.requireReviewAdmission(
-            self.allocator,
-            self.io,
+            runtime.broker.allocator,
+            runtime.broker.io,
             runtime.custody,
             runtime.baseline orelse return error.MissingWorktreeBaseline,
         ) catch |err| {
@@ -2090,6 +2096,7 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
         "repository",
         1,
         "PR_1",
+        null,
     );
     const handler = context.handler();
     defer handler.deinit.?(handler.context);

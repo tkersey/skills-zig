@@ -877,8 +877,7 @@ fn serveHttpRuntime(
         &.{ context.runtime_root, context.launch_id, "stop.request" },
     );
     defer allocator.free(stop_request_path);
-    var runtime = try makeServingRuntime(
-        allocator,
+    var runtime = makeServingRuntime(
         context,
         pull_request_id,
         custody,
@@ -889,6 +888,7 @@ fn serveHttpRuntime(
         skill_path,
         stop_request_path,
     );
+    runtime.tool_domain = try configureToolDomain(allocator, &runtime);
     const tool_domain = runtime.tool_domain.?;
     registry.setExclusionsPending(true);
     state.primary_ready = false;
@@ -928,7 +928,6 @@ fn serveHttpRuntime(
 }
 
 fn makeServingRuntime(
-    allocator: std.mem.Allocator,
     context: GenerationContext,
     pull_request_id: []const u8,
     custody: worktree.Custody,
@@ -938,8 +937,8 @@ fn makeServingRuntime(
     review_cwd: []const u8,
     skill_path: []const u8,
     stop_request_path: []const u8,
-) !http.Runtime {
-    var runtime = makeHttpRuntime(
+) http.Runtime {
+    return makeHttpRuntime(
         context.settings,
         context.options,
         context.identity,
@@ -955,15 +954,6 @@ fn makeServingRuntime(
         context.launch_id,
         stop_request_path,
     );
-    runtime.tool_domain = try configureToolDomain(
-        allocator,
-        state,
-        registry,
-        context.broker,
-        context.identity,
-        pull_request_id,
-    );
-    return runtime;
 }
 
 fn startLaunchExclusionWork(
@@ -994,23 +984,20 @@ fn startLaunchExclusionWork(
 
 fn configureToolDomain(
     allocator: std.mem.Allocator,
-    state: *App,
-    registry: *sessions.Registry,
-    broker: github.Broker,
-    identity: pr.Identity,
-    pull_request_id: []const u8,
+    runtime: *http.Runtime,
 ) !*http.ToolDomainContext {
     const context = try http.ToolDomainContext.create(
         allocator,
-        state,
-        registry,
-        broker,
-        identity.owner,
-        identity.repository,
-        identity.number,
-        pull_request_id,
+        runtime.app,
+        runtime.registry,
+        runtime.broker,
+        runtime.owner,
+        runtime.name,
+        runtime.number,
+        runtime.pull_request_id,
+        runtime,
     );
-    registry.setAuthoritativeToolHandler(context.handler()) catch |err| {
+    runtime.registry.setAuthoritativeToolHandler(context.handler()) catch |err| {
         allocator.destroy(context);
         return err;
     };
