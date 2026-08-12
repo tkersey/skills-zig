@@ -1909,6 +1909,40 @@ test "exclusions config XDG precedence and strong classification" {
     try std.testing.expect(settings.classify("vendor/lib/a.js", "GIT binary patch") == null);
 }
 
+test "exclusions config recognizes only complete binary diff records" {
+    var settings = config.Settings{ .allocator = std.testing.allocator };
+    defer settings.deinit();
+
+    const cases = [_]struct {
+        diff: []const u8,
+        binary: bool,
+    }{
+        .{ .diff = "GIT binary patch", .binary = true },
+        .{ .diff = "header\nGIT binary patch\nbody", .binary = true },
+        .{ .diff = "GIT binary patch\r\n", .binary = true },
+        .{ .diff = "Binary files a/image.png and b/image.png differ", .binary = true },
+        .{ .diff = "Binary files a/image.png and b/image.png differ\r\n", .binary = true },
+        .{ .diff = "+GIT binary patch", .binary = false },
+        .{ .diff = "-GIT binary patch", .binary = false },
+        .{ .diff = " GIT binary patch", .binary = false },
+        .{ .diff = "GIT binary patch suffix", .binary = false },
+        .{ .diff = "const marker = \"GIT binary patch\";", .binary = false },
+        .{ .diff = "+Binary files a/image.png and b/image.png differ", .binary = false },
+        .{ .diff = "-Binary files a/image.png and b/image.png differ", .binary = false },
+        .{ .diff = "Binary files a/image.png and b/image.png differ suffix", .binary = false },
+        .{ .diff = "prefix Binary files a/image.png and b/image.png differ", .binary = false },
+        .{ .diff = "// Binary files a/image.png and b/image.png differ", .binary = false },
+        .{ .diff = "ordinary source", .binary = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.binary, settings.classifyDiff(case.diff) != null);
+    }
+
+    settings.exclusions_enabled = false;
+    try std.testing.expect(settings.classifyDiff("GIT binary patch") == null);
+}
+
 const CancelWhenFileExists = struct {
     cancelled: *std.atomic.Value(bool),
     path: []const u8,
