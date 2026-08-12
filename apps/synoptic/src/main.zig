@@ -447,16 +447,7 @@ fn serveReview(
     defer allocator.free(gh_resolved);
     const codex_resolved = try @import("cas_runtime").resolveExecutableAlloc(allocator, codex_path);
     defer allocator.free(codex_resolved);
-    const schema_dir = try std.fs.path.join(
-        allocator,
-        &.{ runtime_root, launch_id, "codex-schema" },
-    );
-    defer allocator.free(schema_dir);
-    if (try config.codexSchemaProblemAlloc(allocator, io, codex_resolved, schema_dir)) |problem| {
-        defer allocator.free(problem);
-        try writeLaunchProblem(allocator, io, runtime_root, launch_id, problem);
-        return error.CodexSchemaIncompatible;
-    }
+    try validateCodexSchemaForLaunch(allocator, io, codex_resolved, runtime_root, launch_id);
     try preflightGhAuthentication(
         allocator,
         io,
@@ -486,6 +477,25 @@ fn serveReview(
         launch_id,
         runtime_root,
     );
+}
+
+fn validateCodexSchemaForLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    codex_path: []const u8,
+    runtime_root: []const u8,
+    launch_id: []const u8,
+) !void {
+    const schema_dir = try std.fs.path.join(
+        allocator,
+        &.{ runtime_root, launch_id, "codex-schema" },
+    );
+    defer allocator.free(schema_dir);
+    if (try config.codexSchemaProblemAlloc(allocator, io, codex_path, schema_dir)) |problem| {
+        defer allocator.free(problem);
+        try writeLaunchProblem(allocator, io, runtime_root, launch_id, problem);
+        return error.CodexSchemaIncompatible;
+    }
 }
 
 fn serveResolvedPullRequest(

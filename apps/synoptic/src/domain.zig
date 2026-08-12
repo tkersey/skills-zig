@@ -782,8 +782,10 @@ pub const PrGeneration = struct {
         right: []const u8,
     ) bool {
         if (std.mem.eql(u8, left, right)) return true;
-        const current_left = (self.resolveCurrentPath(left) catch return false) orelse return false;
-        const current_right = (self.resolveCurrentPath(right) catch return false) orelse return false;
+        const current_left = (self.resolveCurrentPath(left) catch return false) orelse
+            return false;
+        const current_right = (self.resolveCurrentPath(right) catch return false) orelse
+            return false;
         return std.mem.eql(u8, current_left, current_right);
     }
 

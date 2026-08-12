@@ -287,6 +287,40 @@ pub const ActionStore = struct {
         errdefer self.allocator.free(slot);
         const effect_summary = try self.allocator.dupe(u8, input.effect_summary);
         errdefer self.allocator.free(effect_summary);
+        const target = try self.buildTarget(input, authoritative, github_path);
+        errdefer self.freeTarget(target);
+        const body = try dupeOptional(self.allocator, input.body);
+        errdefer if (body) |value| self.allocator.free(value);
+        const payload_json = try self.allocator.dupe(u8, input.payload_json);
+        errdefer self.allocator.free(payload_json);
+        const owned_supersedes = try dupeOptional(self.allocator, supersedes);
+        errdefer if (owned_supersedes) |value| self.allocator.free(value);
+        const transparent = if (input.kind == .graphql)
+            try self.buildTransparentAction(input)
+        else
+            null;
+        errdefer if (transparent) |action| self.freeTransparent(action);
+        return .{
+            .id = id,
+            .session_id = owned_session_id,
+            .source_turn_id = owned_turn_id,
+            .slot = slot,
+            .kind = input.kind,
+            .effect_summary = effect_summary,
+            .target = target,
+            .body = body,
+            .payload_json = payload_json,
+            .graphql = transparent,
+            .supersedes = owned_supersedes,
+        };
+    }
+
+    fn buildTarget(
+        self: *ActionStore,
+        input: PreparedActionInput,
+        authoritative: AuthoritativeTarget,
+        github_path: ?[]const u8,
+    ) !ActionTarget {
         const repository = try self.allocator.dupe(u8, authoritative.repository);
         errdefer self.allocator.free(repository);
         const pull_request_id = try self.allocator.dupe(u8, authoritative.pull_request_id);
@@ -312,45 +346,40 @@ pub const ActionStore = struct {
         errdefer if (comment_id) |value| self.allocator.free(value);
         const snapshot = try dupeOptional(self.allocator, authoritative.comment_body_snapshot);
         errdefer if (snapshot) |value| self.allocator.free(value);
-        const body = try dupeOptional(self.allocator, input.body);
-        errdefer if (body) |value| self.allocator.free(value);
-        const payload_json = try self.allocator.dupe(u8, input.payload_json);
-        errdefer self.allocator.free(payload_json);
-        const owned_supersedes = try dupeOptional(self.allocator, supersedes);
-        errdefer if (owned_supersedes) |value| self.allocator.free(value);
-        const transparent = if (input.kind == .graphql)
-            try self.buildTransparentAction(input)
-        else
-            null;
-        errdefer if (transparent) |action| self.freeTransparent(action);
         return .{
-            .id = id,
-            .session_id = owned_session_id,
-            .source_turn_id = owned_turn_id,
-            .slot = slot,
-            .kind = input.kind,
-            .effect_summary = effect_summary,
-            .target = .{
-                .repository = repository,
-                .pull_request = authoritative.pull_request,
-                .pull_request_id = pull_request_id,
-                .base_oid = base_oid,
-                .head_oid = head_oid,
-                .session_path = session_path,
-                .current_path = current_path,
-                .path = path,
-                .line = input.line,
-                .start_line = input.start_line,
-                .side = side,
-                .thread_id = thread_id,
-                .comment_id = comment_id,
-                .comment_body_snapshot = snapshot,
-            },
-            .body = body,
-            .payload_json = payload_json,
-            .graphql = transparent,
-            .supersedes = owned_supersedes,
+            .repository = repository,
+            .pull_request = authoritative.pull_request,
+            .pull_request_id = pull_request_id,
+            .base_oid = base_oid,
+            .head_oid = head_oid,
+            .session_path = session_path,
+            .current_path = current_path,
+            .path = path,
+            .line = input.line,
+            .start_line = input.start_line,
+            .side = side,
+            .thread_id = thread_id,
+            .comment_id = comment_id,
+            .comment_body_snapshot = snapshot,
         };
+    }
+
+    fn freeTarget(self: *ActionStore, target: ActionTarget) void {
+        inline for (.{
+            target.repository,
+            target.pull_request_id,
+            target.base_oid,
+            target.head_oid,
+            target.session_path,
+            target.current_path,
+        }) |value| self.allocator.free(value);
+        inline for (.{
+            target.path,
+            target.side,
+            target.thread_id,
+            target.comment_id,
+            target.comment_body_snapshot,
+        }) |value| if (value) |owned| self.allocator.free(owned);
     }
 
     fn buildTransparentAction(
@@ -460,27 +489,17 @@ pub const ActionStore = struct {
                 card.source_turn_id,
                 card.slot,
                 card.effect_summary,
-                card.target.repository,
-                card.target.pull_request_id,
-                card.target.base_oid,
-                card.target.head_oid,
-                card.target.session_path,
-                card.target.current_path,
                 card.payload_json,
             },
         ) |value| self.allocator.free(value);
         inline for (
             .{
-                card.target.path,
-                card.target.side,
-                card.target.thread_id,
-                card.target.comment_id,
-                card.target.comment_body_snapshot,
                 card.body,
                 card.supersedes,
             },
         ) |value| if (value) |owned|
             self.allocator.free(owned);
+        self.freeTarget(card.target);
         if (card.graphql) |action| inline for (
             .{ action.operation_name, action.document, action.variables },
         ) |value| self.allocator.free(value);

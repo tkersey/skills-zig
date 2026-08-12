@@ -702,28 +702,7 @@ pub const Registry = struct {
             self.primary_thread_id.?,
             file_metadata_pages,
         );
-        const primary_role = try readReference(
-            self.allocator,
-            io,
-            skill_path,
-            "primary-context.md",
-        );
-        defer self.allocator.free(primary_role);
-        const untrusted = try readReference(
-            self.allocator,
-            io,
-            skill_path,
-            "untrusted-repository-content.md",
-        );
-        defer self.allocator.free(untrusted);
-        const prompt = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}\n\n{s}\n\nAuthoritative current pull request:\n{s}" ++
-                "\nThis primary context is hidden infrastructure. Do no" ++
-                "t invoke Synoptic tools or produce publication-ready p" ++
-                "er-file review actions.",
-            .{ primary_role, untrusted, pr_json },
-        );
+        const prompt = try self.primaryPromptAlloc(io, skill_path, pr_json);
         defer self.allocator.free(prompt);
         const turn_params = try std.fmt.allocPrint(
             self.allocator,
@@ -743,6 +722,36 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.installPrimaryTurnLocked(primary_turn);
+    }
+
+    fn primaryPromptAlloc(
+        self: *Registry,
+        io: std.Io,
+        skill_path: []const u8,
+        pr_json: []const u8,
+    ) ![]u8 {
+        const primary_role = try readReference(
+            self.allocator,
+            io,
+            skill_path,
+            "primary-context.md",
+        );
+        defer self.allocator.free(primary_role);
+        const untrusted = try readReference(
+            self.allocator,
+            io,
+            skill_path,
+            "untrusted-repository-content.md",
+        );
+        defer self.allocator.free(untrusted);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n\n{s}\n\nAuthoritative current pull request:\n{s}" ++
+                "\nThis primary context is hidden infrastructure. Do no" ++
+                "t invoke Synoptic tools or produce publication-ready p" ++
+                "er-file review actions.",
+            .{ primary_role, untrusted, pr_json },
+        );
     }
 
     pub fn primaryReady(self: *Registry) bool {
@@ -2824,11 +2833,14 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         return .github_any;
     }
     const action_object = actionObjectAfterVerb(directive, &.{
-        "add",    "remove", "set",     "request", "submit",  "dismiss", "change", "execute",
-        "update", "close",  "reopen",  "merge",   "resolve", "reply",   "delete", "unmark",
-        "mark",   "post",   "publish", "prepare",
+        "add",     "remove", "set",   "request", "submit",  "dismiss", "change",
+        "execute", "update", "close", "reopen",  "merge",   "resolve", "reply",
+        "delete",  "unmark", "mark",  "post",    "publish", "prepare",
     });
-    const positive_object = if (action_object) |object| positiveObjectBeforeNegation(object) else null;
+    const positive_object = if (action_object) |object|
+        positiveObjectBeforeNegation(object)
+    else
+        null;
     const github_target = positive_object != null and containsAnyIgnoreCase(positive_object.?, &.{
         "label",   "reviewer", "assignee", "milestone", "pull request",  "this pr",
         "the pr",  "pr #",     "comment",  "thread",    "github review", "mark viewed",

@@ -1127,6 +1127,27 @@ test "automatic exclusion results bind the complete base head generation" {
     );
 }
 
+fn refreshTestPullRequest(
+    title: []const u8,
+    body: []const u8,
+    base_oid: []const u8,
+    head_oid: []const u8,
+) domain.PullRequestHeader {
+    return .{
+        .repository = "o/r",
+        .number = 1,
+        .title = title,
+        .body = body,
+        .url = "https://example/1",
+        .base_ref_name = "main",
+        .base_ref_oid = base_oid,
+        .head_ref_name = "feature",
+        .head_ref_oid = head_oid,
+        .state = "OPEN",
+        .is_draft = false,
+    };
+}
+
 test "refresh preparation is non-mutating across allocation failure" {
     var successes: usize = 0;
     for (0..48) |fail_index| {
@@ -1137,19 +1158,12 @@ test "refresh preparation is non-mutating across allocation failure" {
             .viewed = .unviewed,
             .revision_key = "r1",
         });
-        try state.setPullRequest(.{
-            .repository = "o/r",
-            .number = 1,
-            .title = "old title",
-            .body = "old body",
-            .url = "https://example/1",
-            .base_ref_name = "main",
-            .base_ref_oid = "old-base",
-            .head_ref_name = "feature",
-            .head_ref_oid = "old-head",
-            .state = "OPEN",
-            .is_draft = false,
-        });
+        try state.setPullRequest(refreshTestPullRequest(
+            "old title",
+            "old body",
+            "old-base",
+            "old-head",
+        ));
         try state.tabs.append(std.testing.allocator, .{
             .id = try std.testing.allocator.dupe(u8, "session"),
             .path = try std.testing.allocator.dupe(u8, "a.zig"),
@@ -1173,19 +1187,10 @@ test "refresh preparation is non-mutating across allocation failure" {
             .{ .fail_index = fail_index },
         );
         state.allocator = failing.allocator();
-        const prepared = state.prepareRefresh(&next, .{
-            .repository = "o/r",
-            .number = 1,
-            .title = "new title",
-            .body = "new body",
-            .url = "https://example/1",
-            .base_ref_name = "main",
-            .base_ref_oid = "new-base",
-            .head_ref_name = "feature",
-            .head_ref_oid = "new-head",
-            .state = "OPEN",
-            .is_draft = false,
-        });
+        const prepared = state.prepareRefresh(
+            &next,
+            refreshTestPullRequest("new title", "new body", "new-base", "new-head"),
+        );
         if (prepared) |plan_value| {
             var plan = plan_value;
             plan.deinit();
