@@ -83,6 +83,7 @@ const ExclusionProbe = struct {
     previous_path: ?[]u8,
     revision: []u8,
     reason: ?[]u8,
+    binary: bool,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -90,6 +91,7 @@ const ExclusionProbe = struct {
         previous_path: ?[]const u8,
         revision: []const u8,
         reason: ?[]const u8,
+        binary: bool,
     ) !ExclusionProbe {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -107,6 +109,7 @@ const ExclusionProbe = struct {
             .previous_path = owned_previous_path,
             .revision = owned_revision,
             .reason = owned_reason,
+            .binary = binary,
         };
     }
 
@@ -140,47 +143,14 @@ pub const AutomaticExclusionBatch = struct {
         broker: github.Broker,
         cwd: []const u8,
     ) !void {
+        _ = settings;
+        _ = cwd;
         std.debug.assert(self.candidates.items.len == 0);
-        var merge_base: ?[]u8 = null;
-        defer if (merge_base) |owned| self.allocator.free(owned);
-        for (self.probes.items) |probe| {
-            if (probe.reason != null) continue;
-            merge_base = github.canonicalMergeBaseAlloc(
-                self.allocator,
-                broker.io,
-                broker.git_path,
-                cwd,
-                self.base_oid,
-                self.head_oid,
-                broker.cancelled,
-            ) catch |err| switch (err) {
-                error.GitDiffCancelled => return err,
-                else => null,
-            };
-            break;
-        }
         for (self.probes.items) |probe| {
             if (broker.cancelled) |cancelled| {
                 if (cancelled.load(.acquire)) return error.GitDiffCancelled;
             }
-            const reason = probe.reason orelse binary: {
-                const diff = github.canonicalDiffFromMergeBaseAlloc(
-                    self.allocator,
-                    broker.io,
-                    broker.git_path,
-                    cwd,
-                    merge_base orelse continue,
-                    self.head_oid,
-                    probe.path,
-                    probe.previous_path,
-                    broker.cancelled,
-                ) catch |err| switch (err) {
-                    error.GitDiffCancelled => return err,
-                    else => continue,
-                };
-                defer self.allocator.free(diff);
-                break :binary settings.classifyDiff(diff) orelse continue;
-            };
+            const reason = probe.reason orelse if (probe.binary) "binary" else continue;
             var candidate = try ExclusionCandidate.init(
                 self.allocator,
                 probe.path,
@@ -366,7 +336,7 @@ pub const App = struct {
             self.allocator.free(tab.diff);
             tab.id = id;
             tab.diff = content;
-            tab.diff_state = diffDisplayState(diff);
+            tab.diff_state = domain.diffDisplayState(diff);
             tab.reused = reused;
             tab.initial_review = initial_review;
             if (!reused) tab.turn_active = initial_review;
@@ -408,7 +378,10 @@ pub const App = struct {
             const content = try self.allocator.dupe(u8, diff orelse "");
             self.allocator.free(tab.diff);
             tab.diff = content;
-            tab.diff_state = if (diff) |value| diffDisplayState(value) else .unavailable;
+            tab.diff_state = if (diff) |value|
+                domain.diffDisplayState(value)
+            else
+                .unavailable;
         };
     }
 
@@ -463,7 +436,9 @@ pub const App = struct {
         pull_request_id: []const u8,
         session_path: []const u8,
     ) !tools.ActionCard {
-        const github_path = try self.actionTargetPath(input, session_path);
+        const current_path = self.generation.currentPath(session_path) orelse
+            return error.ActionTargetChanged;
+        const github_path = try self.actionTargetPath(input, current_path);
         const comment_body_snapshot = try self.commentBodySnapshot(input);
         const card = try self.action_store.prepare(
             session_id,
@@ -476,6 +451,7 @@ pub const App = struct {
                 .base_oid = self.generation.base_oid,
                 .head_oid = self.generation.head_oid,
                 .session_path = session_path,
+                .current_path = current_path,
                 .github_path = github_path,
                 .comment_body_snapshot = comment_body_snapshot,
             },
@@ -487,12 +463,12 @@ pub const App = struct {
     fn actionTargetPath(
         self: *const App,
         input: tools.PreparedActionInput,
-        session_path: []const u8,
+        current_path: []const u8,
     ) !?[]const u8 {
         if (input.thread_id) |thread_id| {
             for (self.generation.threads.items) |thread| {
                 if (!std.mem.eql(u8, thread.id, thread_id)) continue;
-                if (!self.generation.sameReviewFile(thread.path, session_path)) {
+                if (!self.generation.sameReviewFile(thread.path, current_path)) {
                     return error.ActionTargetsAnotherSession;
                 }
                 return thread.path;
@@ -503,7 +479,7 @@ pub const App = struct {
             for (self.generation.threads.items) |thread| {
                 for (thread.comments) |comment| {
                     if (!std.mem.eql(u8, comment.id, comment_id)) continue;
-                    if (!self.generation.sameReviewFile(thread.path, session_path)) {
+                    if (!self.generation.sameReviewFile(thread.path, current_path)) {
                         return error.ActionTargetsAnotherSession;
                     }
                     return thread.path;
@@ -830,6 +806,7 @@ pub const App = struct {
                 file.previous_path,
                 file.revision_key,
                 settings.classifyPath(file.path),
+                file.diff_state == .binary,
             );
             errdefer probe.deinit();
             try batch.probes.append(self.allocator, probe);
@@ -1010,13 +987,6 @@ pub const App = struct {
     }
 };
 
-fn diffDisplayState(diff: []const u8) domain.DiffDisplayState {
-    const binary = std.mem.indexOf(u8, diff, "GIT binary patch") != null or
-        std.mem.indexOf(u8, diff, "Binary files ") != null;
-    if (binary) return .binary;
-    return .text;
-}
-
 fn viewedStateName(state: domain.ViewedState) []const u8 {
     return switch (state) {
         .viewed => "VIEWED",
@@ -1086,6 +1056,7 @@ test "action invalidation updates the application snapshot" {
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
     });
     state.pending = card.*;
     try state.invalidateAction(card.id);

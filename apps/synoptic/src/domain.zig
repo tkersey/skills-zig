@@ -3,6 +3,21 @@ const std = @import("std");
 pub const ViewedState = enum { viewed, unviewed, dismissed };
 pub const SessionStatus = enum { current, stale_origin, completed, closed };
 pub const DiffDisplayState = enum { text, binary, unavailable };
+pub const max_inline_thread_evidence_bytes: usize = 512 * 1024;
+
+pub fn diffDisplayState(diff: []const u8) DiffDisplayState {
+    var lines = std.mem.splitScalar(u8, diff, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r"))
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        if (std.mem.eql(u8, line, "GIT binary patch") or
+            (std.mem.startsWith(u8, line, "Binary files ") and
+                std.mem.endsWith(u8, line, " differ"))) return .binary;
+    }
+    return .text;
+}
 
 pub const PullRequestHeader = struct {
     repository: []const u8,
@@ -187,6 +202,8 @@ pub const File = struct {
     change_type: []const u8 = "MODIFIED",
     viewed: ViewedState,
     revision_key: []const u8,
+    canonical_diff: []const u8 = "",
+    diff_state: DiffDisplayState = .unavailable,
     exclusion_reason: ?[]const u8 = null,
     exclusion_sync_error: ?[]const u8 = null,
 };
@@ -218,6 +235,7 @@ pub const PrGeneration = struct {
             self.allocator.free(file.path);
             if (file.previous_path) |value| self.allocator.free(value);
             self.allocator.free(file.revision_key);
+            self.allocator.free(file.canonical_diff);
             self.allocator.free(file.change_type);
             if (file.exclusion_reason) |value| self.allocator.free(value);
             if (file.exclusion_sync_error) |value| self.allocator.free(value);
@@ -243,6 +261,8 @@ pub const PrGeneration = struct {
         errdefer self.allocator.free(change_type);
         const revision_key = try self.allocator.dupe(u8, file.revision_key);
         errdefer self.allocator.free(revision_key);
+        const canonical_diff = try self.allocator.dupe(u8, file.canonical_diff);
+        errdefer self.allocator.free(canonical_diff);
         const exclusion_reason = if (file.exclusion_reason) |value|
             try self.allocator.dupe(u8, value)
         else
@@ -261,6 +281,8 @@ pub const PrGeneration = struct {
             .change_type = change_type,
             .viewed = file.viewed,
             .revision_key = revision_key,
+            .canonical_diff = canonical_diff,
+            .diff_state = file.diff_state,
             .exclusion_reason = exclusion_reason,
             .exclusion_sync_error = exclusion_sync_error,
         });
@@ -361,6 +383,49 @@ pub const PrGeneration = struct {
         };
         try out.writer.writeByte(']');
         return out.toOwnedSlice();
+    }
+
+    pub fn boundedUnresolvedThreadsJsonAlloc(
+        self: *const PrGeneration,
+        allocator: std.mem.Allocator,
+        assigned_path: []const u8,
+        query: ?[]const u8,
+        paths: []const []const u8,
+        whole_pr: bool,
+    ) ![]u8 {
+        const suffix_false = "],\"truncated\":false}";
+        const suffix_true = "],\"truncated\":true," ++
+            "\"instruction\":\"Use synoptic.search_unresolved_threads for " ++
+            "additional current evidence.\"}";
+        const content_limit = max_inline_thread_evidence_bytes - suffix_true.len;
+        const storage = try allocator.alloc(u8, max_inline_thread_evidence_bytes);
+        errdefer allocator.free(storage);
+        var writer = std.Io.Writer.fixed(storage[0..content_limit]);
+        try writer.writeAll("{\"threads\":[");
+        var first = true;
+        var truncated = false;
+        outer: for (0..2) |pass| for (self.threads.items) |thread| {
+            const assigned = self.sameReviewFile(thread.path, assigned_path);
+            if ((pass == 0) != assigned) continue;
+            if (pass == 1 and !whole_pr) continue;
+            if (!self.threadMatchesSearch(thread, query, paths)) continue;
+            const checkpoint = writer.end;
+            if (!first) writer.writeByte(',') catch {
+                truncated = true;
+                break :outer;
+            };
+            std.json.Stringify.value(thread, .{}, &writer) catch {
+                writer.end = checkpoint;
+                truncated = true;
+                break :outer;
+            };
+            first = false;
+        };
+        const suffix = if (truncated) suffix_true else suffix_false;
+        @memcpy(storage[writer.end .. writer.end + suffix.len], suffix);
+        const result = try allocator.dupe(u8, storage[0 .. writer.end + suffix.len]);
+        allocator.free(storage);
+        return result;
     }
 
     pub fn unresolvedThreadsPageJsonAlloc(
@@ -502,6 +567,32 @@ pub const PrGeneration = struct {
         return error.UnknownFile;
     }
 
+    pub fn setCanonicalDiff(self: *PrGeneration, path: []const u8, diff: []const u8) !void {
+        for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
+            const owned = try self.allocator.dupe(u8, diff);
+            self.allocator.free(file.canonical_diff);
+            file.canonical_diff = owned;
+            file.diff_state = diffDisplayState(diff);
+            return;
+        };
+        return error.UnknownFile;
+    }
+
+    pub fn canonicalDiff(self: *const PrGeneration, path: []const u8) ?[]const u8 {
+        for (self.files.items) |file| if (std.mem.eql(u8, file.path, path)) {
+            if (file.diff_state == .unavailable) return null;
+            return file.canonical_diff;
+        };
+        return null;
+    }
+
+    pub fn diffState(self: *const PrGeneration, path: []const u8) DiffDisplayState {
+        for (self.files.items) |file| if (std.mem.eql(u8, file.path, path)) {
+            return file.diff_state;
+        };
+        return .unavailable;
+    }
+
     pub fn setPreviousPath(
         self: *PrGeneration,
         path: []const u8,
@@ -520,6 +611,18 @@ pub const PrGeneration = struct {
         for (self.files.items) |file| if (std.mem.eql(u8, file.path, path)) {
             return file.previous_path;
         };
+        return null;
+    }
+
+    pub fn currentPath(self: *const PrGeneration, review_path: []const u8) ?[]const u8 {
+        for (self.files.items) |file| if (std.mem.eql(u8, file.path, review_path)) {
+            return file.path;
+        };
+        for (self.files.items) |file| {
+            if (!std.mem.eql(u8, file.change_type, "RENAMED")) continue;
+            const previous = file.previous_path orelse continue;
+            if (std.mem.eql(u8, previous, review_path)) return file.path;
+        }
         return null;
     }
 

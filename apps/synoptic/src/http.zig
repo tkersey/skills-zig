@@ -901,17 +901,9 @@ pub const Server = struct {
             &runtime.app.generation,
             path,
         ) orelse return error.MissingRevision;
-        const diff = try github.canonicalReviewDiffAlloc(
-            self.allocator,
-            self.io,
-            runtime.cwd,
-            runtime.app.generation.base_oid,
-            runtime.app.generation.head_oid,
-            path,
-            runtime.app.generation.previousPath(path),
-        );
-        defer self.allocator.free(diff);
-        const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(
+        const diff = runtime.app.generation.canonicalDiff(path) orelse
+            return error.MissingCanonicalDiff;
+        const threads = try runtime.app.generation.boundedUnresolvedThreadsJsonAlloc(
             self.allocator,
             path,
             null,
@@ -1121,16 +1113,9 @@ pub const Server = struct {
         runtime: *Runtime,
         card: tools.ActionCard,
     ) !bool {
-        const diff = try github.canonicalFileDiffAlloc(
-            self.allocator,
-            self.io,
-            runtime.cwd,
-            runtime.app.generation.base_oid,
-            runtime.app.generation.head_oid,
-            card.target.session_path,
-            runtime.app.generation.previousPath(card.target.session_path),
-        );
-        defer self.allocator.free(diff);
+        _ = self;
+        const diff = runtime.app.generation.canonicalDiff(card.target.current_path) orelse
+            return false;
         return github.validateDiffAnchor(
             diff,
             card.target.line.?,
@@ -1339,25 +1324,17 @@ pub const Server = struct {
         runtime: *Runtime,
         next: *const @import("domain.zig").PrGeneration,
     ) !void {
+        _ = self;
         for (runtime.app.tabs.items) |tab| {
             if (tab.status == .closed) continue;
-            if (@import("domain.zig").revisionFor(next, tab.path) == null) {
-                try runtime.app.updateTabDiff(tab.path, null);
-                continue;
-            }
-            const current_diff = github.canonicalReviewDiffAlloc(
-                self.allocator,
-                self.io,
-                runtime.cwd,
-                next.base_oid,
-                next.head_oid,
-                tab.path,
-                next.previousPath(tab.path),
-            ) catch {
+            const current_path = next.currentPath(tab.path) orelse {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
             };
-            defer self.allocator.free(current_diff);
+            const current_diff = next.canonicalDiff(current_path) orelse {
+                try runtime.app.updateTabDiff(tab.path, null);
+                continue;
+            };
             try runtime.app.updateTabDiff(tab.path, current_diff);
         }
     }
@@ -1371,16 +1348,17 @@ pub const Server = struct {
         defer paths.deinit(self.allocator);
         try appendLiveTabPaths(self.allocator, &paths, runtime.app.tabs.items);
         for (paths.items) |path| {
-            const threads = try next.unresolvedThreadsJsonAlloc(
-                self.allocator,
-                path,
-                null,
-                &.{},
-                false,
-            );
-            defer self.allocator.free(threads);
-            const next_revision = @import("domain.zig").revisionFor(next, path) orelse {
+            const current_path = next.currentPath(path) orelse {
+                const threads = try next.boundedUnresolvedThreadsJsonAlloc(
+                    self.allocator,
+                    path,
+                    null,
+                    &.{},
+                    false,
+                );
+                defer self.allocator.free(threads);
                 try runtime.registry.markPathChangedAndInject(
+                    path,
                     path,
                     "deleted",
                     "This file was removed from the current pull request.",
@@ -1388,18 +1366,21 @@ pub const Server = struct {
                 );
                 continue;
             };
-            const diff = try github.canonicalReviewDiffAlloc(
+            const threads = try next.boundedUnresolvedThreadsJsonAlloc(
                 self.allocator,
-                self.io,
-                runtime.cwd,
-                next.base_oid,
-                next.head_oid,
-                path,
-                next.previousPath(path),
+                current_path,
+                null,
+                &.{},
+                false,
             );
-            defer self.allocator.free(diff);
+            defer self.allocator.free(threads);
+            const next_revision = @import("domain.zig").revisionFor(next, current_path) orelse
+                return error.MissingRevision;
+            const diff = next.canonicalDiff(current_path) orelse
+                return error.MissingCanonicalDiff;
             try runtime.registry.markPathChangedAndInject(
                 path,
+                current_path,
                 next_revision,
                 diff,
                 threads,
@@ -1684,6 +1665,10 @@ fn copyRevisionEvidence(
         const revision = @import("domain.zig").revisionFor(current, file.path) orelse
             return error.MissingRevision;
         try generation.setRevision(file.path, revision);
+        try generation.setPreviousPath(file.path, current.previousPath(file.path));
+        const canonical_diff = current.canonicalDiff(file.path) orelse
+            return error.MissingCanonicalDiff;
+        try generation.setCanonicalDiff(file.path, canonical_diff);
         for (current.files.items) |current_file| {
             if (!std.mem.eql(u8, current_file.path, file.path)) continue;
             if (current_file.exclusion_reason) |reason| {
@@ -2058,6 +2043,8 @@ test "action refresh preserves local exclusion synchronization evidence" {
         .path = "vendor/fail.js",
         .viewed = .unviewed,
         .revision_key = "revision",
+        .canonical_diff = "@@ -1 +1 @@\n-old\n+new\n",
+        .diff_state = .text,
         .exclusion_reason = "vendored",
         .exclusion_sync_error = "readback-failed",
     });
@@ -2074,6 +2061,10 @@ test "action refresh preserves local exclusion synchronization evidence" {
     });
     try copyRevisionEvidence(&current, &refreshed);
     try std.testing.expectEqualStrings("revision", refreshed.files.items[0].revision_key);
+    try std.testing.expectEqualStrings(
+        "@@ -1 +1 @@\n-old\n+new\n",
+        refreshed.canonicalDiff("vendor/fail.js").?,
+    );
     try std.testing.expectEqualStrings("vendored", refreshed.files.items[0].exclusion_reason.?);
     try std.testing.expectEqualStrings(
         "readback-failed",

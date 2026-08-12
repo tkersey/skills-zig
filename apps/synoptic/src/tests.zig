@@ -46,6 +46,11 @@ test "vertical state path gates primary, streams session, and retains completed 
 test "comment mutation cards own the server-observed body snapshot" {
     var state = try app.App.init(std.testing.allocator, "h");
     defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r",
+    });
     const comments = [_]domain.ReviewComment{.{
         .id = "C_1",
         .body = "observed body",
@@ -80,6 +85,11 @@ test "comment mutation cards own the server-observed body snapshot" {
 test "thread and comment actions bind to the originating file session" {
     var state = try app.App.init(std.testing.allocator, "h");
     defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r",
+    });
     const comments = [_]domain.ReviewComment{.{
         .id = "C_other",
         .body = "other",
@@ -138,13 +148,15 @@ test "old-path thread actions resolve to the renamed current file" {
         .body = @constCast("body"),
     }, "o/r", 1, "PR_1", "new.zig");
     try std.testing.expectEqualStrings("new.zig", card.target.session_path);
+    try std.testing.expectEqualStrings("new.zig", card.target.current_path);
     try std.testing.expectEqualStrings("old.zig", card.target.path.?);
     const json = try tools.cardJsonAlloc(std.testing.allocator, card);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json,
-        "\"sessionPath\":\"new.zig\",\"path\":\"old.zig\"",
+        "\"sessionPath\":\"new.zig\",\"currentPath\":\"new.zig\"," ++
+            "\"path\":\"old.zig\"",
     ) != null);
 }
 
@@ -196,7 +208,8 @@ test "action broker validates renamed session identity and GitHub identity indep
         .pull_request_id = "PR_1",
         .base_oid = "base",
         .head_oid = "head",
-        .session_path = "new.zig",
+        .session_path = "old.zig",
+        .current_path = "new.zig",
         .github_path = "old.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -319,6 +332,42 @@ test "renamed file identity preserves old-path thread evidence" {
     defer std.testing.allocator.free(evidence);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "T-old") != null);
     try std.testing.expect(generation.sameReviewFile("old.zig", "new.zig"));
+}
+
+test "thread evidence is bounded while the generation serializes it" {
+    const allocator = std.testing.allocator;
+    var generation = try domain.PrGeneration.initFull(allocator, "b", "h");
+    defer generation.deinit();
+    const body = try allocator.alloc(u8, domain.max_inline_thread_evidence_bytes);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    const comments = [_]domain.ReviewComment{.{
+        .id = "C-large",
+        .body = body,
+        .created_at = "2026-01-01T00:00:00Z",
+        .url = "https://example/C-large",
+        .author = "reviewer",
+        .viewer_did_author = false,
+        .review_id = "R-large",
+        .review_state = "COMMENTED",
+    }};
+    try generation.addThread(.{
+        .id = "T-large",
+        .path = "a.zig",
+        .comments = &comments,
+    });
+    const evidence = try generation.boundedUnresolvedThreadsJsonAlloc(
+        allocator,
+        "a.zig",
+        null,
+        &.{},
+        false,
+    );
+    defer allocator.free(evidence);
+    try std.testing.expect(evidence.len <= domain.max_inline_thread_evidence_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"truncated\":true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, evidence, .{});
+    defer parsed.deinit();
 }
 
 test "unresolved thread search pages comments under a fixed byte budget" {
@@ -462,6 +511,7 @@ test "action cards serialize exact effect target payload and rejection terminali
             .base_oid = "base",
             .head_oid = "head",
             .session_path = "a.zig",
+            .current_path = "a.zig",
         },
     );
     const encoded = try tools.cardJsonAlloc(std.testing.allocator, card.*);
@@ -1076,6 +1126,7 @@ test "action broker typed and transparent matrix uses fixed argv and exact stdin
         .base_oid = "b",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
         .comment_body_snapshot = "old",
     };
@@ -1163,6 +1214,7 @@ test "comment action validation rejects a changed body found by nested paginatio
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
         .comment_body_snapshot = "observed body",
     });
@@ -1222,6 +1274,7 @@ test "action broker rejects generation drift on nested comment pagination" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
         .comment_body_snapshot = "body",
     });
@@ -1410,6 +1463,7 @@ test "action broker rejects base drift during ambiguous reconciliation" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -1460,6 +1514,7 @@ test "reply reconciliation does not attribute a preexisting identical reply" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
@@ -1560,6 +1615,7 @@ test "duplicate inline comment reconciliation remains unknown" {
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
     const baseline = github.ReconciliationBaseline{ .allocator = allocator };
@@ -1661,6 +1717,7 @@ fn verifyAmbiguousActions(
             .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
+            .current_path = "a.zig",
         },
     );
     try broker.validateAction("o", "r", 1, "PR_1", card.*);
@@ -1689,6 +1746,7 @@ fn verifyAmbiguousActions(
             .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
+            .current_path = "a.zig",
         },
     );
     try broker.validateAction("o", "r", 1, "PR_1", unmatched.*);
@@ -1698,6 +1756,14 @@ fn verifyAmbiguousActions(
     );
     state.action_state_fresh = true;
     try verifyPreexistingCommentNotAttributed(broker, state);
+    try expectAmbiguousActionLog(allocator, io, log_path);
+}
+
+fn expectAmbiguousActionLog(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_path: []const u8,
+) !void {
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, log, "SynopticAddInlineComment"));
@@ -1725,6 +1791,7 @@ fn verifyPreexistingCommentNotAttributed(broker: github.Broker, state: *app.App)
             .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
+            .current_path = "a.zig",
         },
     );
     try broker.validateAction("o", "r", 1, "PR_1", preexisting.*);
@@ -1786,6 +1853,7 @@ fn verifyUpdatedCommentReconciliation(
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
     });
     const baseline = github.ReconciliationBaseline{ .allocator = allocator };
@@ -1815,6 +1883,7 @@ fn verifyUpdatedCommentReconciliation(
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .current_path = "a.zig",
         .github_path = "a.zig",
     });
     try std.testing.expect(!try broker.reconcileAction(
@@ -1937,28 +2006,15 @@ test "exclusions config recognizes only complete binary diff records" {
 
     for (cases) |case| {
         try std.testing.expectEqual(case.binary, settings.classifyDiff(case.diff) != null);
+        try std.testing.expectEqual(
+            case.binary,
+            domain.diffDisplayState(case.diff) == .binary,
+        );
     }
 
     settings.exclusions_enabled = false;
     try std.testing.expect(settings.classifyDiff("GIT binary patch") == null);
 }
-
-const CancelWhenFileExists = struct {
-    cancelled: *std.atomic.Value(bool),
-    path: []const u8,
-
-    fn run(self: CancelWhenFileExists) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        for (0..1_000) |_| {
-            std.Io.Dir.cwd().access(io, self.path, .{}) catch {
-                std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
-                continue;
-            };
-            self.cancelled.store(true, .release);
-            return;
-        }
-    }
-};
 
 fn verifyExclusionMergeBaseReuse(
     allocator: std.mem.Allocator,
@@ -1969,17 +2025,16 @@ fn verifyExclusionMergeBaseReuse(
     root: []const u8,
     log_path: []const u8,
 ) !void {
+    _ = allocator;
     var batch = try state.captureAutomaticExclusions(settings);
     defer batch.deinit();
     try batch.classify(settings, broker, root);
     try std.testing.expectEqual(@as(usize, 2), batch.candidates.items.len);
-    const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(4096));
-    defer allocator.free(log);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "merge-base\n"));
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        std.mem.count(u8, log, "--literal-pathspecs\n"),
-    );
+    std.Io.Dir.cwd().access(io, log_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.UnexpectedExclusionGitProcess;
 }
 
 fn verifyExclusionDiffCancellation(
@@ -1992,21 +2047,12 @@ fn verifyExclusionDiffCancellation(
     git_path: []const u8,
     started_path: []const u8,
 ) !void {
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "#!/bin/sh\nif [ \"$1\" = merge-base ]; then printf base; exit 0; fi\n" ++
-            "printf started > {s}\ntrap 'exit 0' TERM\nsleep 30\n",
-        .{started_path},
-    );
-    defer allocator.free(script);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = git_path, .data = script });
+    _ = allocator;
+    _ = io;
+    _ = git_path;
+    _ = started_path;
     var cancelled = std.atomic.Value(bool).init(false);
-    const cancel_thread = try std.Thread.spawn(
-        .{},
-        CancelWhenFileExists.run,
-        .{CancelWhenFileExists{ .cancelled = &cancelled, .path = started_path }},
-    );
-    defer cancel_thread.join();
+    cancelled.store(true, .release);
     var batch = try state.captureAutomaticExclusions(settings);
     defer batch.deinit();
     var cancelling_broker = broker;
@@ -2023,16 +2069,20 @@ fn installBinaryProbeGeneration(allocator: std.mem.Allocator, state: *app.App) !
         .path = "src/a.zig",
         .viewed = .unviewed,
         .revision_key = "r1",
+        .canonical_diff = "GIT binary patch\n",
+        .diff_state = .binary,
     });
     try generation.addFile(.{
         .path = "src/b.zig",
         .viewed = .unviewed,
         .revision_key = "r2",
+        .canonical_diff = "Binary files a/src/b.zig and b/src/b.zig differ\n",
+        .diff_state = .binary,
     });
     state.replaceGeneration(generation);
 }
 
-test "exclusions config shares merge base and cancels an in-flight diff" {
+test "exclusions config uses generation diff kind and honors cancellation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2598,8 +2648,8 @@ test "file session receives every later revision and active close interrupts its
         true,
     );
     defer opened.deinit();
-    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", "[]");
-    try registry.markPathChangedAndInject("a.zig", "r3", "+revision three", "[]");
+    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", "[]");
+    try registry.markPathChangedAndInject("a.zig", "a.zig", "r3", "+revision three", "[]");
     try std.testing.expectEqualStrings("r3", registry.sessions.items[0].last_injected_revision);
     registry.sessions.items[0].turn_active = true;
     try registry.closeSession(opened.session_id);
@@ -2651,8 +2701,8 @@ test "session context refresh injects changed thread evidence into every open si
     );
     defer current.deinit();
     const evidence = "[{\"id\":\"T-new\",\"path\":\"a.zig\"}]";
-    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", evidence);
-    try registry.markPathChangedAndInject("a.zig", "r2", "+revision two", evidence);
+    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", evidence);
+    try registry.markPathChangedAndInject("a.zig", "a.zig", "r2", "+revision two", evidence);
     try std.testing.expectEqual(
         sessions.SessionStatus.stale_origin,
         registry.sessions.items[0].status,
@@ -4317,10 +4367,23 @@ fn injectedRefresh(runtime: *http.Runtime) !void {
         runtime.app.generation.head_oid,
     );
     errdefer next.deinit();
-    try next.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r2" });
-    try next.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
+    try next.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r2",
+        .canonical_diff = "@@ -1 +1 @@\n-old\n+refreshed\n",
+        .diff_state = .text,
+    });
+    try next.addFile(.{
+        .path = "b.zig",
+        .viewed = .unviewed,
+        .revision_key = "b1",
+        .canonical_diff = "@@ -1 +1 @@\n-old b\n+new b\n",
+        .diff_state = .text,
+    });
     try runtime.app.updateTabDiff("a.zig", "@@ -1 +1 @@\n+refreshed\n");
     try runtime.registry.markPathChangedAndInject(
+        "a.zig",
         "a.zig",
         "r2",
         "@@ -1 +1 @@\n+refreshed\n",
@@ -4456,8 +4519,20 @@ fn prepareWsState(
     });
     var generation = try domain.PrGeneration.initFull(allocator, base, head);
     errdefer generation.deinit();
-    try generation.addFile(.{ .path = "a.zig", .viewed = .unviewed, .revision_key = "r1" });
-    try generation.addFile(.{ .path = "b.zig", .viewed = .unviewed, .revision_key = "b1" });
+    try generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+        .canonical_diff = "@@ -1 +1 @@\n-old\n+new\n",
+        .diff_state = .text,
+    });
+    try generation.addFile(.{
+        .path = "b.zig",
+        .viewed = .unviewed,
+        .revision_key = "b1",
+        .canonical_diff = "@@ -1 +1 @@\n-old b\n+new b\n",
+        .diff_state = .text,
+    });
     state.replaceGeneration(generation);
     return state;
 }

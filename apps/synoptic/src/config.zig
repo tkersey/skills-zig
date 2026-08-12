@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 
 pub const skill_abi = "synoptic-skill-abi/v1";
 pub const ui_abi = "synoptic-ui/v1";
@@ -137,17 +138,7 @@ pub const Settings = struct {
 
     pub fn classifyDiff(self: *const Settings, diff: []const u8) ?[]const u8 {
         if (!self.exclusions_enabled) return null;
-        var lines = std.mem.splitScalar(u8, diff, '\n');
-        while (lines.next()) |raw_line| {
-            const line = if (std.mem.endsWith(u8, raw_line, "\r"))
-                raw_line[0 .. raw_line.len - 1]
-            else
-                raw_line;
-            if (std.mem.eql(u8, line, "GIT binary patch") or
-                (std.mem.startsWith(u8, line, "Binary files ") and
-                    std.mem.endsWith(u8, line, " differ"))) return "binary";
-        }
-        return null;
+        return if (domain.diffDisplayState(diff) == .binary) "binary" else null;
     }
 
     fn loadSkillExclusions(self: *Settings, io: std.Io, skill_root: []const u8) !void {

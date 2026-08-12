@@ -14,7 +14,6 @@ const unresolved_thread_page_bytes_max: usize = 1024 * 1024;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
-const max_inline_thread_evidence_bytes: usize = 512 * 1024;
 const safe_boundary_quiescence_ms: u32 = 50;
 const review_execution_fields =
     "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"";
@@ -43,7 +42,7 @@ fn boundedThreadEvidenceAlloc(
     allocator: std.mem.Allocator,
     threads_json: []const u8,
 ) ![]u8 {
-    if (threads_json.len <= max_inline_thread_evidence_bytes) {
+    if (threads_json.len <= domain.max_inline_thread_evidence_bytes) {
         return allocator.dupe(u8, threads_json);
     }
     const digest = threadEvidenceDigest(threads_json);
@@ -1441,7 +1440,8 @@ pub const Registry = struct {
 
     pub fn markPathChangedAndInject(
         self: *Registry,
-        path: []const u8,
+        session_path: []const u8,
+        current_path: []const u8,
         revision: []const u8,
         diff: []const u8,
         threads_json: []const u8,
@@ -1465,7 +1465,7 @@ pub const Registry = struct {
                 &session.last_thread_evidence_digest,
                 &evidence_digest,
             );
-            if (session.status != .closed and std.mem.eql(u8, session.path, path) and
+            if (session.status != .closed and std.mem.eql(u8, session.path, session_path) and
                 (revision_changed or evidence_changed))
             {
                 if (!std.mem.eql(u8, session.revision, revision)) {
@@ -1485,7 +1485,7 @@ pub const Registry = struct {
             try self.injectPathUpdate(
                 actor,
                 thread,
-                path,
+                current_path,
                 revision,
                 diff,
                 threads_json,
@@ -3411,7 +3411,10 @@ test "model-requested close acknowledges successful session removal" {
 }
 
 test "oversized thread evidence is bounded with recovery identity" {
-    const raw = try std.testing.allocator.alloc(u8, max_inline_thread_evidence_bytes + 1);
+    const raw = try std.testing.allocator.alloc(
+        u8,
+        domain.max_inline_thread_evidence_bytes + 1,
+    );
     defer std.testing.allocator.free(raw);
     @memset(raw, 'x');
     const bounded = try boundedThreadEvidenceAlloc(std.testing.allocator, raw);

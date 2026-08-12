@@ -31,8 +31,10 @@ pub const ActionTarget = struct {
     pull_request_id: []const u8,
     base_oid: []const u8,
     head_oid: []const u8,
-    /// Current-generation path that owns the originating file session.
+    /// Historical path that identifies the originating file session.
     session_path: []const u8,
+    /// Current-generation path resolved from the session's file lineage.
+    current_path: []const u8,
     /// Exact path reported by GitHub for the targeted file, thread, or comment.
     path: ?[]const u8 = null,
     line: ?u32 = null,
@@ -111,6 +113,7 @@ pub const AuthoritativeTarget = struct {
     base_oid: []const u8,
     head_oid: []const u8,
     session_path: []const u8,
+    current_path: []const u8,
     github_path: ?[]const u8 = null,
     comment_body_snapshot: ?[]const u8 = null,
 };
@@ -239,7 +242,7 @@ pub const ActionStore = struct {
         input: PreparedActionInput,
         authoritative: AuthoritativeTarget,
     ) !*ActionCard {
-        try validateAgainstSession(input, authoritative.session_path);
+        try validateAgainstSession(input, authoritative.current_path);
         if (input.kind == .graphql) try graphql.validateTransparent(
             input.document.?,
             input.operation_name.?,
@@ -268,6 +271,7 @@ pub const ActionStore = struct {
                 .base_oid = try self.allocator.dupe(u8, authoritative.base_oid),
                 .head_oid = try self.allocator.dupe(u8, authoritative.head_oid),
                 .session_path = try self.allocator.dupe(u8, authoritative.session_path),
+                .current_path = try self.allocator.dupe(u8, authoritative.current_path),
                 .path = try dupeOptional(self.allocator, github_path),
                 .line = input.line,
                 .start_line = input.start_line,
@@ -387,6 +391,7 @@ pub const ActionStore = struct {
                 card.target.base_oid,
                 card.target.head_oid,
                 card.target.session_path,
+                card.target.current_path,
                 card.payload_json,
             },
         ) |value| self.allocator.free(value);
@@ -430,6 +435,8 @@ pub fn cardJsonAlloc(allocator: std.mem.Allocator, card: ActionCard) ![]u8 {
         "et\":{{\"repository\":{f},\"pullRequest\":{d},\"baseOi" ++
         "d\":{f},\"headOid\":{f},\"sessionPath\":", header_arguments);
     try writeOptionalString(&out.writer, card.target.session_path);
+    try out.writer.writeAll(",\"currentPath\":");
+    try writeOptionalString(&out.writer, card.target.current_path);
     try out.writer.writeAll(",\"path\":");
     try writeOptionalString(&out.writer, card.target.path);
     try out.writer.writeAll(",\"line\":");
@@ -521,6 +528,7 @@ test "same session slot supersedes immutably and execution is once" {
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a",
+        .current_path = "a",
     };
     const one = PreparedActionInput{
         .slot = @constCast("finding"),
@@ -571,6 +579,7 @@ test "inline comment card owns the default RIGHT side" {
             .base_oid = "unknown-base",
             .head_oid = "h",
             .session_path = "a.zig",
+            .current_path = "a.zig",
         },
     );
     try std.testing.expectEqualStrings("RIGHT", card.target.side.?);
@@ -603,6 +612,7 @@ test "transparent validation runs before immutable card creation" {
                 .base_oid = "unknown-base",
                 .head_oid = "h",
                 .session_path = "a",
+                .current_path = "a",
             },
         ),
     );

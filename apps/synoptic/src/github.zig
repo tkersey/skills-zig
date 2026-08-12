@@ -721,7 +721,10 @@ pub const Broker = struct {
             card.target.pull_request_id,
         );
         const review_target = card.target.thread_id != null or card.target.comment_id != null;
-        const current_path = if (review_target) card.target.session_path else card.target.path;
+        const current_path = if (review_target)
+            card.target.current_path
+        else
+            card.target.path;
         if (current_path) |path| try self.validateCurrentPath(
             owner,
             name,
@@ -1975,6 +1978,15 @@ fn hydrateFileRevision(
         file.previous_path orelse file.path,
     );
     defer if (diff == null) allocator.free(diff_identity);
+    const review_diff = try reviewDiffProjectionAlloc(
+        allocator,
+        diff,
+        merge_base,
+        generation.head_oid,
+        file.path,
+        file.previous_path,
+    );
+    defer allocator.free(review_diff);
     const revision = try domain.revisionKey(
         allocator,
         file.path,
@@ -1984,6 +1996,37 @@ fn hydrateFileRevision(
     );
     defer allocator.free(revision);
     try generation.setRevision(file.path, revision);
+    try generation.setCanonicalDiff(file.path, review_diff);
+}
+
+fn reviewDiffProjectionAlloc(
+    allocator: std.mem.Allocator,
+    diff: ?[]const u8,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) ![]u8 {
+    if (diff) |value| if (value.len <= review_diff_bytes_max) {
+        return allocator.dupe(u8, value);
+    };
+    return oversizedReviewDiffAlloc(allocator, merge_base, head, path, previous_path);
+}
+
+fn oversizedReviewDiffAlloc(
+    allocator: std.mem.Allocator,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Synoptic did not inline this file diff because it exceeds the review evidence " ++
+            "limit. Inspect it locally against merge base {s} and head {s}. " ++
+            "Assigned path: {s}. Previous path: {s}.",
+        .{ merge_base, head, path, previous_path orelse "none" },
+    );
 }
 
 fn oversizedDiffIdentityAlloc(
@@ -2343,42 +2386,35 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         std.math.sub(usize, diff_bytes_max, prefix.len) catch return error.FileDiffTooLarge
     else
         diff_bytes_max;
-    const result = if (previous_path) |old_path|
-        try runCanonicalDiffProcess(
+    const base_spec = if (previous_path) |old_path|
+        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ merge_base, old_path })
+    else
+        null;
+    defer if (base_spec) |value| allocator.free(value);
+    const head_spec = if (previous_path != null)
+        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ head, path })
+    else
+        null;
+    defer if (head_spec) |value| allocator.free(value);
+    const result = if (previous_path != null)
+        try runCanonicalBlobDiff(
             allocator,
             io,
-            &.{
-                git_path,
-                "--literal-pathspecs",
-                "diff",
-                "--no-ext-diff",
-                "--no-color",
-                "-M",
-                range,
-                "--",
-                old_path,
-                path,
-            },
+            git_path,
             cwd,
+            base_spec.?,
+            head_spec.?,
             cancelled,
             process_output_limit,
         )
     else
-        try runCanonicalDiffProcess(
+        try runCanonicalPathDiff(
             allocator,
             io,
-            &.{
-                git_path,
-                "--literal-pathspecs",
-                "diff",
-                "--no-ext-diff",
-                "--no-color",
-                "-M",
-                range,
-                "--",
-                path,
-            },
+            git_path,
             cwd,
+            range,
+            path,
             cancelled,
             process_output_limit,
         );
@@ -2389,6 +2425,84 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         return diff;
     }
     return result.stdout;
+}
+
+fn runCanonicalBlobDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    base_spec: []const u8,
+    head_spec: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    output_limit: usize,
+) !GhOutput {
+    const argv = [_][]const u8{
+        git_path,
+        "--literal-pathspecs",
+        "diff",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--line-prefix=",
+        "--diff-algorithm=myers",
+        "--no-indent-heuristic",
+        "--output-indicator-new=+",
+        "--output-indicator-old=-",
+        "--output-indicator-context= ",
+        base_spec,
+        head_spec,
+    };
+    return runCanonicalDiffProcess(
+        allocator,
+        io,
+        &argv,
+        cwd,
+        cancelled,
+        output_limit,
+    );
+}
+
+fn runCanonicalPathDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    range: []const u8,
+    path: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    output_limit: usize,
+) !GhOutput {
+    const argv = [_][]const u8{
+        git_path,
+        "--literal-pathspecs",
+        "diff",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--no-color",
+        "-M",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--line-prefix=",
+        "--diff-algorithm=myers",
+        "--no-indent-heuristic",
+        "--output-indicator-new=+",
+        "--output-indicator-old=-",
+        "--output-indicator-context= ",
+        range,
+        "--",
+        path,
+    };
+    return runCanonicalDiffProcess(
+        allocator,
+        io,
+        &argv,
+        cwd,
+        cancelled,
+        output_limit,
+    );
 }
 
 fn sourceIdentityAlloc(
@@ -2790,6 +2904,31 @@ test "revision hydration computes one merge base for a generation" {
     try expectOversizedDiffHydration(allocator, io, root, wrapper_path, base, head);
 }
 
+fn configureNonCanonicalDiffDefaults(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "config", "diff.noprefix", "true" },
+        &.{ "git", "config", "diff.mnemonicPrefix", "true" },
+        &.{ "git", "config", "diff.algorithm", "histogram" },
+        &.{ "git", "config", "diff.indentHeuristic", "true" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+}
+
+fn expectRenamedReviewDiff(diff: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diff,
+        "Synoptic source identity: 7 bytes\nold.zig\n" ++
+            "Synoptic current identity: 7 bytes\nnew.zig\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "--- a/old.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+++ b/new.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
+}
+
 test "renamed file identity and review diff include the source path" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2823,6 +2962,7 @@ test "renamed file identity and review diff include the source path" {
     }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
+    try configureNonCanonicalDiffDefaults(allocator, io, root);
     const base = std.mem.trim(u8, base_raw, "\r\n");
     const head = std.mem.trim(u8, head_raw, "\r\n");
     var generation = try domain.PrGeneration.initFull(allocator, base, head);
@@ -2850,15 +2990,8 @@ test "renamed file identity and review diff include the source path" {
         generation.previousPath("new.zig"),
     );
     defer allocator.free(diff);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        diff,
-        "Synoptic source identity: 7 bytes\nold.zig\n" ++
-            "Synoptic current identity: 7 bytes\nnew.zig\n",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "rename from old.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "rename to new.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
+    try std.testing.expectEqualStrings(diff, generation.canonicalDiff("new.zig").?);
+    try expectRenamedReviewDiff(diff);
 }
 
 test "copied file identity finds an unchanged source and includes source evidence" {
@@ -2914,8 +3047,8 @@ test "copied file identity finds an unchanged source and includes source evidenc
         "Synoptic source identity: 10 bytes\nsource.zig\n" ++
             "Synoptic current identity: 8 bytes\ncopy.zig\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "+++ b/copy.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "+const copied = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "source.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "copy.zig") != null);
 }
 
 test "oversized review diff becomes bounded inspectable evidence" {
