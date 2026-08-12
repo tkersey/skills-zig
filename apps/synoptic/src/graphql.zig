@@ -118,6 +118,38 @@ pub fn validateTransparent(
     variables_json: []const u8,
     pull_request_id: []const u8,
 ) !void {
+    return validateTransparentWithHead(
+        document,
+        expected_operation,
+        variables_json,
+        pull_request_id,
+        null,
+    );
+}
+
+pub fn validateTransparentAtHead(
+    document: []const u8,
+    expected_operation: []const u8,
+    variables_json: []const u8,
+    pull_request_id: []const u8,
+    expected_head_oid: []const u8,
+) !void {
+    return validateTransparentWithHead(
+        document,
+        expected_operation,
+        variables_json,
+        pull_request_id,
+        expected_head_oid,
+    );
+}
+
+fn validateTransparentWithHead(
+    document: []const u8,
+    expected_operation: []const u8,
+    variables_json: []const u8,
+    pull_request_id: []const u8,
+    expected_head_oid: ?[]const u8,
+) !void {
     if (document.len == 0 or document.len > TransparentLimits.document_bytes or
         variables_json.len > TransparentLimits.variables_bytes) return error.GraphqlActionTooLarge;
     if (!validName(expected_operation)) return error.InvalidGraphqlOperationName;
@@ -138,7 +170,7 @@ pub fn validateTransparent(
             return error.GraphqlSyntaxForbidden;
         }
     }
-    const input_variable = try validateTokenShape(tokens.items);
+    const root = try validateTokenShape(tokens.items);
     var variables = try std.json.parseFromSlice(
         std.json.Value,
         std.heap.page_allocator,
@@ -147,14 +179,27 @@ pub fn validateTransparent(
     );
     defer variables.deinit();
     if (variables.value != .object) return error.InvalidGraphqlVariables;
-    const input = variables.value.object.get(input_variable) orelse
+    const input = variables.value.object.get(root.input_variable) orelse
         return error.InvalidGraphqlVariables;
     var saw_target = false;
     try validateVariables(input, pull_request_id, &saw_target);
     if (!saw_target) return error.GraphqlPullRequestTargetMissing;
+    if (std.mem.eql(u8, root.field, "mergePullRequest")) {
+        if (input != .object) return error.InvalidGraphqlVariables;
+        const head = input.object.get("expectedHeadOid") orelse
+            return error.GraphqlExpectedHeadMissing;
+        if (head != .string or head.string.len == 0) return error.GraphqlExpectedHeadMissing;
+        if (expected_head_oid) |expected| if (!std.mem.eql(u8, head.string, expected))
+            return error.GraphqlExpectedHeadMismatch;
+    }
 }
 
-fn validateTokenShape(tokens: []const Token) ![]const u8 {
+const TransparentRoot = struct {
+    field: []const u8,
+    input_variable: []const u8,
+};
+
+fn validateTokenShape(tokens: []const Token) !TransparentRoot {
     var selection: ?usize = null;
     var parens: usize = 0;
     for (tokens[2..], 2..) |token, index| switch (token.kind) {
@@ -203,7 +248,10 @@ fn validateTokenShape(tokens: []const Token) ![]const u8 {
     }
     if (depth != 0 or root_count != 1) return error.GraphqlRootCountInvalid;
     const root = root_index orelse return error.GraphqlRootCountInvalid;
-    return rootInputVariable(tokens, root);
+    return .{
+        .field = tokens[root].text,
+        .input_variable = try rootInputVariable(tokens, root),
+    };
 }
 
 fn rootInputVariable(tokens: []const Token, root: usize) ![]const u8 {
@@ -496,55 +544,88 @@ test "transparent GraphQL binds broad mutations to exact PR" {
     const safe =
         "mutation AddReviewNote($input:AddCommentInput!){addCom" ++
         "ment(input:$input){clientMutationId}}";
-    try validateTransparent(
+    try validateTransparentAtHead(
         safe,
         "AddReviewNote",
         "{\"input\":{\"subjectId\":\"PR_1\",\"body\":\"note\"}}",
         "PR_1",
+        "HEAD_1",
     );
     const variables = "{\"input\":{\"subjectId\":\"PR_1\"}}";
     const alias = "mutation AddReviewNote($input:AddCommentInput!){hidden" ++
         ":addComment(input:$input){clientMutationId}}";
     try std.testing.expectError(
         error.GraphqlAliasForbidden,
-        validateTransparent(alias, "AddReviewNote", variables, "PR_1"),
+        validateTransparentAtHead(alias, "AddReviewNote", variables, "PR_1", "HEAD_1"),
     );
     const fragment = "mutation AddReviewNote($input:AddCommentInput!){addCom" ++
         "ment(input:$input){...Fields}} fragment Fields on AddC" ++
         "ommentPayload{clientMutationId}";
     try std.testing.expectError(
         error.GraphqlSyntaxForbidden,
-        validateTransparent(fragment, "AddReviewNote", variables, "PR_1"),
+        validateTransparentAtHead(fragment, "AddReviewNote", variables, "PR_1", "HEAD_1"),
     );
     const multiple = "mutation AddReviewNote($input:AddCommentInput!){addCom" ++
         "ment(input:$input){clientMutationId} deleteIssue(input" ++
         ":$input){clientMutationId}}";
     try std.testing.expectError(
         error.GraphqlRootCountInvalid,
-        validateTransparent(multiple, "AddReviewNote", variables, "PR_1"),
+        validateTransparentAtHead(multiple, "AddReviewNote", variables, "PR_1", "HEAD_1"),
     );
     const update = "mutation ChangePr($input:UpdatePullRequestInput!){upda" ++
         "tePullRequest(input:$input){clientMutationId}}";
     const update_variables = "{\"input\":{\"pullRequestId\":\"PR_1\",\"state\":\"CLOSED\"," ++
         "\"projectIds\":[\"P_1\"]}}";
-    try validateTransparent(update, "ChangePr", update_variables, "PR_1");
+    try validateTransparentAtHead(update, "ChangePr", update_variables, "PR_1", "HEAD_1");
     try std.testing.expectError(
         error.GraphqlPullRequestTargetMismatch,
-        validateTransparent(
+        validateTransparentAtHead(
             safe,
             "AddReviewNote",
             "{\"input\":{\"subjectId\":\"PR_OTHER\"}}",
             "PR_1",
+            "HEAD_1",
         ),
     );
     try std.testing.expectError(
         error.GraphqlPullRequestTargetMismatch,
-        validateTransparent(
+        validateTransparentAtHead(
             safe,
             "AddReviewNote",
             "{\"input\":{\"subjectId\":\"PR_OTHER\"}," ++
                 "\"decoy\":{\"subjectId\":\"PR_1\"}}",
             "PR_1",
+            "HEAD_1",
+        ),
+    );
+
+    const merge = "mutation Merge($input:MergePullRequestInput!){mergePullRequest" ++
+        "(input:$input){pullRequest{id}}}";
+    try validateTransparentAtHead(
+        merge,
+        "Merge",
+        "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"HEAD_1\"}}",
+        "PR_1",
+        "HEAD_1",
+    );
+    try std.testing.expectError(
+        error.GraphqlExpectedHeadMissing,
+        validateTransparentAtHead(
+            merge,
+            "Merge",
+            "{\"input\":{\"pullRequestId\":\"PR_1\"}}",
+            "PR_1",
+            "HEAD_1",
+        ),
+    );
+    try std.testing.expectError(
+        error.GraphqlExpectedHeadMismatch,
+        validateTransparentAtHead(
+            merge,
+            "Merge",
+            "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"OLD\"}}",
+            "PR_1",
+            "HEAD_1",
         ),
     );
 }

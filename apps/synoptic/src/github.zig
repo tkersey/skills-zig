@@ -687,11 +687,12 @@ pub const Broker = struct {
     }
 
     pub fn executeAction(self: Broker, card: tools.ActionCard) !void {
-        if (card.kind == .graphql) try graphql.validateTransparent(
+        if (card.kind == .graphql) try graphql.validateTransparentAtHead(
             card.graphql.?.document,
             card.graphql.?.operation_name,
             card.graphql.?.variables,
             card.target.pull_request_id,
+            card.target.head_oid,
         );
         const document: []const u8 = switch (card.kind) {
             .add_inline_comment => graphql.add_inline_comment_mutation,
@@ -729,11 +730,12 @@ pub const Broker = struct {
             card.target.pull_request_id,
             pull_request_id,
         )) return error.ActionTargetMismatch;
-        if (card.kind == .graphql) try graphql.validateTransparent(
+        if (card.kind == .graphql) try graphql.validateTransparentAtHead(
             card.graphql.?.document,
             card.graphql.?.operation_name,
             card.graphql.?.variables,
             card.target.pull_request_id,
+            card.target.head_oid,
         );
         const review_target = card.target.thread_id != null or card.target.comment_id != null;
         const current_path = if (review_target)
