@@ -49,30 +49,8 @@ const CanonicalGitEvidenceView = struct {
         cwd: []const u8,
         head: []const u8,
     ) !CanonicalGitEvidenceView {
-        var objects = try runCapturedGitProcess(
-            allocator,
-            io,
-            &.{
-                git_path,
-                "--no-replace-objects",
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "objects",
-            },
-            .{ .path = cwd },
-            null,
-            null,
-            4096,
-            git_stderr_bytes_max,
-            false,
-        );
-        defer objects.deinit();
-        if (objects.term != .exited or objects.term.exited != 0) {
-            return error.GitEvidenceViewUnavailable;
-        }
-        const object_path = std.mem.trim(u8, objects.stdout, "\r\n");
-        if (!std.fs.path.isAbsolute(object_path)) return error.GitEvidenceViewUnavailable;
+        const object_path = try canonicalObjectPathAlloc(allocator, io, git_path, cwd);
+        defer allocator.free(object_path);
         const parent = std.fs.path.dirname(object_path) orelse
             return error.GitEvidenceViewUnavailable;
         const parent_path = try allocator.dupe(u8, parent);
@@ -96,7 +74,7 @@ const CanonicalGitEvidenceView = struct {
         defer parent_dir.close(io);
         try parent_dir.createDir(io, name, .default_dir);
         var directory_owned = true;
-        errdefer if (directory_owned) parent_dir.deleteTree(io, name) catch {};
+        errdefer if (directory_owned) deleteTreeBestEffort(&parent_dir, io, name);
         var directory = try parent_dir.openDir(io, name, .{ .follow_symlinks = false });
         defer directory.close(io);
         try directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
@@ -138,7 +116,7 @@ const CanonicalGitEvidenceView = struct {
         )) |parent_value| {
             var parent = parent_value;
             defer parent.close(self.io);
-            parent.deleteTree(self.io, self.name) catch {};
+            deleteTreeBestEffort(&parent, self.io, self.name);
         } else |_| {}
         self.allocator.free(self.attr_tree_config);
         self.allocator.free(self.object_dir_env);
@@ -147,6 +125,45 @@ const CanonicalGitEvidenceView = struct {
         self.allocator.free(self.parent_path);
     }
 };
+
+fn canonicalObjectPathAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+) ![]u8 {
+    var objects = try runCapturedGitProcess(
+        allocator,
+        io,
+        &.{
+            git_path,
+            "--no-replace-objects",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        },
+        .{ .path = cwd },
+        null,
+        null,
+        4096,
+        git_stderr_bytes_max,
+        false,
+    );
+    defer objects.deinit();
+    if (objects.term != .exited or objects.term.exited != 0) {
+        return error.GitEvidenceViewUnavailable;
+    }
+    const path = std.mem.trim(u8, objects.stdout, "\r\n");
+    if (!std.fs.path.isAbsolute(path)) return error.GitEvidenceViewUnavailable;
+    return allocator.dupe(u8, path);
+}
+
+fn deleteTreeBestEffort(dir: *std.Io.Dir, io: std.Io, path: []const u8) void {
+    dir.deleteTree(io, path) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+}
 
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
@@ -2911,48 +2928,25 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         break :blk &local_view;
     };
     defer if (owns_view) local_view.deinit();
-    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
-    defer allocator.free(range);
     const source_identity = try sourceIdentityAlloc(allocator, path, previous_path);
     defer if (source_identity) |prefix| allocator.free(prefix);
     const process_output_limit = if (source_identity) |prefix|
         std.math.sub(usize, diff_bytes_max, prefix.len) catch return error.FileDiffTooLarge
     else
         diff_bytes_max;
-    const base_spec = if (previous_path) |old_path|
-        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ merge_base, old_path })
-    else
-        null;
-    defer if (base_spec) |value| allocator.free(value);
-    const head_spec = if (previous_path != null)
-        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ head, path })
-    else
-        null;
-    defer if (head_spec) |value| allocator.free(value);
-    const result = if (previous_path != null)
-        try runCanonicalBlobDiff(
-            allocator,
-            io,
-            git_path,
-            cwd,
-            evidence_view,
-            base_spec.?,
-            head_spec.?,
-            cancelled,
-            process_output_limit,
-        )
-    else
-        try runCanonicalPathDiff(
-            allocator,
-            io,
-            git_path,
-            cwd,
-            evidence_view,
-            range,
-            path,
-            cancelled,
-            process_output_limit,
-        );
+    const result = try runCanonicalDiff(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        evidence_view,
+        merge_base,
+        head,
+        path,
+        previous_path,
+        cancelled,
+        process_output_limit,
+    );
     allocator.free(result.stderr);
     if (source_identity) |prefix| {
         const diff = try std.mem.concat(allocator, u8, &.{ prefix, result.stdout });
@@ -2960,6 +2954,51 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         return diff;
     }
     return result.stdout;
+}
+
+fn runCanonicalDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+    output_limit: usize,
+) !GhOutput {
+    if (previous_path) |old_path| {
+        const base_spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ merge_base, old_path });
+        defer allocator.free(base_spec);
+        const head_spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ head, path });
+        defer allocator.free(head_spec);
+        return runCanonicalBlobDiff(
+            allocator,
+            io,
+            git_path,
+            cwd,
+            evidence_view,
+            base_spec,
+            head_spec,
+            cancelled,
+            output_limit,
+        );
+    }
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
+    defer allocator.free(range);
+    return runCanonicalPathDiff(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        evidence_view,
+        range,
+        path,
+        cancelled,
+        output_limit,
+    );
 }
 
 fn ensureRevisionPathObjectAvailable(

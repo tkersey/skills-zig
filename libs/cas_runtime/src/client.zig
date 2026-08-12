@@ -1604,6 +1604,23 @@ const ActorState = struct {
 
 threadlocal var actor_callback_state: ?*ActorState = null;
 
+fn validateActorOptions(options: ActorOptions) !void {
+    const invalid = options.outbound_queue_capacity == 0 or
+        options.outbound_queue_capacity > max_actor_outbound_queue or
+        options.outbound_queue_bytes == 0 or
+        options.outbound_queue_bytes > max_actor_queue_bytes or
+        options.server_request_queue_capacity == 0 or
+        options.server_request_queue_capacity > max_actor_server_request_queue or
+        options.server_request_queue_bytes == 0 or
+        options.server_request_queue_bytes > max_actor_queue_bytes or
+        options.notification_queue_bytes == 0 or
+        options.notification_queue_bytes > max_actor_queue_bytes or
+        options.default_request_timeout_ms == 0 or
+        options.server_request_timeout_ms == 0;
+    if (invalid) return error.InvalidActorOptions;
+    try validateOverloadRetryPolicy(options.overload_retry_policy);
+}
+
 /// Owner-lived app-server actor. Exactly one reader owns response routing;
 /// callers may issue concurrent requests while the bounded writer queue owns
 /// all transport writes.
@@ -1622,22 +1639,7 @@ pub const Actor = struct {
             owned_client.close();
             owned_client.deinit();
         };
-        if (options.outbound_queue_capacity == 0 or
-            options.outbound_queue_capacity > max_actor_outbound_queue or
-            options.outbound_queue_bytes == 0 or
-            options.outbound_queue_bytes > max_actor_queue_bytes or
-            options.server_request_queue_capacity == 0 or
-            options.server_request_queue_capacity > max_actor_server_request_queue or
-            options.server_request_queue_bytes == 0 or
-            options.server_request_queue_bytes > max_actor_queue_bytes or
-            options.notification_queue_bytes == 0 or
-            options.notification_queue_bytes > max_actor_queue_bytes or
-            options.default_request_timeout_ms == 0 or
-            options.server_request_timeout_ms == 0)
-        {
-            return error.InvalidActorOptions;
-        }
-        try validateOverloadRetryPolicy(options.overload_retry_policy);
+        try validateActorOptions(options);
         const seed = try resolveOverloadRetrySeed(options.overload_retry_seed, owned_client.io);
 
         const state = try allocator.create(ActorState);

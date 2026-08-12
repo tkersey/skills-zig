@@ -1668,52 +1668,8 @@ test "managed worktree checkout ignores local replacement objects" {
     defer allocator.free(managed);
     const managed_path = try std.fs.path.join(allocator, &.{ managed, "managed" });
     defer allocator.free(managed_path);
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "original\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "config", "user.email", "synoptic@example.test" },
-        &.{ "git", "config", "user.name", "Synoptic Test" },
-        &.{ "git", "switch", "-qc", "feature" },
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "original" },
-    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
-    const original_raw = try gitOutput(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "rev-parse", "HEAD" },
-        error.TestGitFailed,
-    );
-    defer allocator.free(original_raw);
-    const original = std.mem.trim(u8, original_raw, "\r\n");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "add", "tracked.txt" },
-        &.{ "git", "commit", "-qm", "replacement" },
-    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
-    const replacement_raw = try gitOutput(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "rev-parse", "HEAD" },
-        error.TestGitFailed,
-    );
-    defer allocator.free(replacement_raw);
-    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
-    allocator.free(try gitOutput(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "reset", "--hard", original },
-        error.TestGitFailed,
-    ));
-    allocator.free(try gitOutput(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "replace", original, replacement },
-        error.TestGitFailed,
-    ));
+    const original = try installReplacementObjectAlloc(allocator, io, &tmp, repo);
+    defer allocator.free(original);
     const custody = try select(
         allocator,
         io,
@@ -1725,7 +1681,7 @@ test "managed worktree checkout ignores local replacement objects" {
         null,
     );
     defer allocator.free(custody.path());
-    defer retireManaged(allocator, io, custody, repo) catch {};
+    defer retireManagedBestEffort(allocator, io, custody, repo);
     const tracked_path = try std.fs.path.join(allocator, &.{ managed_path, "tracked.txt" });
     defer allocator.free(tracked_path);
     const tracked = try std.Io.Dir.cwd().readFileAlloc(
@@ -1736,4 +1692,92 @@ test "managed worktree checkout ignores local replacement objects" {
     );
     defer allocator.free(tracked);
     try std.testing.expectEqualStrings("original\n", tracked);
+}
+
+fn initializeReplacementTestRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    repository: []const u8,
+) !void {
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "original\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "original" },
+    }) |argv| allocator.free(try gitOutput(
+        allocator,
+        io,
+        repository,
+        argv,
+        error.TestGitFailed,
+    ));
+}
+
+fn installReplacementObjectAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    repository: []const u8,
+) ![]u8 {
+    try initializeReplacementTestRepository(allocator, io, tmp, repository);
+    const original_raw = try gitOutput(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(original_raw);
+    const original = try allocator.dupe(u8, std.mem.trim(u8, original_raw, "\r\n"));
+    errdefer allocator.free(original);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "replacement" },
+    }) |argv| allocator.free(try gitOutput(
+        allocator,
+        io,
+        repository,
+        argv,
+        error.TestGitFailed,
+    ));
+    const replacement_raw = try gitOutput(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(replacement_raw);
+    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "reset", "--hard", original },
+        error.TestGitFailed,
+    ));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "replace", original, replacement },
+        error.TestGitFailed,
+    ));
+    return original;
+}
+
+fn retireManagedBestEffort(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository: []const u8,
+) void {
+    retireManaged(allocator, io, custody, repository) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }

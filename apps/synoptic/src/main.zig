@@ -171,17 +171,7 @@ fn launch(
     defer claim.unlock(io);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
-    if (try readCurrentForLaunch(allocator, io, current_path)) |record_value| {
-        var record = record_value;
-        defer record.deinit();
-        if (try verifiedProcess(allocator, io, record)) return error.SynopticAlreadyRunning;
-        try retireDeadLaunch(allocator, io, runtime_root, record);
-        std.Io.Dir.cwd().deleteFile(io, current_path) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
-        };
-    }
+    try retirePriorLaunch(allocator, io, runtime_root, current_path);
 
     var launch_bytes: [24]u8 = undefined;
     io.random(&launch_bytes);
@@ -194,11 +184,7 @@ fn launch(
     defer allocator.free(ready_path);
     const error_path = try std.fs.path.join(allocator, &.{ launch_dir, "error.json" });
     defer allocator.free(error_path);
-    const repository_cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        io,
-        options.cwd,
-        allocator,
-    );
+    const repository_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cwd, allocator);
     defer allocator.free(repository_cwd);
     const repository_identity = try worktree.repositoryIdentityAlloc(
         allocator,
@@ -230,8 +216,35 @@ fn launch(
     defer ready.deinit();
     if (!try verifiedProcess(allocator, io, ready)) return error.InvalidLaunchReadiness;
     try writeOperationalFile(allocator, io, current_path, ready.raw);
+    try emitLaunchReceipt(allocator, io, ready, options, settings.browser_open);
+    child_owned = false;
+}
+
+fn retirePriorLaunch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    current_path: []const u8,
+) !void {
+    const record_value = try readCurrentForLaunch(allocator, io, current_path) orelse return;
+    var record = record_value;
+    defer record.deinit();
+    if (try verifiedProcess(allocator, io, record)) return error.SynopticAlreadyRunning;
+    try retireDeadLaunch(allocator, io, runtime_root, record);
+    std.Io.Dir.cwd().deleteFile(io, current_path) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+}
+
+fn emitLaunchReceipt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ready: LifecycleRecord,
+    options: config.LaunchOptions,
+    browser_open: bool,
+) !void {
     const ready_url = ready.url orelse return error.InvalidLaunchReadiness;
-    if (!options.no_browser and settings.browser_open) {
+    if (!options.no_browser and browser_open) {
         openBrowser(allocator, io, ready_url) catch |ignored_error| switch (ignored_error) {
             else => {},
         };
@@ -241,7 +254,6 @@ fn launch(
         try out.interface.print("{s}\n", .{ready.raw});
     } else try out.interface.print("{s}\n", .{ready_url});
     try out.interface.flush();
-    child_owned = false;
 }
 
 fn cleanupFailedLaunch(
@@ -528,6 +540,33 @@ fn serveReview(
     );
     defer allocator.free(repository_cwd);
     options.cwd = repository_cwd;
+    try publishStartingReview(
+        allocator,
+        io,
+        launch_id,
+        runtime_root,
+        repository_cwd,
+        repository_identity,
+    );
+    return serveValidatedReview(
+        allocator,
+        io,
+        environment,
+        options,
+        launch_id,
+        runtime_root,
+        repository_identity,
+    );
+}
+
+fn publishStartingReview(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    launch_id: []const u8,
+    runtime_root: []const u8,
+    repository_cwd: []const u8,
+    repository_identity: []const u8,
+) !void {
     const launch_dir = try std.fs.path.join(allocator, &.{ runtime_root, launch_id });
     defer allocator.free(launch_dir);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
@@ -544,6 +583,18 @@ fn serveReview(
         @intCast(std.c.getpid()),
     );
     if (std.c.setpgid(0, 0) != 0) return error.SynopticProcessGroupDetachFailed;
+}
+
+fn serveValidatedReview(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options_value: config.LaunchOptions,
+    launch_id: []const u8,
+    runtime_root: []const u8,
+    repository_identity: []const u8,
+) !void {
+    var options = options_value;
     const canonical_skill_root = try canonicalPathFromDirAlloc(
         allocator,
         io,
@@ -1028,25 +1079,59 @@ fn serveHttpRuntime(
         exclusion_work.cancelled.store(true, .release);
         exclusion_thread.join();
     };
-    try publishRuntimeReady(
+    return runPublishedHttpRuntime(
         allocator,
         io,
         &server,
         &runtime,
+        state,
+        registry,
+        stop_request_path,
+        &exclusion_work,
+        exclusion_thread,
+        &exclusion_thread_owned,
         context.runtime_root,
         context.repository_identity,
+        context.options,
+        custody_retirement,
     );
-    exclusion_work.started.store(true, .release);
-    const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
-    exclusion_work.cancelled.store(true, .release);
-    exclusion_thread.join();
-    exclusion_thread_owned = false;
-    try finishHttpRuntime(
+}
+
+fn runPublishedHttpRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *http.Server,
+    runtime: *http.Runtime,
+    state: *App,
+    registry: *sessions.Registry,
+    stop_request_path: []const u8,
+    exclusion_work: *LaunchExclusionWork,
+    exclusion_thread: std.Thread,
+    exclusion_thread_owned: *bool,
+    runtime_root: []const u8,
+    repository_identity: []const u8,
+    options: config.LaunchOptions,
+    custody_retirement: *CustodyRetirement,
+) !void {
+    try publishRuntimeReady(
         allocator,
         io,
-        context.options,
-        context.runtime_root,
-        &runtime,
+        server,
+        runtime,
+        runtime_root,
+        repository_identity,
+    );
+    exclusion_work.started.store(true, .release);
+    const terminal_error = runHttpLoop(io, server, runtime, state, registry, stop_request_path);
+    exclusion_work.cancelled.store(true, .release);
+    exclusion_thread.join();
+    exclusion_thread_owned.* = false;
+    return finishHttpRuntime(
+        allocator,
+        io,
+        options,
+        runtime_root,
+        runtime,
         custody_retirement,
         terminal_error,
     );
@@ -1618,8 +1703,15 @@ fn stopStartingProcess(
         if (now_ms - started_ms >= launch_shutdown_grace_ms) {
             return error.SynopticStopTimeout;
         }
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        sleepBestEffort(io, 10);
     }
+}
+
+fn sleepBestEffort(io: std.Io, milliseconds: u32) void {
+    const result = std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake);
+    result catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }
 
 fn retireDeadStop(
@@ -2452,16 +2544,7 @@ test "explicit dead stop retires managed custody" {
     defer allocator.free(root);
     const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
     defer allocator.free(repo);
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "config", "user.email", "synoptic@example.test" },
-        &.{ "git", "config", "user.name", "Synoptic Test" },
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "head" },
-    }) |argv| {
-        const output = try runTestCommand(allocator, io, repo, argv);
-        allocator.free(output);
-    }
+    try initializeTestRepository(allocator, io, repo);
     const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
     defer allocator.free(runtime_root);
     const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -2513,6 +2596,20 @@ test "explicit dead stop retires managed custody" {
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
     );
+}
+
+fn initializeTestRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try runTestCommand(allocator, io, repository, argv));
 }
 
 test "worktree integrity dead managed launch retirement survives a missing repository" {

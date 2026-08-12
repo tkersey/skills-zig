@@ -2831,34 +2831,19 @@ test "viewed mutation crossing generation preserves external state and stays loc
     defer allocator.free(reads_path);
     const log_path = try std.fs.path.join(allocator, &.{ root, "log" });
     defer allocator.free(log_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "#!/bin/sh\nset -eu\ninput=$(cat)\nprintf '%s\\n' \"$input\" >> {s}\n" ++
-            "if printf '%s' \"$input\" | grep -q SynopticMarkFileViewed; then " ++
-            "touch {s}; printf '%s\\n' '{{\"data\":{{\"markFileAsViewed\":" ++
-            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
-            "if printf '%s' \"$input\" | grep -q SynopticUnmarkFileViewed; then " ++
-            "rm -f {s}; printf '%s\\n' '{{\"data\":{{\"unmarkFileAsViewed\":" ++
-            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
-            "reads=0; [ -f {s} ] && reads=$(cat {s}); reads=$((reads + 1)); " ++
-            "printf '%s' \"$reads\" > {s}; base=old; " ++
-            "[ \"$reads\" -gt 1 ] && base=new; viewed=UNVIEWED; " ++
-            "[ -f {s} ] && viewed=VIEWED; printf '{{\"data\":{{\"repository\":" ++
-            "{{\"pullRequest\":{{\"baseRefOid\":\"%s\",\"headRefOid\":\"head\",\"files\":" ++
-            "{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
-            "\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
-            "\"endCursor\":null}}}}}}}}}}}}\\n' \"$base\" \"$viewed\"\n",
-        .{ log_path, state_path, state_path, reads_path, reads_path, reads_path, state_path },
-    );
-    defer allocator.free(script);
-    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-viewed-race", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        gh_path,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
+    try installViewedRaceGh(allocator, io, &tmp, gh_path, state_path, reads_path, log_path);
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    try verifyViewedBatchRace(allocator, io, &tmp, broker, log_path);
+    try verifyCompletionRace(allocator, io, &tmp, broker, log_path);
+}
+
+fn verifyViewedBatchRace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    broker: github.Broker,
+    log_path: []const u8,
+) !void {
     const requests = [_]github.Broker.ViewedBatchRequest{.{
         .path = "a.zig",
         .client_id = "mark-1",
@@ -2881,7 +2866,15 @@ test "viewed mutation crossing generation preserves external state and stays loc
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
+}
 
+fn verifyCompletionRace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    broker: github.Broker,
+    log_path: []const u8,
+) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = "reads", .data = "0" });
     var state = try app.App.init(allocator, "head");
     defer state.deinit();
@@ -2924,6 +2917,44 @@ test "viewed mutation crossing generation preserves external state and stays loc
     try std.testing.expectEqual(
         @as(usize, 0),
         std.mem.count(u8, final_log, "SynopticUnmarkFileViewed"),
+    );
+}
+
+fn installViewedRaceGh(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    gh_path: []const u8,
+    state_path: []const u8,
+    reads_path: []const u8,
+    log_path: []const u8,
+) !void {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\ninput=$(cat)\nprintf '%s\\n' \"$input\" >> {s}\n" ++
+            "if printf '%s' \"$input\" | grep -q SynopticMarkFileViewed; then " ++
+            "touch {s}; printf '%s\\n' '{{\"data\":{{\"markFileAsViewed\":" ++
+            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
+            "if printf '%s' \"$input\" | grep -q SynopticUnmarkFileViewed; then " ++
+            "rm -f {s}; printf '%s\\n' '{{\"data\":{{\"unmarkFileAsViewed\":" ++
+            "{{\"pullRequest\":{{\"id\":\"PR_1\"}}}}}}}}'; exit 0; fi\n" ++
+            "reads=0; [ -f {s} ] && reads=$(cat {s}); reads=$((reads + 1)); " ++
+            "printf '%s' \"$reads\" > {s}; base=old; " ++
+            "[ \"$reads\" -gt 1 ] && base=new; viewed=UNVIEWED; " ++
+            "[ -f {s} ] && viewed=VIEWED; printf '{{\"data\":{{\"repository\":" ++
+            "{{\"pullRequest\":{{\"baseRefOid\":\"%s\",\"headRefOid\":\"head\",\"files\":" ++
+            "{{\"nodes\":[{{\"path\":\"a.zig\",\"viewerViewedState\":" ++
+            "\"%s\"}}],\"pageInfo\":{{\"hasNextPage\":false," ++
+            "\"endCursor\":null}}}}}}}}}}}}\\n' \"$base\" \"$viewed\"\n",
+        .{ log_path, state_path, state_path, reads_path, reads_path, reads_path, state_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-viewed-race", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
     );
 }
 
@@ -4270,52 +4301,8 @@ test "worktree integrity authoritative Git identity ignores replacement refs" {
     try tmp.dir.createDirPath(io, "repo");
     const repo = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
     defer allocator.free(repo);
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "base\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "config", "user.email", "synoptic@example.test" },
-        &.{ "git", "config", "user.name", "Synoptic Test" },
-        &.{ "git", "switch", "-qc", "feature" },
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "base" },
-    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
-    const base_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
-    defer allocator.free(base_raw);
-    const base = std.mem.trim(u8, base_raw, "\r\n");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "intended\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "add", "tracked.txt" },
-        &.{ "git", "commit", "-qm", "intended" },
-    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
-    const head_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
-    defer allocator.free(head_raw);
-    const head = std.mem.trim(u8, head_raw, "\r\n");
-    allocator.free(try runGit(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "switch", "--detach", base },
-    ));
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "add", "tracked.txt" },
-        &.{ "git", "commit", "-qm", "replacement" },
-    }) |argv| allocator.free(try runGit(allocator, io, repo, argv));
-    const replacement_raw = try runGit(allocator, io, repo, &.{ "git", "rev-parse", "HEAD" });
-    defer allocator.free(replacement_raw);
-    const replacement = std.mem.trim(u8, replacement_raw, "\r\n");
-    allocator.free(try runGit(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "switch", "--detach", head },
-    ));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        repo,
-        &.{ "git", "replace", head, replacement },
-    ));
+    var history = try installReplacementHistory(allocator, io, &tmp, repo);
+    defer history.deinit(allocator);
     const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_root);
     const managed = try std.fs.path.join(allocator, &.{ tmp_root, "managed" });
@@ -4325,13 +4312,13 @@ test "worktree integrity authoritative Git identity ignores replacement refs" {
         io,
         repo,
         "feature",
-        head,
+        history.head,
         managed,
         false,
         null,
     );
     defer allocator.free(custody.path());
-    defer worktree.retireManaged(allocator, io, custody, repo) catch {};
+    defer retireManagedTestBestEffort(allocator, io, custody, repo);
     const tracked_path = try std.fs.path.join(allocator, &.{ managed, "tracked.txt" });
     defer allocator.free(tracked_path);
     const tracked = try std.Io.Dir.cwd().readFileAlloc(
@@ -4346,13 +4333,93 @@ test "worktree integrity authoritative Git identity ignores replacement refs" {
         allocator,
         io,
         repo,
-        base,
-        head,
+        history.base,
+        history.head,
         "tracked.txt",
     );
     defer allocator.free(diff);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+intended") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+replacement") == null);
+}
+
+const ReplacementHistory = struct {
+    base: []u8,
+    head: []u8,
+
+    fn deinit(self: *ReplacementHistory, allocator: std.mem.Allocator) void {
+        allocator.free(self.head);
+        allocator.free(self.base);
+    }
+};
+
+fn installReplacementHistory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    repository: []const u8,
+) !ReplacementHistory {
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "switch", "-qc", "feature" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runGit(allocator, io, repository, argv));
+    const base = try gitHeadAlloc(allocator, io, repository);
+    errdefer allocator.free(base);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "intended\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "intended" },
+    }) |argv| allocator.free(try runGit(allocator, io, repository, argv));
+    const head = try gitHeadAlloc(allocator, io, repository);
+    errdefer allocator.free(head);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "switch", "--detach", base },
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/tracked.txt", .data = "replacement\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "replacement" },
+    }) |argv| allocator.free(try runGit(allocator, io, repository, argv));
+    const replacement = try gitHeadAlloc(allocator, io, repository);
+    defer allocator.free(replacement);
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "switch", "--detach", head },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        repository,
+        &.{ "git", "replace", head, replacement },
+    ));
+    return .{ .base = base, .head = head };
+}
+
+fn gitHeadAlloc(allocator: std.mem.Allocator, io: std.Io, repository: []const u8) ![]u8 {
+    const raw = try runGit(allocator, io, repository, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trim(u8, raw, "\r\n"));
+}
+
+fn retireManagedTestBestEffort(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: worktree.Custody,
+    repository: []const u8,
+) void {
+    const result = worktree.retireManaged(allocator, io, custody, repository);
+    result catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }
 
 fn verifyManagedCustodyLifecycle(
@@ -4772,7 +4839,7 @@ fn verifyLifecycleInterruptedStartingLaunch(
     const gate = try std.fs.path.join(allocator, &.{ fixture.runtime_tmp, "gh.gate" });
     defer allocator.free(gate);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gate, .data = "hold\n" });
-    defer std.Io.Dir.cwd().deleteFile(io, gate) catch {};
+    defer deleteFileTestBestEffort(io, gate);
     try environment.put("SYNOPTIC_TEST_GH_GATE", gate);
     defer _ = environment.swapRemove("SYNOPTIC_TEST_GH_GATE");
     var launcher = try std.process.spawn(io, .{
@@ -4799,20 +4866,7 @@ fn verifyLifecycleInterruptedStartingLaunch(
         &.{ fixture.runtime_tmp, "synoptic", "current.json" },
     );
     defer allocator.free(current_path);
-    for (0..400) |_| {
-        const raw = std.Io.Dir.cwd().readFileAlloc(
-            io,
-            current_path,
-            allocator,
-            .limited(64 * 1024),
-        ) catch {
-            std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
-            continue;
-        };
-        const published = std.mem.indexOf(u8, raw, "\"status\":\"starting\"") != null;
-        allocator.free(raw);
-        if (published) break;
-    } else return error.StartingRecordNotPublished;
+    try waitForStartingRecord(allocator, io, current_path);
     launcher.kill(io);
     const status = try runLifecycleCommand(
         allocator,
@@ -4834,6 +4888,41 @@ fn verifyLifecycleInterruptedStartingLaunch(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, current_path, .{}),
     );
+}
+
+fn waitForStartingRecord(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    current_path: []const u8,
+) !void {
+    for (0..400) |_| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            current_path,
+            allocator,
+            .limited(64 * 1024),
+        ) catch {
+            sleepTestBestEffort(io, 5);
+            continue;
+        };
+        const published = std.mem.indexOf(u8, raw, "\"status\":\"starting\"") != null;
+        allocator.free(raw);
+        if (published) return;
+    }
+    return error.StartingRecordNotPublished;
+}
+
+fn deleteFileTestBestEffort(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, path) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+}
+
+fn sleepTestBestEffort(io: std.Io, milliseconds: u32) void {
+    const result = std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake);
+    result catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
 }
 
 fn verifyLifecycleStatus(
@@ -6014,7 +6103,22 @@ fn verifyReusedApprovalCustody(
         &.{ "git", "switch", "-q", "-c", "approval-custody-drift" },
     );
     allocator.free(switched);
+    try rejectStaleApprovalDecisions(allocator, io, stream, runtime);
+    try verifyStaleCompletionBlocked(
+        allocator,
+        io,
+        runtime,
+        codex_log_path,
+        gh_log_path,
+    );
+}
 
+fn rejectStaleApprovalDecisions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: *std.Io.net.Stream,
+    runtime: *http.Runtime,
+) !void {
     try sendMaskedText(io, stream, "{\"type\":\"approval.resolve\",\"payload\":{" ++
         "\"sessionId\":\"ses-1\",\"approvalId\":\"apr-1\",\"decision\":\"accept\"}}");
     const accept_rejected = try wsRead(
@@ -6041,7 +6145,15 @@ fn verifyReusedApprovalCustody(
     try std.testing.expect(std.mem.indexOf(u8, declined, "\"decision\":\"decline\"") != null);
     const completed = try wsRead(allocator, io, stream, "turn/completed");
     defer allocator.free(completed);
+}
 
+fn verifyStaleCompletionBlocked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: *http.Runtime,
+    codex_log_path: []const u8,
+    gh_log_path: []const u8,
+) !void {
     try runtime.registry.message("ses-1", "complete this file");
     for (0..200) |_| {
         const log = try std.Io.Dir.cwd().readFileAlloc(
