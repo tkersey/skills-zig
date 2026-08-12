@@ -736,27 +736,15 @@ pub const App = struct {
         const revision = self.official_revision orelse return error.NotOfficialCurrentSession;
         for (self.generation.files.items) |file| if (std.mem.eql(u8, file.path, path) and
             !std.mem.eql(u8, file.revision_key, revision)) return error.StaleOriginSession;
-        try broker.validateCurrentPath(
+        try self.synchronizeCompletedRevision(
+            broker,
             owner,
             name,
             number,
-            self.generation.base_oid,
-            self.generation.head_oid,
+            pull_request_id,
             path,
+            revision,
         );
-        try broker.markViewed(pull_request_id, path);
-        if (!try broker.viewedAfterMutation(
-            owner,
-            name,
-            number,
-            self.generation.base_oid,
-            self.generation.head_oid,
-            path,
-        )) return error.MarkViewedReadbackFailed;
-        try self.generation.markViewed(path);
-        for (self.tabs.items) |*tab| {
-            if (tab.status == .current and std.mem.eql(u8, tab.path, path)) tab.status = .completed;
-        }
     }
     pub fn completeRevision(
         self: *App,
@@ -772,25 +760,55 @@ pub const App = struct {
         const current = domain.revisionFor(&self.generation, path) orelse
             return error.FileNotQueued;
         if (!std.mem.eql(u8, current, revision)) return error.StaleOriginSession;
-        try broker.validateCurrentPath(
+        try self.synchronizeCompletedRevision(
+            broker,
             owner,
             name,
             number,
-            self.generation.base_oid,
-            self.generation.head_oid,
+            pull_request_id,
             path,
+            revision,
         );
-        broker.markViewed(pull_request_id, path) catch |err| {
-            if (err != error.GitHubTransportAmbiguous) return err;
-        };
-        if (!try broker.viewedAfterMutation(
+    }
+
+    fn synchronizeCompletedRevision(
+        self: *App,
+        broker: github.Broker,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        pull_request_id: []const u8,
+        path: []const u8,
+        revision: []const u8,
+    ) !void {
+        const client_id = try std.fmt.allocPrint(
+            self.allocator,
+            "synoptic-complete-{s}",
+            .{revision},
+        );
+        defer self.allocator.free(client_id);
+        const synchronized = broker.synchronizeViewed(
             owner,
             name,
             number,
+            pull_request_id,
             self.generation.base_oid,
             self.generation.head_oid,
             path,
-        )) return error.MarkViewedReadbackFailed;
+            client_id,
+        );
+        if (!synchronized.viewed) {
+            if (synchronized.outcome_unknown) {
+                self.action_state_fresh = false;
+                return error.GitHubTransportAmbiguous;
+            }
+            if (synchronized.error_name) |error_name| {
+                if (std.mem.eql(u8, error_name, @errorName(error.PullRequestChanged))) {
+                    return error.PullRequestChanged;
+                }
+            }
+            return error.MarkViewedReadbackFailed;
+        }
         try self.generation.markViewed(path);
         for (self.tabs.items) |*tab| {
             if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and
