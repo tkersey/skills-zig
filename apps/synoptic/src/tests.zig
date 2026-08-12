@@ -12,6 +12,32 @@ const tools = @import("tools.zig");
 const ui = @import("ui_protocol.zig");
 const worktree = @import("worktree.zig");
 
+test "generation admission rejects invalid snapshot values and aggregate excess" {
+    const prefix = "{\"data\":{\"repository\":{\"pullRequest\":{\"files\":{\"nodes\":[";
+    const suffix = "]}}}}}";
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "base", "head");
+    defer generation.deinit();
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        github.loadSnapshotFiles(std.testing.allocator, prefix ++ "null" ++ suffix, &generation),
+    );
+    const mistyped = prefix ++ "{\"path\":\"a\",\"additions\":null," ++
+        "\"deletions\":0,\"changeType\":\"MODIFIED\"," ++
+        "\"viewerViewedState\":\"UNVIEWED\"}" ++ suffix;
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        github.loadSnapshotFiles(std.testing.allocator, mistyped, &generation),
+    );
+    try std.testing.expectError(
+        error.GenerationFileLimitExceeded,
+        github.GenerationHydrationBudget.admitFileCount(github.generation_file_count_max + 1),
+    );
+    var budget = github.GenerationHydrationBudget{
+        .retained_diff_bytes = github.generation_review_diff_bytes_max,
+    };
+    try std.testing.expectError(error.GenerationDiffBudgetExceeded, budget.admitReviewDiff(1));
+}
+
 test "vertical state path gates primary, streams session, and retains completed tab" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();

@@ -530,7 +530,7 @@ fn serveResolvedPullRequest(
     var generation = try domain.PrGeneration.initFull(allocator, snapshot.base, snapshot.head);
     var generation_owned = true;
     errdefer if (generation_owned) generation.deinit();
-    for (pages.files.items) |page| try loadSnapshotFiles(allocator, page, &generation);
+    for (pages.files.items) |page| try github.loadSnapshotFiles(allocator, page, &generation);
     for (pages.threads.items) |page| try github.loadThreads(allocator, page, &generation);
     try serveGeneration(
         allocator,
@@ -577,23 +577,23 @@ const Snapshot = struct {
     is_draft: bool,
 
     fn load(allocator: std.mem.Allocator, page: []const u8) !Snapshot {
-        const head = try snapshotField(allocator, page, "headRefOid");
+        const head = try github.snapshotStringFieldAlloc(allocator, page, "headRefOid");
         errdefer allocator.free(head);
-        const base = try snapshotField(allocator, page, "baseRefOid");
+        const base = try github.snapshotStringFieldAlloc(allocator, page, "baseRefOid");
         errdefer allocator.free(base);
-        const pull_request_id = try snapshotField(allocator, page, "id");
+        const pull_request_id = try github.snapshotStringFieldAlloc(allocator, page, "id");
         errdefer allocator.free(pull_request_id);
-        const title = try snapshotField(allocator, page, "title");
+        const title = try github.snapshotStringFieldAlloc(allocator, page, "title");
         errdefer allocator.free(title);
-        const body = try snapshotOptionalTextField(allocator, page, "body");
+        const body = try github.snapshotOptionalStringFieldAlloc(allocator, page, "body");
         errdefer allocator.free(body);
-        const base_ref = try snapshotField(allocator, page, "baseRefName");
+        const base_ref = try github.snapshotStringFieldAlloc(allocator, page, "baseRefName");
         errdefer allocator.free(base_ref);
-        const head_ref = try snapshotField(allocator, page, "headRefName");
+        const head_ref = try github.snapshotStringFieldAlloc(allocator, page, "headRefName");
         errdefer allocator.free(head_ref);
-        const pull_url = try snapshotField(allocator, page, "url");
+        const pull_url = try github.snapshotStringFieldAlloc(allocator, page, "url");
         errdefer allocator.free(pull_url);
-        const pull_state = try snapshotField(allocator, page, "state");
+        const pull_state = try github.snapshotStringFieldAlloc(allocator, page, "state");
         errdefer allocator.free(pull_state);
         return .{
             .allocator = allocator,
@@ -606,7 +606,7 @@ const Snapshot = struct {
             .head_ref = head_ref,
             .pull_url = pull_url,
             .pull_state = pull_state,
-            .is_draft = try snapshotBoolField(allocator, page, "isDraft"),
+            .is_draft = try github.snapshotBoolField(allocator, page, "isDraft"),
         };
     }
 
@@ -1831,77 +1831,6 @@ fn parseLaunch(args: []const []const u8) !config.LaunchOptions {
     };
 }
 
-fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const pull = try snapshotPull(parsed.value);
-    return allocator.dupe(u8, pull.get(field).?.string);
-}
-fn snapshotOptionalTextField(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    field: []const u8,
-) ![]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const pull = try snapshotPull(parsed.value);
-    const value = pull.get(field) orelse return error.InvalidSnapshot;
-    return allocator.dupe(u8, if (value == .null) "" else value.string);
-}
-fn snapshotBoolField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const pull = try snapshotPull(parsed.value);
-    return pull.get(field).?.bool;
-}
-fn loadSnapshotFiles(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    generation: *domain.PrGeneration,
-) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const pull = try snapshotPull(parsed.value);
-    const files = (pull.get("files") orelse return error.InvalidSnapshot).object;
-    const nodes = files.get("nodes").?.array.items;
-    for (nodes) |node| {
-        const o = node.object;
-        const state = o.get("viewerViewedState").?.string;
-        const path = o.get("path").?.string;
-        const change_type = o.get("changeType").?.string;
-        const revision = try domain.revisionKey(
-            allocator,
-            path,
-            change_type,
-            "graphql-blob-unavailable",
-            path,
-        );
-        defer allocator.free(revision);
-        try generation.addFile(
-            .{
-                .path = path,
-                .additions = @intCast(o.get("additions").?.integer),
-                .deletions = @intCast(o.get("deletions").?.integer),
-                .change_type = change_type,
-                .viewed = snapshotViewedState(state),
-                .revision_key = revision,
-            },
-        );
-    }
-}
-
-fn snapshotPull(value: std.json.Value) !std.json.ObjectMap {
-    const data = value.object.get("data") orelse return error.InvalidSnapshot;
-    const repository = data.object.get("repository") orelse return error.InvalidSnapshot;
-    const pull = repository.object.get("pullRequest") orelse return error.InvalidSnapshot;
-    return pull.object;
-}
-
-fn snapshotViewedState(value: []const u8) domain.ViewedState {
-    if (std.mem.eql(u8, value, "VIEWED")) return .viewed;
-    if (std.mem.eql(u8, value, "DISMISSED")) return .dismissed;
-    return .unviewed;
-}
 fn resolveSelectorUrl(
     allocator: std.mem.Allocator,
     io: std.Io,

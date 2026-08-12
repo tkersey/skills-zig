@@ -9,6 +9,8 @@ const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
 const canonical_diff_bytes_max: usize = 64 * 1024 * 1024;
 const review_diff_bytes_max: usize = 512 * 1024;
+pub const generation_file_count_max: usize = 3_000;
+pub const generation_review_diff_bytes_max: usize = 128 * 1024 * 1024;
 const rename_metadata_bytes_max: usize = 16 * 1024 * 1024;
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
@@ -1701,20 +1703,49 @@ fn freePages(allocator: std.mem.Allocator, pages: *std.ArrayList([]u8)) void {
     pages.deinit(allocator);
 }
 
-fn viewedState(value: []const u8) domain.ViewedState {
+fn viewedState(value: []const u8) !domain.ViewedState {
     if (std.mem.eql(u8, value, "VIEWED")) return .viewed;
     if (std.mem.eql(u8, value, "DISMISSED")) return .dismissed;
-    return .unviewed;
+    if (std.mem.eql(u8, value, "UNVIEWED")) return .unviewed;
+    return error.InvalidSnapshot;
 }
 
-fn snapshotField(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]u8 {
+pub fn snapshotStringFieldAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    field: []const u8,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const pull = try pullObject(parsed.value);
     return objectStringAlloc(allocator, pull, field, false);
 }
 
-fn objectStringAlloc(
+pub fn snapshotOptionalStringFieldAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    field: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = try pullObject(parsed.value);
+    return objectStringAlloc(allocator, pull, field, true);
+}
+
+pub fn snapshotBoolField(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    field: []const u8,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = try pullObject(parsed.value);
+    const value = pull.get(field) orelse return error.InvalidSnapshot;
+    if (value != .bool) return error.InvalidSnapshot;
+    return value.bool;
+}
+
+pub fn objectStringAlloc(
     allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
     field: []const u8,
@@ -1726,7 +1757,7 @@ fn objectStringAlloc(
     return allocator.dupe(u8, value.string);
 }
 
-fn loadSnapshotFiles(
+pub fn loadSnapshotFiles(
     allocator: std.mem.Allocator,
     raw: []const u8,
     generation: *domain.PrGeneration,
@@ -1734,12 +1765,13 @@ fn loadSnapshotFiles(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const pull = try pullObject(parsed.value);
-    const files = (pull.get("files") orelse return error.InvalidSnapshot).object;
-    for (files.get("nodes").?.array.items) |node| {
-        const object = node.object;
-        const viewed = object.get("viewerViewedState").?.string;
-        const path = object.get("path").?.string;
-        const change_type = object.get("changeType").?.string;
+    const files = try requiredObjectField(pull, "files");
+    const nodes = try requiredArrayField(files, "nodes");
+    for (nodes) |node| {
+        const object = try requiredObject(node);
+        const viewed = try requiredStringField(object, "viewerViewedState");
+        const path = try requiredStringField(object, "path");
+        const change_type = try requiredStringField(object, "changeType");
         const revision = try domain.revisionKey(
             allocator,
             path,
@@ -1751,14 +1783,42 @@ fn loadSnapshotFiles(
         try generation.addFile(
             .{
                 .path = path,
-                .additions = @intCast(object.get("additions").?.integer),
-                .deletions = @intCast(object.get("deletions").?.integer),
+                .additions = try requiredU32Field(object, "additions"),
+                .deletions = try requiredU32Field(object, "deletions"),
                 .change_type = change_type,
-                .viewed = viewedState(viewed),
+                .viewed = try viewedState(viewed),
                 .revision_key = revision,
             },
         );
     }
+}
+
+fn requiredObjectField(object: std.json.ObjectMap, field: []const u8) !std.json.ObjectMap {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    return requiredObject(value);
+}
+
+fn requiredArrayField(
+    object: std.json.ObjectMap,
+    field: []const u8,
+) ![]const std.json.Value {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    if (value != .array) return error.InvalidSnapshot;
+    return value.array.items;
+}
+
+fn requiredStringField(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    if (value != .string) return error.InvalidSnapshot;
+    return value.string;
+}
+
+fn requiredU32Field(object: std.json.ObjectMap, field: []const u8) !u32 {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+        return error.InvalidSnapshot;
+    }
+    return @intCast(value.integer);
 }
 
 pub fn loadThreads(
@@ -1927,6 +1987,24 @@ fn hydrateRevisionKeysWithGitPath(
     );
 }
 
+pub const GenerationHydrationBudget = struct {
+    retained_diff_bytes: usize = 0,
+
+    pub fn admitFileCount(count: usize) !void {
+        if (count > generation_file_count_max) return error.GenerationFileLimitExceeded;
+    }
+
+    pub fn admitReviewDiff(self: *GenerationHydrationBudget, bytes: usize) !void {
+        const next = std.math.add(usize, self.retained_diff_bytes, bytes) catch {
+            return error.GenerationDiffBudgetExceeded;
+        };
+        if (next > generation_review_diff_bytes_max) {
+            return error.GenerationDiffBudgetExceeded;
+        }
+        self.retained_diff_bytes = next;
+    }
+};
+
 fn hydrateRevisionKeysWithGitPathLimit(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1936,6 +2014,8 @@ fn hydrateRevisionKeysWithGitPathLimit(
     git_path: []const u8,
     diff_bytes_max: usize,
 ) !void {
+    try GenerationHydrationBudget.admitFileCount(generation.files.items.len);
+    var budget: GenerationHydrationBudget = .{};
     worktree.ensureObjectAvailable(
         allocator,
         io,
@@ -1981,6 +2061,7 @@ fn hydrateRevisionKeysWithGitPathLimit(
             generation,
             file.*,
             diff_bytes_max,
+            &budget,
         );
     }
 }
@@ -1994,6 +2075,7 @@ fn hydrateFileRevision(
     generation: *domain.PrGeneration,
     file: domain.File,
     diff_bytes_max: usize,
+    budget: *GenerationHydrationBudget,
 ) !void {
     const blob = try blobOidAtAlloc(
         allocator,
@@ -2039,6 +2121,7 @@ fn hydrateFileRevision(
         file.previous_path,
     );
     defer allocator.free(review_diff);
+    try budget.admitReviewDiff(review_diff.len);
     const revision = try domain.revisionKey(
         allocator,
         file.path,
@@ -2633,14 +2716,14 @@ fn validateGenerationIdentity(
     threads: []const []const u8,
 ) !void {
     if (files.len == 0) return error.InvalidSnapshot;
-    const expected_head = try snapshotField(allocator, files[0], "headRefOid");
+    const expected_head = try snapshotStringFieldAlloc(allocator, files[0], "headRefOid");
     defer allocator.free(expected_head);
-    const expected_base = try snapshotField(allocator, files[0], "baseRefOid");
+    const expected_base = try snapshotStringFieldAlloc(allocator, files[0], "baseRefOid");
     defer allocator.free(expected_base);
     for (files) |page| {
-        const head = try snapshotField(allocator, page, "headRefOid");
+        const head = try snapshotStringFieldAlloc(allocator, page, "headRefOid");
         defer allocator.free(head);
-        const base = try snapshotField(allocator, page, "baseRefOid");
+        const base = try snapshotStringFieldAlloc(allocator, page, "baseRefOid");
         defer allocator.free(base);
         if (!std.mem.eql(u8, expected_head, head) or
             !std.mem.eql(u8, expected_base, base)) return error.MixedGenerationPages;
