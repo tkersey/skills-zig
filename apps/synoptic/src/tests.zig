@@ -456,6 +456,7 @@ test "renamed file identity preserves old-path thread evidence" {
     defer std.testing.allocator.free(evidence);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "T-old") != null);
     try std.testing.expect(generation.sameReviewFile("old.zig", "new.zig"));
+    try std.testing.expect(!generation.sameReviewFile("new.zig", "old.zig"));
 }
 
 test "file lineage composes across more than one ephemeral generation" {
@@ -1208,7 +1209,7 @@ fn fakeActionGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8) !
         \\cat > "$input"
         \\printf 'ARGV:%s\nSTDIN:' "$*" >> "$log"; cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticActionAuthority' "$input"; then
-        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[{"id":"C_1","body":"old","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
+        \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_1","path":"a.zig","viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":true,"comments":{"nodes":[{"id":"C_1","body":"old","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
         \\fi
         \\if grep -q 'SynopticAnchor' "$input"; then
         \\  printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"b","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0
@@ -1233,7 +1234,7 @@ fn fakeAmbiguousGhScriptAlloc(allocator: std.mem.Allocator, log_path: []const u8
         \\cat > "$input"
         \\cat "$input" >> "$log"; printf '\n' >> "$log"
         \\if grep -q 'SynopticAnchor' "$input"; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","files":{"nodes":[{"path":"a.zig"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi
-        \\if grep -q 'SynopticReconcile' "$input"; then if [ ! -f "$state" ]; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi; now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
+        \\if grep -q 'SynopticReconcile' "$input"; then if [ ! -f "$state" ]; then printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'; exit 0; fi; now=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '{"data":{"repository":{"pullRequest":{"baseRefOid":"unknown-base","headRefOid":"h","reviewThreads":{"nodes":[{"id":"T_new","path":"a.zig","line":1,"startLine":null,"diffSide":"RIGHT","startDiffSide":null,"isResolved":false,"comments":{"nodes":[{"id":"C_new","body":"body","createdAt":"%s","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$now"; exit 0; fi
         \\if grep -q 'SynopticAddInlineComment' "$input"; then : > "$state"; exit 1; fi
         \\printf '%s\n' '{"data":{}}'
         \\

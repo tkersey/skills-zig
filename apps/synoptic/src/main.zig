@@ -1402,6 +1402,7 @@ fn stop(
         return printStopResult(io, json, null, false);
     defer record.deinit();
     if (!try verifiedProcess(allocator, io, record)) {
+        try retireDeadStop(allocator, io, runtime_root, current_path, record);
         return printStopResult(io, json, null, false);
     }
     const stop_request_path = try std.fs.path.join(
@@ -1435,6 +1436,17 @@ fn stop(
     try requireNoTerminalError(io, terminal_error_path);
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
     return printStopResult(io, json, record.launch_id, true);
+}
+
+fn retireDeadStop(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    current_path: []const u8,
+    record: LifecycleRecord,
+) !void {
+    try retireDeadLaunch(allocator, io, runtime_root, record);
+    removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
 }
 
 fn requireNoTerminalError(io: std.Io, path: []const u8) !void {
@@ -2218,7 +2230,7 @@ test "successful shutdown retires its complete launch directory" {
         std.Io.Dir.cwd().statFile(io, launch_path, .{}),
     );
 }
-test "dead launch recovery retires managed custody" {
+test "explicit dead stop retires managed custody" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2276,7 +2288,9 @@ test "dead launch recovery retires managed custody" {
         .pid = 999_999,
     };
     defer record.deinit();
-    try retireDeadLaunch(allocator, io, runtime_root, record);
+    const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
+    defer allocator.free(current_path);
+    try retireDeadStop(allocator, io, runtime_root, current_path, record);
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, managed, .{}),

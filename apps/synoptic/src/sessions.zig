@@ -2832,10 +2832,14 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
     if (exactDirective(directive, &.{ "take the action", "prepare the action" })) {
         return .github_any;
     }
+    if (actionObjectAfterVerb(directive, &.{"prepare"})) |object| {
+        const positive = positiveObjectBeforeNegation(object) orelse return null;
+        return if (isPreparedGithubEffect(positive)) .github_any else null;
+    }
     const action_object = actionObjectAfterVerb(directive, &.{
         "add",     "remove", "set",   "request", "submit",  "dismiss", "change",
         "execute", "update", "close", "reopen",  "merge",   "resolve", "reply",
-        "delete",  "unmark", "mark",  "post",    "publish", "prepare",
+        "delete",  "unmark", "mark",  "post",    "publish",
     });
     const positive_object = if (action_object) |object|
         positiveObjectBeforeNegation(object)
@@ -2848,6 +2852,25 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
     });
     if (github_target) return .github_any;
     return null;
+}
+
+fn isPreparedGithubEffect(object: []const u8) bool {
+    var target = std.mem.trim(u8, object, " \t\r\n,;.!?");
+    for (0..2) |_| {
+        const before = target.len;
+        for ([_][]const u8{ "a ", "an ", "the ", "this ", "that " }) |prefix| {
+            if (target.len >= prefix.len and
+                std.ascii.eqlIgnoreCase(target[0..prefix.len], prefix))
+            {
+                target = std.mem.trim(u8, target[prefix.len..], " \t\r\n,;.!?");
+                break;
+            }
+        }
+        if (target.len == before) break;
+    }
+    return startsWordAnyIgnoreCase(target, &.{
+        "comment", "inline comment", "reply", "graphql action",
+    });
 }
 
 fn positiveObjectBeforeNegation(object: []const u8) ?[]const u8 {
@@ -3323,6 +3346,19 @@ test "explicit broad GitHub operation grants generic action authority without or
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         classifyHumanInstruction("Could you add this label?").?,
+    );
+}
+
+test "prepare authority distinguishes effects from informational artifacts" {
+    try std.testing.expect(classifyHumanInstruction(
+        "Prepare a summary of the existing comments",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Prepare an overview of this pull request",
+    ) == null);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        classifyHumanInstruction("Prepare an inline comment").?,
     );
 }
 

@@ -451,7 +451,7 @@ pub const PrGeneration = struct {
             if (pass == 1 and !whole_pr) continue;
             if (paths.len > 0) {
                 var matched = false;
-                for (paths) |path| if (self.sameReviewFile(path, thread.path)) {
+                for (paths) |path| if (self.sameReviewFile(thread.path, path)) {
                     matched = true;
                     break;
                 };
@@ -616,7 +616,7 @@ pub const PrGeneration = struct {
     ) bool {
         if (paths.len > 0) {
             var path_matched = false;
-            for (paths) |path| if (self.sameReviewFile(path, thread.path)) {
+            for (paths) |path| if (self.sameReviewFile(thread.path, path)) {
                 path_matched = true;
                 break;
             };
@@ -778,15 +778,13 @@ pub const PrGeneration = struct {
 
     pub fn sameReviewFile(
         self: *const PrGeneration,
-        left: []const u8,
-        right: []const u8,
+        historical_path: []const u8,
+        current_path: []const u8,
     ) bool {
-        if (std.mem.eql(u8, left, right)) return true;
-        const current_left = (self.resolveCurrentPath(left) catch return false) orelse
+        if (std.mem.eql(u8, historical_path, current_path)) return true;
+        const resolved = (self.resolveCurrentPath(historical_path) catch return false) orelse
             return false;
-        const current_right = (self.resolveCurrentPath(right) catch return false) orelse
-            return false;
-        return std.mem.eql(u8, current_left, current_right);
+        return std.mem.eql(u8, resolved, current_path);
     }
 
     pub fn setExclusion(

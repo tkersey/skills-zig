@@ -234,6 +234,29 @@ fn isRecoveryCommand(command: []const u8) bool {
         std.mem.eql(u8, command, "app.stop");
 }
 
+fn commandAdmitted(
+    refresh_epoch: RefreshEpochState,
+    worktree_generation_valid: bool,
+    command: []const u8,
+) bool {
+    if (isRecoveryCommand(command) or std.mem.eql(u8, command, "approval.resolve")) {
+        return true;
+    }
+    return worktree_generation_valid and refresh_epoch == .current;
+}
+
+test "degraded refresh admits recovery commands only" {
+    inline for (.{ "snapshot.get", "pr.refresh", "round.finish", "app.stop" }) |command| {
+        try std.testing.expect(commandAdmitted(.degraded, true, command));
+    }
+    try std.testing.expect(commandAdmitted(.degraded, true, "approval.resolve"));
+    inline for (.{ "file.open", "session.message", "action.confirm" }) |command| {
+        try std.testing.expect(!commandAdmitted(.degraded, true, command));
+    }
+    try std.testing.expect(commandAdmitted(.current, true, "file.open"));
+    try std.testing.expect(!commandAdmitted(.current, false, "file.open"));
+}
+
 fn invalidateActionGeneration(runtime: *Runtime) void {
     runtime.app.action_state_fresh = false;
     runtime.worktree_generation_valid = false;
@@ -836,10 +859,11 @@ pub const Server = struct {
             .object => |o| o,
             else => return error.InvalidUiCommand,
         };
-        if (!runtime.worktree_generation_valid and
-            !isRecoveryCommand(command) and
-            !std.mem.eql(u8, command, "approval.resolve"))
-        {
+        if (!commandAdmitted(
+            runtime.refresh_epoch,
+            runtime.worktree_generation_valid,
+            command,
+        )) {
             return error.WorktreeGenerationMismatch;
         }
         if (std.mem.eql(u8, command, "file.open")) return self.openFile(runtime, payload);

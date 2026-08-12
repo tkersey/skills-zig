@@ -5,6 +5,7 @@ const tools = @import("tools.zig");
 const worktree = @import("worktree.zig");
 
 const max_pages: usize = 10_000;
+const paginated_response_bytes_max: usize = 64 * 1024 * 1024;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
 const canonical_diff_bytes_max: usize = 64 * 1024 * 1024;
@@ -343,6 +344,7 @@ pub const Broker = struct {
         number: u64,
     ) !void {
         const outer_count = pages.items.len;
+        var retained_bytes = try retainedPageBytes(pages.items);
         for (0..outer_count) |index| {
             const page = pages.items[index];
             var parsed = try std.json.parseFromSlice(
@@ -353,19 +355,21 @@ pub const Broker = struct {
             );
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
-            const expected_base = pull.get("baseRefOid").?.string;
-            const expected_head = pull.get("headRefOid").?.string;
-            const nodes = pull.get("reviewThreads").?.object.get("nodes").?.array;
-            for (nodes.items) |node| {
-                if (node != .object) return error.InvalidSnapshot;
-                const comments = node.object.get("comments").?.object;
-                const cursor = nextCursor(comments) orelse continue;
+            const expected_base = try requiredStringField(pull, "baseRefOid");
+            const expected_head = try requiredStringField(pull, "headRefOid");
+            const threads = try requiredObjectField(pull, "reviewThreads");
+            const nodes = try requiredArrayField(threads, "nodes");
+            for (nodes) |node| {
+                const thread = try requiredObject(node);
+                const comments = try requiredObjectField(thread, "comments");
+                const cursor = (try nextCursor(comments)) orelse continue;
                 try self.appendThreadComments(
                     pages,
+                    &retained_bytes,
                     owner,
                     name,
                     number,
-                    node.object.get("id").?.string,
+                    try requiredStringField(thread, "id"),
                     cursor,
                     expected_base,
                     expected_head,
@@ -377,6 +381,7 @@ pub const Broker = struct {
     fn appendThreadComments(
         self: Broker,
         pages: *std.ArrayList([]u8),
+        retained_bytes: *usize,
         owner: []const u8,
         name: []const u8,
         number: u64,
@@ -402,7 +407,7 @@ pub const Broker = struct {
             );
             defer self.allocator.free(vars);
             const page = try self.call(graphql.thread_comments_query, vars);
-            try pages.append(self.allocator, page);
+            try appendRetainedPage(self.allocator, pages, retained_bytes, page);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
                 self.allocator,
@@ -415,9 +420,12 @@ pub const Broker = struct {
                 expected_base,
                 expected_head,
             );
-            const info = comments.get("pageInfo").?.object;
-            if (!info.get("hasNextPage").?.bool) return;
-            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            const info = try requiredObjectField(comments, "pageInfo");
+            if (!try requiredBoolField(info, "hasNextPage")) return;
+            const next = try self.allocator.dupe(
+                u8,
+                try requiredStringField(info, "endCursor"),
+            );
             self.allocator.free(cursor);
             cursor = next;
         }
@@ -797,7 +805,8 @@ pub const Broker = struct {
                 card.target.base_oid,
                 card.target.head_oid,
             );
-            const threads = pull.get("reviewThreads").?.object.get("nodes").?.array.items;
+            const connection = try requiredObjectField(pull, "reviewThreads");
+            const threads = try requiredArrayField(connection, "nodes");
             try self.validateAuthorityThreads(owner, name, number, threads, card, &found);
         }
         if (!found) return error.GitHubActionTargetMissing;
@@ -815,20 +824,24 @@ pub const Broker = struct {
         for (threads) |node| {
             const thread = try requiredObject(node);
             const target_path = card.target.path orelse return error.ActionTargetMismatch;
-            if (!std.mem.eql(u8, thread.get("path").?.string, target_path)) continue;
+            if (!std.mem.eql(
+                u8,
+                try requiredStringField(thread, "path"),
+                target_path,
+            )) continue;
             const thread_action = switch (card.kind) {
                 .reply_thread, .resolve_thread, .unresolve_thread => true,
                 else => false,
             };
             if (thread_action) if (card.target.thread_id) |thread_id| if (std.mem.eql(
                 u8,
-                thread.get("id").?.string,
+                try requiredStringField(thread, "id"),
                 thread_id,
             )) {
                 const allowed = switch (card.kind) {
-                    .reply_thread => thread.get("viewerCanReply").?.bool,
-                    .resolve_thread => thread.get("viewerCanResolve").?.bool,
-                    .unresolve_thread => thread.get("viewerCanUnresolve").?.bool,
+                    .reply_thread => try requiredBoolField(thread, "viewerCanReply"),
+                    .resolve_thread => try requiredBoolField(thread, "viewerCanResolve"),
+                    .unresolve_thread => try requiredBoolField(thread, "viewerCanUnresolve"),
                     else => unreachable,
                 };
                 if (!allowed) return error.GitHubActionNotAuthorized;
@@ -857,27 +870,31 @@ pub const Broker = struct {
     ) !void {
         if (found.*) return;
         const comment_id = card.target.comment_id orelse return;
-        const comments = thread.get("comments").?.object;
-        for (comments.get("nodes").?.array.items) |value| {
+        const comments = try requiredObjectField(thread, "comments");
+        for (try requiredArrayField(comments, "nodes")) |value| {
             const comment = try requiredObject(value);
-            if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
-            if (!comment.get("viewerDidAuthor").?.bool) {
+            if (!std.mem.eql(
+                u8,
+                try requiredStringField(comment, "id"),
+                comment_id,
+            )) continue;
+            if (!try requiredBoolField(comment, "viewerDidAuthor")) {
                 return error.GitHubActionNotAuthorized;
             }
             if (!std.mem.eql(
                 u8,
-                comment.get("body").?.string,
+                try requiredStringField(comment, "body"),
                 card.target.comment_body_snapshot.?,
             )) return error.GitHubActionTargetChanged;
             found.* = true;
             return;
         }
-        const next = nextCursor(comments) orelse return;
+        const next = (try nextCursor(comments)) orelse return;
         const comment = (try self.commentById(
             owner,
             name,
             number,
-            thread.get("id").?.string,
+            try requiredStringField(thread, "id"),
             comment_id,
             next,
             card.target.base_oid,
@@ -955,17 +972,20 @@ pub const Broker = struct {
         defer parsed.deinit();
         const pull = try pullObject(parsed.value);
         try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
-        for (pull.get("reviewThreads").?.object.get("nodes").?.array.items) |value| {
+        const connection = try requiredObjectField(pull, "reviewThreads");
+        for (try requiredArrayField(connection, "nodes")) |value| {
             const thread = try requiredObject(value);
             const path = card.target.path orelse return error.ActionTargetMismatch;
-            if (!std.mem.eql(u8, thread.get("path").?.string, path)) continue;
+            if (!std.mem.eql(u8, try requiredStringField(thread, "path"), path)) continue;
             if (card.target.thread_id) |thread_id| if (!std.mem.eql(
                 u8,
-                thread.get("id").?.string,
+                try requiredStringField(thread, "id"),
                 thread_id,
             )) continue;
-            if (card.kind == .resolve_thread) return thread.get("isResolved").?.bool;
-            if (card.kind == .unresolve_thread) return !thread.get("isResolved").?.bool;
+            if (card.kind == .resolve_thread) return try requiredBoolField(thread, "isResolved");
+            if (card.kind == .unresolve_thread) {
+                return !try requiredBoolField(thread, "isResolved");
+            }
             if (!inlineThreadMatchesCard(thread, card)) continue;
             if (try self.commentMutationObserved(
                 owner,
@@ -1005,13 +1025,9 @@ pub const Broker = struct {
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
             try validateGenerationObject(pull, card.target.base_oid, card.target.head_oid);
-            const threads = pull.get("reviewThreads") orelse return error.InvalidSnapshot;
-            if (threads != .object) return error.InvalidSnapshot;
-            const nodes = threads.object.get("nodes") orelse return error.InvalidSnapshot;
-            if (nodes != .array) return error.InvalidSnapshot;
-            for (nodes.array.items) |value| {
-                if (value != .object) return error.InvalidSnapshot;
-                const thread = value.object;
+            const threads = try requiredObjectField(pull, "reviewThreads");
+            for (try requiredArrayField(threads, "nodes")) |value| {
+                const thread = try requiredObject(value);
                 const path = card.target.path orelse return error.ActionTargetMismatch;
                 const thread_path = thread.get("path") orelse return error.InvalidSnapshot;
                 if (thread_path != .string) return error.InvalidSnapshot;
@@ -1049,7 +1065,7 @@ pub const Broker = struct {
         const initial = thread.get("comments") orelse return error.InvalidSnapshot;
         if (initial != .object) return error.InvalidSnapshot;
         try appendCommentIds(baseline, initial.object);
-        const first_cursor = nextCursor(initial.object) orelse return;
+        const first_cursor = (try nextCursor(initial.object)) orelse return;
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
         for (0..max_pages) |_| {
@@ -1065,7 +1081,7 @@ pub const Broker = struct {
                 card.target.head_oid,
             );
             try appendCommentIds(baseline, comments);
-            const next = nextCursor(comments) orelse return;
+            const next = (try nextCursor(comments)) orelse return;
             const owned_next = try self.allocator.dupe(u8, next);
             if (cursor) |old| self.allocator.free(old);
             cursor = owned_next;
@@ -1080,12 +1096,14 @@ pub const Broker = struct {
 
     fn inlineThreadMatchesCard(thread: std.json.ObjectMap, card: tools.ActionCard) bool {
         if (card.kind != .add_inline_comment) return true;
-        if (optionalU32(thread.get("line")) != card.target.line) return false;
-        if (optionalU32(thread.get("startLine")) != card.target.start_line) return false;
+        if ((optionalU32(thread.get("line")) catch return false) != card.target.line) return false;
+        if ((optionalU32(thread.get("startLine")) catch return false) !=
+            card.target.start_line) return false;
         const side = card.target.side orelse return false;
-        const diff_side = optionalString(thread.get("diffSide")) orelse return false;
+        const diff_side = (optionalString(thread.get("diffSide")) catch return false) orelse
+            return false;
         if (!std.mem.eql(u8, diff_side, side)) return false;
-        const start_side = optionalString(thread.get("startDiffSide"));
+        const start_side = optionalString(thread.get("startDiffSide")) catch return false;
         if (card.target.start_line == null) return start_side == null;
         return start_side != null and std.mem.eql(u8, start_side.?, side);
     }
@@ -1119,22 +1137,32 @@ pub const Broker = struct {
                 expected_base,
                 expected_head,
             );
-            for (comments.get("nodes").?.array.items) |value| {
+            for (try requiredArrayField(comments, "nodes")) |value| {
                 const comment = try requiredObject(value);
-                if (std.mem.eql(u8, comment.get("id").?.string, comment_id)) {
+                if (std.mem.eql(
+                    u8,
+                    try requiredStringField(comment, "id"),
+                    comment_id,
+                )) {
                     return .{
-                        .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
+                        .viewer_did_author = try requiredBoolField(
+                            comment,
+                            "viewerDidAuthor",
+                        ),
                         .body_matches = std.mem.eql(
                             u8,
-                            comment.get("body").?.string,
+                            try requiredStringField(comment, "body"),
                             expected_body,
                         ),
                     };
                 }
             }
-            const info = comments.get("pageInfo").?.object;
-            if (!info.get("hasNextPage").?.bool) return null;
-            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            const info = try requiredObjectField(comments, "pageInfo");
+            if (!try requiredBoolField(info, "hasNextPage")) return null;
+            const next = try self.allocator.dupe(
+                u8,
+                try requiredStringField(info, "endCursor"),
+            );
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
         }
@@ -1153,17 +1181,17 @@ pub const Broker = struct {
         target_found: *bool,
         matching_comments: *u32,
     ) !bool {
-        const initial = thread.get("comments").?.object;
+        const initial = try requiredObjectField(thread, "comments");
         if (try commentsObserve(
             self.io,
-            initial.get("nodes").?.array.items,
+            try requiredArrayField(initial, "nodes"),
             card,
             started_unix_s,
             baseline,
             target_found,
             matching_comments,
         )) return true;
-        const first_cursor = nextCursor(initial) orelse return false;
+        const first_cursor = (try nextCursor(initial)) orelse return false;
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
         for (0..max_pages) |_| {
@@ -1171,7 +1199,7 @@ pub const Broker = struct {
                 owner,
                 name,
                 number,
-                thread.get("id").?.string,
+                try requiredStringField(thread, "id"),
                 cursor,
             );
             defer self.allocator.free(page);
@@ -1189,16 +1217,19 @@ pub const Broker = struct {
             );
             if (try commentsObserve(
                 self.io,
-                comments.get("nodes").?.array.items,
+                try requiredArrayField(comments, "nodes"),
                 card,
                 started_unix_s,
                 baseline,
                 target_found,
                 matching_comments,
             )) return true;
-            const info = comments.get("pageInfo").?.object;
-            if (!info.get("hasNextPage").?.bool) return false;
-            const next = try self.allocator.dupe(u8, info.get("endCursor").?.string);
+            const info = try requiredObjectField(comments, "pageInfo");
+            if (!try requiredBoolField(info, "hasNextPage")) return false;
+            const next = try self.allocator.dupe(
+                u8,
+                try requiredStringField(info, "endCursor"),
+            );
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
         }
@@ -1288,6 +1319,7 @@ pub const Broker = struct {
         }
         var cursor: ?[]u8 = null;
         defer if (cursor) |c| self.allocator.free(c);
+        var retained_bytes: usize = 0;
         for (0..max_pages) |_| {
             const format = "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{f}}}";
             const vars = try std.fmt.allocPrint(self.allocator, format, .{
@@ -1298,7 +1330,7 @@ pub const Broker = struct {
             });
             defer self.allocator.free(vars);
             const page = try self.call(document, vars);
-            try pages.append(self.allocator, page);
+            try appendRetainedPage(self.allocator, &pages, &retained_bytes, page);
             const next = try graphql.pageCursor(self.allocator, page, connection);
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
@@ -1346,15 +1378,17 @@ pub const Broker = struct {
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
             try validateGenerationObject(pull, expected_base, expected_head);
-            for (pull.get("files").?.object.get("nodes").?.array.items) |node| if (std.mem.eql(
-                u8,
-                node.object.get("path").?.string,
-                path,
-            )) return std.mem.eql(
-                u8,
-                node.object.get("viewerViewedState").?.string,
-                "VIEWED",
-            ) == expected_viewed;
+            const files = try requiredObjectField(pull, "files");
+            for (try requiredArrayField(files, "nodes")) |node| {
+                const file = try requiredObject(node);
+                if (std.mem.eql(u8, try requiredStringField(file, "path"), path)) {
+                    return std.mem.eql(
+                        u8,
+                        try requiredStringField(file, "viewerViewedState"),
+                        "VIEWED",
+                    ) == expected_viewed;
+                }
+            }
         }
         return false;
     }
@@ -1378,8 +1412,10 @@ pub const Broker = struct {
             defer parsed.deinit();
             const pull = try pullObject(parsed.value);
             try validateGenerationObject(pull, expected_base, expected_head);
-            for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
-                if (std.mem.eql(u8, node.object.get("path").?.string, path)) found = true;
+            const files = try requiredObjectField(pull, "files");
+            for (try requiredArrayField(files, "nodes")) |node| {
+                const file = try requiredObject(node);
+                if (std.mem.eql(u8, try requiredStringField(file, "path"), path)) found = true;
             }
         }
         if (!found) return error.CommentPathNotCurrent;
@@ -1402,14 +1438,16 @@ fn validateBatchPaths(
         defer parsed.deinit();
         const pull = try pullObject(parsed.value);
         try validateGenerationObject(pull, expected_base, expected_head);
-        for (pull.get("files").?.object.get("nodes").?.array.items) |node| {
-            const path = node.object.get("path").?.string;
+        const files = try requiredObjectField(pull, "files");
+        for (try requiredArrayField(files, "nodes")) |node| {
+            const file = try requiredObject(node);
+            const path = try requiredStringField(file, "path");
             for (requests, 0..) |request, index| {
                 if (!std.mem.eql(u8, request.path, path)) continue;
                 found[index] = true;
                 if (results) |batch_results| batch_results[index].viewed = std.mem.eql(
                     u8,
-                    node.object.get("viewerViewedState").?.string,
+                    try requiredStringField(file, "viewerViewedState"),
                     "VIEWED",
                 );
             }
@@ -1430,14 +1468,10 @@ fn validateGenerationObject(
         !std.mem.eql(u8, head.string, expected_head)) return error.PullRequestChanged;
 }
 
-fn nextCursor(comments: std.json.ObjectMap) ?[]const u8 {
-    const info_value = comments.get("pageInfo") orelse return null;
-    if (info_value != .object) return null;
-    const info = info_value.object;
-    const has_next = info.get("hasNextPage") orelse return null;
-    if (has_next != .bool or !has_next.bool) return null;
-    const cursor = info.get("endCursor") orelse return null;
-    return if (cursor == .string) cursor.string else null;
+fn nextCursor(comments: std.json.ObjectMap) !?[]const u8 {
+    const info = try requiredObjectField(comments, "pageInfo");
+    if (!try requiredBoolField(info, "hasNextPage")) return null;
+    return try requiredStringField(info, "endCursor");
 }
 
 fn nodeComments(value: std.json.Value) !std.json.ObjectMap {
@@ -1472,29 +1506,31 @@ fn commentsObserve(
     matching_comments: *u32,
 ) !bool {
     for (values) |value| {
-        if (value != .object) return error.InvalidSnapshot;
-        const comment = value.object;
+        const comment = try requiredObject(value);
         if (card.target.comment_id) |comment_id| {
-            if (!std.mem.eql(u8, comment.get("id").?.string, comment_id)) continue;
+            if (!std.mem.eql(
+                u8,
+                try requiredStringField(comment, "id"),
+                comment_id,
+            )) continue;
             target_found.* = true;
         }
         if (card.kind == .update_comment) {
-            if (comment.get("viewerDidAuthor").?.bool and
-                std.mem.eql(u8, comment.get("body").?.string, card.body.?))
+            if (try requiredBoolField(comment, "viewerDidAuthor") and
+                std.mem.eql(u8, try requiredStringField(comment, "body"), card.body.?))
             {
                 return true;
             }
             continue;
         }
         const body = card.body orelse continue;
-        if (!comment.get("viewerDidAuthor").?.bool or
-            !std.mem.eql(u8, comment.get("body").?.string, body)) continue;
-        const comment_id = comment.get("id") orelse return error.InvalidSnapshot;
-        if (comment_id != .string) return error.InvalidSnapshot;
+        if (!try requiredBoolField(comment, "viewerDidAuthor") or
+            !std.mem.eql(u8, try requiredStringField(comment, "body"), body)) continue;
+        const comment_id = try requiredStringField(comment, "id");
         if ((card.kind == .add_inline_comment or card.kind == .reply_thread) and
-            baseline.contains(comment_id.string)) continue;
+            baseline.contains(comment_id)) continue;
         const created = parseGithubTimestampSeconds(
-            comment.get("createdAt").?.string,
+            try requiredStringField(comment, "createdAt"),
         ) orelse continue;
         const now: i64 = @intCast(@divFloor(
             std.Io.Clock.real.now(io).nanoseconds,
@@ -1514,13 +1550,10 @@ fn appendCommentIds(
     baseline: *ReconciliationBaseline,
     comments: std.json.ObjectMap,
 ) !void {
-    const nodes = comments.get("nodes") orelse return error.InvalidSnapshot;
-    if (nodes != .array) return error.InvalidSnapshot;
-    for (nodes.array.items) |value| {
-        if (value != .object) return error.InvalidSnapshot;
-        const id = value.object.get("id") orelse return error.InvalidSnapshot;
-        if (id != .string) return error.InvalidSnapshot;
-        const owned = try baseline.allocator.dupe(u8, id.string);
+    for (try requiredArrayField(comments, "nodes")) |value| {
+        const comment = try requiredObject(value);
+        const id = try requiredStringField(comment, "id");
+        const owned = try baseline.allocator.dupe(u8, id);
         errdefer baseline.allocator.free(owned);
         try baseline.comment_ids.append(baseline.allocator, owned);
     }
@@ -1703,6 +1736,54 @@ fn freePages(allocator: std.mem.Allocator, pages: *std.ArrayList([]u8)) void {
     pages.deinit(allocator);
 }
 
+fn retainedPageBytes(pages: []const []const u8) !usize {
+    var total: usize = 0;
+    for (pages) |page| {
+        total = std.math.add(usize, total, page.len) catch
+            return error.PaginationAggregateLimitExceeded;
+        if (total > paginated_response_bytes_max) {
+            return error.PaginationAggregateLimitExceeded;
+        }
+    }
+    return total;
+}
+
+fn appendRetainedPage(
+    allocator: std.mem.Allocator,
+    pages: *std.ArrayList([]u8),
+    retained_bytes: *usize,
+    page: []u8,
+) !void {
+    errdefer allocator.free(page);
+    const next = try nextRetainedPageBytes(retained_bytes.*, page.len);
+    try pages.append(allocator, page);
+    retained_bytes.* = next;
+}
+
+fn nextRetainedPageBytes(retained_bytes: usize, page_bytes: usize) !usize {
+    const next = std.math.add(usize, retained_bytes, page_bytes) catch
+        return error.PaginationAggregateLimitExceeded;
+    if (next > paginated_response_bytes_max) {
+        return error.PaginationAggregateLimitExceeded;
+    }
+    return next;
+}
+
+test "paginated responses enforce one aggregate retained byte budget" {
+    try std.testing.expectEqual(
+        paginated_response_bytes_max,
+        try nextRetainedPageBytes(paginated_response_bytes_max - 1, 1),
+    );
+    try std.testing.expectError(
+        error.PaginationAggregateLimitExceeded,
+        nextRetainedPageBytes(paginated_response_bytes_max, 1),
+    );
+    try std.testing.expectError(
+        error.PaginationAggregateLimitExceeded,
+        nextRetainedPageBytes(std.math.maxInt(usize), 1),
+    );
+}
+
 fn viewedState(value: []const u8) !domain.ViewedState {
     if (std.mem.eql(u8, value, "VIEWED")) return .viewed;
     if (std.mem.eql(u8, value, "DISMISSED")) return .dismissed;
@@ -1813,6 +1894,12 @@ fn requiredStringField(object: std.json.ObjectMap, field: []const u8) ![]const u
     return value.string;
 }
 
+fn requiredBoolField(object: std.json.ObjectMap, field: []const u8) !bool {
+    const value = object.get(field) orelse return error.InvalidSnapshot;
+    if (value != .bool) return error.InvalidSnapshot;
+    return value.bool;
+}
+
 fn requiredU32Field(object: std.json.ObjectMap, field: []const u8) !u32 {
     const value = object.get(field) orelse return error.InvalidSnapshot;
     if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
@@ -1828,70 +1915,78 @@ pub fn loadThreads(
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    const data = (parsed.value.object.get("data") orelse return error.InvalidSnapshot).object;
+    const root = try requiredObject(parsed.value);
+    const data = try requiredObjectField(root, "data");
     const nodes: []const std.json.Value = if (data.get("node")) |node|
         if (node == .null) return else &.{node}
     else blk: {
         const pull = try pullObject(parsed.value);
-        break :blk (pull.get("reviewThreads") orelse
-            return error.InvalidSnapshot).object.get("nodes").?.array.items;
+        const threads = try requiredObjectField(pull, "reviewThreads");
+        break :blk try requiredArrayField(threads, "nodes");
     };
     for (nodes) |node| {
-        if (node != .object) return error.InvalidSnapshot;
-        const object = node.object;
-        if (object.get("isResolved").?.bool) {
-            generation.removeThread(object.get("id").?.string);
+        const object = try requiredObject(node);
+        const thread_id = try requiredStringField(object, "id");
+        if (try requiredBoolField(object, "isResolved")) {
+            generation.removeThread(thread_id);
             continue;
         }
         var comments: std.ArrayList(domain.ReviewComment) = .empty;
         defer comments.deinit(allocator);
-        for (object.get("comments").?.object.get("nodes").?.array.items) |value| {
-            const comment = value.object;
-            const review = comment.get("pullRequestReview").?.object;
+        const connection = try requiredObjectField(object, "comments");
+        for (try requiredArrayField(connection, "nodes")) |value| {
+            const comment = try requiredObject(value);
+            const review = try requiredObjectField(comment, "pullRequestReview");
             const author = comment.get("author") orelse .null;
             try comments.append(allocator, .{
-                .id = comment.get("id").?.string,
-                .body = comment.get("body").?.string,
-                .created_at = comment.get("createdAt").?.string,
-                .url = comment.get("url").?.string,
+                .id = try requiredStringField(comment, "id"),
+                .body = try requiredStringField(comment, "body"),
+                .created_at = try requiredStringField(comment, "createdAt"),
+                .url = try requiredStringField(comment, "url"),
                 .author = if (author == .null)
                     "[deleted]"
                 else
-                    author.object.get("login").?.string,
-                .viewer_did_author = comment.get("viewerDidAuthor").?.bool,
-                .review_id = review.get("id").?.string,
-                .review_state = review.get("state").?.string,
+                    try requiredStringField(try requiredObject(author), "login"),
+                .viewer_did_author = try requiredBoolField(comment, "viewerDidAuthor"),
+                .review_id = try requiredStringField(review, "id"),
+                .review_state = try requiredStringField(review, "state"),
             });
         }
-        if (try generation.appendThreadComments(object.get("id").?.string, comments.items)) {
+        if (try generation.appendThreadComments(thread_id, comments.items)) {
             continue;
         }
         try generation.addThread(
             .{
-                .id = object.get("id").?.string,
-                .path = object.get("path").?.string,
-                .line = optionalU32(object.get("line")),
-                .start_line = optionalU32(object.get("startLine")),
-                .diff_side = optionalString(object.get("diffSide")),
-                .start_diff_side = optionalString(object.get("startDiffSide")),
-                .subject_type = object.get("subjectType").?.string,
-                .outdated = object.get("isOutdated").?.bool,
-                .viewer_can_reply = object.get("viewerCanReply").?.bool,
-                .viewer_can_resolve = object.get("viewerCanResolve").?.bool,
-                .viewer_can_unresolve = object.get("viewerCanUnresolve").?.bool,
+                .id = thread_id,
+                .path = try requiredStringField(object, "path"),
+                .line = try optionalU32(object.get("line")),
+                .start_line = try optionalU32(object.get("startLine")),
+                .diff_side = try optionalString(object.get("diffSide")),
+                .start_diff_side = try optionalString(object.get("startDiffSide")),
+                .subject_type = try requiredStringField(object, "subjectType"),
+                .outdated = try requiredBoolField(object, "isOutdated"),
+                .viewer_can_reply = try requiredBoolField(object, "viewerCanReply"),
+                .viewer_can_resolve = try requiredBoolField(object, "viewerCanResolve"),
+                .viewer_can_unresolve = try requiredBoolField(object, "viewerCanUnresolve"),
                 .comments = comments.items,
             },
         );
     }
 }
 
-fn optionalU32(value: ?std.json.Value) ?u32 {
+fn optionalU32(value: ?std.json.Value) !?u32 {
     const v = value orelse return null;
-    return if (v == .null) null else @intCast(v.integer);
+    if (v == .null) return null;
+    if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u32)) {
+        return error.InvalidSnapshot;
+    }
+    return @intCast(v.integer);
 }
-fn optionalString(value: ?std.json.Value) ?[]const u8 {
+fn optionalString(value: ?std.json.Value) !?[]const u8 {
     const v = value orelse return null;
-    return if (v == .null) null else v.string;
+    if (v == .null) return null;
+    if (v != .string) return error.InvalidSnapshot;
+    return v.string;
 }
 
 fn requiredObject(value: std.json.Value) !std.json.ObjectMap {
@@ -1912,6 +2007,18 @@ test "nullable nested review thread node is a typed missing-target error" {
     );
     defer parsed.deinit();
     try std.testing.expectError(error.GitHubActionTargetMissing, nodeComments(parsed.value));
+}
+
+test "thread loader rejects nullable nested comment nodes" {
+    const raw =
+        "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[" ++
+        "{\"id\":\"T1\",\"isResolved\":false,\"comments\":{\"nodes\":[null]}}]}}}}}";
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "base", "head");
+    defer generation.deinit();
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        loadThreads(std.testing.allocator, raw, &generation),
+    );
 }
 
 pub fn hydrateRevisionKeys(
