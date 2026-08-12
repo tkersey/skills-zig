@@ -94,6 +94,7 @@ pub const Operator = enum {
     sha1,
     array_count_equal,
     array_integer_sum_lte,
+    rebind_existing,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -154,6 +155,7 @@ pub const Operator = enum {
             .compare_replace => "compare-and-replace",
             .create_new => "create-new",
             .bind_existing => "bind-existing",
+            .rebind_existing => "rebind-existing",
             .exclusive_custody => "exclusive-custody",
             .atomic_transaction => "atomic-transaction",
             .id_lookup => "id-lookup",
@@ -214,7 +216,7 @@ pub const Operator = enum {
     pub fn supported(self: Operator) bool {
         comptime {
             const fields = @typeInfo(Operator).@"enum".fields;
-            if (fields.len != 88 or
+            if (fields.len != 89 or
                 !std.mem.eql(u8, fields[46].name, "set_order"))
             {
                 @compileError("update the explicit operator admission set");

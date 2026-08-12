@@ -827,12 +827,14 @@ fn finishTransactionResult(
 }
 
 const PreparedBinding = struct {
+    kind: storage.EffectKind,
     slot_index: u16,
     input_index: u8,
     slot_path: []u8,
     slot_content: []u8,
     slot_digest: []u8,
     binding_path: []u8,
+    binding_before_digest: ?[]u8,
     binding_after: []u8,
 
     fn deinit(self: *PreparedBinding, allocator: std.mem.Allocator) void {
@@ -840,6 +842,7 @@ const PreparedBinding = struct {
         allocator.free(self.slot_content);
         allocator.free(self.slot_digest);
         allocator.free(self.binding_path);
+        if (self.binding_before_digest) |digest| allocator.free(digest);
         allocator.free(self.binding_after);
         self.* = undefined;
     }
@@ -848,7 +851,7 @@ const PreparedBinding = struct {
 fn isBindingOperation(operation: *const storage.Operation) bool {
     if (operation.effects.len == 0) return false;
     for (operation.effects) |effect| {
-        if (effect.kind != .bind_existing) return false;
+        if (!effect.kind.isBinding()) return false;
     }
     return true;
 }
@@ -994,7 +997,10 @@ fn buildExistingBindingMutationsAlloc(
         mutations[index * 2 + 1] = .{
             .path = item.binding_path,
             .text = item.binding_after,
-            .expectation = .{ .expected_exists = false },
+            .expectation = .{
+                .expected_digest = item.binding_before_digest,
+                .expected_exists = item.binding_before_digest != null,
+            },
             .content_mode = .raw,
             .max_bytes = custody.binding_max_bytes,
         };
@@ -1036,7 +1042,10 @@ fn buildBindingReceiptsAlloc(
             errdefer allocator.free(revision_before);
             const revision_after = try allocator.dupe(u8, item.slot_digest);
             errdefer allocator.free(revision_after);
-            const result = try allocator.dupe(u8, "bound");
+            const result = try allocator.dupe(
+                u8,
+                if (item.kind == .rebind_existing) "rebound" else "bound",
+            );
             errdefer allocator.free(result);
             receipts[index] = .{
                 .slot = owned_slot,
@@ -1121,7 +1130,7 @@ fn prepareExistingBinding(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !PreparedBinding {
-    if (effect.kind != .bind_existing) {
+    if (!effect.kind.isBinding()) {
         return error.BindingOperationCannotMixEffects;
     }
     const slot = storage_plan.slot(effect.slot_index);
@@ -1130,9 +1139,23 @@ fn prepareExistingBinding(
         definition_plan,
         slot,
         repo_root,
+        effect.kind,
     );
     errdefer source.deinit(allocator);
-    if (source.before.exists) return error.StoreAlreadyBound;
+    switch (effect.kind) {
+        .bind_existing => if (source.before.exists) {
+            return error.StoreAlreadyBound;
+        },
+        .rebind_existing => {
+            if (!source.before.exists) return error.StoreSlotWithoutBinding;
+            if (source.before.last_revision) |revision| {
+                if (std.mem.eql(u8, revision, source.slot_digest)) {
+                    return error.StoreAlreadyBound;
+                }
+            }
+        },
+        else => unreachable,
+    }
     const record_count = try validateExistingContent(
         allocator,
         definition_plan,
@@ -1159,15 +1182,23 @@ fn prepareExistingBinding(
         record_count,
         parameters,
         replay_parameter_names,
+        effect.kind == .rebind_existing,
     );
+    const binding_before_digest = if (source.before.digest) |digest|
+        try allocator.dupe(u8, digest)
+    else
+        null;
+    errdefer if (binding_before_digest) |digest| allocator.free(digest);
     source.before.deinit(allocator);
     return .{
+        .kind = effect.kind,
         .slot_index = effect.slot_index,
         .input_index = effect.input_index,
         .slot_path = source.slot_path,
         .slot_content = source.slot_content,
         .slot_digest = source.slot_digest,
         .binding_path = source.binding_path,
+        .binding_before_digest = binding_before_digest,
         .binding_after = binding_after,
     };
 }
@@ -1181,10 +1212,11 @@ fn appendExistingBindingAlloc(
     record_count: ?usize,
     parameters: *const definition_core.parameters.Bindings,
     replay_parameter_names: []const []const u8,
+    replace_stale: bool,
 ) ![]u8 {
     return custody.appendBindingRowAlloc(
         allocator,
-        source.before.bytes,
+        if (replace_stale) "" else source.before.bytes,
         definition_plan,
         slot,
         operation_name,
@@ -1210,6 +1242,7 @@ fn readExistingBindingSource(
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
     repo_root: []const u8,
+    kind: storage.EffectKind,
 ) !ExistingBindingSource {
     const slot_path = try std.fs.path.join(
         allocator,
@@ -1234,15 +1267,25 @@ fn readExistingBindingSource(
         slot.relative_path,
     );
     errdefer allocator.free(binding_path);
-    var before = try custody.readBindingSnapshot(
-        allocator,
-        binding_path,
-        definition_plan.id,
-        slot.name,
-        slot.relative_path,
-        slot_digest,
-        null,
-    );
+    var before = if (kind == .rebind_existing)
+        try custody.readBindingSnapshotBeforeReplay(
+            allocator,
+            binding_path,
+            definition_plan.id,
+            slot.name,
+            slot.relative_path,
+            null,
+        )
+    else
+        try custody.readBindingSnapshot(
+            allocator,
+            binding_path,
+            definition_plan.id,
+            slot.name,
+            slot.relative_path,
+            slot_digest,
+            null,
+        );
     errdefer before.deinit(allocator);
     return .{
         .slot_path = slot_path,
@@ -1826,7 +1869,9 @@ fn validateEffectSlotPreconditions(
         .compare_replace => if (!before_exists) {
             return error.StorageSlotMissing;
         },
-        .bind_existing => return error.BindingOperationRequiresMigrationPath,
+        .bind_existing, .rebind_existing => {
+            return error.BindingOperationRequiresMigrationPath;
+        },
     }
     if (effect.expected_revision_parameter) |parameter_name| {
         const expected = parameterText(parameters, parameter_name) orelse
@@ -3243,6 +3288,7 @@ fn buildReceipts(
                     .compare_append => "appended",
                     .compare_replace => "replaced",
                     .bind_existing => "bound",
+                    .rebind_existing => "rebound",
                 },
             ),
         };

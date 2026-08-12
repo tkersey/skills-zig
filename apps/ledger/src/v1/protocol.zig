@@ -4453,7 +4453,7 @@ fn compileTargetSlot(
                 return error.ProtocolInputRequiresEventLogSlot;
             }
             switch (effect.kind) {
-                .compare_append, .bind_existing => {},
+                .compare_append, .bind_existing, .rebind_existing => {},
                 .create_new, .compare_replace => {
                     return error.ProtocolStoreMustBeAppendOnly;
                 },
@@ -4473,7 +4473,7 @@ fn compileTargetSlot(
         for (operation.effects) |effect| {
             if (effect.slot_index != target) continue;
             switch (effect.kind) {
-                .compare_append, .bind_existing => {},
+                .compare_append, .bind_existing, .rebind_existing => {},
                 .create_new, .compare_replace => {
                     return error.ProtocolStoreMustBeAppendOnly;
                 },

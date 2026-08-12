@@ -96,6 +96,13 @@ control root. Current reads fail closed for unbound stores; an owning
 definition may expose an explicit one-shot binding operation for an existing
 validated store.
 
+When an authoritative external transport such as Git replaces an already-bound
+store with another complete valid revision, the owner may expose a separate
+`rebind-existing` operation. It validates the complete current store, requires
+an existing stale binding, atomically replaces only Ledger's binding metadata,
+and leaves the store bytes unchanged. It rejects invalid stores, missing
+bindings, and already-current bindings.
+
 Use `ledger project --payload-only` only for explicit structural piping. Normal
 JSON projections preserve the `ledger-projection-result/v1` envelope and its
 definition/store identity.
