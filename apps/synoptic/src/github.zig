@@ -2596,26 +2596,28 @@ fn treeEntryAtAlloc(
     revision: []const u8,
     path: []const u8,
 ) !?TreeEntry {
-    const result = try std.process.run(
+    var result = try runCapturedGitProcess(
         allocator,
         io,
-        .{
-            .argv = &.{
-                git_path,
-                "--no-replace-objects",
-                "--literal-pathspecs",
-                "ls-tree",
-                "-z",
-                "--full-name",
-                revision,
-                "--",
-                path,
-            },
-            .cwd = .{ .path = cwd },
+        &.{
+            git_path,
+            "--no-replace-objects",
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            "--full-name",
+            revision,
+            "--",
+            path,
         },
+        .{ .path = cwd },
+        null,
+        null,
+        4096,
+        git_stderr_bytes_max,
+        false,
     );
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    defer result.deinit();
     if (result.term != .exited or result.term.exited != 0) return error.GitTreeEntryFailed;
     if (result.stdout.len == 0) return null;
     if (result.stdout[result.stdout.len - 1] != 0 or
@@ -3045,18 +3047,29 @@ fn runCanonicalDiff(
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
     if (previous_path) |old_path| {
-        return runCanonicalRenamedPathDiff(
+        var current_source = try treeEntryAtAlloc(
             allocator,
             io,
             git_path,
             cwd,
-            evidence_view,
-            range,
+            head,
             old_path,
-            path,
-            cancelled,
-            output_limit,
         );
+        defer if (current_source) |*entry| entry.deinit();
+        if (current_source == null) {
+            return runCanonicalRenamedPathDiff(
+                allocator,
+                io,
+                git_path,
+                cwd,
+                evidence_view,
+                range,
+                old_path,
+                path,
+                cancelled,
+                output_limit,
+            );
+        }
     }
     return runCanonicalPathDiff(
         allocator,
@@ -3460,6 +3473,17 @@ fn runTestGit(
     return result.stdout;
 }
 
+fn expectSanitizedTreeEntries(log: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    var tree_entries: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, " ls-tree ") == null) continue;
+        tree_entries += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "selectors=||| ") != null);
+    }
+    try std.testing.expect(tree_entries > 0);
+}
+
 fn expectSingleMergeBaseHydration(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3515,6 +3539,7 @@ fn expectSingleMergeBaseHydration(
         log,
         canonical_git_attributes_config,
     ) >= 3);
+    try expectSanitizedTreeEntries(log);
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, log, "cat-file -e "));
     try std.testing.expectEqual(
         @as(usize, 2),
@@ -3618,9 +3643,11 @@ test "revision hydration computes one merge base for a generation" {
     defer allocator.free(wrapper_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nprintf 'attrs=%s global=%s nosystem=%s %s\\n' " ++
+        "#!/bin/sh\nprintf 'attrs=%s global=%s nosystem=%s selectors=%s|%s|%s|%s %s\\n' " ++
             "\"${{GIT_ATTR_NOSYSTEM:-}}\" \"${{GIT_CONFIG_GLOBAL:-}}\" " ++
-            "\"${{GIT_CONFIG_NOSYSTEM:-}}\" \"$*\" >> {s}\n" ++
+            "\"${{GIT_CONFIG_NOSYSTEM:-}}\" \"${{GIT_DIR:-}}\" " ++
+            "\"${{GIT_WORK_TREE:-}}\" \"${{GIT_INDEX_FILE:-}}\" " ++
+            "\"${{GIT_COMMON_DIR:-}}\" \"$*\" >> {s}\n" ++
             "exec /usr/bin/git \"$@\"\n",
         .{log_path},
     );
@@ -3978,6 +4005,13 @@ test "copied file identity finds an unchanged source and includes source evidenc
     const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(base_raw);
     try tmp.dir.writeFile(io, .{ .sub_path = "copy.zig", .data = source });
+    try tmp.dir.writeFile(
+        io,
+        .{
+            .sub_path = "source.zig",
+            .data = "const copied = 1;\nconst source_only = 2;\n",
+        },
+    );
     for ([_][]const []const u8{
         &.{ "git", "add", "." },
         &.{ "git", "commit", "-qm", "copy" },
@@ -4012,8 +4046,10 @@ test "copied file identity finds an unchanged source and includes source evidenc
         "Synoptic source identity: 10 bytes\nsource.zig\n" ++
             "Synoptic current identity: 8 bytes\ncopy.zig\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "source.zig") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, diff, "diff --git "));
     try std.testing.expect(std.mem.indexOf(u8, diff, "copy.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+++ b/source.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+const source_only = 2;") == null);
 }
 
 test "oversized review diff becomes bounded inspectable evidence" {
