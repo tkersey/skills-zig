@@ -5396,6 +5396,7 @@ fn verifyWsRefresh(
     stream: *std.Io.net.Stream,
     state: *app.App,
     registry: *sessions.Registry,
+    runtime: *http.Runtime,
 ) !void {
     try sendMaskedText(io, stream, "{\"type\":\"pr.refresh\",\"payload\":{}}");
     const refreshed = try wsRead(allocator, io, stream, "\"type\":\"pr.refreshed\"");
@@ -5419,6 +5420,8 @@ fn verifyWsRefresh(
         sessions.SessionStatus.stale_origin,
         registry.sessions.items[0].status,
     );
+    try std.testing.expectEqual(http.RefreshEpochState.current, runtime.refresh_epoch);
+    try std.testing.expect(state.action_state_fresh);
 }
 
 fn verifyWsRound(
@@ -5708,7 +5711,7 @@ test "e2e masked websocket streams normalized review and action events" {
         programs.gh_log,
         tool_domain,
     );
-    try verifyWsRefresh(allocator, io, &connection.stream, &state, &registry);
+    try verifyWsRefresh(allocator, io, &connection.stream, &state, &registry, &runtime);
     try verifyWsRound(allocator, io, &connection.stream, &state);
     const close_payload = [_]u8{ 0x03, 0xE8, 'b', 'y', 'e' };
     try sendMaskedFrame(io, &connection.stream, 0x8, &close_payload);

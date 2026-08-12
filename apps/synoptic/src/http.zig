@@ -206,9 +206,17 @@ pub const Runtime = struct {
     stop_request_path: ?[]const u8 = null,
     stop_requested: bool = false,
     worktree_generation_valid: bool = true,
+    refresh_epoch: RefreshEpochState = .current,
     refresh_override: ?*const fn (runtime: *Runtime) anyerror!void = null,
     tool_domain: ?*ToolDomainContext = null,
     local_domain_mutex: DomainMutex = .{},
+};
+
+pub const RefreshEpochState = enum {
+    current,
+    preparing,
+    committed_reconciling,
+    degraded,
 };
 
 fn domainMutex(runtime: *Runtime) *DomainMutex {
@@ -1236,6 +1244,10 @@ pub const Server = struct {
 
     fn refresh(self: *Server, runtime: *Runtime) !void {
         try runtime.registry.beginSynchronization(self.io, sessions.safe_boundary_timeout_ms);
+        runtime.refresh_epoch = .preparing;
+        errdefer if (runtime.refresh_epoch == .preparing) {
+            runtime.refresh_epoch = .current;
+        };
         var synchronizing = true;
         defer if (synchronizing) runtime.registry.endSynchronization();
         const mutex = domainMutex(runtime);
@@ -1247,7 +1259,12 @@ pub const Server = struct {
             locked = false;
             runtime.registry.endSynchronization();
             synchronizing = false;
-            return run(runtime);
+            run(runtime) catch |err| {
+                runtime.refresh_epoch = .degraded;
+                return err;
+            };
+            runtime.refresh_epoch = .current;
+            return;
         }
         var refreshed = try runtime.broker.readGenerationSnapshot(
             runtime.owner,
@@ -1258,7 +1275,10 @@ pub const Server = struct {
         var next = refreshed.generation;
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
-        var refresh_lease = try self.beginRefreshWorktree(runtime, &next);
+        var refresh_lease = self.beginRefreshWorktree(runtime, &next) catch |err| {
+            if (runtime.refresh_epoch != .degraded) runtime.refresh_epoch = .current;
+            return err;
+        };
         const committed = self.finishRefresh(
             runtime,
             &refreshed,
@@ -1272,28 +1292,31 @@ pub const Server = struct {
             refresh_lease.rollback() catch {
                 runtime.worktree_generation_valid = false;
                 runtime.app.action_state_fresh = false;
+                runtime.refresh_epoch = .degraded;
                 return error.ReusedCheckoutRollbackFailed;
             };
+            runtime.refresh_epoch = .current;
             return err;
         };
         refresh_lease.commit();
         runtime.worktree_generation_valid = true;
+        runtime.app.action_state_fresh = false;
+        runtime.refresh_epoch = .committed_reconciling;
+        self.reconcileCommittedRefresh(runtime, committed) catch |err| {
+            runtime.app.action_state_fresh = false;
+            runtime.refresh_epoch = .degraded;
+            return err;
+        };
         runtime.app.action_state_fresh = true;
-        mutex.unlock();
-        locked = false;
-        runtime.registry.endSynchronization();
-        synchronizing = false;
-        self.reconcileCommittedRefresh(runtime, committed);
+        runtime.refresh_epoch = .current;
     }
 
     const CommittedRefresh = struct {
         allocator: std.mem.Allocator,
         primary_update: []u8,
-        file_metadata_pages: @import("domain.zig").PrimaryMetadataPages,
 
         fn deinit(self: *CommittedRefresh) void {
             self.allocator.free(self.primary_update);
-            self.file_metadata_pages.deinit();
         }
     };
 
@@ -1335,15 +1358,12 @@ pub const Server = struct {
         defer registry_plan.deinit();
         const primary_update = try self.primaryUpdateForMetadataAlloc(refreshed.metadata);
         errdefer self.allocator.free(primary_update);
-        var file_metadata_pages = try next.primaryFileMetadataPagesAlloc(self.allocator);
-        errdefer file_metadata_pages.deinit();
         runtime.app.commitRefresh(&app_plan, next.*);
         next_owned.* = false;
         runtime.registry.commitGeneration(&registry_plan);
         return .{
             .allocator = self.allocator,
             .primary_update = primary_update,
-            .file_metadata_pages = file_metadata_pages,
         };
     }
 
@@ -1351,37 +1371,20 @@ pub const Server = struct {
         self: *Server,
         runtime: *Runtime,
         committed_value: CommittedRefresh,
-    ) void {
+    ) !void {
         var committed = committed_value;
         defer committed.deinit();
-        self.applyRefreshExclusionBatch(runtime) catch |err| {
-            self.queueRefreshWarning(runtime, "github-exclusions", err);
-        };
-        runtime.registry.setGenerationEvidence(&runtime.app.generation) catch |err| {
-            self.queueRefreshWarning(runtime, "registry-evidence", err);
-        };
-        self.markChangedSessions(runtime, &runtime.app.generation) catch |err| {
-            self.queueRefreshWarning(runtime, "file-session-update", err);
-        };
-        runtime.registry.updatePrimary(
-            committed.primary_update,
-            committed.file_metadata_pages.items.items,
-        ) catch |err| self.queueRefreshWarning(runtime, "primary-update", err);
-    }
-
-    fn queueRefreshWarning(
-        self: *Server,
-        runtime: *Runtime,
-        stage: []const u8,
-        err: anyerror,
-    ) void {
-        const payload = std.fmt.allocPrint(
+        try self.applyRefreshExclusionBatch(runtime);
+        try runtime.registry.setGenerationEvidence(&runtime.app.generation);
+        try self.markChangedSessions(runtime, &runtime.app.generation);
+        var file_metadata_pages = try runtime.app.generation.primaryFileMetadataPagesAlloc(
             self.allocator,
-            "{{\"stage\":{f},\"error\":{f}}}",
-            .{ std.json.fmt(stage, .{}), std.json.fmt(@errorName(err), .{}) },
-        ) catch return;
-        defer self.allocator.free(payload);
-        runtime.registry.queueSystemEvent("warning", payload) catch return;
+        );
+        defer file_metadata_pages.deinit();
+        try runtime.registry.updatePrimary(
+            committed.primary_update,
+            file_metadata_pages.items.items,
+        );
     }
 
     fn beginRefreshWorktree(
@@ -1405,7 +1408,13 @@ pub const Server = struct {
             runtime.fetch_source,
             next,
         ) catch |err| {
-            try lease.rollback();
+            lease.rollback() catch {
+                runtime.worktree_generation_valid = false;
+                runtime.app.action_state_fresh = false;
+                runtime.refresh_epoch = .degraded;
+                return error.ReusedCheckoutRollbackFailed;
+            };
+            runtime.refresh_epoch = .current;
             return err;
         };
         return lease;
