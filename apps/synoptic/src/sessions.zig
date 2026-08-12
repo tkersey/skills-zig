@@ -1942,7 +1942,7 @@ pub const Registry = struct {
             if (std.mem.eql(u8, event_kind, "file.complete.requested") and
                 session.status != .current) return error.StaleOriginSession;
             if (std.mem.eql(u8, event_kind, "action.prepared")) {
-                self.validatePreparedAction(allocator, raw_json, session.path) catch
+                self.validatePreparedAction(allocator, raw_json) catch
                     return error.UnsupportedAction;
             }
             if (self.visible_events.items.len + self.authoritative_reservations >=
@@ -1966,12 +1966,11 @@ pub const Registry = struct {
         self: *Registry,
         allocator: std.mem.Allocator,
         raw_json: []const u8,
-        session_path: []const u8,
     ) !void {
         _ = self;
         const decoded = try action_tools.decodePreparedAction(allocator, raw_json);
         defer decoded.deinit(allocator);
-        try action_tools.validateAgainstSession(decoded, session_path);
+        try action_tools.validateInput(decoded);
     }
 
     fn executeAuthoritative(

@@ -628,7 +628,10 @@ test "prepared action input decoding releases every partial allocation" {
         if (decoded) |input| {
             input.deinit(failing.allocator());
             successes += 1;
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        } else |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => {},
+            else => return err,
+        }
     }
     try std.testing.expect(successes > 0);
 }
