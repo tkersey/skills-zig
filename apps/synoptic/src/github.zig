@@ -16,6 +16,7 @@ const rename_metadata_bytes_max: usize = 16 * 1024 * 1024;
 const canonical_git_env_path = "/usr/bin/env";
 const canonical_git_attributes_env = "GIT_ATTR_NOSYSTEM=1";
 const canonical_git_attributes_config = "core.attributesFile=/dev/null";
+const canonical_git_rename_limit_config = "diff.renameLimit=0";
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
 const GhWatchdog = struct {
@@ -2419,6 +2420,8 @@ fn canonicalRenameEntries(
             git_path,
             "-c",
             canonical_git_attributes_config,
+            "-c",
+            canonical_git_rename_limit_config,
             "diff",
             "--name-status",
             "-z",
@@ -3059,6 +3062,10 @@ fn expectSingleMergeBaseHydration(
         @as(usize, 1),
         std.mem.count(u8, log, "--find-copies-harder"),
     );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, log, canonical_git_rename_limit_config),
+    );
     try std.testing.expect(std.mem.count(u8, log, "attrs=1") >= 3);
     try std.testing.expect(std.mem.count(
         u8,
@@ -3258,6 +3265,12 @@ test "renamed file identity and review diff include the source path" {
     const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
     try configureNonCanonicalDiffDefaults(allocator, io, root);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "diff.renameLimit", "1" },
+    ));
     const ambient_attributes = try std.fs.path.join(allocator, &.{ root, "ambient-attributes" });
     defer allocator.free(ambient_attributes);
     try tmp.dir.writeFile(
