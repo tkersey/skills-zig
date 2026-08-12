@@ -13,6 +13,9 @@ pub const safe_boundary_timeout_ms: u32 = 5_000;
 pub const approval_timeout_ms: u32 = 25_000;
 const approval_response_margin_ms: i64 = 50;
 const unresolved_thread_page_bytes_max: usize = 1024 * 1024;
+const unresolved_thread_search_paths_max: usize = 64;
+const unresolved_thread_search_path_bytes_max: usize = 4096;
+const unresolved_thread_search_paths_bytes_max: usize = 64 * 1024;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
@@ -78,7 +81,7 @@ pub const dynamic_tools_json =
     " or when initial evidence is bounded\"," ++
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
     "\"query\":{\"type\":\"string\"},\"paths\":{\"type\":\"" ++
-    "array\",\"items\":{\"type\":\"string\"}},\"includeWhol" ++
+    "array\",\"maxItems\":64,\"items\":{\"type\":\"string\",\"maxLength\":4096}},\"includeWhol" ++
     "ePullRequest\":{\"type\":\"boolean\"},\"threadOffs" ++
     "et\":{\"type\":\"integer\",\"minimum\":0},\"comment" ++
     "Offset\":{\"type\":\"integer\",\"minimum\":0}}}}," ++
@@ -2745,11 +2748,7 @@ pub const Registry = struct {
         const comment_offset = try searchOffset(args, "commentOffset");
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(allocator);
-        if (args == .object) if (args.object.get("paths")) |value| {
-            if (value == .array) for (value.array.items) |path| {
-                if (path == .string) try paths.append(allocator, path.string);
-            };
-        };
+        try appendSearchPaths(args, allocator, &paths);
         const evidence = try generation.unresolvedThreadsPageJsonAlloc(
             allocator,
             assigned_path,
@@ -2767,6 +2766,31 @@ pub const Registry = struct {
                 "{f}}}],\"success\":true}}",
             .{std.json.fmt(evidence, .{})},
         );
+    }
+
+    fn appendSearchPaths(
+        args: std.json.Value,
+        allocator: std.mem.Allocator,
+        paths: *std.ArrayList([]const u8),
+    ) !void {
+        if (args != .object) return error.MalformedToolCall;
+        const value = args.object.get("paths") orelse return;
+        if (value != .array or value.array.items.len > unresolved_thread_search_paths_max) {
+            return error.MalformedToolCall;
+        }
+        var aggregate_bytes: usize = 0;
+        for (value.array.items) |path| {
+            if (path != .string or path.string.len > unresolved_thread_search_path_bytes_max) {
+                return error.MalformedToolCall;
+            }
+            aggregate_bytes = std.math.add(usize, aggregate_bytes, path.string.len) catch {
+                return error.MalformedToolCall;
+            };
+            if (aggregate_bytes > unresolved_thread_search_paths_bytes_max) {
+                return error.MalformedToolCall;
+            }
+            try paths.append(allocator, path.string);
+        }
     }
 
     fn searchOffset(args: std.json.Value, field: []const u8) !usize {
@@ -3208,6 +3232,58 @@ test "unresolved-thread search rejects malformed carrier identities" {
         error.MalformedToolCall,
         registry.searchThreads(raw, std.testing.allocator),
     );
+}
+
+test "unresolved-thread search schema and decoder bound path work before scanning" {
+    try std.testing.expect(std.mem.indexOf(u8, dynamic_tools_json, "\"maxItems\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dynamic_tools_json, "\"maxLength\":4096") != null);
+
+    var oversized: [unresolved_thread_search_path_bytes_max + 1]u8 = undefined;
+    @memset(&oversized, 'a');
+    const oversized_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"paths\":[\"{s}\"]}}",
+        .{oversized},
+    );
+    defer std.testing.allocator.free(oversized_json);
+    var oversized_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        oversized_json,
+        .{},
+    );
+    defer oversized_parsed.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.MalformedToolCall,
+        Registry.appendSearchPaths(
+            oversized_parsed.value,
+            std.testing.allocator,
+            &paths,
+        ),
+    );
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"paths\":[");
+    for (0..unresolved_thread_search_paths_max + 1) |index| {
+        if (index != 0) try writer.writer.writeByte(',');
+        try writer.writer.writeAll("\"a\"");
+    }
+    try writer.writer.writeAll("]}");
+    var count_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer.written(),
+        .{},
+    );
+    defer count_parsed.deinit();
+    try std.testing.expectError(
+        error.MalformedToolCall,
+        Registry.appendSearchPaths(count_parsed.value, std.testing.allocator, &paths),
+    );
+    try std.testing.expectEqual(@as(usize, 0), paths.items.len);
 }
 
 test "failed active close remains synchronization-visible until terminal notification" {
