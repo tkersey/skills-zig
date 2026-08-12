@@ -532,6 +532,50 @@ pub fn repositoryPathExists(io: std.Io, path: []const u8) !bool {
     return true;
 }
 
+pub fn repositoryIdentityAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+) ![]u8 {
+    const common_raw = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "rev-parse", "--path-format=absolute", "--git-common-dir" },
+        error.RepositoryIdentityUnavailable,
+    );
+    defer allocator.free(common_raw);
+    const common = std.mem.trim(u8, common_raw, "\r\n");
+    if (!std.fs.path.isAbsolute(common)) return error.RepositoryIdentityUnavailable;
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, common, allocator);
+    defer allocator.free(canonical);
+    const stat = try std.Io.Dir.cwd().statFile(
+        io,
+        canonical,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind != .directory) return error.RepositoryIdentityUnavailable;
+    return std.fmt.allocPrint(
+        allocator,
+        "synoptic-repository/v1:{d}:{s}",
+        .{ stat.inode, canonical },
+    );
+}
+
+pub fn retireManagedForRepositoryIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    custody: Custody,
+    repository_cwd: []const u8,
+    expected_identity: []const u8,
+) !bool {
+    const current = repositoryIdentityAlloc(allocator, io, repository_cwd) catch return false;
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, expected_identity)) return false;
+    try retireManaged(allocator, io, custody, repository_cwd);
+    return true;
+}
+
 pub fn requireManagedRefresh(custody: Custody) !void {
     if (custody != .managed) return error.ReusedCheckoutRefreshRequiresManagedMigration;
 }
@@ -1400,6 +1444,51 @@ test "worktree integrity cleanup rejects an intermediate symlink" {
     );
     defer allocator.free(sentinel);
     try std.testing.expectEqualStrings("keep\n", sentinel);
+}
+
+test "worktree integrity stale custody rejects a replacement repository" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.createDirPath(io, "managed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/old", .data = "old\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "managed/keep", .data = "keep\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const repo = try std.fs.path.join(allocator, &.{ root, "repo" });
+    defer allocator.free(repo);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "old" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    const old_identity = try repositoryIdentityAlloc(allocator, io, repo);
+    defer allocator.free(old_identity);
+    try tmp.dir.deleteTree(io, "repo");
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/new", .data = "new\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "new" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, repo, argv, error.TestGitFailed));
+    try std.testing.expect(!try retireManagedForRepositoryIdentity(
+        allocator,
+        io,
+        .{ .managed = managed },
+        repo,
+        old_identity,
+    ));
+    _ = try tmp.dir.statFile(io, "managed/keep", .{});
+    _ = try tmp.dir.statFile(io, "repo/new", .{});
 }
 
 test "repository remote matching normalizes transport default ports" {

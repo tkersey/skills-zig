@@ -134,6 +134,7 @@ const LifecycleRecord = struct {
     worktree: ?[]u8,
     worktree_kind: ?[]u8,
     repository_cwd: ?[]u8,
+    repository_identity: ?[]u8,
     pid: u64,
 
     fn deinit(self: *LifecycleRecord) void {
@@ -145,6 +146,7 @@ const LifecycleRecord = struct {
         if (self.worktree) |value| self.allocator.free(value);
         if (self.worktree_kind) |value| self.allocator.free(value);
         if (self.repository_cwd) |value| self.allocator.free(value);
+        if (self.repository_identity) |value| self.allocator.free(value);
     }
 };
 
@@ -192,7 +194,27 @@ fn launch(
     defer allocator.free(ready_path);
     const error_path = try std.fs.path.join(allocator, &.{ launch_dir, "error.json" });
     defer allocator.free(error_path);
-    var child = try spawnServeChild(allocator, io, environment, args, launch_id, runtime_root);
+    const repository_cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.cwd,
+        allocator,
+    );
+    defer allocator.free(repository_cwd);
+    const repository_identity = try worktree.repositoryIdentityAlloc(
+        allocator,
+        io,
+        repository_cwd,
+    );
+    defer allocator.free(repository_identity);
+    var child = try spawnServeChild(
+        allocator,
+        io,
+        environment,
+        args,
+        launch_id,
+        runtime_root,
+        repository_identity,
+    );
     var child_owned = true;
     errdefer if (child_owned) cleanupFailedLaunch(
         allocator,
@@ -255,6 +277,7 @@ fn writeStartingLifecycle(
     runtime_root: []const u8,
     launch_id: []const u8,
     repository_cwd: []const u8,
+    repository_identity: []const u8,
     pid: u64,
 ) !void {
     const executable = try std.process.executablePathAlloc(io, allocator);
@@ -267,7 +290,8 @@ fn writeStartingLifecycle(
             "\"status\":\"starting\",\"capabilityState\":\"starting\"," ++
             "\"lifecycle\":\"detached\",\"launchId\":{f},\"runtimeRoot\":{f}," ++
             "\"executable\":{f},\"pid\":{d},\"worktree\":{f}," ++
-            "\"worktreeKind\":\"starting\",\"repositoryCwd\":{f}}}",
+            "\"worktreeKind\":\"starting\",\"repositoryCwd\":{f}," ++
+            "\"repositoryIdentity\":{f}}}",
         .{
             config.lifecycle_schema,
             std.json.fmt(launch_id, .{}),
@@ -276,6 +300,7 @@ fn writeStartingLifecycle(
             pid,
             std.json.fmt(worktree_path, .{}),
             std.json.fmt(repository_cwd, .{}),
+            std.json.fmt(repository_identity, .{}),
         },
     );
     defer allocator.free(receipt);
@@ -320,6 +345,7 @@ fn retireDeadLaunch(
             return error.IncompleteManagedLaunchRecord;
         const repository_cwd = record.repository_cwd orelse
             return error.IncompleteManagedLaunchRecord;
+        const repository_identity = record.repository_identity;
         if (!std.fs.path.isAbsolute(repository_cwd)) {
             return error.InvalidLifecycleRecord;
         }
@@ -331,18 +357,22 @@ fn retireDeadLaunch(
         if (!std.mem.eql(u8, recorded_path, expected_path)) {
             return error.InvalidLifecycleRecord;
         }
-        if (try worktree.repositoryPathExists(io, repository_cwd)) {
-            try worktree.retireManaged(
+        if (repository_identity != null and
+            try worktree.repositoryPathExists(io, repository_cwd))
+        {
+            _ = try worktree.retireManagedForRepositoryIdentity(
                 allocator,
                 io,
                 .{ .managed = recorded_path },
                 repository_cwd,
+                repository_identity.?,
             );
         }
     } else if (kind != null and !std.mem.eql(u8, kind.?, "reused-current")) {
         return error.InvalidLifecycleRecord;
     } else if (kind == null and
-        (record.worktree != null or record.repository_cwd != null))
+        (record.worktree != null or record.repository_cwd != null or
+            record.repository_identity != null))
     {
         return error.InvalidLifecycleRecord;
     }
@@ -375,6 +405,7 @@ fn spawnServeChild(
     args: []const []const u8,
     launch_id: []const u8,
     runtime_root: []const u8,
+    repository_identity: []const u8,
 ) !std.process.Child {
     const self_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_path);
@@ -382,7 +413,16 @@ fn spawnServeChild(
     defer child_argv.deinit(allocator);
     try child_argv.appendSlice(
         allocator,
-        &.{ self_path, "serve", "--launch-id", launch_id, "--runtime-root", runtime_root },
+        &.{
+            self_path,
+            "serve",
+            "--launch-id",
+            launch_id,
+            "--runtime-root",
+            runtime_root,
+            "--repository-identity",
+            repository_identity,
+        },
     );
     try child_argv.appendSlice(allocator, args);
     return std.process.spawn(io, .{
@@ -443,14 +483,24 @@ fn serve(
     environment: *const std.process.Environ.Map,
     args: []const []const u8,
 ) !void {
-    const invalid = args.len < 4 or !std.mem.eql(u8, args[0], "--launch-id") or
-        !std.mem.eql(u8, args[2], "--runtime-root");
+    const invalid = args.len < 6 or !std.mem.eql(u8, args[0], "--launch-id") or
+        !std.mem.eql(u8, args[2], "--runtime-root") or
+        !std.mem.eql(u8, args[4], "--repository-identity") or args[5].len == 0;
     if (invalid) return error.InvalidArguments;
     const launch_id = args[1];
     const runtime_root = args[3];
+    const repository_identity = args[5];
     if (launch_id.len != 48 or std.mem.indexOfScalar(u8, launch_id, std.fs.path.sep) != null)
         return error.InvalidLaunchId;
-    serveReview(allocator, io, environment, args[4..], launch_id, runtime_root) catch |err| {
+    serveReview(
+        allocator,
+        io,
+        environment,
+        args[6..],
+        launch_id,
+        runtime_root,
+        repository_identity,
+    ) catch |err| {
         writeLaunchError(allocator, io, runtime_root, launch_id, err) catch |ignored_error| {
             switch (ignored_error) {
                 else => {},
@@ -467,6 +517,7 @@ fn serveReview(
     args: []const []const u8,
     launch_id: []const u8,
     runtime_root: []const u8,
+    repository_identity: []const u8,
 ) !void {
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
     var options = try parseLaunch(args);
@@ -489,6 +540,7 @@ fn serveReview(
         runtime_root,
         launch_id,
         repository_cwd,
+        repository_identity,
         @intCast(std.c.getpid()),
     );
     if (std.c.setpgid(0, 0) != 0) return error.SynopticProcessGroupDetachFailed;
@@ -538,6 +590,7 @@ fn serveReview(
         identity,
         launch_id,
         runtime_root,
+        repository_identity,
     );
 }
 
@@ -571,6 +624,7 @@ fn serveResolvedPullRequest(
     identity: pr.Identity,
     launch_id: []const u8,
     runtime_root: []const u8,
+    repository_identity: []const u8,
 ) !void {
     const broker = github.Broker{
         .allocator = allocator,
@@ -615,6 +669,7 @@ fn serveResolvedPullRequest(
             .broker = broker,
             .launch_id = launch_id,
             .runtime_root = runtime_root,
+            .repository_identity = repository_identity,
             .snapshot = snapshot,
             .fetch_source = fetch_source,
         },
@@ -631,6 +686,7 @@ const GenerationContext = struct {
     broker: github.Broker,
     launch_id: []const u8,
     runtime_root: []const u8,
+    repository_identity: []const u8,
     snapshot: Snapshot,
     fetch_source: ?worktree.FetchSource,
 };
@@ -972,7 +1028,14 @@ fn serveHttpRuntime(
         exclusion_work.cancelled.store(true, .release);
         exclusion_thread.join();
     };
-    try publishRuntimeReady(allocator, io, &server, &runtime, context.runtime_root);
+    try publishRuntimeReady(
+        allocator,
+        io,
+        &server,
+        &runtime,
+        context.runtime_root,
+        context.repository_identity,
+    );
     exclusion_work.started.store(true, .release);
     const terminal_error = runHttpLoop(io, &server, &runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
@@ -1135,6 +1198,7 @@ fn publishRuntimeReady(
     server: *http.Server,
     runtime: *http.Runtime,
     runtime_root: []const u8,
+    repository_identity: []const u8,
 ) !void {
     try publishReadyReceipt(
         allocator,
@@ -1151,6 +1215,7 @@ fn publishRuntimeReady(
         runtime.custody,
         runtime.registry.transportName(),
         runtime.repository_cwd,
+        repository_identity,
     );
 }
 
@@ -1266,6 +1331,7 @@ fn publishReadyReceipt(
     custody: worktree.Custody,
     transport: []const u8,
     repository_cwd: []const u8,
+    repository_identity: []const u8,
 ) !void {
     var token_buf: [64]u8 = undefined;
     const token = server.tokenHex(&token_buf);
@@ -1283,13 +1349,22 @@ fn publishReadyReceipt(
     defer allocator.free(repository);
     const executable = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(executable);
+    const current_repository_identity = try worktree.repositoryIdentityAlloc(
+        allocator,
+        io,
+        repository_cwd,
+    );
+    defer allocator.free(current_repository_identity);
+    if (!std.mem.eql(u8, current_repository_identity, repository_identity)) {
+        return error.RepositoryIdentityChanged;
+    }
     const receipt_format = "{{\"schema\":\"synoptic-launch-ready/v1\",\"runtimeSch" ++
         "ema\":\"{s}\",\"status\":\"ready\",\"capabilityState\"" ++
         ":\"ready\",\"lifecycle\":\"detached\",\"launchId\":{f}" ++
         ",\"runtimeRoot\":{f},\"executable\":{f},\"pid\":{d},\"" ++
         "url\":{f},\"repository\":{f},\"pullRequest\":{d},\"wor" ++
         "ktree\":{f},\"worktreeKind\":{f},\"transport\":{f}," ++
-        "\"repositoryCwd\":{f}}}";
+        "\"repositoryCwd\":{f},\"repositoryIdentity\":{f}}}";
     const receipt = try std.fmt.allocPrint(
         allocator,
         receipt_format,
@@ -1306,6 +1381,7 @@ fn publishReadyReceipt(
             std.json.fmt(custody.kind(), .{}),
             std.json.fmt(transport, .{}),
             std.json.fmt(repository_cwd, .{}),
+            std.json.fmt(repository_identity, .{}),
         },
     );
     defer allocator.free(receipt);
@@ -1696,6 +1772,12 @@ fn readLifecycleRecord(
     errdefer if (worktree_kind) |value| allocator.free(value);
     const repository_cwd = try lifecycleOptionalStringAlloc(allocator, object, "repositoryCwd");
     errdefer if (repository_cwd) |value| allocator.free(value);
+    const repository_identity = try lifecycleOptionalStringAlloc(
+        allocator,
+        object,
+        "repositoryIdentity",
+    );
+    errdefer if (repository_identity) |value| allocator.free(value);
     const pid_value = object.get("pid") orelse return error.InvalidLifecycleRecord;
     if (pid_value != .integer or pid_value.integer <= 0) return error.InvalidLifecycleRecord;
     return .{
@@ -1709,6 +1791,7 @@ fn readLifecycleRecord(
         .worktree = worktree_path,
         .worktree_kind = worktree_kind,
         .repository_cwd = repository_cwd,
+        .repository_identity = repository_identity,
         .pid = @intCast(pid_value.integer),
     };
 }
@@ -2402,6 +2485,8 @@ test "explicit dead stop retires managed custody" {
         &.{ "git", "worktree", "add", "--detach", managed, head },
     );
     allocator.free(added);
+    const repository_identity = try worktree.repositoryIdentityAlloc(allocator, io, repo);
+    defer allocator.free(repository_identity);
     var record = LifecycleRecord{
         .allocator = allocator,
         .raw = try allocator.dupe(u8, "{}"),
@@ -2413,6 +2498,7 @@ test "explicit dead stop retires managed custody" {
         .worktree = try allocator.dupe(u8, managed),
         .worktree_kind = try allocator.dupe(u8, "managed"),
         .repository_cwd = try allocator.dupe(u8, repo),
+        .repository_identity = try allocator.dupe(u8, repository_identity),
         .pid = 999_999,
     };
     defer record.deinit();
@@ -2488,6 +2574,7 @@ test "worktree integrity dead managed launch retirement survives a missing repos
         .worktree = try allocator.dupe(u8, managed),
         .worktree_kind = try allocator.dupe(u8, "managed"),
         .repository_cwd = try allocator.dupe(u8, repo),
+        .repository_identity = null,
         .pid = 999_999,
     };
     defer record.deinit();
