@@ -1685,9 +1685,8 @@ fn primaryContextAlloc(
     head_oid: []const u8,
     generation: *const domain.PrGeneration,
 ) ![]u8 {
-    var files: std.Io.Writer.Allocating = .init(allocator);
-    defer files.deinit();
-    try std.json.Stringify.value(generation.files.items, .{}, &files.writer);
+    const files = try generation.primaryFileMetadataJsonAlloc(allocator);
+    defer allocator.free(files);
     const repository = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}",
@@ -1708,7 +1707,7 @@ fn primaryContextAlloc(
             std.json.fmt(base_oid, .{}),
             std.json.fmt(head_ref, .{}),
             std.json.fmt(head_oid, .{}),
-            files.written(),
+            files,
         },
     );
 }

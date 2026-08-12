@@ -2036,6 +2036,33 @@ test "canonical review diffs ignore abbreviated object-id configuration" {
     try std.testing.expectEqual(@as(usize, 40), separator - index - "index ".len);
 }
 
+test "primary file metadata cannot serialize canonical patch bytes" {
+    const allocator = std.testing.allocator;
+    const patch = try allocator.alloc(u8, domain.max_primary_file_metadata_bytes);
+    defer allocator.free(patch);
+    @memset(patch, 'x');
+    var generation = try domain.PrGeneration.initFull(allocator, "base", "head");
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "src/a.zig",
+        .previous_path = "src/old-a.zig",
+        .additions = 4,
+        .deletions = 2,
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "sha256:revision",
+        .canonical_diff = patch,
+        .diff_state = .text,
+    });
+    const metadata = try generation.primaryFileMetadataJsonAlloc(allocator);
+    defer allocator.free(metadata);
+    try std.testing.expect(metadata.len < 512);
+    try std.testing.expect(std.mem.indexOf(u8, metadata, "src/a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata, "src/old-a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata, "canonical_diff") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata, "sha256:revision") == null);
+}
+
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

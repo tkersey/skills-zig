@@ -209,6 +209,17 @@ pub const File = struct {
     exclusion_sync_error: ?[]const u8 = null,
 };
 
+pub const max_primary_file_metadata_bytes: usize = 512 * 1024;
+
+const PrimaryFileMetadata = struct {
+    path: []const u8,
+    previousPath: ?[]const u8,
+    additions: u32,
+    deletions: u32,
+    changeType: []const u8,
+    viewedState: ViewedState,
+};
+
 pub const PrGeneration = struct {
     allocator: std.mem.Allocator,
     head_oid: []u8,
@@ -299,6 +310,31 @@ pub const PrGeneration = struct {
             .exclusion_reason = exclusion_reason,
             .exclusion_sync_error = exclusion_sync_error,
         });
+    }
+
+    pub fn primaryFileMetadataJsonAlloc(
+        self: *const PrGeneration,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const storage = try allocator.alloc(u8, max_primary_file_metadata_bytes);
+        errdefer allocator.free(storage);
+        var writer = std.Io.Writer.fixed(storage);
+        writer.writeByte('[') catch return error.PrimaryFileMetadataTooLarge;
+        for (self.files.items, 0..) |file, index| {
+            if (index != 0) {
+                writer.writeByte(',') catch return error.PrimaryFileMetadataTooLarge;
+            }
+            std.json.Stringify.value(PrimaryFileMetadata{
+                .path = file.path,
+                .previousPath = file.previous_path,
+                .additions = file.additions,
+                .deletions = file.deletions,
+                .changeType = file.change_type,
+                .viewedState = file.viewed,
+            }, .{}, &writer) catch return error.PrimaryFileMetadataTooLarge;
+        }
+        writer.writeByte(']') catch return error.PrimaryFileMetadataTooLarge;
+        return allocator.realloc(storage, writer.end);
     }
 
     pub fn addThread(self: *PrGeneration, thread: ReviewThread) !void {

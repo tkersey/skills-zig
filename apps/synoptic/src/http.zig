@@ -1417,9 +1417,8 @@ pub const Server = struct {
     }
 
     fn primaryUpdateAlloc(self: *Server, runtime: *Runtime) ![]u8 {
-        var files: std.Io.Writer.Allocating = .init(self.allocator);
-        defer files.deinit();
-        try std.json.Stringify.value(runtime.app.generation.files.items, .{}, &files.writer);
+        const files = try runtime.app.generation.primaryFileMetadataJsonAlloc(self.allocator);
+        defer self.allocator.free(files);
         const header = runtime.app.pull_request orelse return error.MissingPullRequestHeader;
         const update_format = "The pull request was explicitly refreshed. Current tit" ++
             "le: {s}. Current body: {s}. Current state: {s}; draft: {}. Current base " ++
@@ -1438,7 +1437,7 @@ pub const Server = struct {
                 header.base_ref_oid,
                 header.head_ref_name,
                 header.head_ref_oid,
-                files.written(),
+                files,
             },
         );
     }
