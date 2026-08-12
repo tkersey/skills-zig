@@ -2768,6 +2768,7 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
         consumer,
         &.{ "git", "remote", "set-url", "target", "https://redirect.invalid/wrong/repo.git" },
     ));
+    try configureFetchRemoteCollision(allocator, io, consumer);
     try worktree.ensureObjectAvailable(allocator, io, consumer, fetch_source, commits.head);
     allocator.free(try runGit(
         allocator,
@@ -2779,6 +2780,25 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, unrelated_witness, .{}),
     );
+}
+
+fn configureFetchRemoteCollision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    consumer: []const u8,
+) !void {
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{
+            "git",
+            "config",
+            "--add",
+            "remote.synoptic-exact.url",
+            "https://redirect.invalid/collision.git",
+        },
+    ));
 }
 
 fn prepareMatchedRemoteConsumer(

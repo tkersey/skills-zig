@@ -1,6 +1,7 @@
 const std = @import("std");
 const App = @import("app.zig").App;
 const config = @import("config.zig");
+const domain = @import("domain.zig");
 const github = @import("github.zig");
 const sessions = @import("sessions.zig");
 const tools = @import("tools.zig");
@@ -30,6 +31,7 @@ pub const ToolDomainContext = struct {
     number: u64,
     pull_request_id: []const u8,
     mutex: DomainMutex,
+    cancelled: std.atomic.Value(bool) = .init(false),
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -53,11 +55,17 @@ pub const ToolDomainContext = struct {
             .pull_request_id = pull_request_id,
             .mutex = .{ .io = broker.io },
         };
+        context.broker.cancelled = &context.cancelled;
         return context;
     }
 
     pub fn handler(self: *ToolDomainContext) sessions.AuthoritativeToolHandler {
-        return .{ .context = self, .handle = handleOpaque, .deinit = deinitOpaque };
+        return .{
+            .context = self,
+            .handle = handleOpaque,
+            .cancel = cancelOpaque,
+            .deinit = deinitOpaque,
+        };
     }
 
     pub fn pendingActionCount(self: *ToolDomainContext) usize {
@@ -83,6 +91,11 @@ pub const ToolDomainContext = struct {
     fn deinitOpaque(raw: *anyopaque) void {
         const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
         self.allocator.destroy(self);
+    }
+
+    fn cancelOpaque(raw: *anyopaque) void {
+        const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
+        self.cancelled.store(true, .release);
     }
 
     fn handleOpaque(
@@ -883,13 +896,14 @@ pub const Server = struct {
             &runtime.app.generation,
             path,
         ) orelse return error.MissingRevision;
-        const diff = try github.canonicalDiffAlloc(
+        const diff = try github.canonicalReviewDiffAlloc(
             self.allocator,
             self.io,
             runtime.cwd,
             runtime.app.generation.base_oid,
             runtime.app.generation.head_oid,
             path,
+            runtime.app.generation.previousPath(path),
         );
         defer self.allocator.free(diff);
         const threads = try runtime.app.generation.unresolvedThreadsJsonAlloc(
@@ -1102,13 +1116,14 @@ pub const Server = struct {
         runtime: *Runtime,
         card: tools.ActionCard,
     ) !bool {
-        const diff = try github.canonicalDiffAlloc(
+        const diff = try github.canonicalFileDiffAlloc(
             self.allocator,
             self.io,
             runtime.cwd,
             runtime.app.generation.base_oid,
             runtime.app.generation.head_oid,
             card.target.path.?,
+            runtime.app.generation.previousPath(card.target.path.?),
         );
         defer self.allocator.free(diff);
         return github.validateDiffAnchor(
@@ -1325,13 +1340,14 @@ pub const Server = struct {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
             }
-            const current_diff = github.canonicalDiffAlloc(
+            const current_diff = github.canonicalReviewDiffAlloc(
                 self.allocator,
                 self.io,
                 runtime.cwd,
                 next.base_oid,
                 next.head_oid,
                 tab.path,
+                next.previousPath(tab.path),
             ) catch {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
@@ -1348,12 +1364,7 @@ pub const Server = struct {
     ) !void {
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(self.allocator);
-        for (runtime.app.generation.files.items) |file| {
-            try appendUniquePath(self.allocator, &paths, file.path);
-        }
-        for (runtime.app.tabs.items) |tab| {
-            if (tab.status != .closed) try appendUniquePath(self.allocator, &paths, tab.path);
-        }
+        try appendLiveTabPaths(self.allocator, &paths, runtime.app.tabs.items);
         for (paths.items) |path| {
             const threads = try next.unresolvedThreadsJsonAlloc(
                 self.allocator,
@@ -1372,13 +1383,14 @@ pub const Server = struct {
                 );
                 continue;
             };
-            const diff = try github.canonicalDiffAlloc(
+            const diff = try github.canonicalReviewDiffAlloc(
                 self.allocator,
                 self.io,
                 runtime.cwd,
                 next.base_oid,
                 next.head_oid,
                 path,
+                next.previousPath(path),
             );
             defer self.allocator.free(diff);
             try runtime.registry.markPathChangedAndInject(
@@ -1553,6 +1565,16 @@ fn appendUniquePath(
         if (std.mem.eql(u8, existing, path)) return;
     }
     try paths.append(allocator, path);
+}
+
+fn appendLiveTabPaths(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    tabs: []const domain.Tab,
+) !void {
+    for (tabs) |tab| {
+        if (tab.status != .closed) try appendUniquePath(allocator, paths, tab.path);
+    }
 }
 
 fn payloadBool(payload: std.json.ObjectMap, key: []const u8) ?bool {
@@ -1952,6 +1974,55 @@ test "static assets are not state-bearing authorization targets" {
     try std.testing.expect(requiresToken("/api/bootstrap"));
     try std.testing.expect(requiresToken("/api/bootstrap?token=launch"));
     try std.testing.expect(!requiresToken("/api/bootstrap-impersonator"));
+}
+
+test "refresh delta hydration selects only live file tabs" {
+    const tabs = [_]domain.Tab{
+        .{ .id = "s1", .path = "a.zig", .revision = "r1", .diff = "" },
+        .{
+            .id = "s2",
+            .path = "a.zig",
+            .revision = "r0",
+            .status = .stale_origin,
+            .diff = "",
+        },
+        .{
+            .id = "s3",
+            .path = "closed.zig",
+            .revision = "r1",
+            .status = .closed,
+            .diff = "",
+        },
+        .{ .id = "s4", .path = "b.zig", .revision = "r1", .diff = "" },
+    };
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(std.testing.allocator);
+    try appendLiveTabPaths(std.testing.allocator, &paths, &tabs);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("a.zig", paths.items[0]);
+    try std.testing.expectEqualStrings("b.zig", paths.items[1]);
+}
+
+test "tool-domain server cancellation reaches in-flight GitHub effects" {
+    var state = try App.init(std.testing.allocator, "head");
+    defer state.deinit();
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    const context = try ToolDomainContext.create(
+        std.testing.allocator,
+        &state,
+        &registry,
+        .{ .allocator = std.testing.allocator, .io = std.testing.io },
+        "owner",
+        "repository",
+        1,
+        "PR_1",
+    );
+    const handler = context.handler();
+    defer handler.deinit.?(handler.context);
+    handler.cancel.?(handler.context);
+    try std.testing.expect(context.cancelled.load(.acquire));
+    try std.testing.expect(context.broker.cancelled.?.load(.acquire));
 }
 
 test "action refresh preserves local exclusion synchronization evidence" {

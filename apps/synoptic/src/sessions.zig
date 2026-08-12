@@ -13,6 +13,7 @@ const approval_response_margin_ms: i64 = 50;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
+const max_inline_thread_evidence_bytes: usize = 512 * 1024;
 const safe_boundary_quiescence_ms: u32 = 50;
 const review_execution_fields =
     "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"";
@@ -37,6 +38,24 @@ fn threadEvidenceDigest(threads_json: []const u8) [32]u8 {
     return digest;
 }
 
+fn boundedThreadEvidenceAlloc(
+    allocator: std.mem.Allocator,
+    threads_json: []const u8,
+) ![]u8 {
+    if (threads_json.len <= max_inline_thread_evidence_bytes) {
+        return allocator.dupe(u8, threads_json);
+    }
+    const digest = threadEvidenceDigest(threads_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"bounded\",\"originalBytes\":{d}," ++
+            "\"sha256\":\"{x}\",\"instruction\":\"Use " ++
+            "synoptic.search_unresolved_threads for this assigned path before " ++
+            "proposing a duplicate concern.\"}}",
+        .{ threads_json.len, digest },
+    );
+}
+
 fn authoritativeToolEventKind(tool: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, tool, "synoptic.prepare_github_action")) return "action.prepared";
     if (std.mem.eql(u8, tool, "synoptic.complete_file_review")) {
@@ -52,7 +71,8 @@ pub const dynamic_tools_json =
     ",\"tools\":[" ++
     "{\"name\":\"search_unresolved_threads\",\"description" ++
     "\":\"Search server-owned unresolved current-PR review " ++
-    "evidence; use whole-PR only for cross-file concerns\"," ++
+    "evidence; use whole-PR only for cross-file concerns or" ++
+    " when the initial prompt reports bounded thread evidence\"," ++
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{" ++
     "\"query\":{\"type\":\"string\"},\"paths\":{\"type\":\"" ++
     "array\",\"items\":{\"type\":\"string\"}},\"includeWhol" ++
@@ -127,6 +147,7 @@ pub const AuthoritativeToolHandler = struct {
         session_id: []const u8,
         result_allocator: std.mem.Allocator,
     ) anyerror![]u8,
+    cancel: ?*const fn (context: *anyopaque) void = null,
     deinit: ?*const fn (context: *anyopaque) void = null,
 };
 pub const OpenResult = struct {
@@ -558,7 +579,11 @@ pub const Registry = struct {
     ) !void {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         try actor.subscribe(.{ .context = self, .handle = onNotification });
-        try actor.setServerRequestHandler(.{ .context = self, .handle = onServerRequest });
+        try actor.setServerRequestHandler(.{
+            .context = self,
+            .handle = onServerRequest,
+            .cancel = cancelServerRequests,
+        });
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"cwd\":{f},\"ephemeral\":true,{s},\"dynamicTools\":{s}}}",
@@ -1137,6 +1162,8 @@ pub const Registry = struct {
             "untrusted-repository-content.md",
         );
         defer self.allocator.free(untrusted);
+        const prompt_threads = try boundedThreadEvidenceAlloc(self.allocator, threads_json);
+        defer self.allocator.free(prompt_threads);
         const format = "{s}\n\n{s}\n\n{s}\n\nAssigned path: {s}\nRevision: {s}" ++
             "\nBase: {s}\nHead: {s}\nServer-computed canonical diff:\n{s}" ++
             "\nComplete unresolved assigned-file thread evidence:\n{s}" ++
@@ -1153,7 +1180,7 @@ pub const Registry = struct {
             base_oid,
             head_oid,
             diff,
-            threads_json,
+            prompt_threads,
         });
     }
 
@@ -1476,13 +1503,15 @@ pub const Registry = struct {
         const owned_revision = try self.allocator.dupe(u8, revision);
         var revision_transferred = false;
         defer if (!revision_transferred) self.allocator.free(owned_revision);
+        const prompt_threads = try boundedThreadEvidenceAlloc(self.allocator, threads_json);
+        defer self.allocator.free(prompt_threads);
         const injected_text = try std.fmt.allocPrint(
             self.allocator,
             "The pull request was explicitly refreshed.\n" ++
                 "Assigned path: {s}\nCurrent revision: {s}\n" ++
                 "Current diff against the pull request base:\n{s}\n" ++
                 "Current unresolved assigned-file review threads:\n{s}",
-            .{ path, revision, diff, threads_json },
+            .{ path, revision, diff, prompt_threads },
         );
         defer self.allocator.free(injected_text);
         const params = try std.fmt.allocPrint(
@@ -1819,6 +1848,15 @@ pub const Registry = struct {
         return error.UnsupportedServerRequest;
     }
 
+    fn cancelServerRequests(context: *anyopaque) void {
+        const self: *Registry = @ptrCast(@alignCast(context));
+        self.mutex.lock();
+        const handler = self.authoritative_tool_handler;
+        self.mutex.unlock();
+        if (handler) |value| if (value.cancel) |cancel| cancel(value.context);
+        self.declineAllApprovals("server-request-cancelled");
+    }
+
     fn handleToolCall(
         self: *Registry,
         raw_json: []const u8,
@@ -1961,6 +1999,9 @@ pub const Registry = struct {
         self.visible_events.appendAssumeCapacity(event);
         event_transferred = true;
         self.authoritative_reservations -= 1;
+        if (std.mem.eql(u8, event_kind, "session.close.requested")) {
+            return allocator.dupe(u8, accepted_domain_response);
+        }
         for (self.sessions.items) |*session| if (std.mem.eql(
             u8,
             session.id,
@@ -3294,6 +3335,22 @@ fn acceptTestAuthoritativeTool(
     return allocator.dupe(u8, "{\"cardId\":\"act-test\"}");
 }
 
+fn closeTestAuthoritativeTool(
+    raw_context: *anyopaque,
+    event_kind: []const u8,
+    raw_json: []const u8,
+    session_id: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    _ = raw_json;
+    if (!std.mem.eql(u8, event_kind, "session.close.requested")) {
+        return error.UnexpectedTool;
+    }
+    const registry: *Registry = @ptrCast(@alignCast(raw_context));
+    registry.removeSession(session_id);
+    return allocator.dupe(u8, "{\"closed\":true}");
+}
+
 test "dynamic tool dispatch binds the exact parsed tool name" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
@@ -3313,6 +3370,39 @@ test "dynamic tool dispatch binds the exact parsed tool name" {
         "{\"cardId\":\"act-test\"}",
         registry.visible_events.items[0].raw_json,
     );
+}
+
+test "model-requested close acknowledges successful session removal" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].human_authority = .close;
+    try registry.setAuthoritativeToolHandler(.{
+        .context = &registry,
+        .handle = closeTestAuthoritativeTool,
+    });
+    const request =
+        "{\"params\":{\"threadId\":\"file-1\",\"tool\":" ++
+        "\"synoptic.close_session\",\"arguments\":{}}}";
+    const response = try registry.handleToolCall(request, std.testing.allocator);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(accepted_domain_response, response);
+    try std.testing.expectEqual(@as(usize, 0), registry.sessions.items.len);
+    try std.testing.expectEqualStrings(
+        "session.close.requested",
+        registry.visible_events.items[0].method,
+    );
+}
+
+test "oversized thread evidence is bounded with recovery identity" {
+    const raw = try std.testing.allocator.alloc(u8, max_inline_thread_evidence_bytes + 1);
+    defer std.testing.allocator.free(raw);
+    @memset(raw, 'x');
+    const bounded = try boundedThreadEvidenceAlloc(std.testing.allocator, raw);
+    defer std.testing.allocator.free(bounded);
+    try std.testing.expect(bounded.len < 1024);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "\"status\":\"bounded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "search_unresolved_threads") != null);
 }
 
 test "authoritative tools fail closed without a domain handler" {

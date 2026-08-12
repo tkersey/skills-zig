@@ -151,6 +151,7 @@ pub const Tab = struct {
 
 pub const File = struct {
     path: []const u8,
+    previous_path: ?[]const u8 = null,
     additions: u32 = 0,
     deletions: u32 = 0,
     change_type: []const u8 = "MODIFIED",
@@ -185,6 +186,7 @@ pub const PrGeneration = struct {
     pub fn deinit(self: *PrGeneration) void {
         for (self.files.items) |file| {
             self.allocator.free(file.path);
+            if (file.previous_path) |value| self.allocator.free(value);
             self.allocator.free(file.revision_key);
             self.allocator.free(file.change_type);
             if (file.exclusion_reason) |value| self.allocator.free(value);
@@ -202,6 +204,11 @@ pub const PrGeneration = struct {
     pub fn addFile(self: *PrGeneration, file: File) !void {
         const path = try self.allocator.dupe(u8, file.path);
         errdefer self.allocator.free(path);
+        const previous_path = if (file.previous_path) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (previous_path) |value| self.allocator.free(value);
         const change_type = try self.allocator.dupe(u8, file.change_type);
         errdefer self.allocator.free(change_type);
         const revision_key = try self.allocator.dupe(u8, file.revision_key);
@@ -218,6 +225,7 @@ pub const PrGeneration = struct {
         errdefer if (exclusion_sync_error) |value| self.allocator.free(value);
         try self.files.append(self.allocator, .{
             .path = path,
+            .previous_path = previous_path,
             .additions = file.additions,
             .deletions = file.deletions,
             .change_type = change_type,
@@ -351,6 +359,27 @@ pub const PrGeneration = struct {
             return;
         };
         return error.UnknownFile;
+    }
+
+    pub fn setPreviousPath(
+        self: *PrGeneration,
+        path: []const u8,
+        previous_path: ?[]const u8,
+    ) !void {
+        for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
+            const next = if (previous_path) |value| try self.allocator.dupe(u8, value) else null;
+            if (file.previous_path) |value| self.allocator.free(value);
+            file.previous_path = next;
+            return;
+        };
+        return error.UnknownFile;
+    }
+
+    pub fn previousPath(self: *const PrGeneration, path: []const u8) ?[]const u8 {
+        for (self.files.items) |file| if (std.mem.eql(u8, file.path, path)) {
+            return file.previous_path;
+        };
+        return null;
     }
 
     pub fn setExclusion(

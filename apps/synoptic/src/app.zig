@@ -80,23 +80,31 @@ const ExclusionCandidate = struct {
 const ExclusionProbe = struct {
     allocator: std.mem.Allocator,
     path: []u8,
+    previous_path: ?[]u8,
     revision: []u8,
     reason: ?[]u8,
 
     fn init(
         allocator: std.mem.Allocator,
         path: []const u8,
+        previous_path: ?[]const u8,
         revision: []const u8,
         reason: ?[]const u8,
     ) !ExclusionProbe {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
+        const owned_previous_path = if (previous_path) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_previous_path) |value| allocator.free(value);
         const owned_revision = try allocator.dupe(u8, revision);
         errdefer allocator.free(owned_revision);
         const owned_reason = if (reason) |value| try allocator.dupe(u8, value) else null;
         return .{
             .allocator = allocator,
             .path = owned_path,
+            .previous_path = owned_previous_path,
             .revision = owned_revision,
             .reason = owned_reason,
         };
@@ -104,6 +112,7 @@ const ExclusionProbe = struct {
 
     fn deinit(self: ExclusionProbe) void {
         self.allocator.free(self.path);
+        if (self.previous_path) |value| self.allocator.free(value);
         self.allocator.free(self.revision);
         if (self.reason) |value| self.allocator.free(value);
     }
@@ -163,6 +172,7 @@ pub const AutomaticExclusionBatch = struct {
                     merge_base orelse continue,
                     self.head_oid,
                     probe.path,
+                    probe.previous_path,
                     broker.cancelled,
                 ) catch |err| switch (err) {
                     error.GitDiffCancelled => return err,
@@ -817,6 +827,7 @@ pub const App = struct {
             var probe = try ExclusionProbe.init(
                 self.allocator,
                 file.path,
+                file.previous_path,
                 file.revision_key,
                 settings.classifyPath(file.path),
             );

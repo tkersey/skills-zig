@@ -234,9 +234,19 @@ fn cleanupFailedLaunch(
         io,
         .{ .managed = managed_path },
         repository_cwd,
-    ) catch |ignored_error| switch (ignored_error) {
-        else => {},
-    };
+    ) catch return;
+    deleteLaunchDirectory(io, launch_dir) catch return;
+}
+
+fn deleteLaunchDirectory(io: std.Io, launch_dir: []const u8) !void {
+    const parent_path = std.fs.path.dirname(launch_dir) orelse
+        return error.InvalidLaunchDirectory;
+    const launch_name = std.fs.path.basename(launch_dir);
+    if (launch_name.len == 0 or std.mem.eql(u8, launch_name, ".") or
+        std.mem.eql(u8, launch_name, "..")) return error.InvalidLaunchDirectory;
+    var parent = try std.Io.Dir.openDirAbsolute(io, parent_path, .{});
+    defer parent.close(io);
+    try parent.deleteTree(io, launch_name);
 }
 
 fn retireDeadLaunch(
@@ -2330,6 +2340,10 @@ test "failed launch retires descendants before managed custody and preserves err
         1_000,
     ));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, managed, .{}));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
+    );
 }
 test {
     _ = domain;

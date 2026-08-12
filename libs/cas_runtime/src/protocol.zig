@@ -34,6 +34,8 @@ pub const ServerRequest = struct {
 
 /// A handler returns an owned exact JSON result. The actor serializes the
 /// matching JSON-RPC response and frees the returned bytes after enqueueing.
+/// `cancel` must be idempotent and must unblock any active `handle` call. The
+/// actor invokes it when the request deadline expires and during shutdown.
 pub const ServerRequestHandler = struct {
     context: *anyopaque,
     handle: *const fn (
@@ -41,6 +43,7 @@ pub const ServerRequestHandler = struct {
         request: ServerRequest,
         allocator: std.mem.Allocator,
     ) anyerror![]u8,
+    cancel: *const fn (context: *anyopaque) void,
 };
 
 /// Notification callbacks are invoked serially by the permanent reader. The

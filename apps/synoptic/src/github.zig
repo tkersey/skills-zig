@@ -8,6 +8,8 @@ const max_pages: usize = 10_000;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
 const canonical_diff_bytes_max: usize = 64 * 1024 * 1024;
+const review_diff_bytes_max: usize = 512 * 1024;
+const rename_metadata_bytes_max: usize = 16 * 1024 * 1024;
 const git_stderr_bytes_max: usize = 1024 * 1024;
 
 const GhWatchdog = struct {
@@ -1902,7 +1904,22 @@ fn hydrateRevisionKeysWithGitPathLimit(
         fetch_source,
     );
     defer allocator.free(merge_base);
-    for (generation.files.items) |file| {
+    var renames = try canonicalRenameEntries(
+        allocator,
+        io,
+        git_path,
+        cwd,
+        merge_base,
+        generation.head_oid,
+    );
+    defer renames.deinit();
+    for (generation.files.items) |*file| {
+        const renamed = std.mem.eql(u8, file.change_type, "RENAMED") or
+            std.mem.eql(u8, file.change_type, "COPIED");
+        try generation.setPreviousPath(
+            file.path,
+            if (renamed) renames.previousPath(file.path) else null,
+        );
         try hydrateFileRevision(
             allocator,
             io,
@@ -1910,7 +1927,7 @@ fn hydrateRevisionKeysWithGitPathLimit(
             git_path,
             merge_base,
             generation,
-            file,
+            file.*,
             diff_bytes_max,
         );
     }
@@ -1944,6 +1961,7 @@ fn hydrateFileRevision(
         merge_base,
         generation.head_oid,
         file.path,
+        file.previous_path,
         null,
         diff_bytes_max,
     ) catch |err| switch (err) {
@@ -1957,7 +1975,7 @@ fn hydrateFileRevision(
         git_path,
         cwd,
         merge_base,
-        file.path,
+        file.previous_path orelse file.path,
     );
     defer if (diff == null) allocator.free(diff_identity);
     const revision = try domain.revisionKey(
@@ -2061,6 +2079,85 @@ fn mergeBaseWithShallowRetryAlloc(
     };
 }
 
+const RenameEntry = struct {
+    previous_path: []u8,
+    path: []u8,
+};
+
+const RenameEntries = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(RenameEntry) = .empty,
+
+    fn deinit(self: *RenameEntries) void {
+        for (self.items.items) |entry| {
+            self.allocator.free(entry.previous_path);
+            self.allocator.free(entry.path);
+        }
+        self.items.deinit(self.allocator);
+    }
+
+    fn previousPath(self: *const RenameEntries, path: []const u8) ?[]const u8 {
+        for (self.items.items) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) return entry.previous_path;
+        }
+        return null;
+    }
+};
+
+fn canonicalRenameEntries(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    merge_base: []const u8,
+    head: []const u8,
+) !RenameEntries {
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
+    defer allocator.free(range);
+    var result = try runCapturedProcess(
+        allocator,
+        io,
+        &.{ git_path, "diff", "--name-status", "-z", "-M", "-C", range },
+        .{ .path = cwd },
+        null,
+        null,
+        rename_metadata_bytes_max,
+        git_stderr_bytes_max,
+        false,
+    );
+    defer result.deinit();
+    if (result.term != .exited or result.term.exited != 0) return error.FileDiffFailed;
+    var entries = RenameEntries{ .allocator = allocator };
+    errdefer entries.deinit();
+    var index: usize = 0;
+    while (index < result.stdout.len) {
+        const status = try nextNulField(result.stdout, &index);
+        if (status.len == 0) return error.InvalidGitNameStatus;
+        const source = try nextNulField(result.stdout, &index);
+        if (status[0] != 'R' and status[0] != 'C') continue;
+        const destination = try nextNulField(result.stdout, &index);
+        const previous_path = try allocator.dupe(u8, source);
+        errdefer allocator.free(previous_path);
+        const path = try allocator.dupe(u8, destination);
+        errdefer allocator.free(path);
+        try entries.items.append(allocator, .{
+            .previous_path = previous_path,
+            .path = path,
+        });
+    }
+    return entries;
+}
+
+fn nextNulField(raw: []const u8, index: *usize) ![]const u8 {
+    if (index.* >= raw.len) return error.InvalidGitNameStatus;
+    const relative_end = std.mem.indexOfScalar(u8, raw[index.*..], 0) orelse
+        return error.InvalidGitNameStatus;
+    const start = index.*;
+    const end = start + relative_end;
+    index.* = end + 1;
+    return raw[start..end];
+}
+
 pub fn canonicalDiffAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2088,7 +2185,82 @@ pub fn canonicalDiffAlloc(
         head,
         path,
         null,
+        null,
     );
+}
+
+pub fn canonicalFileDiffAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) ![]u8 {
+    const merge_base = try canonicalMergeBaseAlloc(
+        allocator,
+        io,
+        "git",
+        cwd,
+        base,
+        head,
+        null,
+    );
+    defer allocator.free(merge_base);
+    return canonicalDiffFromMergeBaseAlloc(
+        allocator,
+        io,
+        "git",
+        cwd,
+        merge_base,
+        head,
+        path,
+        previous_path,
+        null,
+    );
+}
+
+pub fn canonicalReviewDiffAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) ![]u8 {
+    const merge_base = try canonicalMergeBaseAlloc(
+        allocator,
+        io,
+        "git",
+        cwd,
+        base,
+        head,
+        null,
+    );
+    defer allocator.free(merge_base);
+    return canonicalDiffFromMergeBaseWithLimitAlloc(
+        allocator,
+        io,
+        "git",
+        cwd,
+        merge_base,
+        head,
+        path,
+        previous_path,
+        null,
+        review_diff_bytes_max,
+    ) catch |err| switch (err) {
+        error.FileDiffTooLarge => std.fmt.allocPrint(
+            allocator,
+            "Synoptic did not inline this file diff because it exceeds the review evidence " ++
+                "limit. Inspect it locally against merge base {s} and head {s}. " ++
+                "Assigned path: {s}. Previous path: {s}.",
+            .{ merge_base, head, path, previous_path orelse "none" },
+        ),
+        else => return err,
+    };
 }
 
 pub fn canonicalMergeBaseAlloc(
@@ -2128,6 +2300,7 @@ pub fn canonicalDiffFromMergeBaseAlloc(
     merge_base: []const u8,
     head: []const u8,
     path: []const u8,
+    previous_path: ?[]const u8,
     cancelled: ?*const std.atomic.Value(bool),
 ) ![]u8 {
     return canonicalDiffFromMergeBaseWithLimitAlloc(
@@ -2138,6 +2311,7 @@ pub fn canonicalDiffFromMergeBaseAlloc(
         merge_base,
         head,
         path,
+        previous_path,
         cancelled,
         canonical_diff_bytes_max,
     );
@@ -2151,14 +2325,25 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
     merge_base: []const u8,
     head: []const u8,
     path: []const u8,
+    previous_path: ?[]const u8,
     cancelled: ?*const std.atomic.Value(bool),
     diff_bytes_max: usize,
 ) ![]u8 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
-    var result = runCapturedProcess(
-        allocator,
-        io,
+    const argv: []const []const u8 = if (previous_path) |old_path|
+        &.{
+            git_path,
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            range,
+            "--",
+            old_path,
+            path,
+        }
+    else
         &.{
             git_path,
             "--literal-pathspecs",
@@ -2168,7 +2353,11 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             range,
             "--",
             path,
-        },
+        };
+    var result = runCapturedProcess(
+        allocator,
+        io,
+        argv,
         .{ .path = cwd },
         null,
         cancelled,
@@ -2536,6 +2725,112 @@ test "revision hydration computes one merge base for a generation" {
         head,
     );
     try expectOversizedDiffHydration(allocator, io, root, wrapper_path, base, head);
+}
+
+test "renamed file identity and review diff include the source path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "old.zig", .data = "const value = 1;\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "mv", "old.zig", "new.zig" },
+    ));
+    try tmp.dir.writeFile(
+        io,
+        .{ .sub_path = "new.zig", .data = "const value = 1;\nconst added = 2;\n" },
+    );
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "rename" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const base = std.mem.trim(u8, base_raw, "\r\n");
+    const head = std.mem.trim(u8, head_raw, "\r\n");
+    var generation = try domain.PrGeneration.initFull(allocator, base, head);
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "new.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try hydrateRevisionKeys(allocator, io, root, null, &generation);
+    try std.testing.expectEqualStrings("old.zig", generation.previousPath("new.zig").?);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        generation.files.items[0].revision_key,
+        "pending",
+    ));
+    const diff = try canonicalReviewDiffAlloc(
+        allocator,
+        io,
+        root,
+        base,
+        head,
+        "new.zig",
+        generation.previousPath("new.zig"),
+    );
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "rename from old.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "rename to new.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
+}
+
+test "oversized review diff becomes bounded inspectable evidence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.txt", .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const base_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const large = try allocator.alloc(u8, review_diff_bytes_max + 64 * 1024);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.txt", .data = large });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "large" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+    const head_raw = try runTestGit(allocator, io, root, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    const diff = try canonicalReviewDiffAlloc(
+        allocator,
+        io,
+        root,
+        std.mem.trim(u8, base_raw, "\r\n"),
+        std.mem.trim(u8, head_raw, "\r\n"),
+        "large.txt",
+        null,
+    );
+    defer allocator.free(diff);
+    try std.testing.expect(diff.len < 2048);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "exceeds the review evidence limit") != null);
 }
 
 test "revision hydration deepens a shallow checkout before retrying merge base" {

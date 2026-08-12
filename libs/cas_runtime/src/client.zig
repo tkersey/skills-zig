@@ -1646,6 +1646,13 @@ pub const Actor = struct {
     pub fn deinit(self: *Actor) void {
         const state = self.state;
         actorSetTerminal(state, .stopped);
+        state.mutex.lock();
+        const active_handler = if (state.active_server_handlers > 0)
+            state.server_request_handler
+        else
+            null;
+        state.mutex.unlock();
+        if (active_handler) |handler| handler.cancel(handler.context);
         // Closing the underlying transport releases a reader blocked in I/O.
         actorCloseTransportOnce(state);
         if (state.writer_thread) |thread| thread.join();
@@ -2197,6 +2204,15 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         .raw_json = work.raw_json,
         .deadline_ms = work.deadline_ms,
     };
+    var watchdog = ServerHandlerWatchdog{
+        .handler = work.handler,
+        .deadline_ms = work.deadline_ms,
+    };
+    const watchdog_thread = try std.Thread.spawn(.{}, ServerHandlerWatchdog.run, .{&watchdog});
+    defer {
+        watchdog.finished.store(true, .release);
+        watchdog_thread.join();
+    }
     const result_json = work.handler.handle(work.handler.context, request, state.allocator) catch
         return actorEnqueueServerError(
             state,
@@ -2223,6 +2239,25 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
     };
     try actorEnqueueOwned(state, payload, work.deadline_ms, true, null);
 }
+
+const ServerHandlerWatchdog = struct {
+    handler: protocol.ServerRequestHandler,
+    deadline_ms: i64,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ServerHandlerWatchdog) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (!self.finished.load(.acquire)) {
+            const remaining_ms = self.deadline_ms - monotonicMillis();
+            if (remaining_ms <= 0) {
+                self.handler.cancel(self.handler.context);
+                return;
+            }
+            const sleep_ms: u32 = @intCast(@min(remaining_ms, 5));
+            std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake) catch return;
+        }
+    }
+};
 
 fn actorEnqueueServerError(
     state: *ActorState,
@@ -4254,6 +4289,10 @@ const ServerRequestProbe = struct {
     }
 };
 
+fn noServerRequestCancel(context: *anyopaque) void {
+    _ = context;
+}
+
 const InvalidServerResultProbe = struct {
     fn handle(
         context: *anyopaque,
@@ -4276,6 +4315,31 @@ const LateServerRequestProbe = struct {
         _ = request;
         try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
         return allocator.dupe(u8, "{\"handled\":true}");
+    }
+};
+
+const CancellableServerRequestProbe = struct {
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        _ = request;
+        const self: *CancellableServerRequestProbe = @ptrCast(@alignCast(context));
+        for (0..1_000) |_| {
+            if (self.cancelled.load(.acquire)) {
+                return allocator.dupe(u8, "{\"cancelled\":true}");
+            }
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        return error.HandlerDidNotObserveCancellation;
+    }
+
+    fn cancel(context: *anyopaque) void {
+        const self: *CancellableServerRequestProbe = @ptrCast(@alignCast(context));
+        self.cancelled.store(true, .release);
     }
 };
 
@@ -4359,7 +4423,11 @@ test "actor falsifier dispatches server requests through configured handler and 
     var probe = ServerRequestProbe{};
     var actor = try fixture.start(.{
         .outbound_queue_capacity = 1,
-        .server_request_handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
+        },
     });
     defer actor.deinit();
     const result = try actor.requestJson("actor/server-request", "{}", 2_000);
@@ -4386,6 +4454,7 @@ test "actor contains malformed handler output to the originating server request"
         .server_request_handler = .{
             .context = &probe,
             .handle = InvalidServerResultProbe.handle,
+            .cancel = noServerRequestCancel,
         },
     });
     defer actor.deinit();
@@ -4412,6 +4481,7 @@ test "actor server requests make independent bounded progress" {
         .server_request_handler = .{
             .context = &probe,
             .handle = ConcurrentServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
         },
     });
     defer actor.deinit();
@@ -4419,6 +4489,31 @@ test "actor server requests make independent bounded progress" {
     defer allocator.free(result);
     try std.testing.expect(probe.fast_completed.load(.acquire));
     try std.testing.expect(!probe.block_timed_out.load(.acquire));
+}
+
+test "actor server request deadline cooperatively cancels handler and bounds shutdown" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "server_request");
+    defer fixture.deinit();
+    var probe = CancellableServerRequestProbe{};
+    var actor = try fixture.start(.{
+        .server_request_timeout_ms = 20,
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = CancellableServerRequestProbe.handle,
+            .cancel = CancellableServerRequestProbe.cancel,
+        },
+    });
+    const started = monotonicMillis();
+    const request_result = actor.requestJson("actor/server-request", "{}", 2_000);
+    if (request_result) |result| {
+        allocator.free(result);
+        return error.ExpectedRequestDeadline;
+    } else |_| {}
+    actor.deinit();
+    try std.testing.expect(probe.cancelled.load(.acquire));
+    try std.testing.expect(monotonicMillis() - started < 1_000);
 }
 
 test "actor falsifier notification callbacks may issue nested requests" {
@@ -4460,6 +4555,7 @@ test "actor falsifier nested request in server handler cannot deadlock permanent
     try actor.setServerRequestHandler(.{
         .context = &probe,
         .handle = NestedServerRequestProbe.handle,
+        .cancel = noServerRequestCancel,
     });
     const result = try actor.requestJson("actor/original", "{}", 3_000);
     defer allocator.free(result);
@@ -4650,7 +4746,11 @@ test "actor falsifier expired server work never invokes its handler" {
         .server_request_capacity = 1,
         .server_request_timeout_ms = 100,
         .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
-        .server_request_handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
+        },
         .default_request_timeout_ms = 100,
         .overload_retry_policy = .{},
         .overload_retry_seed = 1,
@@ -4661,7 +4761,11 @@ test "actor falsifier expired server work never invokes its handler" {
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
         .deadline_ms = monotonicMillis() - 1,
-        .handler = .{ .context = &probe, .handle = ServerRequestProbe.handle },
+        .handler = .{
+            .context = &probe,
+            .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
+        },
     };
     defer work.deinit(allocator);
     try std.testing.expectError(
@@ -4686,6 +4790,7 @@ test "actor server work retains its admitted handler identity" {
         .server_request_handler = .{
             .context = &replacement_probe,
             .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
         },
         .default_request_timeout_ms = 100,
         .overload_retry_policy = .{},
@@ -4700,6 +4805,7 @@ test "actor server work retains its admitted handler identity" {
         .handler = .{
             .context = &admitted_probe,
             .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
         },
     };
     defer work.deinit(allocator);
@@ -4722,6 +4828,7 @@ test "actor rejects handler replacement while server work is live" {
         .server_request_handler = .{
             .context = &probe,
             .handle = ServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
         },
         .default_request_timeout_ms = 100,
         .overload_retry_policy = .{},
@@ -4748,7 +4855,11 @@ test "actor closes transport when a server handler returns after deadline" {
         .server_request_timeout_ms = 100,
         .active_server_handlers = 1,
         .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
-        .server_request_handler = .{ .context = &probe, .handle = LateServerRequestProbe.handle },
+        .server_request_handler = .{
+            .context = &probe,
+            .handle = LateServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
+        },
         .default_request_timeout_ms = 100,
         .overload_retry_policy = .{},
         .overload_retry_seed = 1,
@@ -4759,7 +4870,11 @@ test "actor closes transport when a server handler returns after deadline" {
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
         .deadline_ms = monotonicMillis() + 1,
-        .handler = .{ .context = &probe, .handle = LateServerRequestProbe.handle },
+        .handler = .{
+            .context = &probe,
+            .handle = LateServerRequestProbe.handle,
+            .cancel = noServerRequestCancel,
+        },
     };
     actorServerRequestWorker(&state, work);
     try std.testing.expectEqual(protocol.TerminalState.poisoned, state.terminal);
