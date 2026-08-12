@@ -1460,6 +1460,7 @@ test "reply reconciliation does not attribute a preexisting identical reply" {
         .base_oid = "base",
         .head_oid = "head",
         .session_path = "a.zig",
+        .github_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
     var baseline = try broker.captureReconciliationBaseline("o", "r", 1, card.*);
@@ -1785,6 +1786,7 @@ fn verifyUpdatedCommentReconciliation(
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .github_path = "a.zig",
     });
     const baseline = github.ReconciliationBaseline{ .allocator = allocator };
     // The fixture's createdAt is current, while the mutation start is far in
@@ -1813,6 +1815,7 @@ fn verifyUpdatedCommentReconciliation(
         .base_oid = "unknown-base",
         .head_oid = "h",
         .session_path = "a.zig",
+        .github_path = "a.zig",
     });
     try std.testing.expect(!try broker.reconcileAction(
         "o",

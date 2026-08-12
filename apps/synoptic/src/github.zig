@@ -2337,6 +2337,20 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
 ) ![]u8 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
     defer allocator.free(range);
+    const source_identity = if (previous_path) |old_path|
+        try std.fmt.allocPrint(
+            allocator,
+            "Synoptic source identity: {d} bytes\n{s}\n" ++
+                "Synoptic current identity: {d} bytes\n{s}\n",
+            .{ old_path.len, old_path, path.len, path },
+        )
+    else
+        null;
+    defer if (source_identity) |prefix| allocator.free(prefix);
+    const process_output_limit = if (source_identity) |prefix|
+        std.math.sub(usize, diff_bytes_max, prefix.len) catch return error.FileDiffTooLarge
+    else
+        diff_bytes_max;
     const argv: []const []const u8 = if (previous_path) |old_path|
         &.{
             git_path,
@@ -2345,8 +2359,6 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             "--no-ext-diff",
             "--no-color",
             "-M",
-            "-C",
-            "--find-copies-harder",
             range,
             "--",
             old_path,
@@ -2360,8 +2372,6 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
             "--no-ext-diff",
             "--no-color",
             "-M",
-            "-C",
-            "--find-copies-harder",
             range,
             "--",
             path,
@@ -2373,7 +2383,7 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         .{ .path = cwd },
         null,
         cancelled,
-        diff_bytes_max,
+        process_output_limit,
         git_stderr_bytes_max,
         false,
     ) catch |err| switch (err) {
@@ -2386,6 +2396,11 @@ fn canonicalDiffFromMergeBaseWithLimitAlloc(
         return error.FileDiffFailed;
     }
     allocator.free(result.stderr);
+    if (source_identity) |prefix| {
+        const diff = try std.mem.concat(allocator, u8, &.{ prefix, result.stdout });
+        allocator.free(result.stdout);
+        return diff;
+    }
     return result.stdout;
 }
 
@@ -2623,6 +2638,10 @@ fn expectSingleMergeBaseHydration(
     );
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "merge-base "));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, log, "--find-copies-harder"),
+    );
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending-a"));
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[1].revision_key, "pending-b"));
 }
@@ -2799,6 +2818,12 @@ test "renamed file identity and review diff include the source path" {
         generation.previousPath("new.zig"),
     );
     defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diff,
+        "Synoptic source identity: 7 bytes\nold.zig\n" ++
+            "Synoptic current identity: 7 bytes\nnew.zig\n",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "rename from old.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "rename to new.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+const added = 2;") != null);
@@ -2851,8 +2876,14 @@ test "copied file identity finds an unchanged source and includes source evidenc
         generation.previousPath("copy.zig"),
     );
     defer allocator.free(diff);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "copy from source.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff, "copy to copy.zig") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diff,
+        "Synoptic source identity: 10 bytes\nsource.zig\n" ++
+            "Synoptic current identity: 8 bytes\ncopy.zig\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+++ b/copy.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+const copied = 1;") != null);
 }
 
 test "oversized review diff becomes bounded inspectable evidence" {
