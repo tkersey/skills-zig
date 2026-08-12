@@ -2858,18 +2858,30 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
 }
 
 fn isGithubEffectObject(object: []const u8) bool {
+    if (isLocalDiscourseObject(object)) return false;
     const explicit = containsAnyIgnoreCase(object, &.{
         "label",  "reviewer", "assignee", "milestone",   "pull request", "this pr",
         "the pr", "pr #",     "github",   "mark viewed", "graphql",
     });
     if (explicit) return true;
-    if (containsAnyIgnoreCase(object, &.{
+    return isPreparedGithubEffect(object);
+}
+
+fn isLocalDiscourseObject(object: []const u8) bool {
+    const target = std.mem.trim(u8, object, " \t\r\n,;.!?");
+    if (startsAnyIgnoreCase(target, &.{
+        "summary",      "the summary",      "your summary",
+        "response",     "the response",     "your response",
+        "analysis",     "the analysis",     "your analysis",
+        "output",       "the output",       "your output",
+        "conversation", "the conversation", "this conversation",
+    })) return true;
+    return containsAnyIgnoreCase(target, &.{
         "from your summary",      "in your summary",      "from the summary",  "in the summary",
         "from your response",     "in your response",     "from the response", "in the response",
         "from your analysis",     "in your analysis",     "from your output",  "in your output",
         "from this conversation", "in this conversation",
-    })) return false;
-    return isPreparedGithubEffect(object);
+    });
 }
 
 fn isPreparedGithubEffect(object: []const u8) bool {
@@ -3380,6 +3392,19 @@ test "prepare authority distinguishes effects from informational artifacts" {
     try std.testing.expect(classifyHumanInstruction(
         "Prepare an overview of this pull request",
     ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Remove GitHub comments from the summary",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Update the summary with GitHub review comments",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Update your response with pull request feedback",
+    ) == null);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        classifyHumanInstruction("Update the pull request summary").?,
+    );
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         classifyHumanInstruction("Prepare an inline comment").?,
