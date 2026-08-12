@@ -140,7 +140,7 @@ pub const ToolDomainContext = struct {
         defer input.deinit(self.allocator);
         const identity = try self.registry.sessionIdentity(session_id);
         defer identity.deinit();
-        const current_path = self.app.generation.currentPath(identity.path) orelse
+        const current_path = (try self.app.generation.resolveCurrentPath(identity.path)) orelse
             return error.ActionTargetsAnotherSession;
         try tools.validateAgainstSession(input, current_path);
         const repository = try std.fmt.allocPrint(
@@ -1336,7 +1336,7 @@ pub const Server = struct {
         _ = self;
         for (runtime.app.tabs.items) |tab| {
             if (tab.status == .closed) continue;
-            const current_path = next.currentPath(tab.path) orelse {
+            const current_path = (try next.resolveCurrentPath(tab.path)) orelse {
                 try runtime.app.updateTabDiff(tab.path, null);
                 continue;
             };
@@ -1357,7 +1357,7 @@ pub const Server = struct {
         defer paths.deinit(self.allocator);
         try appendLiveTabPaths(self.allocator, &paths, runtime.app.tabs.items);
         for (paths.items) |path| {
-            const current_path = next.currentPath(path) orelse {
+            const current_path = (try next.resolveCurrentPath(path)) orelse {
                 const threads = try next.boundedUnresolvedThreadsJsonAlloc(
                     self.allocator,
                     path,

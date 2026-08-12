@@ -1881,9 +1881,9 @@ pub fn rebindGenerationLineage(
         );
     }
     for (previous.files.items) |*previous_file| {
+        const renamed = transitions.renamedPath(previous_file.path);
         const direct = directGenerationPath(next, previous_file.path);
-        const current_path = direct orelse transitions.renamedPath(previous_file.path) orelse
-            continue;
+        const current_path = renamed orelse direct orelse continue;
         try next.inheritLineage(current_path, previous_file);
     }
 }

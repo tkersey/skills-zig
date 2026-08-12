@@ -669,16 +669,30 @@ pub const PrGeneration = struct {
         return null;
     }
 
-    pub fn currentPath(self: *const PrGeneration, review_path: []const u8) ?[]const u8 {
+    pub fn resolveCurrentPath(
+        self: *const PrGeneration,
+        review_path: []const u8,
+    ) !?[]const u8 {
+        var lineage_match: ?[]const u8 = null;
+        for (self.files.items) |file| {
+            for (file.lineage_aliases.items) |alias| {
+                if (!std.mem.eql(u8, alias, review_path)) continue;
+                if (lineage_match) |matched| {
+                    if (!std.mem.eql(u8, matched, file.path)) {
+                        return error.AmbiguousFileLineage;
+                    }
+                } else lineage_match = file.path;
+            }
+        }
+        if (lineage_match) |matched| return matched;
         for (self.files.items) |file| if (std.mem.eql(u8, file.path, review_path)) {
             return file.path;
         };
-        for (self.files.items) |file| {
-            for (file.lineage_aliases.items) |alias| {
-                if (std.mem.eql(u8, alias, review_path)) return file.path;
-            }
-        }
         return null;
+    }
+
+    pub fn currentPath(self: *const PrGeneration, review_path: []const u8) ?[]const u8 {
+        return self.resolveCurrentPath(review_path) catch null;
     }
 
     pub fn inheritLineage(
@@ -709,8 +723,8 @@ pub const PrGeneration = struct {
         right: []const u8,
     ) bool {
         if (std.mem.eql(u8, left, right)) return true;
-        const current_left = self.currentPath(left) orelse return false;
-        const current_right = self.currentPath(right) orelse return false;
+        const current_left = (self.resolveCurrentPath(left) catch return false) orelse return false;
+        const current_right = (self.resolveCurrentPath(right) catch return false) orelse return false;
         return std.mem.eql(u8, current_left, current_right);
     }
 
@@ -918,4 +932,26 @@ test "revision replacement keeps the current value when allocation fails" {
     try std.testing.expectError(error.OutOfMemory, generation.setRevision("a", "new"));
     generation.allocator = std.testing.allocator;
     try std.testing.expectEqualStrings("old", generation.files.items[0].revision_key);
+}
+
+test "explicit rename lineage dominates a replacement at the historical path" {
+    var generation = try PrGeneration.init(std.testing.allocator, "head");
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "old.zig",
+        .change_type = "ADDED",
+        .viewed = .unviewed,
+        .revision_key = "replacement",
+    });
+    try generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "renamed",
+    });
+    try std.testing.expectEqualStrings(
+        "new.zig",
+        (try generation.resolveCurrentPath("old.zig")).?,
+    );
 }

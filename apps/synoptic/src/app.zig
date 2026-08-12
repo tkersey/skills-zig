@@ -436,7 +436,7 @@ pub const App = struct {
         pull_request_id: []const u8,
         session_path: []const u8,
     ) !tools.ActionCard {
-        const current_path = self.generation.currentPath(session_path) orelse
+        const current_path = (try self.generation.resolveCurrentPath(session_path)) orelse
             return error.ActionTargetChanged;
         const github_path = try self.actionTargetPath(input, current_path);
         const comment_body_snapshot = try self.commentBodySnapshot(input);
