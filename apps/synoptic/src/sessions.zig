@@ -1397,31 +1397,26 @@ pub const Registry = struct {
                 ), std.json.fmt(target.turn_id, .{}), std.json.fmt(combined, .{}) },
             );
         defer self.allocator.free(params);
-        try self.markHumanInstruction(session_id, text);
+        self.clearHumanInstruction(session_id);
         const response = actor.requestJson(method, params, null) catch |err| {
             if (target.active and !first_turn and err == error.RequestFailed and
                 self.waitForTurnCompletion(target.turn_id, 250))
             {
                 try self.reserveTurnStart(session_id);
                 target.start_reserved = true;
-                return self.retryCompletedSteer(
+                try self.retryCompletedSteer(
                     actor,
                     session_id,
                     target.thread_id,
                     combined,
-                ) catch |retry_error| {
-                    self.clearHumanInstruction(session_id);
-                    return retry_error;
-                };
+                );
+                return self.markHumanInstruction(session_id, text);
             }
-            self.clearHumanInstruction(session_id);
             return err;
         };
         defer self.allocator.free(response);
-        if (!target.active or first_turn) return self.recordStartedTurn(
-            session_id,
-            response,
-        );
+        if (!target.active or first_turn) try self.recordStartedTurn(session_id, response);
+        try self.markHumanInstruction(session_id, text);
     }
 
     fn waitForTurnCompletion(self: *Registry, turn_id: []const u8, timeout_ms: u32) bool {

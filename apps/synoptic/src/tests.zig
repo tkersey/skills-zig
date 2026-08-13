@@ -719,6 +719,25 @@ test "unresolved thread search pages comments under a fixed byte budget" {
 test "falsifier initial review cannot prepare action" {
     try std.testing.expect(!tools.initialReviewMayPrepareAction(true, true));
 }
+
+test "human authority is installed only after turn admission" {
+    const source = @embedFile("sessions.zig");
+    const request = std.mem.indexOf(
+        u8,
+        source,
+        "const response = actor.requestJson(method, params, null)",
+    ) orelse return error.MissingTurnRequest;
+    const revoke = std.mem.lastIndexOf(u8, source[0..request], "clearHumanInstruction") orelse
+        return error.MissingAuthorityRevocation;
+    const grant_offset = std.mem.indexOf(
+        u8,
+        source[request..],
+        "try self.markHumanInstruction(session_id, text);",
+    ) orelse return error.MissingAuthorityGrant;
+    try std.testing.expect(revoke < request);
+    try std.testing.expect(request < request + grant_offset);
+}
+
 test "falsifier action tool is rejected during initial review" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();
