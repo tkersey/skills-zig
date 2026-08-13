@@ -2473,26 +2473,8 @@ fn hydrateRevisionKeysWithGitPathLimit(
 ) !void {
     try GenerationHydrationBudget.admitFileCount(generation.files.items.len);
     var budget: GenerationHydrationBudget = .{};
-    worktree.ensureObjectAvailable(
-        allocator,
-        io,
-        cwd,
-        fetch_sources.base,
-        generation.base_oid,
-    ) catch |err| switch (err) {
-        error.GitObjectUnavailable => return error.GitFetchFailed,
-        else => return err,
-    };
-    worktree.ensureObjectAvailable(
-        allocator,
-        io,
-        cwd,
-        fetch_sources.head,
-        generation.head_oid,
-    ) catch |err| switch (err) {
-        error.GitObjectUnavailable => return error.GitFetchFailed,
-        else => return err,
-    };
+    try ensureGenerationObject(allocator, io, cwd, fetch_sources.base, generation.base_oid);
+    try ensureGenerationObject(allocator, io, cwd, fetch_sources.head, generation.head_oid);
     const merge_base = try mergeBaseWithShallowRetryAlloc(
         allocator,
         io,
@@ -2540,6 +2522,19 @@ fn hydrateRevisionKeysWithGitPathLimit(
             &budget,
         );
     }
+}
+
+fn ensureGenerationObject(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    source: ?worktree.FetchSource,
+    oid: []const u8,
+) !void {
+    worktree.ensureObjectAvailable(allocator, io, cwd, source, oid) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.GitFetchFailed,
+        else => return err,
+    };
 }
 
 fn hydrateFileRevision(
@@ -2590,6 +2585,36 @@ fn hydrateFileRevision(
         file.previous_path orelse file.path,
     );
     defer if (diff == null) allocator.free(diff_identity);
+    try installFileRevision(
+        allocator,
+        io,
+        cwd,
+        git_path,
+        merge_base,
+        evidence_view,
+        generation,
+        file,
+        diff,
+        diff_identity,
+        tree_entry,
+        budget,
+    );
+}
+
+fn installFileRevision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    git_path: []const u8,
+    merge_base: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
+    generation: *domain.PrGeneration,
+    file: domain.File,
+    diff: ?[]const u8,
+    diff_identity: []const u8,
+    tree_entry: []const u8,
+    budget: *GenerationHydrationBudget,
+) !void {
     const review_diff = try reviewDiffProjectionAlloc(
         allocator,
         diff,
@@ -3870,6 +3895,47 @@ fn expectOversizedDiffHydration(
     ));
 }
 
+const HydrationGitWrapper = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    log_path: []u8,
+
+    fn deinit(self: HydrationGitWrapper) void {
+        self.allocator.free(self.path);
+        self.allocator.free(self.log_path);
+    }
+};
+
+fn installHydrationGitWrapper(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    root: []const u8,
+) !HydrationGitWrapper {
+    const log_path = try std.fs.path.join(allocator, &.{ root, "git.log" });
+    errdefer allocator.free(log_path);
+    const path = try std.fs.path.join(allocator, &.{ root, "fake-git" });
+    errdefer allocator.free(path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf 'attrs=%s global=%s nosystem=%s selectors=%s|%s|%s|%s %s\\n' " ++
+            "\"${{GIT_ATTR_NOSYSTEM:-}}\" \"${{GIT_CONFIG_GLOBAL:-}}\" " ++
+            "\"${{GIT_CONFIG_NOSYSTEM:-}}\" \"${{GIT_DIR:-}}\" " ++
+            "\"${{GIT_WORK_TREE:-}}\" \"${{GIT_INDEX_FILE:-}}\" " ++
+            "\"${{GIT_COMMON_DIR:-}}\" \"$*\" >> {s}\nexec /usr/bin/git \"$@\"\n",
+        .{log_path},
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-git", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    return .{ .allocator = allocator, .path = path, .log_path = log_path };
+}
+
 test "exclusions config revision hydration preserves bounded diff kind" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3900,34 +3966,14 @@ test "exclusions config revision hydration preserves bounded diff kind" {
     defer allocator.free(head_raw);
     const base = std.mem.trim(u8, base_raw, "\r\n");
     const head = std.mem.trim(u8, head_raw, "\r\n");
-    const log_path = try std.fs.path.join(allocator, &.{ root, "git.log" });
-    defer allocator.free(log_path);
-    const wrapper_path = try std.fs.path.join(allocator, &.{ root, "fake-git" });
-    defer allocator.free(wrapper_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "#!/bin/sh\nprintf 'attrs=%s global=%s nosystem=%s selectors=%s|%s|%s|%s %s\\n' " ++
-            "\"${{GIT_ATTR_NOSYSTEM:-}}\" \"${{GIT_CONFIG_GLOBAL:-}}\" " ++
-            "\"${{GIT_CONFIG_NOSYSTEM:-}}\" \"${{GIT_DIR:-}}\" " ++
-            "\"${{GIT_WORK_TREE:-}}\" \"${{GIT_INDEX_FILE:-}}\" " ++
-            "\"${{GIT_COMMON_DIR:-}}\" \"$*\" >> {s}\n" ++
-            "exec /usr/bin/git \"$@\"\n",
-        .{log_path},
-    );
-    defer allocator.free(script);
-    try tmp.dir.writeFile(io, .{ .sub_path = "fake-git", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        wrapper_path,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
+    const wrapper = try installHydrationGitWrapper(allocator, io, &tmp, root);
+    defer wrapper.deinit();
     try expectSingleMergeBaseHydration(
         allocator,
         io,
         root,
-        wrapper_path,
-        log_path,
+        wrapper.path,
+        wrapper.log_path,
         base,
         head,
     );
@@ -3935,7 +3981,7 @@ test "exclusions config revision hydration preserves bounded diff kind" {
         allocator,
         io,
         root,
-        wrapper_path,
+        wrapper.path,
         base,
         head,
         "a.zig",
@@ -3945,7 +3991,7 @@ test "exclusions config revision hydration preserves bounded diff kind" {
         allocator,
         io,
         root,
-        wrapper_path,
+        wrapper.path,
         base,
         head,
         "binary.dat",
@@ -4457,28 +4503,15 @@ test "fork hydration retains independent base and head fetch authorities" {
     const checkout = try std.fs.path.join(allocator, &.{ root, "checkout" });
     defer allocator.free(checkout);
     try tmp.dir.writeFile(io, .{ .sub_path = "upstream/a.zig", .data = "ancestor\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "config", "user.email", "synoptic@example.test" },
-        &.{ "git", "config", "user.name", "Synoptic Test" },
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "ancestor" },
-    }) |argv| allocator.free(try runTestGit(allocator, io, upstream, argv));
+    try initializeRevisionTestRepo(allocator, io, upstream, "ancestor");
     allocator.free(try runTestGit(allocator, io, root, &.{ "git", "clone", "-q", upstream, fork }));
     try tmp.dir.writeFile(io, .{ .sub_path = "fork/a.zig", .data = "fork head\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "config", "user.email", "synoptic@example.test" },
-        &.{ "git", "config", "user.name", "Synoptic Test" },
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "fork head" },
-    }) |argv| allocator.free(try runTestGit(allocator, io, fork, argv));
+    try configureRevisionTestIdentity(allocator, io, fork);
+    try commitRevisionTestRepo(allocator, io, fork, "fork head");
     const head_raw = try runTestGit(allocator, io, fork, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head_raw);
     try tmp.dir.writeFile(io, .{ .sub_path = "upstream/base.zig", .data = "base tip\n" });
-    for ([_][]const []const u8{
-        &.{ "git", "add", "." },
-        &.{ "git", "commit", "-qm", "upstream base" },
-    }) |argv| allocator.free(try runTestGit(allocator, io, upstream, argv));
+    try commitRevisionTestRepo(allocator, io, upstream, "upstream base");
     const base_raw = try runTestGit(allocator, io, upstream, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(base_raw);
     const fork_url = try std.fmt.allocPrint(allocator, "file://{s}", .{fork});
@@ -4519,6 +4552,43 @@ test "fork hydration retains independent base and head fetch authorities" {
         io,
         checkout,
         &.{ "git", "cat-file", "-e", generation.base_oid },
+    ));
+}
+
+fn initializeRevisionTestRepo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    message: []const u8,
+) !void {
+    allocator.free(try runTestGit(allocator, io, root, &.{ "git", "init", "-q" }));
+    try configureRevisionTestIdentity(allocator, io, root);
+    try commitRevisionTestRepo(allocator, io, root, message);
+}
+
+fn configureRevisionTestIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, root, argv));
+}
+
+fn commitRevisionTestRepo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    message: []const u8,
+) !void {
+    allocator.free(try runTestGit(allocator, io, root, &.{ "git", "add", "." }));
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "commit", "-qm", message },
     ));
 }
 

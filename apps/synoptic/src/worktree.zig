@@ -2807,8 +2807,7 @@ test "worktree integrity submodule environment preserves user credential policy"
     try std.testing.expect(effective.get("GIT_CONFIG_KEY_0") == null);
 }
 
-test "worktree integrity selected submodule source is Git-relative and argv-confined" {
-    const allocator = std.testing.allocator;
+fn expectRelativeSubmoduleSources(allocator: std.mem.Allocator) !void {
     for ([_]struct {
         parent: []const u8,
         selected: []const u8,
@@ -2848,6 +2847,11 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         defer allocator.free(resolved);
         try std.testing.expectEqualStrings(fixture.expected, resolved);
     }
+}
+
+test "worktree integrity selected submodule source is Git-relative and argv-confined" {
+    const allocator = std.testing.allocator;
+    try expectRelativeSubmoduleSources(allocator);
     var base = std.process.Environ.Map.init(allocator);
     defer base.deinit();
     const credential_url = "https://token:secret@git.example/owner/lib.git";
