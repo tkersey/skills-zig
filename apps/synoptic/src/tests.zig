@@ -1029,6 +1029,20 @@ test "transparent review root requires confirmed head binding" {
             "HEAD_1",
         ),
     );
+    const mismatched = graphql.validateTransparentAtHead(
+        document,
+        "Review",
+        "{\"input\":{\"pullRequestId\":\"PR_1\",\"commitOID\":\"OTHER\"}}",
+        "PR_1",
+        "HEAD_1",
+    );
+    switch (http.classifyActionValidation(mismatched)) {
+        .definitive_invalid => |err| try std.testing.expectEqual(
+            error.GraphqlExpectedHeadMismatch,
+            err,
+        ),
+        else => return error.ExpectedDefinitiveActionInvalidation,
+    }
 }
 
 test "exclusions config rejects catch-all additional glob before classification" {

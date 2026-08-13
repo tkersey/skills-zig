@@ -357,11 +357,13 @@ test "connection isolation never reclassifies an internal runtime failure" {
     try std.testing.expect(!clientConnectionError(error.MissingOriginSession));
 }
 
-test "transient action validation preserves a pending card" {
-    try std.testing.expect(!definitiveActionValidationFailure(error.GitHubTransportAmbiguous));
-    try std.testing.expect(!definitiveActionValidationFailure(error.InvalidGraphqlResponse));
-    try std.testing.expect(definitiveActionValidationFailure(error.PullRequestChanged));
-    try std.testing.expect(definitiveActionValidationFailure(error.GitHubActionTargetChanged));
+test "action validation has a total terminal disposition" {
+    try expectValidationDisposition(.valid, {});
+    try expectValidationDisposition(.retryable_uncertain, error.GitHubTransportAmbiguous);
+    try expectValidationDisposition(.retryable_uncertain, error.InvalidGraphqlResponse);
+    try expectValidationDisposition(.definitive_invalid, error.PullRequestChanged);
+    try expectValidationDisposition(.definitive_invalid, error.GitHubActionTargetChanged);
+    try expectValidationDisposition(.definitive_invalid, error.GraphqlExpectedHeadMismatch);
 }
 
 test "generation-changing actions close both stale command surfaces" {
@@ -1249,25 +1251,29 @@ pub const Server = struct {
         const card_id = payloadString(payload, "cardId") orelse return error.InvalidUiCommand;
         const card = (try runtime.app.action_store.pendingById(card_id)).*;
         try requireReviewWorktree(runtime);
-        runtime.broker.validateAction(
+        const validation = classifyActionValidation(runtime.broker.validateAction(
             runtime.owner,
             runtime.name,
             runtime.number,
             runtime.pull_request_id,
             card,
-        ) catch |err| {
-            if (!definitiveActionValidationFailure(err)) return err;
-            if (actionValidationQuarantines(err)) invalidateActionGeneration(runtime);
-            try runtime.app.invalidateAction(card_id);
-            const format = "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}";
-            const status = try std.fmt.allocPrint(
-                self.allocator,
-                format,
-                .{ std.json.fmt(card_id, .{}), std.json.fmt(@errorName(err), .{}) },
-            );
-            defer self.allocator.free(status);
-            return runtime.app.nextEnvelope("action.status", status);
-        };
+        ));
+        switch (validation) {
+            .valid => {},
+            .retryable_uncertain => |err| return err,
+            .definitive_invalid => |err| {
+                if (actionValidationQuarantines(err)) invalidateActionGeneration(runtime);
+                try runtime.app.invalidateAction(card_id);
+                const format = "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}";
+                const status = try std.fmt.allocPrint(
+                    self.allocator,
+                    format,
+                    .{ std.json.fmt(card_id, .{}), std.json.fmt(@errorName(err), .{}) },
+                );
+                defer self.allocator.free(status);
+                return runtime.app.nextEnvelope("action.status", status);
+            },
+        }
         if (card.kind == .add_inline_comment) {
             if (!try self.commentAnchorValid(runtime, card)) {
                 try runtime.app.invalidateAction(card_id);
@@ -1694,8 +1700,14 @@ pub const Server = struct {
     }
 };
 
-fn definitiveActionValidationFailure(err: anyerror) bool {
-    return switch (err) {
+pub const ActionValidationDisposition = union(enum) {
+    valid,
+    definitive_invalid: anyerror,
+    retryable_uncertain: anyerror,
+};
+
+pub fn classifyActionValidation(result: anyerror!void) ActionValidationDisposition {
+    result catch |err| return switch (err) {
         error.ActionTargetMismatch,
         error.PullRequestChanged,
         error.CommentPathNotCurrent,
@@ -1703,9 +1715,28 @@ fn definitiveActionValidationFailure(err: anyerror) bool {
         error.GitHubActionNotAuthorized,
         error.GitHubActionTargetChanged,
         error.ActionCommentSnapshotMissing,
-        => true,
-        else => false,
+        error.GraphqlActionTooLarge,
+        error.GraphqlAliasForbidden,
+        error.GraphqlExpectedHeadMismatch,
+        error.GraphqlExpectedHeadMissing,
+        error.GraphqlPullRequestTargetMismatch,
+        error.GraphqlPullRequestTargetMissing,
+        error.GraphqlRootCountInvalid,
+        error.GraphqlSyntaxForbidden,
+        error.InvalidGraphqlDocument,
+        error.InvalidGraphqlOperationName,
+        error.InvalidGraphqlVariables,
+        => .{ .definitive_invalid = err },
+        else => .{ .retryable_uncertain = err },
     };
+    return .valid;
+}
+
+fn expectValidationDisposition(
+    expected: std.meta.Tag(ActionValidationDisposition),
+    result: anyerror!void,
+) !void {
+    try std.testing.expectEqual(expected, classifyActionValidation(result));
 }
 
 fn waitClientReadable(stream: *std.Io.net.Stream, timeout_ms: u32) !void {
