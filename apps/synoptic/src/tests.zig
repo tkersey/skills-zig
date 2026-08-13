@@ -678,7 +678,7 @@ test "unresolved thread search pages comments under a fixed byte budget" {
         false,
         0,
         0,
-        700,
+        1100,
     );
     defer std.testing.allocator.free(first);
     try std.testing.expect(std.mem.indexOf(u8, first, "C1") != null);
@@ -696,11 +696,24 @@ test "unresolved thread search pages comments under a fixed byte budget" {
         false,
         0,
         1,
-        700,
+        1100,
     );
     defer std.testing.allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, second, "C2") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"next\":null") != null);
+    try std.testing.expectError(
+        error.UnresolvedThreadPageItemTooLarge,
+        generation.unresolvedThreadsPageJsonAlloc(
+            std.testing.allocator,
+            "a.zig",
+            null,
+            &.{},
+            false,
+            0,
+            0,
+            700,
+        ),
+    );
 }
 
 test "falsifier initial review cannot prepare action" {

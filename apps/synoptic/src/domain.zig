@@ -558,7 +558,10 @@ pub const PrGeneration = struct {
             const suffix_reserve: usize = 128;
             const projected = out.written().len + separator_bytes +
                 encoded.written().len + suffix_reserve;
-            if (!first and projected > max_bytes) break;
+            if (projected > max_bytes) {
+                if (first) return error.UnresolvedThreadPageItemTooLarge;
+                break;
+            }
             if (!first) try out.writer.writeByte(',');
             first = false;
             try out.writer.writeAll(encoded.written());
