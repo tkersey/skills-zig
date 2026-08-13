@@ -794,6 +794,7 @@ test "falsifier initial review cannot prepare action" {
 
 test "human authority is correlated with turn admission" {
     const source = @embedFile("sessions.zig");
+    const actor_source = @embedFile("../../../libs/cas_runtime/src/client.zig");
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
@@ -808,6 +809,21 @@ test "human authority is correlated with turn admission" {
         u8,
         source,
         "session.human_authority_admission == .admitted",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "request.causal_sequence",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        actor_source,
+        "work.causal_sequence = actorNextCausalSequenceLocked(state)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        actor_source,
+        "pending.causal_sequence = actorNextCausalSequenceLocked(state)",
     ) != null);
 }
 

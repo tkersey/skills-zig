@@ -29,6 +29,7 @@ pub const ServerRequest = struct {
     id: RequestId,
     method: []const u8,
     raw_json: []const u8,
+    causal_sequence: u64 = 0,
     deadline_ms: i64 = std.math.maxInt(i64),
 };
 
@@ -63,6 +64,7 @@ test "protocol carriers preserve correlation and raw envelopes" {
         .id = .{ .string = "approval-1" },
         .method = "item/commandExecution/requestApproval",
         .raw_json = "{}",
+        .causal_sequence = 7,
     };
 
     try std.testing.expectEqual(@as(i64, 42), handle.id);
@@ -71,5 +73,6 @@ test "protocol carriers preserve correlation and raw envelopes" {
         "item/commandExecution/requestApproval",
         request.method,
     );
+    try std.testing.expectEqual(@as(u64, 7), request.causal_sequence);
     try std.testing.expectEqual(TerminalState.running, .running);
 }

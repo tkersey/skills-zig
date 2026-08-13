@@ -366,7 +366,6 @@ pub const Registry = struct {
     max_sessions: usize = config.max_open_sessions,
     io: ?std.Io = null,
     authoritative_tool_handler: ?AuthoritativeToolHandler = null,
-    authoritative_request_sequence: u64 = 0,
     authoritative_reservations: usize = 0,
     authoritative_reserved_bytes: usize = 0,
     visible_event_bytes: usize = 0,
@@ -828,8 +827,7 @@ pub const Registry = struct {
                 return error.HumanAuthorityAdmissionActive;
             }
             session.human_authority = classifyHumanInstruction(text);
-            session.human_authority_after_request_sequence =
-                self.authoritative_request_sequence;
+            session.human_authority_after_request_sequence = 0;
             session.human_authority_admission = if (session.human_authority == null)
                 .absent
             else
@@ -838,13 +836,23 @@ pub const Registry = struct {
         };
         return error.UnknownSession;
     }
-    fn resolveHumanInstruction(self: *Registry, session_id: []const u8, admitted: bool) void {
+    fn resolveHumanInstruction(
+        self: *Registry,
+        session_id: []const u8,
+        admitted: bool,
+        causal_sequence: u64,
+    ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |*session| if (std.mem.eql(u8, session.id, session_id)) {
             if (session.human_authority_admission != .pending) return;
-            session.human_authority_admission = if (admitted) .admitted else .rejected;
-            if (!admitted) session.human_authority = null;
+            if (admitted and causal_sequence != 0) {
+                session.human_authority_after_request_sequence = causal_sequence;
+                session.human_authority_admission = .admitted;
+            } else {
+                session.human_authority = null;
+                session.human_authority_admission = .rejected;
+            }
             return;
         };
     }
@@ -1423,27 +1431,27 @@ pub const Registry = struct {
             );
         defer self.allocator.free(params);
         try self.beginHumanInstruction(session_id, text);
-        errdefer self.resolveHumanInstruction(session_id, false);
-        const response = actor.requestJson(method, params, null) catch |err| {
+        errdefer self.resolveHumanInstruction(session_id, false, 0);
+        const response = actor.requestJsonWithCausality(method, params, null) catch |err| {
             if (target.active and !first_turn and err == error.RequestFailed and
                 self.waitForTurnCompletion(target.turn_id, 250))
             {
                 try self.reserveTurnStart(session_id);
                 target.start_reserved = true;
-                try self.retryCompletedSteer(
+                const causal_sequence = try self.retryCompletedSteer(
                     actor,
                     session_id,
                     target.thread_id,
                     combined,
                 );
-                self.resolveHumanInstruction(session_id, true);
+                self.resolveHumanInstruction(session_id, true, causal_sequence);
                 return;
             }
             return err;
         };
-        defer self.allocator.free(response);
-        if (!target.active or first_turn) try self.recordStartedTurn(session_id, response);
-        self.resolveHumanInstruction(session_id, true);
+        defer self.allocator.free(response.json);
+        if (!target.active or first_turn) try self.recordStartedTurn(session_id, response.json);
+        self.resolveHumanInstruction(session_id, true, response.causal_sequence);
     }
 
     fn waitForTurnCompletion(self: *Registry, turn_id: []const u8, timeout_ms: u32) bool {
@@ -1466,16 +1474,17 @@ pub const Registry = struct {
         session_id: []const u8,
         thread_id: []const u8,
         text: []const u8,
-    ) !void {
+    ) !u64 {
         const params = try std.fmt.allocPrint(
             self.allocator,
             "{{\"threadId\":{f},\"input\":[{{\"type\":\"text\",\"text\":{f}}}]}}",
             .{ std.json.fmt(thread_id, .{}), std.json.fmt(text, .{}) },
         );
         defer self.allocator.free(params);
-        const response = try actor.requestJson("turn/start", params, null);
-        defer self.allocator.free(response);
-        try self.recordStartedTurn(session_id, response);
+        const response = try actor.requestJsonWithCausality("turn/start", params, null);
+        defer self.allocator.free(response.json);
+        try self.recordStartedTurn(session_id, response.json);
+        return response.causal_sequence;
     }
 
     fn recordStartedTurn(
@@ -2069,7 +2078,11 @@ pub const Registry = struct {
             "ver authorizes direct file changes or deprecated appro" ++
             "val requests\"}}}");
         if (std.mem.eql(u8, request.method, "item/tool/call")) {
-            return self.handleToolCall(request.raw_json, allocator);
+            return self.handleToolCall(
+                request.raw_json,
+                request.causal_sequence,
+                allocator,
+            );
         }
         if (std.mem.eql(u8, request.method, "item/tool/requestUserInput")) {
             return allocator.dupe(u8, "{\"answers\":{}}");
@@ -2112,6 +2125,7 @@ pub const Registry = struct {
     fn handleToolCall(
         self: *Registry,
         raw_json: []const u8,
+        causal_sequence: u64,
         allocator: std.mem.Allocator,
     ) ![]u8 {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch
@@ -2128,17 +2142,21 @@ pub const Registry = struct {
             return self.searchThreads(raw_json, allocator);
         const event_kind = authoritativeToolEventKind(tool.string) orelse
             return allocator.dupe(u8, "{\"decision\":\"decline\"}");
-        return self.handleAuthoritativeTool(raw_json, event_kind, allocator);
+        return self.handleAuthoritativeTool(
+            raw_json,
+            causal_sequence,
+            event_kind,
+            allocator,
+        );
     }
 
     fn handleAuthoritativeTool(
         self: *Registry,
         raw_json: []const u8,
+        causal_sequence: u64,
         event_kind: []const u8,
         allocator: std.mem.Allocator,
     ) ![]u8 {
-        const request_sequence = self.nextAuthoritativeRequestSequence() catch
-            return allocator.dupe(u8, missing_authority_response);
         const origin_thread = extractString(
             self.allocator,
             raw_json,
@@ -2153,7 +2171,7 @@ pub const Registry = struct {
         self.mutex.lock();
         const reserved = self.reserveAuthoritativeLocked(
             origin_thread,
-            request_sequence,
+            causal_sequence,
             requested,
             event_kind,
             raw_json,
@@ -2236,16 +2254,6 @@ pub const Registry = struct {
             };
         }
         return null;
-    }
-
-    fn nextAuthoritativeRequestSequence(self: *Registry) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.authoritative_request_sequence == std.math.maxInt(u64)) {
-            return error.AuthoritativeRequestSequenceExhausted;
-        }
-        self.authoritative_request_sequence += 1;
-        return self.authoritative_request_sequence;
     }
 
     fn awaitAuthorityAdmissionLocked(self: *Registry, origin_thread: []const u8) void {
@@ -3689,7 +3697,7 @@ test "session authority becomes governing only after admission" {
         HumanAuthorityAdmission.pending,
         registry.sessions.items[0].human_authority_admission,
     );
-    registry.resolveHumanInstruction("s", true);
+    registry.resolveHumanInstruction("s", true, 1);
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         registry.sessions.items[0].human_authority.?,
@@ -4254,7 +4262,11 @@ test "dynamic tool dispatch binds the exact parsed tool name" {
         .context = &calls,
         .handle = acceptTestAuthoritativeTool,
     });
-    const response = try registry.handleToolCall(exact_tool_test_request, std.testing.allocator);
+    const response = try registry.handleToolCall(
+        exact_tool_test_request,
+        1,
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings(accepted_domain_response, response);
     try std.testing.expectEqual(@as(usize, 1), calls);
@@ -4324,9 +4336,8 @@ test "tool request must be admitted after its governing human instruction" {
     var registry = Registry{ .allocator = std.testing.allocator };
     defer registry.deinit();
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
-    registry.authoritative_request_sequence = 1;
     try registry.beginHumanInstruction("ses-1", "please prepare the comment");
-    registry.resolveHumanInstruction("ses-1", true);
+    registry.resolveHumanInstruction("ses-1", true, 1);
     var calls: usize = 0;
     try registry.setAuthoritativeToolHandler(.{
         .context = &calls,
@@ -4374,7 +4385,7 @@ test "action broker rejects authority from a failed turn admission" {
     defer registry.deinit();
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
     try registry.beginHumanInstruction("ses-1", "please prepare the comment");
-    registry.resolveHumanInstruction("ses-1", false);
+    registry.resolveHumanInstruction("ses-1", false, 0);
     var calls: usize = 0;
     try registry.setAuthoritativeToolHandler(.{
         .context = &calls,
@@ -4382,6 +4393,7 @@ test "action broker rejects authority from a failed turn admission" {
     });
     const response = try registry.handleToolCall(
         exact_tool_test_request,
+        1,
         std.testing.allocator,
     );
     defer std.testing.allocator.free(response);
@@ -4404,6 +4416,7 @@ test "action broker rejects a tool request without a governing instruction" {
     });
     const response = try registry.handleToolCall(
         exact_tool_test_request,
+        1,
         std.testing.allocator,
     );
     defer std.testing.allocator.free(response);
@@ -4427,6 +4440,7 @@ test "failed authoritative handler restores its claimed human grant" {
     });
     const response = try registry.handleToolCall(
         exact_tool_test_request,
+        1,
         std.testing.allocator,
     );
     defer std.testing.allocator.free(response);
@@ -4451,7 +4465,7 @@ test "model-requested close acknowledges successful session removal" {
     const request =
         "{\"params\":{\"threadId\":\"file-1\",\"tool\":" ++
         "\"synoptic.close_session\",\"arguments\":{}}}";
-    const response = try registry.handleToolCall(request, std.testing.allocator);
+    const response = try registry.handleToolCall(request, 1, std.testing.allocator);
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings(accepted_domain_response, response);
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.items.len);
@@ -4481,7 +4495,11 @@ test "authoritative tools fail closed without a domain handler" {
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
     registry.sessions.items[0].human_authority = .github_any;
     registry.sessions.items[0].human_authority_admission = .admitted;
-    const response = try registry.handleToolCall(exact_tool_test_request, std.testing.allocator);
+    const response = try registry.handleToolCall(
+        exact_tool_test_request,
+        1,
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings(evidence_unavailable_response, response);
     try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
@@ -4498,7 +4516,11 @@ test "authoritative tool backpressure preserves human authority" {
     registry.sessions.items[0].human_authority = .github_any;
     registry.sessions.items[0].human_authority_admission = .admitted;
     for (0..max_visible_events) |_| try registry.queueSystemEvent("status", "{}");
-    const response = try registry.handleToolCall(exact_tool_test_request, std.testing.allocator);
+    const response = try registry.handleToolCall(
+        exact_tool_test_request,
+        1,
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(response);
     try std.testing.expectEqualStrings(evidence_unavailable_response, response);
     try std.testing.expectEqual(
