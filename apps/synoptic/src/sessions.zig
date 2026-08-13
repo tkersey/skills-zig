@@ -1468,7 +1468,9 @@ pub const Registry = struct {
             if (!std.mem.eql(u8, session.id, session_id)) continue;
             self.allocator.free(session.turn_id);
             session.turn_id = next_turn;
-            session.turn_active = !self.turnCompletedLocked(next_turn);
+            const completed = self.turnCompletedLocked(next_turn);
+            session.turn_active = !completed;
+            if (completed) session.initial_turn_active = false;
             session.turn_starting = false;
             if (session.pending_initial_prompt) |value| self.allocator.free(value);
             if (session.pending_skill_path) |value| self.allocator.free(value);
@@ -3391,6 +3393,22 @@ test "completed turn identity cache rolls after its bounded capacity" {
     try std.testing.expectEqual(@as(usize, 512), registry.completed_turn_ids.items.len);
     try std.testing.expect(!registry.turnCompletedLocked("turn-0"));
     try std.testing.expect(registry.turnCompletedLocked("turn-512"));
+}
+
+test "cached initial completion clears the initial review gate" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "session", "thread");
+    registry.sessions.items[0].initial_turn_active = true;
+    registry.recordCompletedTurnLocked(
+        "{\"params\":{\"threadId\":\"thread\",\"turn\":{\"id\":\"completed\"}}}",
+    );
+    try registry.recordStartedTurn(
+        "session",
+        "{\"turn\":{\"id\":\"completed\"}}",
+    );
+    try std.testing.expect(!registry.sessions.items[0].turn_active);
+    try std.testing.expect(!registry.sessions.items[0].initial_turn_active);
 }
 
 test "session context dynamic tool namespace exposes the exact authoritative surface" {
