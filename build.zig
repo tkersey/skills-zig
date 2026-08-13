@@ -242,6 +242,28 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cas_hook_policy", .module = cas_hook_policy_root },
         },
     });
+    const core_json_release_safe = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/json_helpers.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const cas_hook_policy_release_safe = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json_release_safe },
+        },
+    });
+    const cas_runtime_release_safe = b.createModule(.{
+        .root_source_file = b.path("libs/cas_runtime/src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json_release_safe },
+            .{ .name = "cas_hook_policy", .module = cas_hook_policy_release_safe },
+        },
+    });
     const synoptic_version = std.mem.trim(
         u8,
         @embedFile("apps/synoptic/VERSION"),
@@ -273,7 +295,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .imports = &.{
             .{ .name = "app_meta", .module = synoptic_meta },
-            .{ .name = "cas_runtime", .module = cas_runtime_root },
+            .{ .name = "cas_runtime", .module = cas_runtime_release_safe },
         },
     });
     const cas_proxy_client_root = b.createModule(.{

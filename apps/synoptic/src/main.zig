@@ -637,6 +637,7 @@ fn serveValidatedReview(
     const selector_url = try resolveSelectorUrl(
         allocator,
         io,
+        environment,
         gh_resolved,
         options.cwd,
         options.pr,
@@ -1127,6 +1128,17 @@ fn runPublishedHttpRuntime(
     options: config.LaunchOptions,
     custody_retirement: *CustodyRetirement,
 ) !void {
+    const tool_domain = runtime.tool_domain orelse return error.MissingToolDomain;
+    var stop_monitor = StopRequestMonitor{
+        .stop_request_path = stop_request_path,
+        .cancelled = tool_domain.combinedCancellationFlag(),
+        .stop_cancelled = tool_domain.stopCancellationFlag(),
+    };
+    const stop_thread = try std.Thread.spawn(.{}, StopRequestMonitor.run, .{&stop_monitor});
+    defer {
+        stop_monitor.finished.store(true, .release);
+        stop_thread.join();
+    }
     try publishRuntimeReady(
         allocator,
         io,
@@ -1135,16 +1147,6 @@ fn runPublishedHttpRuntime(
         runtime_root,
         repository_identity,
     );
-    const tool_domain = runtime.tool_domain orelse return error.MissingToolDomain;
-    var stop_monitor = StopRequestMonitor{
-        .stop_request_path = stop_request_path,
-        .cancelled = &tool_domain.cancelled,
-    };
-    const stop_thread = try std.Thread.spawn(.{}, StopRequestMonitor.run, .{&stop_monitor});
-    defer {
-        stop_monitor.finished.store(true, .release);
-        stop_thread.join();
-    }
     exclusion_work.started.store(true, .release);
     const terminal_error = runHttpLoop(io, server, runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
@@ -1503,6 +1505,7 @@ fn publishReadyReceipt(
 pub const StopRequestMonitor = struct {
     stop_request_path: []const u8,
     cancelled: *std.atomic.Value(bool),
+    stop_cancelled: *std.atomic.Value(bool),
     finished: std.atomic.Value(bool) = .init(false),
 
     pub fn run(self: *StopRequestMonitor) void {
@@ -1510,6 +1513,7 @@ pub const StopRequestMonitor = struct {
         const tick = std.Io.Duration.fromMilliseconds(5);
         while (!self.finished.load(.acquire)) {
             if (std.Io.Dir.cwd().access(io, self.stop_request_path, .{})) |_| {
+                self.stop_cancelled.store(true, .release);
                 self.cancelled.store(true, .release);
                 return;
             } else |_| {}
@@ -2328,6 +2332,7 @@ fn parseLaunch(args: []const []const u8) !config.LaunchOptions {
 fn resolveSelectorUrl(
     allocator: std.mem.Allocator,
     io: std.Io,
+    inherited_environment: *const std.process.Environ.Map,
     gh_path: []const u8,
     cwd: []const u8,
     selector: ?[]const u8,
@@ -2345,7 +2350,22 @@ fn resolveSelectorUrl(
         "--jq",
         ".url",
     } else &.{ gh_path, "pr", "view", "--json", "url", "--jq", ".url" };
-    const result = try std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
+    var environment = try inherited_environment.clone(allocator);
+    defer environment.deinit();
+    inline for (.{
+        "GH_REPO",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }) |key| _ = environment.swapRemove(key);
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = &environment,
+    });
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0) return error.PullRequestResolutionFailed;
@@ -2581,15 +2601,60 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
     )).?;
     defer allocator.free(ssh_default);
     try std.testing.expectEqualStrings("github.example.test", ssh_default);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
     const direct = try resolveSelectorUrl(
         allocator,
         io,
+        &environment,
         "/not-executed",
         ".",
         "https://github.example.test/o/r/pull/9",
     );
     defer allocator.free(direct);
     try std.testing.expectEqualStrings("https://github.example.test/o/r/pull/9", direct);
+}
+
+test "PR resolution ignores inherited repository selector environment" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "gh" });
+    defer allocator.free(gh_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = gh_path,
+        .data = "#!/bin/sh\n" ++
+            "test -z \"${GH_REPO-}\"\n" ++
+            "test -z \"${GIT_DIR-}\"\n" ++
+            "printf '%s\\n' 'https://github.example.test/o/r/pull/9'\n",
+    });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GH_REPO", "wrong/repository");
+    try environment.put("GIT_DIR", "/wrong/worktree/.git");
+    const resolved = try resolveSelectorUrl(
+        allocator,
+        io,
+        &environment,
+        gh_path,
+        root,
+        null,
+    );
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(
+        "https://github.example.test/o/r/pull/9",
+        resolved,
+    );
 }
 test "stop cannot report success after a terminal cleanup error" {
     const io = std.testing.io;

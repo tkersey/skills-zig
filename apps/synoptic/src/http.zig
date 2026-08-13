@@ -32,6 +32,7 @@ pub const ToolDomainContext = struct {
     pull_request_id: []const u8,
     mutex: DomainMutex,
     cancelled: std.atomic.Value(bool) = .init(false),
+    stop_cancelled: std.atomic.Value(bool) = .init(false),
     runtime: ?*Runtime,
 
     pub fn create(
@@ -101,6 +102,14 @@ pub const ToolDomainContext = struct {
         self.cancelled.store(true, .release);
     }
 
+    pub fn stopCancellationFlag(self: *ToolDomainContext) *std.atomic.Value(bool) {
+        return &self.stop_cancelled;
+    }
+
+    pub fn combinedCancellationFlag(self: *ToolDomainContext) *std.atomic.Value(bool) {
+        return &self.cancelled;
+    }
+
     fn handleOpaque(
         raw: *anyopaque,
         event_kind: []const u8,
@@ -109,6 +118,9 @@ pub const ToolDomainContext = struct {
         result_allocator: std.mem.Allocator,
     ) ![]u8 {
         const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
+        defer if (!self.stop_cancelled.load(.acquire)) {
+            self.cancelled.store(false, .release);
+        };
         self.mutex.lock();
         defer self.mutex.unlock();
         if (std.mem.eql(u8, event_kind, "action.prepared")) {
@@ -249,6 +261,17 @@ fn commandAdmitted(
         return true;
     }
     return worktree_generation_valid and refresh_epoch == .current;
+}
+
+fn requireCommandAdmitted(runtime: *Runtime, command: []const u8) !void {
+    const mutex = domainMutex(runtime);
+    mutex.lock();
+    defer mutex.unlock();
+    if (!commandAdmitted(
+        runtime.refresh_epoch,
+        runtime.worktree_generation_valid,
+        command,
+    )) return error.WorktreeGenerationMismatch;
 }
 
 test "degraded refresh admits recovery commands only" {
@@ -951,13 +974,7 @@ pub const Server = struct {
             .object => |o| o,
             else => return error.InvalidUiCommand,
         };
-        if (!commandAdmitted(
-            runtime.refresh_epoch,
-            runtime.worktree_generation_valid,
-            command,
-        )) {
-            return error.WorktreeGenerationMismatch;
-        }
+        try requireCommandAdmitted(runtime, command);
         if (std.mem.eql(u8, command, "file.open")) return self.openFile(runtime, payload);
         if (std.mem.eql(u8, command, "session.close")) {
             return self.closeSession(runtime, payload);
@@ -1171,7 +1188,12 @@ pub const Server = struct {
         const choice_json = try stringifyValueAlloc(self.allocator, decision);
         defer self.allocator.free(choice_json);
         if (!approvalDecisionFailsClosed(decision)) {
-            if (!runtime.worktree_generation_valid) return error.WorktreeGenerationMismatch;
+            const mutex = domainMutex(runtime);
+            mutex.lock();
+            defer mutex.unlock();
+            if (!runtime.worktree_generation_valid) {
+                return error.WorktreeGenerationMismatch;
+            }
             try requireReviewWorktree(runtime);
         }
         try runtime.registry.resolveApproval(session_id, approval_id, choice_json);
@@ -2201,6 +2223,30 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
     handler.cancel.?(handler.context);
     try std.testing.expect(context.cancelled.load(.acquire));
     try std.testing.expect(context.broker.cancelled.?.load(.acquire));
+    try std.testing.expectError(
+        error.UnsupportedAuthoritativeTool,
+        handler.handle(
+            handler.context,
+            "unsupported",
+            "{}",
+            "ses-1",
+            std.testing.allocator,
+        ),
+    );
+    try std.testing.expect(!context.cancelled.load(.acquire));
+    context.stop_cancelled.store(true, .release);
+    handler.cancel.?(handler.context);
+    try std.testing.expectError(
+        error.UnsupportedAuthoritativeTool,
+        handler.handle(
+            handler.context,
+            "unsupported",
+            "{}",
+            "ses-1",
+            std.testing.allocator,
+        ),
+    );
+    try std.testing.expect(context.cancelled.load(.acquire));
 }
 
 test "action refresh preserves local exclusion synchronization evidence" {

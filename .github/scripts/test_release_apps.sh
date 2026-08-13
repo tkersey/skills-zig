@@ -171,6 +171,10 @@ write_cas_hook_policy_only_build() {
   printf 'const img_meta = "apps/img/VERSION";\nconst cas_hook_policy_root = b.createModule(.{});\npub fn build() void {}\n' >build.zig
 }
 
+write_unknown_bare_identifier_build() {
+  printf 'const img_meta = "apps/img/VERSION";\nshared_dep,\npub fn build() void {}\n' >build.zig
+}
+
 write_synoptic_cas_runtime_build() {
   cat >build.zig <<'EOF'
 const img_meta = "apps/img/VERSION";
@@ -356,6 +360,7 @@ assert_affected seq write_seq_build
 assert_affected cas write_cas_control_plane_build
 assert_affected cas,synoptic write_cas_runtime_only_build
 assert_affected cas,synoptic write_cas_hook_policy_only_build
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_unknown_bare_identifier_build
 assert_affected cas,synoptic write_synoptic_cas_runtime_build
 assert_affected synoptic write_synoptic_formatted_build
 assert_affected synoptic write_synoptic_install_guard_build

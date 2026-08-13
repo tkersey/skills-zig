@@ -2071,18 +2071,7 @@ fn actorHandlerMain(state: *ActorState) void {
         state.mutex.unlock();
 
         if (maybe_work) |work| {
-            const thread = std.Thread.spawn(
-                .{},
-                actorServerRequestWorker,
-                .{ state, work },
-            ) catch {
-                work.deinit(state.allocator);
-                actorFinishServerHandler(state);
-                actorSetTerminal(state, .poisoned);
-                actorCloseTransportOnce(state);
-                return;
-            };
-            thread.detach();
+            actorServerRequestWorker(state, work);
         } else {
             std.Io.sleep(state.client.io, .fromMilliseconds(2), .awake) catch {
                 actorSetTerminal(state, .poisoned);
@@ -4642,7 +4631,8 @@ const NestedServerRequestProbe = struct {
 
 const ConcurrentServerRequestProbe = struct {
     fast_completed: std.atomic.Value(bool) = .init(false),
-    block_timed_out: std.atomic.Value(bool) = .init(false),
+    active: std.atomic.Value(bool) = .init(false),
+    overlap_observed: std.atomic.Value(bool) = .init(false),
 
     fn handle(
         context: *anyopaque,
@@ -4650,18 +4640,16 @@ const ConcurrentServerRequestProbe = struct {
         allocator: std.mem.Allocator,
     ) anyerror![]u8 {
         const self: *ConcurrentServerRequestProbe = @ptrCast(@alignCast(context));
+        if (self.active.swap(true, .acq_rel)) {
+            self.overlap_observed.store(true, .release);
+        }
+        defer self.active.store(false, .release);
         if (std.mem.indexOf(u8, request.raw_json, "tool-fast") != null) {
             self.fast_completed.store(true, .release);
             return allocator.dupe(u8, "{\"handled\":\"fast\"}");
         }
-        for (0..200) |_| {
-            if (self.fast_completed.load(.acquire)) {
-                return allocator.dupe(u8, "{\"handled\":\"block\"}");
-            }
-            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-        }
-        self.block_timed_out.store(true, .release);
-        return allocator.dupe(u8, "{\"handled\":\"timeout\"}");
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+        return allocator.dupe(u8, "{\"handled\":\"block\"}");
     }
 };
 
@@ -4748,7 +4736,7 @@ test "actor contains malformed handler output to the originating server request"
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"code\":-32603") != null);
 }
 
-test "actor server requests make independent bounded progress" {
+test "actor serializes calls to one server request handler context" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "concurrent_server_requests");
@@ -4766,7 +4754,7 @@ test "actor server requests make independent bounded progress" {
     const result = try actor.requestJson("actor/server-request", "{}", 2_000);
     defer allocator.free(result);
     try std.testing.expect(probe.fast_completed.load(.acquire));
-    try std.testing.expect(!probe.block_timed_out.load(.acquire));
+    try std.testing.expect(!probe.overlap_observed.load(.acquire));
 }
 
 test "actor server request deadline cooperatively cancels handler and bounds shutdown" {

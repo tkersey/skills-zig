@@ -286,10 +286,7 @@ pub const Connection = struct {
             duration,
         );
         return self.readTextAllocUntil(deadline) catch |err| switch (err) {
-            error.Timeout => {
-                self.poison();
-                return error.Timeout;
-            },
+            error.WebSocketIdleTimeout => return error.Timeout,
             else => return err,
         };
     }
@@ -304,9 +301,12 @@ pub const Connection = struct {
         defer fragmented.deinit(self.allocator);
 
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
-            const frame = self.readFrameAlloc(deadline) catch |err| {
-                self.poison();
-                return err;
+            const frame = self.readFrameAlloc(deadline) catch |err| switch (err) {
+                error.WebSocketIdleTimeout => return err,
+                else => {
+                    self.poison();
+                    return err;
+                },
             };
             defer if (frame.payload) |owned| self.allocator.free(owned);
 
@@ -408,7 +408,10 @@ pub const Connection = struct {
         self: *Connection,
         deadline: ?std.Io.Clock.Timestamp,
     ) !Frame {
-        const first = try readByte(self, deadline);
+        const first = readByte(self, deadline) catch |err| switch (err) {
+            error.Timeout => return error.WebSocketIdleTimeout,
+            else => return err,
+        };
         const second = try readByte(self, deadline);
         if ((first & 0x70) != 0) return self.protocolFailure(error.WebSocketReservedBitsSet);
         const fin = (first & 0x80) != 0;
@@ -1908,6 +1911,34 @@ test "websocket read deadline bounds a stalled live socket" {
     try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "websocket idle read timeout preserves a reusable connection" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer {
+        connection.close();
+        connection.deinit();
+    }
+    try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(5));
+    var writer = server_stream.writer(io, &.{});
+    try writer.interface.writeAll(&.{ 0x81, 0x02, 'o', 'k' });
+    try writer.interface.flush();
+    const message = (try connection.readTextAllocTimeout(500)).?;
+    defer std.testing.allocator.free(message);
+    try std.testing.expectEqualStrings("ok", message);
 }
 
 test "websocket HTTP upgrade shares the finite connection deadline" {

@@ -24,6 +24,8 @@ pub const ActionStatus = enum {
 };
 pub const ToolPhase = enum { initial_review, conversation };
 pub const max_tool_payload_bytes: usize = 128 * 1024;
+pub const max_retained_action_cards: usize = 256;
+pub const max_retained_action_bytes: usize = 4 * 1024 * 1024;
 
 pub const ActionTarget = struct {
     repository: []const u8,
@@ -264,9 +266,63 @@ pub const ActionStore = struct {
         );
         errdefer self.freeCard(card);
         try self.cards.append(self.allocator, card);
-        self.next_id += 1;
         if (pending_slot.index) |index| self.cards.items[index].status = .superseded;
+        self.enforceRetentionBudget() catch |err| {
+            const added = self.cards.pop().?;
+            if (pending_slot.id) |prior_id| for (self.cards.items) |*prior| {
+                if (std.mem.eql(u8, prior.id, prior_id)) prior.status = .pending;
+            };
+            self.freeCard(added);
+            return err;
+        };
+        self.next_id += 1;
         return &self.cards.items[self.cards.items.len - 1];
+    }
+
+    fn enforceRetentionBudget(self: *ActionStore) !void {
+        while (self.cards.items.len > max_retained_action_cards or
+            self.retainedBytes() > max_retained_action_bytes)
+        {
+            var removable: ?usize = null;
+            for (self.cards.items, 0..) |card, index| {
+                if (index == self.cards.items.len - 1) continue;
+                if (card.status == .pending or card.status == .executing) continue;
+                removable = index;
+                break;
+            }
+            const index = removable orelse return error.ActionStoreCapacityExceeded;
+            const removed = self.cards.orderedRemove(index);
+            self.freeCard(removed);
+        }
+    }
+
+    pub fn retainedBytes(self: *const ActionStore) usize {
+        var total: usize = 0;
+        for (self.cards.items) |card| total += cardRetainedBytes(card);
+        return total;
+    }
+
+    fn cardRetainedBytes(card: ActionCard) usize {
+        var total = card.id.len + card.session_id.len + card.source_turn_id.len +
+            card.slot.len + card.effect_summary.len + card.payload_json.len +
+            card.target.repository.len + card.target.pull_request_id.len +
+            card.target.base_oid.len + card.target.head_oid.len +
+            card.target.session_path.len + card.target.current_path.len;
+        inline for (.{
+            card.body,
+            card.supersedes,
+            card.target.path,
+            card.target.side,
+            card.target.thread_id,
+            card.target.comment_id,
+            card.target.comment_body_snapshot,
+        }) |value| if (value) |bytes| {
+            total += bytes.len;
+        };
+        if (card.graphql) |action| {
+            total += action.operation_name.len + action.document.len + action.variables.len;
+        }
+        return total;
     }
 
     fn buildCard(
@@ -695,6 +751,35 @@ test "same session slot supersedes immutably and execution is once" {
     try std.testing.expectEqualStrings("act-1", store.cards.items[1].supersedes.?);
     _ = try store.beginExecute("act-2");
     try std.testing.expectError(error.ActionNotPending, store.beginExecute("act-2"));
+}
+
+test "action store evicts oldest terminal history within fixed budgets" {
+    var store = ActionStore{ .allocator = std.testing.allocator };
+    defer store.deinit();
+    const target = AuthoritativeTarget{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "a.zig",
+        .current_path = "a.zig",
+    };
+    for (0..max_retained_action_cards + 8) |index| {
+        var slot_buffer: [32]u8 = undefined;
+        const slot = try std.fmt.bufPrint(&slot_buffer, "finding-{d}", .{index});
+        const card = try store.prepare("s", "t", .{
+            .slot = @constCast(slot),
+            .kind = .mark_viewed,
+            .effect_summary = @constCast("mark viewed"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("a.zig"),
+        }, target);
+        try store.reject(card.id);
+    }
+    try std.testing.expect(store.cards.items.len <= max_retained_action_cards);
+    try std.testing.expect(store.retainedBytes() <= max_retained_action_bytes);
+    try std.testing.expectEqualStrings("act-9", store.cards.items[0].id);
 }
 test "inline comment card owns the default RIGHT side" {
     var store = ActionStore{ .allocator = std.testing.allocator };

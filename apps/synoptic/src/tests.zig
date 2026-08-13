@@ -731,9 +731,11 @@ test "e2e stop request reaches an active GitHub broker cancellation" {
         .{},
     );
     var cancelled = std.atomic.Value(bool).init(false);
+    var stop_cancelled = std.atomic.Value(bool).init(false);
     var monitor = main.StopRequestMonitor{
         .stop_request_path = stop_path,
         .cancelled = &cancelled,
+        .stop_cancelled = &stop_cancelled,
     };
     const monitor_thread = try std.Thread.spawn(.{}, main.StopRequestMonitor.run, .{&monitor});
     defer {
@@ -757,6 +759,7 @@ test "e2e stop request reaches an active GitHub broker cancellation" {
         broker.call("query SynopticStopCancellation { viewer { login } }", "{}"),
     );
     try std.testing.expect(cancelled.load(.acquire));
+    try std.testing.expect(stop_cancelled.load(.acquire));
 }
 
 fn writeStopAfterGitHubStarts(started_path: []const u8, stop_path: []const u8) void {
