@@ -59,6 +59,30 @@ test "authoritative tools require the instruction-owned capability" {
         "\"required\":[\"authorityToken\"]",
     ) != null);
 }
+
+test "dynamic tool namespace members use the canonical function discriminator" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        sessions.dynamic_tools_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const namespaces = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 1), namespaces.len);
+    try std.testing.expectEqualStrings(
+        "namespace",
+        namespaces[0].object.get("type").?.string,
+    );
+    const members = namespaces[0].object.get("tools").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), members.len);
+    for (members) |member| {
+        try std.testing.expectEqualStrings(
+            "function",
+            member.object.get("type").?.string,
+        );
+    }
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");

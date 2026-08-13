@@ -75,7 +75,7 @@ pub const dynamic_tools_json =
     "[{\"type\":\"namespace\",\"name\":\"synoptic\",\"descr" ++
     "iption\":\"Human-directed Synoptic review operations\"" ++
     ",\"tools\":[" ++
-    "{\"name\":\"search_unresolved_threads\",\"description" ++
+    "{\"type\":\"function\",\"name\":\"search_unresolved_threads\",\"description" ++
     "\":\"Search server-owned unresolved current-PR review " ++
     "evidence in bounded pages; follow the returned next offs" ++
     "ets until null; use whole-PR only for cross-file concerns" ++
@@ -86,7 +86,7 @@ pub const dynamic_tools_json =
     "ePullRequest\":{\"type\":\"boolean\"},\"threadOffs" ++
     "et\":{\"type\":\"integer\",\"minimum\":0},\"comment" ++
     "Offset\":{\"type\":\"integer\",\"minimum\":0}}}}," ++
-    "{\"name\":\"prepare_github_action\",\"description\":\"" ++
+    "{\"type\":\"function\",\"name\":\"prepare_github_action\",\"description\":\"" ++
     "Only after explicit human instruction, prepare an immu" ++
     "table confirmable GitHub action; forbidden during init" ++
     "ial review\",\"inputSchema\":{\"type\":\"object\",\"re" ++
@@ -99,12 +99,12 @@ pub const dynamic_tools_json =
     "ary\":{\"type\":\"string\"},\"payload\":{\"type\":\"ob" ++
     "ject\"},\"authorityToken\":{\"type\":\"string\",\"minLength\":32," ++
     "\"maxLength\":32}}}}," ++
-    "{\"name\":\"complete_file_review\",\"description\":\"C" ++
+    "{\"type\":\"function\",\"name\":\"complete_file_review\",\"description\":\"C" ++
     "omplete the official current file only after explicit " ++
     "human instruction\",\"inputSchema\":{\"type\":\"object\",\"required\":[" ++
     "\"authorityToken\"],\"properties\":{\"authorityToken\":{\"type\":\"string\"," ++
     "\"minLength\":32,\"maxLength\":32}}}}," ++
-    "{\"name\":\"close_session\",\"description\":\"Close th" ++
+    "{\"type\":\"function\",\"name\":\"close_session\",\"description\":\"Close th" ++
     "is local session only after explicit human instruction" ++
     "\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"authorityToken\"]," ++
     "\"properties\":{\"authorityToken\":{\"type\":\"string\",\"minLength\":32," ++
