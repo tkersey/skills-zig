@@ -138,29 +138,16 @@ pub const FetchSource = struct {
                 owner,
                 repository,
             )) continue;
-            const remote_name = try allocator.dupe(u8, remote);
-            errdefer allocator.free(remote_name);
-            const remote_url = try allocator.dupe(u8, url);
-            errdefer allocator.free(remote_url);
-            const repository_host = try allocator.dupe(u8, host);
-            errdefer allocator.free(repository_host);
-            const repository_owner = try allocator.dupe(u8, owner);
-            errdefer allocator.free(repository_owner);
-            const repository_name = try allocator.dupe(u8, repository);
-            errdefer allocator.free(repository_name);
-            const owned_credential = try allocator.dupe(u8, credential_executable);
-            errdefer allocator.free(owned_credential);
-            return .{
-                .allocator = allocator,
-                .environment = environment,
-                .remote_name = remote_name,
-                .remote_url = remote_url,
-                .repository_host = repository_host,
-                .repository_owner = repository_owner,
-                .repository_name = repository_name,
-                .credential_executable = owned_credential,
-                .owns_credential_executable = true,
-            };
+            return matchedFetchSource(
+                allocator,
+                environment,
+                remote,
+                url,
+                host,
+                owner,
+                repository,
+                credential_executable,
+            );
         }
         return error.GitFetchSourceUnavailable;
     }
@@ -179,6 +166,41 @@ pub const FetchSource = struct {
         self.* = undefined;
     }
 };
+
+fn matchedFetchSource(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    remote: []const u8,
+    url: []const u8,
+    host: []const u8,
+    owner: []const u8,
+    repository: []const u8,
+    credential_executable: []const u8,
+) !FetchSource {
+    const remote_name = try allocator.dupe(u8, remote);
+    errdefer allocator.free(remote_name);
+    const remote_url = try allocator.dupe(u8, url);
+    errdefer allocator.free(remote_url);
+    const repository_host = try allocator.dupe(u8, host);
+    errdefer allocator.free(repository_host);
+    const repository_owner = try allocator.dupe(u8, owner);
+    errdefer allocator.free(repository_owner);
+    const repository_name = try allocator.dupe(u8, repository);
+    errdefer allocator.free(repository_name);
+    const owned_credential = try allocator.dupe(u8, credential_executable);
+    errdefer allocator.free(owned_credential);
+    return .{
+        .allocator = allocator,
+        .environment = environment,
+        .remote_name = remote_name,
+        .remote_url = remote_url,
+        .repository_host = repository_host,
+        .repository_owner = repository_owner,
+        .repository_name = repository_name,
+        .credential_executable = owned_credential,
+        .owns_credential_executable = true,
+    };
+}
 
 pub fn resolvePrHeadSource(
     allocator: std.mem.Allocator,

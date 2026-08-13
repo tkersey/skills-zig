@@ -639,9 +639,9 @@ test "thread evidence is bounded while the generation serializes it" {
     defer parsed.deinit();
 }
 
-test "unresolved thread search pages comments under a fixed byte budget" {
+fn pagedThreadComments() [2]domain.ReviewComment {
     const long_body = "x" ** 512;
-    const comments = [_]domain.ReviewComment{
+    return .{
         .{
             .id = "C1",
             .body = long_body,
@@ -663,6 +663,10 @@ test "unresolved thread search pages comments under a fixed byte budget" {
             .review_state = "COMMENTED",
         },
     };
+}
+
+test "unresolved thread search pages comments under a fixed byte budget" {
+    const comments = pagedThreadComments();
     var generation = try domain.PrGeneration.initFull(std.testing.allocator, "b", "h");
     defer generation.deinit();
     try generation.addThread(.{
