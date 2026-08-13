@@ -704,6 +704,71 @@ test "browser protocol exposes action confirmation but not preparation or comple
     try std.testing.expect(!ui.commandAllowed("file.complete"));
     try std.testing.expect(ui.commandAllowed("app.stop"));
 }
+test "e2e stop request reaches an active GitHub broker cancellation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "gh" });
+    defer allocator.free(gh_path);
+    const stop_path = try std.fs.path.join(allocator, &.{ root, "stop.request" });
+    defer allocator.free(stop_path);
+    const started_path = try std.fs.path.join(allocator, &.{ root, "gh.started" });
+    defer allocator.free(started_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ncat >/dev/null\ntouch '{s}'\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+        .{started_path},
+    );
+    defer allocator.free(script);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gh_path, .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var cancelled = std.atomic.Value(bool).init(false);
+    var monitor = main.StopRequestMonitor{
+        .stop_request_path = stop_path,
+        .cancelled = &cancelled,
+    };
+    const monitor_thread = try std.Thread.spawn(.{}, main.StopRequestMonitor.run, .{&monitor});
+    defer {
+        monitor.finished.store(true, .release);
+        monitor_thread.join();
+    }
+    const writer_thread = try std.Thread.spawn(
+        .{},
+        writeStopAfterGitHubStarts,
+        .{ started_path, stop_path },
+    );
+    defer writer_thread.join();
+    const broker = github.Broker{
+        .allocator = allocator,
+        .io = io,
+        .gh_path = gh_path,
+        .cancelled = &cancelled,
+    };
+    try std.testing.expectError(
+        error.GitHubCallCancelled,
+        broker.call("query SynopticStopCancellation { viewer { login } }", "{}"),
+    );
+    try std.testing.expect(cancelled.load(.acquire));
+}
+
+fn writeStopAfterGitHubStarts(started_path: []const u8, stop_path: []const u8) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for (0..400) |_| {
+        if (std.Io.Dir.cwd().access(io, started_path, .{})) |_| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stop_path, .data = "{}\n" }) catch return;
+            return;
+        } else |_| {}
+        std.Io.sleep(io, .fromMilliseconds(5), .awake) catch return;
+    }
+}
 test "action cards serialize exact effect target payload and rejection terminality" {
     var store = tools.ActionStore{ .allocator = std.testing.allocator };
     defer store.deinit();

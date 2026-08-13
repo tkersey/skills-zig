@@ -1135,6 +1135,16 @@ fn runPublishedHttpRuntime(
         runtime_root,
         repository_identity,
     );
+    const tool_domain = runtime.tool_domain orelse return error.MissingToolDomain;
+    var stop_monitor = StopRequestMonitor{
+        .stop_request_path = stop_request_path,
+        .cancelled = &tool_domain.cancelled,
+    };
+    const stop_thread = try std.Thread.spawn(.{}, StopRequestMonitor.run, .{&stop_monitor});
+    defer {
+        stop_monitor.finished.store(true, .release);
+        stop_thread.join();
+    }
     exclusion_work.started.store(true, .release);
     const terminal_error = runHttpLoop(io, server, runtime, state, registry, stop_request_path);
     exclusion_work.cancelled.store(true, .release);
@@ -1221,6 +1231,7 @@ fn configureToolDomain(
         runtime.pull_request_id,
         runtime,
     );
+    runtime.broker.cancelled = &context.cancelled;
     runtime.registry.setAuthoritativeToolHandler(context.handler()) catch |err| {
         allocator.destroy(context);
         return err;
@@ -1488,6 +1499,24 @@ fn publishReadyReceipt(
     defer allocator.free(ready_path);
     try writeOperationalFile(allocator, io, ready_path, receipt);
 }
+
+pub const StopRequestMonitor = struct {
+    stop_request_path: []const u8,
+    cancelled: *std.atomic.Value(bool),
+    finished: std.atomic.Value(bool) = .init(false),
+
+    pub fn run(self: *StopRequestMonitor) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const tick = std.Io.Duration.fromMilliseconds(5);
+        while (!self.finished.load(.acquire)) {
+            if (std.Io.Dir.cwd().access(io, self.stop_request_path, .{})) |_| {
+                self.cancelled.store(true, .release);
+                return;
+            } else |_| {}
+            std.Io.sleep(io, tick, .awake) catch return;
+        }
+    }
+};
 
 fn runHttpLoop(
     io: std.Io,
