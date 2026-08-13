@@ -888,6 +888,37 @@ test "transparent review root requires confirmed head binding" {
     );
 }
 
+test "exclusions config rejects catch-all additional glob before classification" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill/assets");
+    try tmp.dir.createDirPath(io, "xdg/synoptic");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skill/assets/exclusions.json",
+        .data = "{\"schema\":\"synoptic-exclusions/v1\",\"rules\":[{" ++
+            "\"reason\":\"snapshot\",\"globs\":[\"**/*.snap\"]}]}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "xdg/synoptic/config.toml",
+        .data = "[exclusions]\nadditional_globs = ['**']\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const skill = try std.fs.path.join(allocator, &.{ root, "skill" });
+    defer allocator.free(skill);
+    const xdg = try std.fs.path.join(allocator, &.{ root, "xdg" });
+    defer allocator.free(xdg);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_CONFIG_HOME", xdg);
+    try std.testing.expectError(
+        error.InvalidSynopticConfig,
+        config.Settings.load(allocator, io, &environment, skill),
+    );
+}
+
 test "falsifier action tool is rejected during initial review" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();

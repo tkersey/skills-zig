@@ -181,7 +181,7 @@ pub const Settings = struct {
             var rule = ExclusionRule{ .reason = try self.allocator.dupe(u8, reason_value.string) };
             errdefer rule.deinit(self.allocator);
             for (globs_value.array.items) |glob_value| {
-                if (glob_value != .string or !validGlob(glob_value.string)) {
+                if (glob_value != .string or !validAutomaticExclusionGlob(glob_value.string)) {
                     return error.InvalidExclusionsManifest;
                 }
                 try rule.globs.append(
@@ -257,9 +257,9 @@ pub const Settings = struct {
             .exclusions => if (std.mem.eql(u8, key, "enabled")) {
                 self.exclusions_enabled = try tomlBool(value);
             } else if (std.mem.eql(u8, key, "additional_globs")) {
-                try replaceStringArray(self.allocator, &self.additional_globs, value);
+                try replaceStringArray(self.allocator, &self.additional_globs, value, true);
             } else if (std.mem.eql(u8, key, "removed_default_globs")) {
-                try replaceStringArray(self.allocator, &self.removed_default_globs, value);
+                try replaceStringArray(self.allocator, &self.removed_default_globs, value, false);
             } else return error.InvalidSynopticConfig,
             .none => return error.InvalidSynopticConfig,
         }
@@ -296,6 +296,12 @@ fn validExclusionReason(reason: []const u8) bool {
 fn validGlob(glob: []const u8) bool {
     return glob.len > 0 and glob.len <= 1024 and !std.fs.path.isAbsolute(glob) and
         std.mem.indexOf(u8, glob, "..") == null and std.mem.indexOfScalar(u8, glob, '\\') == null;
+}
+
+fn validAutomaticExclusionGlob(glob: []const u8) bool {
+    if (!validGlob(glob)) return false;
+    for (glob) |byte| if (byte != '*' and byte != '?' and byte != '/') return true;
+    return false;
 }
 fn containsExact(values: []const []u8, needle: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
@@ -350,6 +356,7 @@ fn replaceStringArray(
     allocator: std.mem.Allocator,
     target: *std.ArrayList([]u8),
     value: []const u8,
+    automatic_effect: bool,
 ) !void {
     const source = std.mem.trim(u8, value, " \t\r\n");
     if (source.len < 2 or source[0] != '[' or source[source.len - 1] != ']') {
@@ -378,7 +385,9 @@ fn replaceStringArray(
         }
         if (index >= source.len) return error.InvalidSynopticConfig;
         const entry = source[start..index];
-        if (!validGlob(entry)) return error.InvalidSynopticConfig;
+        if (automatic_effect) {
+            if (!validAutomaticExclusionGlob(entry)) return error.InvalidSynopticConfig;
+        } else if (!validGlob(entry)) return error.InvalidSynopticConfig;
         try next.append(allocator, try allocator.dupe(u8, entry));
         index += 1;
         while (index + 1 < source.len and std.ascii.isWhitespace(source[index])) index += 1;
@@ -1336,4 +1345,22 @@ test "exclusion arrays accept TOML strings comments trailing commas and lines" {
     try std.testing.expectEqualStrings("**/*.snap", settings.additional_globs.items[1]);
     try std.testing.expectEqual(@as(usize, 1), settings.removed_default_globs.items.len);
     try std.testing.expectEqualStrings("vendor/**", settings.removed_default_globs.items[0]);
+}
+
+test "exclusions config rejects wildcard-only automatic effect domains" {
+    var settings = Settings{ .allocator = std.testing.allocator };
+    defer settings.deinit();
+    for ([_][]const u8{ "*", "?", "**", "**/**", "**/*/**" }) |glob| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "[exclusions]\nadditional_globs = ['{s}']\n",
+            .{glob},
+        );
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.InvalidSynopticConfig, settings.applyToml(source));
+    }
+    try settings.applyToml(
+        "[exclusions]\nadditional_globs = ['**/*.snap']\n" ++
+            "removed_default_globs = ['**']\n",
+    );
 }
