@@ -265,21 +265,39 @@ pub const ActionStore = struct {
             pending_slot.id,
         );
         errdefer self.freeCard(card);
+        try self.preflightRetention(card, pending_slot.index);
         try self.cards.append(self.allocator, card);
         if (pending_slot.index) |index| self.cards.items[index].status = .superseded;
-        self.enforceRetentionBudget() catch |err| {
-            const added = self.cards.pop().?;
-            if (pending_slot.id) |prior_id| for (self.cards.items) |*prior| {
-                if (std.mem.eql(u8, prior.id, prior_id)) prior.status = .pending;
-            };
-            self.freeCard(added);
-            return err;
-        };
+        self.enforceRetentionBudget();
         self.next_id += 1;
         return &self.cards.items[self.cards.items.len - 1];
     }
 
-    fn enforceRetentionBudget(self: *ActionStore) !void {
+    fn preflightRetention(
+        self: *const ActionStore,
+        card: ActionCard,
+        superseded_index: ?usize,
+    ) !void {
+        var required_count: usize = 1;
+        var required_bytes = cardRetainedBytes(card);
+        for (self.cards.items, 0..) |retained, index| {
+            if (superseded_index != null and index == superseded_index.?) continue;
+            if (retained.status != .pending and retained.status != .executing) continue;
+            required_count += 1;
+            required_bytes = std.math.add(
+                usize,
+                required_bytes,
+                cardRetainedBytes(retained),
+            ) catch return error.ActionStoreCapacityExceeded;
+        }
+        if (required_count > max_retained_action_cards or
+            required_bytes > max_retained_action_bytes)
+        {
+            return error.ActionStoreCapacityExceeded;
+        }
+    }
+
+    fn enforceRetentionBudget(self: *ActionStore) void {
         while (self.cards.items.len > max_retained_action_cards or
             self.retainedBytes() > max_retained_action_bytes)
         {
@@ -290,7 +308,7 @@ pub const ActionStore = struct {
                 removable = index;
                 break;
             }
-            const index = removable orelse return error.ActionStoreCapacityExceeded;
+            const index = removable orelse unreachable;
             const removed = self.cards.orderedRemove(index);
             self.freeCard(removed);
         }

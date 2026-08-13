@@ -2356,6 +2356,53 @@ test "action broker construction releases every partial allocation" {
     try std.testing.expect(graphql_successes > 0);
 }
 
+test "action retention rejection preserves the complete pending store" {
+    var store = tools.ActionStore{ .allocator = std.testing.allocator };
+    defer store.deinit();
+    const target = tools.AuthoritativeTarget{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "src/a.zig",
+        .current_path = "src/a.zig",
+    };
+    for (0..256) |index| {
+        var slot_buffer: [32]u8 = undefined;
+        const slot = try std.fmt.bufPrint(&slot_buffer, "finding-{d}", .{index});
+        _ = try store.prepare("session", "turn", .{
+            .slot = @constCast(slot),
+            .kind = .mark_viewed,
+            .effect_summary = @constCast("mark viewed"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("src/a.zig"),
+        }, target);
+    }
+    const retained_bytes = store.retainedBytes();
+    try std.testing.expectError(error.ActionStoreCapacityExceeded, store.prepare(
+        "session",
+        "turn",
+        .{
+            .slot = @constCast("finding-over-capacity"),
+            .kind = .mark_viewed,
+            .effect_summary = @constCast("mark viewed"),
+            .payload_json = @constCast("{}"),
+            .path = @constCast("src/a.zig"),
+        },
+        target,
+    ));
+    try std.testing.expectEqual(@as(usize, 256), store.cards.items.len);
+    try std.testing.expectEqual(retained_bytes, store.retainedBytes());
+    try std.testing.expectEqual(@as(u64, 257), store.next_id);
+    try std.testing.expectEqualStrings("act-1", store.cards.items[0].id);
+    try std.testing.expectEqualStrings("act-256", store.cards.items[255].id);
+    for (store.cards.items) |card| try std.testing.expectEqual(
+        tools.ActionStatus.pending,
+        card.status,
+    );
+}
+
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
