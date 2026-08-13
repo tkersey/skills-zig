@@ -852,6 +852,20 @@ test "post-authority lifecycle settlement does not re-read process arguments" {
     ) != null);
 }
 
+test "ready stop and starting abort retain distinct settlement budgets" {
+    const source = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "try settleReadyProcessGroup(record);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "settleProcessGroup(record.pid, config.lifecycle_stop_timeout_ms)",
+    ) != null);
+}
+
 test "falsifier action tool is rejected during initial review" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();

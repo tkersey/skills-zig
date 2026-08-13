@@ -1850,7 +1850,7 @@ fn stop(
             else => {},
         }
     };
-    try settleStartingProcessGroup(record);
+    try settleReadyProcessGroup(record);
     try finalizeStoppedLaunch(allocator, io, runtime_root, current_path, record);
     return printStopResult(io, json, record.launch_id, true);
 }
@@ -1987,11 +1987,19 @@ fn signalStartingProcess(record: LifecycleRecord) !void {
 }
 
 fn settleStartingProcessGroup(record: LifecycleRecord) !void {
+    try settleProcessGroup(record.pid, launch_shutdown_grace_ms);
+}
+
+fn settleReadyProcessGroup(record: LifecycleRecord) !void {
+    try settleProcessGroup(record.pid, config.lifecycle_stop_timeout_ms);
+}
+
+fn settleProcessGroup(process_group: u64, cooperative_wait_ms: u32) !void {
     const websocket = @import("cas_runtime").websocket;
-    if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
-        websocket.forceKillProcessGroup(record.pid);
+    if (!websocket.waitForProcessGroupExit(process_group, cooperative_wait_ms)) {
+        websocket.forceKillProcessGroup(process_group);
     }
-    if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
+    if (!websocket.waitForProcessGroupExit(process_group, launch_shutdown_grace_ms)) {
         return error.SynopticStopTimeout;
     }
 }
@@ -3261,6 +3269,36 @@ test "failed launch retires descendants before managed custody and preserves err
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, launch_dir, .{}),
     );
+}
+
+test "falsifier ready stop preserves cooperative custody before escalation" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const marker = try std.fs.path.join(allocator, &.{ root, "cooperative-cleanup" });
+    defer allocator.free(marker);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "(sleep 1; printf ready > \"$1\") &",
+            "synoptic-ready-stop-test",
+            marker,
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const process_group: u64 = @intCast(child.id.?);
+    defer @import("cas_runtime").websocket.forceKillProcessGroup(process_group);
+    _ = try child.wait(io);
+    try settleProcessGroup(process_group, config.lifecycle_stop_timeout_ms);
+    _ = try tmp.dir.statFile(io, "cooperative-cleanup", .{});
 }
 test {
     _ = domain;
