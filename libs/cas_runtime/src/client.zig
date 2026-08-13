@@ -1559,7 +1559,7 @@ const ActorState = struct {
     mutex: ActorMutex = .{},
     transport_mutex: ActorMutex = .{},
     terminal: protocol.TerminalState = .running,
-    transport_closed: bool = false,
+    transport_closed: std.atomic.Value(bool) = .init(false),
     teardown_started: bool = false,
     teardown_ready: bool = false,
     active_calls: usize = 0,
@@ -2639,22 +2639,16 @@ fn actorSetTerminal(state: *ActorState, terminal: protocol.TerminalState) void {
 }
 
 fn actorCloseTransportOnce(state: *ActorState) void {
-    state.transport_mutex.lock();
-    defer state.transport_mutex.unlock();
-    if (state.transport_closed) {
-        return;
-    }
-    state.transport_closed = true;
+    if (state.transport_closed.swap(true, .acq_rel)) return;
     state.client.close();
 }
 
 fn actorSendPayload(state: *ActorState, payload: []const u8, deadline_ms: i64) !void {
     state.transport_mutex.lock();
     defer state.transport_mutex.unlock();
-    if (state.transport_closed) return error.ActorDisconnected;
+    if (state.transport_closed.load(.acquire)) return error.ActorDisconnected;
     state.client.sendPayload(payload, null, deadline_ms, false) catch |err| {
-        state.client.close();
-        state.transport_closed = true;
+        actorCloseTransportOnce(state);
         return err;
     };
 }
@@ -4359,6 +4353,11 @@ fn writeActorFakeCodexInteractiveServerModes(writer: *std.Io.Writer) !void {
 
 fn writeActorFakeCodexTerminalModes(writer: *std.Io.Writer) !void {
     try writer.writeAll(
+        \\if [ "$mode" = non_reading ]; then
+        \\  : > "$reply_log"
+        \\  sleep 5
+        \\  exit 0
+        \\fi
         \\if [ "$mode" = server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -4439,12 +4438,17 @@ const ActorFixture = struct {
 const ActorCall = struct {
     actor: *Actor,
     method: []const u8,
+    params_json: []const u8 = "{}",
     timeout_ms: u32 = 2_000,
     result: ?[]u8 = null,
     failure: ?anyerror = null,
 
     fn run(self: *ActorCall) void {
-        self.result = self.actor.requestJson(self.method, "{}", self.timeout_ms) catch |err| {
+        self.result = self.actor.requestJson(
+            self.method,
+            self.params_json,
+            self.timeout_ms,
+        ) catch |err| {
             self.failure = err;
             return;
         };
@@ -4828,6 +4832,47 @@ test "actor teardown waits for an admitted external request" {
     thread.join();
     if (call.result) |result| allocator.free(result);
     try std.testing.expect(call.failure != null);
+}
+
+test "actor terminal close interrupts a writer blocked by a non-reading peer" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "non_reading");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+
+    const params_json = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(params_json);
+    @memset(params_json, 'a');
+    const prefix = "{\"data\":\"";
+    const suffix = "\"}";
+    @memcpy(params_json[0..prefix.len], prefix);
+    @memcpy(params_json[params_json.len - suffix.len ..], suffix);
+
+    var call = ActorCall{
+        .actor = &actor,
+        .method = "actor/non-reading",
+        .params_json = params_json,
+        .timeout_ms = 5_000,
+    };
+    const thread = try std.Thread.spawn(.{}, ActorCall.run, .{&call});
+    var writer_blocked = false;
+    for (0..1_000) |_| {
+        if (!actor.state.?.transport_mutex.state.tryLock()) {
+            writer_blocked = true;
+            break;
+        }
+        actor.state.?.transport_mutex.state.unlock();
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(writer_blocked);
+    const started = monotonicMillis();
+    actor.deinit();
+    const elapsed_ms = monotonicMillis() - started;
+    thread.join();
+    if (call.result) |result| allocator.free(result);
+    try std.testing.expect(call.failure != null);
+    try std.testing.expect(elapsed_ms < 1_000);
 }
 
 test "actor callback teardown drops notifications admitted behind terminal teardown" {
