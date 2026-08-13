@@ -393,6 +393,7 @@ pub const RefreshLease = struct {
     repository_cwd: []const u8,
     baseline: *Baseline,
     previous: ?Baseline,
+    fetch_source: ?FetchSource,
 
     pub fn commit(self: *RefreshLease) void {
         if (self.previous) |*previous| previous.deinit();
@@ -431,7 +432,7 @@ pub const RefreshLease = struct {
                     self.repository_cwd,
                     previous.head_oid,
                     self.baseline,
-                    null,
+                    self.fetch_source,
                 );
                 previous.deinit();
                 self.previous = null;
@@ -467,6 +468,7 @@ pub fn beginRefresh(
         .repository_cwd = repository_cwd,
         .baseline = baseline,
         .previous = previous,
+        .fetch_source = fetch_source,
     };
 }
 
@@ -1000,16 +1002,19 @@ fn updateSelectedSubmodules(
             module.oid,
             environment,
         )) {
+            var fetch_environment = try selectedSubmoduleFetchEnvironment(
+                allocator,
+                environment,
+                module.url,
+            );
+            defer fetch_environment.deinit();
+            const fetch_command = selectedSubmoduleFetchCommand(module.oid);
             try runSelectedSubmoduleCommand(
                 allocator,
                 io,
                 module.absolute_path,
-                environment,
-                &.{
-                    "git",      "--no-replace-objects", "-c",      "core.hooksPath=/dev/null",
-                    "fetch",    "--no-tags",            "--force", "--",
-                    module.url,
-                },
+                &fetch_environment,
+                &fetch_command.argv,
                 deadline_ms,
             );
         }
@@ -1032,6 +1037,41 @@ fn updateSelectedSubmodules(
             deadline_ms,
         );
     }
+}
+
+const selected_submodule_remote = "synoptic-selected-source";
+
+const SelectedSubmoduleFetchCommand = struct {
+    argv: [9][]const u8,
+};
+
+fn selectedSubmoduleFetchCommand(oid: []const u8) SelectedSubmoduleFetchCommand {
+    return .{ .argv = .{
+        "git",
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--no-tags",
+        "--force",
+        selected_submodule_remote,
+        oid,
+    } };
+}
+
+fn selectedSubmoduleFetchEnvironment(
+    allocator: std.mem.Allocator,
+    base: *const std.process.Environ.Map,
+    url: []const u8,
+) !std.process.Environ.Map {
+    var environment = try base.clone(allocator);
+    errdefer environment.deinit();
+    sanitizeGitEnvironment(&environment);
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    try environment.put("GIT_CONFIG_COUNT", "1");
+    try environment.put("GIT_CONFIG_KEY_0", "remote." ++ selected_submodule_remote ++ ".url");
+    try environment.put("GIT_CONFIG_VALUE_0", url);
+    return environment;
 }
 
 fn runSelectedSubmoduleCommand(
@@ -1175,14 +1215,77 @@ fn resolveSubmoduleUrlAlloc(
         std.mem.startsWith(u8, selected_url, "../");
     if (!relative) return allocator.dupe(u8, selected_url);
     const parent = parent_url orelse return error.ManagedSubmoduleInventoryFailed;
-    const slash = std.mem.lastIndexOfScalar(u8, parent, '/') orelse {
-        return error.ManagedSubmoduleInventoryFailed;
+    const split = try splitSubmoduleParentUrl(parent);
+    var segments: std.ArrayList([]const u8) = .empty;
+    defer segments.deinit(allocator);
+    try appendNormalizedUrlSegments(allocator, &segments, split.path, split.rooted);
+    try appendNormalizedUrlSegments(allocator, &segments, selected_url, split.rooted);
+    if (segments.items.len == 0) return error.ManagedSubmoduleInventoryFailed;
+    const normalized = try std.mem.join(allocator, "/", segments.items);
+    defer allocator.free(normalized);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ split.prefix, normalized });
+}
+
+const SubmoduleParentUrl = struct {
+    prefix: []const u8,
+    path: []const u8,
+    rooted: bool,
+};
+
+fn splitSubmoduleParentUrl(parent: []const u8) !SubmoduleParentUrl {
+    if (std.mem.indexOf(u8, parent, "://")) |scheme_end| {
+        const authority_start = scheme_end + 3;
+        const path_start = std.mem.indexOfScalarPos(
+            u8,
+            parent,
+            authority_start,
+            '/',
+        ) orelse return error.ManagedSubmoduleInventoryFailed;
+        return .{
+            .prefix = parent[0 .. path_start + 1],
+            .path = parent[path_start + 1 ..],
+            .rooted = true,
+        };
+    }
+    if (std.mem.indexOfScalar(u8, parent, ':')) |colon| {
+        const slash = std.mem.indexOfScalar(u8, parent, '/');
+        if (slash == null or colon < slash.?) return .{
+            .prefix = parent[0 .. colon + 1],
+            .path = parent[colon + 1 ..],
+            .rooted = true,
+        };
+    }
+    if (std.mem.startsWith(u8, parent, "/")) return .{
+        .prefix = "/",
+        .path = parent[1..],
+        .rooted = true,
     };
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}",
-        .{ parent[0..slash], selected_url },
-    );
+    return .{ .prefix = "", .path = parent, .rooted = false };
+}
+
+fn appendNormalizedUrlSegments(
+    allocator: std.mem.Allocator,
+    segments: *std.ArrayList([]const u8),
+    path_value: []const u8,
+    rooted: bool,
+) !void {
+    var iterator = std.mem.splitScalar(u8, path_value, '/');
+    while (iterator.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (!std.mem.eql(u8, segment, "..")) {
+            try segments.append(allocator, segment);
+            continue;
+        }
+        if (segments.items.len > 0 and
+            !std.mem.eql(u8, segments.items[segments.items.len - 1], ".."))
+        {
+            _ = segments.pop();
+        } else if (rooted) {
+            return error.ManagedSubmoduleInventoryFailed;
+        } else {
+            try segments.append(allocator, segment);
+        }
+    }
 }
 
 fn parseSubmoduleDeclarations(
@@ -2370,6 +2473,59 @@ test "worktree integrity submodule environment preserves user credential policy"
     try std.testing.expect(effective.get("GIT_CONFIG_KEY_0") == null);
 }
 
+test "worktree integrity selected submodule source is Git-relative and argv-confined" {
+    const allocator = std.testing.allocator;
+    for ([_]struct {
+        parent: []const u8,
+        selected: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .parent = "https://token:secret@git.example/owner/super.git",
+            .selected = "../lib.git",
+            .expected = "https://token:secret@git.example/owner/lib.git",
+        },
+        .{
+            .parent = "git@git.example:owner/super.git",
+            .selected = "../lib.git",
+            .expected = "git@git.example:owner/lib.git",
+        },
+        .{
+            .parent = "/srv/git/owner/super.git",
+            .selected = "../lib.git",
+            .expected = "/srv/git/owner/lib.git",
+        },
+    }) |fixture| {
+        const resolved = try resolveSubmoduleUrlAlloc(
+            allocator,
+            fixture.selected,
+            fixture.parent,
+        );
+        defer allocator.free(resolved);
+        try std.testing.expectEqualStrings(fixture.expected, resolved);
+    }
+    var base = std.process.Environ.Map.init(allocator);
+    defer base.deinit();
+    const credential_url = "https://token:secret@git.example/owner/lib.git";
+    var fetch_environment = try selectedSubmoduleFetchEnvironment(
+        allocator,
+        &base,
+        credential_url,
+    );
+    defer fetch_environment.deinit();
+    try std.testing.expectEqualStrings(
+        credential_url,
+        fetch_environment.get("GIT_CONFIG_VALUE_0").?,
+    );
+    const oid = "0123456789012345678901234567890123456789";
+    const fetch_command = selectedSubmoduleFetchCommand(oid);
+    try std.testing.expectEqualStrings(oid, fetch_command.argv[8]);
+    for (fetch_command.argv) |argument| {
+        try std.testing.expect(std.mem.indexOf(u8, argument, "token:secret") == null);
+        try std.testing.expect(!std.mem.eql(u8, argument, credential_url));
+    }
+}
+
 test "worktree integrity submodule update selects URL without config mutation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2393,6 +2549,84 @@ test "worktree integrity submodule update selects URL without config mutation" {
         parent,
     );
     defer allocator.free(next);
+    try verifySelectedSubmoduleLifecycle(
+        allocator,
+        io,
+        parent,
+        new_repo,
+        next,
+    );
+}
+
+const SelectedParentHeads = struct {
+    allocator: std.mem.Allocator,
+    first_raw: []u8,
+    second_raw: []u8,
+
+    fn first(self: SelectedParentHeads) []const u8 {
+        return std.mem.trim(u8, self.first_raw, "\r\n");
+    }
+
+    fn second(self: SelectedParentHeads) []const u8 {
+        return std.mem.trim(u8, self.second_raw, "\r\n");
+    }
+
+    fn deinit(self: SelectedParentHeads) void {
+        self.allocator.free(self.first_raw);
+        self.allocator.free(self.second_raw);
+    }
+};
+
+fn selectedParentHeadsAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: []const u8,
+    expected_source: []const u8,
+) !SelectedParentHeads {
+    const second_raw = try testHeadAlloc(allocator, io, parent);
+    errdefer allocator.free(second_raw);
+    const first_raw = try gitOutput(
+        allocator,
+        io,
+        parent,
+        &.{ "git", "rev-parse", "HEAD^" },
+        error.TestGitFailed,
+    );
+    errdefer allocator.free(first_raw);
+    const selected_modules = try gitOutput(
+        allocator,
+        io,
+        parent,
+        &.{ "git", "show", "HEAD:.gitmodules" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(selected_modules);
+    try std.testing.expect(std.mem.indexOf(u8, selected_modules, "../new") != null);
+    const resolved = try resolveSubmoduleUrlAlloc(allocator, "../new", parent);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(expected_source, resolved);
+    return .{ .allocator = allocator, .first_raw = first_raw, .second_raw = second_raw };
+}
+
+fn checkoutParentGeneration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: []const u8,
+    head: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "checkout", "-q", "--detach", head },
+        &.{ "git", "submodule", "update", "--checkout" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, parent, argv, error.TestGitFailed));
+}
+
+fn verifySelectedSubmoduleLifecycle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: []const u8,
+    expected_source: []const u8,
+    selected_oid: []const u8,
+) !void {
     const config_path = try std.fs.path.join(allocator, &.{ parent, ".git", "config" });
     defer allocator.free(config_path);
     const config_before = try std.Io.Dir.cwd().readFileAlloc(
@@ -2405,7 +2639,28 @@ test "worktree integrity submodule update selects URL without config mutation" {
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     try environment.put("GIT_ALLOW_PROTOCOL", "file");
-    try reconcileInitializedSubmodules(allocator, io, parent, &environment, null);
+    var heads = try selectedParentHeadsAlloc(allocator, io, parent, expected_source);
+    defer heads.deinit();
+    try checkoutParentGeneration(allocator, io, parent, heads.first());
+    const child = try std.fs.path.join(allocator, &.{ parent, "deps", "sub" });
+    defer allocator.free(child);
+    const prior_child_raw = try testHeadAlloc(allocator, io, child);
+    defer allocator.free(prior_child_raw);
+    var baseline = try Baseline.capture(allocator, io, parent);
+    defer baseline.deinit();
+    var lease = try beginRefresh(
+        allocator,
+        io,
+        .{ .managed = parent },
+        parent,
+        heads.second(),
+        &baseline,
+        .{
+            .environment = &environment,
+            .remote_name = parent,
+            .remote_url = parent,
+        },
+    );
     const config_after = try std.Io.Dir.cwd().readFileAlloc(
         io,
         config_path,
@@ -2414,17 +2669,17 @@ test "worktree integrity submodule update selects URL without config mutation" {
     );
     defer allocator.free(config_after);
     try std.testing.expectEqualSlices(u8, config_before, config_after);
-    const child = try std.fs.path.join(allocator, &.{ parent, "deps", "sub" });
-    defer allocator.free(child);
-    const observed_raw = try gitOutput(
-        allocator,
-        io,
-        child,
-        &.{ "git", "rev-parse", "HEAD" },
-        error.TestGitFailed,
-    );
+    const observed_raw = try testHeadAlloc(allocator, io, child);
     defer allocator.free(observed_raw);
-    try std.testing.expectEqualStrings(next, std.mem.trim(u8, observed_raw, "\r\n"));
+    try std.testing.expectEqualStrings(selected_oid, std.mem.trim(u8, observed_raw, "\r\n"));
+    try lease.rollback();
+    try std.testing.expectEqualStrings(heads.first(), baseline.head_oid);
+    const rolled_back_raw = try testHeadAlloc(allocator, io, child);
+    defer allocator.free(rolled_back_raw);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, prior_child_raw, "\r\n"),
+        std.mem.trim(u8, rolled_back_raw, "\r\n"),
+    );
 }
 
 fn selectReplacementSubmoduleAlloc(
@@ -2443,8 +2698,28 @@ fn selectReplacementSubmoduleAlloc(
             "git",    "-c",       "protocol.file.allow=always", "submodule", "add",
             old_repo, "deps/sub",
         },
+        &.{ "git", "config", "-f", ".gitmodules", "submodule.deps/sub.url", "../old" },
         &.{ "git", "commit", "-qam", "old submodule" },
     }) |argv| allocator.free(try gitOutput(allocator, io, parent, argv, error.TestGitFailed));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        new_repo,
+        &.{ "git", "branch", "default", "HEAD" },
+        error.TestGitFailed,
+    ));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        new_repo,
+        &.{ "git", "switch", "-qc", "topic" },
+        error.TestGitFailed,
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "new/tracked.txt", .data = "selected\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "selected topic" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, new_repo, argv, error.TestGitFailed));
     const raw = try gitOutput(
         allocator,
         io,
@@ -2454,13 +2729,20 @@ fn selectReplacementSubmoduleAlloc(
     );
     defer allocator.free(raw);
     const next = std.mem.trim(u8, raw, "\r\n");
-    const modules = try std.fmt.allocPrint(
+    allocator.free(try gitOutput(
         allocator,
-        "[submodule \"sub\"]\n\tpath = deps/sub\n\turl = {s}\n",
-        .{new_repo},
-    );
-    defer allocator.free(modules);
-    try tmp.dir.writeFile(io, .{ .sub_path = "parent/.gitmodules", .data = modules });
+        io,
+        new_repo,
+        &.{ "git", "switch", "-q", "default" },
+        error.TestGitFailed,
+    ));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        parent,
+        &.{ "git", "config", "-f", ".gitmodules", "submodule.deps/sub.url", "../new" },
+        error.TestGitFailed,
+    ));
     const cache_info = try std.fmt.allocPrint(allocator, "160000,{s},deps/sub", .{next});
     defer allocator.free(cache_info);
     for ([_][]const []const u8{

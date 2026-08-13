@@ -4718,7 +4718,14 @@ test "refresh lease restores reused checkout after a downstream failure" {
         root,
         next_head,
         &baseline,
-        null,
+        .{
+            .remote_name = root,
+            .remote_url = "https://token:secret@example.test/owner/repo.git",
+        },
+    );
+    try std.testing.expectEqualStrings(
+        "https://token:secret@example.test/owner/repo.git",
+        lease.fetch_source.?.remote_url,
     );
     try std.testing.expectEqualStrings(next_head, baseline.head_oid);
     try lease.rollback();
