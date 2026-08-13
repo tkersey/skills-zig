@@ -153,11 +153,16 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
     const argument_value = params.get("arguments") orelse
         params.get("input") orelse return error.InvalidToolPayload;
     const arguments = object(argument_value) orelse return error.InvalidToolPayload;
-    const slot_value = string(arguments.get("slot")) orelse return error.InvalidToolPayload;
-    const kind_value = string(arguments.get("kind")) orelse "add_inline_comment";
+    const slot_value = (try optionalStringField(arguments, "slot")) orelse
+        return error.InvalidToolPayload;
+    const kind_value = (try optionalStringField(arguments, "kind")) orelse
+        "add_inline_comment";
     const kind = try parseKind(kind_value);
-    const effect = string(arguments.get("effectSummary")) orelse
-        string(arguments.get("effect_summary")) orelse return error.InvalidToolPayload;
+    const effect = (try optionalAliasedStringField(
+        arguments,
+        "effectSummary",
+        "effect_summary",
+    )) orelse return error.InvalidToolPayload;
     if (slot_value.len == 0 or slot_value.len > 128 or effect.len == 0 or effect.len > 2048)
         return error.InvalidToolPayload;
     const payload_value = arguments.get("payload") orelse rootPayload(arguments, kind);
@@ -170,19 +175,33 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
         payload_value,
     );
     errdefer result.deinit(allocator);
-    result.path = try dupeOptional(allocator, string(payload.get("path")));
-    result.line = uint32(payload.get("line"));
-    result.start_line = uint32(payload.get("startLine") orelse payload.get("start_line"));
-    result.side = try dupeOptional(allocator, string(payload.get("side")));
-    result.body = try dupeOptional(allocator, string(payload.get("body")));
-    result.thread_id = try dupeOptional(allocator, string(payload.get("threadId") orelse
-        payload.get("thread_id")));
-    result.comment_id = try dupeOptional(allocator, string(payload.get("commentId") orelse
-        payload.get("comment_id")));
+    result.path = try dupeOptional(allocator, try optionalStringField(payload, "path"));
+    result.line = try optionalUint32Field(payload, "line");
+    result.start_line = try optionalAliasedUint32Field(
+        payload,
+        "startLine",
+        "start_line",
+    );
+    result.side = try dupeOptional(allocator, try optionalStringField(payload, "side"));
+    result.body = try dupeOptional(allocator, try optionalStringField(payload, "body"));
+    result.thread_id = try dupeOptional(
+        allocator,
+        try optionalAliasedStringField(payload, "threadId", "thread_id"),
+    );
+    result.comment_id = try dupeOptional(
+        allocator,
+        try optionalAliasedStringField(payload, "commentId", "comment_id"),
+    );
     if (kind == .graphql) {
-        result.operation_name = try dupeOptional(allocator, string(payload.get("operationName")));
-        result.document = try dupeOptional(allocator, string(payload.get("document")));
-        if (payload.get("variables")) |variables| {
+        result.operation_name = try dupeOptional(
+            allocator,
+            try optionalStringField(payload, "operationName"),
+        );
+        result.document = try dupeOptional(
+            allocator,
+            try optionalStringField(payload, "document"),
+        );
+        if (try optionalObjectField(payload, "variables")) |variables| {
             result.variables = try stringifyAlloc(allocator, variables);
         }
     }
@@ -658,18 +677,47 @@ fn object(value: std.json.Value) ?std.json.ObjectMap {
         else => null,
     };
 }
-fn string(value: ?std.json.Value) ?[]const u8 {
-    const present = value orelse return null;
+fn optionalStringField(object_map: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const present = object_map.get(key) orelse return null;
     return switch (present) {
-        .string => |v| v,
-        else => null,
+        .string => |value| value,
+        else => error.InvalidToolPayload,
     };
 }
-fn uint32(value: ?std.json.Value) ?u32 {
-    const present = value orelse return null;
+fn optionalAliasedStringField(
+    object_map: std.json.ObjectMap,
+    primary: []const u8,
+    fallback: []const u8,
+) !?[]const u8 {
+    if (object_map.contains(primary)) return optionalStringField(object_map, primary);
+    return optionalStringField(object_map, fallback);
+}
+fn optionalUint32Field(object_map: std.json.ObjectMap, key: []const u8) !?u32 {
+    const present = object_map.get(key) orelse return null;
     return switch (present) {
-        .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else null,
-        else => null,
+        .integer => |value| if (value > 0 and value <= std.math.maxInt(u32))
+            @intCast(value)
+        else
+            error.InvalidToolPayload,
+        else => error.InvalidToolPayload,
+    };
+}
+fn optionalAliasedUint32Field(
+    object_map: std.json.ObjectMap,
+    primary: []const u8,
+    fallback: []const u8,
+) !?u32 {
+    if (object_map.contains(primary)) return optionalUint32Field(object_map, primary);
+    return optionalUint32Field(object_map, fallback);
+}
+fn optionalObjectField(
+    object_map: std.json.ObjectMap,
+    key: []const u8,
+) !?std.json.Value {
+    const present = object_map.get(key) orelse return null;
+    return switch (present) {
+        .object => present,
+        else => error.InvalidToolPayload,
     };
 }
 fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {

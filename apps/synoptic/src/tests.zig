@@ -83,6 +83,41 @@ test "dynamic tool namespace members use the canonical function discriminator" {
         );
     }
 }
+
+test "prepared action decoder rejects every present field with the wrong JSON type" {
+    const malformed = [_][]const u8{
+        \\{"arguments":{"slot":7,"effectSummary":"x","payload":{"path":"a"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":false,"effectSummary":"x","payload":{}}}
+        ,
+        \\{"arguments":{"slot":"s","effectSummary":[],"payload":{"path":"a"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"mark_viewed","effectSummary":"x","payload":{"path":false}}}
+        ,
+        \\{"arguments":{"slot":"s","effectSummary":"x","payload":{"path":"a","line":"1","body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","effectSummary":"x","payload":{"path":"a","line":1,"startLine":false,"body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","effectSummary":"x","payload":{"path":"a","line":1,"side":7,"body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","effectSummary":"x","payload":{"path":"a","line":1,"body":{}}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"reply_thread","effectSummary":"x","payload":{"threadId":7,"body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"delete_comment","effectSummary":"x","payload":{"commentId":[]}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"graphql","effectSummary":"x","payload":{"operationName":false,"document":"mutation X($input:X!){x(input:$input){id}}","variables":{}}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"graphql","effectSummary":"x","payload":{"operationName":"X","document":7,"variables":{}}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"graphql","effectSummary":"x","payload":{"operationName":"X","document":"mutation X($input:X!){x(input:$input){id}}","variables":[]}}}
+        ,
+    };
+    for (malformed) |raw| try std.testing.expectError(
+        error.InvalidToolPayload,
+        tools.decodePreparedAction(std.testing.allocator, raw),
+    );
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");
