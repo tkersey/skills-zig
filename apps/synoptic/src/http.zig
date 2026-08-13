@@ -811,7 +811,7 @@ pub const Server = struct {
         event: sessions.VisibleEvent,
     ) !void {
         if (isSnapshotInvalidation(event)) {
-            const envelope = try self.snapshot(runtime);
+            const envelope = try self.snapshotLocked(runtime);
             defer self.allocator.free(envelope);
             try writeServerText(self.io, stream, envelope);
             return;
@@ -1009,10 +1009,22 @@ pub const Server = struct {
         const mutex = domainMutex(runtime);
         mutex.lock();
         defer mutex.unlock();
-        runtime.app.synchronizeTabTurnStates(runtime.registry);
-        const body = try runtime.app.bootstrapAlloc();
-        defer self.allocator.free(body);
-        return runtime.app.nextEnvelope("snapshot", body);
+        return self.snapshotLocked(runtime);
+    }
+
+    fn snapshotLocked(self: *Server, runtime: *Runtime) ![]u8 {
+        return snapshotEnvelopeLockedAlloc(self.allocator, runtime.app, runtime.registry);
+    }
+
+    fn snapshotEnvelopeLockedAlloc(
+        allocator: std.mem.Allocator,
+        app: *App,
+        registry: *sessions.Registry,
+    ) ![]u8 {
+        app.synchronizeTabTurnStates(registry);
+        const body = try app.bootstrapAlloc();
+        defer allocator.free(body);
+        return app.nextEnvelope("snapshot", body);
     }
 
     fn openFile(self: *Server, runtime: *Runtime, payload: std.json.ObjectMap) ![]u8 {
@@ -2259,6 +2271,24 @@ test "exclusion notification capacity cannot fail committed reconciliation" {
     try std.testing.expectEqualStrings("snapshot", last.method);
     try std.testing.expectEqualStrings("{}", last.raw_json);
     try std.testing.expect(Server.isSnapshotInvalidation(last));
+}
+
+test "snapshot invalidation materializes under one domain lock" {
+    var app = try App.init(std.testing.allocator, "head");
+    defer app.deinit();
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    var mutex = DomainMutex{ .io = std.testing.io };
+    mutex.lock();
+    defer mutex.unlock();
+
+    const envelope = try Server.snapshotEnvelopeLockedAlloc(
+        std.testing.allocator,
+        &app,
+        &registry,
+    );
+    defer std.testing.allocator.free(envelope);
+    try std.testing.expect(std.mem.indexOf(u8, envelope, "\"type\":\"snapshot\"") != null);
 }
 
 test "WebSocket close payload accepts only valid status and UTF-8 reason" {
