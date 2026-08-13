@@ -664,11 +664,20 @@ pub const PrGeneration = struct {
     }
 
     pub fn setCanonicalDiff(self: *PrGeneration, path: []const u8, diff: []const u8) !void {
+        return self.setCanonicalDiffEvidence(path, diff, diffDisplayState(diff));
+    }
+
+    pub fn setCanonicalDiffEvidence(
+        self: *PrGeneration,
+        path: []const u8,
+        diff: []const u8,
+        state: DiffDisplayState,
+    ) !void {
         for (self.files.items) |*file| if (std.mem.eql(u8, file.path, path)) {
             const owned = try self.allocator.dupe(u8, diff);
             self.allocator.free(file.canonical_diff);
             file.canonical_diff = owned;
-            file.diff_state = diffDisplayState(diff);
+            file.diff_state = state;
             return;
         };
         return error.UnknownFile;

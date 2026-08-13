@@ -2550,6 +2550,20 @@ fn hydrateFileRevision(
         file.previous_path,
     );
     defer allocator.free(review_diff);
+    const diff_state = if (diff) |value|
+        domain.diffDisplayState(value)
+    else
+        try canonicalDiffDisplayState(
+            allocator,
+            io,
+            git_path,
+            cwd,
+            evidence_view,
+            merge_base,
+            generation.head_oid,
+            file.path,
+            file.previous_path,
+        );
     try budget.admitReviewDiff(review_diff.len);
     const revision = try domain.revisionKey(
         allocator,
@@ -2560,7 +2574,109 @@ fn hydrateFileRevision(
     );
     defer allocator.free(revision);
     try generation.setRevision(file.path, revision);
-    try generation.setCanonicalDiff(file.path, review_diff);
+    try generation.setCanonicalDiffEvidence(file.path, review_diff, diff_state);
+}
+
+fn canonicalDiffDisplayState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
+    merge_base: []const u8,
+    head: []const u8,
+    path: []const u8,
+    previous_path: ?[]const u8,
+) !domain.DiffDisplayState {
+    const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base, head });
+    defer allocator.free(range);
+    const renamed_source_exists = if (previous_path) |old_path|
+        (try treeEntryAtAlloc(allocator, io, git_path, cwd, head, old_path))
+    else
+        null;
+    defer if (renamed_source_exists) |entry| {
+        var owned = entry;
+        owned.deinit();
+    };
+    const result = if (previous_path != null and renamed_source_exists == null)
+        try runCanonicalDiffNumstat(
+            allocator,
+            io,
+            git_path,
+            cwd,
+            evidence_view,
+            range,
+            &.{ previous_path.?, path },
+        )
+    else
+        try runCanonicalDiffNumstat(
+            allocator,
+            io,
+            git_path,
+            cwd,
+            evidence_view,
+            range,
+            &.{path},
+        );
+    defer allocator.free(result);
+    var records = std.mem.splitScalar(u8, result, '\n');
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, record, '\t');
+        const additions = fields.next() orelse return error.FileDiffFailed;
+        const deletions = fields.next() orelse return error.FileDiffFailed;
+        if (std.mem.eql(u8, additions, "-") and std.mem.eql(u8, deletions, "-")) {
+            return .binary;
+        }
+    }
+    return .text;
+}
+
+fn runCanonicalDiffNumstat(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_path: []const u8,
+    cwd: []const u8,
+    evidence_view: *const CanonicalGitEvidenceView,
+    range: []const u8,
+    paths: []const []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        canonical_git_env_path,
+        canonical_git_attributes_env,
+        canonical_git_global_config_env,
+        canonical_git_system_config_env,
+        canonical_git_no_replace_env,
+        evidence_view.git_dir_env,
+        evidence_view.object_dir_env,
+        git_path,
+        "-c",
+        canonical_git_attributes_config,
+        "-c",
+        evidence_view.attr_tree_config,
+        "--literal-pathspecs",
+        "diff",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--no-color",
+        "-M",
+        "--numstat",
+        range,
+        "--",
+    });
+    try argv.appendSlice(allocator, paths);
+    const result = try runCanonicalDiffProcess(
+        allocator,
+        io,
+        argv.items,
+        cwd,
+        null,
+        1024 * 1024,
+    );
+    allocator.free(result.stderr);
+    return result.stdout;
 }
 
 fn reviewDiffProjectionAlloc(
@@ -3648,11 +3764,13 @@ fn expectOversizedDiffHydration(
     git_path: []const u8,
     base: []const u8,
     head: []const u8,
+    path: []const u8,
+    expected_state: domain.DiffDisplayState,
 ) !void {
     var bounded = try domain.PrGeneration.initFull(allocator, base, head);
     defer bounded.deinit();
     try bounded.addFile(.{
-        .path = "a.zig",
+        .path = path,
         .change_type = "MODIFIED",
         .viewed = .unviewed,
         .revision_key = "pending-oversized",
@@ -3672,7 +3790,7 @@ fn expectOversizedDiffHydration(
         git_path,
         root,
         head,
-        "a.zig",
+        path,
         "DELETION",
     );
     defer allocator.free(head_entry);
@@ -3682,21 +3800,27 @@ fn expectOversizedDiffHydration(
         git_path,
         root,
         base,
-        "a.zig",
+        path,
     );
     defer allocator.free(diff_identity);
     const expected = try domain.revisionKey(
         allocator,
-        "a.zig",
+        path,
         "MODIFIED",
         head_entry,
         diff_identity,
     );
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, bounded.files.items[0].revision_key);
+    try std.testing.expectEqual(expected_state, bounded.diffState(path));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bounded.canonicalDiff(path).?,
+        "Synoptic did not inline this file diff",
+    ));
 }
 
-test "revision hydration computes one merge base for a generation" {
+test "exclusions config revision hydration preserves bounded diff kind" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3705,6 +3829,7 @@ test "revision hydration computes one merge base for a generation" {
     defer allocator.free(root);
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "base a\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "base b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "base\x00binary" });
     for ([_][]const []const u8{
         &.{ "/usr/bin/git", "init", "-q" },
         &.{ "/usr/bin/git", "config", "user.email", "synoptic@example.test" },
@@ -3716,6 +3841,7 @@ test "revision hydration computes one merge base for a generation" {
     defer allocator.free(base_raw);
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "head a\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "head b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "head\x00binary" });
     for ([_][]const []const u8{
         &.{ "/usr/bin/git", "add", "." },
         &.{ "/usr/bin/git", "commit", "-qm", "head" },
@@ -3755,7 +3881,26 @@ test "revision hydration computes one merge base for a generation" {
         base,
         head,
     );
-    try expectOversizedDiffHydration(allocator, io, root, wrapper_path, base, head);
+    try expectOversizedDiffHydration(
+        allocator,
+        io,
+        root,
+        wrapper_path,
+        base,
+        head,
+        "a.zig",
+        .text,
+    );
+    try expectOversizedDiffHydration(
+        allocator,
+        io,
+        root,
+        wrapper_path,
+        base,
+        head,
+        "binary.dat",
+        .binary,
+    );
 }
 
 fn configureNonCanonicalDiffDefaults(

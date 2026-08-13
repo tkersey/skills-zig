@@ -2674,6 +2674,27 @@ test "exclusions config recognizes only complete binary diff records" {
     try std.testing.expect(settings.classifyDiff("GIT binary patch") == null);
 }
 
+test "exclusions config preserves semantic kind across bounded display" {
+    var generation = try domain.PrGeneration.initFull(
+        std.testing.allocator,
+        "base",
+        "head",
+    );
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "binary.dat",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try generation.setCanonicalDiffEvidence(
+        "binary.dat",
+        "Synoptic did not inline this file diff because it exceeds the limit.",
+        .binary,
+    );
+    try std.testing.expectEqual(domain.DiffDisplayState.binary, generation.diffState("binary.dat"));
+}
+
 fn verifyExclusionMergeBaseReuse(
     allocator: std.mem.Allocator,
     io: std.Io,
