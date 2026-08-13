@@ -773,6 +773,12 @@ pub fn synchronizeManaged(
         };
         return error.ManagedWorktreeRefreshFailed;
     };
+    retireRemovedSubmoduleArtifacts(allocator, io, custody.path()) catch {
+        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
+            return error.ManagedWorktreeRollbackFailed;
+        };
+        return error.ManagedWorktreeRefreshFailed;
+    };
     const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
         rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
@@ -840,6 +846,24 @@ fn runSubmoduleReconciliationBounded(
         termination_grace_ms,
         error.ManagedSubmoduleReconciliationTimedOut,
     );
+}
+
+fn retireRemovedSubmoduleArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    const clean = try runGitCommand(
+        allocator,
+        io,
+        root,
+        &.{ "git", "clean", "-ffdqx" },
+    );
+    defer allocator.free(clean.stdout);
+    defer allocator.free(clean.stderr);
+    if (clean.term != .exited or clean.term.exited != 0) {
+        return error.ManagedSubmoduleRetirementFailed;
+    }
 }
 
 fn rollbackManagedTransition(

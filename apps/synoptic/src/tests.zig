@@ -3854,6 +3854,60 @@ test "worktree integrity managed refresh reconciles initialized submodules" {
     try std.testing.expectEqualStrings(second.root(), baseline.head_oid);
 }
 
+test "worktree integrity managed refresh retires removed initialized submodules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const leaf = try std.fs.path.join(allocator, &.{ root, "leaf" });
+    defer allocator.free(leaf);
+    const middle = try std.fs.path.join(allocator, &.{ root, "middle" });
+    defer allocator.free(middle);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    try prepareNestedSubmoduleFixture(allocator, io, leaf, middle, managed);
+    const first_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(first_raw);
+    const first = std.mem.trim(u8, first_raw, "\r\n");
+    allocator.free(try runGit(allocator, io, managed, &.{ "git", "rm", "-fq", "module" }));
+    try commitFixtureRepository(allocator, io, managed, "remove module");
+    const second_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(second_raw);
+    const second = std.mem.trim(u8, second_raw, "\r\n");
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "checkout", "-q", "--detach", first },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "submodule", "update", "--checkout", "--recursive" },
+    ));
+    var baseline = try worktree.Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    try worktree.synchronizeManaged(
+        allocator,
+        io,
+        .{ .managed = managed },
+        managed,
+        second,
+        &baseline,
+        null,
+    );
+    const removed_module = try std.fs.path.join(allocator, &.{ managed, "module" });
+    defer allocator.free(removed_module);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, removed_module, .{}),
+    );
+    try std.testing.expectEqualStrings(second, baseline.head_oid);
+}
+
 const NestedGeneration = struct {
     root_raw: []u8,
     middle_raw: []u8,
