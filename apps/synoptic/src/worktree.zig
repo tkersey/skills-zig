@@ -378,6 +378,7 @@ pub fn isClean(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !bool 
     const status = try statusAlloc(allocator, io, cwd);
     defer allocator.free(status);
     if (status.len != 0) return false;
+    if (try hasSpecialIndexState(allocator, io, cwd)) return false;
     var artifacts: std.ArrayList([]u8) = .empty;
     defer {
         for (artifacts.items) |path| allocator.free(path);
@@ -1014,6 +1015,14 @@ fn trackedDigest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![32
         error.WorktreeDigestFailed,
     );
     defer allocator.free(identity);
+    const index_state = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "ls-files", "-v", "-z" },
+        error.WorktreeDigestFailed,
+    );
+    defer allocator.free(index_state);
     const diff = try gitOutput(
         allocator,
         io,
@@ -1033,12 +1042,36 @@ fn trackedDigest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![32
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(identity);
     hash.update(&.{0});
+    hash.update(index_state);
+    hash.update(&.{0});
     hash.update(diff);
     hash.update(&.{0});
     hash.update(cached);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
+}
+
+fn hasSpecialIndexState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+) !bool {
+    const index_state = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "ls-files", "-v", "-z" },
+        error.WorktreeDigestFailed,
+    );
+    defer allocator.free(index_state);
+    var records = std.mem.splitScalar(u8, index_state, 0);
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        const tag = record[0];
+        if (tag == 'S' or std.ascii.isLower(tag)) return true;
+    }
+    return false;
 }
 
 fn listArtifacts(
@@ -1431,6 +1464,56 @@ test "custody makes destructive policy explicit" {
 }
 test "reused checkout can never be cleanup target" {
     try std.testing.expect(!cleanupAllowed(.{ .reused_current = "/user" }));
+}
+
+test "reused checkout rejects index-hidden tracked drift" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "head\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
+
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "update-index", "--assume-unchanged", "tracked.txt" },
+        error.TestGitFailed,
+    ));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "hidden\n" });
+    try std.testing.expect(!try isClean(io, allocator, root));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "update-index", "--no-assume-unchanged", "tracked.txt" },
+        error.TestGitFailed,
+    ));
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "restore", "tracked.txt" },
+        error.TestGitFailed,
+    ));
+
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        root,
+        &.{ "git", "update-index", "--skip-worktree", "tracked.txt" },
+        error.TestGitFailed,
+    ));
+    try std.testing.expect(!try isClean(io, allocator, root));
 }
 
 test "worktree integrity authoritative git child receives no repository selector environment" {
