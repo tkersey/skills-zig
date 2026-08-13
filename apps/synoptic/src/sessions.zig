@@ -2972,33 +2972,54 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
 
 fn isGithubEffectObject(object: []const u8) bool {
     if (isLocalDiscourseObject(object)) return false;
-    const explicit_destination = containsWordAnyIgnoreCase(object, &.{
-        "pull request", "this pr", "the pr", "pr #", "github", "graphql",
-    });
-    if (explicit_destination) return true;
+    if (isExplicitGithubDestination(object)) return true;
     const target = trimActionObjectArticles(object);
     if (startsWordAnyIgnoreCase(target, &.{
         "label", "reviewer", "assignee", "milestone", "mark viewed",
     })) return true;
+    if (endsWordAnyIgnoreCase(target, &.{
+        "label",     "labels",     "reviewer", "reviewers", "assignee", "assignees",
+        "milestone", "milestones",
+    })) return true;
     return isPreparedGithubEffect(object);
+}
+
+fn isExplicitGithubDestination(object: []const u8) bool {
+    const target = trimActionObjectArticles(object);
+    if (startsWordAnyIgnoreCase(target, &.{
+        "pull request", "pr", "github", "graphql",
+    })) return true;
+    return containsGithubDestination(object);
 }
 
 fn isLocalDiscourseObject(object: []const u8) bool {
     const target = std.mem.trim(u8, object, " \t\r\n,;.!?");
-    if (startsAnyIgnoreCase(target, &.{
-        "summary",      "the summary",      "your summary",
-        "response",     "the response",     "your response",
-        "analysis",     "the analysis",     "your analysis",
-        "output",       "the output",       "your output",
-        "conversation", "the conversation", "this conversation",
-    })) return true;
-    return containsAnyIgnoreCase(target, &.{
-        "from your summary",      "in your summary",      "from the summary",  "in the summary",
-        "from your response",     "in your response",     "from the response", "in the response",
-        "from your analysis",     "in your analysis",     "from your output",  "in your output",
-        "from this conversation", "in this conversation", "to your summary",   "to the summary",
-        "to your response",       "to the response",      "to your analysis",  "to your output",
-        "to this conversation",   "to the conversation",
+    if (startsLocalDiscourseHead(target)) return true;
+    for ([_][]const u8{ "from", "in", "to" }) |preposition| {
+        var offset: usize = 0;
+        while (offset < target.len) {
+            const relative = indexOfWordIgnoreCase(target[offset..], preposition) orelse break;
+            const after = offset + relative + preposition.len;
+            if (startsLocalDiscourseHead(target[after..])) return true;
+            offset = after;
+        }
+    }
+    return false;
+}
+
+fn startsLocalDiscourseHead(text: []const u8) bool {
+    var target = trimActionObjectArticles(text);
+    for ([_][]const u8{ "your ", "my ", "our " }) |prefix| {
+        if (target.len >= prefix.len and
+            std.ascii.eqlIgnoreCase(target[0..prefix.len], prefix))
+        {
+            target = trimActionObjectArticles(target[prefix.len..]);
+            break;
+        }
+    }
+    return startsWordAnyIgnoreCase(target, &.{
+        "summary", "response", "analysis", "output", "conversation", "chat",
+        "message", "answer",
     });
 }
 
@@ -3115,6 +3136,17 @@ fn startsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
     for (words) |word| {
         if (text.len < word.len or !std.ascii.eqlIgnoreCase(text[0..word.len], word)) continue;
         if (text.len == word.len or !std.ascii.isAlphanumeric(text[word.len])) return true;
+    }
+    return false;
+}
+
+fn endsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
+    const target = std.mem.trim(u8, text, " \t\r\n,;.!?");
+    for (words) |word| {
+        if (target.len < word.len) continue;
+        const start = target.len - word.len;
+        if (!std.ascii.eqlIgnoreCase(target[start..], word)) continue;
+        if (start == 0 or !std.ascii.isAlphanumeric(target[start - 1])) return true;
     }
     return false;
 }
@@ -3667,6 +3699,30 @@ test "prepare authority distinguishes effects from informational artifacts" {
         HumanAuthority.github_any,
         classifyHumanInstruction("Prepare an inline comment").?,
     );
+}
+
+test "GitHub authority uses direct destinations and terminal action object heads" {
+    for ([_][]const u8{
+        "Update the documentation about pull request parsing",
+        "Update the documentation about GitHub parsing",
+        "Delete the note from your chat",
+        "Remove the explanation from the message",
+        "Update this answer with review context",
+    }) |local_instruction| {
+        try std.testing.expect(classifyHumanInstruction(local_instruction) == null);
+    }
+    for ([_][]const u8{
+        "Update the title on this pull request",
+        "Add the bug label",
+        "Set the v1 milestone",
+        "Request Alice as reviewer",
+        "Remove Bob as assignee",
+    }) |github_instruction| {
+        try std.testing.expectEqual(
+            HumanAuthority.github_any,
+            classifyHumanInstruction(github_instruction).?,
+        );
+    }
 }
 
 test "session context unresolved-thread search uses current renamed path" {
