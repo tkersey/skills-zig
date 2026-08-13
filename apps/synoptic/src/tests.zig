@@ -3614,6 +3614,8 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
     defer allocator.free(nested_tracked);
     const nested_root = try std.fs.path.join(allocator, &.{ managed, "module", "nested" });
     defer allocator.free(nested_root);
+    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
+    defer allocator.free(leaf_tracked);
     const tracked_contents = try runGit(
         allocator,
         io,
@@ -3622,6 +3624,18 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
     );
     defer allocator.free(tracked_contents);
     try std.testing.expectEqualStrings("tracked.txt\n", tracked_contents);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "later\n" });
+    try commitFixtureRepository(allocator, io, leaf, "later leaf");
+    allocator.free(try runGit(allocator, io, nested_root, &.{ "git", "fetch", "-q", "origin" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        nested_root,
+        &.{ "git", "checkout", "-q", "FETCH_HEAD" },
+    ));
+    const middle_root = try std.fs.path.join(allocator, &.{ managed, "module" });
+    defer allocator.free(middle_root);
+    allocator.free(try runGit(allocator, io, middle_root, &.{ "git", "add", "nested" }));
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nested_tracked, .data = "changed\n" });
     const nested_artifact = try std.fs.path.join(
         allocator,

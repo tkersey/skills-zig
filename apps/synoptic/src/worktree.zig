@@ -1045,8 +1045,8 @@ fn cleanInitializedSubmodules(
     var index: usize = 0;
     while (index < targets.items.len) : (index += 1) {
         const target = targets.items[index];
-        try appendInitializedSubmodules(allocator, io, target.path, &targets);
         try restoreSubmodule(allocator, io, target);
+        try appendInitializedSubmodules(allocator, io, target.path, &targets);
         try cleanSubmoduleArtifacts(allocator, io, target.path);
     }
     for (targets.items) |target| try verifyCleanSubmodule(allocator, io, target);
