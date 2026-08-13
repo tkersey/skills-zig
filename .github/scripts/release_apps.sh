@@ -246,18 +246,29 @@ case "$mode" in
         if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
           return
         fi
-        local change raw
+        local change hunk_text raw
         local changed_matched=0
         local context_matched=0
+        local release_safe_runtime_hunk=0
         local substantive_unknown=0
         local retired_app_deletion=0
         local has_addition=0
+        hunk_text=$(printf '%s\n' "${build_hunk[@]}")
+        if grep -Eq 'const core_json_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const cas_hook_policy_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const cas_runtime_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const synoptic_release_safe_root = b\.createModule\(' <<<"$hunk_text"; then
+          release_safe_runtime_hunk=1
+        fi
         for change in "${build_changed_lines[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
           fi
-          if classify_build_line "$raw"; then
+          if [[ "$release_safe_runtime_hunk" -eq 1 ]] &&
+             grep -Eq '^[[:space:]]*(const core_json_release_safe = b\.createModule\(\.\{|\.root_source_file = b\.path\("libs/core/src/json_helpers\.zig"\),)$' <<<"$raw"; then
+            mark_cas_runtime_consumers
+          elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1

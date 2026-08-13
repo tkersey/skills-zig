@@ -178,6 +178,11 @@ write_unknown_bare_identifier_build() {
 write_synoptic_cas_runtime_build() {
   cat >build.zig <<'EOF'
 const img_meta = "apps/img/VERSION";
+const core_json_release_safe = b.createModule(.{
+    .root_source_file = b.path("libs/core/src/json_helpers.zig"),
+    .target = target,
+    .optimize = .ReleaseSafe,
+});
 const cas_hook_policy_root = b.createModule(.{
     .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
     .target = target,
@@ -188,6 +193,16 @@ const cas_runtime_root = b.createModule(.{
     .target = target,
     .optimize = optimize,
 });
+const cas_hook_policy_release_safe = b.createModule(.{
+    .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
+    .target = target,
+    .optimize = .ReleaseSafe,
+});
+const cas_runtime_release_safe = b.createModule(.{
+    .root_source_file = b.path("libs/cas_runtime/src/root.zig"),
+    .target = target,
+    .optimize = .ReleaseSafe,
+});
 const synoptic_release_safe_root = b.createModule(.{
     .root_source_file = b.path("apps/synoptic/src/main.zig"),
     .target = target,
@@ -195,7 +210,7 @@ const synoptic_release_safe_root = b.createModule(.{
 });
 const run_cas_runtime_falsifier_tests = addTestStepWithOptions(
     b,
-    cas_runtime_root,
+    cas_runtime_release_safe,
     "test-cas-runtime-falsifiers",
     "Run CAS runtime actor falsifier tests",
     .{ .link_libc = true, .filters = &.{"actor falsifier"} },
@@ -210,6 +225,13 @@ const run_synoptic_tests = addTestStepWithOptions(
 run_synoptic_tests.step.dependOn(&synoptic_install.step);
 pub fn build() void {}
 EOF
+}
+
+write_synoptic_cas_runtime_build_with_unknown() {
+  write_synoptic_cas_runtime_build
+  sed -i.bak '/pub fn build/i\
+const unknown_release_safe_owner = b.createModule(.{});' build.zig
+  rm build.zig.bak
 }
 
 write_synoptic_formatted_build() {
@@ -362,6 +384,8 @@ assert_affected cas,synoptic write_cas_runtime_only_build
 assert_affected cas,synoptic write_cas_hook_policy_only_build
 assert_affected seq,lift,cas,synoptic,ledger,memory-note,img write_unknown_bare_identifier_build
 assert_affected cas,synoptic write_synoptic_cas_runtime_build
+assert_affected seq,lift,cas,synoptic,ledger,memory-note,img \
+  write_synoptic_cas_runtime_build_with_unknown
 assert_affected synoptic write_synoptic_formatted_build
 assert_affected synoptic write_synoptic_install_guard_build
 assert_affected ledger write_ledger_build
