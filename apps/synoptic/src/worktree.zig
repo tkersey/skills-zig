@@ -787,12 +787,37 @@ fn reconcileInitializedSubmodules(
     io: std.Io,
     root: []const u8,
 ) !void {
-    const update = try runGitCommand(
+    const term = try runSubmoduleReconciliationBounded(
         allocator,
         io,
         root,
-        &.{
+        null,
+        fetch_timeout_ms,
+        fetch_termination_grace_ms,
+    );
+    if (term != .exited or term.exited != 0) {
+        return error.ManagedSubmoduleReconciliationFailed;
+    }
+}
+
+fn runSubmoduleReconciliationBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    inherited: ?*const std.process.Environ.Map,
+    timeout_ms: u32,
+    termination_grace_ms: u32,
+) !std.process.Child.Term {
+    var environment = if (inherited) |source|
+        try source.clone(allocator)
+    else
+        std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
             "git",
+            "--no-replace-objects",
             "-c",
             "core.hooksPath=/dev/null",
             "submodule",
@@ -800,12 +825,21 @@ fn reconcileInitializedSubmodules(
             "--checkout",
             "--recursive",
         },
+        .cwd = .{ .path = root },
+        .environ_map = &environment,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    return waitBoundedProcess(
+        allocator,
+        io,
+        &child,
+        timeout_ms,
+        termination_grace_ms,
+        error.ManagedSubmoduleReconciliationTimedOut,
     );
-    defer allocator.free(update.stdout);
-    defer allocator.free(update.stderr);
-    if (update.term != .exited or update.term.exited != 0) {
-        return error.ManagedSubmoduleReconciliationFailed;
-    }
 }
 
 fn rollbackManagedTransition(
@@ -1562,13 +1596,31 @@ fn runFetchBounded(
     operation: FetchOperation,
 ) !std.process.Child.Term {
     var child = try spawnFetchProcess(allocator, io, cwd, source, operation);
+    return waitBoundedProcess(
+        allocator,
+        io,
+        &child,
+        source.timeout_ms,
+        source.termination_grace_ms,
+        error.GitFetchTimedOut,
+    );
+}
+
+fn waitBoundedProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    timeout_ms: u32,
+    termination_grace_ms: u32,
+    timeout_error: anyerror,
+) !std.process.Child.Term {
     var waited = false;
-    const pid: std.posix.pid_t = @intCast(child.id orelse return error.GitFetchProcessFailed);
-    errdefer terminateFetchProcess(io, &child, pid, &waited);
+    const pid: std.posix.pid_t = @intCast(child.id orelse return error.BoundedProcessFailed);
+    errdefer terminateFetchProcess(io, child, pid, &waited);
     var watchdog = FetchWatchdog{
         .pid = pid,
-        .timeout_ms = source.timeout_ms,
-        .termination_grace_ms = source.termination_grace_ms,
+        .timeout_ms = timeout_ms,
+        .termination_grace_ms = termination_grace_ms,
     };
     const watchdog_thread = try std.Thread.spawn(.{}, FetchWatchdog.run, .{&watchdog});
     defer {
@@ -1602,7 +1654,7 @@ fn runFetchBounded(
         .{&stderr_capture},
     ) catch |err| {
         stderr_capture.file.close(io);
-        terminateFetchProcess(io, &child, pid, &waited);
+        terminateFetchProcess(io, child, pid, &waited);
         stdout_thread.join();
         return err;
     };
@@ -1614,7 +1666,7 @@ fn runFetchBounded(
     if (stderr_capture.failure) |err| return err;
     const term = try child.wait(io);
     waited = true;
-    if (watchdog.expired.load(.acquire)) return error.GitFetchTimedOut;
+    if (watchdog.expired.load(.acquire)) return timeout_error;
     return term;
 }
 
@@ -1830,6 +1882,7 @@ test "effective fetch environment isolates selectors and projects credentials" {
         effective.get("GIT_CONFIG_VALUE_1").?,
     );
 }
+
 test "reused checkout can never be cleanup target" {
     try std.testing.expect(!cleanupAllowed(.{ .reused_current = "/user" }));
 }
