@@ -52,6 +52,20 @@ test "lifecycle identity uses exact native argument order" {
     ));
 }
 
+test "runtime root classification binds the canonical filesystem identity" {
+    const source = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "realPathFileAlloc(io, configured, allocator)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "std.mem.eql(u8, canonical, \"/\")",
+    ) != null);
+}
+
 test "authoritative tools require the instruction-owned capability" {
     try std.testing.expect(std.mem.indexOf(
         u8,

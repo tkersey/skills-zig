@@ -162,7 +162,7 @@ fn launch(
     try config.validateManifest(allocator, io, options.skill_root);
     var settings = try config.Settings.load(allocator, io, environment, options.skill_root);
     defer settings.deinit();
-    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    const runtime_root = try runtimeRootAlloc(allocator, io, environment);
     defer allocator.free(runtime_root);
     try ensurePrivateDir(io, runtime_root);
     const claim_path = try std.fs.path.join(allocator, &.{ runtime_root, "launch.lock" });
@@ -1759,7 +1759,7 @@ fn status(
     args: []const []const u8,
 ) !void {
     const json = try parseJsonOnly(args);
-    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    const runtime_root = try runtimeRootAlloc(allocator, io, environment);
     defer allocator.free(runtime_root);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
@@ -1806,7 +1806,7 @@ fn stop(
     args: []const []const u8,
 ) !void {
     const json = try parseJsonOnly(args);
-    const runtime_root = try runtimeRootAlloc(allocator, environment);
+    const runtime_root = try runtimeRootAlloc(allocator, io, environment);
     defer allocator.free(runtime_root);
     try ensurePrivateDir(io, runtime_root);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
@@ -2071,17 +2071,26 @@ fn parseJsonOnly(args: []const []const u8) !bool {
 
 fn runtimeRootAlloc(
     allocator: std.mem.Allocator,
+    io: std.Io,
     environment: *const std.process.Environ.Map,
 ) ![]u8 {
     const configured = environment.get("TMPDIR") orelse "/tmp";
-    const normalized = std.mem.trimEnd(u8, configured, "/");
-    const shared = std.mem.eql(u8, normalized, "/tmp") or
-        std.mem.eql(u8, normalized, "/private/tmp");
-    if (configured.len == 0 or !std.fs.path.isAbsolute(configured) or shared) {
-        return std.fmt.allocPrint(allocator, "/tmp/synoptic-{d}", .{std.c.getuid()});
+    if (configured.len == 0 or !std.fs.path.isAbsolute(configured)) {
+        return privateFallbackRuntimeRootAlloc(allocator);
     }
-    const root = configured;
-    return std.fs.path.join(allocator, &.{ root, "synoptic" });
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, configured, allocator) catch {
+        return privateFallbackRuntimeRootAlloc(allocator);
+    };
+    defer allocator.free(canonical);
+    const shared = std.mem.eql(u8, canonical, "/") or
+        std.mem.eql(u8, canonical, "/tmp") or
+        std.mem.eql(u8, canonical, "/private/tmp");
+    if (shared) return privateFallbackRuntimeRootAlloc(allocator);
+    return std.fs.path.join(allocator, &.{ canonical, "synoptic" });
+}
+
+fn privateFallbackRuntimeRootAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/tmp/synoptic-{d}", .{std.c.getuid()});
 }
 
 fn ensurePrivateDir(io: std.Io, path: []const u8) !void {
@@ -2888,11 +2897,12 @@ test "lifecycle commands distinguish missing and unreadable ownership records" {
 }
 test "runtime root falls back when TMPDIR is empty or relative" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     for ([_][]const u8{ "", "relative/tmp" }) |configured| {
         try environment.put("TMPDIR", configured);
-        const root = try runtimeRootAlloc(allocator, &environment);
+        const root = try runtimeRootAlloc(allocator, io, &environment);
         defer allocator.free(root);
         const expected = try std.fmt.allocPrint(
             allocator,
@@ -2902,20 +2912,32 @@ test "runtime root falls back when TMPDIR is empty or relative" {
         defer allocator.free(expected);
         try std.testing.expectEqualStrings(expected, root);
     }
-    try environment.put("TMPDIR", "/private/tmp");
-    const shared = try runtimeRootAlloc(allocator, &environment);
-    defer allocator.free(shared);
+    for ([_][]const u8{ "/tmp", "/tmp/.", "/private/tmp/../tmp", "/" }) |alias| {
+        try environment.put("TMPDIR", alias);
+        const shared = try runtimeRootAlloc(allocator, io, &environment);
+        defer allocator.free(shared);
+        const shared_expected = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/synoptic-{d}",
+            .{std.c.getuid()},
+        );
+        defer allocator.free(shared_expected);
+        try std.testing.expectEqualStrings(shared_expected, shared);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private_tmp = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(private_tmp);
+    try environment.put("TMPDIR", private_tmp);
+    const configured = try runtimeRootAlloc(allocator, io, &environment);
+    defer allocator.free(configured);
     const shared_expected = try std.fmt.allocPrint(
         allocator,
-        "/tmp/synoptic-{d}",
-        .{std.c.getuid()},
+        "{s}/synoptic",
+        .{private_tmp},
     );
     defer allocator.free(shared_expected);
-    try std.testing.expectEqualStrings(shared_expected, shared);
-    try environment.put("TMPDIR", "/private/tmp/custom");
-    const configured = try runtimeRootAlloc(allocator, &environment);
-    defer allocator.free(configured);
-    try std.testing.expectEqualStrings("/private/tmp/custom/synoptic", configured);
+    try std.testing.expectEqualStrings(shared_expected, configured);
 }
 test "terminal shutdown retains its lifecycle record for later retirement" {
     const allocator = std.testing.allocator;
