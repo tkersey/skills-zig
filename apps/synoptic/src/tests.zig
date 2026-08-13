@@ -720,22 +720,23 @@ test "falsifier initial review cannot prepare action" {
     try std.testing.expect(!tools.initialReviewMayPrepareAction(true, true));
 }
 
-test "human authority is installed only after turn admission" {
+test "human authority is correlated with turn admission" {
     const source = @embedFile("sessions.zig");
-    const request = std.mem.indexOf(
+    try std.testing.expect(std.mem.indexOf(
         u8,
         source,
-        "const response = actor.requestJson(method, params, null)",
-    ) orelse return error.MissingTurnRequest;
-    const revoke = std.mem.lastIndexOf(u8, source[0..request], "clearHumanInstruction") orelse
-        return error.MissingAuthorityRevocation;
-    const grant_offset = std.mem.indexOf(
+        "try self.beginHumanInstruction(session_id, text);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
         u8,
-        source[request..],
-        "try self.markHumanInstruction(session_id, text);",
-    ) orelse return error.MissingAuthorityGrant;
-    try std.testing.expect(revoke < request);
-    try std.testing.expect(request < request + grant_offset);
+        source,
+        "self.awaitAuthorityAdmissionLocked(origin_thread);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "session.human_authority_admission == .admitted",
+    ) != null);
 }
 
 test "falsifier action tool is rejected during initial review" {
@@ -3478,6 +3479,7 @@ test "file session interrupt revokes governing action authority before RPC" {
     registry.sessions.items[0].turn_id = try allocator.dupe(u8, "fail-interrupt");
     registry.sessions.items[0].turn_active = true;
     registry.sessions.items[0].human_authority = .github_any;
+    registry.sessions.items[0].human_authority_admission = .admitted;
     try std.testing.expectError(error.RequestFailed, registry.interrupt(opened.session_id));
     try std.testing.expect(registry.sessions.items[0].human_authority == null);
     const log_path = try std.fmt.allocPrint(allocator, "{s}.log", .{paths.codex});
