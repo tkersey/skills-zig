@@ -270,6 +270,7 @@ const RegistryMutex = struct {
 const TurnRef = struct { thread: []u8, turn: []u8 };
 const ReservedAuthoritative = struct {
     session_id: []u8,
+    claimed_authority: HumanAuthority,
     visible_event: VisibleEvent,
     reserved_bytes: usize,
     handler: AuthoritativeToolHandler,
@@ -2140,6 +2141,7 @@ pub const Registry = struct {
             admission.handler,
             admission.visible_event,
             admission.reserved_bytes,
+            admission.claimed_authority,
             event_kind,
             raw_json,
             admission.session_id,
@@ -2184,10 +2186,13 @@ pub const Registry = struct {
                 self.visible_events.items.len + self.authoritative_reservations + 1,
             );
             const session_id = try self.allocator.dupe(u8, session.id);
+            const claimed_authority = session.human_authority.?;
+            session.human_authority = null;
             self.authoritative_reservations += 1;
             self.authoritative_reserved_bytes += reserved_bytes;
             return .{
                 .session_id = session_id,
+                .claimed_authority = claimed_authority,
                 .visible_event = event,
                 .reserved_bytes = reserved_bytes,
                 .handler = handler,
@@ -2212,6 +2217,7 @@ pub const Registry = struct {
         handler: AuthoritativeToolHandler,
         visible_event: VisibleEvent,
         reserved_bytes: usize,
+        claimed_authority: HumanAuthority,
         event_kind: []const u8,
         raw_json: []const u8,
         session_id: []const u8,
@@ -2227,7 +2233,11 @@ pub const Registry = struct {
             session_id,
             self.allocator,
         ) catch |err| {
-            self.releaseAuthoritativeReservation(reserved_bytes);
+            self.restoreAuthoritativeReservation(
+                session_id,
+                claimed_authority,
+                reserved_bytes,
+            );
             return authoritativeFailureAlloc(allocator, err);
         };
         if (receipt_json.len > max_authoritative_receipt_bytes) {
@@ -2247,15 +2257,34 @@ pub const Registry = struct {
         if (std.mem.eql(u8, event_kind, "session.close.requested")) {
             return allocator.dupe(u8, accepted_domain_response);
         }
-        for (self.sessions.items) |*session| if (std.mem.eql(
+        for (self.sessions.items) |session| if (std.mem.eql(
             u8,
             session.id,
             session_id,
         )) {
-            session.human_authority = null;
             return allocator.dupe(u8, accepted_domain_response);
         };
         return allocator.dupe(u8, missing_origin_response);
+    }
+
+    fn restoreAuthoritativeReservation(
+        self: *Registry,
+        session_id: []const u8,
+        authority: HumanAuthority,
+        reserved_bytes: usize,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.sessions.items) |*session| {
+            if (std.mem.eql(u8, session.id, session_id) and
+                session.status != .closed and session.human_authority == null)
+            {
+                session.human_authority = authority;
+                break;
+            }
+        }
+        self.authoritative_reservations -= 1;
+        self.authoritative_reserved_bytes -= reserved_bytes;
     }
 
     fn releaseAuthoritativeReservation(self: *Registry, reserved_bytes: usize) void {
@@ -2924,7 +2953,7 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         return .github_any;
     }
     if (actionObjectAfterVerb(directive, &.{"prepare"})) |object| {
-        const positive = positiveObjectBeforeNegation(object) orelse return null;
+        const positive = positiveGithubObject(object) orelse return null;
         return if (isPreparedGithubEffect(positive)) .github_any else null;
     }
     const action_object = actionObjectAfterVerb(directive, &.{
@@ -2933,7 +2962,7 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         "delete",  "unmark", "mark",  "post",    "publish",
     });
     const positive_object = if (action_object) |object|
-        positiveObjectBeforeNegation(object)
+        positiveGithubObject(object)
     else
         null;
     const github_target = positive_object != null and isGithubEffectObject(positive_object.?);
@@ -3001,6 +3030,46 @@ fn positiveObjectBeforeNegation(object: []const u8) ?[]const u8 {
     }
     const positive = std.mem.trim(u8, object[0..end], " \t\r\n,;.!?");
     return if (positive.len == 0) null else positive;
+}
+
+fn positiveGithubObject(object: []const u8) ?[]const u8 {
+    if (negatesGithubDestination(object)) return null;
+    return positiveObjectBeforeNegation(object);
+}
+
+fn negatesGithubDestination(object: []const u8) bool {
+    var negation_end: ?usize = null;
+    for ([_][]const u8{
+        " but do not ", " but don't ", " without ", " except ",
+        " not ",        " no ",        " never ",   " do not ",
+        " don't ",
+    }) |marker| {
+        if (indexOfIgnoreCase(object, marker)) |index| {
+            const candidate = index + marker.len;
+            if (negation_end == null or candidate < negation_end.?) {
+                negation_end = candidate;
+            }
+        }
+    }
+    const remainder = std.mem.trim(
+        u8,
+        object[negation_end orelse return false ..],
+        " \t\r\n,;.!?",
+    );
+    for ([_][]const u8{ "on", "to", "in", "at" }) |preposition| {
+        if (remainder.len <= preposition.len or
+            !std.ascii.eqlIgnoreCase(remainder[0..preposition.len], preposition) or
+            std.ascii.isAlphanumeric(remainder[preposition.len])) continue;
+        const destination = std.mem.trim(
+            u8,
+            remainder[preposition.len..],
+            " \t\r\n,;.!?",
+        );
+        return startsWordAnyIgnoreCase(destination, &.{
+            "github", "pull request", "this pr", "the pr", "pr",
+        });
+    }
+    return false;
 }
 
 fn actionObjectAfterVerb(text: []const u8, verbs: []const []const u8) ?[]const u8 {
@@ -3513,6 +3582,16 @@ test "explicit broad GitHub operation grants generic action authority without or
         HumanAuthority.github_any,
         classifyHumanInstruction("Could you add this label?").?,
     );
+    try std.testing.expect(classifyHumanInstruction(
+        "Post a comment not on GitHub",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Post a comment, but not on this pull request",
+    ) == null);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        classifyHumanInstruction("Post a GitHub comment without changing labels").?,
+    );
 }
 
 test "prepare authority distinguishes effects from informational artifacts" {
@@ -3900,6 +3979,21 @@ fn acceptTestAuthoritativeTool(
     return allocator.dupe(u8, "{\"cardId\":\"act-test\"}");
 }
 
+fn rejectTestAuthoritativeTool(
+    raw_context: *anyopaque,
+    event_kind: []const u8,
+    raw_json: []const u8,
+    session_id: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    _ = raw_context;
+    _ = event_kind;
+    _ = raw_json;
+    _ = session_id;
+    _ = allocator;
+    return error.IntentionalTestFailure;
+}
+
 fn closeTestAuthoritativeTool(
     raw_context: *anyopaque,
     event_kind: []const u8,
@@ -3934,6 +4028,75 @@ test "dynamic tool dispatch binds the exact parsed tool name" {
     try std.testing.expectEqualStrings(
         "{\"cardId\":\"act-test\"}",
         registry.visible_events.items[0].raw_json,
+    );
+}
+
+test "authoritative reservation claims one human grant exactly once" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].human_authority = .github_any;
+    var calls: usize = 0;
+    try registry.setAuthoritativeToolHandler(.{
+        .context = &calls,
+        .handle = acceptTestAuthoritativeTool,
+    });
+
+    registry.mutex.lock();
+    const first = try registry.reserveAuthoritativeLocked(
+        "file-1",
+        .github_any,
+        "action.prepared",
+        exact_tool_test_request,
+        std.testing.allocator,
+    );
+    const second = try registry.reserveAuthoritativeLocked(
+        "file-1",
+        .github_any,
+        "action.prepared",
+        exact_tool_test_request,
+        std.testing.allocator,
+    );
+    registry.mutex.unlock();
+    try std.testing.expect(first != null);
+    try std.testing.expect(second == null);
+    try std.testing.expect(registry.sessions.items[0].human_authority == null);
+
+    const admission = first.?;
+    defer std.testing.allocator.free(admission.session_id);
+    const response = try registry.executeAuthoritative(
+        admission.handler,
+        admission.visible_event,
+        admission.reserved_bytes,
+        admission.claimed_authority,
+        "action.prepared",
+        exact_tool_test_request,
+        admission.session_id,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(accepted_domain_response, response);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "failed authoritative handler restores its claimed human grant" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.sessions.items[0].human_authority = .github_any;
+    try registry.setAuthoritativeToolHandler(.{
+        .context = &registry,
+        .handle = rejectTestAuthoritativeTool,
+    });
+    const response = try registry.handleToolCall(
+        exact_tool_test_request,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "decline") != null);
+    try std.testing.expectEqual(
+        HumanAuthority.github_any,
+        registry.sessions.items[0].human_authority.?,
     );
 }
 
