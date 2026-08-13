@@ -3881,32 +3881,10 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
         commits.base,
     );
     defer allocator.free(unrelated_witness);
-    const missing = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "cat-file", "-e", commits.head },
-        .cwd = .{ .path = consumer },
-    });
-    defer allocator.free(missing.stdout);
-    defer allocator.free(missing.stderr);
-    try std.testing.expect(missing.term != .exited or missing.term.exited != 0);
-
-    var fetch_source = try worktree.FetchSource.resolve(
-        allocator,
-        io,
-        &environment,
-        consumer,
-        "github.example.test",
-        "owner",
-        "repo",
-    );
+    try expectObjectMissing(allocator, io, consumer, commits.head);
+    var fetch_source = try resolveFixtureFetchSource(allocator, io, &environment, consumer);
     defer fetch_source.deinit();
-    try std.testing.expectEqualStrings("target", fetch_source.remote_name);
-    try std.testing.expectEqualStrings(
-        "https://github.example.test/owner/repo.git",
-        fetch_source.remote_url,
-    );
-    try std.testing.expectEqualStrings("github.example.test", fetch_source.repository_host);
-    try std.testing.expectEqualStrings("owner", fetch_source.repository_owner);
-    try std.testing.expectEqualStrings("repo", fetch_source.repository_name);
+    try expectFixtureFetchSource(fetch_source);
     try configureFetchRemoteCollision(allocator, io, consumer);
     try worktree.ensureObjectAvailable(allocator, io, consumer, fetch_source, commits.head);
     allocator.free(try runGit(
@@ -3943,6 +3921,49 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
     );
 }
 
+fn expectObjectMissing(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    consumer: []const u8,
+    oid: []const u8,
+) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "cat-file", "-e", oid },
+        .cwd = .{ .path = consumer },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expect(result.term != .exited or result.term.exited != 0);
+}
+
+fn resolveFixtureFetchSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    consumer: []const u8,
+) !worktree.FetchSource {
+    return worktree.FetchSource.resolve(
+        allocator,
+        io,
+        environment,
+        consumer,
+        "github.example.test",
+        "owner",
+        "repo",
+    );
+}
+
+fn expectFixtureFetchSource(source: worktree.FetchSource) !void {
+    try std.testing.expectEqualStrings("target", source.remote_name);
+    try std.testing.expectEqualStrings(
+        "https://github.example.test/owner/repo.git",
+        source.remote_url,
+    );
+    try std.testing.expectEqualStrings("github.example.test", source.repository_host);
+    try std.testing.expectEqualStrings("owner", source.repository_owner);
+    try std.testing.expectEqualStrings("repo", source.repository_name);
+}
+
 test "worktree integrity fetch source rejects option names and multiple URLs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3953,70 +3974,43 @@ test "worktree integrity fetch source rejects option names and multiple URLs" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     allocator.free(try runGit(allocator, io, root, &.{ "git", "init", "-q" }));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        root,
-        &.{
-            "git",
-            "config",
-            "remote.--upload-pack.url",
-            "https://github.example.test/owner/repo.git",
-        },
-    ));
-    try std.testing.expectError(
-        error.GitFetchSourceUnavailable,
-        worktree.FetchSource.resolve(
-            allocator,
-            io,
-            &environment,
-            root,
-            "github.example.test",
-            "owner",
-            "repo",
-        ),
-    );
+    try configureOptionLikeRemote(allocator, io, root);
+    try expectFixtureFetchSourceRejected(allocator, io, &environment, root);
     allocator.free(try runGit(
         allocator,
         io,
         root,
         &.{ "git", "config", "--unset-all", "remote.--upload-pack.url" },
     ));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        root,
-        &.{
-            "git",
-            "config",
-            "--add",
-            "remote.target.url",
-            "https://redirect.invalid/wrong.git",
-        },
-    ));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        root,
-        &.{
-            "git",
-            "config",
-            "--add",
-            "remote.target.url",
-            "https://github.example.test/owner/repo.git",
-        },
-    ));
+    try configureMultipleRemoteUrls(allocator, io, root);
+    try expectFixtureFetchSourceRejected(allocator, io, &environment, root);
+}
+
+fn configureOptionLikeRemote(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    allocator.free(try runGit(allocator, io, root, &.{
+        "git",                                        "config", "remote.--upload-pack.url",
+        "https://github.example.test/owner/repo.git",
+    }));
+}
+
+fn configureMultipleRemoteUrls(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    for ([_][]const u8{
+        "https://redirect.invalid/wrong.git",
+        "https://github.example.test/owner/repo.git",
+    }) |url| allocator.free(try runGit(allocator, io, root, &.{
+        "git", "config", "--add", "remote.target.url", url,
+    }));
+}
+
+fn expectFixtureFetchSourceRejected(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+) !void {
     try std.testing.expectError(
         error.GitFetchSourceUnavailable,
-        worktree.FetchSource.resolve(
-            allocator,
-            io,
-            &environment,
-            root,
-            "github.example.test",
-            "owner",
-            "repo",
-        ),
+        resolveFixtureFetchSource(allocator, io, environment, root),
     );
 }
 
