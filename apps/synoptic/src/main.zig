@@ -630,6 +630,7 @@ fn serveValidatedReview(
     try preflightGhAuthentication(
         allocator,
         io,
+        environment,
         gh_resolved,
         options.cwd,
         options.pr,
@@ -2350,17 +2351,8 @@ fn resolveSelectorUrl(
         "--jq",
         ".url",
     } else &.{ gh_path, "pr", "view", "--json", "url", "--jq", ".url" };
-    var environment = try inherited_environment.clone(allocator);
+    var environment = try sanitizedSelectorEnvironment(allocator, inherited_environment);
     defer environment.deinit();
-    inline for (.{
-        "GH_REPO",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_WORK_TREE",
-    }) |key| _ = environment.swapRemove(key);
     const result = try std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
@@ -2372,9 +2364,30 @@ fn resolveSelectorUrl(
     return allocator.dupe(u8, std.mem.trim(u8, result.stdout, "\r\n"));
 }
 
-fn preflightGhAuthentication(
+fn sanitizedSelectorEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: *const std.process.Environ.Map,
+) !std.process.Environ.Map {
+    var environment = try inherited.clone(allocator);
+    inline for (.{
+        "GH_REPO",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }) |key| _ = environment.swapRemove(key);
+    return environment;
+}
+
+pub fn preflightGhAuthentication(
     allocator: std.mem.Allocator,
     io: std.Io,
+    inherited_environment: *const std.process.Environ.Map,
     gh_path: []const u8,
     cwd: []const u8,
     selector: ?[]const u8,
@@ -2383,7 +2396,7 @@ fn preflightGhAuthentication(
         const identity = try pr.parseUrl(value);
         return requireGhAuthentication(allocator, io, gh_path, identity.host);
     };
-    if (try repositoryHostAlloc(allocator, io, cwd)) |host| {
+    if (try repositoryHostAlloc(allocator, io, inherited_environment, cwd)) |host| {
         defer allocator.free(host);
         return requireGhAuthentication(allocator, io, gh_path, host);
     }
@@ -2402,10 +2415,14 @@ fn preflightGhAuthentication(
 fn repositoryHostAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
+    inherited_environment: *const std.process.Environ.Map,
     cwd: []const u8,
 ) !?[]u8 {
+    var environment = try sanitizedSelectorEnvironment(allocator, inherited_environment);
+    defer environment.deinit();
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ "git", "-C", cwd, "config", "--get", "remote.origin.url" },
+        .environ_map = &environment,
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
