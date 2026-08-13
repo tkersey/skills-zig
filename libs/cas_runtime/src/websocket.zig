@@ -302,7 +302,10 @@ pub const Connection = struct {
 
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const frame = self.readFrameAlloc(deadline) catch |err| switch (err) {
-                error.WebSocketIdleTimeout => return err,
+                error.WebSocketIdleTimeout => {
+                    if (fragment_type != null) self.poison();
+                    return err;
+                },
                 else => {
                     self.poison();
                     return err;
@@ -1939,6 +1942,36 @@ test "websocket idle read timeout preserves a reusable connection" {
     const message = (try connection.readTextAllocTimeout(500)).?;
     defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("ok", message);
+}
+
+test "websocket timeout after a nonfinal fragment poisons the connection" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer connection.deinit();
+    var writer = server_stream.writer(io, &.{});
+    try writer.interface.writeAll(&.{ 0x01, 0x01, 'a' });
+    try writer.interface.flush();
+    try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(10));
+    try std.testing.expect(!connection.usable.load(.acquire));
+    writer.interface.writeAll(&.{ 0x80, 0x01, 'b' }) catch |write_error| switch (write_error) {
+        else => {},
+    };
+    writer.interface.flush() catch |flush_error| switch (flush_error) {
+        else => {},
+    };
+    try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
 }
 
 test "websocket HTTP upgrade shares the finite connection deadline" {
