@@ -295,6 +295,14 @@ fn invalidateActionGeneration(runtime: *Runtime) void {
     runtime.worktree_generation_valid = false;
 }
 
+fn actionValidationQuarantines(err: anyerror) bool {
+    return err == error.PullRequestChanged;
+}
+
+fn actionTerminalQuarantines(status: tools.ActionStatus) bool {
+    return status == .outcome_unknown;
+}
+
 fn requireReviewWorktree(runtime: *Runtime) !void {
     if (runtime.custody == .managed) return;
     worktree.requireReviewAdmission(
@@ -381,6 +389,19 @@ test "generation-changing actions close both stale command surfaces" {
     invalidateActionGeneration(&runtime);
     try std.testing.expect(!state.action_state_fresh);
     try std.testing.expect(!runtime.worktree_generation_valid);
+}
+
+test "action broker quarantines every uncertified action generation" {
+    try std.testing.expect(actionValidationQuarantines(error.PullRequestChanged));
+    try std.testing.expect(!actionValidationQuarantines(error.GitHubActionTargetChanged));
+    try std.testing.expect(actionTerminalQuarantines(.outcome_unknown));
+    try std.testing.expect(!actionTerminalQuarantines(.succeeded));
+    inline for (.{ "file.open", "session.message", "action.confirm" }) |command| {
+        try std.testing.expect(!commandAdmitted(.current, false, command));
+    }
+    inline for (.{ "snapshot.get", "pr.refresh", "round.finish", "app.stop" }) |command| {
+        try std.testing.expect(commandAdmitted(.current, false, command));
+    }
 }
 
 test "action broker confirmation admission rejects reused worktree drift" {
@@ -1235,6 +1256,7 @@ pub const Server = struct {
             card,
         ) catch |err| {
             if (!definitiveActionValidationFailure(err)) return err;
+            if (actionValidationQuarantines(err)) invalidateActionGeneration(runtime);
             try runtime.app.invalidateAction(card_id);
             const format = "{{\"id\":{f},\"status\":\"invalidated\",\"reason\":{f}}}";
             const status = try std.fmt.allocPrint(
@@ -1266,6 +1288,7 @@ pub const Server = struct {
             runtime.number,
             card_id,
         );
+        if (actionTerminalQuarantines(terminal)) invalidateActionGeneration(runtime);
         try self.refreshActionEvidence(runtime, terminal);
         return self.actionStatusEnvelope(runtime, card_id, terminal);
     }
@@ -1316,11 +1339,11 @@ pub const Server = struct {
                     return;
                 }
                 copyRevisionEvidence(&runtime.app.generation, &generation) catch {
-                    runtime.app.action_state_fresh = false;
+                    invalidateActionGeneration(runtime);
                     return;
                 };
                 runtime.registry.setGenerationEvidence(&generation) catch {
-                    runtime.app.action_state_fresh = false;
+                    invalidateActionGeneration(runtime);
                     return;
                 };
                 const repository = std.fmt.allocPrint(
@@ -1328,7 +1351,7 @@ pub const Server = struct {
                     "{s}/{s}",
                     .{ runtime.owner, runtime.name },
                 ) catch {
-                    runtime.app.action_state_fresh = false;
+                    invalidateActionGeneration(runtime);
                     return;
                 };
                 defer runtime.app.allocator.free(repository);
@@ -1345,13 +1368,13 @@ pub const Server = struct {
                     .state = refreshed.metadata.state,
                     .is_draft = refreshed.metadata.is_draft,
                 }) catch {
-                    runtime.app.action_state_fresh = false;
+                    invalidateActionGeneration(runtime);
                     return;
                 };
                 generation_owned = false;
                 runtime.app.action_state_fresh = true;
             } else |_| {
-                runtime.app.action_state_fresh = false;
+                invalidateActionGeneration(runtime);
             }
         }
     }

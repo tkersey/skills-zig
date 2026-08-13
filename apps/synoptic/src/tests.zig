@@ -345,6 +345,21 @@ test "session revision disambiguates replacement and renamed lineage actions" {
     try std.testing.expectEqualStrings("new.zig", historical.target.current_path);
 }
 
+test "action broker quarantined state rejects further confirmation" {
+    var state = try app.App.init(std.testing.allocator, "head");
+    defer state.deinit();
+    state.action_state_fresh = false;
+    const broker = github.Broker{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .gh_path = "unused-gh",
+    };
+    try std.testing.expectError(
+        error.GitHubStateStale,
+        state.confirmAction(broker, "o", "r", 1, "missing-card"),
+    );
+}
+
 test "action broker validates renamed session identity and GitHub identity independently" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
