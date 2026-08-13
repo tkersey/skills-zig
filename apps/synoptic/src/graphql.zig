@@ -3,7 +3,8 @@ const std = @import("std");
 pub const snapshot_query =
     "query SynopticPullRequest($owner:String!,$name:String!,$number:Int!,$after:String){" ++
     "repository(owner:$owner,name:$name){pullRequest(number:$number){id number url title body " ++
-    "state isDraft baseRefName baseRefOid headRefName headRefOid files(first:100,after:$after){" ++
+    "state isDraft baseRefName baseRefOid headRefName headRefOid " ++
+    "headRepository{nameWithOwner url} files(first:100,after:$after){" ++
     "nodes{path additions deletions changeType viewerViewedState}" ++
     "pageInfo{hasNextPage endCursor}}}}}";
 pub const threads_query =

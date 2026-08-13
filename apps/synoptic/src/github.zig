@@ -2107,6 +2107,21 @@ pub fn snapshotOptionalStringFieldAlloc(
     return objectStringAlloc(allocator, pull, field, true);
 }
 
+pub fn snapshotOptionalNestedStringFieldAlloc(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    object_field: []const u8,
+    string_field: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const pull = try pullObject(parsed.value);
+    const nested = pull.get(object_field) orelse return allocator.dupe(u8, "");
+    if (nested == .null) return allocator.dupe(u8, "");
+    if (nested != .object) return error.InvalidSnapshot;
+    return objectStringAlloc(allocator, nested.object, string_field, false);
+}
+
 pub fn snapshotBoolField(
     allocator: std.mem.Allocator,
     raw: []const u8,

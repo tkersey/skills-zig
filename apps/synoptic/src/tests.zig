@@ -4374,6 +4374,43 @@ test "worktree integrity fetch validation rejects ambient and repository rewrite
     );
 }
 
+test "worktree integrity fork head source does not fall back to base remote" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://github.example.test/base/repo.git",
+        },
+    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
+    const fork_url = "https://github.example.test/contributor/repo";
+    var source = try worktree.resolvePrHeadSource(
+        allocator,
+        io,
+        &environment,
+        root,
+        "github.example.test",
+        "contributor",
+        "repo",
+        fork_url,
+        "/tmp/configured gh",
+    );
+    defer source.deinit();
+    try std.testing.expectEqualStrings(fork_url, source.remote_name);
+    try std.testing.expectEqualStrings("", source.remote_url);
+    try std.testing.expectEqualStrings("contributor", source.repository_owner);
+}
+
 fn resolveFixtureFetchSource(
     allocator: std.mem.Allocator,
     io: std.Io,

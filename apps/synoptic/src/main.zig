@@ -699,14 +699,13 @@ fn serveResolvedPullRequest(
     defer pages.deinit();
     var snapshot = try Snapshot.load(allocator, pages.files.items[0]);
     defer snapshot.deinit();
-    var fetch_source = worktree.FetchSource.resolve(
+    var fetch_source = resolveFetchSource(
         allocator,
         io,
         environment,
         options.cwd,
-        identity.host,
-        identity.owner,
-        identity.repository,
+        identity,
+        snapshot,
         gh_resolved,
     ) catch |err| switch (err) {
         error.GitFetchSourceUnavailable => null,
@@ -760,6 +759,8 @@ const Snapshot = struct {
     body: []const u8,
     base_ref: []const u8,
     head_ref: []const u8,
+    head_repository: []const u8,
+    head_repository_url: []const u8,
     pull_url: []const u8,
     pull_state: []const u8,
     is_draft: bool,
@@ -779,6 +780,20 @@ const Snapshot = struct {
         errdefer allocator.free(base_ref);
         const head_ref = try github.snapshotStringFieldAlloc(allocator, page, "headRefName");
         errdefer allocator.free(head_ref);
+        const head_repository = try github.snapshotOptionalNestedStringFieldAlloc(
+            allocator,
+            page,
+            "headRepository",
+            "nameWithOwner",
+        );
+        errdefer allocator.free(head_repository);
+        const head_repository_url = try github.snapshotOptionalNestedStringFieldAlloc(
+            allocator,
+            page,
+            "headRepository",
+            "url",
+        );
+        errdefer allocator.free(head_repository_url);
         const pull_url = try github.snapshotStringFieldAlloc(allocator, page, "url");
         errdefer allocator.free(pull_url);
         const pull_state = try github.snapshotStringFieldAlloc(allocator, page, "state");
@@ -792,6 +807,8 @@ const Snapshot = struct {
             .body = body,
             .base_ref = base_ref,
             .head_ref = head_ref,
+            .head_repository = head_repository,
+            .head_repository_url = head_repository_url,
             .pull_url = pull_url,
             .pull_state = pull_state,
             .is_draft = try github.snapshotBoolField(allocator, page, "isDraft"),
@@ -806,10 +823,58 @@ const Snapshot = struct {
         self.allocator.free(self.body);
         self.allocator.free(self.base_ref);
         self.allocator.free(self.head_ref);
+        self.allocator.free(self.head_repository);
+        self.allocator.free(self.head_repository_url);
         self.allocator.free(self.pull_url);
         self.allocator.free(self.pull_state);
     }
 };
+
+const RepositoryCoordinates = struct {
+    owner: []const u8,
+    name: []const u8,
+};
+
+fn repositoryCoordinates(value: []const u8) ?RepositoryCoordinates {
+    const separator = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+    if (separator == 0 or separator + 1 == value.len or
+        std.mem.indexOfScalarPos(u8, value, separator + 1, '/') != null) return null;
+    return .{ .owner = value[0..separator], .name = value[separator + 1 ..] };
+}
+
+fn resolveFetchSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    cwd: []const u8,
+    identity: pr.Identity,
+    snapshot: Snapshot,
+    gh_resolved: []const u8,
+) !worktree.FetchSource {
+    if (repositoryCoordinates(snapshot.head_repository)) |head| {
+        if (snapshot.head_repository_url.len != 0) return worktree.resolvePrHeadSource(
+            allocator,
+            io,
+            environment,
+            cwd,
+            identity.host,
+            head.owner,
+            head.name,
+            snapshot.head_repository_url,
+            gh_resolved,
+        );
+    }
+    return worktree.FetchSource.resolve(
+        allocator,
+        io,
+        environment,
+        cwd,
+        identity.host,
+        identity.owner,
+        identity.repository,
+        gh_resolved,
+    );
+}
 
 fn serveGeneration(
     allocator: std.mem.Allocator,
