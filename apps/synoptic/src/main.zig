@@ -627,14 +627,6 @@ fn serveValidatedReview(
     const codex_resolved = try @import("cas_runtime").resolveExecutableAlloc(allocator, codex_path);
     defer allocator.free(codex_resolved);
     try validateCodexSchemaForLaunch(allocator, io, codex_resolved, runtime_root, launch_id);
-    try preflightGhAuthentication(
-        allocator,
-        io,
-        environment,
-        gh_resolved,
-        options.cwd,
-        options.pr,
-    );
     const selector_url = try resolveSelectorUrl(
         allocator,
         io,
@@ -2374,6 +2366,7 @@ fn sanitizedSelectorEnvironment(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
         "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM",
         "GIT_DIR",
@@ -2384,73 +2377,6 @@ fn sanitizedSelectorEnvironment(
     return environment;
 }
 
-pub fn preflightGhAuthentication(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    inherited_environment: *const std.process.Environ.Map,
-    gh_path: []const u8,
-    cwd: []const u8,
-    selector: ?[]const u8,
-) !void {
-    if (selector) |value| if (std.mem.startsWith(u8, value, "https://")) {
-        const identity = try pr.parseUrl(value);
-        return requireGhAuthentication(allocator, io, gh_path, identity.host);
-    };
-    if (try repositoryHostAlloc(allocator, io, inherited_environment, cwd)) |host| {
-        defer allocator.free(host);
-        return requireGhAuthentication(allocator, io, gh_path, host);
-    }
-    const result = try std.process.run(
-        allocator,
-        io,
-        .{ .argv = &.{ gh_path, "auth", "status" } },
-    );
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        return error.GitHubAuthenticationFailed;
-    }
-}
-
-fn repositoryHostAlloc(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    inherited_environment: *const std.process.Environ.Map,
-    cwd: []const u8,
-) !?[]u8 {
-    var environment = try sanitizedSelectorEnvironment(allocator, inherited_environment);
-    defer environment.deinit();
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "-C", cwd, "config", "--get", "remote.origin.url" },
-        .environ_map = &environment,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) return null;
-    return remoteHostAlloc(allocator, std.mem.trim(u8, result.stdout, "\r\n"));
-}
-
-fn remoteHostAlloc(allocator: std.mem.Allocator, remote: []const u8) !?[]u8 {
-    if (std.mem.indexOf(u8, remote, "://")) |scheme_end| {
-        const scheme = remote[0..scheme_end];
-        const authority_start = scheme_end + 3;
-        const authority_end = std.mem.indexOfScalarPos(
-            u8,
-            remote,
-            authority_start,
-            '/',
-        ) orelse remote.len;
-        const authority = remote[authority_start..authority_end];
-        const host = worktree.normalizeAuthorityHost(authority, scheme) orelse return null;
-        return @as(?[]u8, try allocator.dupe(u8, host));
-    }
-    const at = std.mem.indexOfScalar(u8, remote, '@') orelse return null;
-    const colon = std.mem.indexOfScalarPos(u8, remote, at + 1, ':') orelse return null;
-    if (colon == at + 1) return null;
-    const host = worktree.normalizeAuthorityHost(remote[at + 1 .. colon], "ssh") orelse
-        return null;
-    return @as(?[]u8, try allocator.dupe(u8, host));
-}
 fn requireGhAuthentication(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2580,7 +2506,7 @@ test "runtime state is owner-private and the launch claim is exclusive" {
     const stat = try receipt.stat(io);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
 }
-test "runtime custody rejects symlink roots and remote hosts retain identity" {
+test "runtime custody rejects symlink roots" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2597,27 +2523,6 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
         rejected = true;
     };
     try std.testing.expect(rejected);
-    const https = (try remoteHostAlloc(
-        allocator,
-        "https://github.example.test/o/r.git",
-    )).?;
-    defer allocator.free(https);
-    try std.testing.expectEqualStrings("github.example.test", https);
-    const ssh = (try remoteHostAlloc(allocator, "git@github.example.test:o/r.git")).?;
-    defer allocator.free(ssh);
-    try std.testing.expectEqualStrings("github.example.test", ssh);
-    const https_default = (try remoteHostAlloc(
-        allocator,
-        "https://github.example.test:443/o/r.git",
-    )).?;
-    defer allocator.free(https_default);
-    try std.testing.expectEqualStrings("github.example.test", https_default);
-    const ssh_default = (try remoteHostAlloc(
-        allocator,
-        "ssh://git@github.example.test:22/o/r.git",
-    )).?;
-    defer allocator.free(ssh_default);
-    try std.testing.expectEqualStrings("github.example.test", ssh_default);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     const direct = try resolveSelectorUrl(
@@ -2630,6 +2535,50 @@ test "runtime custody rejects symlink roots and remote hosts retain identity" {
     );
     defer allocator.free(direct);
     try std.testing.expectEqualStrings("https://github.example.test/o/r/pull/9", direct);
+}
+
+test "numeric selector authenticates exact canonical enterprise host" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "gh" });
+    defer allocator.free(gh_path);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "gh",
+        .data = "#!/bin/sh\n" ++
+            "if test \"$1\" = pr; then\n" ++
+            "  test -z \"${GIT_CONFIG_PARAMETERS-}\"\n" ++
+            "  printf '%s\\n' 'https://ghe.example:8443/o/r/pull/9'\n" ++
+            "  exit 0\n" ++
+            "fi\n" ++
+            "test \"$1 $2 $3 $4\" = 'auth status --hostname ghe.example:8443'\n",
+    });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GH_HOST", "ghe.example:8443");
+    try environment.put("GIT_CONFIG_PARAMETERS", "'remote.origin.url'='wrong/repo'");
+    const selector_url = try resolveSelectorUrl(
+        allocator,
+        io,
+        &environment,
+        gh_path,
+        root,
+        "9",
+    );
+    defer allocator.free(selector_url);
+    const identity = try pr.parseUrl(selector_url);
+    try requireGhAuthentication(allocator, io, gh_path, identity.host);
+    try std.testing.expectEqualStrings("ghe.example:8443", identity.host);
 }
 
 test "PR resolution ignores inherited repository selector environment" {

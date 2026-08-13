@@ -41,6 +41,20 @@ fn effectiveGitEnvironment(
     return environment;
 }
 
+fn submoduleGitEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: ?*const std.process.Environ.Map,
+) !std.process.Environ.Map {
+    var environment = if (inherited) |source|
+        try source.clone(allocator)
+    else
+        std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    sanitizeGitEnvironment(&environment);
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    return environment;
+}
+
 pub const FetchSource = struct {
     allocator: ?std.mem.Allocator = null,
     environment: ?*const std.process.Environ.Map = null,
@@ -786,24 +800,13 @@ pub fn synchronizeManaged(
         };
         return error.ManagedWorktreeRefreshFailed;
     }
-    const fetch_environment = if (fetch_source) |source| source.environment else null;
-    reconcileInitializedSubmodules(
+    advanceManagedSubmodules(
         allocator,
         io,
         custody.path(),
-        fetch_environment,
-    ) catch {
-        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
-            return error.ManagedWorktreeRollbackFailed;
-        };
-        return error.ManagedWorktreeRefreshFailed;
-    };
-    retireRemovedSubmoduleArtifacts(allocator, io, custody.path()) catch {
-        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
-            return error.ManagedWorktreeRollbackFailed;
-        };
-        return error.ManagedWorktreeRefreshFailed;
-    };
+        baseline,
+        fetch_source,
+    ) catch |err| return err;
     const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
         rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
@@ -813,80 +816,456 @@ pub fn synchronizeManaged(
     baseline.replace(next);
 }
 
+fn advanceManagedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    baseline: *const Baseline,
+    fetch_source: ?FetchSource,
+) !void {
+    const fetch_environment = if (fetch_source) |source| source.environment else null;
+    const fetch_url = if (fetch_source) |source| source.remote_url else null;
+    reconcileInitializedSubmodules(
+        allocator,
+        io,
+        root,
+        fetch_environment,
+        fetch_url,
+    ) catch {
+        rollbackManagedTransition(allocator, io, root, baseline) catch {
+            return error.ManagedWorktreeRollbackFailed;
+        };
+        return error.ManagedWorktreeRefreshFailed;
+    };
+    retireRemovedSubmoduleArtifacts(allocator, io, root) catch {
+        rollbackManagedTransition(allocator, io, root, baseline) catch {
+            return error.ManagedWorktreeRollbackFailed;
+        };
+        return error.ManagedWorktreeRefreshFailed;
+    };
+}
+
 fn reconcileInitializedSubmodules(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     inherited: ?*const std.process.Environ.Map,
+    parent_url: ?[]const u8,
 ) !void {
-    const sync_term = try runSubmoduleReconciliationBounded(
+    var total: usize = 0;
+    const deadline_ms = monotonicMilliseconds(io) + fetch_timeout_ms;
+    try reconcileSelectedSubmodulesAt(
         allocator,
         io,
         root,
         inherited,
-        .sync,
-        fetch_timeout_ms,
-        fetch_termination_grace_ms,
+        parent_url,
+        0,
+        &total,
+        deadline_ms,
     );
-    if (sync_term != .exited or sync_term.exited != 0) {
-        return error.ManagedSubmoduleReconciliationFailed;
-    }
-    const update_term = try runSubmoduleReconciliationBounded(
-        allocator,
-        io,
-        root,
-        inherited,
-        .update,
-        fetch_timeout_ms,
-        fetch_termination_grace_ms,
-    );
-    if (update_term != .exited or update_term.exited != 0) {
-        return error.ManagedSubmoduleReconciliationFailed;
-    }
     try cleanInitializedSubmodules(allocator, io, root);
 }
 
-const SubmoduleReconciliation = enum { sync, update };
+const selected_submodule_depth_max = 32;
+const selected_submodule_direct_max = 128;
 
-fn runSubmoduleReconciliationBounded(
+const PendingSubmoduleRepository = struct {
+    root: []u8,
+    parent_url: ?[]u8,
+    depth: usize,
+
+    fn deinit(self: PendingSubmoduleRepository, allocator: std.mem.Allocator) void {
+        allocator.free(self.root);
+        if (self.parent_url) |value| allocator.free(value);
+    }
+};
+
+const SubmoduleDeclaration = struct {
+    name: []u8,
+    path: ?[]u8 = null,
+    url: ?[]u8 = null,
+
+    fn deinit(self: SubmoduleDeclaration, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.path) |value| allocator.free(value);
+        if (self.url) |value| allocator.free(value);
+    }
+};
+
+const SelectedSubmodule = struct {
+    name: []u8,
+    path: []u8,
+    url: []u8,
+    oid: []u8,
+    absolute_path: []u8,
+
+    fn deinit(self: SelectedSubmodule, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.path);
+        allocator.free(self.url);
+        allocator.free(self.oid);
+        allocator.free(self.absolute_path);
+    }
+};
+
+fn reconcileSelectedSubmodulesAt(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     inherited: ?*const std.process.Environ.Map,
-    operation: SubmoduleReconciliation,
-    timeout_ms: u32,
-    termination_grace_ms: u32,
-) !std.process.Child.Term {
-    var environment = try effectiveGitEnvironment(allocator, inherited);
-    defer environment.deinit();
-    const sync_argv = [_][]const u8{
-        "git",       "--no-replace-objects", "-c",          "core.hooksPath=/dev/null",
-        "submodule", "sync",                 "--recursive",
-    };
-    const update_argv = [_][]const u8{
-        "git",       "--no-replace-objects", "-c",         "core.hooksPath=/dev/null",
-        "submodule", "update",               "--checkout", "--recursive",
-    };
+    parent_url: ?[]const u8,
+    depth: usize,
+    total: *usize,
+    deadline_ms: i64,
+) !void {
+    var pending: std.ArrayList(PendingSubmoduleRepository) = .empty;
+    defer {
+        for (pending.items) |repository| repository.deinit(allocator);
+        pending.deinit(allocator);
+    }
+    try appendPendingRepository(allocator, &pending, root, parent_url, depth);
+    var index: usize = 0;
+    while (index < pending.items.len) : (index += 1) {
+        const repository = pending.items[index];
+        var environment = try submoduleGitEnvironment(allocator, inherited);
+        defer environment.deinit();
+        var selected = try selectedInitializedSubmodules(
+            allocator,
+            io,
+            repository.root,
+            &environment,
+            repository.parent_url,
+        );
+        defer {
+            for (selected.items) |module| module.deinit(allocator);
+            selected.deinit(allocator);
+        }
+        if (total.* > managed_submodule_max - selected.items.len) {
+            return error.ManagedSubmoduleInventoryLimitExceeded;
+        }
+        total.* += selected.items.len;
+        try updateSelectedSubmodules(
+            allocator,
+            io,
+            repository.root,
+            &environment,
+            selected.items,
+            deadline_ms,
+        );
+        for (selected.items) |module| try appendPendingRepository(
+            allocator,
+            &pending,
+            module.absolute_path,
+            module.url,
+            repository.depth + 1,
+        );
+    }
+}
+
+fn appendPendingRepository(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(PendingSubmoduleRepository),
+    root: []const u8,
+    parent_url: ?[]const u8,
+    depth: usize,
+) !void {
+    if (depth >= selected_submodule_depth_max) {
+        return error.ManagedSubmoduleInventoryLimitExceeded;
+    }
+    const owned_root = try allocator.dupe(u8, root);
+    errdefer allocator.free(owned_root);
+    const owned_parent = if (parent_url) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_parent) |value| allocator.free(value);
+    try pending.append(allocator, .{
+        .root = owned_root,
+        .parent_url = owned_parent,
+        .depth = depth,
+    });
+}
+
+fn updateSelectedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: []const u8,
+    environment: *const std.process.Environ.Map,
+    selected: []const SelectedSubmodule,
+    deadline_ms: i64,
+) !void {
+    for (selected) |module| {
+        if (!try commitExistsWithEnvironment(
+            allocator,
+            io,
+            module.absolute_path,
+            module.oid,
+            environment,
+        )) {
+            try runSelectedSubmoduleCommand(
+                allocator,
+                io,
+                module.absolute_path,
+                environment,
+                &.{
+                    "git",      "--no-replace-objects", "-c",      "core.hooksPath=/dev/null",
+                    "fetch",    "--no-tags",            "--force", "--",
+                    module.url,
+                },
+                deadline_ms,
+            );
+        }
+        if (!try commitExistsWithEnvironment(
+            allocator,
+            io,
+            module.absolute_path,
+            module.oid,
+            environment,
+        )) return error.ManagedSubmoduleReconciliationFailed;
+        try runSelectedSubmoduleCommand(
+            allocator,
+            io,
+            module.absolute_path,
+            environment,
+            &.{
+                "git",      "--no-replace-objects", "-c",      "core.hooksPath=/dev/null",
+                "checkout", "--detach",             "--force", module.oid,
+            },
+            deadline_ms,
+        );
+    }
+}
+
+fn runSelectedSubmoduleCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    environment: *const std.process.Environ.Map,
+    argv: []const []const u8,
+    deadline_ms: i64,
+) !void {
+    const remaining_ms = deadline_ms - monotonicMilliseconds(io);
+    if (remaining_ms <= 0) return error.ManagedSubmoduleReconciliationTimedOut;
     var child = try std.process.spawn(io, .{
-        .argv = switch (operation) {
-            .sync => &sync_argv,
-            .update => &update_argv,
-        },
+        .argv = argv,
         .cwd = .{ .path = root },
-        .environ_map = &environment,
+        .environ_map = environment,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .pgid = 0,
     });
-    return waitBoundedProcess(
+    const term = try waitBoundedProcess(
         allocator,
         io,
         &child,
-        timeout_ms,
-        termination_grace_ms,
+        @intCast(@min(remaining_ms, std.math.maxInt(u32))),
+        fetch_termination_grace_ms,
         error.ManagedSubmoduleReconciliationTimedOut,
     );
+    if (term != .exited or term.exited != 0) {
+        return error.ManagedSubmoduleReconciliationFailed;
+    }
+}
+
+fn monotonicMilliseconds(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
+}
+
+fn selectedInitializedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    environment: *const std.process.Environ.Map,
+    parent_url: ?[]const u8,
+) !std.ArrayList(SelectedSubmodule) {
+    var selected: std.ArrayList(SelectedSubmodule) = .empty;
+    errdefer {
+        for (selected.items) |module| module.deinit(allocator);
+        selected.deinit(allocator);
+    }
+    const modules_path = try std.fs.path.join(allocator, &.{ root, ".gitmodules" });
+    defer allocator.free(modules_path);
+    if (!try repositoryPathExists(io, modules_path)) return selected;
+    const config = try gitOutputWithEnvironment(
+        allocator,
+        io,
+        root,
+        &.{
+            "git", "config", "--no-includes", "-z", "--file", ".gitmodules", "--list",
+        },
+        error.ManagedSubmoduleInventoryFailed,
+        environment,
+    );
+    defer allocator.free(config);
+    var declarations = try parseSubmoduleDeclarations(allocator, config);
+    defer {
+        for (declarations.items) |declaration| declaration.deinit(allocator);
+        declarations.deinit(allocator);
+    }
+    const gitlinks = try gitOutputWithEnvironment(
+        allocator,
+        io,
+        root,
+        &.{ "git", "ls-files", "-s", "-z" },
+        error.ManagedSubmoduleInventoryFailed,
+        environment,
+    );
+    defer allocator.free(gitlinks);
+    for (declarations.items) |declaration| {
+        const relative = declaration.path orelse continue;
+        const selected_url = declaration.url orelse continue;
+        const oid = gitlinkOid(gitlinks, relative) orelse continue;
+        const absolute = (try confinedDirectoryAlloc(
+            allocator,
+            io,
+            root,
+            relative,
+        )) orelse continue;
+        if (!try isInitializedRepository(allocator, io, absolute)) {
+            allocator.free(absolute);
+            continue;
+        }
+        try appendSelectedSubmodule(
+            allocator,
+            &selected,
+            declaration.name,
+            relative,
+            selected_url,
+            parent_url,
+            oid,
+            absolute,
+        );
+    }
+    return selected;
+}
+
+fn appendSelectedSubmodule(
+    allocator: std.mem.Allocator,
+    selected: *std.ArrayList(SelectedSubmodule),
+    name_source: []const u8,
+    path_source: []const u8,
+    url_source: []const u8,
+    parent_url: ?[]const u8,
+    oid_source: []const u8,
+    absolute_path: []u8,
+) !void {
+    errdefer allocator.free(absolute_path);
+    const name = try allocator.dupe(u8, name_source);
+    errdefer allocator.free(name);
+    const path = try allocator.dupe(u8, path_source);
+    errdefer allocator.free(path);
+    const url = try resolveSubmoduleUrlAlloc(allocator, url_source, parent_url);
+    errdefer allocator.free(url);
+    const oid = try allocator.dupe(u8, oid_source);
+    errdefer allocator.free(oid);
+    try selected.append(allocator, .{
+        .name = name,
+        .path = path,
+        .url = url,
+        .oid = oid,
+        .absolute_path = absolute_path,
+    });
+}
+
+fn resolveSubmoduleUrlAlloc(
+    allocator: std.mem.Allocator,
+    selected_url: []const u8,
+    parent_url: ?[]const u8,
+) ![]u8 {
+    const relative = std.mem.startsWith(u8, selected_url, "./") or
+        std.mem.startsWith(u8, selected_url, "../");
+    if (!relative) return allocator.dupe(u8, selected_url);
+    const parent = parent_url orelse return error.ManagedSubmoduleInventoryFailed;
+    const slash = std.mem.lastIndexOfScalar(u8, parent, '/') orelse {
+        return error.ManagedSubmoduleInventoryFailed;
+    };
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ parent[0..slash], selected_url },
+    );
+}
+
+fn parseSubmoduleDeclarations(
+    allocator: std.mem.Allocator,
+    config: []const u8,
+) !std.ArrayList(SubmoduleDeclaration) {
+    var declarations: std.ArrayList(SubmoduleDeclaration) = .empty;
+    errdefer {
+        for (declarations.items) |declaration| declaration.deinit(allocator);
+        declarations.deinit(allocator);
+    }
+    var records = std.mem.splitScalar(u8, config, 0);
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        const newline = std.mem.indexOfScalar(u8, record, '\n') orelse {
+            return error.ManagedSubmoduleInventoryFailed;
+        };
+        const key = record[0..newline];
+        const value = record[newline + 1 ..];
+        const field = submoduleConfigField(key) orelse continue;
+        const declaration = try findOrAppendDeclaration(
+            allocator,
+            &declarations,
+            field.name,
+        );
+        const target = switch (field.kind) {
+            .path => &declaration.path,
+            .url => &declaration.url,
+        };
+        if (target.* != null or value.len == 0) {
+            return error.ManagedSubmoduleInventoryFailed;
+        }
+        target.* = try allocator.dupe(u8, value);
+    }
+    return declarations;
+}
+
+const SubmoduleConfigFieldKind = enum { path, url };
+
+const SubmoduleConfigField = struct {
+    name: []const u8,
+    kind: SubmoduleConfigFieldKind,
+};
+
+fn submoduleConfigField(key: []const u8) ?SubmoduleConfigField {
+    const prefix = "submodule.";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const suffix: []const u8, const kind: SubmoduleConfigFieldKind =
+        if (std.mem.endsWith(u8, key, ".path"))
+            .{ ".path", .path }
+        else if (std.mem.endsWith(u8, key, ".url"))
+            .{ ".url", .url }
+        else
+            return null;
+    const name = key[prefix.len .. key.len - suffix.len];
+    if (name.len == 0) return null;
+    return .{ .name = name, .kind = kind };
+}
+
+fn findOrAppendDeclaration(
+    allocator: std.mem.Allocator,
+    declarations: *std.ArrayList(SubmoduleDeclaration),
+    name: []const u8,
+) !*SubmoduleDeclaration {
+    for (declarations.items) |*declaration| {
+        if (std.mem.eql(u8, declaration.name, name)) return declaration;
+    }
+    if (declarations.items.len >= selected_submodule_direct_max) {
+        return error.ManagedSubmoduleInventoryLimitExceeded;
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try declarations.append(allocator, .{ .name = owned_name });
+    return &declarations.items[declarations.items.len - 1];
+}
+
+fn gitlinkOid(gitlinks: []const u8, expected: []const u8) ?[]const u8 {
+    var records = std.mem.splitScalar(u8, gitlinks, 0);
+    while (records.next()) |record| {
+        const parsed = parseGitlink(record) orelse continue;
+        if (std.mem.eql(u8, parsed.path, expected)) return parsed.oid;
+    }
+    return null;
 }
 
 fn retireRemovedSubmoduleArtifacts(
@@ -1845,6 +2224,27 @@ fn commitExists(
     return result.term == .exited and result.term.exited == 0;
 }
 
+fn commitExistsWithEnvironment(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    oid: []const u8,
+    environment: *const std.process.Environ.Map,
+) !bool {
+    const object = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{oid});
+    defer allocator.free(object);
+    const result = try runGitCommandWithEnvironment(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "cat-file", "-e", object },
+        environment,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .exited and result.term.exited == 0;
+}
+
 fn gitOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1946,6 +2346,160 @@ test "effective fetch environment isolates selectors and projects credentials" {
         credential_helper,
         effective.get("GIT_CONFIG_VALUE_1").?,
     );
+}
+
+test "worktree integrity submodule environment preserves user credential policy" {
+    var inherited = std.process.Environ.Map.init(std.testing.allocator);
+    defer inherited.deinit();
+    try inherited.put("GIT_CONFIG_GLOBAL", "/tmp/synoptic-user-gitconfig");
+    try inherited.put("GIT_CONFIG_SYSTEM", "/tmp/synoptic-system-gitconfig");
+    try inherited.put("GIT_CONFIG_COUNT", "1");
+    try inherited.put("GIT_CONFIG_PARAMETERS", "'credential.helper'='attacker'");
+    var effective = try submoduleGitEnvironment(std.testing.allocator, &inherited);
+    defer effective.deinit();
+    try std.testing.expectEqualStrings(
+        "/tmp/synoptic-user-gitconfig",
+        effective.get("GIT_CONFIG_GLOBAL").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/synoptic-system-gitconfig",
+        effective.get("GIT_CONFIG_SYSTEM").?,
+    );
+    try std.testing.expect(effective.get("GIT_CONFIG_COUNT") == null);
+    try std.testing.expect(effective.get("GIT_CONFIG_PARAMETERS") == null);
+    try std.testing.expect(effective.get("GIT_CONFIG_KEY_0") == null);
+}
+
+test "worktree integrity submodule update selects URL without config mutation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "old", "new", "parent" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+    }
+    const old_repo = try tmp.dir.realPathFileAlloc(io, "old", allocator);
+    defer allocator.free(old_repo);
+    const new_repo = try tmp.dir.realPathFileAlloc(io, "new", allocator);
+    defer allocator.free(new_repo);
+    const parent = try tmp.dir.realPathFileAlloc(io, "parent", allocator);
+    defer allocator.free(parent);
+    const next = try selectReplacementSubmoduleAlloc(
+        allocator,
+        io,
+        &tmp,
+        old_repo,
+        new_repo,
+        parent,
+    );
+    defer allocator.free(next);
+    const config_path = try std.fs.path.join(allocator, &.{ parent, ".git", "config" });
+    defer allocator.free(config_path);
+    const config_before = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        config_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(config_before);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_ALLOW_PROTOCOL", "file");
+    try reconcileInitializedSubmodules(allocator, io, parent, &environment, null);
+    const config_after = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        config_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(config_after);
+    try std.testing.expectEqualSlices(u8, config_before, config_after);
+    const child = try std.fs.path.join(allocator, &.{ parent, "deps", "sub" });
+    defer allocator.free(child);
+    const observed_raw = try gitOutput(
+        allocator,
+        io,
+        child,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(observed_raw);
+    try std.testing.expectEqualStrings(next, std.mem.trim(u8, observed_raw, "\r\n"));
+}
+
+fn selectReplacementSubmoduleAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    old_repo: []const u8,
+    new_repo: []const u8,
+    parent: []const u8,
+) ![]u8 {
+    try initializeSubmoduleTestRepository(allocator, io, tmp, "old", "old\n");
+    try initializeSubmoduleTestRepository(allocator, io, tmp, "new", "new\n");
+    try initializeEmptyTestRepository(allocator, io, parent);
+    for ([_][]const []const u8{
+        &.{
+            "git",    "-c",       "protocol.file.allow=always", "submodule", "add",
+            old_repo, "deps/sub",
+        },
+        &.{ "git", "commit", "-qam", "old submodule" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, parent, argv, error.TestGitFailed));
+    const raw = try gitOutput(
+        allocator,
+        io,
+        new_repo,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.TestGitFailed,
+    );
+    defer allocator.free(raw);
+    const next = std.mem.trim(u8, raw, "\r\n");
+    const modules = try std.fmt.allocPrint(
+        allocator,
+        "[submodule \"sub\"]\n\tpath = deps/sub\n\turl = {s}\n",
+        .{new_repo},
+    );
+    defer allocator.free(modules);
+    try tmp.dir.writeFile(io, .{ .sub_path = "parent/.gitmodules", .data = modules });
+    const cache_info = try std.fmt.allocPrint(allocator, "160000,{s},deps/sub", .{next});
+    defer allocator.free(cache_info);
+    for ([_][]const []const u8{
+        &.{ "git", "add", ".gitmodules" },
+        &.{ "git", "update-index", "--cacheinfo", cache_info },
+        &.{ "git", "commit", "-qm", "select new submodule" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, parent, argv, error.TestGitFailed));
+    return allocator.dupe(u8, next);
+}
+
+fn initializeEmptyTestRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
+}
+
+fn initializeSubmoduleTestRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    name: []const u8,
+    contents: []const u8,
+) !void {
+    const root = try tmp.dir.realPathFileAlloc(io, name, allocator);
+    defer allocator.free(root);
+    const file = try std.fmt.allocPrint(allocator, "{s}/tracked.txt", .{name});
+    defer allocator.free(file);
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = contents });
+    try initializeEmptyTestRepository(allocator, io, root);
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "head" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
 }
 
 test "reused checkout can never be cleanup target" {

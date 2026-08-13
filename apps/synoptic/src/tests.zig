@@ -2479,49 +2479,6 @@ test "process stop cancellation survives request-local cleanup" {
     );
 }
 
-test "authentication preflight ignores inherited repository selectors" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    const git_path = try std.fs.path.join(allocator, &.{ root, "git" });
-    defer allocator.free(git_path);
-    const gh_path = try std.fs.path.join(allocator, &.{ root, "gh" });
-    defer allocator.free(gh_path);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "git",
-        .data = "#!/bin/sh\ntest -z \"${GIT_DIR-}\"\n" ++
-            "test -z \"${GIT_WORK_TREE-}\"\n" ++
-            "printf '%s\\n' 'https://github.example.test/o/r.git'\n",
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "gh",
-        .data = "#!/bin/sh\nexit 0\n",
-    });
-    for ([_][]const u8{ git_path, gh_path }) |path| try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        path,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
-    var environment = std.process.Environ.Map.init(allocator);
-    defer environment.deinit();
-    try environment.put("PATH", root);
-    try environment.put("GIT_DIR", "/wrong/repository/.git");
-    try environment.put("GIT_WORK_TREE", "/wrong/repository");
-    try main.preflightGhAuthentication(
-        allocator,
-        io,
-        &environment,
-        gh_path,
-        root,
-        null,
-    );
-}
-
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
