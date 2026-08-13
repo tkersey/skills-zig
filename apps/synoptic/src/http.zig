@@ -60,6 +60,7 @@ pub const ToolDomainContext = struct {
             .runtime = runtime,
         };
         context.broker.cancelled = &context.cancelled;
+        context.broker.stop_cancelled = &context.stop_cancelled;
         return context;
     }
 
@@ -110,6 +111,11 @@ pub const ToolDomainContext = struct {
         return &self.cancelled;
     }
 
+    pub fn cancelForStop(self: *ToolDomainContext) void {
+        self.stop_cancelled.store(true, .release);
+        self.cancelled.store(true, .release);
+    }
+
     fn handleOpaque(
         raw: *anyopaque,
         event_kind: []const u8,
@@ -118,9 +124,7 @@ pub const ToolDomainContext = struct {
         result_allocator: std.mem.Allocator,
     ) ![]u8 {
         const self: *ToolDomainContext = @ptrCast(@alignCast(raw));
-        defer if (!self.stop_cancelled.load(.acquire)) {
-            self.cancelled.store(false, .release);
-        };
+        defer self.cancelled.store(false, .release);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (std.mem.eql(u8, event_kind, "action.prepared")) {
@@ -1014,6 +1018,7 @@ pub const Server = struct {
             if (payload.count() != 0) return error.InvalidUiCommand;
             runtime.registry.declineAllApprovals("shutdown");
             runtime.stop_requested = true;
+            if (runtime.tool_domain) |tool_domain| tool_domain.cancelForStop();
             const mutex = domainMutex(runtime);
             mutex.lock();
             defer mutex.unlock();
@@ -2234,8 +2239,7 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
         ),
     );
     try std.testing.expect(!context.cancelled.load(.acquire));
-    context.stop_cancelled.store(true, .release);
-    handler.cancel.?(handler.context);
+    context.cancelForStop();
     try std.testing.expectError(
         error.UnsupportedAuthoritativeTool,
         handler.handle(
@@ -2246,7 +2250,12 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
             std.testing.allocator,
         ),
     );
-    try std.testing.expect(context.cancelled.load(.acquire));
+    try std.testing.expect(!context.cancelled.load(.acquire));
+    try std.testing.expect(context.stop_cancelled.load(.acquire));
+    try std.testing.expectError(
+        error.GitHubCallCancelled,
+        context.broker.call("query Cancelled{viewer{login}}", "{}"),
+    );
 }
 
 test "action refresh preserves local exclusion synchronization evidence" {

@@ -2403,6 +2403,42 @@ test "action retention rejection preserves the complete pending store" {
     );
 }
 
+test "process stop cancellation survives request-local cleanup" {
+    var state = try app.App.init(std.testing.allocator, "head");
+    defer state.deinit();
+    var registry = sessions.Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    const context = try http.ToolDomainContext.create(
+        std.testing.allocator,
+        &state,
+        &registry,
+        .{ .allocator = std.testing.allocator, .io = std.testing.io },
+        "owner",
+        "repository",
+        1,
+        "PR_1",
+        null,
+    );
+    defer context.handler().deinit.?(context.handler().context);
+    context.cancelForStop();
+    try std.testing.expectError(
+        error.UnsupportedAuthoritativeTool,
+        context.handler().handle(
+            context.handler().context,
+            "unsupported",
+            "{}",
+            "ses-1",
+            std.testing.allocator,
+        ),
+    );
+    try std.testing.expect(!context.combinedCancellationFlag().load(.acquire));
+    try std.testing.expect(context.stopCancellationFlag().load(.acquire));
+    try std.testing.expectError(
+        error.GitHubCallCancelled,
+        context.broker.call("query Cancelled{viewer{login}}", "{}"),
+    );
+}
+
 test "exclusions config XDG precedence and strong classification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

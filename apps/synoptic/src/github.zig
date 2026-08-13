@@ -165,14 +165,23 @@ fn deleteTreeBestEffort(dir: *std.Io.Dir, io: std.Io, path: []const u8) void {
     };
 }
 
+const CancellationSources = struct {
+    request: ?*const std.atomic.Value(bool) = null,
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn isCancelled(self: CancellationSources) bool {
+        return (if (self.request) |flag| flag.load(.acquire) else false) or
+            (if (self.stop) |flag| flag.load(.acquire) else false);
+    }
+};
+
 const GhWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
     pid: std.posix.pid_t,
-    cancelled: ?*const std.atomic.Value(bool) = null,
+    cancellation: CancellationSources = .{},
 
     fn shouldStop(self: *const GhWatchdog) bool {
-        return self.finished.load(.acquire) or
-            if (self.cancelled) |cancelled| cancelled.load(.acquire) else false;
+        return self.finished.load(.acquire) or self.cancellation.isCancelled();
     }
 
     fn run(self: *GhWatchdog) void {
@@ -200,6 +209,29 @@ const GhWatchdog = struct {
         };
     }
 };
+
+fn signalProcessGroup(pid: std.posix.pid_t, signal: @TypeOf(std.posix.SIG.TERM)) void {
+    std.posix.kill(-pid, signal) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+}
+
+fn terminateOwnedProcessGroup(
+    child: *std.process.Child,
+    io: std.Io,
+    pid: std.posix.pid_t,
+) void {
+    if (child.stdin) |file| file.close(io);
+    child.stdin = null;
+    signalProcessGroup(pid, std.posix.SIG.TERM);
+    std.Io.sleep(io, .fromMilliseconds(20), .awake) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+    signalProcessGroup(pid, std.posix.SIG.KILL);
+    _ = child.wait(io) catch |ignored_error| switch (ignored_error) {
+        else => {},
+    };
+}
 
 const PipeCapture = struct {
     allocator: std.mem.Allocator,
@@ -262,6 +294,7 @@ fn captureChildPipes(
     child: *std.process.Child,
     stdout_limit: usize,
     stderr_limit: usize,
+    process_group: std.posix.pid_t,
 ) !CapturedPipes {
     var stdout_capture = PipeCapture{
         .allocator = allocator,
@@ -282,7 +315,7 @@ fn captureChildPipes(
         return err;
     };
     const stderr_thread = spawnPipeCapture(&stderr_capture) catch |err| {
-        child.kill(io);
+        signalProcessGroup(process_group, std.posix.SIG.KILL);
         stdout_thread.join();
         return err;
     };
@@ -309,7 +342,7 @@ fn runCapturedProcess(
     argv: []const []const u8,
     cwd: std.process.Child.Cwd,
     input: ?[]const u8,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancellation: CancellationSources,
     stdout_limit: usize,
     stderr_limit: usize,
     effectful: bool,
@@ -320,7 +353,7 @@ fn runCapturedProcess(
         argv,
         cwd,
         input,
-        cancelled,
+        cancellation,
         stdout_limit,
         stderr_limit,
         effectful,
@@ -347,7 +380,7 @@ fn runCapturedGitProcess(
         argv,
         cwd,
         input,
-        cancelled,
+        .{ .request = cancelled },
         stdout_limit,
         stderr_limit,
         effectful,
@@ -361,7 +394,7 @@ fn runCapturedProcessWithEnvironment(
     argv: []const []const u8,
     cwd: std.process.Child.Cwd,
     input: ?[]const u8,
-    cancelled: ?*const std.atomic.Value(bool),
+    cancellation: CancellationSources,
     stdout_limit: usize,
     stderr_limit: usize,
     effectful: bool,
@@ -378,9 +411,16 @@ fn runCapturedProcessWithEnvironment(
     });
     var dispatch_started = false;
     var waited = false;
-    errdefer if (!waited and child.id != null) child.kill(io);
     const child_id = child.id orelse return error.ProcessTransportFailed;
-    var watchdog = GhWatchdog{ .pid = @intCast(child_id), .cancelled = cancelled };
+    const process_group: std.posix.pid_t = @intCast(child_id);
+    errdefer if (!waited and child.id != null) {
+        terminateOwnedProcessGroup(&child, io, process_group);
+        waited = true;
+    };
+    var watchdog = GhWatchdog{
+        .pid = process_group,
+        .cancellation = cancellation,
+    };
     const watchdog_thread = try std.Thread.spawn(.{}, GhWatchdog.run, .{&watchdog});
     defer {
         watchdog.finished.store(true, .release);
@@ -393,6 +433,7 @@ fn runCapturedProcessWithEnvironment(
         &child,
         stdout_limit,
         stderr_limit,
+        process_group,
     ) catch |err| {
         if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
         return err;
@@ -404,11 +445,9 @@ fn runCapturedProcessWithEnvironment(
         return err;
     };
     waited = true;
-    if (cancelled) |flag| {
-        if (flag.load(.acquire)) {
-            if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
-            return error.ProcessCallCancelled;
-        }
+    if (cancellation.isCancelled()) {
+        if (effectful and dispatch_started) return error.ProcessOutcomeUnknown;
+        return error.ProcessCallCancelled;
     }
     return .{
         .allocator = allocator,
@@ -449,11 +488,14 @@ pub const Broker = struct {
     git_path: []const u8 = "git",
     host: []const u8 = "github.com",
     cancelled: ?*const std.atomic.Value(bool) = null,
+    stop_cancelled: ?*const std.atomic.Value(bool) = null,
+
+    fn cancellation(self: Broker) CancellationSources {
+        return .{ .request = self.cancelled, .stop = self.stop_cancelled };
+    }
 
     pub fn call(self: Broker, document: []const u8, variables: []const u8) ![]u8 {
-        if (self.cancelled) |cancelled| {
-            if (cancelled.load(.acquire)) return error.GitHubCallCancelled;
-        }
+        if (self.cancellation().isCancelled()) return error.GitHubCallCancelled;
         const mutation = try graphql.isMutation(self.allocator, document);
         const input = try graphql.requestAlloc(self.allocator, document, variables);
         defer self.allocator.free(input);
@@ -509,7 +551,7 @@ pub const Broker = struct {
             argv,
             .inherit,
             input,
-            self.cancelled,
+            self.cancellation(),
             16 * 1024 * 1024,
             1024 * 1024,
             effectful,
@@ -4196,7 +4238,7 @@ test "captured process rejects output beyond its exact bound" {
             &.{ "/bin/sh", "-c", "printf 0123456789abcdef" },
             .inherit,
             null,
-            null,
+            .{},
             8,
             8,
             false,
@@ -4213,12 +4255,76 @@ test "effectful process capture failure is classified outcome unknown" {
             &.{ "/bin/sh", "-c", "cat >/dev/null; printf 0123456789abcdef" },
             .inherit,
             "{}",
-            null,
+            .{},
             8,
             8,
             true,
         ),
     );
+}
+
+test "post-spawn input failure reaps the owned process group" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const script_path = try std.fs.path.join(allocator, &.{ root, "effect.sh" });
+    defer allocator.free(script_path);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "descendant.pid" });
+    defer allocator.free(pid_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\n" ++
+            "echo $! > '{s}'\nexit 0\n",
+        .{pid_path},
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "effect.sh", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        script_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const input = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(input);
+    @memset(input, 'x');
+    try std.testing.expectError(
+        error.ProcessOutcomeUnknown,
+        runCapturedProcess(
+            allocator,
+            io,
+            &.{script_path},
+            .inherit,
+            input,
+            .{},
+            8,
+            8,
+            true,
+        ),
+    );
+    const raw_pid = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        pid_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(raw_pid);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, raw_pid, "\r\n"),
+        10,
+    );
+    for (0..100) |_| {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    return error.TestExpectedProcessGone;
 }
 
 const CancelGhCall = struct {
