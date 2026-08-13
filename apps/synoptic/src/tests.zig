@@ -13,6 +13,44 @@ test "generation fetch sources retain distinct endpoint carriers" {
     try std.testing.expect(sources.base == null);
     try std.testing.expect(sources.head == null);
 }
+
+test "lifecycle identity uses exact native argument order" {
+    const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const executable = "/tmp/synoptic";
+    const runtime_root = "/tmp/synoptic-runtime";
+    const exact = [_][]const u8{
+        executable,
+        "serve",
+        "--launch-id",
+        launch_id,
+        "--runtime-root",
+        runtime_root,
+        "--repository-identity",
+        "repo",
+    };
+    try std.testing.expect(try main.lifecycleArgumentVectorMatchesForTest(
+        std.testing.allocator,
+        &exact,
+        executable,
+        launch_id,
+        runtime_root,
+    ));
+    const reordered = [_][]const u8{
+        executable,
+        "serve",
+        "--runtime-root",
+        runtime_root,
+        "--launch-id",
+        launch_id,
+    };
+    try std.testing.expect(!try main.lifecycleArgumentVectorMatchesForTest(
+        std.testing.allocator,
+        &reordered,
+        executable,
+        launch_id,
+        runtime_root,
+    ));
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");

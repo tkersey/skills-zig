@@ -19,6 +19,7 @@ const pr = @import("pr.zig");
 const sessions = @import("sessions.zig");
 const worktree = @import("worktree.zig");
 const launch_shutdown_grace_ms: u32 = 500;
+const max_process_arguments_bytes: usize = 64 * 1024;
 const usage_text =
     \\Usage:
     \\  synoptic launch [--pr SELECTOR] --cwd PATH --skill-root PATH [--json]
@@ -2236,33 +2237,74 @@ fn lifecycleOptionalStringAlloc(
 }
 
 fn verifiedProcess(allocator: std.mem.Allocator, io: std.Io, record: LifecycleRecord) !bool {
+    _ = io;
     if (!processAlive(record.pid)) return false;
-    const pid_text = try std.fmt.allocPrint(
-        allocator,
-        "{d}",
-        .{record.pid},
-    );
-    defer allocator.free(pid_text);
-    const result = try std.process.run(
-        allocator,
-        io,
-        .{ .argv = &.{ "/bin/ps", "-ww", "-p", pid_text, "-o", "command=" } },
-    );
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) return false;
-    const command = std.mem.trim(u8, result.stdout, " \t\r\n");
-    const identity = try std.fmt.allocPrint(
-        allocator,
-        "serve --launch-id {s} --runtime-root {s}",
-        .{ record.launch_id, record.runtime_root },
-    );
-    defer allocator.free(identity);
-    return std.mem.startsWith(
-        u8,
-        command,
+    if (comptime builtin.os.tag != .macos) return false;
+    const bytes = try allocator.alloc(u8, max_process_arguments_bytes);
+    defer allocator.free(bytes);
+    var length = bytes.len;
+    const pid = std.math.cast(c_int, record.pid) orelse return false;
+    var mib = [_]c_int{ 1, 49, pid };
+    if (std.c.sysctl(&mib, mib.len, bytes.ptr, &length, null, 0) != 0) return false;
+    return lifecycleArgumentsMatch(
+        bytes[0..length],
         record.executable,
-    ) and std.mem.indexOf(u8, command, identity) != null;
+        record.launch_id,
+        record.runtime_root,
+    );
+}
+
+fn lifecycleArgumentsMatch(
+    bytes: []const u8,
+    executable: []const u8,
+    launch_id: []const u8,
+    runtime_root: []const u8,
+) bool {
+    if (bytes.len < @sizeOf(c_int)) return false;
+    const argc_signed = std.mem.readInt(c_int, bytes[0..@sizeOf(c_int)], .native);
+    if (argc_signed < 6) return false;
+    const argc: usize = @intCast(argc_signed);
+    var cursor: usize = @sizeOf(c_int);
+    const executable_end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return false;
+    cursor = executable_end + 1;
+    while (cursor < bytes.len and bytes[cursor] == 0) cursor += 1;
+    const expected = [_][]const u8{
+        executable,
+        "serve",
+        "--launch-id",
+        launch_id,
+        "--runtime-root",
+        runtime_root,
+    };
+    for (0..argc) |index| {
+        const end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return false;
+        if (index < expected.len and !std.mem.eql(u8, bytes[cursor..end], expected[index])) {
+            return false;
+        }
+        cursor = end + 1;
+    }
+    return true;
+}
+
+pub fn lifecycleArgumentVectorMatchesForTest(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    executable: []const u8,
+    launch_id: []const u8,
+    runtime_root: []const u8,
+) !bool {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const argc = std.math.cast(c_int, argv.len) orelse return false;
+    try bytes.appendSlice(allocator, std.mem.asBytes(&argc));
+    try bytes.appendSlice(allocator, executable);
+    try bytes.append(allocator, 0);
+    try bytes.append(allocator, 0);
+    for (argv) |argument| {
+        try bytes.appendSlice(allocator, argument);
+        try bytes.append(allocator, 0);
+    }
+    return lifecycleArgumentsMatch(bytes.items, executable, launch_id, runtime_root);
 }
 
 fn processAlive(process_id: u64) bool {
@@ -2654,6 +2696,43 @@ test "runtime state is owner-private and the launch claim is exclusive" {
     defer receipt.close(io);
     const stat = try receipt.stat(io);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+}
+test "native lifecycle identity classifies the owner child without process enumeration" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const runtime_root = "/tmp/synoptic-native-identity-test";
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            "/usr/bin/yes",
+            "serve",
+            "--launch-id",
+            launch_id,
+            "--runtime-root",
+            runtime_root,
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    var record = LifecycleRecord{
+        .allocator = allocator,
+        .raw = try allocator.dupe(u8, "{}"),
+        .launch_id = try allocator.dupe(u8, launch_id),
+        .runtime_root = try allocator.dupe(u8, runtime_root),
+        .executable = try allocator.dupe(u8, "/usr/bin/yes"),
+        .phase = .starting,
+        .url = null,
+        .worktree = null,
+        .worktree_kind = null,
+        .repository_cwd = null,
+        .repository_identity = null,
+        .pid = @intCast(child.id orelse return error.ChildMissingPid),
+    };
+    defer record.deinit();
+    try std.testing.expect(try verifiedProcess(allocator, io, record));
 }
 test "runtime custody rejects symlink roots" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
