@@ -2974,9 +2974,7 @@ fn isGithubEffectObject(object: []const u8) bool {
     if (isLocalDiscourseObject(object)) return false;
     if (isExplicitGithubDestination(object)) return true;
     const target = trimActionObjectArticles(object);
-    if (startsWordAnyIgnoreCase(target, &.{
-        "label", "reviewer", "assignee", "milestone", "mark viewed",
-    })) return true;
+    if (startsWordAnyIgnoreCase(target, &.{"mark viewed"})) return true;
     if (endsWordAnyIgnoreCase(target, &.{
         "label",     "labels",     "reviewer", "reviewers", "assignee", "assignees",
         "milestone", "milestones",
@@ -3705,6 +3703,9 @@ test "GitHub authority uses direct destinations and terminal action object heads
     for ([_][]const u8{
         "Update the documentation about pull request parsing",
         "Update the documentation about GitHub parsing",
+        "Remove the label parsing code",
+        "Remove reviewer selection code",
+        "Set milestone parsing defaults",
         "Delete the note from your chat",
         "Remove the explanation from the message",
         "Update this answer with review context",
