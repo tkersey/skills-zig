@@ -4412,8 +4412,9 @@ test "worktree integrity fork head source does not fall back to base remote" {
         "/tmp/configured gh",
     );
     defer source.deinit();
+    try std.testing.expectEqual(worktree.FetchSource.Kind.direct_url, source.kind);
     try std.testing.expectEqualStrings(fork_url, source.remote_name);
-    try std.testing.expectEqualStrings("", source.remote_url);
+    try std.testing.expectEqualStrings(fork_url, source.remote_url);
     try std.testing.expectEqualStrings("contributor", source.repository_owner);
 }
 
@@ -4436,6 +4437,7 @@ fn resolveFixtureFetchSource(
 }
 
 fn expectFixtureFetchSource(source: worktree.FetchSource) !void {
+    try std.testing.expectEqual(worktree.FetchSource.Kind.configured_remote, source.kind);
     try std.testing.expectEqualStrings("target", source.remote_name);
     try std.testing.expectEqualStrings(
         "https://github.example.test/owner/repo.git",
@@ -4539,6 +4541,7 @@ test "worktree integrity stalled TERM-resistant fetch is bounded and reaped" {
             root,
             .{
                 .remote_name = fixture.url,
+                .remote_url = fixture.url,
                 .timeout_ms = 100,
                 .termination_grace_ms = 50,
             },
@@ -4687,7 +4690,7 @@ test "worktree integrity managed synchronization cleans then advances detached h
         source,
         head,
         &baseline,
-        .{ .remote_name = source },
+        .{ .remote_name = source, .remote_url = source },
     );
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, artifact, .{}));
@@ -4797,7 +4800,7 @@ test "worktree integrity reused checkout advances only by clean fast forward" {
         root,
         head,
         &baseline,
-        .{ .remote_name = root },
+        .{ .remote_name = root, .remote_url = root },
     );
     try std.testing.expectEqualStrings(head, baseline.head_oid);
     try std.testing.expectEqualStrings("feature", baseline.branch.?);
@@ -4998,7 +5001,7 @@ test "worktree integrity dirty launch selects managed custody" {
         head,
         managed,
         true,
-        .{ .remote_name = repo },
+        .{ .remote_name = repo, .remote_url = repo },
     );
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
@@ -5268,7 +5271,7 @@ test "worktree integrity ignored launch artifact selects managed custody" {
         head,
         managed,
         true,
-        .{ .remote_name = repo },
+        .{ .remote_name = repo, .remote_url = repo },
     );
     defer allocator.free(custody.path());
     try std.testing.expect(custody == .managed);
@@ -6765,7 +6768,7 @@ fn prepareWsRuntime(
         .cwd = root,
         .skill_path = programs.skill,
         .repository_cwd = root,
-        .fetch_source = .{ .remote_name = root },
+        .fetch_source = .{ .remote_name = root, .remote_url = root },
         .custody = .{ .managed = root },
         .refresh_override = injectedRefresh,
     };

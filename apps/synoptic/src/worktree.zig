@@ -79,8 +79,11 @@ fn submoduleGitEnvironment(
 }
 
 pub const FetchSource = struct {
+    pub const Kind = enum { configured_remote, direct_url };
+
     allocator: ?std.mem.Allocator = null,
     environment: ?*const std.process.Environ.Map = null,
+    kind: Kind = .direct_url,
     remote_name: []const u8,
     remote_url: []const u8 = "",
     repository_host: []const u8 = "",
@@ -192,6 +195,7 @@ fn matchedFetchSource(
     return .{
         .allocator = allocator,
         .environment = environment,
+        .kind = .configured_remote,
         .remote_name = remote_name,
         .remote_url = remote_url,
         .repository_host = repository_host,
@@ -252,7 +256,7 @@ fn fetchSourceFromUrlAlloc(
     }
     const remote_name = try allocator.dupe(u8, url);
     errdefer allocator.free(remote_name);
-    const remote_url = try allocator.dupe(u8, "");
+    const remote_url = try allocator.dupe(u8, url);
     errdefer allocator.free(remote_url);
     const repository_host = try allocator.dupe(u8, host);
     errdefer allocator.free(repository_host);
@@ -265,6 +269,7 @@ fn fetchSourceFromUrlAlloc(
     return .{
         .allocator = allocator,
         .environment = environment,
+        .kind = .direct_url,
         .remote_name = remote_name,
         .remote_url = remote_url,
         .repository_host = repository_host,
@@ -1010,15 +1015,30 @@ fn advanceManagedSubmodules(
     baseline: *const Baseline,
     fetch_source: ?FetchSource,
 ) !void {
-    const fetch_environment = if (fetch_source) |source| source.environment else null;
-    const fetch_url = if (fetch_source) |source| source.remote_url else null;
-    reconcileInitializedSubmodules(
+    const reconcile_result = if (fetch_source) |source| result: {
+        var environment = try effectiveGitEnvironment(
+            allocator,
+            source.environment,
+            source.credential_executable,
+        );
+        defer environment.deinit();
+        break :result reconcileInitializedSubmodules(
+            allocator,
+            io,
+            root,
+            &environment,
+            source.remote_url,
+            source.credential_executable,
+        );
+    } else reconcileInitializedSubmodules(
         allocator,
         io,
         root,
-        fetch_environment,
-        fetch_url,
-    ) catch {
+        null,
+        null,
+        null,
+    );
+    reconcile_result catch {
         rollbackManagedTransition(allocator, io, root, baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
         };
@@ -1038,6 +1058,7 @@ fn reconcileInitializedSubmodules(
     root: []const u8,
     inherited: ?*const std.process.Environ.Map,
     parent_url: ?[]const u8,
+    credential_executable: ?[]const u8,
 ) !void {
     var total: usize = 0;
     const deadline_ms = monotonicMilliseconds(io) + fetch_timeout_ms;
@@ -1047,6 +1068,7 @@ fn reconcileInitializedSubmodules(
         root,
         inherited,
         parent_url,
+        credential_executable,
         0,
         &total,
         deadline_ms,
@@ -1187,6 +1209,7 @@ fn reconcileSelectedSubmodulesAt(
     root: []const u8,
     inherited: ?*const std.process.Environ.Map,
     parent_url: ?[]const u8,
+    credential_executable: ?[]const u8,
     depth: usize,
     total: *usize,
     deadline_ms: i64,
@@ -1202,7 +1225,10 @@ fn reconcileSelectedSubmodulesAt(
     var index: usize = 0;
     while (index < pending.items.len) : (index += 1) {
         const repository = pending.items[index];
-        var environment = try submoduleGitEnvironment(allocator, inherited);
+        var environment = if (credential_executable) |executable|
+            try effectiveGitEnvironment(allocator, inherited, executable)
+        else
+            try submoduleGitEnvironment(allocator, inherited);
         defer environment.deinit();
         var selected = try selectedInitializedSubmodules(
             allocator,
@@ -1225,6 +1251,7 @@ fn reconcileSelectedSubmodulesAt(
             repository.root,
             &environment,
             selected.items,
+            credential_executable,
             deadline_ms,
         );
         for (selected.items) |module| try appendPendingRepository(
@@ -1264,6 +1291,7 @@ fn updateSelectedSubmodules(
     _: []const u8,
     environment: *const std.process.Environ.Map,
     selected: []const SelectedSubmodule,
+    credential_executable: ?[]const u8,
     deadline_ms: i64,
 ) !void {
     for (selected) |module| {
@@ -1280,6 +1308,7 @@ fn updateSelectedSubmodules(
                 allocator,
                 environment,
                 source_url,
+                credential_executable,
             );
             defer fetch_environment.deinit();
             const fetch_command = selectedSubmoduleFetchCommand(module.oid);
@@ -1338,18 +1367,28 @@ fn selectedSubmoduleFetchEnvironment(
     allocator: std.mem.Allocator,
     base: *const std.process.Environ.Map,
     url: []const u8,
+    credential_executable: ?[]const u8,
 ) !std.process.Environ.Map {
     if (!selectedSubmoduleProtocolAllowed(url)) {
         return error.ManagedSubmoduleSourceProtocolRejected;
     }
-    var environment = try base.clone(allocator);
+    var environment = if (credential_executable) |executable|
+        try effectiveGitEnvironment(allocator, base, executable)
+    else
+        try base.clone(allocator);
     errdefer environment.deinit();
-    sanitizeGitEnvironment(&environment);
+    if (credential_executable == null) sanitizeGitEnvironment(&environment);
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
     try environment.put("GIT_ALLOW_PROTOCOL", selected_submodule_protocols);
-    try environment.put("GIT_CONFIG_COUNT", "1");
-    try environment.put("GIT_CONFIG_KEY_0", "remote." ++ selected_submodule_remote ++ ".url");
-    try environment.put("GIT_CONFIG_VALUE_0", url);
+    try environment.put("GIT_CONFIG_COUNT", if (credential_executable == null) "1" else "3");
+    try environment.put(
+        if (credential_executable == null) "GIT_CONFIG_KEY_0" else "GIT_CONFIG_KEY_2",
+        "remote." ++ selected_submodule_remote ++ ".url",
+    );
+    try environment.put(
+        if (credential_executable == null) "GIT_CONFIG_VALUE_0" else "GIT_CONFIG_VALUE_2",
+        url,
+    );
     return environment;
 }
 
@@ -2525,7 +2564,20 @@ fn validateFetchSource(
     environment: *const std.process.Environ.Map,
 ) !void {
     if (!fetchRemoteNameSafe(source.remote_name)) return error.GitFetchSourceUnavailable;
-    if (source.remote_url.len == 0) return;
+    if (source.remote_url.len == 0) return error.GitFetchSourceUnavailable;
+    if (source.kind == .direct_url) {
+        if (!std.mem.eql(u8, source.remote_name, source.remote_url)) {
+            return error.GitFetchSourceUnavailable;
+        }
+        if (source.repository_host.len != 0 and
+            !remoteMatchesRepository(
+                source.remote_url,
+                source.repository_host,
+                source.repository_owner,
+                source.repository_name,
+            )) return error.GitFetchSourceUnavailable;
+        return;
+    }
     const current_url = try singleRemoteUrlAlloc(
         allocator,
         io,
@@ -2786,6 +2838,7 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         allocator,
         &base,
         credential_url,
+        null,
     );
     defer fetch_environment.deinit();
     try std.testing.expectEqualStrings(
@@ -2795,6 +2848,25 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
     try std.testing.expectEqualStrings(
         selected_submodule_protocols,
         fetch_environment.get("GIT_ALLOW_PROTOCOL").?,
+    );
+    var credential_environment = try selectedSubmoduleFetchEnvironment(
+        allocator,
+        &base,
+        credential_url,
+        "/tmp/configured gh",
+    );
+    defer credential_environment.deinit();
+    try std.testing.expectEqualStrings(
+        "3",
+        credential_environment.get("GIT_CONFIG_COUNT").?,
+    );
+    try std.testing.expectEqualStrings(
+        "!'/tmp/configured gh' auth git-credential",
+        credential_environment.get("GIT_CONFIG_VALUE_1").?,
+    );
+    try std.testing.expectEqualStrings(
+        credential_url,
+        credential_environment.get("GIT_CONFIG_VALUE_2").?,
     );
     const oid = "0123456789012345678901234567890123456789";
     const fetch_command = selectedSubmoduleFetchCommand(oid);
@@ -2815,7 +2887,7 @@ test "worktree integrity selected submodule source rejects external protocols" {
         "helper://host/repository.git",
     }) |source| try std.testing.expectError(
         error.ManagedSubmoduleSourceProtocolRejected,
-        selectedSubmoduleFetchEnvironment(allocator, &base, source),
+        selectedSubmoduleFetchEnvironment(allocator, &base, source, null),
     );
     for ([_][]const u8{
         "file:///srv/repository.git",
@@ -2823,7 +2895,12 @@ test "worktree integrity selected submodule source rejects external protocols" {
         "git@git.example:repository.git",
         "/srv/repository.git",
     }) |source| {
-        var environment = try selectedSubmoduleFetchEnvironment(allocator, &base, source);
+        var environment = try selectedSubmoduleFetchEnvironment(
+            allocator,
+            &base,
+            source,
+            null,
+        );
         defer environment.deinit();
         try std.testing.expectEqualStrings(
             selected_submodule_protocols,
@@ -2900,6 +2977,7 @@ test "worktree integrity local selected object does not require parent source" {
         root,
         &environment,
         selected.items,
+        null,
         monotonicMilliseconds(io) + 5_000,
     );
     try std.testing.expectError(
@@ -3039,8 +3117,10 @@ fn verifySelectedSubmoduleLifecycle(
         &baseline,
         .{
             .environment = &environment,
+            .kind = .direct_url,
             .remote_name = parent,
             .remote_url = parent,
+            .credential_executable = "/tmp/configured gh",
         },
     );
     const config_after = try std.Io.Dir.cwd().readFileAlloc(
