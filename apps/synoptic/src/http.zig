@@ -1909,7 +1909,11 @@ fn copyRevisionEvidence(
         try generation.setPreviousPath(file.path, current.previousPath(file.path));
         const canonical_diff = current.canonicalDiff(file.path) orelse
             return error.MissingCanonicalDiff;
-        try generation.setCanonicalDiff(file.path, canonical_diff);
+        try generation.setCanonicalDiffEvidence(
+            file.path,
+            canonical_diff,
+            current.diffState(file.path),
+        );
         for (current.files.items) |*current_file| {
             if (!std.mem.eql(u8, current_file.path, file.path)) continue;
             try generation.inheritLineage(file.path, current_file);
@@ -2294,8 +2298,8 @@ test "action refresh preserves local exclusion synchronization evidence" {
         .path = "vendor/fail.js",
         .viewed = .unviewed,
         .revision_key = "revision",
-        .canonical_diff = "@@ -1 +1 @@\n-old\n+new\n",
-        .diff_state = .text,
+        .canonical_diff = "Synoptic did not inline this binary diff.",
+        .diff_state = .binary,
         .exclusion_reason = "vendored",
         .exclusion_sync_error = "readback-failed",
     });
@@ -2313,8 +2317,12 @@ test "action refresh preserves local exclusion synchronization evidence" {
     try copyRevisionEvidence(&current, &refreshed);
     try std.testing.expectEqualStrings("revision", refreshed.files.items[0].revision_key);
     try std.testing.expectEqualStrings(
-        "@@ -1 +1 @@\n-old\n+new\n",
+        "Synoptic did not inline this binary diff.",
         refreshed.canonicalDiff("vendor/fail.js").?,
+    );
+    try std.testing.expectEqual(
+        @import("domain.zig").DiffDisplayState.binary,
+        refreshed.diffState("vendor/fail.js"),
     );
     try std.testing.expectEqualStrings("vendored", refreshed.files.items[0].exclusion_reason.?);
     try std.testing.expectEqualStrings(

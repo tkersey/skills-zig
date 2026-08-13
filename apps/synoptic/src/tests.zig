@@ -1020,6 +1020,8 @@ test "ui domain bootstrap owns PR queue tab diff and reconnect state" {
             .change_type = "MODIFIED",
             .viewed = .unviewed,
             .revision_key = "r1",
+            .canonical_diff = "@@ -1 +1 @@\n-old\n+new\n",
+            .diff_state = .text,
             .exclusion_reason = "generated",
             .exclusion_sync_error = "readback-failed",
         },
@@ -2717,6 +2719,51 @@ test "exclusions config preserves semantic kind across bounded display" {
         .binary,
     );
     try std.testing.expectEqual(domain.DiffDisplayState.binary, generation.diffState("binary.dat"));
+}
+
+test "UI projections preserve authoritative binary diff kind" {
+    const placeholder = "Synoptic did not inline this file diff because it exceeds the limit.";
+    var state = try app.App.init(std.testing.allocator, "head");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "binary.dat",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+        .canonical_diff = placeholder,
+        .diff_state = .binary,
+    });
+    state.primary_ready = true;
+    const opened = try state.openFile("binary.dat");
+    defer std.testing.allocator.free(opened);
+    try state.recordOpenedSession("binary.dat", "r1", "session", placeholder, false, true);
+    try std.testing.expectEqual(domain.DiffDisplayState.binary, state.tabs.items[0].diff_state);
+    try state.updateTabDiff("binary.dat", "r1", placeholder);
+    try std.testing.expectEqual(domain.DiffDisplayState.binary, state.tabs.items[0].diff_state);
+
+    var next = try domain.PrGeneration.initFull(std.testing.allocator, "base", "head");
+    defer next.deinit();
+    try next.addFile(.{
+        .path = "binary.dat",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+        .canonical_diff = placeholder,
+        .diff_state = .binary,
+    });
+    var plan = try state.prepareRefresh(&next, .{
+        .repository = "o/r",
+        .number = 1,
+        .title = "PR",
+        .body = "",
+        .url = "https://github.com/o/r/pull/1",
+        .base_ref_name = "main",
+        .base_ref_oid = "base",
+        .head_ref_name = "feature",
+        .head_ref_oid = "head",
+        .state = "OPEN",
+        .is_draft = false,
+    });
+    defer plan.deinit();
+    try std.testing.expectEqual(domain.DiffDisplayState.binary, plan.tabs.items[0].diff_state);
 }
 
 fn verifyExclusionMergeBaseReuse(

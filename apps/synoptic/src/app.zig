@@ -286,10 +286,7 @@ pub const App = struct {
             try plan.tabs.append(self.allocator, .{
                 .index = index,
                 .diff = owned_diff,
-                .diff_state = if (diff) |value|
-                    domain.diffDisplayState(value)
-                else
-                    .unavailable,
+                .diff_state = if (current_path) |path| next.diffState(path) else .unavailable,
                 .status = next_status,
             });
         }
@@ -406,7 +403,7 @@ pub const App = struct {
             self.allocator.free(tab.diff);
             tab.id = id;
             tab.diff = content;
-            tab.diff_state = domain.diffDisplayState(diff);
+            tab.diff_state = self.generation.diffState(path);
             tab.reused = reused;
             tab.initial_review = initial_review;
             if (!reused) tab.turn_active = initial_review;
@@ -453,10 +450,7 @@ pub const App = struct {
             const content = try self.allocator.dupe(u8, diff orelse "");
             self.allocator.free(tab.diff);
             tab.diff = content;
-            tab.diff_state = if (diff) |value|
-                domain.diffDisplayState(value)
-            else
-                .unavailable;
+            tab.diff_state = if (diff != null) self.generation.diffState(path) else .unavailable;
         };
     }
 
