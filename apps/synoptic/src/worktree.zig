@@ -3,6 +3,7 @@ const std = @import("std");
 const fetch_timeout_ms: u32 = 30_000;
 const fetch_termination_grace_ms: u32 = 250;
 const fetch_output_limit: usize = 1024 * 1024;
+const credential_helper = "!gh auth git-credential";
 const git_selector_environment_keys = [_][]const u8{
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -32,6 +33,11 @@ fn effectiveGitEnvironment(
     try environment.put("GIT_CONFIG_SYSTEM", "/dev/null");
     try environment.put("GIT_CONFIG_NOSYSTEM", "1");
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    try environment.put("GIT_CONFIG_COUNT", "2");
+    try environment.put("GIT_CONFIG_KEY_0", "credential.helper");
+    try environment.put("GIT_CONFIG_VALUE_0", "");
+    try environment.put("GIT_CONFIG_KEY_1", "credential.helper");
+    try environment.put("GIT_CONFIG_VALUE_1", credential_helper);
     return environment;
 }
 
@@ -1803,6 +1809,26 @@ fn runGitCommandWithEnvironment(
 
 test "custody makes destructive policy explicit" {
     try std.testing.expectEqualStrings("managed", (Custody{ .managed = "/tmp/w" }).kind());
+}
+
+test "effective fetch environment isolates selectors and projects credentials" {
+    var inherited = std.process.Environ.Map.init(std.testing.allocator);
+    defer inherited.deinit();
+    try inherited.put("GIT_CONFIG_COUNT", "1");
+    try inherited.put("GIT_CONFIG_KEY_0", "url.https://evil.invalid/.insteadOf");
+    try inherited.put("GIT_CONFIG_VALUE_0", "https://github.com/");
+    var effective = try effectiveGitEnvironment(std.testing.allocator, &inherited);
+    defer effective.deinit();
+    try std.testing.expectEqualStrings("2", effective.get("GIT_CONFIG_COUNT").?);
+    try std.testing.expectEqualStrings(
+        "credential.helper",
+        effective.get("GIT_CONFIG_KEY_0").?,
+    );
+    try std.testing.expectEqualStrings("", effective.get("GIT_CONFIG_VALUE_0").?);
+    try std.testing.expectEqualStrings(
+        credential_helper,
+        effective.get("GIT_CONFIG_VALUE_1").?,
+    );
 }
 test "reused checkout can never be cleanup target" {
     try std.testing.expect(!cleanupAllowed(.{ .reused_current = "/user" }));
