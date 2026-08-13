@@ -1512,7 +1512,6 @@ const ActorPending = struct {
     response_json: ?[]u8 = null,
     response_received_ms: i64 = 0,
     transmission_started: bool = false,
-    causal_sequence: u64 = 0,
 };
 
 const ActorOutbound = struct {
@@ -1527,7 +1526,6 @@ const ActorServerRequest = struct {
     method: []u8,
     raw_json: []u8,
     deadline_ms: i64,
-    causal_sequence: u64 = 0,
     handler: protocol.ServerRequestHandler,
 
     fn byteSize(self: ActorServerRequest) usize {
@@ -1582,7 +1580,6 @@ const ActorState = struct {
     subscriptions: std.ArrayList(protocol.NotificationHandler) = .empty,
     server_request_handler: ?protocol.ServerRequestHandler,
     next_request_id: i64 = 1,
-    next_causal_sequence: u64 = 1,
     default_request_timeout_ms: u32,
     overload_retry_policy: OverloadRetryPolicy,
     overload_retry_seed: u64,
@@ -1772,28 +1769,12 @@ pub const Actor = struct {
         params_json: ?[]const u8,
         timeout_ms: ?u32,
     ) ![]u8 {
-        const response = try self.requestJsonWithCausality(method, params_json, timeout_ms);
-        return response.json;
-    }
-
-    pub const CausalResponse = struct {
-        json: []u8,
-        causal_sequence: u64,
-    };
-
-    pub fn requestJsonWithCausality(
-        self: *Actor,
-        method: []const u8,
-        params_json: ?[]const u8,
-        timeout_ms: ?u32,
-    ) !CausalResponse {
         const state = try self.acquireState();
         defer actorReleaseCall(state);
         const budget_ms = timeout_ms orelse state.default_request_timeout_ms;
         if (budget_ms == 0) return error.InvalidRequestDeadline;
         const deadline = monotonicMillis() + @as(i64, budget_ms);
         var retry_index: u32 = 0;
-        var first_causal_sequence: ?u64 = null;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const remaining_ms = deadline - monotonicMillis();
             if (remaining_ms <= 0) return error.RequestDeadlineExceeded;
@@ -1803,13 +1784,7 @@ pub const Actor = struct {
                 params_json,
                 @intCast(remaining_ms),
             );
-            if (first_causal_sequence == null) {
-                first_causal_sequence = response.causal_sequence;
-            }
-            if (!response.is_error) return .{
-                .json = response.json,
-                .causal_sequence = first_causal_sequence.?,
-            };
+            if (!response.is_error) return response.json;
 
             const retryable = actorResponseIsOverload(state.allocator, response.json);
             if (!retryable or retry_index >= state.overload_retry_policy.max_retries) {
@@ -1833,7 +1808,6 @@ pub const Actor = struct {
     const Response = struct {
         json: []u8,
         is_error: bool,
-        causal_sequence: u64,
     };
 
     fn requestOnce(
@@ -1854,10 +1828,6 @@ pub const Actor = struct {
         }
         const request_id = state.next_request_id;
         state.next_request_id += 1;
-        pending.causal_sequence = actorNextCausalSequenceLocked(state) catch |err| {
-            state.mutex.unlock();
-            return err;
-        };
         state.pending.put(request_id, &pending) catch |err| {
             state.mutex.unlock();
             return err;
@@ -1916,15 +1886,6 @@ fn actorAcquireCall(state: *ActorState) !void {
     defer state.mutex.unlock();
     if (state.teardown_started) return error.ActorStopped;
     state.active_calls += 1;
-}
-
-fn actorNextCausalSequenceLocked(state: *ActorState) !u64 {
-    if (state.next_causal_sequence == std.math.maxInt(u64)) {
-        return error.ActorCausalSequenceExhausted;
-    }
-    const sequence = state.next_causal_sequence;
-    state.next_causal_sequence += 1;
-    return sequence;
 }
 
 fn actorReleaseCall(state: *ActorState) void {
@@ -2025,7 +1986,6 @@ fn actorCompletedResponse(
     const result = Actor.Response{
         .json = pending.response_json.?,
         .is_error = pending.is_error,
-        .causal_sequence = pending.causal_sequence,
     };
     state.mutex.unlock();
     return result;
@@ -2398,10 +2358,6 @@ fn actorDispatchServerRequest(
         );
     }
     work.handler = handler;
-    work.causal_sequence = actorNextCausalSequenceLocked(state) catch |err| {
-        state.mutex.unlock();
-        return err;
-    };
     state.server_requests.append(state.allocator, work) catch |err| {
         state.mutex.unlock();
         return err;
@@ -2428,7 +2384,6 @@ fn actorServerRequestAlloc(
         .method = owned_method,
         .raw_json = raw_json,
         .deadline_ms = deadline_ms,
-        .causal_sequence = undefined,
         .handler = undefined,
     };
 }
@@ -2451,7 +2406,6 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         .id = request_id,
         .method = work.method,
         .raw_json = work.raw_json,
-        .causal_sequence = work.causal_sequence,
         .deadline_ms = work.deadline_ms,
     };
     var watchdog = ServerHandlerWatchdog{
@@ -4593,7 +4547,6 @@ const TransportTerminalNotificationProbe = struct {
 
 const ServerRequestProbe = struct {
     calls: usize = 0,
-    causal_sequence: u64 = 0,
 
     fn handle(
         context: *anyopaque,
@@ -4603,7 +4556,6 @@ const ServerRequestProbe = struct {
         const self: *ServerRequestProbe = @ptrCast(@alignCast(context));
         try std.testing.expectEqualStrings("item/tool/call", request.method);
         self.calls += 1;
-        self.causal_sequence = request.causal_sequence;
         return allocator.dupe(u8, "{\"handled\":true}");
     }
 };
@@ -4748,10 +4700,9 @@ test "actor falsifier dispatches server requests through configured handler and 
         },
     });
     defer actor.deinit();
-    const result = try actor.requestJsonWithCausality("actor/server-request", "{}", 2_000);
-    defer allocator.free(result.json);
+    const result = try actor.requestJson("actor/server-request", "{}", 2_000);
+    defer allocator.free(result);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
-    try std.testing.expect(probe.causal_sequence > result.causal_sequence);
     const reply = try fixture.tmp.dir.readFileAlloc(
         std.testing.io,
         "reply.json",

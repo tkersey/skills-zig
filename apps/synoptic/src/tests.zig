@@ -52,10 +52,12 @@ test "lifecycle identity uses exact native argument order" {
     ));
 }
 
-test "authoritative request order excludes pre-instruction requests" {
-    try std.testing.expect(!sessions.requestFollowsInstructionOrderForTest(7, 7));
-    try std.testing.expect(!sessions.requestFollowsInstructionOrderForTest(6, 7));
-    try std.testing.expect(sessions.requestFollowsInstructionOrderForTest(8, 7));
+test "authoritative tools require the instruction-owned capability" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sessions.dynamic_tools_json,
+        "\"required\":[\"authorityToken\"]",
+    ) != null);
 }
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
@@ -797,7 +799,7 @@ test "human authority is correlated with turn admission" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
-        "try self.beginHumanInstruction(session_id, text);",
+        "try self.beginHumanInstruction(session_id, text)",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -812,7 +814,7 @@ test "human authority is correlated with turn admission" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
-        "request.causal_sequence",
+        "authorityToken exactly",
     ) != null);
 }
 
@@ -1400,18 +1402,19 @@ const fake_codex_script =
     \\        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"primary","turn":{"id":"primary-turn","status":"completed"}}}'
     \\      else
     \\        thread_id=$(printf '%s\n' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+    \\        authority_token=$(printf '%s\n' "$line" | sed -n 's/.*authorityToken exactly \\"\([0-9a-f]*\)\\".*/\1/p')
     \\        if printf '%s' "$line" | grep -q 'fail-initial-file-turn'; then
     \\          printf '{"id":%s,"error":{"code":-32000,"message":"turn failed"}}\n' "$id"
     \\          continue
     \\        fi
     \\        if printf '%s' "$line" | grep -q 'prepare the comment'; then
-    \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"slot":"finding-1","kind":"add_inline_comment","effectSummary":"Add an inline comment on a.zig line 1","payload":{"path":"a.zig","line":1,"side":"RIGHT","body":"Could this fail?"}}}}\n' "$thread_id"
+    \\          printf '{"id":"tool-prepare","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.prepare_github_action","arguments":{"authorityToken":"%s","slot":"finding-1","kind":"add_inline_comment","effectSummary":"Add an inline comment on a.zig line 1","payload":{"path":"a.zig","line":1,"side":"RIGHT","body":"Could this fail?"}}}}\n' "$thread_id" "$authority_token"
     \\        fi
     \\        printf '{"id":%s,"result":{"turn":{"id":"file-turn"}}}\n' "$id"
     \\        if printf '%s' "$line" | grep -q 'complete this file'; then
-    \\          printf '{"id":"tool-complete","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.complete_file_review","arguments":{}}}\n' "$thread_id"
+    \\          printf '{"id":"tool-complete","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.complete_file_review","arguments":{"authorityToken":"%s"}}}\n' "$thread_id" "$authority_token"
     \\        elif printf '%s' "$line" | grep -q 'close this session'; then
-    \\          printf '{"id":"tool-close","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.close_session","arguments":{}}}\n' "$thread_id"
+    \\          printf '{"id":"tool-close","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.close_session","arguments":{"authorityToken":"%s"}}}\n' "$thread_id" "$authority_token"
     \\        elif printf '%s' "$line" | grep -q 'search cross-file'; then
     \\          printf '{"id":"tool-search","method":"item/tool/call","params":{"threadId":"%s","tool":"synoptic.search_unresolved_threads","arguments":{"query":"risk","paths":[],"includeWholePullRequest":true}}}\n' "$thread_id"
     \\        elif printf '%s' "$line" | grep -q 'run approved command'; then
