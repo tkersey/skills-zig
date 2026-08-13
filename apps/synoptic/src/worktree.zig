@@ -1219,6 +1219,7 @@ fn updateSelectedSubmodules(
 }
 
 const selected_submodule_remote = "synoptic-selected-source";
+const selected_submodule_protocols = "file:http:https:ssh:git";
 
 const SelectedSubmoduleFetchCommand = struct {
     argv: [9][]const u8,
@@ -1243,14 +1244,28 @@ fn selectedSubmoduleFetchEnvironment(
     base: *const std.process.Environ.Map,
     url: []const u8,
 ) !std.process.Environ.Map {
+    if (!selectedSubmoduleProtocolAllowed(url)) {
+        return error.ManagedSubmoduleSourceProtocolRejected;
+    }
     var environment = try base.clone(allocator);
     errdefer environment.deinit();
     sanitizeGitEnvironment(&environment);
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    try environment.put("GIT_ALLOW_PROTOCOL", selected_submodule_protocols);
     try environment.put("GIT_CONFIG_COUNT", "1");
     try environment.put("GIT_CONFIG_KEY_0", "remote." ++ selected_submodule_remote ++ ".url");
     try environment.put("GIT_CONFIG_VALUE_0", url);
     return environment;
+}
+
+fn selectedSubmoduleProtocolAllowed(url: []const u8) bool {
+    if (std.mem.indexOf(u8, url, "::") != null) return false;
+    const location = GitRepositoryLocation.parse(url) orelse return false;
+    if (location.kind != .url) return true;
+    inline for (.{ "file", "http", "https", "ssh", "git" }) |allowed| {
+        if (std.ascii.eqlIgnoreCase(location.scheme, allowed)) return true;
+    }
+    return false;
 }
 
 fn runSelectedSubmoduleCommand(
@@ -2682,12 +2697,43 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         credential_url,
         fetch_environment.get("GIT_CONFIG_VALUE_0").?,
     );
+    try std.testing.expectEqualStrings(
+        selected_submodule_protocols,
+        fetch_environment.get("GIT_ALLOW_PROTOCOL").?,
+    );
     const oid = "0123456789012345678901234567890123456789";
     const fetch_command = selectedSubmoduleFetchCommand(oid);
     try std.testing.expectEqualStrings(oid, fetch_command.argv[8]);
     for (fetch_command.argv) |argument| {
         try std.testing.expect(std.mem.indexOf(u8, argument, "token:secret") == null);
         try std.testing.expect(!std.mem.eql(u8, argument, credential_url));
+    }
+}
+
+test "worktree integrity selected submodule source rejects external protocols" {
+    const allocator = std.testing.allocator;
+    var base = std.process.Environ.Map.init(allocator);
+    defer base.deinit();
+    try base.put("GIT_ALLOW_PROTOCOL", "ext:file");
+    for ([_][]const u8{
+        "ext::sh -c 'touch /tmp/escaped'",
+        "helper://host/repository.git",
+    }) |source| try std.testing.expectError(
+        error.ManagedSubmoduleSourceProtocolRejected,
+        selectedSubmoduleFetchEnvironment(allocator, &base, source),
+    );
+    for ([_][]const u8{
+        "file:///srv/repository.git",
+        "https://git.example/repository.git",
+        "git@git.example:repository.git",
+        "/srv/repository.git",
+    }) |source| {
+        var environment = try selectedSubmoduleFetchEnvironment(allocator, &base, source);
+        defer environment.deinit();
+        try std.testing.expectEqualStrings(
+            selected_submodule_protocols,
+            environment.get("GIT_ALLOW_PROTOCOL").?,
+        );
     }
 }
 
