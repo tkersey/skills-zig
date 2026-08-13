@@ -2235,8 +2235,12 @@ fn actorRouteLineAt(state: *ActorState, line: []const u8, received_ms: i64) !voi
     const response_id = id_value orelse return error.InvalidAppServerEnvelope;
     const integer_id = core_json.intFromValue(response_id) orelse
         return error.InvalidAppServerEnvelope;
-    const response_value = object.get("result") orelse object.get("error") orelse
+    const result_value = object.get("result");
+    const error_value = object.get("error");
+    if ((result_value == null) == (error_value == null)) {
         return error.InvalidAppServerEnvelope;
+    }
+    const response_value = result_value orelse error_value.?;
     const response_json = try core_json.stringifyAlloc(state.allocator, response_value);
     errdefer state.allocator.free(response_json);
 
@@ -2250,7 +2254,7 @@ fn actorRouteLineAt(state: *ActorState, line: []const u8, received_ms: i64) !voi
         return error.DuplicateAppServerResponse;
     }
     pending.response_json = response_json;
-    pending.is_error = object.get("error") != null;
+    pending.is_error = error_value != null;
     pending.response_received_ms = received_ms;
     pending.done = true;
 }
@@ -5333,6 +5337,32 @@ test "actor response correlation rejects a duplicate before replacement" {
         actorRouteLine(&state, "{\"id\":7,\"result\":{\"second\":true}}"),
     );
     try std.testing.expectEqualStrings("{\"first\":true}", pending.response_json.?);
+}
+
+test "actor response correlation rejects an ambiguous discriminant" {
+    const allocator = std.testing.allocator;
+    var pending = ActorPending{};
+    var state = ActorState{
+        .allocator = allocator,
+        .client = serverRequestTestClient(),
+        .outbound_capacity = 1,
+        .server_request_capacity = 1,
+        .server_request_timeout_ms = 100,
+        .pending = std.AutoHashMap(i64, *ActorPending).init(allocator),
+        .server_request_handler = null,
+        .default_request_timeout_ms = 100,
+        .overload_retry_policy = .{},
+        .overload_retry_seed = 1,
+    };
+    defer state.deinit();
+    try state.pending.put(7, &pending);
+
+    try std.testing.expectError(
+        error.InvalidAppServerEnvelope,
+        actorRouteLine(&state, "{\"id\":7,\"result\":{},\"error\":{}}"),
+    );
+    try std.testing.expect(!pending.done);
+    try std.testing.expect(pending.response_json == null);
 }
 
 test "transport acquisition helpers require an already resolved retry seed" {
