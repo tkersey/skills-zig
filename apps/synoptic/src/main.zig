@@ -457,25 +457,21 @@ fn awaitChildReady(
 ) !LifecycleRecord {
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
     while (true) { // tiger: event-loop -- bounded by owner state or deadline.
+        if (try reportChildLaunchError(allocator, io, error_path)) {
+            return error.SynopticChildLaunchFailed;
+        }
         if (readLifecycleRecord(allocator, io, ready_path)) |candidate| {
+            if (try reportChildLaunchError(allocator, io, error_path)) {
+                var cancelled = candidate;
+                cancelled.deinit();
+                return error.SynopticChildLaunchFailed;
+            }
             if (candidate.pid != child_pid or !std.mem.eql(u8, candidate.launch_id, launch_id)) {
                 var invalid = candidate;
                 invalid.deinit();
                 return error.InvalidLaunchReadiness;
             }
             return candidate;
-        } else |_| {}
-        if (std.Io.Dir.cwd().readFileAlloc(
-            io,
-            error_path,
-            allocator,
-            .limited(64 * 1024),
-        )) |child_error| {
-            defer allocator.free(child_error);
-            var err_out = std.Io.File.stderr().writer(io, &.{});
-            try err_out.interface.print("{s}\n", .{child_error});
-            try err_out.interface.flush();
-            return error.SynopticChildLaunchFailed;
         } else |_| {}
         if (!processAlive(child_pid)) return error.SynopticChildExitedBeforeReady;
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
@@ -488,6 +484,24 @@ fn awaitChildReady(
             }
         };
     }
+}
+
+fn reportChildLaunchError(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    error_path: []const u8,
+) !bool {
+    const child_error = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        error_path,
+        allocator,
+        .limited(64 * 1024),
+    ) catch return false;
+    defer allocator.free(child_error);
+    var err_out = std.Io.File.stderr().writer(io, &.{});
+    try err_out.interface.print("{s}\n", .{child_error});
+    try err_out.interface.flush();
+    return true;
 }
 
 fn serve(
@@ -1619,13 +1633,20 @@ fn stop(
     const runtime_root = try runtimeRootAlloc(allocator, environment);
     defer allocator.free(runtime_root);
     try ensurePrivateDir(io, runtime_root);
-    const claim_path = try std.fs.path.join(allocator, &.{ runtime_root, "launch.lock" });
-    defer allocator.free(claim_path);
-    var claim = try acquireLaunchClaim(io, claim_path);
-    defer claim.close(io);
-    defer claim.unlock(io);
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
+    const claim_path = try std.fs.path.join(allocator, &.{ runtime_root, "launch.lock" });
+    defer allocator.free(claim_path);
+    var claim = (try acquireStopClaim(
+        allocator,
+        io,
+        runtime_root,
+        current_path,
+        claim_path,
+        json,
+    )) orelse return;
+    defer claim.close(io);
+    defer claim.unlock(io);
     var record = (try readCurrentForLaunch(allocator, io, current_path)) orelse
         return printStopResult(io, json, null, false);
     defer record.deinit();
@@ -1669,6 +1690,94 @@ fn stop(
     return printStopResult(io, json, record.launch_id, true);
 }
 
+fn acquireStopClaim(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    current_path: []const u8,
+    claim_path: []const u8,
+    json: bool,
+) !?std.Io.File {
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (true) { // tiger: event-loop -- bounded by the stop deadline.
+        if (try stopStartingBeforeClaim(
+            allocator,
+            io,
+            runtime_root,
+            current_path,
+            claim_path,
+            json,
+        )) return null;
+        if (acquireLaunchClaim(io, claim_path)) |claim| return claim else |err| switch (err) {
+            error.SynopticLaunchInProgress => {},
+            else => return err,
+        }
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
+            return error.SynopticStopTimeout;
+        }
+        sleepBestEffort(io, 10);
+    }
+}
+
+fn stopStartingBeforeClaim(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_root: []const u8,
+    current_path: []const u8,
+    claim_path: []const u8,
+    json: bool,
+) !bool {
+    var observed = (try readCurrentForLaunch(allocator, io, current_path)) orelse return false;
+    defer observed.deinit();
+    if (observed.phase != .starting) return false;
+    const was_running = try verifiedProcess(allocator, io, observed);
+    if (was_running) {
+        try writeLaunchError(
+            allocator,
+            io,
+            observed.runtime_root,
+            observed.launch_id,
+            error.SynopticLaunchStopped,
+        );
+        try signalStartingProcess(allocator, io, observed);
+    }
+    var claim = try awaitLaunchClaim(io, claim_path);
+    defer claim.close(io);
+    defer claim.unlock(io);
+    var current = (try readCurrentForLaunch(allocator, io, current_path)) orelse {
+        try printStopResult(io, json, observed.launch_id, was_running);
+        return true;
+    };
+    defer current.deinit();
+    if (!std.mem.eql(u8, current.launch_id, observed.launch_id)) {
+        try printStopResult(io, json, observed.launch_id, was_running);
+        return true;
+    }
+    if (try verifiedProcess(allocator, io, current)) {
+        return error.StartingLaunchStillRunning;
+    }
+    try settleStartingProcessGroup(current);
+    try retireDeadStop(allocator, io, runtime_root, current_path, current);
+    try printStopResult(io, json, observed.launch_id, was_running);
+    return true;
+}
+
+fn awaitLaunchClaim(io: std.Io, path: []const u8) !std.Io.File {
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (true) { // tiger: event-loop -- bounded by the stop deadline.
+        if (acquireLaunchClaim(io, path)) |claim| return claim else |err| switch (err) {
+            error.SynopticLaunchInProgress => {},
+            else => return err,
+        }
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
+            return error.SynopticStopTimeout;
+        }
+        sleepBestEffort(io, 10);
+    }
+}
+
 fn finalizeStoppedLaunch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1702,6 +1811,15 @@ fn stopStartingProcess(
     io: std.Io,
     record: LifecycleRecord,
 ) !void {
+    try signalStartingProcess(allocator, io, record);
+    try settleStartingProcessGroup(record);
+}
+
+fn signalStartingProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record: LifecycleRecord,
+) !void {
     const group = std.math.cast(std.posix.pid_t, record.pid) orelse
         return error.InvalidLifecycleRecord;
     std.posix.kill(-group, std.posix.SIG.TERM) catch |err| switch (err) {
@@ -1712,26 +1830,32 @@ fn stopStartingProcess(
         error.ProcessNotFound => {},
         else => return err,
     };
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+    while (try verifiedProcess(allocator, io, record)) {
+        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (now_ms - started_ms < launch_shutdown_grace_ms) {
+            sleepBestEffort(io, 10);
+            continue;
+        }
+        std.posix.kill(group, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => return err,
+        };
+        const killed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
+        if (killed_ms - started_ms >= launch_shutdown_grace_ms * 2) {
+            return error.SynopticStopTimeout;
+        }
+        sleepBestEffort(io, 10);
+    }
+}
+
+fn settleStartingProcessGroup(record: LifecycleRecord) !void {
     const websocket = @import("cas_runtime").websocket;
     if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
         websocket.forceKillProcessGroup(record.pid);
     }
     if (!websocket.waitForProcessGroupExit(record.pid, launch_shutdown_grace_ms)) {
         return error.SynopticStopTimeout;
-    }
-    if (try verifiedProcess(allocator, io, record)) {
-        std.posix.kill(group, std.posix.SIG.KILL) catch |err| switch (err) {
-            error.ProcessNotFound => {},
-            else => return err,
-        };
-    }
-    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcess(allocator, io, record)) {
-        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-        if (now_ms - started_ms >= launch_shutdown_grace_ms) {
-            return error.SynopticStopTimeout;
-        }
-        sleepBestEffort(io, 10);
     }
 }
 

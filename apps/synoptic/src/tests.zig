@@ -4867,14 +4867,14 @@ fn verifyLifecycleInterruptedStartingLaunch(
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer launcher.kill(io);
+    var launcher_owned = true;
+    defer if (launcher_owned) launcher.kill(io);
     const current_path = try std.fs.path.join(
         allocator,
         &.{ fixture.runtime_tmp, "synoptic", "current.json" },
     );
     defer allocator.free(current_path);
     try waitForStartingRecord(allocator, io, current_path);
-    launcher.kill(io);
     const status = try runLifecycleCommand(
         allocator,
         io,
@@ -4891,6 +4891,9 @@ fn verifyLifecycleInterruptedStartingLaunch(
     );
     defer allocator.free(stopped);
     try std.testing.expect(std.mem.indexOf(u8, stopped, "\"status\":\"stopped\"") != null);
+    const launch_term = try launcher.wait(io);
+    launcher_owned = false;
+    try std.testing.expect(launch_term != .exited or launch_term.exited != 0);
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, current_path, .{}),
