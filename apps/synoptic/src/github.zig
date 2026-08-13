@@ -2159,6 +2159,7 @@ pub fn loadThreads(
     defer parsed.deinit();
     const root = try requiredObject(parsed.value);
     const data = try requiredObjectField(root, "data");
+    const nested_page = data.get("node") != null;
     const nodes: []const std.json.Value = if (data.get("node")) |node|
         if (node == .null) return else &.{node}
     else blk: {
@@ -2197,6 +2198,7 @@ pub fn loadThreads(
         if (try generation.appendThreadComments(thread_id, comments.items)) {
             continue;
         }
+        if (nested_page) return error.InvalidSnapshot;
         try generation.addThread(
             .{
                 .id = thread_id,
@@ -3399,6 +3401,20 @@ test "thread evidence accepts deleted authors and nested comment pages" {
         "head",
     );
     defer generation.deinit();
+    try generation.addThread(.{
+        .id = "T1",
+        .path = "a.zig",
+        .line = 1,
+        .start_line = null,
+        .diff_side = "RIGHT",
+        .start_diff_side = null,
+        .subject_type = "LINE",
+        .outdated = false,
+        .viewer_can_reply = true,
+        .viewer_can_resolve = true,
+        .viewer_can_unresolve = false,
+        .comments = &.{},
+    });
     const raw =
         "{\"data\":{\"node\":{\"id\":\"T1\",\"path\":\"a.zig\"," ++
         "\"line\":1,\"startLine\":null,\"diffSide\":\"RIGHT\"," ++
@@ -3437,6 +3453,10 @@ test "thread evidence accepts deleted authors and nested comment pages" {
         "{\"data\":{\"node\":{\"id\":\"T1\",\"isResolved\":true}}}";
     try loadThreads(std.testing.allocator, resolved, &generation);
     try std.testing.expectEqual(@as(usize, 0), generation.threads.items.len);
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        loadThreads(std.testing.allocator, next, &generation),
+    );
 }
 
 test "snapshot rejects nullable outer review thread nodes" {
