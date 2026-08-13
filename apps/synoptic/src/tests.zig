@@ -51,6 +51,12 @@ test "lifecycle identity uses exact native argument order" {
         runtime_root,
     ));
 }
+
+test "authoritative request order excludes pre-instruction requests" {
+    try std.testing.expect(!sessions.requestFollowsInstructionOrderForTest(7, 7));
+    try std.testing.expect(!sessions.requestFollowsInstructionOrderForTest(6, 7));
+    try std.testing.expect(sessions.requestFollowsInstructionOrderForTest(8, 7));
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");

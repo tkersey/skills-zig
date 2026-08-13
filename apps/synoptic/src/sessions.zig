@@ -143,6 +143,7 @@ pub const Session = struct {
     turn_starting: bool = false,
     human_authority: ?HumanAuthority = null,
     human_authority_admission: HumanAuthorityAdmission = .absent,
+    human_authority_after_request_sequence: u64 = 0,
     pending_initial_prompt: ?[]u8 = null,
     pending_skill_path: ?[]u8 = null,
     fn deinit(self: Session, allocator: std.mem.Allocator) void {
@@ -365,6 +366,7 @@ pub const Registry = struct {
     max_sessions: usize = config.max_open_sessions,
     io: ?std.Io = null,
     authoritative_tool_handler: ?AuthoritativeToolHandler = null,
+    authoritative_request_sequence: u64 = 0,
     authoritative_reservations: usize = 0,
     authoritative_reserved_bytes: usize = 0,
     visible_event_bytes: usize = 0,
@@ -826,6 +828,8 @@ pub const Registry = struct {
                 return error.HumanAuthorityAdmissionActive;
             }
             session.human_authority = classifyHumanInstruction(text);
+            session.human_authority_after_request_sequence =
+                self.authoritative_request_sequence;
             session.human_authority_admission = if (session.human_authority == null)
                 .absent
             else
@@ -2133,6 +2137,8 @@ pub const Registry = struct {
         event_kind: []const u8,
         allocator: std.mem.Allocator,
     ) ![]u8 {
+        const request_sequence = self.nextAuthoritativeRequestSequence() catch
+            return allocator.dupe(u8, missing_authority_response);
         const origin_thread = extractString(
             self.allocator,
             raw_json,
@@ -2147,6 +2153,7 @@ pub const Registry = struct {
         self.mutex.lock();
         const reserved = self.reserveAuthoritativeLocked(
             origin_thread,
+            request_sequence,
             requested,
             event_kind,
             raw_json,
@@ -2174,6 +2181,7 @@ pub const Registry = struct {
     fn reserveAuthoritativeLocked(
         self: *Registry,
         origin_thread: []const u8,
+        request_sequence: u64,
         requested: HumanAuthority,
         event_kind: []const u8,
         raw_json: []const u8,
@@ -2185,6 +2193,10 @@ pub const Registry = struct {
             const eligible = std.mem.eql(u8, session.thread_id, origin_thread) and
                 session.status != .closed and !session.initial_turn_active and
                 session.human_authority_admission == .admitted and
+                requestFollowsInstructionOrder(
+                    request_sequence,
+                    session.human_authority_after_request_sequence,
+                ) and
                 authorityCovers(session.human_authority, requested);
             if (!eligible) continue;
             if (std.mem.eql(u8, event_kind, "file.complete.requested") and
@@ -2224,6 +2236,16 @@ pub const Registry = struct {
             };
         }
         return null;
+    }
+
+    fn nextAuthoritativeRequestSequence(self: *Registry) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.authoritative_request_sequence == std.math.maxInt(u64)) {
+            return error.AuthoritativeRequestSequenceExhausted;
+        }
+        self.authoritative_request_sequence += 1;
+        return self.authoritative_request_sequence;
     }
 
     fn awaitAuthorityAdmissionLocked(self: *Registry, origin_thread: []const u8) void {
@@ -3297,6 +3319,17 @@ fn authorityCovers(granted: ?HumanAuthority, requested: HumanAuthority) bool {
         (value == .github_any and requested != .complete and requested != .close);
 }
 
+fn requestFollowsInstructionOrder(request_sequence: u64, instruction_floor: u64) bool {
+    return request_sequence > instruction_floor;
+}
+
+pub fn requestFollowsInstructionOrderForTest(
+    request_sequence: u64,
+    instruction_floor: u64,
+) bool {
+    return requestFollowsInstructionOrder(request_sequence, instruction_floor);
+}
+
 fn declineResult(method: []const u8) []const u8 {
     return if (std.mem.eql(u8, method, "item/permissions/requestApproval"))
         "{\"permissions\":{},\"scope\":\"turn\"}"
@@ -4247,6 +4280,7 @@ test "authoritative reservation claims one human grant exactly once" {
     registry.mutex.lock();
     const first = try registry.reserveAuthoritativeLocked(
         "file-1",
+        1,
         .github_any,
         "action.prepared",
         exact_tool_test_request,
@@ -4254,6 +4288,7 @@ test "authoritative reservation claims one human grant exactly once" {
     );
     const second = try registry.reserveAuthoritativeLocked(
         "file-1",
+        2,
         .github_any,
         "action.prepared",
         exact_tool_test_request,
@@ -4283,6 +4318,55 @@ test "authoritative reservation claims one human grant exactly once" {
         HumanAuthorityAdmission.consumed,
         registry.sessions.items[0].human_authority_admission,
     );
+}
+
+test "tool request must be admitted after its governing human instruction" {
+    var registry = Registry{ .allocator = std.testing.allocator };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    registry.authoritative_request_sequence = 1;
+    try registry.beginHumanInstruction("ses-1", "please prepare the comment");
+    registry.resolveHumanInstruction("ses-1", true);
+    var calls: usize = 0;
+    try registry.setAuthoritativeToolHandler(.{
+        .context = &calls,
+        .handle = acceptTestAuthoritativeTool,
+    });
+
+    registry.mutex.lock();
+    const pre_instruction = try registry.reserveAuthoritativeLocked(
+        "file-1",
+        1,
+        .github_any,
+        "action.prepared",
+        exact_tool_test_request,
+        std.testing.allocator,
+    );
+    const post_instruction = try registry.reserveAuthoritativeLocked(
+        "file-1",
+        2,
+        .github_any,
+        "action.prepared",
+        exact_tool_test_request,
+        std.testing.allocator,
+    );
+    registry.mutex.unlock();
+    try std.testing.expect(pre_instruction == null);
+    try std.testing.expect(post_instruction != null);
+    const admission = post_instruction.?;
+    defer std.testing.allocator.free(admission.session_id);
+    const response = try registry.executeAuthoritative(
+        admission.handler,
+        admission.visible_event,
+        admission.reserved_bytes,
+        admission.claimed_authority,
+        "action.prepared",
+        exact_tool_test_request,
+        admission.session_id,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 test "action broker rejects authority from a failed turn admission" {
