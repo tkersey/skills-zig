@@ -707,6 +707,7 @@ fn serveResolvedPullRequest(
         identity.host,
         identity.owner,
         identity.repository,
+        gh_resolved,
     ) catch |err| switch (err) {
         error.GitFetchSourceUnavailable => null,
         else => return err,

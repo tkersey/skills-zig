@@ -4388,6 +4388,7 @@ fn resolveFixtureFetchSource(
         "github.example.test",
         "owner",
         "repo",
+        "/tmp/configured gh",
     );
 }
 
@@ -4400,6 +4401,7 @@ fn expectFixtureFetchSource(source: worktree.FetchSource) !void {
     try std.testing.expectEqualStrings("github.example.test", source.repository_host);
     try std.testing.expectEqualStrings("owner", source.repository_owner);
     try std.testing.expectEqualStrings("repo", source.repository_name);
+    try std.testing.expectEqualStrings("/tmp/configured gh", source.credential_executable);
 }
 
 test "worktree integrity fetch source rejects option names and multiple URLs" {

@@ -3,7 +3,7 @@ const std = @import("std");
 const fetch_timeout_ms: u32 = 30_000;
 const fetch_termination_grace_ms: u32 = 250;
 const fetch_output_limit: usize = 1024 * 1024;
-const credential_helper = "!gh auth git-credential";
+const default_credential_executable = "gh";
 const git_selector_environment_keys = [_][]const u8{
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -22,6 +22,7 @@ fn sanitizeGitEnvironment(environment: *std.process.Environ.Map) void {
 fn effectiveGitEnvironment(
     allocator: std.mem.Allocator,
     inherited: ?*const std.process.Environ.Map,
+    credential_executable: []const u8,
 ) !std.process.Environ.Map {
     var environment = if (inherited) |source|
         try source.clone(allocator)
@@ -37,8 +38,30 @@ fn effectiveGitEnvironment(
     try environment.put("GIT_CONFIG_KEY_0", "credential.helper");
     try environment.put("GIT_CONFIG_VALUE_0", "");
     try environment.put("GIT_CONFIG_KEY_1", "credential.helper");
-    try environment.put("GIT_CONFIG_VALUE_1", credential_helper);
+    const helper = try credentialHelperAlloc(allocator, credential_executable);
+    defer allocator.free(helper);
+    try environment.put("GIT_CONFIG_VALUE_1", helper);
     return environment;
+}
+
+fn credentialHelperAlloc(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+) ![]u8 {
+    if (executable.len == 0 or executable.len > 4096) return error.InvalidCredentialExecutable;
+    var helper: std.ArrayList(u8) = .empty;
+    errdefer helper.deinit(allocator);
+    try helper.appendSlice(allocator, "!'");
+    for (executable) |byte| {
+        if (byte == 0 or std.ascii.isControl(byte)) return error.InvalidCredentialExecutable;
+        if (byte == '\'') {
+            try helper.appendSlice(allocator, "'\\''");
+        } else {
+            try helper.append(allocator, byte);
+        }
+    }
+    try helper.appendSlice(allocator, "' auth git-credential");
+    return helper.toOwnedSlice(allocator);
 }
 
 fn submoduleGitEnvironment(
@@ -63,6 +86,8 @@ pub const FetchSource = struct {
     repository_host: []const u8 = "",
     repository_owner: []const u8 = "",
     repository_name: []const u8 = "",
+    credential_executable: []const u8 = default_credential_executable,
+    owns_credential_executable: bool = false,
     timeout_ms: u32 = fetch_timeout_ms,
     termination_grace_ms: u32 = fetch_termination_grace_ms,
 
@@ -74,8 +99,13 @@ pub const FetchSource = struct {
         host: []const u8,
         owner: []const u8,
         repository: []const u8,
+        credential_executable: []const u8,
     ) !FetchSource {
-        var effective_environment = try effectiveGitEnvironment(allocator, environment);
+        var effective_environment = try effectiveGitEnvironment(
+            allocator,
+            environment,
+            credential_executable,
+        );
         defer effective_environment.deinit();
         const remotes = try gitOutputWithEnvironment(
             allocator,
@@ -118,6 +148,8 @@ pub const FetchSource = struct {
             errdefer allocator.free(repository_owner);
             const repository_name = try allocator.dupe(u8, repository);
             errdefer allocator.free(repository_name);
+            const owned_credential = try allocator.dupe(u8, credential_executable);
+            errdefer allocator.free(owned_credential);
             return .{
                 .allocator = allocator,
                 .environment = environment,
@@ -126,6 +158,8 @@ pub const FetchSource = struct {
                 .repository_host = repository_host,
                 .repository_owner = repository_owner,
                 .repository_name = repository_name,
+                .credential_executable = owned_credential,
+                .owns_credential_executable = true,
             };
         }
         return error.GitFetchSourceUnavailable;
@@ -138,6 +172,9 @@ pub const FetchSource = struct {
             allocator.free(self.repository_host);
             allocator.free(self.repository_owner);
             allocator.free(self.repository_name);
+            if (self.owns_credential_executable) {
+                allocator.free(self.credential_executable);
+            }
         }
         self.* = undefined;
     }
@@ -2333,7 +2370,11 @@ fn spawnFetchProcess(
     source: FetchSource,
     operation: FetchOperation,
 ) !std.process.Child {
-    var environment = try effectiveGitEnvironment(allocator, source.environment);
+    var environment = try effectiveGitEnvironment(
+        allocator,
+        source.environment,
+        source.credential_executable,
+    );
     defer environment.deinit();
     try validateFetchSource(allocator, io, cwd, source, &environment);
     var argv_buffer: [8][]const u8 = undefined;
@@ -2546,7 +2587,12 @@ test "effective fetch environment isolates selectors and projects credentials" {
     try inherited.put("GIT_CONFIG_COUNT", "1");
     try inherited.put("GIT_CONFIG_KEY_0", "url.https://evil.invalid/.insteadOf");
     try inherited.put("GIT_CONFIG_VALUE_0", "https://github.com/");
-    var effective = try effectiveGitEnvironment(std.testing.allocator, &inherited);
+    const custom_gh = "/tmp/custom gh'client";
+    var effective = try effectiveGitEnvironment(
+        std.testing.allocator,
+        &inherited,
+        custom_gh,
+    );
     defer effective.deinit();
     try std.testing.expectEqualStrings("2", effective.get("GIT_CONFIG_COUNT").?);
     try std.testing.expectEqualStrings(
@@ -2555,7 +2601,7 @@ test "effective fetch environment isolates selectors and projects credentials" {
     );
     try std.testing.expectEqualStrings("", effective.get("GIT_CONFIG_VALUE_0").?);
     try std.testing.expectEqualStrings(
-        credential_helper,
+        "!'/tmp/custom gh'\\''client' auth git-credential",
         effective.get("GIT_CONFIG_VALUE_1").?,
     );
 }
