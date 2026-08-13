@@ -2341,7 +2341,8 @@ pub fn deepenShallowHistory(
     io: std.Io,
     git_path: []const u8,
     cwd: []const u8,
-    source: ?FetchSource,
+    base_source: ?FetchSource,
+    head_source: ?FetchSource,
     base: []const u8,
     head: []const u8,
 ) !void {
@@ -2356,15 +2357,28 @@ pub fn deepenShallowHistory(
     if (!std.mem.eql(u8, std.mem.trim(u8, shallow, "\r\n"), "true")) {
         return error.GitMergeBaseUnavailable;
     }
-    const exact_source = source orelse return error.GitFetchSourceUnavailable;
-    const term = try runFetchBounded(
+    const exact_base_source = base_source orelse return error.GitFetchSourceUnavailable;
+    const base_term = try runFetchBounded(
         allocator,
         io,
         cwd,
-        exact_source,
-        .{ .unshallow = .{ .base = base, .head = head } },
+        exact_base_source,
+        .{ .deepen = base },
     );
-    if (term != .exited or term.exited != 0) return error.GitMergeBaseUnavailable;
+    if (base_term != .exited or base_term.exited != 0) {
+        return error.GitMergeBaseUnavailable;
+    }
+    const exact_head_source = head_source orelse return error.GitFetchSourceUnavailable;
+    const head_term = try runFetchBounded(
+        allocator,
+        io,
+        cwd,
+        exact_head_source,
+        .{ .deepen = head },
+    );
+    if (head_term != .exited or head_term.exited != 0) {
+        return error.GitMergeBaseUnavailable;
+    }
 }
 
 const FetchWatchdog = struct {
@@ -2427,7 +2441,7 @@ const FetchPipeCapture = struct {
 
 const FetchOperation = union(enum) {
     object: []const u8,
-    unshallow: struct { base: []const u8, head: []const u8 },
+    deepen: []const u8,
 };
 
 fn runFetchBounded(
@@ -2537,12 +2551,15 @@ fn spawnFetchProcess(
             argv_buffer[5] = oid;
             break :argv argv_buffer[0..6];
         },
-        .unshallow => |commits| argv: {
-            argv_buffer = .{
-                "git", "fetch",            "--no-tags",  "--unshallow",
-                "--",  source.remote_name, commits.base, commits.head,
-            };
-            break :argv argv_buffer[0..8];
+        .deepen => |oid| argv: {
+            argv_buffer[0] = "git";
+            argv_buffer[1] = "fetch";
+            argv_buffer[2] = "--no-tags";
+            argv_buffer[3] = "--deepen=2147483647";
+            argv_buffer[4] = "--";
+            argv_buffer[5] = source.remote_name;
+            argv_buffer[6] = oid;
+            break :argv argv_buffer[0..7];
         },
     };
     return std.process.spawn(io, .{

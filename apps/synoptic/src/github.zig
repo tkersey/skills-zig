@@ -2339,11 +2339,32 @@ pub fn hydrateRevisionKeys(
     fetch_source: ?worktree.FetchSource,
     generation: *domain.PrGeneration,
 ) !void {
-    return hydrateRevisionKeysWithGitPath(
+    return hydrateRevisionKeysWithSources(
         allocator,
         io,
         cwd,
-        fetch_source,
+        .{ .base = fetch_source, .head = fetch_source },
+        generation,
+    );
+}
+
+pub const GenerationFetchSources = struct {
+    base: ?worktree.FetchSource,
+    head: ?worktree.FetchSource,
+};
+
+pub fn hydrateRevisionKeysWithSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    fetch_sources: GenerationFetchSources,
+    generation: *domain.PrGeneration,
+) !void {
+    return hydrateRevisionKeysWithGitPathSources(
+        allocator,
+        io,
+        cwd,
+        fetch_sources,
         generation,
         "git",
     );
@@ -2394,11 +2415,29 @@ fn hydrateRevisionKeysWithGitPath(
     generation: *domain.PrGeneration,
     git_path: []const u8,
 ) !void {
+    return hydrateRevisionKeysWithGitPathSources(
+        allocator,
+        io,
+        cwd,
+        .{ .base = fetch_source, .head = fetch_source },
+        generation,
+        git_path,
+    );
+}
+
+fn hydrateRevisionKeysWithGitPathSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    fetch_sources: GenerationFetchSources,
+    generation: *domain.PrGeneration,
+    git_path: []const u8,
+) !void {
     return hydrateRevisionKeysWithGitPathLimit(
         allocator,
         io,
         cwd,
-        fetch_source,
+        fetch_sources,
         generation,
         git_path,
         canonical_diff_bytes_max,
@@ -2427,7 +2466,7 @@ fn hydrateRevisionKeysWithGitPathLimit(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    fetch_source: ?worktree.FetchSource,
+    fetch_sources: GenerationFetchSources,
     generation: *domain.PrGeneration,
     git_path: []const u8,
     diff_bytes_max: usize,
@@ -2438,8 +2477,18 @@ fn hydrateRevisionKeysWithGitPathLimit(
         allocator,
         io,
         cwd,
-        fetch_source,
+        fetch_sources.base,
         generation.base_oid,
+    ) catch |err| switch (err) {
+        error.GitObjectUnavailable => return error.GitFetchFailed,
+        else => return err,
+    };
+    worktree.ensureObjectAvailable(
+        allocator,
+        io,
+        cwd,
+        fetch_sources.head,
+        generation.head_oid,
     ) catch |err| switch (err) {
         error.GitObjectUnavailable => return error.GitFetchFailed,
         else => return err,
@@ -2451,7 +2500,7 @@ fn hydrateRevisionKeysWithGitPathLimit(
         cwd,
         generation.base_oid,
         generation.head_oid,
-        fetch_source,
+        fetch_sources,
     );
     defer allocator.free(merge_base);
     var renames = try canonicalRenameEntries(
@@ -2839,7 +2888,7 @@ fn mergeBaseWithShallowRetryAlloc(
     cwd: []const u8,
     base: []const u8,
     head: []const u8,
-    fetch_source: ?worktree.FetchSource,
+    fetch_sources: GenerationFetchSources,
 ) ![]u8 {
     return canonicalMergeBaseAlloc(
         allocator,
@@ -2856,7 +2905,8 @@ fn mergeBaseWithShallowRetryAlloc(
                 io,
                 git_path,
                 cwd,
-                fetch_source,
+                fetch_sources.base,
+                fetch_sources.head,
                 base,
                 head,
             ) catch |deepen_error| switch (deepen_error) {
@@ -3779,7 +3829,7 @@ fn expectOversizedDiffHydration(
         allocator,
         io,
         root,
-        null,
+        .{ .base = null, .head = null },
         &bounded,
         git_path,
         1,
@@ -4390,6 +4440,86 @@ test "revision hydration deepens a shallow checkout before retrying merge base" 
     );
     defer allocator.free(shallow);
     try std.testing.expectEqualStrings("false", std.mem.trim(u8, shallow, "\r\n"));
+}
+
+test "fork hydration retains independent base and head fetch authorities" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "upstream");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const upstream = try std.fs.path.join(allocator, &.{ root, "upstream" });
+    defer allocator.free(upstream);
+    const fork = try std.fs.path.join(allocator, &.{ root, "fork" });
+    defer allocator.free(fork);
+    const checkout = try std.fs.path.join(allocator, &.{ root, "checkout" });
+    defer allocator.free(checkout);
+    try tmp.dir.writeFile(io, .{ .sub_path = "upstream/a.zig", .data = "ancestor\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "ancestor" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, upstream, argv));
+    allocator.free(try runTestGit(allocator, io, root, &.{ "git", "clone", "-q", upstream, fork }));
+    try tmp.dir.writeFile(io, .{ .sub_path = "fork/a.zig", .data = "fork head\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "fork head" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, fork, argv));
+    const head_raw = try runTestGit(allocator, io, fork, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head_raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "upstream/base.zig", .data = "base tip\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", "upstream base" },
+    }) |argv| allocator.free(try runTestGit(allocator, io, upstream, argv));
+    const base_raw = try runTestGit(allocator, io, upstream, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(base_raw);
+    const fork_url = try std.fmt.allocPrint(allocator, "file://{s}", .{fork});
+    defer allocator.free(fork_url);
+    const upstream_url = try std.fmt.allocPrint(allocator, "file://{s}", .{upstream});
+    defer allocator.free(upstream_url);
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "clone", "-q", "--depth=1", fork_url, checkout },
+    ));
+    var generation = try domain.PrGeneration.initFull(
+        allocator,
+        std.mem.trim(u8, base_raw, "\r\n"),
+        std.mem.trim(u8, head_raw, "\r\n"),
+    );
+    defer generation.deinit();
+    try generation.addFile(.{
+        .path = "a.zig",
+        .change_type = "MODIFIED",
+        .viewed = .unviewed,
+        .revision_key = "pending",
+    });
+    try hydrateRevisionKeysWithSources(
+        allocator,
+        io,
+        checkout,
+        .{
+            .base = .{ .remote_name = upstream_url, .remote_url = upstream_url },
+            .head = .{ .remote_name = fork_url, .remote_url = fork_url },
+        },
+        &generation,
+    );
+    try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending"));
+    allocator.free(try runTestGit(
+        allocator,
+        io,
+        checkout,
+        &.{ "git", "cat-file", "-e", generation.base_oid },
+    ));
 }
 
 test "GitHub transport is a fixed argv stdin broker" {

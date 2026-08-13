@@ -4,6 +4,15 @@ const app = @import("app.zig");
 const config = @import("config.zig");
 const domain = @import("domain.zig");
 const github = @import("github.zig");
+
+test "generation fetch sources retain distinct endpoint carriers" {
+    const sources = github.GenerationFetchSources{
+        .base = null,
+        .head = null,
+    };
+    try std.testing.expect(sources.base == null);
+    try std.testing.expect(sources.head == null);
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");

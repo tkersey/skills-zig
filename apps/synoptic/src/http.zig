@@ -220,6 +220,7 @@ pub const Runtime = struct {
     cwd: []const u8,
     skill_path: []const u8,
     repository_cwd: []const u8,
+    base_fetch_source: ?worktree.FetchSource = null,
     fetch_source: ?worktree.FetchSource,
     custody: worktree.Custody,
     baseline: ?*worktree.Baseline = null,
@@ -1573,11 +1574,11 @@ pub const Server = struct {
             runtime.baseline orelse return error.MissingWorktreeBaseline,
             runtime.fetch_source,
         );
-        github.hydrateRevisionKeys(
+        github.hydrateRevisionKeysWithSources(
             self.allocator,
             self.io,
             runtime.cwd,
-            runtime.fetch_source,
+            .{ .base = runtime.base_fetch_source, .head = runtime.fetch_source },
             next,
         ) catch |err| {
             lease.rollback() catch {

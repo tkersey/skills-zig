@@ -699,7 +699,7 @@ fn serveResolvedPullRequest(
     defer pages.deinit();
     var snapshot = try Snapshot.load(allocator, pages.files.items[0]);
     defer snapshot.deinit();
-    var fetch_source = resolveFetchSource(
+    var fetch_sources = try resolveFetchSources(
         allocator,
         io,
         environment,
@@ -707,11 +707,8 @@ fn serveResolvedPullRequest(
         identity,
         snapshot,
         gh_resolved,
-    ) catch |err| switch (err) {
-        error.GitFetchSourceUnavailable => null,
-        else => return err,
-    };
-    defer if (fetch_source) |*source| source.deinit();
+    );
+    defer fetch_sources.deinit();
     var generation = try domain.PrGeneration.initFull(allocator, snapshot.base, snapshot.head);
     var generation_owned = true;
     errdefer if (generation_owned) generation.deinit();
@@ -730,7 +727,7 @@ fn serveResolvedPullRequest(
             .runtime_root = runtime_root,
             .repository_identity = repository_identity,
             .snapshot = snapshot,
-            .fetch_source = fetch_source,
+            .fetch_sources = fetch_sources,
         },
         &generation,
         &generation_owned,
@@ -747,7 +744,7 @@ const GenerationContext = struct {
     runtime_root: []const u8,
     repository_identity: []const u8,
     snapshot: Snapshot,
-    fetch_source: ?worktree.FetchSource,
+    fetch_sources: FetchSources,
 };
 
 const Snapshot = struct {
@@ -842,7 +839,79 @@ fn repositoryCoordinates(value: []const u8) ?RepositoryCoordinates {
     return .{ .owner = value[0..separator], .name = value[separator + 1 ..] };
 }
 
-fn resolveFetchSource(
+const FetchSources = struct {
+    base: ?worktree.FetchSource,
+    head: ?worktree.FetchSource,
+    head_is_base: bool = false,
+
+    fn deinit(self: *FetchSources) void {
+        if (self.base) |*source| source.deinit();
+        if (!self.head_is_base) if (self.head) |*source| source.deinit();
+        self.* = .{ .base = null, .head = null };
+    }
+};
+
+fn optionalRepositoryFetchSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    cwd: []const u8,
+    host: []const u8,
+    owner: []const u8,
+    repository: []const u8,
+    repository_url: []const u8,
+    gh_resolved: []const u8,
+) !?worktree.FetchSource {
+    if (repository_url.len != 0) return worktree.resolvePrHeadSource(
+        allocator,
+        io,
+        environment,
+        cwd,
+        host,
+        owner,
+        repository,
+        repository_url,
+        gh_resolved,
+    ) catch |err| switch (err) {
+        error.GitFetchSourceUnavailable => null,
+        else => return err,
+    };
+    if (worktree.FetchSource.resolve(
+        allocator,
+        io,
+        environment,
+        cwd,
+        host,
+        owner,
+        repository,
+        gh_resolved,
+    )) |source| return source else |err| switch (err) {
+        error.GitFetchSourceUnavailable => {},
+        else => return err,
+    }
+    const fallback_url = try std.fmt.allocPrint(
+        allocator,
+        "https://{s}/{s}/{s}.git",
+        .{ host, owner, repository },
+    );
+    defer allocator.free(fallback_url);
+    return worktree.resolvePrHeadSource(
+        allocator,
+        io,
+        environment,
+        cwd,
+        host,
+        owner,
+        repository,
+        fallback_url,
+        gh_resolved,
+    ) catch |err| switch (err) {
+        error.GitFetchSourceUnavailable => null,
+        else => return err,
+    };
+}
+
+fn resolveFetchSources(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -850,21 +919,8 @@ fn resolveFetchSource(
     identity: pr.Identity,
     snapshot: Snapshot,
     gh_resolved: []const u8,
-) !worktree.FetchSource {
-    if (repositoryCoordinates(snapshot.head_repository)) |head| {
-        if (snapshot.head_repository_url.len != 0) return worktree.resolvePrHeadSource(
-            allocator,
-            io,
-            environment,
-            cwd,
-            identity.host,
-            head.owner,
-            head.name,
-            snapshot.head_repository_url,
-            gh_resolved,
-        );
-    }
-    return worktree.FetchSource.resolve(
+) !FetchSources {
+    const base = try optionalRepositoryFetchSource(
         allocator,
         io,
         environment,
@@ -872,8 +928,32 @@ fn resolveFetchSource(
         identity.host,
         identity.owner,
         identity.repository,
+        "",
         gh_resolved,
     );
+    errdefer if (base) |source_value| {
+        var source = source_value;
+        source.deinit();
+    };
+    const head = if (repositoryCoordinates(snapshot.head_repository)) |coordinates|
+        try optionalRepositoryFetchSource(
+            allocator,
+            io,
+            environment,
+            cwd,
+            identity.host,
+            coordinates.owner,
+            coordinates.name,
+            snapshot.head_repository_url,
+            gh_resolved,
+        )
+    else
+        null;
+    return .{
+        .base = base,
+        .head = head orelse base,
+        .head_is_base = head == null and base != null,
+    };
 }
 
 fn serveGeneration(
@@ -896,7 +976,7 @@ fn serveGeneration(
         context.snapshot.head,
         managed_path,
         context.settings.worktree_prefer_current_pr_checkout,
-        context.fetch_source,
+        context.fetch_sources.head,
     );
     defer selection.deinit();
     var custody_retirement: CustodyRetirement = .pending;
@@ -925,11 +1005,11 @@ fn serveSelectedGeneration(
     custody_retirement: *CustodyRetirement,
 ) !void {
     const review_cwd = custody.path();
-    try github.hydrateRevisionKeys(
+    try github.hydrateRevisionKeysWithSources(
         allocator,
         io,
         review_cwd,
-        context.fetch_source,
+        .{ .base = context.fetch_sources.base, .head = context.fetch_sources.head },
         generation,
     );
     var state = try configureAppState(
@@ -1238,7 +1318,8 @@ fn makeServingRuntime(
         context.options,
         context.identity,
         context.broker,
-        context.fetch_source,
+        context.fetch_sources.base,
+        context.fetch_sources.head,
         pull_request_id,
         custody,
         worktree_baseline,
@@ -1420,7 +1501,8 @@ fn makeHttpRuntime(
     options: config.LaunchOptions,
     identity: pr.Identity,
     broker: github.Broker,
-    fetch_source: ?worktree.FetchSource,
+    base_fetch_source: ?worktree.FetchSource,
+    head_fetch_source: ?worktree.FetchSource,
     pull_request_id: []const u8,
     custody: worktree.Custody,
     worktree_baseline: *worktree.Baseline,
@@ -1442,7 +1524,8 @@ fn makeHttpRuntime(
         .cwd = review_cwd,
         .skill_path = skill_path,
         .repository_cwd = options.cwd,
-        .fetch_source = fetch_source,
+        .base_fetch_source = base_fetch_source,
+        .fetch_source = head_fetch_source,
         .custody = custody,
         .baseline = worktree_baseline,
         .settings = settings,
