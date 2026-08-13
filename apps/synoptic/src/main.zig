@@ -19,7 +19,7 @@ const pr = @import("pr.zig");
 const sessions = @import("sessions.zig");
 const worktree = @import("worktree.zig");
 const launch_shutdown_grace_ms: u32 = 500;
-const max_process_arguments_bytes: usize = 64 * 1024;
+const max_kernel_process_arguments_bytes: usize = 4 * 1024 * 1024;
 const usage_text =
     \\Usage:
     \\  synoptic launch [--pr SELECTOR] --cwd PATH --skill-root PATH [--json]
@@ -1851,7 +1851,7 @@ fn stop(
         }
     };
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcess(allocator, io, record)) {
+    while (try verifiedProcessDuringTermination(allocator, io, record)) {
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
         if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
             return error.SynopticStopTimeout;
@@ -1862,6 +1862,7 @@ fn stop(
             }
         };
     }
+    try settleStartingProcessGroup(record);
     try finalizeStoppedLaunch(allocator, io, runtime_root, current_path, record);
     return printStopResult(io, json, record.launch_id, true);
 }
@@ -2007,7 +2008,7 @@ fn signalStartingProcess(
         else => return err,
     };
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcess(allocator, io, record)) {
+    while (try verifiedProcessDuringTermination(allocator, io, record)) {
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
         if (now_ms - started_ms < launch_shutdown_grace_ms) {
             sleepBestEffort(io, 10);
@@ -2023,6 +2024,17 @@ fn signalStartingProcess(
         }
         sleepBestEffort(io, 10);
     }
+}
+
+fn verifiedProcessDuringTermination(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record: LifecycleRecord,
+) !bool {
+    return verifiedProcess(allocator, io, record) catch |err| switch (err) {
+        error.ProcessArgumentsTargetUnavailable => false,
+        else => return err,
+    };
 }
 
 fn settleStartingProcessGroup(record: LifecycleRecord) !void {
@@ -2240,18 +2252,46 @@ fn verifiedProcess(allocator: std.mem.Allocator, io: std.Io, record: LifecycleRe
     _ = io;
     if (!processAlive(record.pid)) return false;
     if (comptime builtin.os.tag != .macos) return false;
-    const bytes = try allocator.alloc(u8, max_process_arguments_bytes);
+    const bytes = try allocator.alloc(u8, try processArgumentsCapacity());
     defer allocator.free(bytes);
     var length = bytes.len;
     const pid = std.math.cast(c_int, record.pid) orelse return false;
     var mib = [_]c_int{ 1, 49, pid };
-    if (std.c.sysctl(&mib, mib.len, bytes.ptr, &length, null, 0) != 0) return false;
+    const rc = std.c.sysctl(&mib, mib.len, bytes.ptr, &length, null, 0);
+    switch (std.c.errno(rc)) {
+        .SUCCESS => {},
+        .SRCH => return false,
+        .INVAL => return error.ProcessArgumentsTargetUnavailable,
+        else => return error.ProcessArgumentsUnavailable,
+    }
     return lifecycleArgumentsMatch(
         bytes[0..length],
         record.executable,
         record.launch_id,
         record.runtime_root,
     );
+}
+
+fn processArgumentsCapacity() !usize {
+    return switch (builtin.os.tag) {
+        .macos => blk: {
+            if (!builtin.link_libc) return error.ProcessArgumentsCapacityUnavailable;
+            var argmax: c_int = 0;
+            var length: usize = @sizeOf(c_int);
+            if (std.c.sysctlbyname("kern.argmax", &argmax, &length, null, 0) != 0 or
+                length != @sizeOf(c_int) or argmax <= @sizeOf(c_int))
+            {
+                return error.ProcessArgumentsCapacityUnavailable;
+            }
+            const capacity = std.math.cast(usize, argmax) orelse
+                return error.ProcessArgumentsCapacityUnavailable;
+            if (capacity > max_kernel_process_arguments_bytes) {
+                return error.ProcessArgumentsCapacityExceeded;
+            }
+            break :blk capacity;
+        },
+        else => error.ProcessArgumentsCapacityUnsupported,
+    };
 }
 
 fn lifecycleArgumentsMatch(
@@ -2703,6 +2743,9 @@ test "native lifecycle identity classifies the owner child without process enume
     const io = std.testing.io;
     const launch_id = "0123456789abcdef0123456789abcdef0123456789abcdef";
     const runtime_root = "/tmp/synoptic-native-identity-test";
+    const padding = try allocator.alloc(u8, 96 * 1024);
+    defer allocator.free(padding);
+    @memset(padding, 'x');
     var child = try std.process.spawn(io, .{
         .argv = &.{
             "/usr/bin/yes",
@@ -2711,6 +2754,7 @@ test "native lifecycle identity classifies the owner child without process enume
             launch_id,
             "--runtime-root",
             runtime_root,
+            padding,
         },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -2733,6 +2777,13 @@ test "native lifecycle identity classifies the owner child without process enume
     };
     defer record.deinit();
     try std.testing.expect(try verifiedProcess(allocator, io, record));
+}
+
+test "native lifecycle identity uses bounded kernel advertised argument capacity" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const capacity = try processArgumentsCapacity();
+    try std.testing.expect(capacity > 64 * 1024);
+    try std.testing.expect(capacity <= max_kernel_process_arguments_bytes);
 }
 test "runtime custody rejects symlink roots" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;

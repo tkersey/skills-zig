@@ -794,7 +794,6 @@ test "falsifier initial review cannot prepare action" {
 
 test "human authority is correlated with turn admission" {
     const source = @embedFile("sessions.zig");
-    const actor_source = @embedFile("../../../libs/cas_runtime/src/client.zig");
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
@@ -815,16 +814,21 @@ test "human authority is correlated with turn admission" {
         source,
         "request.causal_sequence",
     ) != null);
+}
+
+test "lifecycle identity sizes process arguments from bounded kernel authority" {
+    const source = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "kern.argmax") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        actor_source,
-        "work.causal_sequence = actorNextCausalSequenceLocked(state)",
+        source,
+        "max_kernel_process_arguments_bytes",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        actor_source,
-        "pending.causal_sequence = actorNextCausalSequenceLocked(state)",
-    ) != null);
+        source,
+        "const max_process_arguments_bytes: usize = 64 * 1024",
+    ) == null);
 }
 
 test "falsifier action tool is rejected during initial review" {
