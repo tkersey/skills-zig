@@ -3066,7 +3066,8 @@ fn negatesGithubDestination(object: []const u8) bool {
             " \t\r\n,;.!?",
         );
         return startsWordAnyIgnoreCase(destination, &.{
-            "github", "pull request", "this pr", "the pr", "pr",
+            "github",  "pull request", "this pull request", "the pull request",
+            "this pr", "the pr",       "pr",
         });
     }
     return false;
