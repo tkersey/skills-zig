@@ -833,6 +833,25 @@ test "lifecycle identity sizes process arguments from bounded kernel authority" 
     ) == null);
 }
 
+test "post-authority lifecycle settlement does not re-read process arguments" {
+    const source = @embedFile("main.zig");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "verifiedProcessDuringTermination",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "try signalStartingProcess(observed);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "try settleStartingProcessGroup(current);",
+    ) != null);
+}
+
 test "falsifier action tool is rejected during initial review" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();

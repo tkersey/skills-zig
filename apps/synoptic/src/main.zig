@@ -1831,7 +1831,7 @@ fn stop(
         return printStopResult(io, json, null, false);
     }
     if (record.phase == .starting) {
-        try stopStartingProcess(allocator, io, record);
+        try stopStartingProcess(record);
         try retireDeadStop(allocator, io, runtime_root, current_path, record);
         return printStopResult(io, json, record.launch_id, true);
     }
@@ -1850,18 +1850,6 @@ fn stop(
             else => {},
         }
     };
-    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcessDuringTermination(allocator, io, record)) {
-        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-        if (now_ms - started_ms >= config.lifecycle_stop_timeout_ms) {
-            return error.SynopticStopTimeout;
-        }
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
-        };
-    }
     try settleStartingProcessGroup(record);
     try finalizeStoppedLaunch(allocator, io, runtime_root, current_path, record);
     return printStopResult(io, json, record.launch_id, true);
@@ -1917,7 +1905,7 @@ fn stopStartingBeforeClaim(
             observed.launch_id,
             error.SynopticLaunchStopped,
         );
-        try signalStartingProcess(allocator, io, observed);
+        try signalStartingProcess(observed);
     }
     var claim = try awaitLaunchClaim(io, claim_path);
     defer claim.close(io);
@@ -1930,9 +1918,6 @@ fn stopStartingBeforeClaim(
     if (!std.mem.eql(u8, current.launch_id, observed.launch_id)) {
         try printStopResult(io, json, observed.launch_id, was_running);
         return true;
-    }
-    if (try verifiedProcess(allocator, io, current)) {
-        return error.StartingLaunchStillRunning;
     }
     try settleStartingProcessGroup(current);
     try retireDeadStop(allocator, io, runtime_root, current_path, current);
@@ -1983,20 +1968,12 @@ fn finalizeStoppedLaunch(
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
 }
 
-fn stopStartingProcess(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    record: LifecycleRecord,
-) !void {
-    try signalStartingProcess(allocator, io, record);
+fn stopStartingProcess(record: LifecycleRecord) !void {
+    try signalStartingProcess(record);
     try settleStartingProcessGroup(record);
 }
 
-fn signalStartingProcess(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    record: LifecycleRecord,
-) !void {
+fn signalStartingProcess(record: LifecycleRecord) !void {
     const group = std.math.cast(std.posix.pid_t, record.pid) orelse
         return error.InvalidLifecycleRecord;
     std.posix.kill(-group, std.posix.SIG.TERM) catch |err| switch (err) {
@@ -2005,34 +1982,6 @@ fn signalStartingProcess(
     };
     std.posix.kill(group, std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
-        else => return err,
-    };
-    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-    while (try verifiedProcessDuringTermination(allocator, io, record)) {
-        const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-        if (now_ms - started_ms < launch_shutdown_grace_ms) {
-            sleepBestEffort(io, 10);
-            continue;
-        }
-        std.posix.kill(group, std.posix.SIG.KILL) catch |err| switch (err) {
-            error.ProcessNotFound => {},
-            else => return err,
-        };
-        const killed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms);
-        if (killed_ms - started_ms >= launch_shutdown_grace_ms * 2) {
-            return error.SynopticStopTimeout;
-        }
-        sleepBestEffort(io, 10);
-    }
-}
-
-fn verifiedProcessDuringTermination(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    record: LifecycleRecord,
-) !bool {
-    return verifiedProcess(allocator, io, record) catch |err| switch (err) {
-        error.ProcessArgumentsTargetUnavailable => false,
         else => return err,
     };
 }
