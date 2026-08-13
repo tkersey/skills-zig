@@ -3183,19 +3183,6 @@ fn stringifyValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u
     );
     return out.toOwnedSlice();
 }
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return indexOfIgnoreCase(haystack, needle) != null;
-}
-
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or needle.len > haystack.len) return null;
-    for (0..haystack.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(
-        haystack[i .. i + needle.len],
-        needle,
-    )) return i;
-    return null;
-}
-
 fn authoritativeFailureAlloc(allocator: std.mem.Allocator, err: anyerror) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
