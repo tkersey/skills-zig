@@ -43,7 +43,8 @@ pub const ActionTarget = struct {
     thread_id: ?[]const u8 = null,
     comment_id: ?[]const u8 = null,
     /// Server-observed body at preparation time for destructive comment actions.
-    /// This is intentionally omitted from the browser card representation.
+    /// Serialized into the immutable confirmation card so the human can identify
+    /// the exact target; execution still revalidates this authoritative snapshot.
     comment_body_snapshot: ?[]const u8 = null,
 };
 
@@ -542,6 +543,8 @@ pub fn cardJsonAlloc(allocator: std.mem.Allocator, card: ActionCard) ![]u8 {
     try writeOptionalString(&out.writer, card.target.thread_id);
     try out.writer.writeAll(",\"commentId\":");
     try writeOptionalString(&out.writer, card.target.comment_id);
+    try out.writer.writeAll(",\"commentBodySnapshot\":");
+    try writeOptionalString(&out.writer, card.target.comment_body_snapshot);
     try out.writer.writeAll("},\"body\":");
     try writeOptionalString(&out.writer, card.body);
     try out.writer.writeAll(",\"payload\":");

@@ -153,6 +153,13 @@ test "comment mutation cards own the server-observed body snapshot" {
     );
     try std.testing.expectEqualStrings("a.zig", card.target.path.?);
     try std.testing.expectEqualStrings("replacement body", card.body.?);
+    const json = try tools.cardJsonAlloc(std.testing.allocator, card);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"commentBodySnapshot\":\"observed body\"",
+    ) != null);
 }
 
 test "thread and comment actions bind to the originating file session" {
