@@ -924,12 +924,90 @@ const selected_submodule_direct_max = 128;
 
 const PendingSubmoduleRepository = struct {
     root: []u8,
-    parent_url: ?[]u8,
+    source_intent: SelectedSourceIntent,
     depth: usize,
 
     fn deinit(self: PendingSubmoduleRepository, allocator: std.mem.Allocator) void {
         allocator.free(self.root);
-        if (self.parent_url) |value| allocator.free(value);
+        self.source_intent.deinit(allocator);
+    }
+};
+
+const SelectedSourceIntent = struct {
+    root_url: ?[]u8,
+    selected_urls: std.ArrayList([]u8) = .empty,
+
+    fn initAlloc(
+        allocator: std.mem.Allocator,
+        root_url: ?[]const u8,
+    ) !SelectedSourceIntent {
+        return .{
+            .root_url = if (root_url) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+
+    fn deinit(self: SelectedSourceIntent, allocator: std.mem.Allocator) void {
+        if (self.root_url) |value| allocator.free(value);
+        for (self.selected_urls.items) |value| allocator.free(value);
+        var selected_urls = self.selected_urls;
+        selected_urls.deinit(allocator);
+    }
+
+    fn cloneAppend(
+        self: *const SelectedSourceIntent,
+        allocator: std.mem.Allocator,
+        selected_url: []const u8,
+    ) !SelectedSourceIntent {
+        var result = try SelectedSourceIntent.initAlloc(allocator, self.root_url);
+        errdefer result.deinit(allocator);
+        for (self.selected_urls.items) |value| {
+            try result.appendOwned(allocator, value);
+        }
+        try result.appendOwned(allocator, selected_url);
+        return result;
+    }
+
+    fn clone(
+        self: *const SelectedSourceIntent,
+        allocator: std.mem.Allocator,
+    ) !SelectedSourceIntent {
+        var result = try SelectedSourceIntent.initAlloc(allocator, self.root_url);
+        errdefer result.deinit(allocator);
+        for (self.selected_urls.items) |value| {
+            try result.appendOwned(allocator, value);
+        }
+        return result;
+    }
+
+    fn resolveAlloc(
+        self: *const SelectedSourceIntent,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        var resolved: ?[]u8 = if (self.root_url) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (resolved) |value| allocator.free(value);
+        for (self.selected_urls.items) |selected_url| {
+            const next = try resolveSubmoduleUrlAlloc(
+                allocator,
+                selected_url,
+                resolved,
+            );
+            if (resolved) |value| allocator.free(value);
+            resolved = next;
+        }
+        return resolved orelse error.ManagedSubmoduleInventoryFailed;
+    }
+
+    fn appendOwned(
+        self: *SelectedSourceIntent,
+        allocator: std.mem.Allocator,
+        value: []const u8,
+    ) !void {
+        const owned = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned);
+        try self.selected_urls.append(allocator, owned);
     }
 };
 
@@ -948,14 +1026,14 @@ const SubmoduleDeclaration = struct {
 const SelectedSubmodule = struct {
     name: []u8,
     path: []u8,
-    url: []u8,
+    source_intent: SelectedSourceIntent,
     oid: []u8,
     absolute_path: []u8,
 
     fn deinit(self: SelectedSubmodule, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.path);
-        allocator.free(self.url);
+        self.source_intent.deinit(allocator);
         allocator.free(self.oid);
         allocator.free(self.absolute_path);
     }
@@ -971,12 +1049,14 @@ fn reconcileSelectedSubmodulesAt(
     total: *usize,
     deadline_ms: i64,
 ) !void {
+    var root_intent = try SelectedSourceIntent.initAlloc(allocator, parent_url);
+    defer root_intent.deinit(allocator);
     var pending: std.ArrayList(PendingSubmoduleRepository) = .empty;
     defer {
         for (pending.items) |repository| repository.deinit(allocator);
         pending.deinit(allocator);
     }
-    try appendPendingRepository(allocator, &pending, root, parent_url, depth);
+    try appendPendingRepository(allocator, &pending, root, &root_intent, depth);
     var index: usize = 0;
     while (index < pending.items.len) : (index += 1) {
         const repository = pending.items[index];
@@ -987,7 +1067,7 @@ fn reconcileSelectedSubmodulesAt(
             io,
             repository.root,
             &environment,
-            repository.parent_url,
+            &repository.source_intent,
         );
         defer {
             for (selected.items) |module| module.deinit(allocator);
@@ -1009,7 +1089,7 @@ fn reconcileSelectedSubmodulesAt(
             allocator,
             &pending,
             module.absolute_path,
-            module.url,
+            &module.source_intent,
             repository.depth + 1,
         );
     }
@@ -1019,7 +1099,7 @@ fn appendPendingRepository(
     allocator: std.mem.Allocator,
     pending: *std.ArrayList(PendingSubmoduleRepository),
     root: []const u8,
-    parent_url: ?[]const u8,
+    source_intent: *const SelectedSourceIntent,
     depth: usize,
 ) !void {
     if (depth >= selected_submodule_depth_max) {
@@ -1027,11 +1107,11 @@ fn appendPendingRepository(
     }
     const owned_root = try allocator.dupe(u8, root);
     errdefer allocator.free(owned_root);
-    const owned_parent = if (parent_url) |value| try allocator.dupe(u8, value) else null;
-    errdefer if (owned_parent) |value| allocator.free(value);
+    const owned_intent = try source_intent.clone(allocator);
+    errdefer owned_intent.deinit(allocator);
     try pending.append(allocator, .{
         .root = owned_root,
-        .parent_url = owned_parent,
+        .source_intent = owned_intent,
         .depth = depth,
     });
 }
@@ -1052,10 +1132,12 @@ fn updateSelectedSubmodules(
             module.oid,
             environment,
         )) {
+            const source_url = try module.source_intent.resolveAlloc(allocator);
+            defer allocator.free(source_url);
             var fetch_environment = try selectedSubmoduleFetchEnvironment(
                 allocator,
                 environment,
-                module.url,
+                source_url,
             );
             defer fetch_environment.deinit();
             const fetch_command = selectedSubmoduleFetchCommand(module.oid);
@@ -1165,7 +1247,7 @@ fn selectedInitializedSubmodules(
     io: std.Io,
     root: []const u8,
     environment: *const std.process.Environ.Map,
-    parent_url: ?[]const u8,
+    parent_intent: *const SelectedSourceIntent,
 ) !std.ArrayList(SelectedSubmodule) {
     var selected: std.ArrayList(SelectedSubmodule) = .empty;
     errdefer {
@@ -1220,7 +1302,7 @@ fn selectedInitializedSubmodules(
             declaration.name,
             relative,
             selected_url,
-            parent_url,
+            parent_intent,
             oid,
             absolute,
         );
@@ -1234,7 +1316,7 @@ fn appendSelectedSubmodule(
     name_source: []const u8,
     path_source: []const u8,
     url_source: []const u8,
-    parent_url: ?[]const u8,
+    parent_intent: *const SelectedSourceIntent,
     oid_source: []const u8,
     absolute_path: []u8,
 ) !void {
@@ -1243,14 +1325,14 @@ fn appendSelectedSubmodule(
     errdefer allocator.free(name);
     const path = try allocator.dupe(u8, path_source);
     errdefer allocator.free(path);
-    const url = try resolveSubmoduleUrlAlloc(allocator, url_source, parent_url);
-    errdefer allocator.free(url);
+    const source_intent = try parent_intent.cloneAppend(allocator, url_source);
+    errdefer source_intent.deinit(allocator);
     const oid = try allocator.dupe(u8, oid_source);
     errdefer allocator.free(oid);
     try selected.append(allocator, .{
         .name = name,
         .path = path,
-        .url = url,
+        .source_intent = source_intent,
         .oid = oid,
         .absolute_path = absolute_path,
     });
@@ -2548,6 +2630,55 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         try std.testing.expect(std.mem.indexOf(u8, argument, "token:secret") == null);
         try std.testing.expect(!std.mem.eql(u8, argument, credential_url));
     }
+}
+
+test "worktree integrity local selected object does not require parent source" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "selected\n" });
+    try initializeEmptyTestRepository(allocator, io, root);
+    for ([_][]const []const u8{
+        &.{ "git", "add", "tracked.txt" },
+        &.{ "git", "commit", "-qm", "selected" },
+    }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
+    const oid_raw = try testHeadAlloc(allocator, io, root);
+    defer allocator.free(oid_raw);
+    const oid = std.mem.trim(u8, oid_raw, "\r\n");
+    var parent_intent = try SelectedSourceIntent.initAlloc(allocator, null);
+    defer parent_intent.deinit(allocator);
+    var selected: std.ArrayList(SelectedSubmodule) = .empty;
+    defer {
+        for (selected.items) |module| module.deinit(allocator);
+        selected.deinit(allocator);
+    }
+    try appendSelectedSubmodule(
+        allocator,
+        &selected,
+        "local",
+        "local",
+        "../unavailable",
+        &parent_intent,
+        oid,
+        try allocator.dupe(u8, root),
+    );
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try updateSelectedSubmodules(
+        allocator,
+        io,
+        root,
+        &environment,
+        selected.items,
+        monotonicMilliseconds(io) + 5_000,
+    );
+    try std.testing.expectError(
+        error.ManagedSubmoduleInventoryFailed,
+        selected.items[0].source_intent.resolveAlloc(allocator),
+    );
 }
 
 test "worktree integrity submodule update selects URL without config mutation" {
