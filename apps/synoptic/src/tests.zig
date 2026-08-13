@@ -872,7 +872,8 @@ test "human authority is correlated with turn admission" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
-        "try self.beginHumanInstruction(\n            session_id,\n            text,\n            !first_turn,",
+        "try self.beginHumanInstruction(\n" ++
+            "            session_id,\n            text,\n            !first_turn,",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
