@@ -6,6 +6,8 @@ const fetch_output_limit: usize = 1024 * 1024;
 const git_selector_environment_keys = [_][]const u8{
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
     "GIT_DIR",
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
@@ -14,6 +16,23 @@ const git_selector_environment_keys = [_][]const u8{
 
 fn sanitizeGitEnvironment(environment: *std.process.Environ.Map) void {
     inline for (git_selector_environment_keys) |key| _ = environment.swapRemove(key);
+}
+
+fn effectiveGitEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: ?*const std.process.Environ.Map,
+) !std.process.Environ.Map {
+    var environment = if (inherited) |source|
+        try source.clone(allocator)
+    else
+        std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    sanitizeGitEnvironment(&environment);
+    try environment.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try environment.put("GIT_CONFIG_SYSTEM", "/dev/null");
+    try environment.put("GIT_CONFIG_NOSYSTEM", "1");
+    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    return environment;
 }
 
 pub const FetchSource = struct {
@@ -36,12 +55,15 @@ pub const FetchSource = struct {
         owner: []const u8,
         repository: []const u8,
     ) !FetchSource {
-        const remotes = try gitOutput(
+        var effective_environment = try effectiveGitEnvironment(allocator, environment);
+        defer effective_environment.deinit();
+        const remotes = try gitOutputWithEnvironment(
             allocator,
             io,
             cwd,
             &.{ "git", "remote" },
             error.GitFetchSourceUnavailable,
+            &effective_environment,
         );
         defer allocator.free(remotes);
         var lines = std.mem.splitScalar(u8, remotes, '\n');
@@ -52,9 +74,13 @@ pub const FetchSource = struct {
             remote_count += 1;
             if (remote_count > 128) return error.GitFetchSourceUnavailable;
             if (!fetchRemoteNameSafe(remote)) continue;
-            const key = try std.fmt.allocPrint(allocator, "remote.{s}.url", .{remote});
-            defer allocator.free(key);
-            const url = singleRemoteUrlAlloc(allocator, io, cwd, key) catch continue;
+            const url = singleRemoteUrlAlloc(
+                allocator,
+                io,
+                cwd,
+                remote,
+                &effective_environment,
+            ) catch continue;
             defer allocator.free(url);
             if (!remoteMatchesRepository(
                 std.mem.trim(u8, url, "\r\n"),
@@ -107,14 +133,16 @@ fn singleRemoteUrlAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    key: []const u8,
+    remote: []const u8,
+    environment: *const std.process.Environ.Map,
 ) ![]u8 {
-    const urls = try gitOutput(
+    const urls = try gitOutputWithEnvironment(
         allocator,
         io,
         cwd,
-        &.{ "git", "config", "--get-all", key },
+        &.{ "git", "remote", "get-url", "--all", "--", remote },
         error.GitFetchSourceUnavailable,
+        environment,
     );
     defer allocator.free(urls);
     var lines = std.mem.splitScalar(u8, urls, '\n');
@@ -733,6 +761,12 @@ pub fn synchronizeManaged(
         };
         return error.ManagedWorktreeRefreshFailed;
     }
+    reconcileInitializedSubmodules(allocator, io, custody.path()) catch {
+        rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
+            return error.ManagedWorktreeRollbackFailed;
+        };
+        return error.ManagedWorktreeRefreshFailed;
+    };
     const next = Baseline.capture(allocator, io, custody.path()) catch |capture_error| {
         rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
@@ -740,6 +774,32 @@ pub fn synchronizeManaged(
         return capture_error;
     };
     baseline.replace(next);
+}
+
+fn reconcileInitializedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    const update = try runGitCommand(
+        allocator,
+        io,
+        root,
+        &.{
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "submodule",
+            "update",
+            "--checkout",
+            "--recursive",
+        },
+    );
+    defer allocator.free(update.stdout);
+    defer allocator.free(update.stderr);
+    if (update.term != .exited or update.term.exited != 0) {
+        return error.ManagedSubmoduleReconciliationFailed;
+    }
 }
 
 fn rollbackManagedTransition(
@@ -1559,14 +1619,9 @@ fn spawnFetchProcess(
     source: FetchSource,
     operation: FetchOperation,
 ) !std.process.Child {
-    try validateFetchSource(allocator, io, cwd, source);
-    var environment = if (source.environment) |inherited|
-        try inherited.clone(allocator)
-    else
-        std.process.Environ.Map.init(allocator);
+    var environment = try effectiveGitEnvironment(allocator, source.environment);
     defer environment.deinit();
-    sanitizeGitEnvironment(&environment);
-    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    try validateFetchSource(allocator, io, cwd, source, &environment);
     var argv_buffer: [8][]const u8 = undefined;
     const argv: []const []const u8 = switch (operation) {
         .object => |oid| argv: {
@@ -1602,12 +1657,17 @@ fn validateFetchSource(
     io: std.Io,
     cwd: []const u8,
     source: FetchSource,
+    environment: *const std.process.Environ.Map,
 ) !void {
     if (!fetchRemoteNameSafe(source.remote_name)) return error.GitFetchSourceUnavailable;
     if (source.remote_url.len == 0) return;
-    const key = try std.fmt.allocPrint(allocator, "remote.{s}.url", .{source.remote_name});
-    defer allocator.free(key);
-    const current_url = try singleRemoteUrlAlloc(allocator, io, cwd, key);
+    const current_url = try singleRemoteUrlAlloc(
+        allocator,
+        io,
+        cwd,
+        source.remote_name,
+        environment,
+    );
     defer allocator.free(current_url);
     if (!std.mem.eql(u8, current_url, source.remote_url) or
         !remoteMatchesRepository(
@@ -1678,6 +1738,23 @@ fn gitOutput(
     return result.stdout;
 }
 
+fn gitOutputWithEnvironment(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+    failure: anyerror,
+    environment: *const std.process.Environ.Map,
+) ![]u8 {
+    const result = try runGitCommandWithEnvironment(allocator, io, cwd, argv, environment);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return failure;
+    }
+    return result.stdout;
+}
+
 fn runGitCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1702,6 +1779,26 @@ fn runGitCommand(
             .environ_map = &environment,
         },
     );
+}
+
+fn runGitCommandWithEnvironment(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv: []const []const u8,
+    environment: *const std.process.Environ.Map,
+) !std.process.RunResult {
+    if (argv.len == 0) return error.InvalidGitCommand;
+    const isolated = try allocator.alloc([]const u8, argv.len + 1);
+    defer allocator.free(isolated);
+    isolated[0] = argv[0];
+    isolated[1] = "--no-replace-objects";
+    @memcpy(isolated[2..], argv[1..]);
+    return std.process.run(allocator, io, .{
+        .argv = isolated,
+        .cwd = .{ .path = cwd },
+        .environ_map = environment,
+    });
 }
 
 test "custody makes destructive policy explicit" {

@@ -3788,6 +3788,111 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
     );
 }
 
+test "worktree integrity managed refresh reconciles initialized submodules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const leaf = try std.fs.path.join(allocator, &.{ root, "leaf" });
+    defer allocator.free(leaf);
+    const middle = try std.fs.path.join(allocator, &.{ root, "middle" });
+    defer allocator.free(middle);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    try prepareNestedSubmoduleFixture(allocator, io, leaf, middle, managed);
+    const first_root_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(first_root_raw);
+    const first_root = std.mem.trim(u8, first_root_raw, "\r\n");
+
+    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
+    defer allocator.free(leaf_tracked);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "second\n" });
+    try commitFixtureRepository(allocator, io, leaf, "second leaf");
+    const second_leaf_raw = try runGit(allocator, io, leaf, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(second_leaf_raw);
+    const second_leaf = std.mem.trim(u8, second_leaf_raw, "\r\n");
+
+    const middle_nested = try std.fs.path.join(allocator, &.{ middle, "nested" });
+    defer allocator.free(middle_nested);
+    allocator.free(try runGit(allocator, io, middle_nested, &.{ "git", "fetch", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        middle_nested,
+        &.{ "git", "checkout", "-q", second_leaf },
+    ));
+    allocator.free(try runGit(allocator, io, middle, &.{ "git", "add", "nested" }));
+    try commitFixtureRepository(allocator, io, middle, "second middle");
+    const second_middle_raw = try runGit(
+        allocator,
+        io,
+        middle,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(second_middle_raw);
+    const second_middle = std.mem.trim(u8, second_middle_raw, "\r\n");
+
+    const managed_module = try std.fs.path.join(allocator, &.{ managed, "module" });
+    defer allocator.free(managed_module);
+    allocator.free(try runGit(allocator, io, managed_module, &.{ "git", "fetch", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed_module,
+        &.{ "git", "checkout", "-q", second_middle },
+    ));
+    allocator.free(try runGit(allocator, io, managed, &.{ "git", "add", "module" }));
+    try commitFixtureRepository(allocator, io, managed, "second root");
+    const second_root_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(second_root_raw);
+    const second_root = std.mem.trim(u8, second_root_raw, "\r\n");
+
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "checkout", "-q", "--detach", first_root },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "submodule", "update", "--checkout", "--recursive" },
+    ));
+    var baseline = try worktree.Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    try worktree.synchronizeManaged(
+        allocator,
+        io,
+        .{ .managed = managed },
+        managed,
+        second_root,
+        &baseline,
+        null,
+    );
+    const observed_middle = try runGit(
+        allocator,
+        io,
+        managed_module,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(observed_middle);
+    try std.testing.expectEqualStrings(second_middle, std.mem.trim(u8, observed_middle, "\r\n"));
+    const managed_nested = try std.fs.path.join(allocator, &.{ managed_module, "nested" });
+    defer allocator.free(managed_nested);
+    const observed_leaf = try runGit(
+        allocator,
+        io,
+        managed_nested,
+        &.{ "git", "rev-parse", "HEAD" },
+    );
+    defer allocator.free(observed_leaf);
+    try std.testing.expectEqualStrings(second_leaf, std.mem.trim(u8, observed_leaf, "\r\n"));
+    try std.testing.expectEqualStrings(second_root, baseline.head_oid);
+}
+
 fn prepareNestedSubmoduleFixture(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3987,46 +4092,35 @@ fn prepareSyncRepo(
     };
 }
 
-test "worktree integrity Git object hydration uses only the matched PR remote" {
+test "worktree integrity fetch validation rejects ambient and repository rewrites" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
+    try environment.put("GIT_CONFIG_COUNT", "1");
+    try environment.put(
+        "GIT_CONFIG_KEY_0",
+        "url.https://redirect.invalid/.insteadOf",
+    );
+    try environment.put("GIT_CONFIG_VALUE_0", "https://github.example.test/");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "source");
     try tmp.dir.createDirPath(io, "consumer");
-    const source = try tmp.dir.realPathFileAlloc(io, "source", allocator);
-    defer allocator.free(source);
     const consumer = try tmp.dir.realPathFileAlloc(io, "consumer", allocator);
     defer allocator.free(consumer);
-    const commits = try prepareSyncRepo(allocator, io, &tmp, source);
-    defer commits.deinit();
-    const unrelated_witness = try prepareMatchedRemoteConsumer(
-        allocator,
-        io,
-        &tmp,
-        consumer,
-        source,
-        commits.base,
-    );
-    defer allocator.free(unrelated_witness);
-    try expectObjectMissing(allocator, io, consumer, commits.head);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{
+            "git",
+            "remote",
+            "add",
+            "target",
+            "https://github.example.test/owner/repo.git",
+        },
+    }) |argv| allocator.free(try runGit(allocator, io, consumer, argv));
     var fetch_source = try resolveFixtureFetchSource(allocator, io, &environment, consumer);
     defer fetch_source.deinit();
     try expectFixtureFetchSource(fetch_source);
-    try configureFetchRemoteCollision(allocator, io, consumer);
-    try worktree.ensureObjectAvailable(allocator, io, consumer, fetch_source, commits.head);
-    allocator.free(try runGit(
-        allocator,
-        io,
-        consumer,
-        &.{ "git", "cat-file", "-e", commits.head },
-    ));
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().statFile(io, unrelated_witness, .{}),
-    );
     allocator.free(try runGit(
         allocator,
         io,
@@ -4049,21 +4143,6 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
             "1111111111111111111111111111111111111111",
         ),
     );
-}
-
-fn expectObjectMissing(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    consumer: []const u8,
-    oid: []const u8,
-) !void {
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "cat-file", "-e", oid },
-        .cwd = .{ .path = consumer },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    try std.testing.expect(result.term != .exited or result.term.exited != 0);
 }
 
 fn resolveFixtureFetchSource(
@@ -4142,94 +4221,6 @@ fn expectFixtureFetchSourceRejected(
         error.GitFetchSourceUnavailable,
         resolveFixtureFetchSource(allocator, io, environment, root),
     );
-}
-
-fn configureFetchRemoteCollision(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    consumer: []const u8,
-) !void {
-    allocator.free(try runGit(
-        allocator,
-        io,
-        consumer,
-        &.{
-            "git",
-            "config",
-            "--add",
-            "remote.synoptic-exact.url",
-            "https://redirect.invalid/collision.git",
-        },
-    ));
-}
-
-fn prepareMatchedRemoteConsumer(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    tmp: *std.testing.TmpDir,
-    consumer: []const u8,
-    source: []const u8,
-    base: []const u8,
-) ![]u8 {
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "remote", "add", "bootstrap", source },
-        &.{ "git", "fetch", "--no-tags", "bootstrap", base },
-        &.{ "git", "checkout", "-qb", "feature", "FETCH_HEAD" },
-        &.{ "git", "remote", "remove", "bootstrap" },
-        &.{ "git", "remote", "add", "unrelated", source },
-        &.{ "git", "remote", "add", "target", "https://github.example.test/owner/repo.git" },
-    }) |argv| allocator.free(try runGit(allocator, io, consumer, argv));
-    const source_url = try std.fmt.allocPrint(allocator, "file://{s}", .{source});
-    defer allocator.free(source_url);
-    const instead_of_key = try std.fmt.allocPrint(allocator, "url.{s}.insteadOf", .{source_url});
-    defer allocator.free(instead_of_key);
-    allocator.free(try runGit(
-        allocator,
-        io,
-        consumer,
-        &.{
-            "git",
-            "config",
-            instead_of_key,
-            "https://github.example.test/owner/repo.git",
-        },
-    ));
-    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(tmp_root);
-    const unrelated_witness = try std.fs.path.join(
-        allocator,
-        &.{ tmp_root, "unrelated-fetch-ran" },
-    );
-    errdefer allocator.free(unrelated_witness);
-    const unrelated_upload_pack = try std.fs.path.join(
-        allocator,
-        &.{ tmp_root, "unrelated-upload-pack" },
-    );
-    defer allocator.free(unrelated_upload_pack);
-    const unrelated_script = try std.fmt.allocPrint(
-        allocator,
-        "#!/bin/sh\ntouch '{s}'\nexit 1\n",
-        .{unrelated_witness},
-    );
-    defer allocator.free(unrelated_script);
-    try std.Io.Dir.cwd().writeFile(
-        io,
-        .{ .sub_path = unrelated_upload_pack, .data = unrelated_script },
-    );
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        unrelated_upload_pack,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
-    allocator.free(try runGit(
-        allocator,
-        io,
-        consumer,
-        &.{ "git", "config", "remote.unrelated.uploadpack", unrelated_upload_pack },
-    ));
-    return unrelated_witness;
 }
 
 test "worktree integrity local object path never invokes fetch" {
