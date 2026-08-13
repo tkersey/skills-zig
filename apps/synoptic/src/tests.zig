@@ -1866,6 +1866,45 @@ test "malformed successful mutation response remains transport ambiguous" {
         error.InvalidGraphqlResponse,
         broker.call(graphql.anchor_query, "{}"),
     );
+
+    for ([_]struct { name: []const u8, response: []const u8 }{
+        .{ .name = "fake-gh-empty-object", .response = "{}" },
+        .{ .name = "fake-gh-null-data", .response = "{\"data\":null}" },
+        .{ .name = "fake-gh-empty-data", .response = "{\"data\":{}}" },
+        .{ .name = "fake-gh-null-payload", .response = "{\"data\":{\"result\":null}}" },
+    }) |fixture| {
+        const path = try std.fs.path.join(allocator, &.{ root, fixture.name });
+        defer allocator.free(path);
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{s}'\n",
+            .{fixture.response},
+        );
+        defer allocator.free(body);
+        try tmp.dir.writeFile(io, .{ .sub_path = fixture.name, .data = body });
+        try std.Io.Dir.cwd().setFilePermissions(
+            io,
+            path,
+            std.Io.File.Permissions.fromMode(0o755),
+            .{},
+        );
+        const data_less = github.Broker{ .allocator = allocator, .io = io, .gh_path = path };
+        try std.testing.expectError(
+            error.GitHubTransportAmbiguous,
+            data_less.call(graphql.add_inline_comment_mutation, "{}"),
+        );
+    }
+}
+
+test "worktree integrity SSH ports are transport metadata" {
+    try std.testing.expectEqualStrings(
+        "ghe.example",
+        worktree.normalizeAuthorityHost("git@ghe.example:2222", "ssh").?,
+    );
+    try std.testing.expectEqualStrings(
+        "ghe.example:8443",
+        worktree.normalizeAuthorityHost("ghe.example:8443", "https").?,
+    );
 }
 
 test "duplicate inline comment reconciliation remains unknown" {
@@ -3904,6 +3943,74 @@ test "worktree integrity managed refresh retires removed initialized submodules"
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, removed_module, .{}),
+    );
+    try std.testing.expectEqualStrings(second, baseline.head_oid);
+}
+
+test "worktree integrity managed refresh retires removed nested submodules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const leaf = try std.fs.path.join(allocator, &.{ root, "leaf" });
+    defer allocator.free(leaf);
+    const middle = try std.fs.path.join(allocator, &.{ root, "middle" });
+    defer allocator.free(middle);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    try prepareNestedSubmoduleFixture(allocator, io, leaf, middle, managed);
+    const first_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(first_raw);
+    const first = std.mem.trim(u8, first_raw, "\r\n");
+    allocator.free(try runGit(allocator, io, middle, &.{ "git", "rm", "-fq", "nested" }));
+    try commitFixtureRepository(allocator, io, middle, "remove nested module");
+    const managed_module = try std.fs.path.join(allocator, &.{ managed, "module" });
+    defer allocator.free(managed_module);
+    allocator.free(try runGit(allocator, io, managed_module, &.{ "git", "fetch", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed_module,
+        &.{ "git", "checkout", "-q", "FETCH_HEAD" },
+    ));
+    allocator.free(try runGit(allocator, io, managed, &.{ "git", "add", "module" }));
+    try commitFixtureRepository(allocator, io, managed, "remove nested generation");
+    const second_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(second_raw);
+    const second = std.mem.trim(u8, second_raw, "\r\n");
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "checkout", "-q", "--detach", first },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed,
+        &.{ "git", "submodule", "update", "--checkout", "--recursive" },
+    ));
+    var baseline = try worktree.Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    try worktree.synchronizeManaged(
+        allocator,
+        io,
+        .{ .managed = managed },
+        managed,
+        second,
+        &baseline,
+        null,
+    );
+    const removed_nested = try std.fs.path.join(
+        allocator,
+        &.{ managed, "module", "nested" },
+    );
+    defer allocator.free(removed_nested);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, removed_nested, .{}),
     );
     try std.testing.expectEqualStrings(second, baseline.head_oid);
 }

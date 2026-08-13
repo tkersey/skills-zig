@@ -532,11 +532,21 @@ pub const Broker = struct {
                 return error.GitHubGraphqlRejected;
             }
             if (parsed.value != .object) return error.InvalidGraphqlResponse;
+            if (mutation and !hasAuthoritativeMutationData(parsed.value.object)) {
+                return error.GitHubTransportAmbiguous;
+            }
         }
         const failed = output.term != .exited or output.term.exited != 0 or
             output.stdout.len == 0;
         if (failed) return error.GitHubTransportAmbiguous;
         return self.allocator.dupe(u8, output.stdout);
+    }
+
+    fn hasAuthoritativeMutationData(response: std.json.ObjectMap) bool {
+        const data = response.get("data") orelse return false;
+        if (data != .object or data.object.count() == 0) return false;
+        for (data.object.values()) |value| if (value != .null) return true;
+        return false;
     }
 
     fn run(

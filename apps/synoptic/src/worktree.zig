@@ -168,8 +168,10 @@ fn remoteMatchesRepository(
 ) bool {
     var remote_host: []const u8 = undefined;
     var path: []const u8 = undefined;
+    var ssh_transport = false;
     if (std.mem.indexOf(u8, url, "://")) |scheme_end| {
         const scheme = url[0..scheme_end];
+        ssh_transport = std.ascii.eqlIgnoreCase(scheme, "ssh");
         const authority_start = scheme_end + 3;
         const path_start = std.mem.indexOfScalarPos(
             u8,
@@ -181,6 +183,7 @@ fn remoteMatchesRepository(
         remote_host = normalizeAuthorityHost(authority, scheme) orelse return false;
         path = url[path_start + 1 ..];
     } else {
+        ssh_transport = true;
         const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
         if (std.mem.indexOfScalar(u8, url[0..colon], '/')) |_| return false;
         const authority = url[0..colon];
@@ -196,7 +199,11 @@ fn remoteMatchesRepository(
     if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - 4];
     const separator = std.mem.indexOfScalar(u8, path, '/') orelse return false;
     const expected_host = normalizeAuthorityHost(host, "https") orelse return false;
-    return std.ascii.eqlIgnoreCase(remote_host, expected_host) and
+    const host_matches = if (ssh_transport)
+        std.ascii.eqlIgnoreCase(authorityHostname(remote_host), authorityHostname(expected_host))
+    else
+        std.ascii.eqlIgnoreCase(remote_host, expected_host);
+    return host_matches and
         std.ascii.eqlIgnoreCase(path[0..separator], owner) and
         std.ascii.eqlIgnoreCase(path[separator + 1 ..], repository);
 }
@@ -222,12 +229,24 @@ pub fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]cons
 }
 
 fn stripTransportPort(scheme: []const u8, port: []const u8) bool {
-    const default_port = (std.ascii.eqlIgnoreCase(scheme, "https") and
-        std.mem.eql(u8, port, "443")) or
+    const default_port = std.ascii.eqlIgnoreCase(scheme, "ssh") or
+        (std.ascii.eqlIgnoreCase(scheme, "https") and
+            std.mem.eql(u8, port, "443")) or
         (std.ascii.eqlIgnoreCase(scheme, "http") and std.mem.eql(u8, port, "80")) or
-        (std.ascii.eqlIgnoreCase(scheme, "ssh") and std.mem.eql(u8, port, "22")) or
         (std.ascii.eqlIgnoreCase(scheme, "git") and std.mem.eql(u8, port, "9418"));
     return default_port;
+}
+
+fn authorityHostname(authority: []const u8) []const u8 {
+    if (authority.len > 0 and authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return authority;
+        return authority[0 .. close + 1];
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return authority;
+    const port = authority[colon + 1 ..];
+    if (port.len == 0) return authority;
+    for (port) |byte| if (!std.ascii.isDigit(byte)) return authority;
+    return authority[0..colon];
 }
 
 pub const Custody = union(enum) {
@@ -767,7 +786,13 @@ pub fn synchronizeManaged(
         };
         return error.ManagedWorktreeRefreshFailed;
     }
-    reconcileInitializedSubmodules(allocator, io, custody.path()) catch {
+    const fetch_environment = if (fetch_source) |source| source.environment else null;
+    reconcileInitializedSubmodules(
+        allocator,
+        io,
+        custody.path(),
+        fetch_environment,
+    ) catch {
         rollbackManagedTransition(allocator, io, custody.path(), baseline) catch {
             return error.ManagedWorktreeRollbackFailed;
         };
@@ -792,44 +817,60 @@ fn reconcileInitializedSubmodules(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
+    inherited: ?*const std.process.Environ.Map,
 ) !void {
-    const term = try runSubmoduleReconciliationBounded(
+    const sync_term = try runSubmoduleReconciliationBounded(
         allocator,
         io,
         root,
-        null,
+        inherited,
+        .sync,
         fetch_timeout_ms,
         fetch_termination_grace_ms,
     );
-    if (term != .exited or term.exited != 0) {
+    if (sync_term != .exited or sync_term.exited != 0) {
         return error.ManagedSubmoduleReconciliationFailed;
     }
+    const update_term = try runSubmoduleReconciliationBounded(
+        allocator,
+        io,
+        root,
+        inherited,
+        .update,
+        fetch_timeout_ms,
+        fetch_termination_grace_ms,
+    );
+    if (update_term != .exited or update_term.exited != 0) {
+        return error.ManagedSubmoduleReconciliationFailed;
+    }
+    try cleanInitializedSubmodules(allocator, io, root);
 }
+
+const SubmoduleReconciliation = enum { sync, update };
 
 fn runSubmoduleReconciliationBounded(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     inherited: ?*const std.process.Environ.Map,
+    operation: SubmoduleReconciliation,
     timeout_ms: u32,
     termination_grace_ms: u32,
 ) !std.process.Child.Term {
-    var environment = if (inherited) |source|
-        try source.clone(allocator)
-    else
-        std.process.Environ.Map.init(allocator);
+    var environment = try effectiveGitEnvironment(allocator, inherited);
     defer environment.deinit();
-    try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
+    const sync_argv = [_][]const u8{
+        "git",       "--no-replace-objects", "-c",          "core.hooksPath=/dev/null",
+        "submodule", "sync",                 "--recursive",
+    };
+    const update_argv = [_][]const u8{
+        "git",       "--no-replace-objects", "-c",         "core.hooksPath=/dev/null",
+        "submodule", "update",               "--checkout", "--recursive",
+    };
     var child = try std.process.spawn(io, .{
-        .argv = &.{
-            "git",
-            "--no-replace-objects",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "submodule",
-            "update",
-            "--checkout",
-            "--recursive",
+        .argv = switch (operation) {
+            .sync => &sync_argv,
+            .update => &update_argv,
         },
         .cwd = .{ .path = root },
         .environ_map = &environment,
@@ -2055,7 +2096,7 @@ test "worktree integrity stale custody rejects a replacement repository" {
     _ = try tmp.dir.statFile(io, "repo/new", .{});
 }
 
-test "repository remote matching normalizes transport default ports" {
+test "repository remote matching separates SSH and API port semantics" {
     try std.testing.expect(remoteMatchesRepository(
         "https://github.com:443/owner/repo.git",
         "github.com",
@@ -2076,13 +2117,13 @@ test "repository remote matching normalizes transport default ports" {
     ));
     try std.testing.expect(remoteMatchesRepository(
         "ssh://token:secret@github.example.test:2222/owner/repo.git",
-        "github.example.test:2222",
+        "github.example.test:8443",
         "owner",
         "repo",
     ));
     try std.testing.expect(!remoteMatchesRepository(
-        "ssh://git@github.example.test:2223/owner/repo.git",
-        "github.example.test:2222",
+        "ssh://git@other.example.test:2222/owner/repo.git",
+        "github.example.test:8443",
         "owner",
         "repo",
     ));
