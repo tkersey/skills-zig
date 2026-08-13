@@ -2972,7 +2972,7 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
 
 fn isGithubEffectObject(object: []const u8) bool {
     if (isLocalDiscourseObject(object)) return false;
-    const explicit = containsAnyIgnoreCase(object, &.{
+    const explicit = containsWordAnyIgnoreCase(object, &.{
         "label",  "reviewer", "assignee", "milestone",   "pull request", "this pr",
         "the pr", "pr #",     "github",   "mark viewed", "graphql",
     });
@@ -2993,7 +2993,9 @@ fn isLocalDiscourseObject(object: []const u8) bool {
         "from your summary",      "in your summary",      "from the summary",  "in the summary",
         "from your response",     "in your response",     "from the response", "in the response",
         "from your analysis",     "in your analysis",     "from your output",  "in your output",
-        "from this conversation", "in this conversation",
+        "from this conversation", "in this conversation", "to your summary",   "to the summary",
+        "to your response",       "to the response",      "to your analysis",  "to your output",
+        "to this conversation",   "to the conversation",
     });
 }
 
@@ -3038,37 +3040,35 @@ fn positiveGithubObject(object: []const u8) ?[]const u8 {
 }
 
 fn negatesGithubDestination(object: []const u8) bool {
-    var negation_end: ?usize = null;
     for ([_][]const u8{
         " but do not ", " but don't ", " without ", " except ",
         " not ",        " no ",        " never ",   " do not ",
         " don't ",
     }) |marker| {
-        if (indexOfIgnoreCase(object, marker)) |index| {
-            const candidate = index + marker.len;
-            if (negation_end == null or candidate < negation_end.?) {
-                negation_end = candidate;
-            }
+        var offset: usize = 0;
+        while (offset < object.len) {
+            const relative = indexOfIgnoreCase(object[offset..], marker) orelse break;
+            const start = offset + relative + marker.len;
+            if (containsGithubDestination(object[start..])) return true;
+            offset = start;
         }
     }
-    const remainder = std.mem.trim(
-        u8,
-        object[negation_end orelse return false ..],
-        " \t\r\n,;.!?",
-    );
+    return false;
+}
+
+fn containsGithubDestination(text: []const u8) bool {
     for ([_][]const u8{ "on", "to", "in", "at" }) |preposition| {
-        if (remainder.len <= preposition.len or
-            !std.ascii.eqlIgnoreCase(remainder[0..preposition.len], preposition) or
-            std.ascii.isAlphanumeric(remainder[preposition.len])) continue;
-        const destination = std.mem.trim(
-            u8,
-            remainder[preposition.len..],
-            " \t\r\n,;.!?",
-        );
-        return startsWordAnyIgnoreCase(destination, &.{
-            "github",  "pull request", "this pull request", "the pull request",
-            "this pr", "the pr",       "pr",
-        });
+        var offset: usize = 0;
+        while (offset < text.len) {
+            const relative = indexOfWordIgnoreCase(text[offset..], preposition) orelse break;
+            const after = offset + relative + preposition.len;
+            const destination = std.mem.trim(u8, text[after..], " \t\r\n,;.!?");
+            if (startsWordAnyIgnoreCase(destination, &.{
+                "github",  "pull request", "this pull request", "the pull request",
+                "this pr", "the pr",       "pr",
+            })) return true;
+            offset = after;
+        }
     }
     return false;
 }
@@ -3136,6 +3136,25 @@ fn startsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
 fn containsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| if (containsIgnoreCase(text, needle)) return true;
     return false;
+}
+
+fn containsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
+    for (words) |word| if (indexOfWordIgnoreCase(text, word) != null) return true;
+    return false;
+}
+
+fn indexOfWordIgnoreCase(text: []const u8, word: []const u8) ?usize {
+    var offset: usize = 0;
+    while (offset <= text.len) {
+        const relative = indexOfIgnoreCase(text[offset..], word) orelse return null;
+        const start = offset + relative;
+        const end = start + word.len;
+        const left_boundary = start == 0 or !std.ascii.isAlphanumeric(text[start - 1]);
+        const right_boundary = end == text.len or !std.ascii.isAlphanumeric(text[end]);
+        if (left_boundary and right_boundary) return start;
+        offset = start + 1;
+    }
+    return null;
 }
 fn requestedAuthority(
     allocator: std.mem.Allocator,
@@ -3596,6 +3615,9 @@ test "GitHub destination negation does not grant action authority" {
         HumanAuthority.github_any,
         classifyHumanInstruction("Post a GitHub comment without changing labels").?,
     );
+    try std.testing.expect(classifyHumanInstruction(
+        "Post a comment without changing labels, and do not post it on GitHub",
+    ) == null);
 }
 
 test "prepare authority distinguishes effects from informational artifacts" {
@@ -3619,6 +3641,15 @@ test "prepare authority distinguishes effects from informational artifacts" {
     ) == null);
     try std.testing.expect(classifyHumanInstruction(
         "Update your response with pull request feedback",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Update the documentation about label parsing",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Add the comment to your summary",
+    ) == null);
+    try std.testing.expect(classifyHumanInstruction(
+        "Post a comment to this conversation",
     ) == null);
     try std.testing.expectEqual(
         HumanAuthority.github_any,
