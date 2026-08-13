@@ -4378,7 +4378,7 @@ test "revision hydration deepens a shallow checkout before retrying merge base" 
         allocator,
         io,
         checkout,
-        .{ .remote_name = "origin" },
+        .{ .remote_name = source_url, .remote_url = source_url },
         &generation,
     );
     try std.testing.expect(!std.mem.eql(u8, generation.files.items[0].revision_key, "pending"));
