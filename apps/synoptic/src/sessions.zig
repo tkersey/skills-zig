@@ -2972,11 +2972,14 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
 
 fn isGithubEffectObject(object: []const u8) bool {
     if (isLocalDiscourseObject(object)) return false;
-    const explicit = containsWordAnyIgnoreCase(object, &.{
-        "label",  "reviewer", "assignee", "milestone",   "pull request", "this pr",
-        "the pr", "pr #",     "github",   "mark viewed", "graphql",
+    const explicit_destination = containsWordAnyIgnoreCase(object, &.{
+        "pull request", "this pr", "the pr", "pr #", "github", "graphql",
     });
-    if (explicit) return true;
+    if (explicit_destination) return true;
+    const target = trimActionObjectArticles(object);
+    if (startsWordAnyIgnoreCase(target, &.{
+        "label", "reviewer", "assignee", "milestone", "mark viewed",
+    })) return true;
     return isPreparedGithubEffect(object);
 }
 
@@ -3000,6 +3003,13 @@ fn isLocalDiscourseObject(object: []const u8) bool {
 }
 
 fn isPreparedGithubEffect(object: []const u8) bool {
+    const target = trimActionObjectArticles(object);
+    return startsWordAnyIgnoreCase(target, &.{
+        "comment", "inline comment", "reply", "thread", "graphql action",
+    });
+}
+
+fn trimActionObjectArticles(object: []const u8) []const u8 {
     var target = std.mem.trim(u8, object, " \t\r\n,;.!?");
     for (0..2) |_| {
         const before = target.len;
@@ -3013,9 +3023,7 @@ fn isPreparedGithubEffect(object: []const u8) bool {
         }
         if (target.len == before) break;
     }
-    return startsWordAnyIgnoreCase(target, &.{
-        "comment", "inline comment", "reply", "thread", "graphql action",
-    });
+    return target;
 }
 
 fn positiveObjectBeforeNegation(object: []const u8) ?[]const u8 {
