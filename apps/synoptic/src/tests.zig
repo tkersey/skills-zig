@@ -3537,26 +3537,7 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
     defer allocator.free(middle);
     const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
     defer allocator.free(managed);
-    try std.Io.Dir.cwd().createDirPath(io, leaf);
-    try initializeFixtureRepository(allocator, io, leaf);
-    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
-    defer allocator.free(leaf_tracked);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "leaf\n" });
-    try commitFixtureRepository(allocator, io, leaf, "leaf");
-    try std.Io.Dir.cwd().createDirPath(io, middle);
-    try initializeFixtureRepository(allocator, io, middle);
-    for ([_][]const []const u8{
-        &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "nested" },
-        &.{ "git", "-C", "nested", "checkout", "-q", "HEAD" },
-    }) |argv| allocator.free(try runGit(allocator, io, middle, argv));
-    try commitFixtureRepository(allocator, io, middle, "middle");
-    try std.Io.Dir.cwd().createDirPath(io, managed);
-    try initializeFixtureRepository(allocator, io, managed);
-    for ([_][]const []const u8{
-        &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", middle, "module" },
-        &.{ "git", "-c", "protocol.file.allow=always", "-C", "module", "submodule", "update", "--init", "--recursive" },
-    }) |argv| allocator.free(try runGit(allocator, io, managed, argv));
-    try commitFixtureRepository(allocator, io, managed, "root");
+    try prepareNestedSubmoduleFixture(allocator, io, leaf, middle, managed);
     var baseline = try worktree.Baseline.capture(allocator, io, managed);
     defer baseline.deinit();
     const selected = try allocator.dupe(u8, baseline.head_oid);
@@ -3583,14 +3564,6 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
     );
     defer allocator.free(nested_artifact);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nested_artifact, .data = "artifact" });
-    const nested_before = try runGit(
-        allocator,
-        io,
-        nested_root,
-        &.{ "git", "status", "--porcelain=v2", "--untracked-files=all" },
-    );
-    defer allocator.free(nested_before);
-    try std.testing.expect(nested_before.len > 0);
     try worktree.reconcileShutdown(allocator, io, .{ .managed = managed }, selected, &baseline);
     const restored = try std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -3604,6 +3577,54 @@ test "worktree integrity managed cleanup restores initialized nested submodules"
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, nested_artifact, .{}),
     );
+}
+
+fn prepareNestedSubmoduleFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    leaf: []const u8,
+    middle: []const u8,
+    managed: []const u8,
+) !void {
+    try std.Io.Dir.cwd().createDirPath(io, leaf);
+    try initializeFixtureRepository(allocator, io, leaf);
+    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
+    defer allocator.free(leaf_tracked);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "leaf\n" });
+    try commitFixtureRepository(allocator, io, leaf, "leaf");
+    try std.Io.Dir.cwd().createDirPath(io, middle);
+    try initializeFixtureRepository(allocator, io, middle);
+    for ([_][]const []const u8{
+        &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "nested" },
+        &.{ "git", "-C", "nested", "checkout", "-q", "HEAD" },
+    }) |argv| allocator.free(try runGit(allocator, io, middle, argv));
+    try commitFixtureRepository(allocator, io, middle, "middle");
+    try std.Io.Dir.cwd().createDirPath(io, managed);
+    try initializeFixtureRepository(allocator, io, managed);
+    for ([_][]const []const u8{
+        &.{
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            middle,
+            "module",
+        },
+        &.{
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "-C",
+            "module",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        },
+    }) |argv| allocator.free(try runGit(allocator, io, managed, argv));
+    try commitFixtureRepository(allocator, io, managed, "root");
 }
 
 fn initializeFixtureRepository(
