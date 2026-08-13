@@ -610,7 +610,9 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cas_automation_install.step);
-    install_all.dependOn(&synoptic_install.step);
+    if (installsSynopticByDefault(target.result.os.tag)) {
+        install_all.dependOn(&synoptic_install.step);
+    }
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
     install_all.dependOn(&img_install.step);
@@ -1241,6 +1243,16 @@ pub fn build(b: *std.Build) void {
         "Verify and summarize the current perf capsule",
         &.{"report"},
     );
+}
+
+fn installsSynopticByDefault(os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .macos;
+}
+
+test "default install admits Synoptic only for macOS targets" {
+    try std.testing.expect(installsSynopticByDefault(.macos));
+    try std.testing.expect(!installsSynopticByDefault(.linux));
+    try std.testing.expect(!installsSynopticByDefault(.windows));
 }
 
 fn addExecutable(
