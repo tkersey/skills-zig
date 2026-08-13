@@ -810,6 +810,12 @@ pub const Server = struct {
         runtime: *Runtime,
         event: sessions.VisibleEvent,
     ) !void {
+        if (isSnapshotInvalidation(event)) {
+            const envelope = try self.snapshot(runtime);
+            defer self.allocator.free(envelope);
+            try writeServerText(self.io, stream, envelope);
+            return;
+        }
         if ((event.session_id == null and std.mem.eql(
             u8,
             event.method,
@@ -852,6 +858,12 @@ pub const Server = struct {
         return std.mem.eql(u8, method, "turn/started") or
             std.mem.eql(u8, method, "turn/completed") or
             std.mem.eql(u8, method, "turn/failed");
+    }
+
+    fn isSnapshotInvalidation(event: sessions.VisibleEvent) bool {
+        return event.session_id == null and
+            std.mem.eql(u8, event.method, "snapshot") and
+            std.mem.eql(u8, event.raw_json, "{}");
     }
 
     fn flushPreparedAction(
@@ -1587,9 +1599,7 @@ pub const Server = struct {
             }
             try queueExclusionEvents(runtime.registry, outcomes.items);
             if (outcomes.items.len > 0) {
-                const current_snapshot = try runtime.app.bootstrapAlloc();
-                defer self.allocator.free(current_snapshot);
-                try runtime.registry.queueSystemEventEventually("snapshot", current_snapshot);
+                try runtime.registry.queueSnapshotInvalidationEventually();
             }
         }
     }
@@ -2241,13 +2251,14 @@ test "exclusion notification capacity cannot fail committed reconciliation" {
         sessions.max_visible_events,
         registry.visible_events.items.len,
     );
-    try registry.queueSystemEventEventually("snapshot", "{\"queue\":[]}");
+    try registry.queueSnapshotInvalidationEventually();
     try std.testing.expect(registry.pending_system_event != null);
     try registry.acknowledgeVisible();
     try std.testing.expect(registry.pending_system_event == null);
     const last = registry.visible_events.items[registry.visible_events.items.len - 1];
     try std.testing.expectEqualStrings("snapshot", last.method);
-    try std.testing.expectEqualStrings("{\"queue\":[]}", last.raw_json);
+    try std.testing.expectEqualStrings("{}", last.raw_json);
+    try std.testing.expect(Server.isSnapshotInvalidation(last));
 }
 
 test "WebSocket close payload accepts only valid status and UTF-8 reason" {

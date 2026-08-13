@@ -938,18 +938,12 @@ pub const Registry = struct {
         try self.appendVisibleLocked(null, method, raw_json);
     }
 
-    pub fn queueSystemEventEventually(
-        self: *Registry,
-        method: []const u8,
-        raw_json: []const u8,
-    ) !void {
+    pub fn queueSnapshotInvalidationEventually(self: *Registry) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const event = try self.makeVisibleEvent(null, method, raw_json);
+        const event = try self.makeVisibleEvent(null, "snapshot", "{}");
         errdefer event.deinit(self.allocator);
-        if (event.byteSize() > max_visible_event_bytes) {
-            return error.VisibleEventLimitExceeded;
-        }
+        std.debug.assert(event.byteSize() <= max_visible_event_bytes);
         if (self.pending_system_event) |pending| pending.deinit(self.allocator);
         self.pending_system_event = event;
         self.queuePendingSystemEventLocked();
