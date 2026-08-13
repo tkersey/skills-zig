@@ -184,7 +184,7 @@ fn validateTransparentWithHead(
     var saw_target = false;
     try validateVariables(input, pull_request_id, &saw_target);
     if (!saw_target) return error.GraphqlPullRequestTargetMissing;
-    if (std.mem.eql(u8, root.field, "mergePullRequest")) {
+    if (transparentMutationRequiresHead(root.field)) {
         if (input != .object) return error.InvalidGraphqlVariables;
         const head = input.object.get("expectedHeadOid") orelse
             return error.GraphqlExpectedHeadMissing;
@@ -192,6 +192,11 @@ fn validateTransparentWithHead(
         if (expected_head_oid) |expected| if (!std.mem.eql(u8, head.string, expected))
             return error.GraphqlExpectedHeadMismatch;
     }
+}
+
+fn transparentMutationRequiresHead(field: []const u8) bool {
+    return std.mem.eql(u8, field, "mergePullRequest") or
+        std.mem.eql(u8, field, "updatePullRequestBranch");
 }
 
 const TransparentRoot = struct {
@@ -598,15 +603,22 @@ test "transparent GraphQL binds broad mutations to exact PR" {
             "HEAD_1",
         ),
     );
-    try expectTransparentMergeHeadBinding();
+    try expectTransparentHeadSensitiveMutationBinding();
 }
 
-fn expectTransparentMergeHeadBinding() !void {
+fn expectTransparentHeadSensitiveMutationBinding() !void {
     const merge = "mutation Merge($input:MergePullRequestInput!){mergePullRequest" ++
         "(input:$input){pullRequest{id}}}";
+    try expectTransparentHeadBinding(merge, "Merge");
+    const update = "mutation UpdateBranch($input:UpdatePullRequestBranchInput!){" ++
+        "updatePullRequestBranch(input:$input){clientMutationId}}";
+    try expectTransparentHeadBinding(update, "UpdateBranch");
+}
+
+fn expectTransparentHeadBinding(document: []const u8, operation: []const u8) !void {
     try validateTransparentAtHead(
-        merge,
-        "Merge",
+        document,
+        operation,
         "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"HEAD_1\"}}",
         "PR_1",
         "HEAD_1",
@@ -614,8 +626,8 @@ fn expectTransparentMergeHeadBinding() !void {
     try std.testing.expectError(
         error.GraphqlExpectedHeadMissing,
         validateTransparentAtHead(
-            merge,
-            "Merge",
+            document,
+            operation,
             "{\"input\":{\"pullRequestId\":\"PR_1\"}}",
             "PR_1",
             "HEAD_1",
@@ -624,8 +636,8 @@ fn expectTransparentMergeHeadBinding() !void {
     try std.testing.expectError(
         error.GraphqlExpectedHeadMismatch,
         validateTransparentAtHead(
-            merge,
-            "Merge",
+            document,
+            operation,
             "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"OLD\"}}",
             "PR_1",
             "HEAD_1",
