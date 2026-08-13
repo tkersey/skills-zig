@@ -20,6 +20,7 @@ pub const FetchSource = struct {
     allocator: ?std.mem.Allocator = null,
     environment: ?*const std.process.Environ.Map = null,
     remote_name: []const u8,
+    remote_url: []const u8 = "",
     repository_host: []const u8 = "",
     repository_owner: []const u8 = "",
     repository_name: []const u8 = "",
@@ -50,15 +51,10 @@ pub const FetchSource = struct {
             if (remote.len == 0) continue;
             remote_count += 1;
             if (remote_count > 128) return error.GitFetchSourceUnavailable;
+            if (!fetchRemoteNameSafe(remote)) continue;
             const key = try std.fmt.allocPrint(allocator, "remote.{s}.url", .{remote});
             defer allocator.free(key);
-            const url = gitOutput(
-                allocator,
-                io,
-                cwd,
-                &.{ "git", "config", "--get", key },
-                error.GitFetchSourceUnavailable,
-            ) catch continue;
+            const url = singleRemoteUrlAlloc(allocator, io, cwd, key) catch continue;
             defer allocator.free(url);
             if (!remoteMatchesRepository(
                 std.mem.trim(u8, url, "\r\n"),
@@ -68,6 +64,8 @@ pub const FetchSource = struct {
             )) continue;
             const remote_name = try allocator.dupe(u8, remote);
             errdefer allocator.free(remote_name);
+            const remote_url = try allocator.dupe(u8, url);
+            errdefer allocator.free(remote_url);
             const repository_host = try allocator.dupe(u8, host);
             errdefer allocator.free(repository_host);
             const repository_owner = try allocator.dupe(u8, owner);
@@ -78,6 +76,7 @@ pub const FetchSource = struct {
                 .allocator = allocator,
                 .environment = environment,
                 .remote_name = remote_name,
+                .remote_url = remote_url,
                 .repository_host = repository_host,
                 .repository_owner = repository_owner,
                 .repository_name = repository_name,
@@ -89,6 +88,7 @@ pub const FetchSource = struct {
     pub fn deinit(self: *FetchSource) void {
         if (self.allocator) |allocator| {
             allocator.free(self.remote_name);
+            allocator.free(self.remote_url);
             allocator.free(self.repository_host);
             allocator.free(self.repository_owner);
             allocator.free(self.repository_name);
@@ -96,6 +96,35 @@ pub const FetchSource = struct {
         self.* = undefined;
     }
 };
+
+fn fetchRemoteNameSafe(remote: []const u8) bool {
+    if (remote.len == 0 or remote[0] == '-') return false;
+    for (remote) |byte| if (std.ascii.isControl(byte)) return false;
+    return true;
+}
+
+fn singleRemoteUrlAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    key: []const u8,
+) ![]u8 {
+    const urls = try gitOutput(
+        allocator,
+        io,
+        cwd,
+        &.{ "git", "config", "--get-all", key },
+        error.GitFetchSourceUnavailable,
+    );
+    defer allocator.free(urls);
+    var lines = std.mem.splitScalar(u8, urls, '\n');
+    const first = std.mem.trim(u8, lines.next() orelse "", "\r");
+    if (first.len == 0) return error.GitFetchSourceUnavailable;
+    while (lines.next()) |raw| {
+        if (std.mem.trim(u8, raw, "\r").len != 0) return error.GitFetchSourceUnavailable;
+    }
+    return allocator.dupe(u8, first);
+}
 
 fn remoteMatchesRepository(
     url: []const u8,
@@ -1530,6 +1559,7 @@ fn spawnFetchProcess(
     source: FetchSource,
     operation: FetchOperation,
 ) !std.process.Child {
+    try validateFetchSource(allocator, io, cwd, source);
     var environment = if (source.environment) |inherited|
         try inherited.clone(allocator)
     else
@@ -1537,22 +1567,23 @@ fn spawnFetchProcess(
     defer environment.deinit();
     sanitizeGitEnvironment(&environment);
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
-    var argv_buffer: [7][]const u8 = undefined;
+    var argv_buffer: [8][]const u8 = undefined;
     const argv: []const []const u8 = switch (operation) {
         .object => |oid| argv: {
             argv_buffer[0] = "git";
             argv_buffer[1] = "fetch";
             argv_buffer[2] = "--no-tags";
-            argv_buffer[3] = source.remote_name;
-            argv_buffer[4] = oid;
-            break :argv argv_buffer[0..5];
+            argv_buffer[3] = "--";
+            argv_buffer[4] = source.remote_name;
+            argv_buffer[5] = oid;
+            break :argv argv_buffer[0..6];
         },
         .unshallow => |commits| argv: {
             argv_buffer = .{
-                "git",        "fetch",      "--no-tags", "--unshallow", source.remote_name,
-                commits.base, commits.head,
+                "git", "fetch",            "--no-tags",  "--unshallow",
+                "--",  source.remote_name, commits.base, commits.head,
             };
-            break :argv argv_buffer[0..7];
+            break :argv argv_buffer[0..8];
         },
     };
     return std.process.spawn(io, .{
@@ -1564,6 +1595,27 @@ fn spawnFetchProcess(
         .stderr = .pipe,
         .pgid = 0,
     });
+}
+
+fn validateFetchSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    source: FetchSource,
+) !void {
+    if (!fetchRemoteNameSafe(source.remote_name)) return error.GitFetchSourceUnavailable;
+    if (source.remote_url.len == 0) return;
+    const key = try std.fmt.allocPrint(allocator, "remote.{s}.url", .{source.remote_name});
+    defer allocator.free(key);
+    const current_url = try singleRemoteUrlAlloc(allocator, io, cwd, key);
+    defer allocator.free(current_url);
+    if (!std.mem.eql(u8, current_url, source.remote_url) or
+        !remoteMatchesRepository(
+            current_url,
+            source.repository_host,
+            source.repository_owner,
+            source.repository_name,
+        )) return error.GitFetchSourceUnavailable;
 }
 
 fn terminateFetchProcess(

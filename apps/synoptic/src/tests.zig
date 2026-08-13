@@ -3886,6 +3886,10 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
     );
     defer fetch_source.deinit();
     try std.testing.expectEqualStrings("target", fetch_source.remote_name);
+    try std.testing.expectEqualStrings(
+        "https://github.example.test/owner/repo.git",
+        fetch_source.remote_url,
+    );
     try std.testing.expectEqualStrings("github.example.test", fetch_source.repository_host);
     try std.testing.expectEqualStrings("owner", fetch_source.repository_owner);
     try std.testing.expectEqualStrings("repo", fetch_source.repository_name);
@@ -3900,6 +3904,105 @@ test "worktree integrity Git object hydration uses only the matched PR remote" {
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(io, unrelated_witness, .{}),
+    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        consumer,
+        &.{
+            "git",
+            "config",
+            "--add",
+            "remote.target.url",
+            "https://redirect.invalid/changed.git",
+        },
+    ));
+    try std.testing.expectError(
+        error.GitFetchSourceUnavailable,
+        worktree.ensureObjectAvailable(
+            allocator,
+            io,
+            consumer,
+            fetch_source,
+            "1111111111111111111111111111111111111111",
+        ),
+    );
+}
+
+test "worktree integrity fetch source rejects option names and multiple URLs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    allocator.free(try runGit(allocator, io, root, &.{ "git", "init", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{
+            "git",
+            "config",
+            "remote.--upload-pack.url",
+            "https://github.example.test/owner/repo.git",
+        },
+    ));
+    try std.testing.expectError(
+        error.GitFetchSourceUnavailable,
+        worktree.FetchSource.resolve(
+            allocator,
+            io,
+            &environment,
+            root,
+            "github.example.test",
+            "owner",
+            "repo",
+        ),
+    );
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{ "git", "config", "--unset-all", "remote.--upload-pack.url" },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{
+            "git",
+            "config",
+            "--add",
+            "remote.target.url",
+            "https://redirect.invalid/wrong.git",
+        },
+    ));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        root,
+        &.{
+            "git",
+            "config",
+            "--add",
+            "remote.target.url",
+            "https://github.example.test/owner/repo.git",
+        },
+    ));
+    try std.testing.expectError(
+        error.GitFetchSourceUnavailable,
+        worktree.FetchSource.resolve(
+            allocator,
+            io,
+            &environment,
+            root,
+            "github.example.test",
+            "owner",
+            "repo",
+        ),
     );
 }
 
