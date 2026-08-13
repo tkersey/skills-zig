@@ -1545,10 +1545,10 @@ fn finishLifecycleRecord(
     if (terminal_error) |err| return err;
     const current_path = try std.fs.path.join(allocator, &.{ runtime_root, "current.json" });
     defer allocator.free(current_path);
-    removeCurrentIfLaunch(allocator, io, current_path, launch_id);
     var root = try std.Io.Dir.openDirAbsolute(io, runtime_root, .{});
     defer root.close(io);
     try root.deleteTree(io, launch_id);
+    removeCurrentIfLaunch(allocator, io, current_path, launch_id);
 }
 
 fn readCurrentForLaunch(
@@ -2523,6 +2523,40 @@ test "terminal shutdown retains its lifecycle record for later retirement" {
             "launch",
             error.SyntheticTerminalFailure,
         ),
+    );
+    _ = try std.Io.Dir.cwd().statFile(io, current_path, .{});
+}
+test "failed launch directory retirement preserves lifecycle discovery" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(runtime);
+    try tmp.dir.createDirPath(io, "launch/blocked");
+    var launch_dir_handle = try tmp.dir.openDir(io, "launch", .{});
+    defer launch_dir_handle.close(io);
+    try launch_dir_handle.setPermissions(io, std.Io.File.Permissions.fromMode(0));
+    defer launch_dir_handle.setPermissions(
+        io,
+        std.Io.File.Permissions.fromMode(0o700),
+    ) catch |err| {
+        std.debug.panic("restore launch permissions: {s}", .{@errorName(err)});
+    };
+    const current_path = try std.fs.path.join(allocator, &.{ runtime, "current.json" });
+    defer allocator.free(current_path);
+    try writeOperationalFile(
+        allocator,
+        io,
+        current_path,
+        "{\"runtimeSchema\":\"synoptic-runtime/v1\",\"launchId\":\"launch\"," ++
+            "\"runtimeRoot\":\"/tmp/runtime\",\"executable\":\"/bin/false\"," ++
+            "\"url\":\"http://127.0.0.1:1/\",\"pid\":1}",
+    );
+    try std.testing.expectError(
+        error.AccessDenied,
+        finishLifecycleRecord(allocator, io, runtime, "launch", null),
     );
     _ = try std.Io.Dir.cwd().statFile(io, current_path, .{});
 }
