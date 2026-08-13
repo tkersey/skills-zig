@@ -185,9 +185,9 @@ fn validateTransparentWithHead(
     var saw_target = false;
     try validateVariables(input, pull_request_id, &saw_target);
     if (!saw_target) return error.GraphqlPullRequestTargetMissing;
-    if (transparentMutationRequiresHead(root.field)) {
+    if (transparentMutationHeadField(root.field)) |head_field| {
         if (input != .object) return error.InvalidGraphqlVariables;
-        const head = input.object.get("expectedHeadOid") orelse
+        const head = input.object.get(head_field) orelse
             return error.GraphqlExpectedHeadMissing;
         if (head != .string or head.string.len == 0) return error.GraphqlExpectedHeadMissing;
         if (expected_head_oid) |expected| if (!std.mem.eql(u8, head.string, expected))
@@ -195,9 +195,11 @@ fn validateTransparentWithHead(
     }
 }
 
-fn transparentMutationRequiresHead(field: []const u8) bool {
-    return std.mem.eql(u8, field, "mergePullRequest") or
-        std.mem.eql(u8, field, "updatePullRequestBranch");
+fn transparentMutationHeadField(field: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, field, "addPullRequestReview")) return "commitOID";
+    if (std.mem.eql(u8, field, "mergePullRequest") or
+        std.mem.eql(u8, field, "updatePullRequestBranch")) return "expectedHeadOid";
+    return null;
 }
 
 const TransparentRoot = struct {
@@ -631,19 +633,32 @@ test "transparent GraphQL binds broad mutations to exact PR" {
 }
 
 fn expectTransparentHeadSensitiveMutationBinding() !void {
+    const review = "mutation Review($input:AddPullRequestReviewInput!){" ++
+        "addPullRequestReview(input:$input){pullRequestReview{id}}}";
+    try expectTransparentHeadBinding(review, "Review", "commitOID");
     const merge = "mutation Merge($input:MergePullRequestInput!){mergePullRequest" ++
         "(input:$input){pullRequest{id}}}";
-    try expectTransparentHeadBinding(merge, "Merge");
+    try expectTransparentHeadBinding(merge, "Merge", "expectedHeadOid");
     const update = "mutation UpdateBranch($input:UpdatePullRequestBranchInput!){" ++
         "updatePullRequestBranch(input:$input){clientMutationId}}";
-    try expectTransparentHeadBinding(update, "UpdateBranch");
+    try expectTransparentHeadBinding(update, "UpdateBranch", "expectedHeadOid");
 }
 
-fn expectTransparentHeadBinding(document: []const u8, operation: []const u8) !void {
+fn expectTransparentHeadBinding(
+    document: []const u8,
+    operation: []const u8,
+    head_field: []const u8,
+) !void {
+    const matching = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"input\":{{\"pullRequestId\":\"PR_1\",\"{s}\":\"HEAD_1\"}}}}",
+        .{head_field},
+    );
+    defer std.testing.allocator.free(matching);
     try validateTransparentAtHead(
         document,
         operation,
-        "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"HEAD_1\"}}",
+        matching,
         "PR_1",
         "HEAD_1",
     );
@@ -662,7 +677,10 @@ fn expectTransparentHeadBinding(document: []const u8, operation: []const u8) !vo
         validateTransparentAtHead(
             document,
             operation,
-            "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"OLD\"}}",
+            if (std.mem.eql(u8, head_field, "commitOID"))
+                "{\"input\":{\"pullRequestId\":\"PR_1\",\"commitOID\":\"OLD\"}}"
+            else
+                "{\"input\":{\"pullRequestId\":\"PR_1\",\"expectedHeadOid\":\"OLD\"}}",
             "PR_1",
             "HEAD_1",
         ),

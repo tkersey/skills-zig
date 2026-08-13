@@ -866,6 +866,28 @@ test "ready stop and starting abort retain distinct settlement budgets" {
     ) != null);
 }
 
+test "transparent review root requires confirmed head binding" {
+    const document = "mutation Review($input:AddPullRequestReviewInput!){" ++
+        "addPullRequestReview(input:$input){pullRequestReview{id}}}";
+    try graphql.validateTransparentAtHead(
+        document,
+        "Review",
+        "{\"input\":{\"pullRequestId\":\"PR_1\",\"commitOID\":\"HEAD_1\"}}",
+        "PR_1",
+        "HEAD_1",
+    );
+    try std.testing.expectError(
+        error.GraphqlExpectedHeadMissing,
+        graphql.validateTransparentAtHead(
+            document,
+            "Review",
+            "{\"input\":{\"pullRequestId\":\"PR_1\"}}",
+            "PR_1",
+            "HEAD_1",
+        ),
+    );
+}
+
 test "falsifier action tool is rejected during initial review" {
     var state = try app.App.init(std.testing.allocator, "head");
     defer state.deinit();
