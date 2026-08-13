@@ -949,6 +949,7 @@ fn cleanManaged(
     defer allocator.free(restore.stderr);
     const restore_failed = restore.term != .exited or restore.term.exited != 0;
     if (restore_failed) return error.ManagedTrackedCleanupFailed;
+    try cleanInitializedSubmodules(allocator, io, root);
     const status = try statusAlloc(allocator, io, root);
     defer allocator.free(status);
     var current: std.ArrayList([]u8) = .empty;
@@ -987,6 +988,198 @@ fn cleanManaged(
         final_artifacts.items,
         baseline.artifacts.items,
     )) return error.ManagedWorktreeCleanupIncomplete;
+}
+
+const SubmoduleTarget = struct {
+    path: []u8,
+    oid: []u8,
+
+    fn deinit(self: SubmoduleTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.oid);
+    }
+};
+
+const managed_submodule_max = 1024;
+
+fn cleanInitializedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) !void {
+    var targets: std.ArrayList(SubmoduleTarget) = .empty;
+    defer {
+        for (targets.items) |target| target.deinit(allocator);
+        targets.deinit(allocator);
+    }
+    try appendInitializedSubmodules(allocator, io, root, &targets);
+    var index: usize = 0;
+    while (index < targets.items.len) : (index += 1) {
+        const target = targets.items[index];
+        try appendInitializedSubmodules(allocator, io, target.path, &targets);
+        try restoreSubmodule(allocator, io, target);
+        try cleanSubmoduleArtifacts(allocator, io, target.path);
+    }
+    for (targets.items) |target| try verifyCleanSubmodule(allocator, io, target);
+}
+
+fn appendInitializedSubmodules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: []const u8,
+    targets: *std.ArrayList(SubmoduleTarget),
+) !void {
+    const entries = try gitOutput(
+        allocator,
+        io,
+        parent,
+        &.{ "git", "ls-files", "-s", "-z" },
+        error.ManagedSubmoduleInventoryFailed,
+    );
+    defer allocator.free(entries);
+    var records = std.mem.splitScalar(u8, entries, 0);
+    while (records.next()) |record| {
+        const parsed = parseGitlink(record) orelse continue;
+        if (targets.items.len >= managed_submodule_max) {
+            return error.ManagedSubmoduleInventoryLimitExceeded;
+        }
+        const canonical = (try confinedDirectoryAlloc(
+            allocator,
+            io,
+            parent,
+            parsed.path,
+        )) orelse continue;
+        defer allocator.free(canonical);
+        const path = try allocator.dupe(u8, canonical);
+        errdefer allocator.free(path);
+        if (!try isInitializedRepository(allocator, io, path)) {
+            allocator.free(path);
+            continue;
+        }
+        try targets.append(allocator, .{
+            .path = path,
+            .oid = try allocator.dupe(u8, parsed.oid),
+        });
+    }
+}
+
+const Gitlink = struct { oid: []const u8, path: []const u8 };
+
+fn parseGitlink(record: []const u8) ?Gitlink {
+    const tab = std.mem.indexOfScalar(u8, record, '\t') orelse return null;
+    var fields = std.mem.splitScalar(u8, record[0..tab], ' ');
+    const mode = fields.next() orelse return null;
+    const oid = fields.next() orelse return null;
+    const stage = fields.next() orelse return null;
+    if (!std.mem.eql(u8, mode, "160000") or !std.mem.eql(u8, stage, "0") or
+        oid.len == 0 or tab + 1 == record.len)
+    {
+        return null;
+    }
+    return .{ .oid = oid, .path = record[tab + 1 ..] };
+}
+
+fn confinedDirectoryAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    relative: []const u8,
+) !?[]u8 {
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative)) {
+        return error.UnsafeManagedArtifactPath;
+    }
+    var dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    var parts = std.mem.splitScalar(u8, relative, std.fs.path.sep);
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, "..")) {
+            return error.UnsafeManagedArtifactPath;
+        }
+        const next = dir.openDir(io, part, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return error.UnsafeManagedArtifactPath,
+        };
+        dir.close(io);
+        dir = next;
+    }
+    const canonical = try dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(canonical);
+    return try allocator.dupe(u8, canonical);
+}
+
+fn isInitializedRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !bool {
+    const result = try runGitCommand(
+        allocator,
+        io,
+        path,
+        &.{ "git", "rev-parse", "--show-toplevel" },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, result.stdout, "\r\n"), path);
+}
+
+fn restoreSubmodule(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: SubmoduleTarget,
+) !void {
+    const result = try runGitCommand(
+        allocator,
+        io,
+        target.path,
+        &.{ "git", "reset", "--hard", target.oid },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.ManagedSubmoduleCleanupFailed;
+    }
+}
+
+fn cleanSubmoduleArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const result = try runGitCommand(
+        allocator,
+        io,
+        path,
+        &.{ "git", "clean", "-ffdqx" },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.ManagedSubmoduleCleanupFailed;
+    }
+}
+
+fn verifyCleanSubmodule(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: SubmoduleTarget,
+) !void {
+    const head = try gitOutput(
+        allocator,
+        io,
+        target.path,
+        &.{ "git", "rev-parse", "HEAD" },
+        error.ManagedSubmoduleCleanupFailed,
+    );
+    defer allocator.free(head);
+    const status = try statusAlloc(allocator, io, target.path);
+    defer allocator.free(status);
+    if (!std.mem.eql(u8, std.mem.trim(u8, head, "\r\n"), target.oid) or
+        status.len != 0)
+    {
+        return error.ManagedSubmoduleCleanupFailed;
+    }
 }
 
 fn statusAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]u8 {

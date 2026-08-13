@@ -3524,6 +3524,119 @@ test "worktree integrity managed cleanup restores tracked and removes only revie
     );
 }
 
+test "worktree integrity managed cleanup restores initialized nested submodules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const leaf = try std.fs.path.join(allocator, &.{ root, "leaf" });
+    defer allocator.free(leaf);
+    const middle = try std.fs.path.join(allocator, &.{ root, "middle" });
+    defer allocator.free(middle);
+    const managed = try std.fs.path.join(allocator, &.{ root, "managed" });
+    defer allocator.free(managed);
+    try std.Io.Dir.cwd().createDirPath(io, leaf);
+    try initializeFixtureRepository(allocator, io, leaf);
+    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
+    defer allocator.free(leaf_tracked);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "leaf\n" });
+    try commitFixtureRepository(allocator, io, leaf, "leaf");
+    try std.Io.Dir.cwd().createDirPath(io, middle);
+    try initializeFixtureRepository(allocator, io, middle);
+    for ([_][]const []const u8{
+        &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "nested" },
+        &.{ "git", "-C", "nested", "checkout", "-q", "HEAD" },
+    }) |argv| allocator.free(try runGit(allocator, io, middle, argv));
+    try commitFixtureRepository(allocator, io, middle, "middle");
+    try std.Io.Dir.cwd().createDirPath(io, managed);
+    try initializeFixtureRepository(allocator, io, managed);
+    for ([_][]const []const u8{
+        &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", middle, "module" },
+        &.{ "git", "-c", "protocol.file.allow=always", "-C", "module", "submodule", "update", "--init", "--recursive" },
+    }) |argv| allocator.free(try runGit(allocator, io, managed, argv));
+    try commitFixtureRepository(allocator, io, managed, "root");
+    var baseline = try worktree.Baseline.capture(allocator, io, managed);
+    defer baseline.deinit();
+    const selected = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(selected);
+    const nested_tracked = try std.fs.path.join(
+        allocator,
+        &.{ managed, "module", "nested", "tracked.txt" },
+    );
+    defer allocator.free(nested_tracked);
+    const nested_root = try std.fs.path.join(allocator, &.{ managed, "module", "nested" });
+    defer allocator.free(nested_root);
+    const tracked_contents = try runGit(
+        allocator,
+        io,
+        nested_root,
+        &.{ "git", "ls-files", "tracked.txt" },
+    );
+    defer allocator.free(tracked_contents);
+    try std.testing.expectEqualStrings("tracked.txt\n", tracked_contents);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nested_tracked, .data = "changed\n" });
+    const nested_artifact = try std.fs.path.join(
+        allocator,
+        &.{ managed, "module", "nested", "artifact.tmp" },
+    );
+    defer allocator.free(nested_artifact);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = nested_artifact, .data = "artifact" });
+    const nested_before = try runGit(
+        allocator,
+        io,
+        nested_root,
+        &.{ "git", "status", "--porcelain=v2", "--untracked-files=all" },
+    );
+    defer allocator.free(nested_before);
+    try std.testing.expect(nested_before.len > 0);
+    try worktree.reconcileShutdown(allocator, io, .{ .managed = managed }, selected, &baseline);
+    const restored = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        nested_tracked,
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("leaf\n", restored);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, nested_artifact, .{}),
+    );
+}
+
+fn initializeFixtureRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "init", "-q" },
+        &.{ "git", "config", "user.email", "synoptic@example.test" },
+        &.{ "git", "config", "user.name", "Synoptic Test" },
+    }) |argv| {
+        const output = try runGit(allocator, io, path, argv);
+        allocator.free(output);
+    }
+    try commitFixtureRepository(allocator, io, path, "initial");
+}
+
+fn commitFixtureRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    message: []const u8,
+) !void {
+    for ([_][]const []const u8{
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "-qm", message, "--allow-empty" },
+    }) |argv| {
+        const output = try runGit(allocator, io, path, argv);
+        allocator.free(output);
+    }
+}
+
 test "worktree integrity reused contamination blocks without cleanup" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
