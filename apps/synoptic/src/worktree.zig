@@ -180,35 +180,16 @@ fn remoteMatchesRepository(
     owner: []const u8,
     repository: []const u8,
 ) bool {
-    var remote_host: []const u8 = undefined;
-    var path: []const u8 = undefined;
-    var ssh_transport = false;
-    if (std.mem.indexOf(u8, url, "://")) |scheme_end| {
-        const scheme = url[0..scheme_end];
-        ssh_transport = std.ascii.eqlIgnoreCase(scheme, "ssh");
-        const authority_start = scheme_end + 3;
-        const path_start = std.mem.indexOfScalarPos(
-            u8,
-            url,
-            authority_start,
-            '/',
-        ) orelse return false;
-        const authority = url[authority_start..path_start];
-        remote_host = normalizeAuthorityHost(authority, scheme) orelse return false;
-        path = url[path_start + 1 ..];
-    } else {
-        ssh_transport = true;
-        const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
-        if (std.mem.indexOfScalar(u8, url[0..colon], '/')) |_| return false;
-        const authority = url[0..colon];
-        const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at|
-            at + 1
-        else
-            0;
-        if (host_start == authority.len) return false;
-        remote_host = authority[host_start..];
-        path = url[colon + 1 ..];
-    }
+    const location = GitRepositoryLocation.parse(url) orelse return false;
+    if (location.kind == .local) return false;
+    const scheme = if (location.kind == .url) location.scheme else "ssh";
+    const ssh_transport = location.kind == .scp or
+        std.ascii.eqlIgnoreCase(scheme, "ssh");
+    const remote_host = normalizeAuthorityHost(
+        location.authority,
+        scheme,
+    ) orelse return false;
+    var path = location.path;
     path = std.mem.trimEnd(u8, path, "/");
     if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - 4];
     const separator = std.mem.indexOfScalar(u8, path, '/') orelse return false;
@@ -220,6 +201,75 @@ fn remoteMatchesRepository(
     return host_matches and
         std.ascii.eqlIgnoreCase(path[0..separator], owner) and
         std.ascii.eqlIgnoreCase(path[separator + 1 ..], repository);
+}
+
+const GitRepositoryLocationKind = enum { url, scp, local };
+
+const GitRepositoryLocation = struct {
+    kind: GitRepositoryLocationKind,
+    scheme: []const u8 = "",
+    authority: []const u8 = "",
+    prefix: []const u8,
+    path: []const u8,
+    rooted: bool,
+
+    fn parse(value: []const u8) ?GitRepositoryLocation {
+        if (std.mem.indexOf(u8, value, "://")) |scheme_end| {
+            const authority_start = scheme_end + 3;
+            const path_start = std.mem.indexOfScalarPos(
+                u8,
+                value,
+                authority_start,
+                '/',
+            ) orelse return null;
+            if (scheme_end == 0 or path_start == authority_start) return null;
+            return .{
+                .kind = .url,
+                .scheme = value[0..scheme_end],
+                .authority = value[authority_start..path_start],
+                .prefix = value[0 .. path_start + 1],
+                .path = value[path_start + 1 ..],
+                .rooted = true,
+            };
+        }
+        if (scpSeparator(value)) |separator| {
+            const path_start = separator + 1;
+            if (separator == 0 or path_start == value.len) return null;
+            const rooted = value[path_start] == '/';
+            return .{
+                .kind = .scp,
+                .authority = value[0..separator],
+                .prefix = value[0 .. path_start + @intFromBool(rooted)],
+                .path = value[path_start + @intFromBool(rooted) ..],
+                .rooted = rooted,
+            };
+        }
+        const rooted = std.mem.startsWith(u8, value, "/");
+        return .{
+            .kind = .local,
+            .prefix = if (rooted) value[0..1] else value[0..0],
+            .path = if (rooted) value[1..] else value,
+            .rooted = rooted,
+        };
+    }
+};
+
+fn scpSeparator(value: []const u8) ?usize {
+    var bracketed = false;
+    for (value, 0..) |byte, index| switch (byte) {
+        '[' => if (!bracketed) {
+            bracketed = true;
+        },
+        ']' => if (bracketed) {
+            bracketed = false;
+        } else return null,
+        ':' => if (!bracketed) {
+            if (std.mem.indexOfScalar(u8, value[0..index], '/')) |_| return null;
+            return index;
+        },
+        else => {},
+    };
+    return null;
 }
 
 pub fn normalizeAuthorityHost(authority: []const u8, scheme: []const u8) ?[]const u8 {
@@ -1215,52 +1265,16 @@ fn resolveSubmoduleUrlAlloc(
         std.mem.startsWith(u8, selected_url, "../");
     if (!relative) return allocator.dupe(u8, selected_url);
     const parent = parent_url orelse return error.ManagedSubmoduleInventoryFailed;
-    const split = try splitSubmoduleParentUrl(parent);
+    const location = GitRepositoryLocation.parse(parent) orelse
+        return error.ManagedSubmoduleInventoryFailed;
     var segments: std.ArrayList([]const u8) = .empty;
     defer segments.deinit(allocator);
-    try appendNormalizedUrlSegments(allocator, &segments, split.path, split.rooted);
-    try appendNormalizedUrlSegments(allocator, &segments, selected_url, split.rooted);
+    try appendNormalizedUrlSegments(allocator, &segments, location.path, location.rooted);
+    try appendNormalizedUrlSegments(allocator, &segments, selected_url, location.rooted);
     if (segments.items.len == 0) return error.ManagedSubmoduleInventoryFailed;
     const normalized = try std.mem.join(allocator, "/", segments.items);
     defer allocator.free(normalized);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ split.prefix, normalized });
-}
-
-const SubmoduleParentUrl = struct {
-    prefix: []const u8,
-    path: []const u8,
-    rooted: bool,
-};
-
-fn splitSubmoduleParentUrl(parent: []const u8) !SubmoduleParentUrl {
-    if (std.mem.indexOf(u8, parent, "://")) |scheme_end| {
-        const authority_start = scheme_end + 3;
-        const path_start = std.mem.indexOfScalarPos(
-            u8,
-            parent,
-            authority_start,
-            '/',
-        ) orelse return error.ManagedSubmoduleInventoryFailed;
-        return .{
-            .prefix = parent[0 .. path_start + 1],
-            .path = parent[path_start + 1 ..],
-            .rooted = true,
-        };
-    }
-    if (std.mem.indexOfScalar(u8, parent, ':')) |colon| {
-        const slash = std.mem.indexOfScalar(u8, parent, '/');
-        if (slash == null or colon < slash.?) return .{
-            .prefix = parent[0 .. colon + 1],
-            .path = parent[colon + 1 ..],
-            .rooted = true,
-        };
-    }
-    if (std.mem.startsWith(u8, parent, "/")) return .{
-        .prefix = "/",
-        .path = parent[1..],
-        .rooted = true,
-    };
-    return .{ .prefix = "", .path = parent, .rooted = false };
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ location.prefix, normalized });
 }
 
 fn appendNormalizedUrlSegments(
@@ -2491,6 +2505,16 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
             .expected = "git@git.example:owner/lib.git",
         },
         .{
+            .parent = "git@[2001:db8::1]:owner/super.git",
+            .selected = "../lib.git",
+            .expected = "git@[2001:db8::1]:owner/lib.git",
+        },
+        .{
+            .parent = "git@git.example:/srv/owner/super.git",
+            .selected = "../lib.git",
+            .expected = "git@git.example:/srv/owner/lib.git",
+        },
+        .{
             .parent = "/srv/git/owner/super.git",
             .selected = "../lib.git",
             .expected = "/srv/git/owner/lib.git",
@@ -2975,6 +2999,12 @@ test "repository remote matching accepts scp syntax without a user" {
     try std.testing.expect(remoteMatchesRepository(
         "git@github.com:owner/repo.git",
         "github.com",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(remoteMatchesRepository(
+        "git@[2001:db8::1]:owner/repo.git",
+        "[2001:db8::1]",
         "owner",
         "repo",
     ));
