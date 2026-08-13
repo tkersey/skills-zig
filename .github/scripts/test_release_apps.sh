@@ -225,6 +225,19 @@ pub fn build() void {}
 EOF
 }
 
+write_synoptic_install_guard_build() {
+  cat >build.zig <<'EOF'
+const img_meta = "apps/img/VERSION";
+fn installsSynopticByDefault(os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .macos;
+}
+test "default install admits Synoptic only for macOS targets" {
+    try std.testing.expect(installsSynopticByDefault(.macos));
+}
+pub fn build() void {}
+EOF
+}
+
 write_synoptic_import_build() {
   local imported_module=$1
   printf '%s\n' \
@@ -345,6 +358,7 @@ assert_affected cas,synoptic write_cas_runtime_only_build
 assert_affected cas,synoptic write_cas_hook_policy_only_build
 assert_affected cas,synoptic write_synoptic_cas_runtime_build
 assert_affected synoptic write_synoptic_formatted_build
+assert_affected synoptic write_synoptic_install_guard_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_universalist_build
