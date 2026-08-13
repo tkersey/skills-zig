@@ -826,8 +826,10 @@ pub const Registry = struct {
         self: *Registry,
         session_id: []const u8,
         text: []const u8,
+        allow_card_proposal: bool,
     ) !?[32]u8 {
-        const authority = classifyHumanInstruction(text);
+        const authority = classifyImmediateHumanInstruction(text) orelse
+            if (allow_card_proposal) HumanAuthority.github_any else null;
         const token: ?[32]u8 = if (authority != null) token: {
             const io = self.io orelse return error.AppServerUnavailable;
             var random: [16]u8 = undefined;
@@ -1419,7 +1421,11 @@ pub const Registry = struct {
         const actor = &(self.actor orelse return error.AppServerUnavailable);
         const first_turn = target.initial_prompt != null;
         const method = if (target.active and !first_turn) "turn/steer" else "turn/start";
-        const authority_token = try self.beginHumanInstruction(session_id, text);
+        const authority_token = try self.beginHumanInstruction(
+            session_id,
+            text,
+            !first_turn,
+        );
         errdefer self.resolveHumanInstruction(session_id, false);
         const combined = try self.humanMessageAlloc(
             target.initial_prompt,
@@ -1488,7 +1494,11 @@ pub const Registry = struct {
             "{s}\n\n[Synoptic runtime authority binding: if you invoke an " ++
                 "effectful synoptic tool for this instruction, include " ++
                 "authorityToken exactly \"{s}\". This unpredictable token is " ++
-                "valid only for this instruction and one action.]",
+                "valid only for this instruction and one tool request. For " ++
+                "prepare_github_action it authorizes only an immutable pending " ++
+                "card; GitHub execution still requires explicit UI confirmation. " ++
+                "Invoke complete_file_review or close_session only when this " ++
+                "human instruction directly and unambiguously requests it.]",
             .{ plain, token },
         ) else self.allocator.dupe(u8, plain);
     }
@@ -3075,14 +3085,8 @@ fn visibleMethod(method: []const u8) bool {
             "delta",
         ) != null;
 }
-fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (startsAnyIgnoreCase(trimmed, &.{
-        "do not ", "don't ", "please do not ", "please don't ", "never ",
-    }) or containsAnyIgnoreCase(trimmed, &.{
-        "i don't want you to ", "i do not want you to ",
-    })) return null;
-    const directive = directiveBody(trimmed);
+fn classifyImmediateHumanInstruction(text: []const u8) ?HumanAuthority {
+    const directive = directiveBody(text);
     if (exactDirective(directive, &.{
         "complete this file",
         "complete the file review",
@@ -3095,165 +3099,6 @@ fn classifyHumanInstruction(text: []const u8) ?HumanAuthority {
         "close this session", "close the session", "close session",
         "close this tab",     "close the tab",
     })) return .close;
-    if (exactDirective(directive, &.{ "take the action", "prepare the action" })) {
-        return .github_any;
-    }
-    if (actionObjectAfterVerb(directive, &.{"prepare"})) |object| {
-        const positive = positiveGithubObject(object) orelse return null;
-        return if (isPreparedGithubEffect(positive)) .github_any else null;
-    }
-    const action_object = actionObjectAfterVerb(directive, &.{
-        "add",     "remove", "set",   "request", "submit",  "dismiss", "change",
-        "execute", "update", "close", "reopen",  "merge",   "resolve", "reply",
-        "delete",  "unmark", "mark",  "post",    "publish",
-    });
-    const positive_object = if (action_object) |object|
-        positiveGithubObject(object)
-    else
-        null;
-    const github_target = positive_object != null and isGithubEffectObject(positive_object.?);
-    if (github_target) return .github_any;
-    return null;
-}
-
-fn isGithubEffectObject(object: []const u8) bool {
-    if (isLocalDiscourseObject(object)) return false;
-    if (isExplicitGithubDestination(object)) return true;
-    const target = trimActionObjectArticles(object);
-    if (startsWordAnyIgnoreCase(target, &.{"mark viewed"})) return true;
-    if (endsWordAnyIgnoreCase(target, &.{
-        "label",     "labels",     "reviewer", "reviewers", "assignee", "assignees",
-        "milestone", "milestones",
-    })) return true;
-    return isPreparedGithubEffect(object);
-}
-
-fn isExplicitGithubDestination(object: []const u8) bool {
-    const target = trimActionObjectArticles(object);
-    if (startsWordAnyIgnoreCase(target, &.{
-        "pull request", "pr", "github", "graphql",
-    })) return true;
-    return containsGithubDestination(object);
-}
-
-fn isLocalDiscourseObject(object: []const u8) bool {
-    const target = std.mem.trim(u8, object, " \t\r\n,;.!?");
-    if (startsLocalDiscourseHead(target)) return true;
-    for ([_][]const u8{ "from", "in", "to" }) |preposition| {
-        var offset: usize = 0;
-        while (offset < target.len) {
-            const relative = indexOfWordIgnoreCase(target[offset..], preposition) orelse break;
-            const after = offset + relative + preposition.len;
-            if (startsLocalDiscourseHead(target[after..])) return true;
-            offset = after;
-        }
-    }
-    return false;
-}
-
-fn startsLocalDiscourseHead(text: []const u8) bool {
-    var target = trimActionObjectArticles(text);
-    for ([_][]const u8{ "your ", "my ", "our " }) |prefix| {
-        if (target.len >= prefix.len and
-            std.ascii.eqlIgnoreCase(target[0..prefix.len], prefix))
-        {
-            target = trimActionObjectArticles(target[prefix.len..]);
-            break;
-        }
-    }
-    return startsWordAnyIgnoreCase(target, &.{
-        "summary", "response", "analysis", "output", "conversation", "chat",
-        "message", "answer",
-    });
-}
-
-fn isPreparedGithubEffect(object: []const u8) bool {
-    const target = trimActionObjectArticles(object);
-    return startsWordAnyIgnoreCase(target, &.{
-        "comment", "inline comment", "reply", "thread", "graphql action",
-    });
-}
-
-fn trimActionObjectArticles(object: []const u8) []const u8 {
-    var target = std.mem.trim(u8, object, " \t\r\n,;.!?");
-    for (0..2) |_| {
-        const before = target.len;
-        for ([_][]const u8{ "a ", "an ", "the ", "this ", "that " }) |prefix| {
-            if (target.len >= prefix.len and
-                std.ascii.eqlIgnoreCase(target[0..prefix.len], prefix))
-            {
-                target = std.mem.trim(u8, target[prefix.len..], " \t\r\n,;.!?");
-                break;
-            }
-        }
-        if (target.len == before) break;
-    }
-    return target;
-}
-
-fn positiveObjectBeforeNegation(object: []const u8) ?[]const u8 {
-    if (startsAnyIgnoreCase(object, &.{
-        "not ", "no ", "never ", "do not ", "don't ", "without ", "except ",
-    })) return null;
-    var end = object.len;
-    for ([_][]const u8{
-        " but do not ", " but don't ", " without ", " except ",
-        " not ",        " no ",        " never ",   " do not ",
-        " don't ",
-    }) |marker| {
-        if (indexOfIgnoreCase(object, marker)) |index| end = @min(end, index);
-    }
-    const positive = std.mem.trim(u8, object[0..end], " \t\r\n,;.!?");
-    return if (positive.len == 0) null else positive;
-}
-
-fn positiveGithubObject(object: []const u8) ?[]const u8 {
-    if (negatesGithubDestination(object)) return null;
-    return positiveObjectBeforeNegation(object);
-}
-
-fn negatesGithubDestination(object: []const u8) bool {
-    for ([_][]const u8{
-        " but do not ", " but don't ", " without ", " except ",
-        " not ",        " no ",        " never ",   " do not ",
-        " don't ",
-    }) |marker| {
-        var offset: usize = 0;
-        while (offset < object.len) {
-            const relative = indexOfIgnoreCase(object[offset..], marker) orelse break;
-            const start = offset + relative + marker.len;
-            if (containsGithubDestination(object[start..])) return true;
-            offset = start;
-        }
-    }
-    return false;
-}
-
-fn containsGithubDestination(text: []const u8) bool {
-    for ([_][]const u8{ "on", "to", "in", "at" }) |preposition| {
-        var offset: usize = 0;
-        while (offset < text.len) {
-            const relative = indexOfWordIgnoreCase(text[offset..], preposition) orelse break;
-            const after = offset + relative + preposition.len;
-            const destination = std.mem.trim(u8, text[after..], " \t\r\n,;.!?");
-            if (startsWordAnyIgnoreCase(destination, &.{
-                "github",  "pull request", "this pull request", "the pull request",
-                "this pr", "the pr",       "pr",
-            })) return true;
-            offset = after;
-        }
-    }
-    return false;
-}
-
-fn actionObjectAfterVerb(text: []const u8, verbs: []const []const u8) ?[]const u8 {
-    for (verbs) |verb| {
-        if (text.len <= verb.len or !std.ascii.eqlIgnoreCase(text[0..verb.len], verb) or
-            std.ascii.isAlphanumeric(text[verb.len])) continue;
-        const object = std.mem.trim(u8, text[verb.len..], " \t\r\n.!;?");
-        if (startsWordAnyIgnoreCase(object, &.{ "me", "us", "you", "your" })) return null;
-        return object;
-    }
     return null;
 }
 
@@ -3276,25 +3121,6 @@ fn directiveBody(text: []const u8) []const u8 {
     return candidate;
 }
 
-fn startsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
-    for (words) |word| {
-        if (text.len < word.len or !std.ascii.eqlIgnoreCase(text[0..word.len], word)) continue;
-        if (text.len == word.len or !std.ascii.isAlphanumeric(text[word.len])) return true;
-    }
-    return false;
-}
-
-fn endsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
-    const target = std.mem.trim(u8, text, " \t\r\n,;.!?");
-    for (words) |word| {
-        if (target.len < word.len) continue;
-        const start = target.len - word.len;
-        if (!std.ascii.eqlIgnoreCase(target[start..], word)) continue;
-        if (start == 0 or !std.ascii.isAlphanumeric(target[start - 1])) return true;
-    }
-    return false;
-}
-
 fn exactDirective(text: []const u8, directives: []const []const u8) bool {
     var candidate = std.mem.trim(u8, text, " \t\r\n.!;");
     if (candidate.len >= "please ".len and
@@ -3308,38 +3134,6 @@ fn exactDirective(text: []const u8, directives: []const []const u8) bool {
     return false;
 }
 
-fn startsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (text.len >= needle.len and std.ascii.eqlIgnoreCase(text[0..needle.len], needle)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn containsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| if (containsIgnoreCase(text, needle)) return true;
-    return false;
-}
-
-fn containsWordAnyIgnoreCase(text: []const u8, words: []const []const u8) bool {
-    for (words) |word| if (indexOfWordIgnoreCase(text, word) != null) return true;
-    return false;
-}
-
-fn indexOfWordIgnoreCase(text: []const u8, word: []const u8) ?usize {
-    var offset: usize = 0;
-    while (offset <= text.len) {
-        const relative = indexOfIgnoreCase(text[offset..], word) orelse return null;
-        const start = offset + relative;
-        const end = start + word.len;
-        const left_boundary = start == 0 or !std.ascii.isAlphanumeric(text[start - 1]);
-        const right_boundary = end == text.len or !std.ascii.isAlphanumeric(text[end]);
-        if (left_boundary and right_boundary) return start;
-        offset = start + 1;
-    }
-    return null;
-}
 fn requestedAuthority(
     allocator: std.mem.Allocator,
     event_kind: []const u8,
@@ -3723,7 +3517,7 @@ test "session authority becomes governing only after admission" {
             .turn_active = false,
         },
     );
-    _ = try registry.beginHumanInstruction("s", "please prepare the comment");
+    _ = try registry.beginHumanInstruction("s", "please prepare the comment", true);
     try std.testing.expectEqual(
         HumanAuthorityAdmission.pending,
         registry.sessions.items[0].human_authority_admission,
@@ -3747,155 +3541,47 @@ test "session authority becomes governing only after admission" {
     try std.testing.expectEqual(@as(usize, 0), registry.visible_events.items.len);
 }
 
-test "explicit broad GitHub operation grants generic action authority without ordinary questions" {
+test "only exact completion and close directives carry immediate authority" {
     try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("please add the release label to this pull request").?,
-    );
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("close this pull request").?,
-    );
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("update the pull request title").?,
+        HumanAuthority.complete,
+        classifyImmediateHumanInstruction("Please complete this file.").?,
     );
     try std.testing.expectEqual(
         HumanAuthority.close,
-        classifyHumanInstruction("close this session").?,
+        classifyImmediateHumanInstruction("close this session").?,
     );
-    const label_question = classifyHumanInstruction(
-        "which labels are already on this pull request?",
-    );
-    try std.testing.expect(label_question == null);
-    const label_help = classifyHumanInstruction(
-        "tell me how to add a label to the pull request",
-    );
-    try std.testing.expect(label_help == null);
-    try std.testing.expect(classifyHumanInstruction("Should we mark this file reviewed?") == null);
-    try std.testing.expect(classifyHumanInstruction("Never mark this file reviewed") == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "I don't want you to mark this file reviewed",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "I don't want you to delete this comment",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction("Summarize changes in this PR") == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Update me on this pull request status",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Explain the findings, then complete this file",
-    ) == null);
-    try std.testing.expectEqual(
-        HumanAuthority.complete,
-        classifyHumanInstruction("Please complete this file.").?,
-    );
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Add the comment, but do not close this session").?,
-    );
-    try std.testing.expect(classifyHumanInstruction(
-        "Add the local note, but do not post a GitHub comment",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Update details without changing the pull request",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Add no comment to this pull request",
-    ) == null);
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Add the label, but do not close this session").?,
-    );
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Could you add this label?").?,
-    );
-}
-
-test "GitHub destination negation does not grant action authority" {
-    try std.testing.expect(classifyHumanInstruction(
-        "Post a comment not on GitHub",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Post a comment, but not on this pull request",
-    ) == null);
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Post a GitHub comment without changing labels").?,
-    );
-    try std.testing.expect(classifyHumanInstruction(
-        "Post a comment without changing labels, and do not post it on GitHub",
-    ) == null);
-}
-
-test "prepare authority distinguishes effects from informational artifacts" {
-    try std.testing.expect(classifyHumanInstruction(
-        "Remove comments from your summary",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Delete the comment from your response",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Prepare a summary of the existing comments",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Prepare an overview of this pull request",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Remove GitHub comments from the summary",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Update the summary with GitHub review comments",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Update your response with pull request feedback",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Update the documentation about label parsing",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Add the comment to your summary",
-    ) == null);
-    try std.testing.expect(classifyHumanInstruction(
-        "Post a comment to this conversation",
-    ) == null);
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Update the pull request summary").?,
-    );
-    try std.testing.expectEqual(
-        HumanAuthority.github_any,
-        classifyHumanInstruction("Prepare an inline comment").?,
-    );
-}
-
-test "GitHub authority uses direct destinations and terminal action object heads" {
     for ([_][]const u8{
-        "Update the documentation about pull request parsing",
-        "Update the documentation about GitHub parsing",
-        "Remove the label parsing code",
-        "Remove reviewer selection code",
-        "Set milestone parsing defaults",
-        "Delete the note from your chat",
-        "Remove the explanation from the message",
-        "Update this answer with review context",
-    }) |local_instruction| {
-        try std.testing.expect(classifyHumanInstruction(local_instruction) == null);
+        "close this PR review session",
+        "delete the PR parsing helper",
+        "add a label to this pull request",
+        "Should we mark this file reviewed?",
+        "Never mark this file reviewed",
+    }) |instruction| {
+        try std.testing.expect(classifyImmediateHumanInstruction(instruction) == null);
     }
+}
+
+test "continued turns receive proposal-only authority independent of target language" {
+    var registry = Registry{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
     for ([_][]const u8{
-        "Update the title on this pull request",
-        "Add the bug label",
-        "Set the v1 milestone",
-        "Request Alice as reviewer",
-        "Remove Bob as assignee",
-    }) |github_instruction| {
+        "close this PR review session",
+        "delete the PR parsing helper",
+        "which labels are already on this pull request?",
+    }) |instruction| {
+        _ = try registry.beginHumanInstruction("ses-1", instruction, true);
         try std.testing.expectEqual(
             HumanAuthority.github_any,
-            classifyHumanInstruction(github_instruction).?,
+            registry.sessions.items[0].human_authority.?,
         );
+        registry.resolveHumanInstruction("ses-1", false);
     }
+    try std.testing.expect((try registry.beginHumanInstruction(
+        "ses-1",
+        "add a label",
+        false,
+    )) == null);
 }
 
 test "session context unresolved-thread search uses current renamed path" {
@@ -4375,6 +4061,7 @@ test "tool request requires the unpredictable governing instruction capability" 
     const token = (try registry.beginHumanInstruction(
         "ses-1",
         "please prepare the comment",
+        true,
     )).?;
     registry.resolveHumanInstruction("ses-1", true);
     var calls: usize = 0;
@@ -4434,7 +4121,7 @@ test "action broker rejects authority from a failed turn admission" {
     var registry = Registry{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer registry.deinit();
     try appendApprovalTestSession(&registry, "ses-1", "file-1");
-    _ = try registry.beginHumanInstruction("ses-1", "please prepare the comment");
+    _ = try registry.beginHumanInstruction("ses-1", "please prepare the comment", true);
     registry.resolveHumanInstruction("ses-1", false);
     var calls: usize = 0;
     try registry.setAuthoritativeToolHandler(.{
