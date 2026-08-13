@@ -222,10 +222,13 @@ const GitRepositoryLocation = struct {
                 authority_start,
                 '/',
             ) orelse return null;
-            if (scheme_end == 0 or path_start == authority_start) return null;
+            if (scheme_end == 0) return null;
+            const scheme = value[0..scheme_end];
+            if (path_start == authority_start and
+                !std.ascii.eqlIgnoreCase(scheme, "file")) return null;
             return .{
                 .kind = .url,
-                .scheme = value[0..scheme_end],
+                .scheme = scheme,
                 .authority = value[authority_start..path_start],
                 .prefix = value[0 .. path_start + 1],
                 .path = value[path_start + 1 ..],
@@ -983,12 +986,19 @@ const SelectedSourceIntent = struct {
         self: *const SelectedSourceIntent,
         allocator: std.mem.Allocator,
     ) ![]u8 {
+        var first_selected: usize = 0;
         var resolved: ?[]u8 = if (self.root_url) |value|
             try allocator.dupe(u8, value)
         else
             null;
         errdefer if (resolved) |value| allocator.free(value);
-        for (self.selected_urls.items) |selected_url| {
+        for (self.selected_urls.items, 0..) |selected_url, index| {
+            if (isRelativeSubmoduleUrl(selected_url)) continue;
+            first_selected = index;
+            if (resolved) |value| allocator.free(value);
+            resolved = null;
+        }
+        for (self.selected_urls.items[first_selected..]) |selected_url| {
             const next = try resolveSubmoduleUrlAlloc(
                 allocator,
                 selected_url,
@@ -1343,9 +1353,7 @@ fn resolveSubmoduleUrlAlloc(
     selected_url: []const u8,
     parent_url: ?[]const u8,
 ) ![]u8 {
-    const relative = std.mem.startsWith(u8, selected_url, "./") or
-        std.mem.startsWith(u8, selected_url, "../");
-    if (!relative) return allocator.dupe(u8, selected_url);
+    if (!isRelativeSubmoduleUrl(selected_url)) return allocator.dupe(u8, selected_url);
     const parent = parent_url orelse return error.ManagedSubmoduleInventoryFailed;
     const location = GitRepositoryLocation.parse(parent) orelse
         return error.ManagedSubmoduleInventoryFailed;
@@ -1357,6 +1365,11 @@ fn resolveSubmoduleUrlAlloc(
     const normalized = try std.mem.join(allocator, "/", segments.items);
     defer allocator.free(normalized);
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ location.prefix, normalized });
+}
+
+fn isRelativeSubmoduleUrl(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, "./") or
+        std.mem.startsWith(u8, value, "../");
 }
 
 fn appendNormalizedUrlSegments(
@@ -2630,6 +2643,33 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         try std.testing.expect(std.mem.indexOf(u8, argument, "token:secret") == null);
         try std.testing.expect(!std.mem.eql(u8, argument, credential_url));
     }
+}
+
+test "worktree integrity selected source accepts file URLs and absolute resets" {
+    const allocator = std.testing.allocator;
+    const local = try resolveSubmoduleUrlAlloc(
+        allocator,
+        "../child.git",
+        "file:///srv/owner/parent.git",
+    );
+    defer allocator.free(local);
+    try std.testing.expectEqualStrings("file:///srv/owner/child.git", local);
+    try std.testing.expectError(
+        error.ManagedSubmoduleInventoryFailed,
+        resolveSubmoduleUrlAlloc(allocator, "../child.git", "https:///parent.git"),
+    );
+
+    var intent = try SelectedSourceIntent.initAlloc(allocator, null);
+    defer intent.deinit(allocator);
+    try intent.appendOwned(allocator, "../unresolved-parent.git");
+    try intent.appendOwned(allocator, "https://git.example/owner/parent.git");
+    try intent.appendOwned(allocator, "../child.git");
+    const resolved = try intent.resolveAlloc(allocator);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(
+        "https://git.example/owner/child.git",
+        resolved,
+    );
 }
 
 test "worktree integrity local selected object does not require parent source" {

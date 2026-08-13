@@ -717,6 +717,24 @@ pub const PrGeneration = struct {
         self: *const PrGeneration,
         review_path: []const u8,
     ) !?[]const u8 {
+        const lineage_match = try self.resolveLineageAlias(review_path);
+        var direct_match: ?[]const u8 = null;
+        for (self.files.items) |file| if (std.mem.eql(u8, file.path, review_path)) {
+            direct_match = file.path;
+            break;
+        };
+        if (lineage_match != null and direct_match != null and
+            !std.mem.eql(u8, lineage_match.?, direct_match.?))
+        {
+            return error.AmbiguousFileLineage;
+        }
+        return direct_match orelse lineage_match;
+    }
+
+    fn resolveLineageAlias(
+        self: *const PrGeneration,
+        review_path: []const u8,
+    ) !?[]const u8 {
         var lineage_match: ?[]const u8 = null;
         for (self.files.items) |file| {
             for (file.lineage_aliases.items) |alias| {
@@ -728,11 +746,7 @@ pub const PrGeneration = struct {
                 } else lineage_match = file.path;
             }
         }
-        if (lineage_match) |matched| return matched;
-        for (self.files.items) |file| if (std.mem.eql(u8, file.path, review_path)) {
-            return file.path;
-        };
-        return null;
+        return lineage_match;
     }
 
     pub fn resolveSessionCurrentPath(
@@ -747,7 +761,7 @@ pub const PrGeneration = struct {
                 return file.path;
             }
         }
-        return self.resolveCurrentPath(review_path);
+        return self.resolveLineageAlias(review_path);
     }
 
     pub fn currentPath(self: *const PrGeneration, review_path: []const u8) ?[]const u8 {
@@ -781,10 +795,9 @@ pub const PrGeneration = struct {
         historical_path: []const u8,
         current_path: []const u8,
     ) bool {
-        if (std.mem.eql(u8, historical_path, current_path)) return true;
-        const resolved = (self.resolveCurrentPath(historical_path) catch return false) orelse
-            return false;
-        return std.mem.eql(u8, resolved, current_path);
+        const resolved = self.resolveCurrentPath(historical_path) catch return false;
+        if (resolved == null) return std.mem.eql(u8, historical_path, current_path);
+        return std.mem.eql(u8, resolved.?, current_path);
     }
 
     pub fn setExclusion(
@@ -993,7 +1006,7 @@ test "revision replacement keeps the current value when allocation fails" {
     try std.testing.expectEqualStrings("old", generation.files.items[0].revision_key);
 }
 
-test "explicit rename lineage dominates a replacement at the historical path" {
+test "rename lineage and a replacement form an explicit path collision" {
     var generation = try PrGeneration.init(std.testing.allocator, "head");
     defer generation.deinit();
     try generation.addFile(.{
@@ -1009,9 +1022,9 @@ test "explicit rename lineage dominates a replacement at the historical path" {
         .viewed = .unviewed,
         .revision_key = "renamed",
     });
-    try std.testing.expectEqualStrings(
-        "new.zig",
-        (try generation.resolveCurrentPath("old.zig")).?,
+    try std.testing.expectError(
+        error.AmbiguousFileLineage,
+        generation.resolveCurrentPath("old.zig"),
     );
     try std.testing.expectEqualStrings(
         "old.zig",
@@ -1021,6 +1034,8 @@ test "explicit rename lineage dominates a replacement at the historical path" {
         "new.zig",
         (try generation.resolveSessionCurrentPath("old.zig", "historical")).?,
     );
+    try std.testing.expect(!generation.sameReviewFile("old.zig", "old.zig"));
+    try std.testing.expect(!generation.sameReviewFile("old.zig", "new.zig"));
 }
 
 test "primary metadata preserves order across bounded pages" {

@@ -241,6 +241,59 @@ test "old-path thread actions resolve to the renamed current file" {
     ) != null);
 }
 
+test "rename alias and replacement collision admits no path-only thread action" {
+    var state = try app.App.init(std.testing.allocator, "h");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "old.zig",
+        .change_type = "ADDED",
+        .viewed = .unviewed,
+        .revision_key = "replacement",
+    });
+    try state.generation.addFile(.{
+        .path = "new.zig",
+        .previous_path = "old.zig",
+        .change_type = "RENAMED",
+        .viewed = .unviewed,
+        .revision_key = "renamed",
+    });
+    try state.generation.addThread(.{ .id = "T_old", .path = "old.zig" });
+    const input = tools.PreparedActionInput{
+        .slot = @constCast("reply"),
+        .kind = .reply_thread,
+        .effect_summary = @constCast("Reply"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T_old"),
+        .body = @constCast("body"),
+    };
+    try std.testing.expectError(
+        error.ActionTargetsAnotherSession,
+        state.prepareModelAction(
+            "replacement",
+            "turn-1",
+            input,
+            "o/r",
+            1,
+            "PR_1",
+            "old.zig",
+            "replacement",
+        ),
+    );
+    try std.testing.expectError(
+        error.ActionTargetsAnotherSession,
+        state.prepareModelAction(
+            "renamed",
+            "turn-2",
+            input,
+            "o/r",
+            1,
+            "PR_1",
+            "new.zig",
+            "renamed",
+        ),
+    );
+}
+
 test "session revision disambiguates replacement and renamed lineage actions" {
     var state = try app.App.init(std.testing.allocator, "h");
     defer state.deinit();
