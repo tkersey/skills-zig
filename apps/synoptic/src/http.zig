@@ -1736,7 +1736,10 @@ fn expectValidationDisposition(
     expected: std.meta.Tag(ActionValidationDisposition),
     result: anyerror!void,
 ) !void {
-    try std.testing.expectEqual(expected, classifyActionValidation(result));
+    try std.testing.expectEqual(
+        expected,
+        std.meta.activeTag(classifyActionValidation(result)),
+    );
 }
 
 fn waitClientReadable(stream: *std.Io.net.Stream, timeout_ms: u32) !void {
