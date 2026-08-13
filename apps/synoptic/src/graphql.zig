@@ -11,7 +11,7 @@ pub const threads_query =
     "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide " ++
     "subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve " ++
-    "comments(first:100){nodes{id body createdAt url author{login} viewerDidAuthor " ++
+    "comments(first:1){nodes{id body createdAt url author{login} viewerDidAuthor " ++
     "pullRequestReview{id state}}pageInfo{hasNextPage endCursor}}}" ++
     "pageInfo{hasNextPage endCursor}}}}}";
 pub const thread_comments_query =
@@ -93,13 +93,13 @@ pub const action_authority_query =
     "query SynopticActionAuthority($owner:String!,$name:String!,$number:Int!,$after:String){" ++
     "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path viewerCanReply viewerCanResolve " ++
-    "viewerCanUnresolve comments(first:100){nodes{id body viewerDidAuthor}" ++
+    "viewerCanUnresolve comments(first:1){nodes{id body viewerDidAuthor}" ++
     "pageInfo{hasNextPage endCursor}}}pageInfo{hasNextPage endCursor}}}}}";
 pub const reconcile_query =
     "query SynopticReconcile($owner:String!,$name:String!,$number:Int!,$after:String){" ++
     "repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefOid headRefOid " ++
     "reviewThreads(first:100,after:$after){nodes{id path line startLine diffSide startDiffSide " ++
-    "isResolved comments(first:100){" ++
+    "isResolved comments(first:1){" ++
     "nodes{id body createdAt viewerDidAuthor}pageInfo{hasNextPage endCursor}}}" ++
     "pageInfo{hasNextPage endCursor}}}}}";
 
@@ -514,6 +514,29 @@ test "pagination rejects nullable GraphQL targets" {
         error.InvalidGraphqlResponse,
         pageCursor(std.testing.allocator, nullable_pull, "files"),
     );
+}
+
+test "thread metadata and nested comments have separate response bounds" {
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        threads_query,
+        "comments(first:1)",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        action_authority_query,
+        "comments(first:1)",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        reconcile_query,
+        "comments(first:1)",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        thread_comments_query,
+        "comments(first:100,after:$after)",
+    ));
 }
 
 test "operation identity remains inspectable in fake gh stdin" {
