@@ -3583,6 +3583,9 @@ test "explicit broad GitHub operation grants generic action authority without or
         HumanAuthority.github_any,
         classifyHumanInstruction("Could you add this label?").?,
     );
+}
+
+test "GitHub destination negation does not grant action authority" {
     try std.testing.expect(classifyHumanInstruction(
         "Post a comment not on GitHub",
     ) == null);
