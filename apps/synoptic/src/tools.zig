@@ -146,13 +146,8 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
     );
     defer root.deinit();
     const root_object = object(root.value) orelse return error.InvalidToolPayload;
-    const params = if (root_object.get("params")) |value|
-        object(value) orelse return error.InvalidToolPayload
-    else
-        root_object;
-    const argument_value = params.get("arguments") orelse
-        params.get("input") orelse return error.InvalidToolPayload;
-    const arguments = object(argument_value) orelse return error.InvalidToolPayload;
+    const arguments = try preparedActionArguments(root_object);
+    const has_payload = arguments.contains("payload");
     const slot_value = (try optionalStringField(arguments, "slot")) orelse
         return error.InvalidToolPayload;
     const kind_value = (try optionalStringField(arguments, "kind")) orelse
@@ -163,10 +158,12 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
         "effectSummary",
         "effect_summary",
     )) orelse return error.InvalidToolPayload;
+    try validatePreparedActionMembers(arguments, kind, has_payload);
     if (slot_value.len == 0 or slot_value.len > 128 or effect.len == 0 or effect.len > 2048)
         return error.InvalidToolPayload;
     const payload_value = arguments.get("payload") orelse rootPayload(arguments, kind);
     const payload = object(payload_value) orelse return error.InvalidToolPayload;
+    try validatePayloadMembers(payload, kind, !has_payload);
     var result = try initPreparedActionInput(
         allocator,
         slot_value,
@@ -209,9 +206,94 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
     return result;
 }
 
+fn preparedActionArguments(root_object: std.json.ObjectMap) !std.json.ObjectMap {
+    const params = if (root_object.get("params")) |value|
+        object(value) orelse return error.InvalidToolPayload
+    else
+        root_object;
+    const argument_value = params.get("arguments") orelse
+        params.get("input") orelse return error.InvalidToolPayload;
+    return object(argument_value) orelse error.InvalidToolPayload;
+}
+
 fn rootPayload(arguments: std.json.ObjectMap, kind: ActionKind) std.json.Value {
     _ = kind;
     return .{ .object = arguments };
+}
+
+fn validatePreparedActionMembers(
+    arguments: std.json.ObjectMap,
+    kind: ActionKind,
+    has_payload: bool,
+) !void {
+    if (arguments.contains("effectSummary") and arguments.contains("effect_summary")) {
+        return error.InvalidToolPayload;
+    }
+    var iterator = arguments.iterator();
+    while (iterator.next()) |entry| {
+        if (isEnvelopeMember(entry.key_ptr.*)) continue;
+        if (!has_payload and isPayloadMember(kind, entry.key_ptr.*)) continue;
+        return error.InvalidToolPayload;
+    }
+}
+
+fn validatePayloadMembers(
+    payload: std.json.ObjectMap,
+    kind: ActionKind,
+    includes_envelope: bool,
+) !void {
+    try rejectAliasPair(payload, "startLine", "start_line");
+    try rejectAliasPair(payload, "threadId", "thread_id");
+    try rejectAliasPair(payload, "commentId", "comment_id");
+    var iterator = payload.iterator();
+    while (iterator.next()) |entry| {
+        if (includes_envelope and isEnvelopeMember(entry.key_ptr.*)) continue;
+        if (isPayloadMember(kind, entry.key_ptr.*)) continue;
+        return error.InvalidToolPayload;
+    }
+}
+
+fn rejectAliasPair(object_map: std.json.ObjectMap, primary: []const u8, alias: []const u8) !void {
+    if (object_map.contains(primary) and object_map.contains(alias)) {
+        return error.InvalidToolPayload;
+    }
+}
+
+fn isEnvelopeMember(key: []const u8) bool {
+    return stringInSet(key, &.{
+        "slot",
+        "kind",
+        "effectSummary",
+        "effect_summary",
+        "payload",
+        "authorityToken",
+    });
+}
+
+fn isPayloadMember(kind: ActionKind, key: []const u8) bool {
+    return switch (kind) {
+        .add_inline_comment => stringInSet(key, &.{
+            "path",
+            "line",
+            "startLine",
+            "start_line",
+            "side",
+            "body",
+        }),
+        .reply_thread => stringInSet(key, &.{ "threadId", "thread_id", "body" }),
+        .resolve_thread, .unresolve_thread => stringInSet(key, &.{ "threadId", "thread_id" }),
+        .update_comment => stringInSet(key, &.{ "commentId", "comment_id", "body" }),
+        .delete_comment => stringInSet(key, &.{ "commentId", "comment_id" }),
+        .mark_viewed, .unmark_viewed => std.mem.eql(u8, key, "path"),
+        .graphql => stringInSet(key, &.{ "operationName", "document", "variables" }),
+    };
+}
+
+fn stringInSet(value: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, value, candidate)) return true;
+    }
+    return false;
 }
 
 pub fn validateInput(input: PreparedActionInput) !void {

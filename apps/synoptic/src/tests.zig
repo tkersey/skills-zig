@@ -132,6 +132,75 @@ test "prepared action decoder rejects every present field with the wrong JSON ty
         tools.decodePreparedAction(std.testing.allocator, raw),
     );
 }
+
+test "prepared action decoder admits exactly the selected kind member set" {
+    const cases = [_]struct { kind: []const u8, members: []const u8 }{
+        .{ .kind = "add_inline_comment", .members = "\"path\":\"a\",\"line\":1,\"body\":\"b\"" },
+        .{ .kind = "reply_thread", .members = "\"threadId\":\"t\",\"body\":\"b\"" },
+        .{ .kind = "resolve_thread", .members = "\"threadId\":\"t\"" },
+        .{ .kind = "unresolve_thread", .members = "\"threadId\":\"t\"" },
+        .{ .kind = "update_comment", .members = "\"commentId\":\"c\",\"body\":\"b\"" },
+        .{ .kind = "delete_comment", .members = "\"commentId\":\"c\"" },
+        .{ .kind = "mark_viewed", .members = "\"path\":\"a\"" },
+        .{ .kind = "unmark_viewed", .members = "\"path\":\"a\"" },
+        .{
+            .kind = "graphql",
+            .members = "\"operationName\":\"X\",\"document\":\"mutation X($input:X!)" ++
+                "{x(input:$input){id}}\",\"variables\":{}",
+        },
+    };
+    for (cases) |case| {
+        const valid = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"arguments\":{{\"slot\":\"s\",\"kind\":\"{s}\",\"effectSummary\":" ++
+                "\"x\",\"payload\":{{{s}}}}}}}",
+            .{ case.kind, case.members },
+        );
+        defer std.testing.allocator.free(valid);
+        const decoded = try tools.decodePreparedAction(std.testing.allocator, valid);
+        decoded.deinit(std.testing.allocator);
+
+        const unknown = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"arguments\":{{\"slot\":\"s\",\"kind\":\"{s}\",\"effectSummary\":" ++
+                "\"x\",\"payload\":{{{s},\"unexpected\":true}}}}}}",
+            .{ case.kind, case.members },
+        );
+        defer std.testing.allocator.free(unknown);
+        try std.testing.expectError(
+            error.InvalidToolPayload,
+            tools.decodePreparedAction(std.testing.allocator, unknown),
+        );
+    }
+
+    const malformed = [_][]const u8{
+        \\{"arguments":{"slot":"s","kind":"add_inline_comment","effectSummary":"x","payload":{"path":"a","line":1,"body":"b","sied":"LEFT"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"add_inline_comment","effectSummary":"x","payload":{"path":"a","line":1,"body":"b","threadId":"t"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"add_inline_comment","effectSummary":"x","payload":{"path":"a","line":1,"startLine":1,"start_line":1,"body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"reply_thread","effectSummary":"x","payload":{"threadId":"t","thread_id":"t","body":"b"}}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"mark_viewed","effectSummary":"x","payload":{"path":"a"},"body":"ignored"}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"mark_viewed","effectSummary":"x","payload":{"path":"a"},"unexpected":true}}
+        ,
+        \\{"arguments":{"slot":"s","kind":"mark_viewed","effectSummary":"x","effect_summary":"x","payload":{"path":"a"}}}
+        ,
+    };
+    for (malformed) |raw| try std.testing.expectError(
+        error.InvalidToolPayload,
+        tools.decodePreparedAction(std.testing.allocator, raw),
+    );
+
+    const legacy =
+        \\{"arguments":{"slot":"s","kind":"mark_viewed","effectSummary":"x","path":"a"}}
+    ;
+    const decoded = try tools.decodePreparedAction(std.testing.allocator, legacy);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a", decoded.path.?);
+}
 const graphql = @import("graphql.zig");
 const http = @import("http.zig");
 const main = @import("main.zig");
