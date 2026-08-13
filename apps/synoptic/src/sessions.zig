@@ -4093,7 +4093,8 @@ test "failed authoritative handler restores its claimed human grant" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "decline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"success\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "IntentionalTestFailure") != null);
     try std.testing.expectEqual(
         HumanAuthority.github_any,
         registry.sessions.items[0].human_authority.?,
