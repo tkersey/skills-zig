@@ -3805,49 +3805,10 @@ test "worktree integrity managed refresh reconciles initialized submodules" {
     const first_root_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(first_root_raw);
     const first_root = std.mem.trim(u8, first_root_raw, "\r\n");
-
-    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
-    defer allocator.free(leaf_tracked);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "second\n" });
-    try commitFixtureRepository(allocator, io, leaf, "second leaf");
-    const second_leaf_raw = try runGit(allocator, io, leaf, &.{ "git", "rev-parse", "HEAD" });
-    defer allocator.free(second_leaf_raw);
-    const second_leaf = std.mem.trim(u8, second_leaf_raw, "\r\n");
-
-    const middle_nested = try std.fs.path.join(allocator, &.{ middle, "nested" });
-    defer allocator.free(middle_nested);
-    allocator.free(try runGit(allocator, io, middle_nested, &.{ "git", "fetch", "-q" }));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        middle_nested,
-        &.{ "git", "checkout", "-q", second_leaf },
-    ));
-    allocator.free(try runGit(allocator, io, middle, &.{ "git", "add", "nested" }));
-    try commitFixtureRepository(allocator, io, middle, "second middle");
-    const second_middle_raw = try runGit(
-        allocator,
-        io,
-        middle,
-        &.{ "git", "rev-parse", "HEAD" },
-    );
-    defer allocator.free(second_middle_raw);
-    const second_middle = std.mem.trim(u8, second_middle_raw, "\r\n");
-
+    var second = try advanceNestedSubmoduleFixture(allocator, io, leaf, middle, managed);
+    defer second.deinit(allocator);
     const managed_module = try std.fs.path.join(allocator, &.{ managed, "module" });
     defer allocator.free(managed_module);
-    allocator.free(try runGit(allocator, io, managed_module, &.{ "git", "fetch", "-q" }));
-    allocator.free(try runGit(
-        allocator,
-        io,
-        managed_module,
-        &.{ "git", "checkout", "-q", second_middle },
-    ));
-    allocator.free(try runGit(allocator, io, managed, &.{ "git", "add", "module" }));
-    try commitFixtureRepository(allocator, io, managed, "second root");
-    const second_root_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
-    defer allocator.free(second_root_raw);
-    const second_root = std.mem.trim(u8, second_root_raw, "\r\n");
 
     allocator.free(try runGit(
         allocator,
@@ -3868,7 +3829,7 @@ test "worktree integrity managed refresh reconciles initialized submodules" {
         io,
         .{ .managed = managed },
         managed,
-        second_root,
+        second.root(),
         &baseline,
         null,
     );
@@ -3879,7 +3840,7 @@ test "worktree integrity managed refresh reconciles initialized submodules" {
         &.{ "git", "rev-parse", "HEAD" },
     );
     defer allocator.free(observed_middle);
-    try std.testing.expectEqualStrings(second_middle, std.mem.trim(u8, observed_middle, "\r\n"));
+    try std.testing.expectEqualStrings(second.middle(), std.mem.trim(u8, observed_middle, "\r\n"));
     const managed_nested = try std.fs.path.join(allocator, &.{ managed_module, "nested" });
     defer allocator.free(managed_nested);
     const observed_leaf = try runGit(
@@ -3889,8 +3850,73 @@ test "worktree integrity managed refresh reconciles initialized submodules" {
         &.{ "git", "rev-parse", "HEAD" },
     );
     defer allocator.free(observed_leaf);
-    try std.testing.expectEqualStrings(second_leaf, std.mem.trim(u8, observed_leaf, "\r\n"));
-    try std.testing.expectEqualStrings(second_root, baseline.head_oid);
+    try std.testing.expectEqualStrings(second.leaf(), std.mem.trim(u8, observed_leaf, "\r\n"));
+    try std.testing.expectEqualStrings(second.root(), baseline.head_oid);
+}
+
+const NestedGeneration = struct {
+    root_raw: []u8,
+    middle_raw: []u8,
+    leaf_raw: []u8,
+
+    fn deinit(self: *NestedGeneration, allocator: std.mem.Allocator) void {
+        allocator.free(self.root_raw);
+        allocator.free(self.middle_raw);
+        allocator.free(self.leaf_raw);
+    }
+
+    fn root(self: NestedGeneration) []const u8 {
+        return std.mem.trim(u8, self.root_raw, "\r\n");
+    }
+
+    fn middle(self: NestedGeneration) []const u8 {
+        return std.mem.trim(u8, self.middle_raw, "\r\n");
+    }
+
+    fn leaf(self: NestedGeneration) []const u8 {
+        return std.mem.trim(u8, self.leaf_raw, "\r\n");
+    }
+};
+
+fn advanceNestedSubmoduleFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    leaf: []const u8,
+    middle: []const u8,
+    managed: []const u8,
+) !NestedGeneration {
+    const leaf_tracked = try std.fs.path.join(allocator, &.{ leaf, "tracked.txt" });
+    defer allocator.free(leaf_tracked);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_tracked, .data = "second\n" });
+    try commitFixtureRepository(allocator, io, leaf, "second leaf");
+    const leaf_raw = try runGit(allocator, io, leaf, &.{ "git", "rev-parse", "HEAD" });
+    errdefer allocator.free(leaf_raw);
+    const middle_nested = try std.fs.path.join(allocator, &.{ middle, "nested" });
+    defer allocator.free(middle_nested);
+    allocator.free(try runGit(allocator, io, middle_nested, &.{ "git", "fetch", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        middle_nested,
+        &.{ "git", "checkout", "-q", std.mem.trim(u8, leaf_raw, "\r\n") },
+    ));
+    allocator.free(try runGit(allocator, io, middle, &.{ "git", "add", "nested" }));
+    try commitFixtureRepository(allocator, io, middle, "second middle");
+    const middle_raw = try runGit(allocator, io, middle, &.{ "git", "rev-parse", "HEAD" });
+    errdefer allocator.free(middle_raw);
+    const managed_module = try std.fs.path.join(allocator, &.{ managed, "module" });
+    defer allocator.free(managed_module);
+    allocator.free(try runGit(allocator, io, managed_module, &.{ "git", "fetch", "-q" }));
+    allocator.free(try runGit(
+        allocator,
+        io,
+        managed_module,
+        &.{ "git", "checkout", "-q", std.mem.trim(u8, middle_raw, "\r\n") },
+    ));
+    allocator.free(try runGit(allocator, io, managed, &.{ "git", "add", "module" }));
+    try commitFixtureRepository(allocator, io, managed, "second root");
+    const root_raw = try runGit(allocator, io, managed, &.{ "git", "rev-parse", "HEAD" });
+    return .{ .root_raw = root_raw, .middle_raw = middle_raw, .leaf_raw = leaf_raw };
 }
 
 fn prepareNestedSubmoduleFixture(
