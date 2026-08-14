@@ -132,6 +132,32 @@ fn migrateLegacySlot(
         definition_plan.closure_digest[0..],
     );
     defer allocator.free(checkpoint_bytes);
+    return migrateLegacyFile(
+        allocator,
+        definition_plan,
+        definition_closure,
+        definition_entry_path,
+        repo_root,
+        slot,
+        &legacy,
+        stats.records_validated,
+        checkpoint_bytes,
+        target,
+    );
+}
+
+fn migrateLegacyFile(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    definition_closure: *const definition_core.Closure,
+    definition_entry_path: []const u8,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    legacy: *custody.ReplaySlot,
+    records_validated: usize,
+    checkpoint_bytes: []const u8,
+    target: *const segmented_event_log.Snapshot,
+) !Result {
     const io = std.Io.Threaded.global_single_threaded.io();
     const event_stat = try std.Io.Dir.cwd().statFile(
         io,
@@ -154,9 +180,37 @@ fn migrateLegacySlot(
     });
     defer event_map.destroy(io);
     try event_map.read(io);
+    return migrateLegacyBytes(
+        allocator,
+        definition_plan,
+        definition_closure,
+        definition_entry_path,
+        repo_root,
+        slot,
+        legacy,
+        records_validated,
+        event_map.memory,
+        checkpoint_bytes,
+        target,
+    );
+}
+
+fn migrateLegacyBytes(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    definition_closure: *const definition_core.Closure,
+    definition_entry_path: []const u8,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    legacy: *custody.ReplaySlot,
+    records_validated: usize,
+    event_bytes: []const u8,
+    checkpoint_bytes: []const u8,
+    target: *const segmented_event_log.Snapshot,
+) !Result {
     var segments = try MigrationSegments.init(
         allocator,
-        event_map.memory,
+        event_bytes,
         legacy.binding.bytes,
     );
     defer segments.deinit(allocator);
@@ -168,7 +222,7 @@ fn migrateLegacySlot(
         checkpoint_bytes,
     );
     defer head.deinit(allocator);
-    if (head.total_event_records != stats.records_validated or
+    if (head.total_event_records != records_validated or
         head.total_binding_rows != legacy.binding.rows.len)
     {
         return error.SegmentedMigrationRecordMismatch;
@@ -176,7 +230,7 @@ fn migrateLegacySlot(
     const revision = try head.revisionAlloc(allocator);
     errdefer allocator.free(revision);
     try requireRevision(revision, legacy.revision);
-    releaseReadCustody(&legacy);
+    releaseReadCustody(legacy);
     const transaction_id = try commitMigration(
         allocator,
         definition_plan,
@@ -184,7 +238,7 @@ fn migrateLegacySlot(
         definition_entry_path,
         repo_root,
         target,
-        &legacy,
+        legacy,
         &head,
         &segments,
         checkpoint_bytes,
@@ -193,7 +247,7 @@ fn migrateLegacySlot(
     return migratedResult(
         allocator,
         slot.relative_path,
-        stats.records_validated,
+        records_validated,
         revision,
         transaction_id,
     );

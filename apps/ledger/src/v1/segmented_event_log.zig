@@ -742,11 +742,7 @@ pub const Snapshot = struct {
     ) !Snapshot {
         var paths = try Paths.init(allocator, repo_root, logical_path);
         errdefer paths.deinit(allocator);
-        var head_read = try readOptionalFile(
-            allocator,
-            paths.manifest,
-            64 * 1024,
-        );
+        var head_read = try readOptionalFile(allocator, paths.manifest, 64 * 1024);
         errdefer head_read.deinit(allocator);
         var head = if (head_read.exists)
             try Head.decode(allocator, head_read.bytes)
@@ -756,87 +752,31 @@ pub const Snapshot = struct {
         if (!std.mem.eql(u8, head.logical_path, logical_path)) {
             return error.SegmentedLogicalPathMismatch;
         }
-        var absent_custody: ?durable_store.CasReadLockPair = null;
-        defer if (absent_custody) |*value| value.deinit();
-        if (!head_read.exists and try durable_store.casAdvisoryLockExists(
+        var absent_custody = try acquireAbsentHeadCustody(
             allocator,
-            paths.manifest,
-        )) {
-            var initial_custody = durable_store.acquireCasReadLockPair(
-                allocator,
-                paths.manifest,
-                paths.manifest,
-            ) catch |err| switch (err) {
-                error.EventStoreBusy => return error.SegmentedSnapshotGenerationChanged,
-                else => return err,
-            };
-            if (initial_custody.count != 1) {
-                initial_custody.deinit();
-                return error.SegmentedGenerationCustodyMissing;
-            }
-            absent_custody = initial_custody;
-            const checked_head = try readOptionalFile(
-                allocator,
-                paths.manifest,
-                64 * 1024,
-            );
-            if (checked_head.exists) {
-                head_read.deinit(allocator);
-                head_read = checked_head;
-                head.deinit(allocator);
-                head = try Head.decode(allocator, head_read.bytes);
-                if (!std.mem.eql(u8, head.logical_path, logical_path)) {
-                    return error.SegmentedLogicalPathMismatch;
-                }
-            } else {
-                checked_head.deinit(allocator);
-            }
-        }
-        var generation: ?ReadGeneration = if (head_read.exists)
-            try ReadGeneration.acquire(allocator, &paths, &head)
-        else
-            null;
-        defer if (generation) |*value| value.deinit();
-        if (generation != null) {
-            const locked_head = try readOptionalFile(
-                allocator,
-                paths.manifest,
-                64 * 1024,
-            );
-            errdefer locked_head.deinit(allocator);
-            if (!locked_head.exists or
-                !std.mem.eql(u8, head_read.bytes, locked_head.bytes))
-            {
-                locked_head.deinit(allocator);
-                return error.SegmentedSnapshotGenerationChanged;
-            }
-            head_read.deinit(allocator);
-            head_read = locked_head;
-        }
-        const active = try ActiveFiles.load(allocator, &paths, &head);
-        errdefer active.deinit(allocator);
-        const checkpoint_file = try CheckpointFile.load(
+            &paths,
+            logical_path,
+            &head_read,
+            &head,
+        );
+        defer if (absent_custody) |*value| value.deinit();
+        var generation = try acquireStableGeneration(
             allocator,
             &paths,
             &head,
+            &head_read,
         );
+        defer if (generation) |*value| value.deinit();
+        const active = try ActiveFiles.load(allocator, &paths, &head);
+        errdefer active.deinit(allocator);
+        const checkpoint_file = try CheckpointFile.load(allocator, &paths, &head);
         errdefer checkpoint_file.deinit(allocator);
-        if (!head_read.exists) {
-            var final_head = try readOptionalFile(
-                allocator,
-                paths.manifest,
-                64 * 1024,
-            );
-            defer final_head.deinit(allocator);
-            if (final_head.exists) {
-                return error.SegmentedSnapshotGenerationChanged;
-            }
-        }
-        if (!head_read.exists and absent_custody == null and
-            try durable_store.casAdvisoryLockExists(
-                allocator,
-                paths.manifest,
-            )) return error.SegmentedSnapshotGenerationChanged;
+        try validateAbsentHeadStable(
+            allocator,
+            &paths,
+            head_read.exists,
+            absent_custody != null,
+        );
         const head_digest = if (head_read.exists)
             try digestAlloc(allocator, head_read.bytes)
         else
@@ -879,6 +819,96 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 };
+
+fn acquireAbsentHeadCustody(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    logical_path: []const u8,
+    head_read: *OptionalFile,
+    head: *Head,
+) !?durable_store.CasReadLockPair {
+    if (head_read.exists or !try durable_store.casAdvisoryLockExists(
+        allocator,
+        paths.manifest,
+    )) return null;
+    var custody_lock = durable_store.acquireCasReadLockPair(
+        allocator,
+        paths.manifest,
+        paths.manifest,
+    ) catch |err| switch (err) {
+        error.EventStoreBusy => return error.SegmentedSnapshotGenerationChanged,
+        else => return err,
+    };
+    errdefer custody_lock.deinit();
+    if (custody_lock.count != 1) {
+        return error.SegmentedGenerationCustodyMissing;
+    }
+    var checked_head = try readOptionalFile(
+        allocator,
+        paths.manifest,
+        64 * 1024,
+    );
+    errdefer checked_head.deinit(allocator);
+    if (!checked_head.exists) {
+        checked_head.deinit(allocator);
+        return custody_lock;
+    }
+    var decoded = try Head.decode(allocator, checked_head.bytes);
+    errdefer decoded.deinit(allocator);
+    if (!std.mem.eql(u8, decoded.logical_path, logical_path)) {
+        return error.SegmentedLogicalPathMismatch;
+    }
+    head_read.deinit(allocator);
+    head.deinit(allocator);
+    head_read.* = checked_head;
+    head.* = decoded;
+    return custody_lock;
+}
+
+fn acquireStableGeneration(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    head: *const Head,
+    head_read: *OptionalFile,
+) !?ReadGeneration {
+    if (!head_read.exists) return null;
+    var generation = try ReadGeneration.acquire(allocator, paths, head);
+    errdefer generation.deinit();
+    const locked_head = try readOptionalFile(
+        allocator,
+        paths.manifest,
+        64 * 1024,
+    );
+    errdefer locked_head.deinit(allocator);
+    if (!locked_head.exists or
+        !std.mem.eql(u8, head_read.bytes, locked_head.bytes))
+    {
+        return error.SegmentedSnapshotGenerationChanged;
+    }
+    head_read.deinit(allocator);
+    head_read.* = locked_head;
+    return generation;
+}
+
+fn validateAbsentHeadStable(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    head_exists: bool,
+    has_custody: bool,
+) !void {
+    if (head_exists) return;
+    var final_head = try readOptionalFile(
+        allocator,
+        paths.manifest,
+        64 * 1024,
+    );
+    defer final_head.deinit(allocator);
+    if (final_head.exists or (!has_custody and
+        try durable_store.casAdvisoryLockExists(allocator, paths.manifest)))
+    {
+        return error.SegmentedSnapshotGenerationChanged;
+    }
+}
 
 const ReadGeneration = struct {
     first: durable_store.CasReadLockPair,
@@ -1908,6 +1938,66 @@ fn runGenerationWriter(context: *GenerationWriterContext) void {
     context.finished.store(1, .release);
 }
 
+fn commitInitialGeneration(
+    allocator: std.mem.Allocator,
+    transactions: []const u8,
+    event_path: []const u8,
+    binding_path: []const u8,
+    manifest_path: []const u8,
+    head_bytes: []const u8,
+) !durable_store.CommitTransactionReceipt {
+    const initial = [_]durable_store.TransactionMutation{
+        .{
+            .path = event_path,
+            .text = "{\"sequence\":1}\n",
+            .content_mode = .raw,
+            .max_bytes = event_segment_bytes,
+        },
+        .{
+            .path = binding_path,
+            .text = "{\"binding\":1}\n",
+            .content_mode = .raw,
+            .max_bytes = binding_segment_bytes,
+        },
+        .{
+            .path = manifest_path,
+            .text = head_bytes,
+            .content_mode = .raw,
+            .max_bytes = 64 * 1024,
+        },
+    };
+    return durable_store.commitTextTransaction(
+        allocator,
+        transactions,
+        &initial,
+        .{
+            .owner = .{
+                .process_id = 1,
+                .session_id = "generation-initial",
+                .executor = "test",
+            },
+        },
+    );
+}
+
+fn expectGenerationWriterBlocked(
+    context: *GenerationWriterContext,
+    generation: *ReadGeneration,
+) !void {
+    const thread = try std.Thread.spawn(.{}, runGenerationWriter, .{context});
+    while (context.started.load(.acquire) == 0) {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
+    try std.testing.expectEqual(@as(u8, 1), context.finished.load(.acquire));
+    thread.join();
+    try std.testing.expectEqual(error.LockBusy, context.result.?);
+    generation.deinit();
+    context.result = null;
+    context.started.store(0, .release);
+    context.finished.store(0, .release);
+}
+
 test "segmented snapshot custody excludes mixed writer generations" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1933,31 +2023,13 @@ test "segmented snapshot custody excludes mixed writer generations" {
     _ = try predecessor.append(first_event, first_binding);
     const predecessor_head = try predecessor.encodeAlloc(allocator);
     defer allocator.free(predecessor_head);
-    const initial = [_]durable_store.TransactionMutation{
-        .{
-            .path = event_path,
-            .text = first_event,
-            .content_mode = .raw,
-            .max_bytes = event_segment_bytes,
-        },
-        .{
-            .path = binding_path,
-            .text = first_binding,
-            .content_mode = .raw,
-            .max_bytes = binding_segment_bytes,
-        },
-        .{
-            .path = paths.manifest,
-            .text = predecessor_head,
-            .content_mode = .raw,
-            .max_bytes = 64 * 1024,
-        },
-    };
-    var initial_receipt = try durable_store.commitTextTransaction(
+    var initial_receipt = try commitInitialGeneration(
         allocator,
         transactions,
-        &initial,
-        .{ .owner = .{ .process_id = 1, .session_id = "generation-initial", .executor = "test" } },
+        event_path,
+        binding_path,
+        paths.manifest,
+        predecessor_head,
     );
     defer initial_receipt.deinit(allocator);
     var generation = try ReadGeneration.acquire(allocator, &paths, &predecessor);
@@ -1977,18 +2049,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
         .binding_bytes = binding_bytes,
         .head_bytes = successor_head,
     };
-    const thread = try std.Thread.spawn(.{}, runGenerationWriter, .{&context});
-    while (context.started.load(.acquire) == 0) {
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
-    try std.testing.expectEqual(@as(u8, 1), context.finished.load(.acquire));
-    thread.join();
-    try std.testing.expectEqual(error.LockBusy, context.result.?);
-    generation.deinit();
-    context.result = null;
-    context.started.store(0, .release);
-    context.finished.store(0, .release);
+    try expectGenerationWriterBlocked(&context, &generation);
     const retry = try std.Thread.spawn(.{}, runGenerationWriter, .{&context});
     retry.join();
     if (context.result) |err| return err;

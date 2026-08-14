@@ -6785,7 +6785,12 @@ fn parseTransactionRecord(allocator: std.mem.Allocator, record_path: []const u8)
         transaction_record_max_bytes,
     );
     defer allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{},
+    ) catch return error.TransactionCorrupt;
     defer parsed.deinit();
     if (parsed.value != .object) return error.TransactionCorrupt;
     const object = parsed.value.object;
