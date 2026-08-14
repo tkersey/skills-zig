@@ -110,6 +110,8 @@ const SegmentedPrepared = struct {
     binding_after_digest: []u8,
     checkpoint_path: ?[]u8,
     checkpoint_bytes: ?[]u8,
+    legacy_event_path: ?[]u8,
+    legacy_binding_path: ?[]u8,
 
     fn deinit(self: *SegmentedPrepared, allocator: std.mem.Allocator) void {
         allocator.free(self.head_path);
@@ -122,6 +124,8 @@ const SegmentedPrepared = struct {
         allocator.free(self.binding_after_digest);
         if (self.checkpoint_path) |path| allocator.free(path);
         if (self.checkpoint_bytes) |bytes| allocator.free(bytes);
+        if (self.legacy_event_path) |path| allocator.free(path);
+        if (self.legacy_binding_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -133,6 +137,14 @@ pub fn installRuntimeIo(io: std.Io) void {
 
 pub fn lastMutationState() ?bool {
     return last_mutation_state;
+}
+
+pub fn markStorageMutated() void {
+    last_mutation_state = true;
+}
+
+pub fn markStorageMutationUnknown() void {
+    if (last_mutation_state != true) last_mutation_state = null;
 }
 
 pub fn transact(
@@ -2297,6 +2309,15 @@ fn buildSegmentedPrepared(
         )
     else
         null;
+    const legacy_event_path = if (!snapshot.head_exists)
+        try allocator.dupe(u8, snapshot.paths.legacy_event)
+    else
+        null;
+    errdefer if (legacy_event_path) |path| allocator.free(path);
+    const legacy_binding_path = if (!snapshot.head_exists)
+        try allocator.dupe(u8, snapshot.paths.legacy_binding)
+    else
+        null;
     return .{
         .head_path = head_path,
         .head_before_digest = head_before_digest,
@@ -2311,6 +2332,8 @@ fn buildSegmentedPrepared(
         .binding_after_digest = binding_after_digest,
         .checkpoint_path = checkpoint_path,
         .checkpoint_bytes = checkpoint_bytes,
+        .legacy_event_path = legacy_event_path,
+        .legacy_binding_path = legacy_binding_path,
     };
 }
 
@@ -3824,6 +3847,24 @@ fn buildMutations(
                 };
                 mutation_index += 1;
             }
+            if (segmented.legacy_event_path) |legacy_event_path| {
+                mutations[mutation_index] = .{
+                    .path = legacy_event_path,
+                    .text = segmented_event_log.legacy_event_tombstone,
+                    .expectation = .{ .expected_exists = false },
+                    .content_mode = .raw,
+                    .max_bytes = segmented_event_log.event_segment_bytes,
+                };
+                mutation_index += 1;
+                mutations[mutation_index] = .{
+                    .path = segmented.legacy_binding_path.?,
+                    .text = segmented_event_log.legacy_binding_tombstone,
+                    .expectation = .{ .expected_exists = false },
+                    .content_mode = .raw,
+                    .max_bytes = segmented_event_log.binding_segment_bytes,
+                };
+                mutation_index += 1;
+            }
             mutations[mutation_index] = .{
                 .path = segmented.head_path,
                 .text = segmented.head_after,
@@ -3896,7 +3937,8 @@ fn countEffectMutations(prepared: []const PreparedEffect) usize {
     var count: usize = 0;
     for (prepared) |effect| {
         count += if (effect.segmented) |segmented|
-            if (segmented.checkpoint_path == null) 3 else 4
+            @as(usize, if (segmented.checkpoint_path == null) 3 else 4) +
+                @as(usize, if (segmented.legacy_event_path == null) 0 else 2)
         else
             2;
     }
@@ -5646,6 +5688,23 @@ fn segmentedDefinitionBoundAlloc(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
+test "segmented definitions reject inputs that can exceed one event" {
+    const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    plans.definition_plan.inputs[0].max_bytes =
+        segmented_event_log.event_max_bytes + 1;
+    try std.testing.expectError(
+        error.SegmentedEventInputBoundsExceeded,
+        protocol.compile(
+            std.testing.allocator,
+            &plans.definition_plan,
+            &plans.storage_plan,
+        ),
+    );
+}
+
 fn appendDefinitionBoundPair(
     plans: *const TransactionTestPlans,
     protocol_plan: *const protocol.Plan,
@@ -5827,6 +5886,49 @@ test "segmented transaction checkpoints and appends bounded active files" {
         slot.relative_path,
     );
     defer snapshot.deinit(std.testing.allocator);
+    const legacy_event = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        snapshot.paths.legacy_event,
+        segmented_event_log.legacy_event_tombstone.len,
+    );
+    defer std.testing.allocator.free(legacy_event);
+    try std.testing.expectEqualStrings(
+        segmented_event_log.legacy_event_tombstone,
+        legacy_event,
+    );
+    const legacy_binding = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        snapshot.paths.legacy_binding,
+        segmented_event_log.legacy_binding_tombstone.len,
+    );
+    defer std.testing.allocator.free(legacy_binding);
+    try std.testing.expectEqualStrings(
+        segmented_event_log.legacy_binding_tombstone,
+        legacy_binding,
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = snapshot.paths.legacy_event,
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.SegmentedLegacyCustodyMismatch,
+        segmented_event_log.requireMigratedCustody(
+            std.testing.allocator,
+            plans.repo_root,
+            slot.relative_path,
+            true,
+        ),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = snapshot.paths.legacy_event,
+        .data = segmented_event_log.legacy_event_tombstone,
+    });
+    try segmented_event_log.requireMigratedCustody(
+        std.testing.allocator,
+        plans.repo_root,
+        slot.relative_path,
+        true,
+    );
     const revision = try snapshot.head.revisionAlloc(std.testing.allocator);
     defer std.testing.allocator.free(revision);
     var binding = try custody.parseBindingSegment(
@@ -5852,6 +5954,38 @@ test "segmented transaction checkpoints and appends bounded active files" {
         true,
     );
     defer stats.deinit(std.testing.allocator);
+    try replay.validateSegmentedHistoryArchives(
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        &snapshot,
+    );
+    const archive_path = try definition_archive.pathAlloc(
+        std.testing.allocator,
+        plans.repo_root,
+        &plans.definition_plan.closure_digest,
+    );
+    defer std.testing.allocator.free(archive_path);
+    const archive_bytes = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        archive_path,
+        definition_archive.max_bytes,
+    );
+    defer std.testing.allocator.free(archive_bytes);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, archive_path);
+    try std.testing.expectError(
+        error.HistoricalDefinitionMissing,
+        replay.validateSegmentedHistoryArchives(
+            std.testing.allocator,
+            plans.repo_root,
+            plans.definition_plan.id,
+            &snapshot,
+        ),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = archive_path,
+        .data = archive_bytes,
+    });
     try std.testing.expectEqual(@as(usize, 2), stats.records_validated);
     try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
     try std.testing.expect(snapshot.event_bytes.len <

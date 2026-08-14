@@ -115,6 +115,50 @@ const PlanCache = struct {
     }
 };
 
+pub fn validateSegmentedHistoryArchives(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    snapshot: *const segmented_event_log.Snapshot,
+) !void {
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = definition_id,
+    };
+    defer cache.deinit();
+    var history = segmented_event_log.BindingHistoryIterator{
+        .allocator = allocator,
+        .snapshot = snapshot,
+    };
+    while (try history.next()) |bytes| {
+        defer allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                line,
+                .{ .duplicate_field_behavior = .@"error" },
+            ) catch return error.InvalidSegmentedBindingHistory;
+            defer parsed.deinit();
+            if (parsed.value != .object) {
+                return error.InvalidSegmentedBindingHistory;
+            }
+            const digest = definition_core.json.requiredString(
+                parsed.value.object,
+                "definition_digest",
+            ) catch return error.InvalidSegmentedBindingHistory;
+            _ = cache.get(digest) catch |err| switch (err) {
+                error.FileNotFound => return error.HistoricalDefinitionMissing,
+                else => return err,
+            };
+        }
+    }
+    try history.finish();
+}
+
 pub const Stats = struct {
     records_validated: usize,
     definition_versions: usize,
@@ -447,8 +491,14 @@ fn decodeReplayCheckpoint(
     bytes: []const u8,
 ) !protocol.DecodedCheckpoint {
     var identity = try protocol.decodeCheckpoint(allocator, null, bytes);
-    defer identity.deinit(allocator);
-    const archived = try cache.get(identity.definition_digest);
+    if (identity.definition_digest.len != 71) {
+        identity.deinit(allocator);
+        return error.InvalidReplayCheckpoint;
+    }
+    var definition_digest: [71]u8 = undefined;
+    @memcpy(&definition_digest, identity.definition_digest);
+    identity.deinit(allocator);
+    const archived = try cache.get(&definition_digest);
     const plan = if (archived.protocol_plan) |*value|
         value
     else

@@ -2953,6 +2953,7 @@ fn ensureState(
         &state.active_layout_digest,
         &plan.layout_digest,
     )) return;
+    pruneInactiveState(allocator, plan, state);
     const register_map = try allocator.alloc(u16, plan.registers.len);
     errdefer allocator.free(register_map);
     const set_map = try allocator.alloc(u16, plan.sets.len);
@@ -2988,6 +2989,29 @@ fn ensureState(
         &missing_registers,
         &missing_sets,
     );
+}
+
+fn pruneInactiveState(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+) void {
+    var register_index = state.registers.items.len;
+    while (register_index > 0) {
+        register_index -= 1;
+        const item = &state.registers.items[register_index];
+        if (registerIndex(plan, item.name) != null) continue;
+        var removed = state.registers.orderedRemove(register_index);
+        removed.deinit(allocator);
+    }
+    var set_index = state.sets.items.len;
+    while (set_index > 0) {
+        set_index -= 1;
+        const item = &state.sets.items[set_index];
+        if (findSet(plan.sets, item.name) != null) continue;
+        var removed = state.sets.orderedRemove(set_index);
+        removed.deinit(allocator);
+    }
 }
 
 fn mapStateRegisters(
@@ -4119,6 +4143,27 @@ const retained_evolution_second =
     \\    }]
     ++ retained_test_suffix;
 
+const retained_evolution_third =
+    retained_test_prefix ++
+    \\    ["reducer",{
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"latest","max_bytes":4096}],
+    \\      "admissions":[{
+    \\        "on":"archived",
+    \\        "requires":[],
+    \\        "forbids":[],
+    \\        "rules":[],
+    \\        "actions":[{
+    \\          "op":"set",
+    \\          "register":"latest",
+    \\          "input":"event",
+    \\          "path":"/body"
+    \\        }]
+    \\      }]
+    \\    }]
+    ++ retained_test_suffix;
+
 const upsert_created_event =
     "{\"kind\":\"created\",\"body\":{\"items\":[]}}";
 
@@ -4449,4 +4494,37 @@ test "retained state follows carrier names across definition plans" {
             updated.value,
         },
     );
+}
+
+test "retained state prunes carriers absent from the active plan" {
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var second = try TestPlan.init(retained_evolution_second);
+    defer second.deinit();
+    var third = try TestPlan.init(retained_evolution_third);
+    defer third.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var created = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+    );
+    defer created.deinit();
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    var updated = try parseTestEvent(
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"item-2\"}}",
+    );
+    defer updated.deinit();
+    try apply(std.testing.allocator, &second.reducer, &state, updated.value);
+    try std.testing.expectEqual(@as(usize, 1), state.sets.items.len);
+    var archived = try parseTestEvent(
+        "{\"kind\":\"archived\",\"body\":{\"id\":\"item-3\"}}",
+    );
+    defer archived.deinit();
+    try apply(std.testing.allocator, &third.reducer, &state, archived.value);
+    try std.testing.expectEqual(@as(usize, 1), state.registers.items.len);
+    try std.testing.expectEqualStrings(
+        "latest",
+        state.registers.items[0].name,
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.sets.items.len);
 }

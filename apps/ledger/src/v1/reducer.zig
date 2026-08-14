@@ -211,7 +211,7 @@ pub const State = struct {
             const retained_source = try decoder.readOptionalBytes(
                 checkpoint.max_checkpoint_bytes,
             );
-            const event_count = try decoder.readCount(std.math.maxInt(usize));
+            const event_count = try decoder.readUsize();
             if (event_count == 0) return error.InvalidReducerCheckpoint;
             var retained: ?[]u8 = null;
             if (retained_source) |source| {

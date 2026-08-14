@@ -5,6 +5,7 @@ const reducer = @import("reducer.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 const checkpoint = @import("checkpoint.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 
 const max_event_kinds: usize = 256;
 const replay_checkpoint_base_bytes: usize =
@@ -886,6 +887,11 @@ pub fn validateSegmentedSupport(
             }
             segmented_effects += 1;
             if (effect.kind.isBinding()) continue;
+            if (definition_plan.inputs[effect.input_index].max_bytes >
+                segmented_event_log.event_max_bytes)
+            {
+                return error.SegmentedEventInputBoundsExceeded;
+            }
             if (effect.kind != .compare_append or
                 effect.idempotency_parameter != null or
                 (effect.event != null and
@@ -899,7 +905,6 @@ pub fn validateSegmentedSupport(
         }
     }
     try validateSegmentedCheckpointCapacity(event_plan);
-    _ = definition_plan;
 }
 
 fn validateSegmentedCheckpointCapacity(plan: *const Plan) !void {

@@ -46,6 +46,14 @@ test {
     _ = checkpoint;
 }
 
+test "segmented custody upgrade exposes distinct legacy tombstones" {
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        segmented_event_log.legacy_event_tombstone,
+        segmented_event_log.legacy_binding_tombstone,
+    ));
+}
+
 const PlainPlans = struct {
     closure: definition_core.closure.Closure,
     artifact: definition.Plan,

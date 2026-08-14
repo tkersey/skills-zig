@@ -8,6 +8,10 @@ pub const event_segment_bytes: usize = 64 * 1024 * 1024;
 pub const binding_segment_bytes: usize = 16 * 1024 * 1024;
 pub const checkpoint_interval_bytes: usize = 16 * 1024 * 1024;
 pub const event_max_bytes: usize = 4 * 1024 * 1024;
+pub const legacy_event_tombstone =
+    "ledger-segmented-custody-tombstone/v1 event-log\n";
+pub const legacy_binding_tombstone =
+    "ledger-segmented-custody-tombstone/v1 binding-log\n";
 const head_schema = "ledger-segmented-event-head/v3";
 const Hash = std.crypto.hash.sha2.Sha256;
 
@@ -138,6 +142,58 @@ pub const Head = struct {
         self.total_binding_hash.update(binding_bytes);
         self.event_hash.update(event_bytes);
         self.binding_hash.update(binding_bytes);
+    }
+
+    pub fn importLegacySegments(
+        self: *Head,
+        event_segments: []const []const u8,
+        binding_segments: []const []const u8,
+    ) !void {
+        if (self.total_event_bytes != 0 or self.total_binding_bytes != 0 or
+            event_segments.len == 0 or binding_segments.len == 0)
+        {
+            return error.SegmentedLegacyImportBoundsExceeded;
+        }
+        for (event_segments, 0..) |segment, index| {
+            if (segment.len == 0 or segment.len > event_segment_bytes) {
+                return error.SegmentedLegacyImportBoundsExceeded;
+            }
+            self.logical_hash.update(segment);
+            self.total_event_bytes = try addU64(
+                self.total_event_bytes,
+                segment.len,
+            );
+            self.total_event_records = try addU64(
+                self.total_event_records,
+                recordCount(segment),
+            );
+            if (index + 1 == event_segments.len) {
+                self.event_index = @intCast(index);
+                self.event_bytes = segment.len;
+                self.event_records = recordCount(segment);
+                self.event_hash.update(segment);
+            }
+        }
+        for (binding_segments, 0..) |segment, index| {
+            if (segment.len == 0 or segment.len > binding_segment_bytes) {
+                return error.SegmentedLegacyImportBoundsExceeded;
+            }
+            self.total_binding_hash.update(segment);
+            self.total_binding_bytes = try addU64(
+                self.total_binding_bytes,
+                segment.len,
+            );
+            self.total_binding_rows = try addU64(
+                self.total_binding_rows,
+                recordCount(segment),
+            );
+            if (index + 1 == binding_segments.len) {
+                self.binding_index = @intCast(index);
+                self.binding_bytes = segment.len;
+                self.binding_rows = recordCount(segment);
+                self.binding_hash.update(segment);
+            }
+        }
     }
 
     pub fn revisionAlloc(
@@ -529,6 +585,8 @@ pub const Paths = struct {
     events: []u8,
     bindings: []u8,
     checkpoints: []u8,
+    legacy_event: []u8,
+    legacy_binding: []u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -564,12 +622,25 @@ pub const Paths = struct {
             allocator,
             &.{ root, "checkpoints" },
         );
+        errdefer allocator.free(checkpoints);
+        const legacy_event = try std.fs.path.join(
+            allocator,
+            &.{ repo_root, ".ledger", logical_path },
+        );
+        errdefer allocator.free(legacy_event);
+        const legacy_binding = try custody.bindingPathAlloc(
+            allocator,
+            repo_root,
+            logical_path,
+        );
         return .{
             .root = root,
             .manifest = manifest,
             .events = events,
             .bindings = bindings,
             .checkpoints = checkpoints,
+            .legacy_event = legacy_event,
+            .legacy_binding = legacy_binding,
         };
     }
 
@@ -579,6 +650,8 @@ pub const Paths = struct {
         allocator.free(self.events);
         allocator.free(self.bindings);
         allocator.free(self.checkpoints);
+        allocator.free(self.legacy_event);
+        allocator.free(self.legacy_binding);
         self.* = undefined;
     }
 
@@ -800,7 +873,6 @@ pub fn requireMigratedCustody(
     logical_path: []const u8,
     head_exists: bool,
 ) !void {
-    if (head_exists) return;
     const event_path = try std.fs.path.join(
         allocator,
         &.{ repo_root, ".ledger", logical_path },
@@ -812,10 +884,39 @@ pub fn requireMigratedCustody(
         logical_path,
     );
     defer allocator.free(binding_path);
+    if (head_exists) {
+        try requireLegacyTombstone(
+            allocator,
+            event_path,
+            legacy_event_tombstone,
+        );
+        try requireLegacyTombstone(
+            allocator,
+            binding_path,
+            legacy_binding_tombstone,
+        );
+        return;
+    }
     if (try legacyFileExists(event_path, event_segment_bytes) or
         try legacyFileExists(binding_path, custody.binding_max_bytes))
     {
         return error.SegmentedMigrationRequired;
+    }
+}
+
+fn requireLegacyTombstone(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected: []const u8,
+) !void {
+    const bytes = durable_store.readRegularFileNoSymlink(
+        allocator,
+        path,
+        expected.len,
+    ) catch return error.SegmentedLegacyCustodyMismatch;
+    defer allocator.free(bytes);
+    if (!std.mem.eql(u8, bytes, expected)) {
+        return error.SegmentedLegacyCustodyMismatch;
     }
 }
 
@@ -913,6 +1014,52 @@ pub const EventHistoryIterator = struct {
     }
 };
 
+pub const BindingHistoryIterator = struct {
+    allocator: std.mem.Allocator,
+    snapshot: *const Snapshot,
+    index: u64 = 0,
+    summary: HistorySummary = .{},
+
+    pub fn next(self: *BindingHistoryIterator) !?[]u8 {
+        if (self.index > self.snapshot.head.binding_index) return null;
+        const bytes = if (self.index == self.snapshot.head.binding_index)
+            try self.allocator.dupe(u8, self.snapshot.binding_bytes)
+        else blk: {
+            const path = try self.snapshot.paths.bindingSegmentAlloc(
+                self.allocator,
+                self.index,
+            );
+            defer self.allocator.free(path);
+            break :blk try durable_store.readRegularFileNoSymlink(
+                self.allocator,
+                path,
+                binding_segment_bytes,
+            );
+        };
+        errdefer self.allocator.free(bytes);
+        if (self.index < self.snapshot.head.binding_index and bytes.len == 0) {
+            return error.EmptySealedSegment;
+        }
+        try observeHistoryBytes(&self.summary, bytes);
+        self.index = std.math.add(u64, self.index, 1) catch
+            return error.SegmentedIndexOverflow;
+        return bytes;
+    }
+
+    pub fn finish(self: *const BindingHistoryIterator) !void {
+        if (self.index != self.snapshot.head.binding_index + 1 or
+            self.summary.bytes != self.snapshot.head.total_binding_bytes or
+            self.summary.records != self.snapshot.head.total_binding_rows or
+            !hashStatesEqual(
+                self.summary.hash,
+                self.snapshot.head.total_binding_hash,
+            ))
+        {
+            return error.SegmentedHistoryMismatch;
+        }
+    }
+};
+
 const SegmentKind = enum { events, bindings };
 
 const HistorySummary = struct {
@@ -974,6 +1121,10 @@ fn observeHistoryBytes(
         summary.records,
         @intCast(records),
     ) catch return error.SegmentedLengthOverflow;
+}
+
+fn recordCount(bytes: []const u8) usize {
+    return std.mem.count(u8, bytes, "\n");
 }
 
 const CheckpointFile = struct {

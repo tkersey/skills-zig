@@ -562,7 +562,7 @@ fn runSegmentedMigration(
         allocator,
     );
     defer allocator.free(repo_root);
-    var result = try ledger.migration.execute(
+    var result = ledger.migration.execute(
         allocator,
         &context.definition_plan,
         &context.closure,
@@ -571,9 +571,18 @@ fn runSegmentedMigration(
         if (context.protocol_plan) |*plan| plan else null,
         repo_root,
         &bindings,
-    );
+    ) catch |err| {
+        try emitTransactionError(err, ledger.transaction.lastMutationState());
+        return 2;
+    };
     defer result.deinit(allocator);
-    try emitSegmentedMigration(args.format, &result);
+    emitSegmentedMigration(args.format, &result) catch |err| {
+        try emitTransactionError(
+            err,
+            ledger.transaction.lastMutationState(),
+        );
+        return 2;
+    };
     return 0;
 }
 

@@ -203,6 +203,12 @@ fn inspectSegmentedEventSlot(
     );
     if (!snapshot.head_exists) return error.StoreSlotMissing;
     try segmented_event_log.auditHistory(allocator, &snapshot);
+    try replay.validateSegmentedHistoryArchives(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        &snapshot,
+    );
     const revision = try snapshot.head.revisionAlloc(allocator);
     errdefer allocator.free(revision);
     var binding = try custody.parseBindingSegment(
