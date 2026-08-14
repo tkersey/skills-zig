@@ -583,6 +583,51 @@ test "segmented migration preserves bytes revision and replay state" {
         .sub_path = segmented.paths.manifest,
         .data = invalid_head_bytes,
     });
+    try std.Io.Dir.cwd().deleteFile(
+        std.testing.io,
+        segmented.paths.legacy_event,
+    );
+    try std.Io.Dir.cwd().deleteFile(
+        std.testing.io,
+        segmented.paths.legacy_binding,
+    );
+    try std.testing.expectError(
+        error.SegmentedCheckpointStateMismatch,
+        migration.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.store,
+            &plans.protocol,
+            repo_root,
+            &plans.parameters,
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(
+            std.testing.io,
+            segmented.paths.legacy_event,
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(
+            std.testing.io,
+            segmented.paths.legacy_binding,
+            .{},
+        ),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.paths.legacy_event,
+        .data = segmented_event_log.legacy_event_tombstone,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.paths.legacy_binding,
+        .data = segmented_event_log.legacy_binding_tombstone,
+    });
     const checkpoint_projection = &plans.projection.projections[0];
     const checkpoint_fold = checkpoint_projection.fold;
     checkpoint_projection.fold = null;
@@ -599,6 +644,26 @@ test "segmented migration preserves bytes revision and replay state" {
         .sub_path = segmented.paths.manifest,
         .data = segmented.head_bytes,
     });
+    try std.Io.Dir.cwd().deleteFile(
+        std.testing.io,
+        segmented.paths.legacy_event,
+    );
+    try std.Io.Dir.cwd().deleteFile(
+        std.testing.io,
+        segmented.paths.legacy_binding,
+    );
+    var reconciled = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer reconciled.deinit(std.testing.allocator);
+    try std.testing.expect(!reconciled.already_migrated);
     const archive_path = try definition_archive.pathAlloc(
         std.testing.allocator,
         repo_root,
@@ -642,7 +707,7 @@ test "segmented migration preserves bytes revision and replay state" {
     plans.artifact.id = @constCast("example/wrong-definition");
     defer plans.artifact.id = original_id;
     try std.testing.expectError(
-        error.DefinitionArchiveOwnerMismatch,
+        error.StoreBindingDefinitionMismatch,
         migration.execute(
             std.testing.allocator,
             &plans.artifact,

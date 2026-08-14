@@ -101,14 +101,14 @@ fn migrateLegacySlot(
     var legacy_slot = slot;
     legacy_slot.layout = .monolithic;
     legacy_slot.max_bytes = segmented_event_log.legacy_event_max_bytes;
-    var legacy = try custody.readSlot(
+    var legacy = try custody.readReplaySlotOrMissing(
         allocator,
         repo_root,
         definition_plan.id,
         legacy_slot,
     );
     defer legacy.deinit(allocator);
-    var stats = try replay.validateSlot(
+    var stats = try replay.validateReplaySlot(
         allocator,
         repo_root,
         definition_plan.id,
@@ -128,9 +128,31 @@ fn migrateLegacySlot(
         definition_plan.closure_digest[0..],
     );
     defer allocator.free(checkpoint_bytes);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const event_stat = try std.Io.Dir.cwd().statFile(
+        io,
+        legacy.path,
+        .{ .follow_symlinks = false },
+    );
+    const event_bytes = std.math.cast(usize, event_stat.size) orelse
+        return error.FileTooBig;
+    if (event_bytes == 0) return error.InvalidLegacySegmentSource;
+    var event_file = try std.Io.Dir.openFileAbsolute(
+        io,
+        legacy.path,
+        .{},
+    );
+    defer event_file.close(io);
+    var event_map = try std.Io.File.MemoryMap.create(io, event_file, .{
+        .len = event_bytes,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    defer event_map.destroy(io);
+    try event_map.read(io);
     var segments = try MigrationSegments.init(
         allocator,
-        legacy.content,
+        event_map.memory,
         legacy.binding.bytes,
     );
     defer segments.deinit(allocator);
@@ -268,7 +290,7 @@ fn prepareHead(
     return head;
 }
 
-fn releaseReadCustody(legacy: *custody.SlotSnapshot) void {
+fn releaseReadCustody(legacy: *custody.ReplaySlot) void {
     if (legacy.read_custody) |*read_custody| read_custody.deinit();
     legacy.read_custody = null;
 }
@@ -289,6 +311,15 @@ fn validateExistingTarget(
     target: *const segmented_event_log.Snapshot,
 ) !Result {
     try segmented_event_log.auditHistory(allocator, target);
+    try replay.validateSegmentedHistory(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        target,
+        parameters,
+        true,
+    );
     const logical_revision = try target.head.revisionAlloc(allocator);
     defer allocator.free(logical_revision);
     var binding = try custody.parseBindingSegment(
@@ -544,7 +575,7 @@ fn commitMigration(
     definition_entry_path: []const u8,
     repo_root: []const u8,
     target: *const segmented_event_log.Snapshot,
-    legacy: *const custody.SlotSnapshot,
+    legacy: *const custody.ReplaySlot,
     head: *const segmented_event_log.Head,
     segments: *const MigrationSegments,
     checkpoint_bytes: []const u8,
@@ -632,7 +663,7 @@ const MigrationMutations = struct {
         allocator: std.mem.Allocator,
         target: *const segmented_event_log.Snapshot,
         repo_root: []const u8,
-        legacy: *const custody.SlotSnapshot,
+        legacy: *const custody.ReplaySlot,
         head: *const segmented_event_log.Head,
         segments: *const MigrationSegments,
         checkpoint_bytes: []const u8,
@@ -677,7 +708,7 @@ const MigrationMutations = struct {
     fn fill(
         self: *MigrationMutations,
         target: *const segmented_event_log.Snapshot,
-        legacy: *const custody.SlotSnapshot,
+        legacy: *const custody.ReplaySlot,
         segments: *const MigrationSegments,
         checkpoint_bytes: []const u8,
         archive: *const definition_archive.Candidate,
@@ -786,7 +817,7 @@ fn initMigrationMutationStorage(
 
 fn sourceEventMutation(
     owned: *const MigrationMutations,
-    legacy: *const custody.SlotSnapshot,
+    legacy: *const custody.ReplaySlot,
 ) durable_store.TransactionMutation {
     return .{
         .path = legacy.path,
@@ -803,7 +834,7 @@ fn sourceEventMutation(
 
 fn sourceBindingMutation(
     owned: *const MigrationMutations,
-    legacy: *const custody.SlotSnapshot,
+    legacy: *const custody.ReplaySlot,
 ) durable_store.TransactionMutation {
     return .{
         .path = owned.legacy_binding_path,

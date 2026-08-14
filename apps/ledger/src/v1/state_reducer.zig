@@ -1273,7 +1273,40 @@ fn applyMode(
     event: std.json.Value,
     mode: ApplyMode,
 ) !void {
-    try ensureState(allocator, plan, state);
+    if (state.has_active_layout and std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &plan.layout_digest,
+    )) return applyModeWithActiveLayout(
+        allocator,
+        plan,
+        state,
+        event,
+        mode,
+    );
+    var staged = try cloneStateCarriers(allocator, state);
+    errdefer staged.deinit(allocator);
+    try ensureStateInPlace(allocator, plan, &staged);
+    try applyModeWithActiveLayout(
+        allocator,
+        plan,
+        &staged,
+        event,
+        mode,
+    );
+    const previous = state.*;
+    state.* = staged;
+    staged = previous;
+    staged.deinit(allocator);
+}
+
+fn applyModeWithActiveLayout(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+    event: std.json.Value,
+    mode: ApplyMode,
+) !void {
     const kind_value = definition_core.json_pointer.lookup(
         event,
         plan.event_kind,
@@ -4615,6 +4648,45 @@ test "retained state follows carrier names across definition plans" {
             updated.value,
         },
     );
+}
+
+test "rejected event does not commit a new retained layout" {
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var second = try TestPlan.init(retained_evolution_second);
+    defer second.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var created = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"status\":\"open\"}}",
+    );
+    defer created.deinit();
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &first.reducer.layout_digest,
+    ));
+    var rejected = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"status\":\"closed\"}}",
+    );
+    defer rejected.deinit();
+    try std.testing.expectError(
+        error.IllegalRetainedTransition,
+        apply(
+            std.testing.allocator,
+            &second.reducer,
+            &state,
+            rejected.value,
+        ),
+    );
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &first.reducer.layout_digest,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), state.sets.items.len);
+    try expectRetainedStatus(&first.reducer, &state, "open");
 }
 
 test "retained state prunes carriers absent from the active plan" {

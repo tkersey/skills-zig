@@ -495,6 +495,7 @@ pub fn validateSegmentedSnapshotObserved(
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
+        .rolling = true,
     };
     defer cache.deinit();
     var decoded = try decodeReplayCheckpoint(
