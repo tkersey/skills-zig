@@ -546,7 +546,7 @@ fn runSegmentedMigration(
         allocator,
         environment,
         args.definition_path,
-        .{ .kind = .doctor },
+        .{ .kind = .migration },
     );
     defer context.deinit(allocator);
     var bindings = try bindParameters(

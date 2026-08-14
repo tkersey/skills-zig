@@ -7,7 +7,7 @@ const custody = @import("custody.zig");
 pub const event_segment_bytes: usize = 64 * 1024 * 1024;
 pub const binding_segment_bytes: usize = 16 * 1024 * 1024;
 pub const checkpoint_interval_bytes: usize = 16 * 1024 * 1024;
-pub const event_max_bytes: usize = 4 * 1024 * 1024;
+pub const event_max_bytes: usize = 16 * 1024 * 1024;
 pub const legacy_event_max_bytes: usize = 4 * 1024 * 1024 * 1024;
 pub const legacy_event_tombstone =
     "ledger-segmented-custody-tombstone/v1 event-log\n";
@@ -720,6 +720,10 @@ pub const Snapshot = struct {
         if (!std.mem.eql(u8, head.logical_path, logical_path)) {
             return error.SegmentedLogicalPathMismatch;
         }
+        if (!head_read.exists and try durable_store.casAdvisoryLockExists(
+            allocator,
+            paths.manifest,
+        )) return error.SegmentedSnapshotGenerationChanged;
         var generation: ?ReadGeneration = if (head_read.exists)
             try ReadGeneration.acquire(allocator, &paths, &head)
         else
@@ -1791,6 +1795,41 @@ test "segmented snapshot custody excludes mixed writer generations" {
     try std.testing.expectEqualStrings(event_bytes, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding_bytes, snapshot.binding_bytes);
     try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
+}
+
+test "segmented snapshot rejects an absent head with writer custody" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    var paths = try Paths.init(
+        allocator,
+        root,
+        "actuation/initial-writer/events.jsonl",
+    );
+    defer paths.deinit(allocator);
+    const advisory_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.cas.lock.advisory",
+        .{paths.manifest},
+    );
+    defer allocator.free(advisory_path);
+    try durable_store.ensureDirectoryPathNoSymlinks(
+        std.fs.path.dirname(advisory_path) orelse return error.InvalidPath,
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = advisory_path,
+        .data = "",
+    });
+    try std.testing.expectError(
+        error.SegmentedSnapshotGenerationChanged,
+        Snapshot.load(
+            allocator,
+            root,
+            "actuation/initial-writer/events.jsonl",
+        ),
+    );
 }
 
 test "segmented falsifier detects corruption in a sealed segment" {

@@ -4675,16 +4675,24 @@ fn executeSegmentedProjection(
         slot.relative_path,
         snapshot.head_exists,
     );
-    if (compiled.fold == null) return executeSegmentedHistoryProjection(
-        allocator,
-        definition_plan,
-        plan,
-        compiled,
-        projection_name,
-        slot,
-        parameters,
-        &snapshot,
-    );
+    if (compiled.fold == null) {
+        try replay.validateSegmentedHistoryArchives(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            &snapshot,
+        );
+        return executeSegmentedHistoryProjection(
+            allocator,
+            definition_plan,
+            plan,
+            compiled,
+            projection_name,
+            slot,
+            parameters,
+            &snapshot,
+        );
+    }
     var fold_history = try initFoldHistory(
         allocator,
         compiled,

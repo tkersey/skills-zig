@@ -890,6 +890,11 @@ pub fn validateSegmentedSupport(
     {
         return error.SegmentedLayoutProtocolTargetMismatch;
     }
+    if (definition_plan.bounds.max_output_bytes >
+        segmented_event_log.event_max_bytes)
+    {
+        return error.SegmentedEventOutputBoundsExceeded;
+    }
     for (storage_plan.operations) |operation| {
         var segmented_effects: usize = 0;
         for (operation.effects) |effect| {
@@ -897,7 +902,10 @@ pub fn validateSegmentedSupport(
                 continue;
             }
             segmented_effects += 1;
-            if (effect.kind.isBinding()) continue;
+            if (effect.kind == .rebind_existing) {
+                return error.UnsupportedSegmentedEffect;
+            }
+            if (effect.kind == .bind_existing) continue;
             if (definition_plan.inputs[effect.input_index].max_bytes >
                 segmented_event_log.event_max_bytes)
             {

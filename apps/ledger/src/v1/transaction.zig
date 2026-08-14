@@ -232,7 +232,7 @@ fn transactResolved(
     transaction_generated: []const protocol.GeneratedOutput,
 ) !Result {
     if (isBindingOperation(operation)) {
-        try rejectSegmentedBindingOperation(storage_plan, operation);
+        try rejectSegmentedRebindOperation(storage_plan, operation);
         if (documents.len != 0) {
             return error.BindingOperationRejectsExternalInput;
         }
@@ -933,12 +933,14 @@ fn isBindingOperation(operation: *const storage.Operation) bool {
     return true;
 }
 
-fn rejectSegmentedBindingOperation(
+fn rejectSegmentedRebindOperation(
     storage_plan: *const storage.ResolvedPlan,
     operation: *const storage.Operation,
 ) !void {
     for (operation.effects) |effect| {
-        if (storage_plan.slot(effect.slot_index).isSegmented()) {
+        if (effect.kind == .rebind_existing and
+            storage_plan.slot(effect.slot_index).isSegmented())
+        {
             return error.UnsupportedSegmentedEffect;
         }
     }
@@ -1079,7 +1081,7 @@ fn buildExistingBindingMutationsAlloc(
                 .expected_exists = true,
             },
             .content_mode = .raw,
-            .max_bytes = slot.max_bytes,
+            .max_bytes = bindingSourceMaxBytes(slot),
             .action = .check_only,
         };
         mutations[index * 2 + 1] = .{
@@ -1341,7 +1343,7 @@ fn readExistingBindingSource(
     const slot_content = try durable_store.readRegularFileNoSymlink(
         allocator,
         slot_path,
-        slot.max_bytes,
+        bindingSourceMaxBytes(slot),
     );
     errdefer allocator.free(slot_content);
     const slot_digest = try definition_core.canonical_json.digestBytesAlloc(
@@ -1382,6 +1384,13 @@ fn readExistingBindingSource(
         .binding_path = binding_path,
         .before = before,
     };
+}
+
+fn bindingSourceMaxBytes(slot: storage.ResolvedSlot) usize {
+    return if (slot.isSegmented())
+        segmented_event_log.legacy_event_max_bytes
+    else
+        slot.max_bytes;
 }
 
 fn validateExistingContent(
@@ -1871,12 +1880,6 @@ fn prepareSegmentedEffect(
     defer replay_context.deinit(allocator);
     var head = try snapshot.head.clone(allocator);
     defer head.deinit(allocator);
-    var checkpoint_candidate: ?[]u8 = try encodeSegmentedCheckpoint(
-        allocator,
-        definition_plan,
-        &replay_context,
-    );
-    errdefer if (checkpoint_candidate) |bytes| allocator.free(bytes);
     const protocol_records = try beginSegmentedSuffixAdmission(
         &replay_context,
         &snapshot.head,
@@ -1892,26 +1895,111 @@ fn prepareSegmentedEffect(
         &replay_context,
     );
     errdefer input.deinit(allocator);
-    try finishSegmentedSuffixAdmission(&replay_context, protocol_records);
-    return assembleSegmentedEffect(
+    if (input.canonical.len > definition_plan.bounds.max_output_bytes) {
+        return error.OutputBoundsExceeded;
+    }
+    const event_suffix = try segmentedEventSuffix(allocator, input.canonical);
+    errdefer allocator.free(event_suffix);
+    const record_start = std.math.cast(
+        usize,
+        head.total_event_records,
+    ) orelse return error.TransactionRecordBoundsExceeded;
+    const extent_start = std.math.cast(
+        usize,
+        head.total_event_bytes,
+    ) orelse return error.StorageSlotBoundsExceeded;
+    var probe = try head.clone(allocator);
+    defer probe.deinit(allocator);
+    _ = try probe.appendEvent(event_suffix);
+    const logical_after = try probe.revisionAlloc(allocator);
+    errdefer allocator.free(logical_after);
+    const binding_suffix = try segmentedBindingAfter(
         allocator,
         definition_plan,
         event_protocol.?,
         effect,
         operation_name,
         slot,
+        idempotency.input_digest,
+        input.canonical,
+        record_start,
+        extent_start,
+        logical_before,
+        logical_after,
+        parameters,
+    );
+    errdefer allocator.free(binding_suffix);
+    var checkpoint_candidate: ?[]u8 = null;
+    if (try head.requiresCheckpointBeforeAppend(
+        event_suffix.len,
+        binding_suffix.len,
+        definition_plan.bounds.max_records,
+    )) {
+        const suffix_records = replay_context.state.?.records;
+        replay_context.state.?.records = protocol_records;
+        try protocol.activateCheckpoint(
+            allocator,
+            event_protocol.?,
+            &replay_context.state.?,
+        );
+        checkpoint_candidate = try encodeSegmentedCheckpoint(
+            allocator,
+            definition_plan,
+            &replay_context,
+        );
+        replay_context.state.?.records = suffix_records;
+    }
+    errdefer if (checkpoint_candidate) |bytes| allocator.free(bytes);
+    try admitSegmentedInput(
+        allocator,
+        event_protocol.?,
+        effect,
+        execution,
+        parameters,
+        &replay_context,
+        input.canonical,
+    );
+    try finishSegmentedSuffixAdmission(&replay_context, protocol_records);
+    return assembleSegmentedEffect(
+        allocator,
+        effect,
         &snapshot,
         &head,
         &binding,
         logical_before,
-        idempotency.input_digest,
-        parameters,
-        checkpoint: {
-            const bytes = checkpoint_candidate.?;
-            checkpoint_candidate = null;
-            break :checkpoint bytes;
-        },
+        logical_after,
+        event_suffix,
+        binding_suffix,
+        checkpoint_candidate,
         &input,
+    );
+}
+
+fn admitSegmentedInput(
+    allocator: std.mem.Allocator,
+    event_plan: *const protocol.Plan,
+    effect: storage.Effect,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_context: *EffectReplayContext,
+    canonical_input: []const u8,
+) !void {
+    if (effect.event != null) {
+        return protocol.admitBound(
+            allocator,
+            event_plan,
+            &replay_context.state.?,
+            canonical_input,
+            parameters,
+        );
+    }
+    return protocol.admitValueBound(
+        allocator,
+        event_plan,
+        &replay_context.state.?,
+        execution.inputJson(effect.input_index) orelse
+            return error.ProtocolInputMustBeJson,
+        parameters,
     );
 }
 
@@ -1968,6 +2056,7 @@ fn materializeSegmentedInput(
         effect.input_index,
         parameters,
         replay_context,
+        false,
     );
     const request = try materialization.canonicalizeInputAlloc(
         allocator,
@@ -1985,6 +2074,7 @@ fn materializeSegmentedInput(
         parameters,
         replay_context,
         request,
+        false,
         false,
     );
 }
@@ -2062,82 +2152,20 @@ fn encodeSegmentedCheckpoint(
     );
 }
 
-fn maybeCheckpointSegmentedHead(
-    head: *segmented_event_log.Head,
-    event_len: usize,
-    binding_len: usize,
-    max_suffix_records: usize,
-    checkpoint_candidate: []u8,
-) !?[]u8 {
-    if (!try head.requiresCheckpointBeforeAppend(
-        event_len,
-        binding_len,
-        max_suffix_records,
-    )) {
-        return null;
-    }
-    try head.installCheckpoint(checkpoint_candidate);
-    return checkpoint_candidate;
-}
-
 fn assembleSegmentedEffect(
     allocator: std.mem.Allocator,
-    definition_plan: *const definition.Plan,
-    event_plan: *const protocol.Plan,
     effect: storage.Effect,
-    operation_name: []const u8,
-    slot: storage.ResolvedSlot,
     snapshot: *const segmented_event_log.Snapshot,
     head: *segmented_event_log.Head,
     binding: *custody.BindingSnapshot,
     logical_before: []const u8,
-    input_digest: []const u8,
-    parameters: *const definition_core.parameters.Bindings,
-    checkpoint_candidate: []u8,
+    logical_after: []u8,
+    event_suffix: []u8,
+    binding_suffix: []u8,
+    checkpoint_candidate: ?[]u8,
     input: *EffectMaterializedInput,
 ) !PreparedEffect {
-    var candidate_owned = true;
-    defer if (candidate_owned) allocator.free(checkpoint_candidate);
-    const event_suffix = try segmentedEventSuffix(allocator, input.canonical);
-    errdefer allocator.free(event_suffix);
-    const record_start = std.math.cast(
-        usize,
-        head.total_event_records,
-    ) orelse return error.TransactionRecordBoundsExceeded;
-    const extent_start = std.math.cast(
-        usize,
-        head.total_event_bytes,
-    ) orelse return error.StorageSlotBoundsExceeded;
-    var probe = try head.clone(allocator);
-    defer probe.deinit(allocator);
-    _ = try probe.appendEvent(event_suffix);
-    const logical_after = try probe.revisionAlloc(allocator);
-    errdefer allocator.free(logical_after);
-    const binding_suffix = try segmentedBindingAfter(
-        allocator,
-        definition_plan,
-        event_plan,
-        effect,
-        operation_name,
-        slot,
-        input_digest,
-        input.canonical,
-        record_start,
-        extent_start,
-        logical_before,
-        logical_after,
-        parameters,
-    );
-    errdefer allocator.free(binding_suffix);
-    const checkpoint_bytes = try maybeCheckpointSegmentedHead(
-        head,
-        event_suffix.len,
-        binding_suffix.len,
-        definition_plan.bounds.max_records,
-        checkpoint_candidate,
-    );
-    candidate_owned = checkpoint_bytes == null;
-    errdefer if (!candidate_owned) allocator.free(checkpoint_candidate);
+    if (checkpoint_candidate) |bytes| try head.installCheckpoint(bytes);
     const disposition = try head.append(event_suffix, binding_suffix);
     return finishSegmentedPrepared(
         allocator,
@@ -2151,7 +2179,7 @@ fn assembleSegmentedEffect(
         disposition.event_rolled,
         binding_suffix,
         disposition.binding_rolled,
-        checkpoint_bytes,
+        checkpoint_candidate,
         input,
     );
 }
@@ -3109,6 +3137,7 @@ fn materializeEffectInputAlloc(
             effect.input_index,
             parameters,
             replay_context,
+            true,
         );
     }
     return materializeNonEventEffectInput(
@@ -3165,6 +3194,7 @@ fn materializeNonEventEffectInput(
         replay_context,
         request,
         idempotency_match,
+        true,
     );
 }
 
@@ -3218,6 +3248,7 @@ fn materializeEventEffectInput(
     input_index: u8,
     parameters: *const definition_core.parameters.Bindings,
     replay_context: *EffectReplayContext,
+    admit_protocol: bool,
 ) !EffectMaterializedInput {
     const protocol_required = protocolTargetsSlot(
         event_protocol,
@@ -3246,7 +3277,7 @@ fn materializeEventEffectInput(
         ),
     };
     errdefer materialized_event.deinit(allocator);
-    if (protocol_required) {
+    if (protocol_required and admit_protocol) {
         try protocol.admitBound(
             allocator,
             event_protocol.?,
@@ -3401,13 +3432,15 @@ fn materializeRawEffectInput(
     replay_context: *EffectReplayContext,
     request: []const u8,
     idempotency_match: bool,
+    admit_protocol: bool,
 ) !EffectMaterializedInput {
     const result = try effectInputWithNoOutputs(allocator, request);
     errdefer {
         var owned = result;
         owned.deinit(allocator);
     }
-    if (protocolTargetsSlot(event_protocol, slot_index) and
+    if (admit_protocol and
+        protocolTargetsSlot(event_protocol, slot_index) and
         !idempotency_match)
     {
         const current_protocol = event_protocol.?;

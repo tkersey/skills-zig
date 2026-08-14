@@ -250,6 +250,42 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try expectPlainProjection(&plans, repo_root);
 }
 
+test "segmented bind existing bootstraps explicit migration" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/plain.jsonl",
+        .data = "{\"kind\":\"created\",\"value\":{\"id\":\"item-1\",\"revision\":1}}\n",
+    });
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try bindPlainStore(&plans, repo_root);
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try std.testing.expect(!migrated.already_migrated);
+    try std.testing.expectEqual(@as(usize, 1), migrated.records);
+    try appendPlainEvent(&plans, repo_root);
+    try expectPlainProjection(&plans, repo_root);
+}
+
 test "segmented migration preserves bytes revision and replay state" {
     var plans = try compilePlainPlans();
     defer plans.deinit();
@@ -372,6 +408,32 @@ test "segmented migration preserves bytes revision and replay state" {
     defer std.testing.allocator.free(sealed_bindings);
     try std.testing.expectEqualStrings(legacy_binding, sealed_bindings);
     try expectPlainProjection(&plans, repo_root);
+    const archive_path = try definition_archive.pathAlloc(
+        std.testing.allocator,
+        repo_root,
+        &plans.artifact.closure_digest,
+    );
+    defer std.testing.allocator.free(archive_path);
+    const archive_bytes = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        archive_path,
+        definition_archive.max_bytes,
+    );
+    defer std.testing.allocator.free(archive_bytes);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, archive_path);
+    const history_projection = &plans.projection.projections[0];
+    const fold = history_projection.fold;
+    history_projection.fold = null;
+    defer history_projection.fold = fold;
+    try std.testing.expectError(
+        error.HistoricalDefinitionMissing,
+        expectPlainProjection(&plans, repo_root),
+    );
+    history_projection.fold = fold;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = archive_path,
+        .data = archive_bytes,
+    });
     var repeated = try migration.execute(
         std.testing.allocator,
         &plans.artifact,
@@ -416,6 +478,25 @@ test "segmented cross-plan admission rejects unsupported surfaces" {
             null,
         ),
     );
+    const binding_effect =
+        &plans.store.findOperation("bind-existing").?.effects[0];
+    try protocol.validateSegmentedSupport(
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+    );
+    const original_binding_kind = binding_effect.kind;
+    binding_effect.kind = .rebind_existing;
+    defer binding_effect.kind = original_binding_kind;
+    try std.testing.expectError(
+        error.UnsupportedSegmentedEffect,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    binding_effect.kind = .bind_existing;
     try protocol.validateSegmentedSupport(
         &plans.artifact,
         &plans.store,
@@ -447,6 +528,18 @@ test "segmented cross-plan admission rejects unsupported surfaces" {
     );
     std.testing.allocator.free(effect.idempotency_parameter.?);
     effect.idempotency_parameter = null;
+    const original_output_bound = plans.artifact.bounds.max_output_bytes;
+    plans.artifact.bounds.max_output_bytes =
+        segmented_event_log.event_max_bytes + 1;
+    try std.testing.expectError(
+        error.SegmentedEventOutputBoundsExceeded,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    plans.artifact.bounds.max_output_bytes = original_output_bound;
     const compiled_projection = &plans.projection.projections[0];
     const original_fold = compiled_projection.fold;
     compiled_projection.fold = null;

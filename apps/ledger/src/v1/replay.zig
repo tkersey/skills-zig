@@ -121,12 +121,6 @@ pub fn validateSegmentedHistoryArchives(
     definition_id: []const u8,
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
-    var cache = PlanCache{
-        .allocator = allocator,
-        .repo_root = repo_root,
-        .definition_id = definition_id,
-    };
-    defer cache.deinit();
     var history = segmented_event_log.BindingHistoryIterator{
         .allocator = allocator,
         .snapshot = snapshot,
@@ -150,6 +144,12 @@ pub fn validateSegmentedHistoryArchives(
                 parsed.value.object,
                 "definition_digest",
             ) catch return error.InvalidSegmentedBindingHistory;
+            var cache = PlanCache{
+                .allocator = allocator,
+                .repo_root = repo_root,
+                .definition_id = definition_id,
+            };
+            defer cache.deinit();
             _ = cache.get(digest) catch |err| switch (err) {
                 error.FileNotFound => return error.HistoricalDefinitionMissing,
                 else => return err,
