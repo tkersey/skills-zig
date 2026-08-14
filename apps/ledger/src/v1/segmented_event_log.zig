@@ -214,6 +214,45 @@ pub const Head = struct {
         return if (self.checkpoint_exists) &self.checkpoint_revision else null;
     }
 
+    pub fn requiresCheckpointBeforeAppend(
+        self: *const Head,
+        event_len: usize,
+        binding_len: usize,
+        max_suffix_records: usize,
+    ) !bool {
+        if (event_len == 0 or event_len > event_max_bytes + 1 or
+            binding_len == 0 or binding_len > binding_segment_bytes or
+            max_suffix_records == 0)
+        {
+            return error.SegmentedAppendBoundsExceeded;
+        }
+        if (!self.checkpoint_exists) return true;
+        const event_suffix = std.math.sub(
+            u64,
+            self.total_event_bytes,
+            self.checkpoint_event_bytes,
+        ) catch return error.InvalidSegmentedHead;
+        const binding_suffix = std.math.sub(
+            u64,
+            self.total_binding_bytes,
+            self.checkpoint_binding_bytes,
+        ) catch return error.InvalidSegmentedHead;
+        const record_suffix = std.math.sub(
+            u64,
+            self.total_event_records,
+            self.checkpoint_event_records,
+        ) catch return error.InvalidSegmentedHead;
+        return try exceedsInterval(event_suffix, event_len) or
+            try exceedsInterval(binding_suffix, binding_len) or
+            record_suffix >= @as(u64, @intCast(max_suffix_records)) or
+            needsRollover(self.event_bytes, event_len, event_segment_bytes) or
+            needsRollover(
+                self.binding_bytes,
+                binding_len,
+                binding_segment_bytes,
+            );
+    }
+
     pub fn append(
         self: *Head,
         event: []const u8,
@@ -394,6 +433,12 @@ pub const AppendDisposition = struct {
 
 fn needsRollover(current: usize, incoming: usize, maximum: usize) bool {
     return current != 0 and (incoming > maximum - current);
+}
+
+fn exceedsInterval(current: u64, incoming: usize) !bool {
+    const result = std.math.add(u64, current, @intCast(incoming)) catch
+        return error.SegmentedLengthOverflow;
+    return result > checkpoint_interval_bytes;
 }
 
 fn nextIndex(current: u64, advance: bool) !u64 {
@@ -1051,6 +1096,26 @@ test "segmented checkpoint seals active files and bounds the suffix" {
     defer restored.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), restored.total_event_records);
     try std.testing.expectEqual(@as(usize, 1), restored.event_records);
+}
+
+test "checkpoint admission jointly bounds both streams and record suffix" {
+    const allocator = std.testing.allocator;
+    var head = try Head.init(allocator, "actuation/a/events.jsonl");
+    defer head.deinit(allocator);
+    try std.testing.expect(try head.requiresCheckpointBeforeAppend(2, 2, 2));
+    try head.installCheckpoint("checkpoint");
+    try std.testing.expect(!try head.requiresCheckpointBeforeAppend(2, 2, 2));
+    _ = try head.append("a\n", "b\n");
+    try std.testing.expect(!try head.requiresCheckpointBeforeAppend(2, 2, 2));
+    _ = try head.append("c\n", "d\n");
+    try std.testing.expect(try head.requiresCheckpointBeforeAppend(2, 2, 2));
+    head.total_event_bytes = head.checkpoint_event_bytes +
+        checkpoint_interval_bytes;
+    try std.testing.expect(try head.requiresCheckpointBeforeAppend(1, 1, 8));
+    head.total_event_bytes = head.checkpoint_event_bytes;
+    head.total_binding_bytes = head.checkpoint_binding_bytes +
+        checkpoint_interval_bytes;
+    try std.testing.expect(try head.requiresCheckpointBeforeAppend(1, 1, 8));
 }
 
 test "segmented snapshot reads only the active bounded files" {

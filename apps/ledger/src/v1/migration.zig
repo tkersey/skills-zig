@@ -10,6 +10,11 @@ const replay = @import("replay.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 
+const legacy_event_tombstone =
+    "ledger-segmented-custody-tombstone/v1 event-log\n";
+const legacy_binding_tombstone =
+    "ledger-segmented-custody-tombstone/v1 binding-log\n";
+
 pub const Result = struct {
     logical_ref: []u8,
     revision: []u8,
@@ -292,6 +297,8 @@ const MigrationMutations = struct {
     head_after: []u8,
     head_digest: []u8,
     checkpoint_digest: []u8,
+    legacy_event_tombstone_digest: []u8,
+    legacy_binding_tombstone_digest: []u8,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -324,6 +331,8 @@ const MigrationMutations = struct {
         allocator.free(self.head_after);
         allocator.free(self.head_digest);
         allocator.free(self.checkpoint_digest);
+        allocator.free(self.legacy_event_tombstone_digest);
+        allocator.free(self.legacy_binding_tombstone_digest);
         self.* = undefined;
     }
 
@@ -334,7 +343,7 @@ const MigrationMutations = struct {
         checkpoint_bytes: []const u8,
         archive: *const definition_archive.Candidate,
     ) void {
-        self.mutations[0] = sourceEventMutation(legacy);
+        self.mutations[0] = sourceEventMutation(self, legacy);
         self.mutations[1] = sourceBindingMutation(self, legacy);
         self.mutations[2] = sealedEventMutation(self, legacy);
         self.mutations[3] = sealedBindingMutation(self, legacy);
@@ -379,6 +388,18 @@ fn initMigrationMutationStorage(
     errdefer allocator.free(head_after);
     const head_digest = try digestAlloc(allocator, head_after);
     errdefer allocator.free(head_digest);
+    const checkpoint_digest = try digestAlloc(allocator, checkpoint_bytes);
+    errdefer allocator.free(checkpoint_digest);
+    const legacy_event_tombstone_digest = try digestAlloc(
+        allocator,
+        legacy_event_tombstone,
+    );
+    errdefer allocator.free(legacy_event_tombstone_digest);
+    const legacy_binding_tombstone_digest = try digestAlloc(
+        allocator,
+        legacy_binding_tombstone,
+    );
+    errdefer allocator.free(legacy_binding_tombstone_digest);
     return .{
         .mutations = mutations,
         .event_path = event_path,
@@ -387,23 +408,26 @@ fn initMigrationMutationStorage(
         .legacy_binding_path = legacy_binding_path,
         .head_after = head_after,
         .head_digest = head_digest,
-        .checkpoint_digest = try digestAlloc(allocator, checkpoint_bytes),
+        .checkpoint_digest = checkpoint_digest,
+        .legacy_event_tombstone_digest = legacy_event_tombstone_digest,
+        .legacy_binding_tombstone_digest = legacy_binding_tombstone_digest,
     };
 }
 
 fn sourceEventMutation(
+    owned: *const MigrationMutations,
     legacy: *const custody.SlotSnapshot,
 ) durable_store.TransactionMutation {
     return .{
         .path = legacy.path,
-        .text = legacy.content,
+        .text = legacy_event_tombstone,
         .expectation = .{
             .expected_digest = legacy.revision,
             .expected_exists = true,
         },
         .content_mode = .raw,
         .max_bytes = segmented_event_log.event_segment_bytes,
-        .expected_digest_after = legacy.revision,
+        .expected_digest_after = owned.legacy_event_tombstone_digest,
     };
 }
 
@@ -413,14 +437,14 @@ fn sourceBindingMutation(
 ) durable_store.TransactionMutation {
     return .{
         .path = owned.legacy_binding_path,
-        .text = legacy.binding.bytes,
+        .text = legacy_binding_tombstone,
         .expectation = .{
             .expected_digest = legacy.binding.digest,
             .expected_exists = true,
         },
         .content_mode = .raw,
         .max_bytes = segmented_event_log.binding_segment_bytes,
-        .expected_digest_after = legacy.binding.digest,
+        .expected_digest_after = owned.legacy_binding_tombstone_digest,
     };
 }
 
@@ -478,6 +502,19 @@ fn headMutation(
         .max_bytes = 64 * 1024,
         .expected_digest_after = owned.head_digest,
     };
+}
+
+test "legacy custody tombstones are fail-closed for monolithic readers" {
+    const event_result = durable_store.validateJsonlBytes(
+        std.testing.allocator,
+        legacy_event_tombstone,
+    );
+    const binding_result = durable_store.validateJsonlBytes(
+        std.testing.allocator,
+        legacy_binding_tombstone,
+    );
+    try std.testing.expect(!event_result.ok());
+    try std.testing.expect(!binding_result.ok());
 }
 
 fn digestAlloc(

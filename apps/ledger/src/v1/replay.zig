@@ -356,9 +356,6 @@ pub fn validateSegmentedSnapshotObserved(
         usize,
         snapshot.head.total_event_records,
     ) orelse return error.CurrentStoreRecordBoundsExceeded;
-    if (total_records > current_max_records) {
-        return error.CurrentStoreRecordBoundsExceeded;
-    }
     if (snapshot.event_bytes.len == 0) {
         if (binding.rows.len != 0) return error.InvalidStoreBinding;
         return segmentedCheckpointOnlyStats(&cache, &decoded);
@@ -688,7 +685,7 @@ const StreamEventValidator = struct {
             @intCast(self.record_offset),
             record.ordinal,
         ) catch return error.CurrentStoreRecordBoundsExceeded;
-        if (global_ordinal > @as(u64, @intCast(self.max_records))) {
+        if (record.ordinal > @as(u64, @intCast(self.max_records))) {
             return error.CurrentStoreRecordBoundsExceeded;
         }
         const record_index: usize = @intCast(global_ordinal - 1);
