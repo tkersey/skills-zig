@@ -1957,16 +1957,26 @@ fn prepareSegmentedEffect(
     if (input.canonical.len > definition_plan.bounds.max_output_bytes) {
         return error.OutputBoundsExceeded;
     }
-    const event_suffix = try segmentedEventSuffix(allocator, input.canonical);
+    const separator_bytes = head.eventAppendSeparatorBytes();
+    const event_suffix = try segmentedEventSuffix(
+        allocator,
+        input.canonical,
+        separator_bytes,
+    );
     errdefer allocator.free(event_suffix);
     const record_start = std.math.cast(
         usize,
         head.total_event_records,
     ) orelse return error.TransactionRecordBoundsExceeded;
-    const extent_start = std.math.cast(
+    const extent_start_unframed = std.math.cast(
         usize,
         head.total_event_bytes,
     ) orelse return error.StorageSlotBoundsExceeded;
+    const extent_start = std.math.add(
+        usize,
+        extent_start_unframed,
+        separator_bytes,
+    ) catch return error.StorageSlotBoundsExceeded;
     var probe = try head.clone(allocator);
     defer probe.deinit(allocator);
     _ = try probe.appendEvent(event_suffix);
@@ -2251,15 +2261,24 @@ fn assembleSegmentedEffect(
 fn segmentedEventSuffix(
     allocator: std.mem.Allocator,
     canonical_input: []const u8,
+    separator_bytes: usize,
 ) ![]u8 {
-    if (canonical_input.len > segmented_event_log.event_max_bytes) {
+    if (canonical_input.len > segmented_event_log.event_max_bytes or
+        separator_bytes > 1)
+    {
         return error.SegmentedAppendBoundsExceeded;
     }
-    const length = std.math.add(usize, canonical_input.len, 1) catch
+    const framed_length = std.math.add(usize, canonical_input.len, 1) catch
+        return error.SegmentedAppendBoundsExceeded;
+    const length = std.math.add(usize, framed_length, separator_bytes) catch
         return error.SegmentedAppendBoundsExceeded;
     const result = try allocator.alloc(u8, length);
-    @memcpy(result[0..canonical_input.len], canonical_input);
-    result[canonical_input.len] = '\n';
+    if (separator_bytes == 1) result[0] = '\n';
+    @memcpy(
+        result[separator_bytes .. separator_bytes + canonical_input.len],
+        canonical_input,
+    );
+    result[length - 1] = '\n';
     return result;
 }
 

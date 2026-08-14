@@ -241,6 +241,11 @@ pub fn activateCheckpoint(
     plan: *const Plan,
     state: *ReplayState,
 ) !void {
+    if (plan.reducer_plan) |*reducer_plan| {
+        if (state.reducer_state.count() > reducer_plan.max_entries) {
+            return error.CheckpointBoundsExceeded;
+        }
+    }
     if (plan.state_reducer_plan) |*state_plan| {
         try state_reducer.activateCheckpoint(
             allocator,

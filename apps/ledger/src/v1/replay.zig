@@ -264,15 +264,10 @@ pub fn validateSegmentedHistory(
     while (try events.next()) |bytes| {
         defer allocator.free(bytes);
         if (bytes.len == 0) continue;
-        var backend = try activeMemoryStore(
+        var summary = try scanSegmentBytes(
             allocator,
             slot.relative_path,
             bytes,
-        );
-        defer backend.deinit();
-        var summary = try backend.eventStore().scan(
-            allocator,
-            segmented_event_log.event_segment_bytes,
             .{
                 .context = &validator,
                 .visitFn = StreamEventValidator.visit,
@@ -554,7 +549,7 @@ pub fn validateSegmentedSnapshotObserved(
         snapshot,
         binding,
         parameters,
-        current_max_records,
+        @max(current_max_records, snapshot.head.event_records),
         protocol_required,
         observer,
         total_records,
@@ -575,12 +570,6 @@ fn validateSegmentedActive(
     total_records: usize,
     decoded: *protocol.DecodedCheckpoint,
 ) !Stats {
-    var backend = try activeMemoryStore(
-        allocator,
-        slot.relative_path,
-        snapshot.event_bytes,
-    );
-    defer backend.deinit();
     var validator = StreamEventValidator{
         .allocator = allocator,
         .cache = cache,
@@ -602,9 +591,10 @@ fn validateSegmentedActive(
         bindings.deinit(allocator);
     };
     errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
-    var summary = try backend.eventStore().scan(
+    var summary = try scanSegmentBytes(
         allocator,
-        segmented_event_log.event_segment_bytes,
+        slot.relative_path,
+        snapshot.event_bytes,
         .{
             .context = &validator,
             .visitFn = StreamEventValidator.visit,
@@ -671,30 +661,76 @@ fn segmentedCheckpointOnlyStats(
     };
 }
 
-fn activeMemoryStore(
+fn scanSegmentBytes(
     allocator: std.mem.Allocator,
     logical_ref: []const u8,
     bytes: []const u8,
-) !durable_store.MemoryEventStore {
-    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') {
-        return error.InvalidSegmentedActiveEventFile;
-    }
-    var result = durable_store.MemoryEventStore.init(allocator, logical_ref);
-    errdefer result.deinit();
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (!std.mem.eql(u8, line, std.mem.trim(u8, line, " \t\r"))) {
-            return error.InvalidSegmentedActiveEventFile;
+    visitor: durable_store.EventRecordVisitor,
+) !durable_store.EventScanSummary {
+    if (bytes.len == 0) return error.InvalidSegmentedActiveEventFile;
+    try visitor.observeRaw(bytes);
+    var record_count: usize = 0;
+    var blank_entries: usize = 0;
+    var canonical_hash = EventHash.init(.{});
+    var line_number: usize = 0;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        line_number += 1;
+        const newline = std.mem.indexOfScalar(u8, bytes[offset..], '\n');
+        const line_end = if (newline) |relative|
+            offset + relative
+        else
+            bytes.len;
+        const line = bytes[offset..line_end];
+        const payload = std.mem.trim(u8, line, " \t\r");
+        if (payload.len == 0) {
+            blank_entries += 1;
+        } else {
+            record_count += 1;
+            canonical_hash.update(payload);
+            canonical_hash.update("\n");
+            const leading = std.mem.trimStart(u8, line, " \t\r");
+            const payload_start = offset + (line.len - leading.len);
+            try visitor.visit(.{
+                .payload = payload,
+                .ordinal = @intCast(record_count),
+                .diagnostic_position = line_number,
+                .extent_start = payload_start,
+                .extent_end = payload_start + payload.len,
+            });
         }
-        const owned = try allocator.dupe(u8, line);
-        result.records.append(allocator, owned) catch |err| {
-            allocator.free(owned);
-            return err;
-        };
+        offset = if (newline != null) line_end + 1 else bytes.len;
     }
-    result.exists = true;
-    return result;
+    const owned_logical_ref = try allocator.dupe(u8, logical_ref);
+    errdefer allocator.free(owned_logical_ref);
+    const revision = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        bytes,
+    );
+    errdefer allocator.free(revision);
+    const content_digest = try finishEventHashAlloc(allocator, &canonical_hash);
+    errdefer allocator.free(content_digest);
+    return .{
+        .logical_ref = owned_logical_ref,
+        .exists = true,
+        .revision = revision,
+        .content_digest = content_digest,
+        .record_count = record_count,
+        .blank_entries = blank_entries,
+        .extent_bytes = bytes.len,
+        .append_separator_bytes = @intFromBool(bytes[bytes.len - 1] != '\n'),
+        .append_context = durable_store.EventAppendContext.fromBytes(bytes),
+    };
+}
+
+fn finishEventHashAlloc(
+    allocator: std.mem.Allocator,
+    hash: *EventHash,
+) ![]u8 {
+    var digest: [EventHash.digest_length]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
 }
 
 fn validateSegmentedSummary(

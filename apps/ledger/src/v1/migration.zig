@@ -224,12 +224,14 @@ const MigrationSegments = struct {
             allocator,
             events,
             segmented_event_log.event_segment_bytes,
+            true,
         );
         errdefer allocator.free(event_segments);
         const binding_segments = try splitSegmentsAlloc(
             allocator,
             bindings,
             segmented_event_log.binding_segment_bytes,
+            false,
         );
         return .{
             .events = event_segments,
@@ -248,10 +250,9 @@ fn splitSegmentsAlloc(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     maximum: usize,
+    allow_unterminated_final_record: bool,
 ) ![][]const u8 {
-    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') {
-        return error.InvalidLegacySegmentSource;
-    }
+    if (bytes.len == 0) return error.InvalidLegacySegmentSource;
     var segments: std.ArrayList([]const u8) = .empty;
     errdefer segments.deinit(allocator);
     var segment_start: usize = 0;
@@ -261,8 +262,13 @@ fn splitSegmentsAlloc(
             u8,
             bytes[record_start..],
             '\n',
-        ) orelse return error.InvalidLegacySegmentSource;
-        const record_end = record_start + newline_offset + 1;
+        );
+        const record_end = if (newline_offset) |offset|
+            record_start + offset + 1
+        else if (allow_unterminated_final_record)
+            bytes.len
+        else
+            return error.InvalidLegacySegmentSource;
         if (record_end - record_start > maximum) {
             return error.LegacyRecordExceedsSegment;
         }

@@ -225,6 +225,35 @@ fn appendPlainCreatedEvent(
     try std.testing.expect(appended.storage_mutated);
 }
 
+fn appendPlainCreatedEventFor(
+    plans: *const PlainPlans,
+    repo_root: []const u8,
+    id: []const u8,
+) !void {
+    const bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"kind\":\"created\",\"value\":{{" ++
+            "\"id\":\"{s}\",\"revision\":1}}}}",
+        .{id},
+    );
+    defer std.testing.allocator.free(bytes);
+    var appended = try transaction.transact(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.validator,
+        &plans.store,
+        &plans.protocol,
+        "append",
+        repo_root,
+        &.{.{ .name = "event", .bytes = bytes }},
+        &plans.parameters,
+    );
+    defer appended.deinit(std.testing.allocator);
+    try std.testing.expect(appended.storage_mutated);
+}
+
 fn expectPlainProjection(plans: *const PlainPlans, repo_root: []const u8) !void {
     var result = try projection.execute(
         std.testing.allocator,
@@ -309,6 +338,169 @@ test "segmented bind existing bootstraps explicit migration" {
     try std.testing.expectEqual(@as(usize, 1), migrated.records);
     try appendPlainEvent(&plans, repo_root);
     try expectPlainProjection(&plans, repo_root);
+}
+
+test "segmented migration preserves legacy jsonl framing" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const legacy =
+        "{\"kind\":\"created\",\"value\":{" ++
+        "\"id\":\"item-1\",\"revision\":1}}\r\n \t\r\n" ++
+        "{\"kind\":\"updated\",\"value\":{" ++
+        "\"id\":\"item-1\",\"revision\":1}}";
+    try repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/plain.jsonl",
+        .data = legacy,
+    });
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try bindPlainStore(&plans, repo_root);
+    const legacy_revision = try definition_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        legacy,
+    );
+    defer std.testing.allocator.free(legacy_revision);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(legacy_revision, migrated.revision);
+    try std.testing.expectEqual(@as(usize, 2), migrated.records);
+    var before_append = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    try std.testing.expect(before_append.head.event_separator_pending);
+    try segmented_event_log.auditHistory(
+        std.testing.allocator,
+        &before_append,
+    );
+    before_append.deinit(std.testing.allocator);
+    try appendPlainEvent(&plans, repo_root);
+    var after_append = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    defer after_append.deinit(std.testing.allocator);
+    try std.testing.expect(!after_append.head.event_separator_pending);
+    try std.testing.expect(after_append.event_bytes.len != 0);
+    try std.testing.expectEqual(@as(u8, '\n'), after_append.event_bytes[0]);
+    var health = try doctor.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer health.deinit(std.testing.allocator);
+    try std.testing.expect(health.healthy);
+}
+
+test "segmented successor bounds checkpoint before enforcement" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try appendPlainCreatedEvent(&plans, repo_root);
+    plans.artifact.bounds.max_records = 1;
+    try appendPlainEvent(&plans, repo_root);
+    var snapshot = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.head.event_records);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        snapshot.head.checkpoint_event_records,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        snapshot.head.total_event_records,
+    );
+    const future_path = try snapshot.paths.eventSegmentAlloc(
+        std.testing.allocator,
+        snapshot.head.event_index + 1,
+    );
+    defer std.testing.allocator.free(future_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = future_path,
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.UnexpectedFutureSegment,
+        segmented_event_log.auditHistory(std.testing.allocator, &snapshot),
+    );
+}
+
+test "segmented checkpoint enforces keyed reducer capacity" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try appendPlainCreatedEvent(&plans, repo_root);
+    try appendPlainCreatedEventFor(&plans, repo_root, "item-2");
+    plans.artifact.bounds.max_records = 2;
+    plans.artifact.bounds.max_reducer_states = 1;
+    plans.protocol.reducer_plan.?.max_entries = 1;
+    try std.testing.expectError(
+        error.CheckpointBoundsExceeded,
+        transaction.transact(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.validator,
+            &plans.store,
+            &plans.protocol,
+            "append",
+            repo_root,
+            &.{.{
+                .name = "event",
+                .bytes = "{\"kind\":\"updated\",\"value\":{" ++
+                    "\"id\":\"item-1\",\"revision\":1}}",
+            }},
+            &plans.parameters,
+        ),
+    );
 }
 
 test "segmented full history admits missing genesis and lifetime states" {

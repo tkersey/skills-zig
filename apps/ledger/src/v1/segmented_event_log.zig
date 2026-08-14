@@ -13,7 +13,8 @@ pub const legacy_event_tombstone =
     "ledger-segmented-custody-tombstone/v1 event-log\n";
 pub const legacy_binding_tombstone =
     "ledger-segmented-custody-tombstone/v1 binding-log\n";
-const head_schema = "ledger-segmented-event-head/v3";
+const head_schema = "ledger-segmented-event-head/v4";
+const legacy_head_schema = "ledger-segmented-event-head/v3";
 const Hash = std.crypto.hash.sha2.Sha256;
 
 const HashState = struct {
@@ -77,6 +78,7 @@ pub const Head = struct {
     event_index: u64 = 0,
     event_bytes: usize = 0,
     event_records: usize = 0,
+    event_separator_pending: bool = false,
     binding_index: u64 = 0,
     binding_bytes: usize = 0,
     binding_rows: usize = 0,
@@ -133,6 +135,8 @@ pub const Head = struct {
         }
         self.event_bytes = event_bytes.len;
         self.event_records = event_records;
+        self.event_separator_pending = event_bytes.len != 0 and
+            event_bytes[event_bytes.len - 1] != '\n';
         self.binding_bytes = binding_bytes.len;
         self.binding_rows = binding_rows;
         self.total_event_bytes = @intCast(event_bytes.len);
@@ -166,12 +170,14 @@ pub const Head = struct {
             );
             self.total_event_records = try addU64(
                 self.total_event_records,
-                recordCount(segment),
+                eventRecordCount(segment),
             );
             if (index + 1 == event_segments.len) {
                 self.event_index = @intCast(index);
                 self.event_bytes = segment.len;
-                self.event_records = recordCount(segment);
+                self.event_records = eventRecordCount(segment);
+                self.event_separator_pending =
+                    segment[segment.len - 1] != '\n';
                 self.event_hash.update(segment);
             }
         }
@@ -186,12 +192,12 @@ pub const Head = struct {
             );
             self.total_binding_rows = try addU64(
                 self.total_binding_rows,
-                recordCount(segment),
+                lineRecordCount(segment),
             );
             if (index + 1 == binding_segments.len) {
                 self.binding_index = @intCast(index);
                 self.binding_bytes = segment.len;
-                self.binding_rows = recordCount(segment);
+                self.binding_rows = lineRecordCount(segment);
                 self.binding_hash.update(segment);
             }
         }
@@ -278,7 +284,7 @@ pub const Head = struct {
         binding_len: usize,
         max_suffix_records: usize,
     ) !bool {
-        if (event_len == 0 or event_len > event_max_bytes + 1 or
+        if (event_len == 0 or event_len > event_max_bytes + 2 or
             binding_len == 0 or binding_len > binding_segment_bytes or
             max_suffix_records == 0)
         {
@@ -316,7 +322,7 @@ pub const Head = struct {
         event: []const u8,
         binding: []const u8,
     ) !AppendDisposition {
-        if (event.len == 0 or event.len > event_max_bytes + 1 or
+        if (event.len == 0 or event.len > event_max_bytes + 2 or
             binding.len == 0 or binding.len > binding_segment_bytes)
         {
             return error.SegmentedAppendBoundsExceeded;
@@ -330,8 +336,14 @@ pub const Head = struct {
     }
 
     pub fn appendEvent(self: *Head, event: []const u8) !bool {
-        if (event.len == 0 or event.len > event_max_bytes + 1) {
+        if (event.len == 0 or event.len > event_max_bytes + 2) {
             return error.SegmentedAppendBoundsExceeded;
+        }
+        if (self.event_separator_pending) {
+            if (event[0] != '\n') return error.SegmentedAppendSeparatorMissing;
+            self.event_separator_pending = false;
+        } else if (event[0] == '\n') {
+            return error.SegmentedAppendSeparatorUnexpected;
         }
         const event_roll = needsRollover(
             self.event_bytes,
@@ -355,6 +367,10 @@ pub const Head = struct {
         self.logical_hash.update(event);
         self.event_hash.update(event);
         return event_roll;
+    }
+
+    pub fn eventAppendSeparatorBytes(self: *const Head) usize {
+        return @intFromBool(self.event_separator_pending);
     }
 
     pub fn appendBinding(self: *Head, binding: []const u8) !bool {
@@ -396,7 +412,7 @@ pub const Head = struct {
         defer encoder.deinit();
         try encoder.writeBytes(head_schema);
         try encoder.writeBytes(self.logical_path);
-        try encodeHeadCounts(self, &encoder);
+        try encodeHeadCounts(self, &encoder, true);
         try self.logical_hash.encode(&encoder);
         try self.total_binding_hash.encode(&encoder);
         try self.event_hash.encode(&encoder);
@@ -410,13 +426,16 @@ pub const Head = struct {
     ) !Head {
         var decoder = try checkpoint.Decoder.init(bytes);
         const schema = try decoder.readBytes(head_schema.len);
-        if (!std.mem.eql(u8, schema, head_schema)) {
+        const has_separator_state = if (std.mem.eql(u8, schema, head_schema))
+            true
+        else if (std.mem.eql(u8, schema, legacy_head_schema))
+            false
+        else
             return error.UnsupportedSegmentedHead;
-        }
         const logical_path = try decoder.readBytes(4096);
         var result = try Head.init(allocator, logical_path);
         errdefer result.deinit(allocator);
-        try decodeHeadCounts(&result, &decoder);
+        try decodeHeadCounts(&result, &decoder, has_separator_state);
         result.logical_hash = try HashState.decode(&decoder);
         result.total_binding_hash = try HashState.decode(&decoder);
         result.event_hash = try HashState.decode(&decoder);
@@ -481,6 +500,11 @@ pub const Head = struct {
             definition_core.json.digest(&self.checkpoint_revision) catch
                 return error.InvalidSegmentedHead;
         }
+        if (self.event_separator_pending and
+            (!self.checkpoint_exists or self.event_bytes != 0))
+        {
+            return error.InvalidSegmentedHead;
+        }
     }
 };
 
@@ -518,10 +542,14 @@ fn addU64(left: u64, right: usize) !u64 {
 fn encodeHeadCounts(
     head: *const Head,
     encoder: *checkpoint.Encoder,
+    include_separator_state: bool,
 ) !void {
     try encoder.writeU64(head.event_index);
     try encoder.writeU64(@intCast(head.event_bytes));
     try encoder.writeU64(@intCast(head.event_records));
+    if (include_separator_state) {
+        try encoder.writeBool(head.event_separator_pending);
+    }
     try encoder.writeU64(head.binding_index);
     try encoder.writeU64(@intCast(head.binding_bytes));
     try encoder.writeU64(@intCast(head.binding_rows));
@@ -545,10 +573,18 @@ fn encodeHeadCounts(
         null);
 }
 
-fn decodeHeadCounts(head: *Head, decoder: *checkpoint.Decoder) !void {
+fn decodeHeadCounts(
+    head: *Head,
+    decoder: *checkpoint.Decoder,
+    has_separator_state: bool,
+) !void {
     head.event_index = try decoder.readU64();
     head.event_bytes = try decoder.readBoundedUsize(event_segment_bytes);
     head.event_records = try decoder.readCount(checkpoint.max_collection_items);
+    head.event_separator_pending = if (has_separator_state)
+        try decoder.readBool()
+    else
+        false;
     head.binding_index = try decoder.readU64();
     head.binding_bytes = try decoder.readBoundedUsize(binding_segment_bytes);
     head.binding_rows = try decoder.readCount(checkpoint.max_collection_items);
@@ -983,6 +1019,24 @@ pub fn auditHistory(
     allocator: std.mem.Allocator,
     snapshot: *const Snapshot,
 ) !void {
+    try rejectFutureSegmentFiles(
+        snapshot.paths.events,
+        snapshot.head.event_index,
+        ".jsonl",
+    );
+    try rejectFutureSegmentFiles(
+        snapshot.paths.bindings,
+        snapshot.head.binding_index,
+        ".jsonl",
+    );
+    try rejectFutureSegmentFiles(
+        snapshot.paths.checkpoints,
+        if (snapshot.head.checkpoint_exists)
+            snapshot.head.checkpoint_index
+        else
+            null,
+        ".bin",
+    );
     const events = try auditSegmentSequence(
         allocator,
         &snapshot.paths,
@@ -1037,7 +1091,7 @@ pub const EventHistoryIterator = struct {
         if (self.index < self.snapshot.head.event_index and bytes.len == 0) {
             return error.EmptySealedSegment;
         }
-        try observeHistoryBytes(&self.summary, bytes);
+        try observeEventHistoryBytes(&self.summary, bytes);
         self.index = std.math.add(u64, self.index, 1) catch
             return error.SegmentedIndexOverflow;
         return bytes;
@@ -1083,7 +1137,7 @@ pub const BindingHistoryIterator = struct {
         if (self.index < self.snapshot.head.binding_index and bytes.len == 0) {
             return error.EmptySealedSegment;
         }
-        try observeHistoryBytes(&self.summary, bytes);
+        try observeBindingHistoryBytes(&self.summary, bytes);
         self.index = std.math.add(u64, self.index, 1) catch
             return error.SegmentedIndexOverflow;
         return bytes;
@@ -1137,15 +1191,39 @@ fn auditSegmentSequence(
         );
         defer allocator.free(bytes);
         if (bytes.len == 0) return error.EmptySealedSegment;
-        try observeHistoryBytes(&summary, bytes);
+        switch (kind) {
+            .events => try observeEventHistoryBytes(&summary, bytes),
+            .bindings => try observeBindingHistoryBytes(&summary, bytes),
+        }
         index = std.math.add(u64, index, 1) catch
             return error.SegmentedIndexOverflow;
     }
-    try observeHistoryBytes(&summary, active_bytes);
+    switch (kind) {
+        .events => try observeEventHistoryBytes(&summary, active_bytes),
+        .bindings => try observeBindingHistoryBytes(&summary, active_bytes),
+    }
     return summary;
 }
 
-fn observeHistoryBytes(
+fn observeEventHistoryBytes(
+    summary: *HistorySummary,
+    bytes: []const u8,
+) !void {
+    summary.hash.update(bytes);
+    summary.bytes = std.math.add(
+        u64,
+        summary.bytes,
+        @intCast(bytes.len),
+    ) catch return error.SegmentedLengthOverflow;
+    const records = eventRecordCount(bytes);
+    summary.records = std.math.add(
+        u64,
+        summary.records,
+        @intCast(records),
+    ) catch return error.SegmentedLengthOverflow;
+}
+
+fn observeBindingHistoryBytes(
     summary: *HistorySummary,
     bytes: []const u8,
 ) !void {
@@ -1158,16 +1236,62 @@ fn observeHistoryBytes(
         summary.bytes,
         @intCast(bytes.len),
     ) catch return error.SegmentedLengthOverflow;
-    const records = std.mem.count(u8, bytes, "\n");
     summary.records = std.math.add(
         u64,
         summary.records,
-        @intCast(records),
+        @intCast(lineRecordCount(bytes)),
     ) catch return error.SegmentedLengthOverflow;
 }
 
-fn recordCount(bytes: []const u8) usize {
+fn eventRecordCount(bytes: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        count += @intFromBool(std.mem.trim(u8, line, " \t\r").len != 0);
+    }
+    return count;
+}
+
+fn lineRecordCount(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\n");
+}
+
+fn rejectFutureSegmentFiles(
+    directory: []const u8,
+    maximum_index: ?u64,
+    extension: []const u8,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.openDirAbsolute(io, directory, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+    var entries: usize = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        entries = std.math.add(usize, entries, 1) catch
+            return error.TooManyFiles;
+        if (entries > checkpoint.max_collection_items) {
+            return error.TooManyFiles;
+        }
+        const index = segmentIndex(entry.name, extension) orelse continue;
+        if (maximum_index == null or index > maximum_index.?) {
+            return error.UnexpectedFutureSegment;
+        }
+    }
+}
+
+fn segmentIndex(name: []const u8, extension: []const u8) ?u64 {
+    if (name.len != 16 + extension.len or
+        !std.mem.endsWith(u8, name, extension))
+    {
+        return null;
+    }
+    return std.fmt.parseInt(u64, name[0..16], 10) catch null;
 }
 
 const CheckpointFile = struct {
@@ -1423,6 +1547,36 @@ test "segmented head round trip preserves resumable logical revision" {
     );
     defer allocator.free(direct);
     try std.testing.expectEqualStrings(direct, actual);
+}
+
+test "segmented head decodes the v3 compatibility format" {
+    const allocator = std.testing.allocator;
+    var head = try Head.init(allocator, "actuation/a/events.jsonl");
+    defer head.deinit(allocator);
+    _ = try head.append("{\"sequence\":1}\n", "{\"binding\":1}\n");
+    var encoder = checkpoint.Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.writeBytes(legacy_head_schema);
+    try encoder.writeBytes(head.logical_path);
+    try encodeHeadCounts(&head, &encoder, false);
+    try head.logical_hash.encode(&encoder);
+    try head.total_binding_hash.encode(&encoder);
+    try head.event_hash.encode(&encoder);
+    try head.binding_hash.encode(&encoder);
+    const encoded = try encoder.toOwnedSlice();
+    defer allocator.free(encoded);
+    var restored = try Head.decode(allocator, encoded);
+    defer restored.deinit(allocator);
+    try std.testing.expect(!restored.event_separator_pending);
+    try std.testing.expectEqual(
+        head.total_event_records,
+        restored.total_event_records,
+    );
+    const expected = try head.revisionAlloc(allocator);
+    defer allocator.free(expected);
+    const actual = try restored.revisionAlloc(allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "segmented head rolls only before a nonempty overflow" {
