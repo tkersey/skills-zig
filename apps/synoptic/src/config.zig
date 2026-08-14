@@ -195,6 +195,7 @@ pub const Settings = struct {
 
     fn applyToml(self: *Settings, bytes: []const u8) !void {
         var section: Section = .none;
+        var seen: [6]bool = @splat(false);
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |raw_line| {
             const without_comment = stripTomlComment(raw_line);
@@ -228,8 +229,25 @@ pub const Settings = struct {
                 }
                 effective_value = continued.items;
             }
+            const setting_index = try tomlSettingIndex(section, key);
+            if (seen[setting_index]) return error.InvalidSynopticConfig;
+            seen[setting_index] = true;
             try self.applyTomlSetting(section, key, effective_value);
         }
+    }
+
+    fn tomlSettingIndex(section: Section, key: []const u8) !usize {
+        return switch (section) {
+            .file_review => if (std.mem.eql(u8, key, "start_mode")) 0 else error.InvalidSynopticConfig,
+            .browser => if (std.mem.eql(u8, key, "open")) 1 else error.InvalidSynopticConfig,
+            .worktree => if (std.mem.eql(u8, key, "prefer_current_pr_checkout")) 2 else error.InvalidSynopticConfig,
+            .exclusions => if (std.mem.eql(u8, key, "enabled")) 3 else if (std.mem.eql(
+                u8,
+                key,
+                "additional_globs",
+            )) 4 else if (std.mem.eql(u8, key, "removed_default_globs")) 5 else error.InvalidSynopticConfig,
+            .none => error.InvalidSynopticConfig,
+        };
     }
 
     fn applyTomlSetting(
@@ -1345,6 +1363,20 @@ test "exclusion arrays accept TOML strings comments trailing commas and lines" {
     try std.testing.expectEqualStrings("**/*.snap", settings.additional_globs.items[1]);
     try std.testing.expectEqual(@as(usize, 1), settings.removed_default_globs.items.len);
     try std.testing.expectEqualStrings("vendor/**", settings.removed_default_globs.items[0]);
+}
+
+test "configuration rejects duplicate section keys" {
+    var settings = Settings{ .allocator = std.testing.allocator };
+    defer settings.deinit();
+    try std.testing.expectError(
+        error.InvalidSynopticConfig,
+        settings.applyToml(
+            "[exclusions]\n" ++
+                "enabled = false\n" ++
+                "[exclusions]\n" ++
+                "enabled = true\n",
+        ),
+    );
 }
 
 test "exclusions config rejects wildcard-only automatic effect domains" {

@@ -151,7 +151,7 @@ pub fn decodePreparedAction(allocator: std.mem.Allocator, raw: []const u8) !Prep
     const slot_value = (try optionalStringField(arguments, "slot")) orelse
         return error.InvalidToolPayload;
     const kind_value = (try optionalStringField(arguments, "kind")) orelse
-        "add_inline_comment";
+        return error.InvalidToolPayload;
     const kind = try parseKind(kind_value);
     const effect = (try optionalAliasedStringField(
         arguments,
@@ -846,6 +846,16 @@ test "initial tool call is rejected even with plausible payload" {
     try std.testing.expectError(
         error.InitialReviewActionForbidden,
         authorizeTool(.initial_review, true),
+    );
+}
+test "prepared action requires an explicit kind discriminator" {
+    const raw =
+        \\{"arguments":{"slot":"finding","effectSummary":"Add a comment",
+        \\"path":"a.zig","line":1,"body":"Could this fail?"}}
+    ;
+    try std.testing.expectError(
+        error.InvalidToolPayload,
+        decodePreparedAction(std.testing.allocator, raw),
     );
 }
 test "prepared action input decoding releases every partial allocation" {

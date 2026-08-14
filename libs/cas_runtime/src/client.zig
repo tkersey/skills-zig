@@ -1578,6 +1578,7 @@ const ActorState = struct {
     server_request_timeout_ms: u32,
     pending: std.AutoHashMap(i64, *ActorPending),
     subscriptions: std.ArrayList(protocol.NotificationHandler) = .empty,
+    active_notification_callbacks: usize = 0,
     server_request_handler: ?protocol.ServerRequestHandler,
     next_request_id: i64 = 1,
     default_request_timeout_ms: u32,
@@ -1740,10 +1741,44 @@ pub const Actor = struct {
         state.mutex.lock();
         defer state.mutex.unlock();
         if (state.terminal != .running) return actorTerminalError(state.terminal);
+        for (state.subscriptions.items) |candidate| {
+            if (candidate.context == subscription.context and
+                candidate.handle == subscription.handle)
+            {
+                return error.DuplicateNotificationSubscription;
+            }
+        }
         if (state.subscriptions.items.len >= max_actor_subscriptions) {
             return error.NotificationSubscriptionLimitExceeded;
         }
         try state.subscriptions.append(state.allocator, subscription);
+    }
+
+    pub fn unsubscribe(
+        self: *Actor,
+        subscription: protocol.NotificationHandler,
+    ) !void {
+        const state = try self.acquireState();
+        defer actorReleaseCall(state);
+        state.mutex.lock();
+        var removed = false;
+        for (state.subscriptions.items, 0..) |candidate, index| {
+            if (candidate.context != subscription.context or
+                candidate.handle != subscription.handle) continue;
+            _ = state.subscriptions.orderedRemove(index);
+            removed = true;
+            break;
+        }
+        state.mutex.unlock();
+        if (!removed) return error.UnknownNotificationSubscription;
+        if (actor_callback_state == state) return;
+        while (true) {
+            state.mutex.lock();
+            const callbacks_active = state.active_notification_callbacks != 0;
+            state.mutex.unlock();
+            if (!callbacks_active) return;
+            std.atomic.spinLoopHint();
+        }
     }
 
     pub fn setServerRequestHandler(
@@ -2282,15 +2317,23 @@ fn actorInvokeNotificationHandlers(
     line: []const u8,
 ) !void {
     state.mutex.lock();
+    state.active_notification_callbacks += 1;
     const subscriptions = state.allocator.dupe(
         protocol.NotificationHandler,
         state.subscriptions.items,
     ) catch |err| {
+        state.active_notification_callbacks -= 1;
         state.mutex.unlock();
         return err;
     };
     state.mutex.unlock();
     defer state.allocator.free(subscriptions);
+    defer {
+        state.mutex.lock();
+        std.debug.assert(state.active_notification_callbacks > 0);
+        state.active_notification_callbacks -= 1;
+        state.mutex.unlock();
+    }
     const notification = protocol.Notification{ .method = method, .raw_json = line };
     for (subscriptions) |subscription| {
         subscription.handle(subscription.context, notification);
@@ -4683,6 +4726,39 @@ test "actor falsifier permanent reader correlates concurrent reversed responses 
     notifications.mutex.lock();
     defer notifications.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 1), notifications.count);
+}
+
+test "actor notification subscriptions can be removed before owner teardown" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "concurrent");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{ .outbound_queue_capacity = 2 });
+    defer actor.deinit();
+    var notifications = NotificationProbe{};
+    const subscription = protocol.NotificationHandler{
+        .context = &notifications,
+        .handle = NotificationProbe.observe,
+    };
+    try actor.subscribe(subscription);
+    try actor.unsubscribe(subscription);
+    try std.testing.expectError(
+        error.UnknownNotificationSubscription,
+        actor.unsubscribe(subscription),
+    );
+    var first = ActorCall{ .actor = &actor, .method = "actor/first" };
+    var second = ActorCall{ .actor = &actor, .method = "actor/second" };
+    const first_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(second.failure == null);
+    defer allocator.free(first.result.?);
+    defer allocator.free(second.result.?);
+    notifications.mutex.lock();
+    defer notifications.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), notifications.count);
 }
 
 test "actor falsifier dispatches server requests through configured handler and bounded writer" {

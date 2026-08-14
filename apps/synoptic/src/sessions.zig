@@ -919,7 +919,6 @@ pub const Registry = struct {
             const response = try actor.requestJson("turn/interrupt", params, null);
             self.allocator.free(response);
         }
-        try self.deleteFileThread(actor, thread_id.?);
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items, 0..) |session, index| {
@@ -1122,7 +1121,7 @@ pub const Registry = struct {
             prompt,
             skill_path,
             start_immediately,
-        ) catch |err| return self.retireForkAfterError(actor, file_thread_id, err);
+        ) catch |err| return err;
         errdefer {
             self.removeSession(session_id);
             self.allocator.free(session_id);
@@ -1134,40 +1133,13 @@ pub const Registry = struct {
                 file_thread_id,
                 skill_path,
                 prompt,
-            ) catch |err| return self.retireForkAfterError(actor, file_thread_id, err);
+            ) catch |err| return err;
             defer self.allocator.free(file_turn_id);
             self.activateOpeningSession(session_id, file_turn_id) catch |err| {
-                return self.retireForkAfterError(actor, file_thread_id, err);
+                return err;
             };
         }
         return .{ .reused = false, .session_id = session_id, .allocator = self.allocator };
-    }
-
-    fn retireForkAfterError(
-        self: *Registry,
-        actor: *cas_runtime.Actor,
-        thread_id: []const u8,
-        original_error: anyerror,
-    ) anyerror {
-        self.deleteFileThread(actor, thread_id) catch |retirement_error| {
-            return retirement_error;
-        };
-        return original_error;
-    }
-
-    fn deleteFileThread(
-        self: *Registry,
-        actor: *cas_runtime.Actor,
-        thread_id: []const u8,
-    ) !void {
-        const params = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"threadId\":{f}}}",
-            .{std.json.fmt(thread_id, .{})},
-        );
-        defer self.allocator.free(params);
-        const response = try actor.requestJson("thread/delete", params, null);
-        self.allocator.free(response);
     }
 
     fn admitFile(self: *Registry, path: []const u8, revision: []const u8) !OpenAdmission {

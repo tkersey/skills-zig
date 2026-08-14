@@ -196,6 +196,14 @@ pub const AutomaticExclusionBatch = struct {
 };
 
 pub const App = struct {
+    const AmbiguousViewed = struct {
+        path: []u8,
+
+        fn deinit(self: AmbiguousViewed, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+        }
+    };
+
     allocator: std.mem.Allocator,
     generation: domain.PrGeneration,
     primary_ready: bool = false,
@@ -210,7 +218,7 @@ pub const App = struct {
     action_state_fresh: bool = true,
     file_review_start_mode: config.FileReviewStartMode = .immediate,
     pull_request: ?domain.OwnedPullRequestHeader = null,
-    ambiguous_viewed_paths: std.ArrayList([]u8) = .empty,
+    ambiguous_viewed: std.ArrayList(AmbiguousViewed) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{
@@ -231,8 +239,8 @@ pub const App = struct {
             self.allocator.free(tab.diff);
         }
         self.tabs.deinit(self.allocator);
-        for (self.ambiguous_viewed_paths.items) |path| self.allocator.free(path);
-        self.ambiguous_viewed_paths.deinit(self.allocator);
+        for (self.ambiguous_viewed.items) |item| item.deinit(self.allocator);
+        self.ambiguous_viewed.deinit(self.allocator);
         self.action_store.deinit();
     }
 
@@ -947,7 +955,9 @@ pub const App = struct {
         outcomes: *std.ArrayList(ExclusionOutcome),
     ) !void {
         for (candidates, results) |candidate, result| {
-            if (result.outcome_unknown) try self.quarantineViewedPath(candidate.path);
+            if (result.outcome_unknown) {
+                try self.quarantineViewedPath(candidate.path);
+            }
             const applied = try self.recordAutomaticExclusion(
                 candidate.path,
                 candidate.revision,
@@ -969,43 +979,71 @@ pub const App = struct {
     }
 
     fn quarantineViewedPath(self: *App, path: []const u8) !void {
-        for (self.ambiguous_viewed_paths.items) |existing| {
-            if (std.mem.eql(u8, existing, path)) return;
+        for (self.ambiguous_viewed.items) |existing| {
+            if (std.mem.eql(u8, existing.path, path)) return;
         }
-        try self.ambiguous_viewed_paths.append(
-            self.allocator,
-            try self.allocator.dupe(u8, path),
-        );
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.ambiguous_viewed.append(self.allocator, .{ .path = owned_path });
     }
 
     fn clearViewedQuarantine(self: *App, path: []const u8) void {
-        for (self.ambiguous_viewed_paths.items, 0..) |existing, index| {
-            if (!std.mem.eql(u8, existing, path)) continue;
-            self.allocator.free(self.ambiguous_viewed_paths.orderedRemove(index));
-            return;
+        var index: usize = 0;
+        while (index < self.ambiguous_viewed.items.len) {
+            if (!std.mem.eql(u8, self.ambiguous_viewed.items[index].path, path)) {
+                index += 1;
+                continue;
+            }
+            self.ambiguous_viewed.orderedRemove(index).deinit(self.allocator);
         }
     }
 
     fn reconcileAmbiguousViewedPaths(self: *App, next: *const domain.PrGeneration) void {
         var index: usize = 0;
-        while (index < self.ambiguous_viewed_paths.items.len) {
-            const path = self.ambiguous_viewed_paths.items[index];
-            var file_index: ?usize = null;
-            for (next.files.items, 0..) |file, candidate_index| {
-                if (std.mem.eql(u8, file.path, path)) {
-                    file_index = candidate_index;
-                    break;
+        while (index < self.ambiguous_viewed.items.len) {
+            const item = self.ambiguous_viewed.items[index];
+            const current_path = next.resolveCurrentPath(item.path) catch {
+                var matched = false;
+                for (next.files.items) |*file| {
+                    if (!fileHasLineageAlias(file, item.path)) continue;
+                    matched = true;
+                    if (file.viewed == .viewed) file.viewed = .dismissed;
                 }
-            }
-            if (file_index) |candidate_index| {
-                if (next.files.items[candidate_index].viewed == .viewed) {
-                    next.files.items[candidate_index].viewed = .dismissed;
+                if (matched) {
                     index += 1;
                     continue;
                 }
+                self.ambiguous_viewed.orderedRemove(index).deinit(self.allocator);
+                continue;
+            };
+            if (current_path) |path| {
+                var found = false;
+                for (next.files.items) |*file| {
+                    if (!std.mem.eql(u8, file.path, path)) continue;
+                    found = true;
+                    if (file.viewed == .viewed) {
+                        file.viewed = .dismissed;
+                        index += 1;
+                    } else {
+                        self.ambiguous_viewed.orderedRemove(index).deinit(self.allocator);
+                    }
+                    break;
+                }
+                if (!found) {
+                    self.ambiguous_viewed.orderedRemove(index).deinit(self.allocator);
+                }
+                continue;
             }
-            self.allocator.free(self.ambiguous_viewed_paths.orderedRemove(index));
+            self.ambiguous_viewed.orderedRemove(index).deinit(self.allocator);
         }
+    }
+
+    fn fileHasLineageAlias(file: *const domain.File, path: []const u8) bool {
+        if (std.mem.eql(u8, file.path, path)) return true;
+        for (file.lineage_aliases.items) |alias| {
+            if (std.mem.eql(u8, alias, path)) return true;
+        }
+        return false;
     }
 
     pub fn recordAutomaticExclusion(

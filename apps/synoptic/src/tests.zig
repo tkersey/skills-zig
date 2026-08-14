@@ -3693,28 +3693,34 @@ fn verifyCompletionRace(
 
     var viewed = try domain.PrGeneration.initFull(allocator, "new", "next");
     try viewed.addFile(.{
-        .path = "a.zig",
+        .path = "b.zig",
+        .previous_path = "a.zig",
+        .change_type = "RENAMED",
         .viewed = .viewed,
         .revision_key = "r2",
     });
     state.replaceGeneration(viewed);
-    try std.testing.expect(state.generation.queued("a.zig"));
+    try std.testing.expect(state.generation.queued("b.zig"));
 
     var unviewed = try domain.PrGeneration.initFull(allocator, "new", "next-2");
     try unviewed.addFile(.{
-        .path = "a.zig",
+        .path = "b.zig",
+        .previous_path = "a.zig",
+        .change_type = "RENAMED",
         .viewed = .unviewed,
         .revision_key = "r3",
     });
     state.replaceGeneration(unviewed);
     var externally_viewed = try domain.PrGeneration.initFull(allocator, "new", "next-3");
     try externally_viewed.addFile(.{
-        .path = "a.zig",
+        .path = "b.zig",
+        .previous_path = "a.zig",
+        .change_type = "RENAMED",
         .viewed = .viewed,
         .revision_key = "r4",
     });
     state.replaceGeneration(externally_viewed);
-    try std.testing.expect(!state.generation.queued("a.zig"));
+    try std.testing.expect(!state.generation.queued("b.zig"));
 }
 
 fn installViewedRaceGh(
@@ -3959,7 +3965,7 @@ test "file session receives every later revision and active close interrupts its
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/inject_items"));
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "thread/delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "thread/delete") == null);
 }
 
 test "file session interrupt revokes governing action authority before RPC" {
@@ -4002,7 +4008,7 @@ test "file session interrupt revokes governing action authority before RPC" {
     try std.testing.expect(std.mem.indexOf(u8, log, "turn/interrupt") != null);
 }
 
-test "file session fork custody deletes every failed initial turn" {
+test "ephemeral file session forks need no deletion after failed initial turn" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4043,7 +4049,7 @@ test "file session fork custody deletes every failed initial turn" {
     );
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/fork"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "thread/delete"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "thread/delete"));
 }
 
 test "session context refresh injects changed thread evidence into every open sibling" {
@@ -4153,7 +4159,7 @@ test "local close remains open when turn interruption fails" {
     try std.testing.expect(registry.sessions.items[0].turn_active);
 }
 
-test "local close retains session custody when thread deletion fails" {
+test "local close retires ephemeral session without thread deletion" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4181,12 +4187,8 @@ test "local close retains session custody when thread deletion fails" {
     defer opened.deinit();
     allocator.free(registry.sessions.items[0].thread_id);
     registry.sessions.items[0].thread_id = try allocator.dupe(u8, "fail-delete");
-    try std.testing.expectError(error.RequestFailed, registry.closeSession(opened.session_id));
-    try std.testing.expectEqual(@as(usize, 1), registry.sessionCount());
-    try std.testing.expectEqual(
-        sessions.SessionStatus.current,
-        registry.sessions.items[0].status,
-    );
+    try registry.closeSession(opened.session_id);
+    try std.testing.expectEqual(@as(usize, 0), registry.sessionCount());
 }
 
 fn verifySessionModes(
@@ -5377,8 +5379,8 @@ test "refresh lease restores reused checkout after a downstream failure" {
         lease.fetch_source.?.remote_url,
     );
     try std.testing.expectEqualStrings(next_head, baseline.head_oid);
-    try lease.rollback();
-    try std.testing.expectEqualStrings(original_head, baseline.head_oid);
+    try std.testing.expectError(error.ReusedCheckoutRollbackFailed, lease.rollback());
+    try std.testing.expectEqualStrings(next_head, baseline.head_oid);
 }
 
 fn verifyReusedCustodyDrift(

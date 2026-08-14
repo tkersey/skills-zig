@@ -303,6 +303,12 @@ fn actionValidationQuarantines(err: anyerror) bool {
     return err == error.PullRequestChanged;
 }
 
+fn refreshFailureQuarantines(err: anyerror) bool {
+    return err == error.ManagedWorktreeRollbackFailed or
+        err == error.ReusedCheckoutRollbackFailed or
+        err == error.ReusedCheckoutRollbackUnsafe;
+}
+
 fn actionTerminalQuarantines(status: tools.ActionStatus) bool {
     return status == .outcome_unknown;
 }
@@ -395,6 +401,13 @@ test "generation-changing actions close both stale command surfaces" {
     invalidateActionGeneration(&runtime);
     try std.testing.expect(!state.action_state_fresh);
     try std.testing.expect(!runtime.worktree_generation_valid);
+}
+
+test "failed worktree rollback keeps the refresh boundary quarantined" {
+    try std.testing.expect(refreshFailureQuarantines(error.ManagedWorktreeRollbackFailed));
+    try std.testing.expect(refreshFailureQuarantines(error.ReusedCheckoutRollbackFailed));
+    try std.testing.expect(refreshFailureQuarantines(error.ReusedCheckoutRollbackUnsafe));
+    try std.testing.expect(!refreshFailureQuarantines(error.ManagedWorktreeRefreshFailed));
 }
 
 test "action broker quarantines every uncertified action generation" {
@@ -1480,7 +1493,13 @@ pub const Server = struct {
         var next_owned = true;
         errdefer if (next_owned) next.deinit();
         var refresh_lease = self.beginRefreshWorktree(runtime, &next) catch |err| {
-            if (runtime.refresh_epoch != .degraded) runtime.refresh_epoch = .current;
+            if (refreshFailureQuarantines(err)) {
+                runtime.worktree_generation_valid = false;
+                runtime.app.action_state_fresh = false;
+                runtime.refresh_epoch = .degraded;
+            } else if (runtime.refresh_epoch != .degraded) {
+                runtime.refresh_epoch = .current;
+            }
             return err;
         };
         const committed = self.finishRefresh(
