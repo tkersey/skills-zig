@@ -1039,6 +1039,7 @@ fn applyWithParameters(
         parsed.value,
         parameters,
         mode,
+        true,
     );
 }
 
@@ -1055,6 +1056,7 @@ pub fn applyValue(
         event,
         null,
         .replay,
+        true,
     );
 }
 
@@ -1072,6 +1074,25 @@ pub fn applyValueBound(
         event,
         parameters,
         .replay,
+        true,
+    );
+}
+
+pub fn applyValueFullHistory(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    return applyValueWithParameters(
+        allocator,
+        plan,
+        state,
+        event,
+        parameters,
+        .replay,
+        false,
     );
 }
 
@@ -1089,6 +1110,7 @@ pub fn admitValueBound(
         event,
         parameters,
         .current,
+        true,
     );
 }
 
@@ -1099,8 +1121,9 @@ fn applyValueWithParameters(
     event: std.json.Value,
     parameters: ?*const definition_core.parameters.Bindings,
     mode: ApplyMode,
+    enforce_record_bound: bool,
 ) !void {
-    if (state.records >= plan.max_records) {
+    if (enforce_record_bound and state.records >= plan.max_records) {
         return error.ProtocolRecordBoundsExceeded;
     }
     if (plan.mode == .plain) {

@@ -75,6 +75,7 @@ pub const BindingHistoryReader = struct {
     definition_id: []const u8,
     slot_name: []const u8,
     logical_path: []const u8,
+    accepted_genesis_revision: ?[]const u8 = null,
     last_revision: ?[]u8 = null,
     rows: usize = 0,
 
@@ -88,6 +89,8 @@ pub const BindingHistoryReader = struct {
         line: []const u8,
     ) !BindingRow {
         var accumulator = BindingAccumulator{ .allocator = self.allocator };
+        accumulator.accepted_genesis_revision =
+            self.accepted_genesis_revision;
         defer accumulator.deinit();
         if (self.last_revision) |revision| {
             accumulator.last_revision = try self.allocator.dupe(u8, revision);
@@ -787,6 +790,7 @@ const BindingAccumulator = struct {
     allocator: std.mem.Allocator,
     rows: std.ArrayList(BindingRow) = .empty,
     last_revision: ?[]u8 = null,
+    accepted_genesis_revision: ?[]const u8 = null,
     idempotency_match: bool = false,
     idempotency_match_index: ?usize = null,
 
@@ -802,7 +806,16 @@ const BindingAccumulator = struct {
         row: BorrowedBindingRow,
         query: ?IdempotencyQuery,
     ) !void {
-        try validateRevisionLink(self.last_revision, row.revision_before);
+        const accepted_genesis = self.last_revision == null and
+            self.accepted_genesis_revision != null and
+            row.revision_before != null and std.mem.eql(
+            u8,
+            self.accepted_genesis_revision.?,
+            row.revision_before.?,
+        );
+        if (!accepted_genesis) {
+            try validateRevisionLink(self.last_revision, row.revision_before);
+        }
         const matches = try matchesIdempotency(row, query);
         if (matches and self.idempotency_match_index != null) {
             return error.DuplicateIdempotencyMatch;

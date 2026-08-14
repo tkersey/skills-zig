@@ -200,6 +200,31 @@ fn appendPlainEvent(plans: *const PlainPlans, repo_root: []const u8) !void {
     try std.testing.expect(appended.storage_mutated);
 }
 
+fn appendPlainCreatedEvent(
+    plans: *const PlainPlans,
+    repo_root: []const u8,
+) !void {
+    var appended = try transaction.transact(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.validator,
+        &plans.store,
+        &plans.protocol,
+        "append",
+        repo_root,
+        &.{.{
+            .name = "event",
+            .bytes = "{\"kind\":\"created\",\"value\":{" ++
+                "\"id\":\"item-1\",\"revision\":1}}",
+        }},
+        &plans.parameters,
+    );
+    defer appended.deinit(std.testing.allocator);
+    try std.testing.expect(appended.storage_mutated);
+}
+
 fn expectPlainProjection(plans: *const PlainPlans, repo_root: []const u8) !void {
     var result = try projection.execute(
         std.testing.allocator,
@@ -284,6 +309,71 @@ test "segmented bind existing bootstraps explicit migration" {
     try std.testing.expectEqual(@as(usize, 1), migrated.records);
     try appendPlainEvent(&plans, repo_root);
     try expectPlainProjection(&plans, repo_root);
+}
+
+test "segmented full history admits missing genesis and lifetime states" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    const history_projection = &plans.projection.projections[0];
+    const fold = history_projection.fold;
+    history_projection.fold = null;
+    defer history_projection.fold = fold;
+    var missing = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("[]", missing.payload);
+    try appendPlainCreatedEvent(&plans, repo_root);
+    var genesis_doctor = try doctor.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer genesis_doctor.deinit(std.testing.allocator);
+    try std.testing.expect(genesis_doctor.healthy);
+    var genesis_projection = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer genesis_projection.deinit(std.testing.allocator);
+    for (0..4) |_| try appendPlainEvent(&plans, repo_root);
+    var lifetime_doctor = try doctor.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer lifetime_doctor.deinit(std.testing.allocator);
+    try std.testing.expect(lifetime_doctor.healthy);
 }
 
 test "segmented migration preserves bytes revision and replay state" {
@@ -427,6 +517,38 @@ test "segmented migration preserves bytes revision and replay state" {
     defer std.testing.allocator.free(sealed_bindings);
     try std.testing.expectEqualStrings(legacy_binding, sealed_bindings);
     try expectPlainProjection(&plans, repo_root);
+    const post_migration_projection = &plans.projection.projections[0];
+    const post_migration_fold = post_migration_projection.fold;
+    post_migration_projection.fold = null;
+    var raw_projection = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer raw_projection.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "[{\"kind\":\"created\",\"value\":{" ++
+            "\"id\":\"item-1\",\"revision\":1}},{" ++
+            "\"kind\":\"updated\",\"value\":{" ++
+            "\"id\":\"item-1\",\"revision\":1}}]",
+        raw_projection.payload,
+    );
+    post_migration_projection.fold = post_migration_fold;
+    var post_migration_doctor = try doctor.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer post_migration_doctor.deinit(std.testing.allocator);
+    try std.testing.expect(post_migration_doctor.healthy);
     var decoded = try protocol.decodeCheckpoint(
         std.testing.allocator,
         &plans.protocol,

@@ -188,11 +188,19 @@ pub fn validateSegmentedHistory(
         .rolling = true,
     };
     defer cache.deinit();
+    var genesis_head = try segmented_event_log.Head.init(
+        allocator,
+        slot.relative_path,
+    );
+    defer genesis_head.deinit(allocator);
+    const genesis_revision = try genesis_head.revisionAlloc(allocator);
+    defer allocator.free(genesis_revision);
     var rows = HistoryRowCursor.init(
         allocator,
         snapshot,
         definition_id,
         slot,
+        genesis_revision,
     );
     defer rows.deinit();
     var observer: IgnoreRecords = .{};
@@ -203,6 +211,7 @@ pub fn validateSegmentedHistory(
         .history_rows = &rows,
         .parameters = parameters,
         .protocol_required = protocol_required,
+        .lifetime_protocol = true,
         .max_records = std.math.maxInt(usize),
         .observer = eraseReplayObserver(&observer),
         .checkpoint_records = std.math.cast(
@@ -215,12 +224,16 @@ pub fn validateSegmentedHistory(
         bindings.deinit(allocator);
     };
     defer if (validator.protocol_state) |*state| state.deinit(allocator);
+    if (validator.checkpoint_records.? == 0) {
+        try validator.verifyCheckpoint();
+    }
     var events = segmented_event_log.EventHistoryIterator{
         .allocator = allocator,
         .snapshot = snapshot,
     };
     while (try events.next()) |bytes| {
         defer allocator.free(bytes);
+        if (bytes.len == 0) continue;
         var backend = try activeMemoryStore(
             allocator,
             slot.relative_path,
@@ -760,6 +773,7 @@ const HistoryRowCursor = struct {
         snapshot: *const segmented_event_log.Snapshot,
         definition_id: []const u8,
         slot: storage.ResolvedSlot,
+        accepted_genesis_revision: []const u8,
     ) HistoryRowCursor {
         return .{
             .allocator = allocator,
@@ -770,6 +784,7 @@ const HistoryRowCursor = struct {
                 .definition_id = definition_id,
                 .slot_name = slot.name,
                 .logical_path = slot.relative_path,
+                .accepted_genesis_revision = accepted_genesis_revision,
             },
         };
     }
@@ -804,15 +819,18 @@ const HistoryRowCursor = struct {
                 self.current_row = try self.reader.parseRow(line);
                 return;
             }
-            if (self.segment.len != 0) self.allocator.free(self.segment);
-            self.segment = (try self.history.next()) orelse {
+            if (self.segment.len != 0) {
+                self.allocator.free(self.segment);
+                self.segment = &.{};
+            }
+            const next = (try self.history.next()) orelse {
                 self.exhausted = true;
                 break;
             };
+            if (next.len == 0) continue;
+            self.segment = next;
             self.offset = 0;
-            if (self.segment.len == 0 or
-                self.segment[self.segment.len - 1] != '\n')
-            {
+            if (self.segment[self.segment.len - 1] != '\n') {
                 return error.InvalidSegmentedBindingHistory;
             }
         }
@@ -845,6 +863,7 @@ const StreamEventValidator = struct {
     history_rows: ?*HistoryRowCursor = null,
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
+    lifetime_protocol: bool = false,
     max_records: usize,
     observer: ReplayObserver,
     row_index: usize = 0,
@@ -966,6 +985,7 @@ const StreamEventValidator = struct {
             self.row_parameters orelse
                 return error.StoreBindingRecordRangeMissing,
             row.kind == .admission,
+            self.lifetime_protocol,
             &self.observer,
         );
         if (record_index + 1 == end) {
@@ -977,7 +997,7 @@ const StreamEventValidator = struct {
     }
 
     fn verifyCheckpoint(self: *StreamEventValidator) !void {
-        if (self.resolved_effect != null or self.protocol_state == null) {
+        if (self.resolved_effect != null) {
             return error.SegmentedCheckpointRecordMismatch;
         }
         var identity = try protocol.decodeCheckpoint(
@@ -991,6 +1011,9 @@ const StreamEventValidator = struct {
             value
         else
             return error.HistoricalProtocolBindingMismatch;
+        if (self.protocol_state == null) {
+            self.protocol_state = protocol.ReplayState.init(plan);
+        }
         try protocol.activateCheckpoint(
             self.allocator,
             plan,
@@ -1593,6 +1616,7 @@ fn validateExistingEvents(
             record,
             parameters,
             false,
+            false,
             observer,
         );
     }
@@ -1625,6 +1649,7 @@ fn validateAdmittedEvents(
                 content[row.extent_start..row.extent_end],
                 parameters,
                 true,
+                false,
                 observer,
             );
         },
@@ -1719,6 +1744,7 @@ fn validateEventInput(
     bytes: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     require_canonical: bool,
+    lifetime_protocol: bool,
     observer: anytype,
 ) !void {
     const input =
@@ -1738,6 +1764,7 @@ fn validateEventInput(
             bytes,
             parameters,
             require_canonical,
+            lifetime_protocol,
             observer,
         );
     }
@@ -1750,6 +1777,7 @@ fn validateEventInput(
         bytes,
         parameters,
         require_canonical,
+        lifetime_protocol,
         observer,
     );
 }
@@ -1772,6 +1800,7 @@ fn validateMaterializedEvent(
     bytes: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     require_canonical: bool,
+    lifetime_protocol: bool,
     observer: anytype,
 ) !void {
     var parsed = try std.json.parseFromSlice(
@@ -1809,13 +1838,23 @@ fn validateMaterializedEvent(
     defer execution.deinit();
     if (!execution.isValid()) return error.HistoricalArtifactInvalid;
     if (historical_plan) |plan| {
-        try protocol.applyValueBound(
-            allocator,
-            plan,
-            &protocol_state.*.?,
-            parsed.value,
-            parameters,
-        );
+        if (lifetime_protocol) {
+            try protocol.applyValueFullHistory(
+                allocator,
+                plan,
+                &protocol_state.*.?,
+                parsed.value,
+                parameters,
+            );
+        } else {
+            try protocol.applyValueBound(
+                allocator,
+                plan,
+                &protocol_state.*.?,
+                parsed.value,
+                parameters,
+            );
+        }
     }
     try notifyObserver(
         observer,
@@ -1896,6 +1935,7 @@ fn validateRawEvent(
     bytes: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     require_canonical: bool,
+    lifetime_protocol: bool,
     observer: anytype,
 ) !void {
     var execution = try validation.execute(
@@ -1923,13 +1963,23 @@ fn validateRawEvent(
         if (protocol_state.* == null) {
             protocol_state.* = protocol.ReplayState.init(plan);
         }
-        try protocol.applyValueBound(
-            allocator,
-            plan,
-            &protocol_state.*.?,
-            event,
-            parameters,
-        );
+        if (lifetime_protocol) {
+            try protocol.applyValueFullHistory(
+                allocator,
+                plan,
+                &protocol_state.*.?,
+                event,
+                parameters,
+            );
+        } else {
+            try protocol.applyValueBound(
+                allocator,
+                plan,
+                &protocol_state.*.?,
+                event,
+                parameters,
+            );
+        }
         try notifyObserver(
             observer,
             event,
