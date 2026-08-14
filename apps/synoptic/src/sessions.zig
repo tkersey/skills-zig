@@ -1050,6 +1050,28 @@ pub const Registry = struct {
         return error.UnknownApproval;
     }
 
+    pub fn pendingApprovalsJsonAlloc(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try out.writer.writeByte('[');
+        var count: usize = 0;
+        for (self.approvals.items) |approval| {
+            if (approval.state != .pending) continue;
+            if (count > 0) try out.writer.writeByte(',');
+            const payload = try self.approvalRequestedPayloadLocked(approval);
+            defer self.allocator.free(payload);
+            try out.writer.writeAll(payload);
+            count += 1;
+        }
+        try out.writer.writeByte(']');
+        return out.toOwnedSlice();
+    }
+
     pub fn declineAllApprovals(self: *Registry, reason: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -4331,6 +4353,32 @@ test "command approvals accept exact offered decisions only" {
         error.ApprovalAlreadyResolved,
         registry.resolveApproval("ses-1", "apr-1", "\"accept\""),
     );
+}
+
+test "pending approval snapshot includes only unresolved authority" {
+    var registry = Registry{ .allocator = std.heap.page_allocator, .io = std.testing.io };
+    defer registry.deinit();
+    try appendApprovalTestSession(&registry, "ses-1", "file-1");
+    var invocation = ApprovalInvocation{
+        .registry = &registry,
+        .method = "item/commandExecution/requestApproval",
+        .raw = "{\"id\":7,\"method\":\"item/commandExecution/requestApproval\"," ++
+            "\"params\":{\"threadId\":\"file-1\",\"turnId\":\"turn\"," ++
+            "\"itemId\":\"cmd\",\"startedAtMs\":1,\"command\":\"make test\"," ++
+            "\"availableDecisions\":[\"accept\",\"decline\"]}}",
+    };
+    const thread = try std.Thread.spawn(.{}, ApprovalInvocation.run, .{&invocation});
+    try waitForApproval(&registry);
+    const pending = try registry.pendingApprovalsJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"approvalId\":\"apr-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "\"sessionId\":\"ses-1\"") != null);
+    try registry.resolveApproval("ses-1", "apr-1", "\"decline\"");
+    thread.join();
+    defer if (invocation.response) |response| std.heap.page_allocator.free(response);
+    const resolved = try registry.pendingApprovalsJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("[]", resolved);
 }
 
 test "command approval without offered decisions fails closed to decline" {

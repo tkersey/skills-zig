@@ -806,12 +806,11 @@ pub const Broker = struct {
             results,
         );
         if (readback == .generation_changed) {
-            self.compensateViewedBatchGeneration(
-                pull_request_id,
-                requests,
-                mutation_may_have_reached,
-                results,
-            );
+            for (results, mutation_may_have_reached) |*result, may_have_reached| {
+                result.viewed = false;
+                result.outcome_unknown = may_have_reached;
+                result.error_name = @errorName(error.PullRequestChanged);
+            }
         }
         return results;
     }
@@ -915,42 +914,6 @@ pub const Broker = struct {
         return .current;
     }
 
-    fn compensateViewedBatchGeneration(
-        self: Broker,
-        pull_request_id: []const u8,
-        requests: []const ViewedBatchRequest,
-        mutation_may_have_reached: []const bool,
-        results: []ViewedBatchResult,
-    ) void {
-        var compensation = self;
-        compensation.cancelled = null;
-        compensation.stop_cancelled = null;
-        for (requests, mutation_may_have_reached, results) |request, may_reach, *result| {
-            result.viewed = false;
-            result.error_name = @errorName(error.PullRequestChanged);
-            result.outcome_unknown = false;
-            if (!may_reach) continue;
-            const client_id = std.fmt.allocPrint(
-                self.allocator,
-                "{s}-generation-compensation",
-                .{request.client_id},
-            ) catch |err| {
-                result.error_name = @errorName(err);
-                result.outcome_unknown = true;
-                continue;
-            };
-            defer self.allocator.free(client_id);
-            compensation.unmarkViewedWithId(
-                pull_request_id,
-                request.path,
-                client_id,
-            ) catch |err| {
-                result.error_name = @errorName(err);
-                result.outcome_unknown = true;
-            };
-        }
-    }
-
     pub fn synchronizeViewed(
         self: Broker,
         owner: []const u8,
@@ -988,22 +951,10 @@ pub const Broker = struct {
             path,
         ) catch |err| {
             if (err == error.PullRequestChanged) {
-                const request = [_]ViewedBatchRequest{.{
-                    .path = path,
-                    .client_id = client_id,
-                }};
-                var result = [_]ViewedBatchResult{.{ .error_name = mutation_error }};
-                const may_reach = [_]bool{mutation_may_have_reached};
-                self.compensateViewedBatchGeneration(
-                    pull_request_id,
-                    &request,
-                    &may_reach,
-                    &result,
-                );
                 return .{
                     .viewed = false,
-                    .error_name = result[0].error_name,
-                    .outcome_unknown = result[0].outcome_unknown,
+                    .error_name = @errorName(error.PullRequestChanged),
+                    .outcome_unknown = mutation_may_have_reached,
                 };
             }
             return .{

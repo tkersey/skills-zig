@@ -570,8 +570,11 @@ pub const Server = struct {
                 const mutex = domainMutex(runtime);
                 mutex.lock();
                 defer mutex.unlock();
-                runtime.app.synchronizeTabTurnStates(runtime.registry);
-                break :body try runtime.app.bootstrapAlloc();
+                break :body try bootstrapBodyLockedAlloc(
+                    self.allocator,
+                    runtime.app,
+                    runtime.registry,
+                );
             };
             defer self.allocator.free(body);
             return writeResponse(self.io, stream, "200 OK", "application/json", body, true);
@@ -1065,13 +1068,32 @@ pub const Server = struct {
         return snapshotEnvelopeLockedAlloc(self.allocator, runtime.app, runtime.registry);
     }
 
-    fn snapshotEnvelopeLockedAlloc(
+    fn bootstrapBodyLockedAlloc(
         allocator: std.mem.Allocator,
         app: *App,
         registry: *sessions.Registry,
     ) ![]u8 {
         app.synchronizeTabTurnStates(registry);
-        const body = try app.bootstrapAlloc();
+        const base = try app.bootstrapAlloc();
+        defer allocator.free(base);
+        if (base.len == 0 or base[base.len - 1] != '}') return error.InvalidBootstrap;
+        const approvals = try registry.pendingApprovalsJsonAlloc(allocator);
+        defer allocator.free(approvals);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try out.writer.writeAll(base[0 .. base.len - 1]);
+        try out.writer.writeAll(",\"approvals\":");
+        try out.writer.writeAll(approvals);
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
+    fn snapshotEnvelopeLockedAlloc(
+        allocator: std.mem.Allocator,
+        app: *App,
+        registry: *sessions.Registry,
+    ) ![]u8 {
+        const body = try bootstrapBodyLockedAlloc(allocator, app, registry);
         defer allocator.free(body);
         return app.nextEnvelope("snapshot", body);
     }

@@ -210,6 +210,7 @@ pub const App = struct {
     action_state_fresh: bool = true,
     file_review_start_mode: config.FileReviewStartMode = .immediate,
     pull_request: ?domain.OwnedPullRequestHeader = null,
+    ambiguous_viewed_paths: std.ArrayList([]u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, head: []const u8) !App {
         return .{
@@ -230,10 +231,13 @@ pub const App = struct {
             self.allocator.free(tab.diff);
         }
         self.tabs.deinit(self.allocator);
+        for (self.ambiguous_viewed_paths.items) |path| self.allocator.free(path);
+        self.ambiguous_viewed_paths.deinit(self.allocator);
         self.action_store.deinit();
     }
 
     pub fn replaceGeneration(self: *App, next: domain.PrGeneration) void {
+        self.reconcileAmbiguousViewedPaths(&next);
         self.generation.deinit();
         self.generation = next;
         for (self.tabs.items) |*tab| {
@@ -301,6 +305,7 @@ pub const App = struct {
         if (self.pull_request) |*old| old.deinit();
         self.pull_request = plan.header;
         plan.committed = true;
+        self.reconcileAmbiguousViewedPaths(&next);
         self.generation.deinit();
         self.generation = next;
         for (plan.tabs.items) |*update| {
@@ -792,17 +797,23 @@ pub const App = struct {
             client_id,
         );
         if (!synchronized.viewed) {
-            if (synchronized.outcome_unknown) {
-                self.action_state_fresh = false;
-                return error.GitHubTransportAmbiguous;
-            }
             if (synchronized.error_name) |error_name| {
                 if (std.mem.eql(u8, error_name, @errorName(error.PullRequestChanged))) {
+                    if (synchronized.outcome_unknown) {
+                        try self.quarantineViewedPath(path);
+                        self.action_state_fresh = false;
+                    }
                     return error.PullRequestChanged;
                 }
             }
+            if (synchronized.outcome_unknown) {
+                try self.quarantineViewedPath(path);
+                self.action_state_fresh = false;
+                return error.GitHubTransportAmbiguous;
+            }
             return error.MarkViewedReadbackFailed;
         }
+        self.clearViewedQuarantine(path);
         try self.generation.markViewed(path);
         for (self.tabs.items) |*tab| {
             if (std.mem.eql(u8, tab.path, path) and std.mem.eql(u8, tab.revision, revision) and
@@ -936,6 +947,7 @@ pub const App = struct {
         outcomes: *std.ArrayList(ExclusionOutcome),
     ) !void {
         for (candidates, results) |candidate, result| {
+            if (result.outcome_unknown) try self.quarantineViewedPath(candidate.path);
             const applied = try self.recordAutomaticExclusion(
                 candidate.path,
                 candidate.revision,
@@ -953,6 +965,46 @@ pub const App = struct {
                     result.error_name,
                 ),
             );
+        }
+    }
+
+    fn quarantineViewedPath(self: *App, path: []const u8) !void {
+        for (self.ambiguous_viewed_paths.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) return;
+        }
+        try self.ambiguous_viewed_paths.append(
+            self.allocator,
+            try self.allocator.dupe(u8, path),
+        );
+    }
+
+    fn clearViewedQuarantine(self: *App, path: []const u8) void {
+        for (self.ambiguous_viewed_paths.items, 0..) |existing, index| {
+            if (!std.mem.eql(u8, existing, path)) continue;
+            self.allocator.free(self.ambiguous_viewed_paths.orderedRemove(index));
+            return;
+        }
+    }
+
+    fn reconcileAmbiguousViewedPaths(self: *App, next: *const domain.PrGeneration) void {
+        var index: usize = 0;
+        while (index < self.ambiguous_viewed_paths.items.len) {
+            const path = self.ambiguous_viewed_paths.items[index];
+            var file_index: ?usize = null;
+            for (next.files.items, 0..) |file, candidate_index| {
+                if (std.mem.eql(u8, file.path, path)) {
+                    file_index = candidate_index;
+                    break;
+                }
+            }
+            if (file_index) |candidate_index| {
+                if (next.files.items[candidate_index].viewed == .viewed) {
+                    next.files.items[candidate_index].viewed = .dismissed;
+                    index += 1;
+                    continue;
+                }
+            }
+            self.allocator.free(self.ambiguous_viewed_paths.orderedRemove(index));
         }
     }
 

@@ -3546,7 +3546,7 @@ test "exclusions config mutation readback and failure retention across generatio
     );
 }
 
-test "viewed mutation crossing generation compensates before reporting changed" {
+test "viewed mutation crossing generation remains quarantined without inverse mutation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3631,12 +3631,12 @@ fn verifyViewedBatchRace(
     );
     defer allocator.free(results);
     try std.testing.expectEqualStrings("PullRequestChanged", results[0].error_name.?);
-    try std.testing.expect(!results[0].outcome_unknown);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "viewed", .{}));
+    try std.testing.expect(results[0].outcome_unknown);
+    try tmp.dir.access(io, "viewed", .{});
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
 }
 
@@ -3674,7 +3674,7 @@ fn verifyCompletionRace(
         ),
     );
     try std.testing.expect(state.generation.queued("a.zig"));
-    try std.testing.expect(state.action_state_fresh);
+    try std.testing.expect(!state.action_state_fresh);
     const final_log = try std.Io.Dir.cwd().readFileAlloc(
         io,
         log_path,
@@ -3687,9 +3687,34 @@ fn verifyCompletionRace(
         std.mem.count(u8, final_log, "SynopticMarkFileViewed"),
     );
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 0),
         std.mem.count(u8, final_log, "SynopticUnmarkFileViewed"),
     );
+
+    var viewed = try domain.PrGeneration.initFull(allocator, "new", "next");
+    try viewed.addFile(.{
+        .path = "a.zig",
+        .viewed = .viewed,
+        .revision_key = "r2",
+    });
+    state.replaceGeneration(viewed);
+    try std.testing.expect(state.generation.queued("a.zig"));
+
+    var unviewed = try domain.PrGeneration.initFull(allocator, "new", "next-2");
+    try unviewed.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r3",
+    });
+    state.replaceGeneration(unviewed);
+    var externally_viewed = try domain.PrGeneration.initFull(allocator, "new", "next-3");
+    try externally_viewed.addFile(.{
+        .path = "a.zig",
+        .viewed = .viewed,
+        .revision_key = "r4",
+    });
+    state.replaceGeneration(externally_viewed);
+    try std.testing.expect(!state.generation.queued("a.zig"));
 }
 
 fn installViewedRaceGh(
