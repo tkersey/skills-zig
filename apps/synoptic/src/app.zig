@@ -825,6 +825,12 @@ pub const App = struct {
     pub fn closeTabById(self: *App, session_id: []const u8) !void {
         for (self.tabs.items, 0..) |tab, index| {
             if (!std.mem.eql(u8, tab.id, session_id) or tab.status == .closed) continue;
+            _ = self.action_store.invalidatePendingForSession(session_id);
+            if (self.pending) |pending| if (std.mem.eql(u8, pending.session_id, session_id) and
+                pending.status == .pending)
+            {
+                self.pending.?.status = .invalidated;
+            };
             const removed = self.tabs.orderedRemove(index);
             self.allocator.free(removed.id);
             self.allocator.free(removed.path);

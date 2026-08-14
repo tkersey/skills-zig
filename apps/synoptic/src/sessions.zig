@@ -20,6 +20,7 @@ const unresolved_thread_search_paths_bytes_max: usize = 64 * 1024;
 const max_approval_records: usize = 64;
 const max_approval_decisions: usize = 16;
 const max_approval_request_bytes: usize = 512 * 1024;
+const app_server_request_frame_reserve_bytes: usize = 4096;
 const safe_boundary_quiescence_ms: u32 = 50;
 const review_execution_fields =
     "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"";
@@ -60,6 +61,12 @@ fn boundedThreadEvidenceAlloc(
             "proposing a duplicate concern.\"}}",
         .{ threads_json.len, digest },
     );
+}
+
+fn ensureAppServerParamsFit(params: []const u8) !void {
+    const limit = cas_runtime.websocket.max_message_bytes -
+        app_server_request_frame_reserve_bytes;
+    if (params.len > limit) return error.AppServerRequestTooLarge;
 }
 
 fn authoritativeToolEventKind(tool: []const u8) ?[]const u8 {
@@ -745,6 +752,7 @@ pub const Registry = struct {
             },
         );
         defer self.allocator.free(turn_params);
+        try ensureAppServerParamsFit(turn_params);
         const turn = try actor.requestJson("turn/start", turn_params, null);
         defer self.allocator.free(turn);
         const primary_turn = try extractString(self.allocator, turn, &.{ "turn", "id" });
@@ -1357,6 +1365,7 @@ pub const Registry = struct {
             },
         );
         defer self.allocator.free(turn_params);
+        try ensureAppServerParamsFit(turn_params);
         const turn = try actor.requestJson("turn/start", turn_params, null);
         defer self.allocator.free(turn);
         return extractString(
@@ -1455,6 +1464,7 @@ pub const Registry = struct {
                 ), std.json.fmt(target.turn_id, .{}), std.json.fmt(combined, .{}) },
             );
         defer self.allocator.free(params);
+        try ensureAppServerParamsFit(params);
         const response = actor.requestJson(method, params, null) catch |err| {
             if (target.active and !first_turn and err == error.RequestFailed and
                 self.waitForTurnCompletion(target.turn_id, 250))
@@ -1530,6 +1540,7 @@ pub const Registry = struct {
             .{ std.json.fmt(thread_id, .{}), std.json.fmt(text, .{}) },
         );
         defer self.allocator.free(params);
+        try ensureAppServerParamsFit(params);
         const response = try actor.requestJson("turn/start", params, null);
         defer self.allocator.free(response);
         try self.recordStartedTurn(session_id, response);
@@ -1783,6 +1794,7 @@ pub const Registry = struct {
             .{ std.json.fmt(thread, .{}), std.json.fmt(injected_text, .{}) },
         );
         defer self.allocator.free(params);
+        try ensureAppServerParamsFit(params);
         const response = try actor.requestJson("thread/inject_items", params, null);
         defer self.allocator.free(response);
         self.mutex.lock();
@@ -1815,6 +1827,7 @@ pub const Registry = struct {
             ), std.json.fmt(summary, .{}) },
         );
         defer self.allocator.free(params);
+        try ensureAppServerParamsFit(params);
         const response = try actor.requestJson("turn/start", params, null);
         defer self.allocator.free(response);
         const next_turn = try extractString(self.allocator, response, &.{ "turn", "id" });
@@ -1842,6 +1855,7 @@ pub const Registry = struct {
                 .{ std.json.fmt(thread_id, .{}), std.json.fmt(text, .{}) },
             );
             defer self.allocator.free(params);
+            try ensureAppServerParamsFit(params);
             const response = try actor.requestJson("thread/inject_items", params, null);
             defer self.allocator.free(response);
         }
@@ -4593,5 +4607,20 @@ test "thread construction fixes review execution to read-only" {
     try std.testing.expectEqualStrings(
         "\"approvalPolicy\":\"on-request\",\"sandbox\":\"read-only\"",
         review_execution_fields,
+    );
+}
+
+test "app-server request preflight reserves JSON-RPC framing capacity" {
+    const allocator = std.testing.allocator;
+    const limit = cas_runtime.websocket.max_message_bytes -
+        app_server_request_frame_reserve_bytes;
+    const admitted = try allocator.alloc(u8, limit);
+    defer allocator.free(admitted);
+    try ensureAppServerParamsFit(admitted);
+    const rejected = try allocator.alloc(u8, limit + 1);
+    defer allocator.free(rejected);
+    try std.testing.expectError(
+        error.AppServerRequestTooLarge,
+        ensureAppServerParamsFit(rejected),
     );
 }

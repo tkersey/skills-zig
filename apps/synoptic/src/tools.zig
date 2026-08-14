@@ -646,6 +646,16 @@ pub const ActionStore = struct {
         const card = try self.pendingById(id);
         card.status = .invalidated;
     }
+    pub fn invalidatePendingForSession(self: *ActionStore, session_id: []const u8) usize {
+        var invalidated: usize = 0;
+        for (self.cards.items) |*card| {
+            if (card.status != .pending or
+                !std.mem.eql(u8, card.session_id, session_id)) continue;
+            card.status = .invalidated;
+            invalidated += 1;
+        }
+        return invalidated;
+    }
     pub fn setTerminal(self: *ActionStore, id: []const u8, status: ActionStatus) !void {
         if (status != .succeeded and status != .failed and status != .outcome_unknown and
             status != .invalidated) return error.InvalidTerminalStatus;

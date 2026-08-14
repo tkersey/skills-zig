@@ -127,6 +127,9 @@ pub const ToolDomainContext = struct {
         defer self.cancelled.store(false, .release);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.cancelled.load(.acquire) or self.stop_cancelled.load(.acquire)) {
+            return error.AuthoritativeRequestCancelled;
+        }
         if (std.mem.eql(u8, event_kind, "action.prepared")) {
             const card = try self.prepareAction(raw_json, session_id);
             return std.fmt.allocPrint(
@@ -2291,7 +2294,7 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
     try std.testing.expect(context.cancelled.load(.acquire));
     try std.testing.expect(context.broker.cancelled.?.load(.acquire));
     try std.testing.expectError(
-        error.UnsupportedAuthoritativeTool,
+        error.AuthoritativeRequestCancelled,
         handler.handle(
             handler.context,
             "unsupported",
@@ -2303,7 +2306,7 @@ test "tool-domain server cancellation reaches in-flight GitHub effects" {
     try std.testing.expect(!context.cancelled.load(.acquire));
     context.cancelForStop();
     try std.testing.expectError(
-        error.UnsupportedAuthoritativeTool,
+        error.AuthoritativeRequestCancelled,
         handler.handle(
             handler.context,
             "unsupported",

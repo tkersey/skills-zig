@@ -2459,6 +2459,46 @@ test "ambiguous complete-file mutation succeeds only through viewed readback" {
     try std.testing.expect(std.mem.indexOf(u8, closed, "\"completedTabOpen\":false") != null);
 }
 
+test "closing a file session invalidates its pending action cards" {
+    const allocator = std.testing.allocator;
+    var state = try app.App.init(allocator, "head");
+    defer state.deinit();
+    try state.generation.addFile(.{
+        .path = "a.zig",
+        .viewed = .unviewed,
+        .revision_key = "r1",
+    });
+    state.primary_ready = true;
+    const opened = try state.openFile("a.zig");
+    allocator.free(opened);
+    try state.recordOpenedSession("a.zig", "r1", "session-1", "", false, true);
+    const card = try state.action_store.prepare("session-1", "turn-1", .{
+        .slot = @constCast("finding"),
+        .kind = .add_inline_comment,
+        .effect_summary = @constCast("Comment on a.zig"),
+        .payload_json = @constCast("{}"),
+        .path = @constCast("a.zig"),
+        .line = 1,
+        .body = @constCast("body"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "base",
+        .head_oid = "head",
+        .session_path = "a.zig",
+        .current_path = "a.zig",
+    });
+    const card_id = try allocator.dupe(u8, card.id);
+    defer allocator.free(card_id);
+    try state.closeTabById("session-1");
+    try std.testing.expectError(error.ActionNotPending, state.action_store.pendingById(card_id));
+    try std.testing.expectEqual(
+        tools.ActionStatus.invalidated,
+        (try state.action_store.byId(card_id)).status,
+    );
+}
+
 fn verifyAmbiguousActions(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2888,7 +2928,7 @@ test "process stop cancellation survives request-local cleanup" {
     defer context.handler().deinit.?(context.handler().context);
     context.cancelForStop();
     try std.testing.expectError(
-        error.UnsupportedAuthoritativeTool,
+        error.AuthoritativeRequestCancelled,
         context.handler().handle(
             context.handler().context,
             "unsupported",
@@ -3506,7 +3546,7 @@ test "exclusions config mutation readback and failure retention across generatio
     );
 }
 
-test "viewed mutation crossing generation preserves external state and stays locally unknown" {
+test "viewed mutation crossing generation compensates before reporting changed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3590,13 +3630,13 @@ fn verifyViewedBatchRace(
         &requests,
     );
     defer allocator.free(results);
-    try std.testing.expectEqualStrings("GitHubTransportAmbiguous", results[0].error_name.?);
-    try std.testing.expect(results[0].outcome_unknown);
-    try tmp.dir.access(io, "viewed", .{});
+    try std.testing.expectEqualStrings("PullRequestChanged", results[0].error_name.?);
+    try std.testing.expect(!results[0].outcome_unknown);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "viewed", .{}));
     const log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(64 * 1024));
     defer allocator.free(log);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticMarkFileViewed"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "SynopticUnmarkFileViewed"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "SynopticFileState"));
 }
 
@@ -3622,7 +3662,7 @@ fn verifyCompletionRace(
     allocator.free(opened);
     try state.recordOpenedSession("a.zig", "r1", "session-race", "", false, true);
     try std.testing.expectError(
-        error.GitHubTransportAmbiguous,
+        error.PullRequestChanged,
         state.completeRevision(
             broker,
             "o",
@@ -3634,7 +3674,7 @@ fn verifyCompletionRace(
         ),
     );
     try std.testing.expect(state.generation.queued("a.zig"));
-    try std.testing.expect(!state.action_state_fresh);
+    try std.testing.expect(state.action_state_fresh);
     const final_log = try std.Io.Dir.cwd().readFileAlloc(
         io,
         log_path,
@@ -3647,7 +3687,7 @@ fn verifyCompletionRace(
         std.mem.count(u8, final_log, "SynopticMarkFileViewed"),
     );
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 2),
         std.mem.count(u8, final_log, "SynopticUnmarkFileViewed"),
     );
 }

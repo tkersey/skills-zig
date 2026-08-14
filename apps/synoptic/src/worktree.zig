@@ -2494,10 +2494,11 @@ fn waitBoundedProcess(
         .termination_grace_ms = termination_grace_ms,
     };
     const watchdog_thread = try std.Thread.spawn(.{}, FetchWatchdog.run, .{&watchdog});
-    defer {
+    var watchdog_joined = false;
+    defer if (!watchdog_joined) {
         watchdog.finished.store(true, .release);
         watchdog_thread.join();
-    }
+    };
     var stdout_capture = FetchPipeCapture{
         .allocator = allocator,
         .io = io,
@@ -2531,6 +2532,11 @@ fn waitBoundedProcess(
     };
     stdout_thread.join();
     stderr_thread.join();
+    // Keep the group leader unreaped until timeout escalation has finished so
+    // its PID/PGID cannot be reused before the watchdog's final signal.
+    watchdog.finished.store(true, .release);
+    watchdog_thread.join();
+    watchdog_joined = true;
     defer if (stdout_capture.bytes) |bytes| allocator.free(bytes);
     defer if (stderr_capture.bytes) |bytes| allocator.free(bytes);
     if (stdout_capture.failure) |err| return err;

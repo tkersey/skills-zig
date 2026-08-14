@@ -749,6 +749,14 @@ pub const Broker = struct {
         outcome_unknown: bool = false,
     };
 
+    fn viewedMutationMayHaveReached(error_name: ?[]const u8) bool {
+        return error_name == null or std.mem.eql(
+            u8,
+            error_name.?,
+            @errorName(error.GitHubTransportAmbiguous),
+        );
+    }
+
     /// Reconcile one automatic-exclusion generation with two paginated reads:
     /// one admission read before any effect, then one uncancelled readback.
     pub fn synchronizeViewedBatch(
@@ -782,7 +790,12 @@ pub const Broker = struct {
             requests,
             null,
         );
+        const mutation_may_have_reached = try self.allocator.alloc(bool, results.len);
+        defer self.allocator.free(mutation_may_have_reached);
         self.markViewedBatch(pull_request_id, requests, results);
+        for (results, mutation_may_have_reached) |result, *may_have_reached| {
+            may_have_reached.* = viewedMutationMayHaveReached(result.error_name);
+        }
         const readback = try self.readbackViewedBatch(
             owner,
             name,
@@ -793,11 +806,12 @@ pub const Broker = struct {
             results,
         );
         if (readback == .generation_changed) {
-            for (results) |*result| {
-                result.viewed = false;
-                result.error_name = @errorName(error.GitHubTransportAmbiguous);
-                result.outcome_unknown = true;
-            }
+            self.compensateViewedBatchGeneration(
+                pull_request_id,
+                requests,
+                mutation_may_have_reached,
+                results,
+            );
         }
         return results;
     }
@@ -901,6 +915,42 @@ pub const Broker = struct {
         return .current;
     }
 
+    fn compensateViewedBatchGeneration(
+        self: Broker,
+        pull_request_id: []const u8,
+        requests: []const ViewedBatchRequest,
+        mutation_may_have_reached: []const bool,
+        results: []ViewedBatchResult,
+    ) void {
+        var compensation = self;
+        compensation.cancelled = null;
+        compensation.stop_cancelled = null;
+        for (requests, mutation_may_have_reached, results) |request, may_reach, *result| {
+            result.viewed = false;
+            result.error_name = @errorName(error.PullRequestChanged);
+            result.outcome_unknown = false;
+            if (!may_reach) continue;
+            const client_id = std.fmt.allocPrint(
+                self.allocator,
+                "{s}-generation-compensation",
+                .{request.client_id},
+            ) catch |err| {
+                result.error_name = @errorName(err);
+                result.outcome_unknown = true;
+                continue;
+            };
+            defer self.allocator.free(client_id);
+            compensation.unmarkViewedWithId(
+                pull_request_id,
+                request.path,
+                client_id,
+            ) catch |err| {
+                result.error_name = @errorName(err);
+                result.outcome_unknown = true;
+            };
+        }
+    }
+
     pub fn synchronizeViewed(
         self: Broker,
         owner: []const u8,
@@ -928,6 +978,7 @@ pub const Broker = struct {
         self.markViewedWithId(pull_request_id, path, client_id) catch |err| {
             mutation_error = @errorName(err);
         };
+        const mutation_may_have_reached = viewedMutationMayHaveReached(mutation_error);
         const viewed = reconciliation.viewedAfterMutation(
             owner,
             name,
@@ -937,28 +988,30 @@ pub const Broker = struct {
             path,
         ) catch |err| {
             if (err == error.PullRequestChanged) {
+                const request = [_]ViewedBatchRequest{.{
+                    .path = path,
+                    .client_id = client_id,
+                }};
+                var result = [_]ViewedBatchResult{.{ .error_name = mutation_error }};
+                const may_reach = [_]bool{mutation_may_have_reached};
+                self.compensateViewedBatchGeneration(
+                    pull_request_id,
+                    &request,
+                    &may_reach,
+                    &result,
+                );
                 return .{
                     .viewed = false,
-                    .error_name = @errorName(error.GitHubTransportAmbiguous),
-                    .outcome_unknown = true,
+                    .error_name = result[0].error_name,
+                    .outcome_unknown = result[0].outcome_unknown,
                 };
             }
-            const mutation_may_have_reached = mutation_error == null or std.mem.eql(
-                u8,
-                mutation_error.?,
-                @errorName(error.GitHubTransportAmbiguous),
-            );
             return .{
                 .viewed = false,
                 .error_name = @errorName(err),
                 .outcome_unknown = mutation_may_have_reached,
             };
         };
-        const mutation_may_have_reached = mutation_error == null or std.mem.eql(
-            u8,
-            mutation_error.?,
-            @errorName(error.GitHubTransportAmbiguous),
-        );
         return .{
             .viewed = viewed,
             .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
