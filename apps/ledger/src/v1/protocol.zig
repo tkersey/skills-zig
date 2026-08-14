@@ -8,9 +8,12 @@ const checkpoint = @import("checkpoint.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 
 const max_event_kinds: usize = 256;
+const checkpoint_schema_v1 = "ledger-replay-checkpoint/v1";
+const checkpoint_schema_v2 = "ledger-replay-checkpoint/v2";
 const replay_checkpoint_base_bytes: usize =
-    8 + checkpoint_schema.len +
+    8 + checkpoint_schema_v2.len +
     8 + 71 +
+    8 + 32 +
     8 +
     1 + 8 + 71 +
     8 +
@@ -135,12 +138,18 @@ pub const ReplayState = struct {
     has_previous_digest: bool = false,
     kind_counts: [max_event_kinds]usize =
         [_]usize{0} ** max_event_kinds,
+    event_kinds_digest: [32]u8 = [_]u8{0} ** 32,
+    has_event_kinds_digest: bool = false,
     records: usize = 0,
     reducer_state: reducer.State = .{},
     state_reducer_state: state_reducer.State = .{},
 
     pub fn init(plan: *const Plan) ReplayState {
-        return .{ .next_sequence = plan.sequence_start };
+        return .{
+            .next_sequence = plan.sequence_start,
+            .event_kinds_digest = eventKindsDigest(plan.event_kinds),
+            .has_event_kinds_digest = true,
+        };
     }
 
     pub fn deinit(self: *ReplayState, allocator: std.mem.Allocator) void {
@@ -192,13 +201,35 @@ pub const DecodedCheckpoint = struct {
     }
 };
 
-const checkpoint_schema = "ledger-replay-checkpoint/v1";
+const CheckpointHeader = struct {
+    definition_digest: [71]u8,
+    has_event_kinds_digest: bool,
+};
 
-fn readCheckpointDefinitionDigest(
+fn eventKindsDigest(kinds: []const []u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(kinds.len), .big);
+    hash.update(&length);
+    for (kinds) |kind| {
+        std.mem.writeInt(u64, &length, @intCast(kind.len), .big);
+        hash.update(&length);
+        hash.update(kind);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn readCheckpointHeader(
     decoder: *checkpoint.Decoder,
-) ![71]u8 {
-    const schema = try decoder.readBytes(checkpoint_schema.len);
-    if (!std.mem.eql(u8, schema, checkpoint_schema)) {
+) !CheckpointHeader {
+    const schema = try decoder.readBytes(checkpoint_schema_v2.len);
+    const has_event_kinds_digest =
+        std.mem.eql(u8, schema, checkpoint_schema_v2);
+    if (!has_event_kinds_digest and
+        !std.mem.eql(u8, schema, checkpoint_schema_v1))
+    {
         return error.UnsupportedReplayCheckpoint;
     }
     const source = try decoder.readBytes(71);
@@ -206,12 +237,15 @@ fn readCheckpointDefinitionDigest(
         return error.InvalidReplayCheckpoint;
     var digest: [71]u8 = undefined;
     @memcpy(&digest, source);
-    return digest;
+    return .{
+        .definition_digest = digest,
+        .has_event_kinds_digest = has_event_kinds_digest,
+    };
 }
 
 pub fn checkpointDefinitionDigest(bytes: []const u8) ![71]u8 {
     var decoder = try checkpoint.Decoder.init(bytes);
-    return readCheckpointDefinitionDigest(&decoder);
+    return (try readCheckpointHeader(&decoder)).definition_digest;
 }
 
 pub fn encodeCheckpointAlloc(
@@ -222,8 +256,9 @@ pub fn encodeCheckpointAlloc(
     try definition_core.json.digest(definition_digest);
     var encoder = checkpoint.Encoder.init(allocator);
     defer encoder.deinit();
-    try encoder.writeBytes(checkpoint_schema);
+    try encoder.writeBytes(checkpoint_schema_v2);
     try encoder.writeBytes(definition_digest);
+    try encoder.writeBytes(&state.event_kinds_digest);
     try encoder.writeU64(state.next_sequence);
     try encoder.writeOptionalBytes(state.previousDigest());
     try encoder.writeU64(max_event_kinds);
@@ -241,10 +276,23 @@ pub fn activateCheckpoint(
     plan: *const Plan,
     state: *ReplayState,
 ) !void {
+    const current_event_kinds_digest = eventKindsDigest(plan.event_kinds);
+    if (state.has_event_kinds_digest and
+        !std.mem.eql(
+            u8,
+            &state.event_kinds_digest,
+            &current_event_kinds_digest,
+        ))
+    {
+        return error.CheckpointEventKindsChanged;
+    }
+    state.event_kinds_digest = current_event_kinds_digest;
+    state.has_event_kinds_digest = true;
     if (plan.reducer_plan) |*reducer_plan| {
-        if (state.reducer_state.count() > reducer_plan.max_entries) {
+        state.reducer_state.validateCheckpoint(reducer_plan) catch
             return error.CheckpointBoundsExceeded;
-        }
+    } else if (state.reducer_state.count() != 0) {
+        return error.CheckpointReducerMissing;
     }
     if (plan.state_reducer_plan) |*state_plan| {
         try state_reducer.activateCheckpoint(
@@ -261,7 +309,8 @@ pub fn decodeCheckpoint(
     bytes: []const u8,
 ) !DecodedCheckpoint {
     var decoder = try checkpoint.Decoder.init(bytes);
-    const checkpoint_digest = try readCheckpointDefinitionDigest(&decoder);
+    const header = try readCheckpointHeader(&decoder);
+    const checkpoint_digest = header.definition_digest;
     const definition_digest = try allocator.dupe(u8, &checkpoint_digest);
     errdefer allocator.free(definition_digest);
     var state = if (current_plan) |plan|
@@ -269,6 +318,11 @@ pub fn decodeCheckpoint(
     else
         ReplayState{ .next_sequence = 0 };
     errdefer state.deinit(allocator);
+    if (header.has_event_kinds_digest) {
+        const digest = try decoder.readBytes(32);
+        @memcpy(&state.event_kinds_digest, digest);
+        state.has_event_kinds_digest = true;
+    }
     state.next_sequence = try decoder.readU64();
     if (try decoder.readOptionalBytes(71)) |digest| {
         definition_core.json.digest(digest) catch
@@ -335,8 +389,9 @@ test "segmented checkpoint identity reads only the bounded header" {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var encoder = checkpoint.Encoder.init(std.testing.allocator);
     defer encoder.deinit();
-    try encoder.writeBytes(checkpoint_schema);
+    try encoder.writeBytes(checkpoint_schema_v2);
     try encoder.writeBytes(digest);
+    try encoder.writeBytes(&([_]u8{0} ** 32));
     const encoded = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(encoded);
     const actual = try checkpointDefinitionDigest(encoded);
@@ -344,6 +399,66 @@ test "segmented checkpoint identity reads only the bounded header" {
     try std.testing.expectError(
         error.CheckpointTruncated,
         decodeCheckpoint(std.testing.allocator, null, encoded),
+    );
+}
+
+test "replay checkpoint v1 remains readable" {
+    const digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var state = ReplayState{ .next_sequence = 1 };
+    defer state.deinit(std.testing.allocator);
+    var encoder = checkpoint.Encoder.init(std.testing.allocator);
+    defer encoder.deinit();
+    try encoder.writeBytes(checkpoint_schema_v1);
+    try encoder.writeBytes(digest);
+    try encoder.writeU64(state.next_sequence);
+    try encoder.writeOptionalBytes(null);
+    try encoder.writeU64(max_event_kinds);
+    for (state.kind_counts) |count| try encoder.writeU64(count);
+    try encoder.writeU64(state.records);
+    try state.reducer_state.encodeCheckpoint(std.testing.allocator, &encoder);
+    try state.state_reducer_state.encodeCheckpoint(
+        std.testing.allocator,
+        &encoder,
+    );
+    const encoded = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decodeCheckpoint(std.testing.allocator, null, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), decoded.state.next_sequence);
+    try std.testing.expect(!decoded.state.has_event_kinds_digest);
+}
+
+test "checkpoint rejects event kind identity changes" {
+    var source_kinds = [_][]u8{@constCast("created")};
+    var current_kinds = [_][]u8{@constCast("updated")};
+    const source = Plan{
+        .mode = .plain,
+        .envelope = undefined,
+        .sequence_start = 1,
+        .genesis = undefined,
+        .event_kinds = &source_kinds,
+        .max_records = 1,
+        .target_slot_index = 0,
+        .reducer_plan = null,
+        .state_reducer_plan = null,
+    };
+    const current = Plan{
+        .mode = .plain,
+        .envelope = undefined,
+        .sequence_start = 1,
+        .genesis = undefined,
+        .event_kinds = &current_kinds,
+        .max_records = 1,
+        .target_slot_index = 0,
+        .reducer_plan = null,
+        .state_reducer_plan = null,
+    };
+    var state = ReplayState.init(&source);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CheckpointEventKindsChanged,
+        activateCheckpoint(std.testing.allocator, &current, &state),
     );
 }
 

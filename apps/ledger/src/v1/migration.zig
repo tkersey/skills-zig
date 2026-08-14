@@ -108,6 +108,10 @@ fn migrateLegacySlot(
         legacy_slot,
     );
     defer legacy.deinit(allocator);
+    if (legacy.binding.rows.len == 0) return error.InvalidStoreBinding;
+    const lifetime_records = legacy.binding.rows[
+        legacy.binding.rows.len - 1
+    ].record_end orelse return error.InvalidStoreBinding;
     var stats = try replay.validateReplaySlot(
         allocator,
         repo_root,
@@ -115,7 +119,7 @@ fn migrateLegacySlot(
         legacy_slot,
         &legacy,
         parameters,
-        definition_plan.bounds.max_records,
+        @max(definition_plan.bounds.max_records, lifetime_records),
         true,
     );
     defer stats.deinit(allocator);

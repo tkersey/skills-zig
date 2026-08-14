@@ -169,6 +169,25 @@ pub const State = struct {
         return self.entries.count();
     }
 
+    pub fn validateCheckpoint(self: *const State, plan: *const Plan) !void {
+        if (self.entries.count() > plan.max_entries or
+            self.retained_bytes > plan.max_retained_total_bytes)
+        {
+            return error.ReducerStateBoundsExceeded;
+        }
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| {
+            if (!containsSorted(plan.states, entry.state())) {
+                return error.UnknownReducerState;
+            }
+            if (entry.retained) |value| {
+                if (value.len > plan.max_retained_value_bytes) {
+                    return error.ReducerRetainedValueBoundsExceeded;
+                }
+            }
+        }
+    }
+
     pub fn encodeCheckpoint(
         self: *State,
         allocator: std.mem.Allocator,

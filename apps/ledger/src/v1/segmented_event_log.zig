@@ -756,6 +756,8 @@ pub const Snapshot = struct {
         if (!std.mem.eql(u8, head.logical_path, logical_path)) {
             return error.SegmentedLogicalPathMismatch;
         }
+        var absent_custody: ?durable_store.CasReadLockPair = null;
+        defer if (absent_custody) |*value| value.deinit();
         if (!head_read.exists and try durable_store.casAdvisoryLockExists(
             allocator,
             paths.manifest,
@@ -768,10 +770,11 @@ pub const Snapshot = struct {
                 error.EventStoreBusy => return error.SegmentedSnapshotGenerationChanged,
                 else => return err,
             };
-            defer initial_custody.deinit();
             if (initial_custody.count != 1) {
+                initial_custody.deinit();
                 return error.SegmentedGenerationCustodyMissing;
             }
+            absent_custody = initial_custody;
             const checked_head = try readOptionalFile(
                 allocator,
                 paths.manifest,
@@ -818,6 +821,22 @@ pub const Snapshot = struct {
             &head,
         );
         errdefer checkpoint_file.deinit(allocator);
+        if (!head_read.exists) {
+            var final_head = try readOptionalFile(
+                allocator,
+                paths.manifest,
+                64 * 1024,
+            );
+            defer final_head.deinit(allocator);
+            if (final_head.exists) {
+                return error.SegmentedSnapshotGenerationChanged;
+            }
+        }
+        if (!head_read.exists and absent_custody == null and
+            try durable_store.casAdvisoryLockExists(
+                allocator,
+                paths.manifest,
+            )) return error.SegmentedSnapshotGenerationChanged;
         const head_digest = if (head_read.exists)
             try digestAlloc(allocator, head_read.bytes)
         else

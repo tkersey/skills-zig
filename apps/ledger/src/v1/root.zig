@@ -462,7 +462,7 @@ test "segmented successor bounds checkpoint before enforcement" {
     );
 }
 
-test "segmented checkpoint enforces keyed reducer capacity" {
+test "segmented checkpoint enforces keyed reducer retained bounds" {
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -479,8 +479,8 @@ test "segmented checkpoint enforces keyed reducer capacity" {
     try appendPlainCreatedEvent(&plans, repo_root);
     try appendPlainCreatedEventFor(&plans, repo_root, "item-2");
     plans.artifact.bounds.max_records = 2;
-    plans.artifact.bounds.max_reducer_states = 1;
-    plans.protocol.reducer_plan.?.max_entries = 1;
+    plans.protocol.reducer_plan.?.max_retained_value_bytes = 1;
+    plans.protocol.reducer_plan.?.max_retained_total_bytes = 1;
     try std.testing.expectError(
         error.CheckpointBoundsExceeded,
         transaction.transact(
@@ -501,6 +501,38 @@ test "segmented checkpoint enforces keyed reducer capacity" {
             &plans.parameters,
         ),
     );
+}
+
+test "segmented migration treats max records as a suffix bound" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try appendPlainCreatedEvent(&plans, repo_root);
+    try appendPlainEvent(&plans, repo_root);
+    plans.artifact.bounds.max_records = 1;
+    plans.protocol.max_records = 1;
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), migrated.records);
 }
 
 test "segmented full history admits missing genesis and lifetime states" {

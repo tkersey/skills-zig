@@ -4874,7 +4874,7 @@ fn segmentedProjectionReplay(
         null,
     );
     defer binding.deinit(allocator);
-    return replay.validateSegmentedSnapshot(
+    var stats = try replay.validateSegmentedSnapshot(
         allocator,
         repo_root,
         definition_plan.id,
@@ -4885,6 +4885,11 @@ fn segmentedProjectionReplay(
         definition_plan.bounds.max_records,
         true,
     );
+    errdefer stats.deinit(allocator);
+    if (stats.protocol_state) |*state| {
+        try protocol.activateCheckpoint(allocator, event_plan, state);
+    }
+    return stats;
 }
 
 fn renderSegmentedFold(

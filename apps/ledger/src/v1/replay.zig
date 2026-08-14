@@ -1810,6 +1810,11 @@ fn validateEventInput(
     if ((historical_plan != null) != protocol_required) {
         return error.HistoricalProtocolBindingMismatch;
     }
+    if (historical_plan) |plan| {
+        if (protocol_state.*) |*state| {
+            try protocol.activateCheckpoint(allocator, plan, state);
+        }
+    }
     if (resolved.effect.event) |*event_materialization| {
         return validateMaterializedEvent(
             allocator,

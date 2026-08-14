@@ -2202,6 +2202,9 @@ fn segmentedReplayBefore(
         true,
     );
     defer stats.deinit(allocator);
+    if (stats.protocol_state) |*state| {
+        try protocol.activateCheckpoint(allocator, event_plan, state);
+    }
     return .{
         .existing_records = stats.records_validated,
         .state = stats.takeProtocolState(),
