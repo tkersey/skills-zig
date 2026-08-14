@@ -1,6 +1,6 @@
 # Ledger
 
-Ledger 1.0 compiles passive artifact definitions into bounded native plans for
+Ledger 1.1 compiles passive artifact definitions into bounded native plans for
 validation, canonicalization, identity, durable transactions, replay, and
 projection.
 
@@ -24,6 +24,7 @@ From the repository root:
 ```bash
 zig build build-ledger -Doptimize=ReleaseFast
 zig build test-ledger -Doptimize=ReleaseFast
+zig build test-ledger-segmented -Doptimize=ReleaseFast
 ```
 
 The binary is written to `zig-out/bin/ledger`.
@@ -88,7 +89,17 @@ ledger doctor \
   --definition <protocol-definition.json> \
   --repo <repo> \
   --format json
+
+ledger migrate-segmented \
+  --definition <protocol-definition.json> \
+  --repo <repo> \
+  --format json
 ```
+
+Segmented event-log slots use 64 MiB event segments, resumable checkpoints,
+and an explicit atomic migration. Ordinary replay reads only the checkpoint and
+active suffix; `doctor` walks every segment sequentially and verifies the full
+event and binding history without imposing a lifetime-size ceiling.
 
 Transactions write only declared logical slots under the selected repository's
 `.ledger/` root. Definitions cannot select absolute output paths or escape the

@@ -9,7 +9,7 @@ if [[ ! -x "$bin_path" ]]; then
   exit 1
 fi
 
-expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
+expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nmigrate-segmented\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
   awk '
@@ -30,7 +30,7 @@ actual=$(
 )
 
 if [[ "$actual" != "$expected" ]]; then
-  echo "Ledger 1.0 command surface mismatch" >&2
+  echo "Ledger 1.1 command surface mismatch" >&2
   diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
   exit 1
 fi
@@ -45,6 +45,10 @@ jq -e --arg version "$version" \
     (.operators | type == "array" and length > 0) and
     (.codecs | type == "array" and length > 0) and
     (.storage_adapters | type == "array" and length > 0) and
+    .features.bounded_checkpoint_replay_v1 == true and
+    .features.full_history_doctor_v1 == true and
+    .features.segmented_event_log_v1 == true and
+    .features.segmented_migration_v1 == true and
     .cache_format != null and
     (.result_schemas | type == "array" and length > 0)
   ' \
@@ -65,4 +69,4 @@ do
   fi
 done
 
-echo "Ledger 1.0 command-surface gate passed for $bin_path"
+echo "Ledger 1.1 command-surface gate passed for $bin_path"

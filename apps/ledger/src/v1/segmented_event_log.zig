@@ -1095,7 +1095,7 @@ test "segmented snapshot reads only the active bounded files" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.head.total_event_records);
 }
 
-test "full history audit detects corruption in a sealed segment" {
+test "segmented falsifier detects corruption in a sealed segment" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -2291,6 +2291,10 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "],\"codecs\":[\"json\",\"jsonl\",\"text\"]," ++
             "\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"]," ++
+            "\"features\":{\"bounded_checkpoint_replay_v1\":true," ++
+            "\"full_history_doctor_v1\":true," ++
+            "\"segmented_event_log_v1\":true," ++
+            "\"segmented_migration_v1\":true}," ++
             "\"cache_format\":",
     );
     try writer.print(
@@ -2311,6 +2315,7 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"ledger-definition-description/v1\"," ++
             "\"ledger-doctor-result/v1\"," ++
             "\"ledger-materialization-result/v1\"," ++
+            "\"ledger-segmented-migration-result/v1\"," ++
             "\"ledger-projection-error/v1\"," ++
             "\"ledger-recovery-inspection/v1\"," ++
             "\"ledger-recovery-reclaim-result/v1\"," ++
