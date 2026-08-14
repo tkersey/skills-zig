@@ -4,6 +4,7 @@ const definition = @import("definition.zig");
 const reducer = @import("reducer.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
+const checkpoint = @import("checkpoint.zig");
 
 const max_event_kinds: usize = 256;
 
@@ -167,6 +168,106 @@ pub const ReplayState = struct {
         return self.kind_counts[index];
     }
 };
+
+pub const DecodedCheckpoint = struct {
+    definition_digest: []u8,
+    state: ReplayState,
+
+    pub fn deinit(
+        self: *DecodedCheckpoint,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.definition_digest);
+        self.state.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const checkpoint_schema = "ledger-replay-checkpoint/v1";
+
+pub fn encodeCheckpointAlloc(
+    allocator: std.mem.Allocator,
+    state: *ReplayState,
+    definition_digest: []const u8,
+) ![]u8 {
+    try definition_core.json.digest(definition_digest);
+    var encoder = checkpoint.Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.writeBytes(checkpoint_schema);
+    try encoder.writeBytes(definition_digest);
+    try encoder.writeU64(state.next_sequence);
+    try encoder.writeOptionalBytes(state.previousDigest());
+    try encoder.writeU64(max_event_kinds);
+    for (state.kind_counts) |count| {
+        try encoder.writeU64(@intCast(count));
+    }
+    try encoder.writeU64(@intCast(state.records));
+    try state.reducer_state.encodeCheckpoint(allocator, &encoder);
+    try state.state_reducer_state.encodeCheckpoint(allocator, &encoder);
+    return encoder.toOwnedSlice();
+}
+
+pub fn decodeCheckpoint(
+    allocator: std.mem.Allocator,
+    current_plan: ?*const Plan,
+    bytes: []const u8,
+) !DecodedCheckpoint {
+    var decoder = try checkpoint.Decoder.init(bytes);
+    const schema = try decoder.readBytes(checkpoint_schema.len);
+    if (!std.mem.eql(u8, schema, checkpoint_schema)) {
+        return error.UnsupportedReplayCheckpoint;
+    }
+    const digest_source = try decoder.readBytes(71);
+    definition_core.json.digest(digest_source) catch
+        return error.InvalidReplayCheckpoint;
+    const definition_digest = try allocator.dupe(u8, digest_source);
+    errdefer allocator.free(definition_digest);
+    var state = if (current_plan) |plan|
+        ReplayState.init(plan)
+    else
+        ReplayState{ .next_sequence = 0 };
+    errdefer state.deinit(allocator);
+    state.next_sequence = try decoder.readU64();
+    if (try decoder.readOptionalBytes(71)) |digest| {
+        definition_core.json.digest(digest) catch
+            return error.InvalidReplayCheckpoint;
+        @memcpy(&state.previous_digest, digest);
+        state.has_previous_digest = true;
+    }
+    if (try decoder.readCount(max_event_kinds) != max_event_kinds) {
+        return error.InvalidReplayCheckpoint;
+    }
+    var kind_total: usize = 0;
+    for (&state.kind_counts) |*count| {
+        count.* = try decoder.readCount(checkpoint.max_collection_items);
+        kind_total = std.math.add(usize, kind_total, count.*) catch
+            return error.InvalidReplayCheckpoint;
+    }
+    state.records = try decoder.readCount(checkpoint.max_collection_items);
+    if (kind_total != state.records) return error.InvalidReplayCheckpoint;
+    state.reducer_state = try reducer.State.decodeCheckpoint(
+        allocator,
+        &decoder,
+    );
+    state.state_reducer_state = try state_reducer.State.decodeCheckpoint(
+        allocator,
+        &decoder,
+    );
+    try decoder.finish();
+    if (current_plan) |plan| {
+        if (plan.state_reducer_plan) |*state_plan| {
+            try state_reducer.activateCheckpoint(
+                allocator,
+                state_plan,
+                &state.state_reducer_state,
+            );
+        }
+    }
+    return .{
+        .definition_digest = definition_digest,
+        .state = state,
+    };
+}
 
 pub const GeneratedOutput = struct {
     name: []u8,
@@ -5119,6 +5220,75 @@ test "retained reducer validates events against compiled current state" {
     try std.testing.expectEqual(@as(usize, 2), state.records);
 }
 
+test "checkpoint restore preserves retained replay state" {
+    var plans = try ProtocolTestPlans.init(retained_protocol_definition);
+    defer plans.deinit();
+    var plan = try plans.cacheProtocol();
+    defer plan.deinit(std.testing.allocator);
+    var state = ReplayState.init(&plan);
+    defer state.deinit(std.testing.allocator);
+    const first = try eventAlloc(
+        std.testing.allocator,
+        1,
+        "created",
+        null,
+        "{\"id\":\"item-1\",\"status\":\"open\"}",
+    );
+    defer std.testing.allocator.free(first);
+    try apply(std.testing.allocator, &plan, &state, first);
+    const definition_digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const encoded = try encodeCheckpointAlloc(
+        std.testing.allocator,
+        &state,
+        definition_digest,
+    );
+    defer std.testing.allocator.free(encoded);
+    var restored = try decodeCheckpoint(
+        std.testing.allocator,
+        &plan,
+        encoded,
+    );
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        definition_digest,
+        restored.definition_digest,
+    );
+    try std.testing.expectEqual(state.records, restored.state.records);
+    try std.testing.expectEqualStrings(
+        state.previousDigest().?,
+        restored.state.previousDigest().?,
+    );
+    const current = restored.state.state_reducer_state.get(
+        &plan.state_reducer_plan.?,
+        "current",
+    ).?;
+    var status = try definition_core.json_pointer.compile(
+        std.testing.allocator,
+        "/status",
+    );
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "open",
+        definition_core.json_pointer.lookup(current, status).?.string,
+    );
+    const second = try eventAlloc(
+        std.testing.allocator,
+        2,
+        "updated",
+        restored.state.previousDigest(),
+        "{\"id\":\"item-1\",\"status\":\"closed\"}",
+    );
+    defer std.testing.allocator.free(second);
+    try apply(std.testing.allocator, &plan, &state, second);
+    try apply(std.testing.allocator, &plan, &restored.state, second);
+    try std.testing.expectEqualStrings(
+        state.previousDigest().?,
+        restored.state.previousDigest().?,
+    );
+    try std.testing.expectEqual(state.records, restored.state.records);
+}
+
 test "keyed reducer guards validate transitions against retained values" {
     var plans = try ProtocolTestPlans.init(guarded_keyed_protocol_definition);
     defer plans.deinit();
@@ -5133,23 +5303,81 @@ test "keyed reducer guards validate transitions against retained values" {
         "{\"id\":\"item-1\",\"kind\":\"capture\"," ++
             "\"record\":{\"id\":\"expected\"},\"status\":\"open\"}",
     );
+    const definition_digest =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const checkpoint_bytes = try encodeCheckpointAlloc(
+        std.testing.allocator,
+        &state,
+        definition_digest,
+    );
+    defer std.testing.allocator.free(checkpoint_bytes);
+    var restored = try decodeCheckpoint(
+        std.testing.allocator,
+        &cached,
+        checkpoint_bytes,
+    );
+    defer restored.deinit(std.testing.allocator);
+    try verifyGuardedCheckpointParity(
+        &cached,
+        &state,
+        &restored.state,
+        definition_digest,
+    );
+}
+
+fn verifyGuardedCheckpointParity(
+    plan: *const Plan,
+    expected_state: *ReplayState,
+    restored_state: *ReplayState,
+    definition_digest: []const u8,
+) !void {
     try std.testing.expectError(
         error.ReducerTransitionGuardRejected,
         apply(
             std.testing.allocator,
-            &cached,
-            &state,
+            plan,
+            expected_state,
+            "{\"claim\":\"wrong\",\"id\":\"item-1\"," ++
+                "\"kind\":\"status\",\"status\":\"closed\"}",
+        ),
+    );
+    try std.testing.expectError(
+        error.ReducerTransitionGuardRejected,
+        apply(
+            std.testing.allocator,
+            plan,
+            restored_state,
             "{\"claim\":\"wrong\",\"id\":\"item-1\"," ++
                 "\"kind\":\"status\",\"status\":\"closed\"}",
         ),
     );
     try apply(
         std.testing.allocator,
-        &cached,
-        &state,
+        plan,
+        expected_state,
         "{\"claim\":\"expected\",\"id\":\"item-1\"," ++
             "\"kind\":\"status\",\"status\":\"closed\"}",
     );
+    try apply(
+        std.testing.allocator,
+        plan,
+        restored_state,
+        "{\"claim\":\"expected\",\"id\":\"item-1\"," ++
+            "\"kind\":\"status\",\"status\":\"closed\"}",
+    );
+    const expected = try encodeCheckpointAlloc(
+        std.testing.allocator,
+        expected_state,
+        definition_digest,
+    );
+    defer std.testing.allocator.free(expected);
+    const actual = try encodeCheckpointAlloc(
+        std.testing.allocator,
+        restored_state,
+        definition_digest,
+    );
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualSlices(u8, expected, actual);
 }
 
 test "event materialization reconstructs validated request literals" {

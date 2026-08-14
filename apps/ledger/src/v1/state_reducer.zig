@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
+const checkpoint = @import("checkpoint.zig");
 
 const max_registers: usize = 1024;
 const max_sets: usize = 1024;
@@ -251,7 +252,222 @@ pub const State = struct {
         const index = registerIndex(plan, name) orelse return null;
         return getByIndex(self, plan, index);
     }
+
+    pub fn encodeCheckpoint(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        encoder: *checkpoint.Encoder,
+    ) !void {
+        const registers = try allocator.alloc(
+            *const NamedRegisterState,
+            self.registers.items.len,
+        );
+        defer allocator.free(registers);
+        for (self.registers.items, 0..) |*item, index| {
+            registers[index] = item;
+        }
+        std.sort.heap(
+            *const NamedRegisterState,
+            registers,
+            {},
+            namedRegisterLessThan,
+        );
+        try encoder.writeU64(@intCast(registers.len));
+        for (registers) |register| {
+            try encoder.writeBytes(register.name);
+            try encoder.writeOptionalBytes(if (register.value) |owned|
+                owned.bytes
+            else
+                null);
+        }
+
+        const sets = try allocator.alloc(
+            *const NamedSetState,
+            self.sets.items.len,
+        );
+        defer allocator.free(sets);
+        for (self.sets.items, 0..) |*item, index| sets[index] = item;
+        std.sort.heap(*const NamedSetState, sets, {}, namedSetLessThan);
+        try encoder.writeU64(@intCast(sets.len));
+        for (sets) |set| {
+            try encoder.writeBytes(set.name);
+            const keys = try allocator.alloc(
+                []const u8,
+                set.value.entries.count(),
+            );
+            defer allocator.free(keys);
+            var iterator = set.value.entries.valueIterator();
+            var key_index: usize = 0;
+            while (iterator.next()) |key| : (key_index += 1) {
+                keys[key_index] = key.*;
+            }
+            std.sort.heap([]const u8, keys, {}, bytesLessThan);
+            try encoder.writeU64(@intCast(keys.len));
+            for (keys) |key| try encoder.writeBytes(key);
+        }
+    }
+
+    pub fn decodeCheckpoint(
+        allocator: std.mem.Allocator,
+        decoder: *checkpoint.Decoder,
+    ) !State {
+        var result: State = .{};
+        errdefer result.deinit(allocator);
+        try decodeCheckpointRegisters(allocator, decoder, &result);
+        try decodeCheckpointSets(allocator, decoder, &result);
+        return result;
+    }
 };
+
+fn decodeCheckpointRegisters(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+    state: *State,
+) !void {
+    const count = try decoder.readCount(max_registers);
+    try state.registers.ensureTotalCapacity(allocator, count);
+    var previous_name: ?[]const u8 = null;
+    for (0..count) |_| {
+        const name = try decoder.readBytes(256);
+        try validateCheckpointName(name, previous_name);
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        var owned_value: ?OwnedValue = null;
+        const source = try decoder.readOptionalBytes(
+            checkpoint.max_checkpoint_bytes,
+        );
+        if (source) |value| {
+            owned_value = try decodeOwnedValue(allocator, value);
+        }
+        state.registers.appendAssumeCapacity(.{
+            .name = owned_name,
+            .value = owned_value,
+        });
+        previous_name = name;
+    }
+}
+
+fn decodeCheckpointSets(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+    state: *State,
+) !void {
+    const count = try decoder.readCount(max_sets);
+    try state.sets.ensureTotalCapacity(allocator, count);
+    var previous_name: ?[]const u8 = null;
+    for (0..count) |_| {
+        const name = try decoder.readBytes(256);
+        try validateCheckpointName(name, previous_name);
+        if (findNamedRegister(state.registers.items, name) != null) {
+            return error.InvalidRetainedStateCheckpoint;
+        }
+        var set_state = try decodeCheckpointSet(allocator, decoder);
+        errdefer set_state.deinit(allocator);
+        const owned_name = try allocator.dupe(u8, name);
+        state.sets.appendAssumeCapacity(.{
+            .name = owned_name,
+            .value = set_state,
+        });
+        set_state = .{};
+        previous_name = name;
+    }
+}
+
+fn decodeCheckpointSet(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+) !RetainedSetState {
+    var result: RetainedSetState = .{};
+    errdefer result.deinit(allocator);
+    const count = try decoder.readCount(
+        @min(checkpoint.max_collection_items, std.math.maxInt(u32)),
+    );
+    try result.entries.ensureTotalCapacity(allocator, @intCast(count));
+    var previous_key: ?[]const u8 = null;
+    for (0..count) |_| {
+        const key = try decoder.readBytes(checkpoint.max_checkpoint_bytes);
+        if (previous_key != null and
+            std.mem.order(u8, previous_key.?, key) != .lt)
+        {
+            return error.InvalidRetainedStateCheckpoint;
+        }
+        const owned_key = try allocator.dupe(u8, key);
+        const digest = retainedKeyDigest(key);
+        if (result.entries.contains(digest)) {
+            allocator.free(owned_key);
+            return error.RetainedSetDigestCollision;
+        }
+        result.insertAssumeCapacity(owned_key);
+        previous_key = key;
+    }
+    return result;
+}
+
+pub fn activateCheckpoint(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+) !void {
+    try ensureState(allocator, plan, state);
+}
+
+fn namedRegisterLessThan(
+    _: void,
+    left: *const NamedRegisterState,
+    right: *const NamedRegisterState,
+) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
+fn namedSetLessThan(
+    _: void,
+    left: *const NamedSetState,
+    right: *const NamedSetState,
+) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
+fn bytesLessThan(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn validateCheckpointName(
+    name: []const u8,
+    previous: ?[]const u8,
+) !void {
+    definition_core.json.safeIdentifier(name, 256) catch
+        return error.InvalidRetainedStateCheckpoint;
+    if (previous != null and
+        std.mem.order(u8, previous.?, name) != .lt)
+    {
+        return error.InvalidRetainedStateCheckpoint;
+    }
+}
+
+fn decodeOwnedValue(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedValue {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    errdefer parsed.deinit();
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        parsed.value,
+    );
+    errdefer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) {
+        return error.InvalidRetainedStateCheckpoint;
+    }
+    return .{ .bytes = canonical, .parsed = parsed };
+}
 
 pub fn hasRegister(plan: *const Plan, name: []const u8) bool {
     return findRegister(plan.registers, name) != null;
