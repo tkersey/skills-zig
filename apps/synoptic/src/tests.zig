@@ -2386,10 +2386,37 @@ test "duplicate inline comment reconciliation remains unknown" {
         .head_oid = "h",
         .session_path = "a.zig",
         .current_path = "a.zig",
+        .github_path = "a.zig",
     });
     const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
     const baseline = github.ReconciliationBaseline{ .allocator = allocator };
     try std.testing.expect(!try broker.reconcileAction("o", "r", 1, card.*, 0, &baseline));
+    try expectDuplicateReplyUnknown(&store, broker, &baseline);
+}
+
+fn expectDuplicateReplyUnknown(
+    store: *tools.ActionStore,
+    broker: github.Broker,
+    baseline: *const github.ReconciliationBaseline,
+) !void {
+    const reply = try store.prepare("ses", "turn-reply", .{
+        .slot = @constCast("reply"),
+        .kind = .reply_thread,
+        .effect_summary = @constCast("reply"),
+        .payload_json = @constCast("{}"),
+        .thread_id = @constCast("T"),
+        .body = @constCast("body"),
+    }, .{
+        .repository = "o/r",
+        .pull_request = 1,
+        .pull_request_id = "PR_1",
+        .base_oid = "unknown-base",
+        .head_oid = "h",
+        .session_path = "a.zig",
+        .current_path = "a.zig",
+        .github_path = "a.zig",
+    });
+    try std.testing.expect(!try broker.reconcileAction("o", "r", 1, reply.*, 0, baseline));
 }
 
 test "ambiguous complete-file mutation succeeds only through viewed readback" {
@@ -5060,6 +5087,64 @@ test "worktree integrity stalled TERM-resistant fetch is bounded and reaped" {
             "1111111111111111111111111111111111111111",
         ),
     );
+    try expectStalledFetchProcessesGone(allocator, io, fixture);
+}
+
+const CancelStalledFetch = struct {
+    cancelled: *std.atomic.Value(bool),
+    started_path: []const u8,
+
+    fn run(self: CancelStalledFetch) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        for (0..1_000) |_| {
+            if (std.Io.Dir.cwd().access(io, self.started_path, .{})) |_| break else |_| {}
+            std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
+        }
+        self.cancelled.store(true, .release);
+    }
+};
+
+test "worktree integrity cancellation reaps an independently grouped fetch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const root = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(root);
+    var fixture = try prepareStalledFetchFixture(allocator, io, &tmp, root);
+    defer fixture.deinit();
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    const cancel_thread = try std.Thread.spawn(.{}, CancelStalledFetch.run, .{CancelStalledFetch{
+        .cancelled = &cancelled,
+        .started_path = fixture.shell_pid_path,
+    }});
+    defer cancel_thread.join();
+    try std.testing.expectError(
+        error.GitFetchCancelled,
+        worktree.ensureObjectAvailable(
+            allocator,
+            io,
+            root,
+            .{
+                .environment = &fixture.environment,
+                .remote_name = fixture.url,
+                .remote_url = fixture.url,
+                .timeout_ms = 5_000,
+                .termination_grace_ms = 50,
+                .cancelled = &cancelled,
+            },
+            "1111111111111111111111111111111111111111",
+        ),
+    );
+    try expectStalledFetchProcessesGone(allocator, io, fixture);
+}
+
+fn expectStalledFetchProcessesGone(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: StalledFetchFixture,
+) !void {
     const shell_pid_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         fixture.shell_pid_path,

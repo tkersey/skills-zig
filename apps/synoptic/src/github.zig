@@ -1255,7 +1255,9 @@ pub const Broker = struct {
             );
             if (observed) |result| return result;
         }
-        if (card.kind == .add_inline_comment) return matching_comments == 1;
+        if (card.kind == .add_inline_comment or card.kind == .reply_thread) {
+            return matching_comments == 1;
+        }
         if (card.kind == .delete_comment) return !target_comment_found;
         return false;
     }
@@ -1845,7 +1847,7 @@ fn commentsObserve(
             std.time.ns_per_s,
         ));
         if (created < started_unix_s or created > now + 60) continue;
-        if (card.kind == .add_inline_comment) {
+        if (card.kind == .add_inline_comment or card.kind == .reply_thread) {
             matching_comments.* += 1;
             continue;
         }

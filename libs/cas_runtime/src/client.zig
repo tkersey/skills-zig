@@ -1605,6 +1605,7 @@ const ActorState = struct {
 };
 
 threadlocal var actor_callback_state: ?*ActorState = null;
+threadlocal var actor_notification_callback_state: ?*ActorState = null;
 
 fn validateActorOptions(options: ActorOptions) !void {
     const invalid = options.outbound_queue_capacity == 0 or
@@ -1772,8 +1773,8 @@ pub const Actor = struct {
         }
         state.mutex.unlock();
         if (!removed) return error.UnknownNotificationSubscription;
-        if (actor_callback_state == state) return;
-        while (true) {
+        if (actor_notification_callback_state == state) return;
+        while (true) { // tiger: event-loop -- bounded by callback quiescence.
             state.mutex.lock();
             const callbacks_active = state.active_notification_callbacks != 0;
             const callback_epoch = state.notification_callback_epoch.load(.acquire);
@@ -2219,6 +2220,9 @@ fn actorNotificationMain(state: *ActorState) void {
             const previous_callback_state = actor_callback_state;
             actor_callback_state = state;
             defer actor_callback_state = previous_callback_state;
+            const previous_notification_state = actor_notification_callback_state;
+            actor_notification_callback_state = state;
+            defer actor_notification_callback_state = previous_notification_state;
             actorInvokeNotificationHandlers(
                 state,
                 notification.method,
@@ -4429,6 +4433,17 @@ fn writeActorFakeCodexInteractiveServerModes(writer: *std.Io.Writer) !void {
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
+        \\if [ "$mode" = unsubscribe_server_request ]; then
+        \\  IFS= read -r request
+        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  printf '%s\n' '{"method":"turn/started","params":{}}'
+        \\  printf '%s\n' '{"id":"tool-unsubscribe","method":"item/tool/call","params":{}}'
+        \\  IFS= read -r reply
+        \\  printf '%s\n' "$reply" > "$reply_log"
+        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
+        \\  while IFS= read -r ignored; do :; done
+        \\  exit 0
+        \\fi
     );
 }
 
@@ -4581,6 +4596,39 @@ const RemovingNotificationProbe = struct {
             try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
         }
         return error.NotificationDeadlineExceeded;
+    }
+};
+
+const BlockingNotificationProbe = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *BlockingNotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        self.entered.store(true, .release);
+        for (0..1_000) |_| {
+            if (self.released.load(.acquire)) return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake) catch return;
+        }
+    }
+};
+
+const UnsubscribingServerRequestProbe = struct {
+    actor: *Actor,
+    target: protocol.NotificationHandler,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn handle(
+        context: *anyopaque,
+        request: protocol.ServerRequest,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8 {
+        const self: *UnsubscribingServerRequestProbe = @ptrCast(@alignCast(context));
+        try std.testing.expectEqualStrings("item/tool/call", request.method);
+        try self.actor.unsubscribe(self.target);
+        self.completed.store(true, .release);
+        return allocator.dupe(u8, "{\"handled\":true}");
     }
 };
 
@@ -5122,6 +5170,51 @@ test "actor falsifier nested request in server handler cannot deadlock permanent
     defer allocator.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":\"tool-nested\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":\"nested\"") != null);
+}
+
+test "server callback unsubscribe waits for active notification context" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "unsubscribe_server_request");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{});
+    defer actor.deinit();
+    var notification = BlockingNotificationProbe{};
+    const subscription = protocol.NotificationHandler{
+        .context = &notification,
+        .handle = BlockingNotificationProbe.observe,
+    };
+    try actor.subscribe(subscription);
+    var server = UnsubscribingServerRequestProbe{
+        .actor = &actor,
+        .target = subscription,
+    };
+    try actor.setServerRequestHandler(.{
+        .context = &server,
+        .handle = UnsubscribingServerRequestProbe.handle,
+        .cancel = noServerRequestCancel,
+    });
+    var call = ActorCall{ .actor = &actor, .method = "actor/original", .timeout_ms = 3_000 };
+    const call_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&call});
+    var call_joined = false;
+    defer if (!call_joined) call_thread.join();
+    for (0..1_000) |_| {
+        if (notification.entered.load(.acquire)) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(notification.entered.load(.acquire));
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
+    try std.testing.expect(!server.completed.load(.acquire));
+    notification.released.store(true, .release);
+    for (0..1_000) |_| {
+        if (server.completed.load(.acquire)) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(server.completed.load(.acquire));
+    call_thread.join();
+    call_joined = true;
+    if (call.result) |result| allocator.free(result);
+    try std.testing.expect(call.failure == null);
 }
 
 test "actor falsifier retries only structured overload and honors per-request deadline" {

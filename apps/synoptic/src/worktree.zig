@@ -109,6 +109,7 @@ pub const FetchSource = struct {
     owns_credential_executable: bool = false,
     timeout_ms: u32 = fetch_timeout_ms,
     termination_grace_ms: u32 = fetch_termination_grace_ms,
+    cancelled: ?*const std.atomic.Value(bool) = null,
 
     pub fn resolve(
         allocator: std.mem.Allocator,
@@ -1046,11 +1047,13 @@ fn advanceManagedSubmodules(
             &environment,
             source.remote_url,
             source.credential_executable,
+            source.cancelled,
         );
     } else reconcileInitializedSubmodules(
         allocator,
         io,
         root,
+        null,
         null,
         null,
         null,
@@ -1076,6 +1079,7 @@ fn reconcileInitializedSubmodules(
     inherited: ?*const std.process.Environ.Map,
     parent_url: ?[]const u8,
     credential_executable: ?[]const u8,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     var total: usize = 0;
     const deadline_ms = monotonicMilliseconds(io) + fetch_timeout_ms;
@@ -1089,6 +1093,7 @@ fn reconcileInitializedSubmodules(
         0,
         &total,
         deadline_ms,
+        cancelled,
     );
     try cleanInitializedSubmodules(allocator, io, root);
 }
@@ -1230,6 +1235,7 @@ fn reconcileSelectedSubmodulesAt(
     depth: usize,
     total: *usize,
     deadline_ms: i64,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     var root_intent = try SelectedSourceIntent.initAlloc(allocator, parent_url);
     defer root_intent.deinit(allocator);
@@ -1270,6 +1276,7 @@ fn reconcileSelectedSubmodulesAt(
             selected.items,
             credential_executable,
             deadline_ms,
+            cancelled,
         );
         for (selected.items) |module| try appendPendingRepository(
             allocator,
@@ -1310,6 +1317,7 @@ fn updateSelectedSubmodules(
     selected: []const SelectedSubmodule,
     credential_executable: ?[]const u8,
     deadline_ms: i64,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !void {
     for (selected) |module| {
         if (!try commitExistsWithEnvironment(
@@ -1337,6 +1345,7 @@ fn updateSelectedSubmodules(
                 &fetch_environment,
                 &fetch_command.argv,
                 deadline_ms,
+                cancelled,
             );
         }
         if (!try commitExistsWithEnvironment(
@@ -1356,6 +1365,7 @@ fn updateSelectedSubmodules(
                 "checkout", "--detach",             "--force", module.oid,
             },
             deadline_ms,
+            cancelled,
         );
     }
 }
@@ -1449,7 +1459,9 @@ fn runSelectedSubmoduleCommand(
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
     deadline_ms: i64,
+    cancelled: ?*const std.atomic.Value(bool),
 ) !void {
+    if (cancelled) |signal| if (signal.load(.acquire)) return error.GitFetchCancelled;
     const remaining_ms = deadline_ms - monotonicMilliseconds(io);
     if (remaining_ms <= 0) return error.ManagedSubmoduleReconciliationTimedOut;
     var child = try std.process.spawn(io, .{
@@ -1467,6 +1479,7 @@ fn runSelectedSubmoduleCommand(
         &child,
         @intCast(@min(remaining_ms, std.math.maxInt(u32))),
         fetch_termination_grace_ms,
+        cancelled,
         error.ManagedSubmoduleReconciliationTimedOut,
     );
     if (term != .exited or term.exited != 0) {
@@ -2424,21 +2437,30 @@ pub fn deepenShallowHistory(
 const FetchWatchdog = struct {
     finished: std.atomic.Value(bool) = .init(false),
     expired: std.atomic.Value(bool) = .init(false),
+    cancelled_observed: std.atomic.Value(bool) = .init(false),
     pid: std.posix.pid_t,
     timeout_ms: u32,
     termination_grace_ms: u32,
+    cancelled: ?*const std.atomic.Value(bool),
 
     fn run(self: *FetchWatchdog) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const tick = std.Io.Duration.fromMilliseconds(5);
         for (0..@max(@as(u32, 1), self.timeout_ms / 5)) |_| {
             if (self.finished.load(.acquire)) return;
+            if (self.cancelled) |cancelled| if (cancelled.load(.acquire)) {
+                self.cancelled_observed.store(true, .release);
+                break;
+            };
             std.Io.sleep(io, tick, .awake) catch |ignored_error| switch (ignored_error) {
                 else => {},
             };
         }
         if (self.finished.load(.acquire)) return;
-        self.expired.store(true, .release);
+        if (self.cancelled) |cancelled| if (cancelled.load(.acquire)) {
+            self.cancelled_observed.store(true, .release);
+        };
+        if (!self.cancelled_observed.load(.acquire)) self.expired.store(true, .release);
         std.posix.kill(-self.pid, std.posix.SIG.TERM) catch |ignored_error| switch (ignored_error) {
             else => {},
         };
@@ -2488,6 +2510,9 @@ fn runFetchBounded(
     source: FetchSource,
     operation: FetchOperation,
 ) !std.process.Child.Term {
+    if (source.cancelled) |cancelled| if (cancelled.load(.acquire)) {
+        return error.GitFetchCancelled;
+    };
     var child = try spawnFetchProcess(allocator, io, cwd, source, operation);
     return waitBoundedProcess(
         allocator,
@@ -2495,6 +2520,7 @@ fn runFetchBounded(
         &child,
         source.timeout_ms,
         source.termination_grace_ms,
+        source.cancelled,
         error.GitFetchTimedOut,
     );
 }
@@ -2505,6 +2531,7 @@ fn waitBoundedProcess(
     child: *std.process.Child,
     timeout_ms: u32,
     termination_grace_ms: u32,
+    cancelled: ?*const std.atomic.Value(bool),
     timeout_error: anyerror,
 ) !std.process.Child.Term {
     var waited = false;
@@ -2514,6 +2541,7 @@ fn waitBoundedProcess(
         .pid = pid,
         .timeout_ms = timeout_ms,
         .termination_grace_ms = termination_grace_ms,
+        .cancelled = cancelled,
     };
     const watchdog_thread = try std.Thread.spawn(.{}, FetchWatchdog.run, .{&watchdog});
     var watchdog_joined = false;
@@ -2554,19 +2582,28 @@ fn waitBoundedProcess(
     };
     stdout_thread.join();
     stderr_thread.join();
-    // Keep the group leader unreaped until timeout escalation has finished so
-    // its PID/PGID cannot be reused before the watchdog's final signal.
-    watchdog.finished.store(true, .release);
-    watchdog_thread.join();
-    watchdog_joined = true;
+    finishFetchWatchdog(&watchdog, watchdog_thread, &watchdog_joined);
     defer if (stdout_capture.bytes) |bytes| allocator.free(bytes);
     defer if (stderr_capture.bytes) |bytes| allocator.free(bytes);
     if (stdout_capture.failure) |err| return err;
     if (stderr_capture.failure) |err| return err;
     const term = try child.wait(io);
     waited = true;
+    if (watchdog.cancelled_observed.load(.acquire)) return error.GitFetchCancelled;
     if (watchdog.expired.load(.acquire)) return timeout_error;
     return term;
+}
+
+fn finishFetchWatchdog(
+    watchdog: *FetchWatchdog,
+    watchdog_thread: std.Thread,
+    joined: *bool,
+) void {
+    // Keep the group leader unreaped until timeout escalation has finished so
+    // its PID/PGID cannot be reused before the watchdog's final signal.
+    watchdog.finished.store(true, .release);
+    watchdog_thread.join();
+    joined.* = true;
 }
 
 fn spawnFetchProcess(
@@ -3063,6 +3100,7 @@ test "worktree integrity local selected object does not require parent source" {
         selected.items,
         null,
         monotonicMilliseconds(io) + 5_000,
+        null,
     );
     try std.testing.expectError(
         error.ManagedSubmoduleInventoryFailed,

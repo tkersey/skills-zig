@@ -731,6 +731,8 @@ fn serveResolvedPullRequest(
         gh_resolved,
     );
     defer fetch_sources.deinit();
+    if (fetch_sources.base) |*source| source.cancelled = startup_cancelled;
+    if (fetch_sources.head) |*source| source.cancelled = startup_cancelled;
     var generation = try domain.PrGeneration.initFull(allocator, snapshot.base, snapshot.head);
     var generation_owned = true;
     errdefer if (generation_owned) generation.deinit();
