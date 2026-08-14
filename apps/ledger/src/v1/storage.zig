@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const document = @import("document.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 
 pub const SlotKind = enum {
     document,
@@ -12,6 +13,17 @@ pub const SlotKind = enum {
         if (std.mem.eql(u8, text, "document")) return .document;
         if (std.mem.eql(u8, text, "event-log")) return .event_log;
         return error.UnsupportedSlotKind;
+    }
+};
+
+pub const SlotLayout = enum {
+    monolithic,
+    segmented,
+
+    fn parse(text: []const u8) !SlotLayout {
+        if (std.mem.eql(u8, text, "monolithic")) return .monolithic;
+        if (std.mem.eql(u8, text, "segmented")) return .segmented;
+        return error.UnsupportedSlotLayout;
     }
 };
 
@@ -37,6 +49,7 @@ pub const Slot = struct {
     kind: SlotKind,
     codec: definition.Codec,
     max_bytes: usize,
+    layout: SlotLayout = .monolithic,
 
     fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -54,6 +67,11 @@ pub const ResolvedSlot = struct {
     kind: SlotKind,
     codec: definition.Codec,
     max_bytes: usize,
+    layout: SlotLayout = .monolithic,
+
+    pub fn isSegmented(self: ResolvedSlot) bool {
+        return self.layout == .segmented;
+    }
 
     fn deinit(self: *ResolvedSlot, allocator: std.mem.Allocator) void {
         if (self.owned_path) |path| allocator.free(path);
@@ -642,6 +660,7 @@ pub fn resolveWithGenerated(
             .kind = slot.kind,
             .codec = slot.codec,
             .max_bytes = slot.max_bytes,
+            .layout = slot.layout,
         };
         resolved.slot_count += 1;
     }
@@ -682,7 +701,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(13);
+    try encoder.writeU16(14);
     try encoder.writeEnum(plan.storage_kind);
     try encodeCacheSlots(plan.slots, encoder);
     try encodeCacheOperations(plan.operations, encoder);
@@ -704,6 +723,7 @@ fn encodeCacheSlots(
         try encoder.writeEnum(slot.kind);
         try encoder.writeEnum(slot.codec);
         try encoder.writeUsize(slot.max_bytes);
+        try encoder.writeEnum(slot.layout);
     }
 }
 
@@ -831,7 +851,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 13) {
+    if (try decoder.readU16() != 14) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -900,7 +920,9 @@ fn validateCacheSlots(
     definition_plan: *const definition.Plan,
 ) !void {
     for (slots) |slot| {
-        if (slot.max_bytes > definition_plan.bounds.max_store_bytes) {
+        if (slot.layout == .monolithic and
+            slot.max_bytes > definition_plan.bounds.max_store_bytes)
+        {
             return error.CacheStoragePlanMismatch;
         }
         for (slot.path_segments) |segment| switch (segment.kind) {
@@ -1136,6 +1158,8 @@ fn decodeCacheSlot(
     if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
         return error.StorageSlotBoundsExceeded;
     }
+    const layout = try decoder.readEnum(SlotLayout);
+    try validateSlotLayout(kind, codec, layout, max_bytes);
     for (prior_slots) |prior| {
         if (slotPathsAmbiguous(
             prior.relative_path,
@@ -1149,6 +1173,7 @@ fn decodeCacheSlot(
         .kind = kind,
         .codec = codec,
         .max_bytes = max_bytes,
+        .layout = layout,
     };
 }
 
@@ -2220,7 +2245,7 @@ fn compileSlot(
     const object = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "path", "kind", "codec", "max_bytes" },
+        &.{ "path", "kind", "codec", "max_bytes", "layout" },
     );
     try definition_core.json.requireFields(
         object,
@@ -2252,6 +2277,11 @@ fn compileSlot(
     if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
         return error.StorageSlotBoundsExceeded;
     }
+    const layout = if (object.get("layout")) |value|
+        try SlotLayout.parse(try definition_core.json.string(value))
+    else
+        .monolithic;
+    try validateSlotLayout(kind, codec, layout, max_bytes);
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
     const owned_path = try allocator.dupe(u8, relative_path);
@@ -2263,7 +2293,26 @@ fn compileSlot(
         .kind = kind,
         .codec = codec,
         .max_bytes = max_bytes,
+        .layout = layout,
     };
+}
+
+fn validateSlotLayout(
+    kind: SlotKind,
+    codec: definition.Codec,
+    layout: SlotLayout,
+    max_bytes: usize,
+) !void {
+    if (layout == .segmented and
+        (kind != .event_log or codec != .jsonl))
+    {
+        return error.SegmentedLayoutRequiresEventLog;
+    }
+    if (layout == .segmented and
+        max_bytes != segmented_event_log.event_segment_bytes)
+    {
+        return error.SegmentedEventSegmentBoundsInvalid;
+    }
 }
 
 fn validateSlotPathAmbiguity(slots: []const Slot) !void {
@@ -5615,6 +5664,21 @@ const storage_parameterized_definition =
     "\"max_records\":10,\"max_output_bytes\":1024,\"max_diagnostics\":8," ++
     "\"max_reducer_states\":4}}";
 
+const storage_segmented_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/segmented\",\"owner\":\"example\",\"requires\":{" ++
+    "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"parameters\":{},\"inputs\":{\"event\":{" ++
+    "\"codec\":\"json\",\"max_bytes\":4194304}},\"canonicalization\":{}," ++
+    "\"shape\":{},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"example/events.jsonl\",\"codec\":\"jsonl\"," ++
+    "\"layout\":\"segmented\",\"max_bytes\":67108864}}}," ++
+    "\"operations\":{},\"projections\":{},\"bounds\":{" ++
+    "\"max_input_bytes\":4194304,\"max_store_bytes\":4194304," ++
+    "\"max_records\":10,\"max_output_bytes\":4194304," ++
+    "\"max_diagnostics\":8,\"max_reducer_states\":4}}";
+
 const storage_reserved_definition =
     "{\"schema\":\"ledger-artifact-definition/v1\"," ++
     "\"id\":\"example/reserved\",\"owner\":\"example\",\"requires\":{" ++
@@ -5805,6 +5869,27 @@ test "storage compiler binds generic slots and atomic effects" {
         &parameters,
     );
     defer resolved.deinit(failing.allocator());
+}
+
+test "segmented event layout is explicit and cache stable" {
+    var test_plan = try StorageTestPlan.init(storage_segmented_definition);
+    defer test_plan.deinit();
+    try std.testing.expectEqual(
+        SlotLayout.segmented,
+        test_plan.plan.slots[0].layout,
+    );
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &test_plan.definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    try expectStorageCacheRoundTrip(
+        &test_plan.plan,
+        &test_plan.definition_plan,
+        &parameters,
+        "example/events.jsonl",
+    );
 }
 
 test "storage path parameters compile once and resolve as safe components" {
