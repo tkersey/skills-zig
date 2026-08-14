@@ -1012,6 +1012,13 @@ fn validateNestedPlans(plan_set: *const PlanSet) !void {
             &plan_set.storage_plan.?,
         );
     }
+    if (plan_set.storage_plan) |*storage_plan| {
+        try protocol.validateSegmentedSupport(
+            &plan_set.definition_plan,
+            storage_plan,
+            if (plan_set.protocol_plan) |*plan| plan else null,
+        );
+    }
     if (plan_set.projection_plan) |*plan| {
         try projection.validateCachePlan(
             plan,

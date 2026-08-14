@@ -163,6 +163,30 @@ pub const Plan = struct {
     }
 };
 
+pub fn checkpointUpperBound(plan: *const Plan) !usize {
+    var total: usize = 16;
+    for (plan.registers) |register| {
+        total = try addCheckpointBound(total, 8 + 128 + 1 + 8);
+        total = try addCheckpointBound(total, register.max_bytes);
+    }
+    for (plan.sets) |set| {
+        total = try addCheckpointBound(total, 8 + 128 + 8);
+        total = try addCheckpointBound(total, set.max_bytes);
+        const framing = std.math.mul(
+            usize,
+            set.max_entries,
+            8,
+        ) catch return error.CheckpointCapacityOverflow;
+        total = try addCheckpointBound(total, framing);
+    }
+    return total;
+}
+
+fn addCheckpointBound(left: usize, right: usize) !usize {
+    return std.math.add(usize, left, right) catch
+        error.CheckpointCapacityOverflow;
+}
+
 const OwnedValue = struct {
     bytes: []u8,
     parsed: std.json.Parsed(std.json.Value),

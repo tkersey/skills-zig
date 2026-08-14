@@ -1106,6 +1106,7 @@ pub fn compile(
             source,
         );
         errdefer compiled.deinit(allocator);
+        try validateSegmentedProjectionSupport(&compiled, storage_plan);
         try projections.append(allocator, compiled);
     }
     return .{
@@ -1382,6 +1383,7 @@ fn validateCachedProjection(
     if (projection.slot_index >= storage_plan.slots.len) {
         return error.CacheProjectionPlanMismatch;
     }
+    try validateSegmentedProjectionSupport(&projection, storage_plan);
     try validateCachedRequiredParameters(projection, definition_plan);
     try validateCachedSourceScope(projection, storage_plan);
     try validateCachedFold(projection, definition_plan, event_protocol);
@@ -1391,6 +1393,27 @@ fn validateCachedProjection(
     try validateCachedSortKeys(projection);
     try validateCachedShape(projection);
     try validateCachedFields(projection);
+}
+
+fn validateSegmentedProjectionSupport(
+    projection_plan: *const Projection,
+    storage_plan: *const storage.Plan,
+) !void {
+    const slot = storage_plan.slots[projection_plan.slot_index];
+    if (slot.layout != .segmented) return;
+    const fold = projection_plan.fold orelse {
+        if (projection_plan.source_scope != .resolved or
+            projection_plan.sort_keys.len != 0 or
+            projection_plan.relevance != null or
+            projection_plan.latest != null)
+        {
+            return error.SegmentedHistoryProjectionUnsupported;
+        }
+        return;
+    };
+    if (fold == .keyed and fold.keyed.history.active()) {
+        return error.SegmentedProjectionHistoryRequiresFullReplay;
+    }
 }
 
 fn validateCachedRequiredParameters(
@@ -4640,9 +4663,28 @@ fn executeSegmentedProjection(
     slot: storage.ResolvedSlot,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    if (compiled.fold == null) {
-        return error.SegmentedProjectionRequiresFold;
-    }
+    var snapshot = try segmented_event_log.Snapshot.load(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(allocator);
+    try segmented_event_log.requireMigratedCustody(
+        allocator,
+        repo_root,
+        slot.relative_path,
+        snapshot.head_exists,
+    );
+    if (compiled.fold == null) return executeSegmentedHistoryProjection(
+        allocator,
+        definition_plan,
+        plan,
+        compiled,
+        projection_name,
+        slot,
+        parameters,
+        &snapshot,
+    );
     var fold_history = try initFoldHistory(
         allocator,
         compiled,
@@ -4652,12 +4694,6 @@ fn executeSegmentedProjection(
     if (fold_history != null) {
         return error.SegmentedProjectionHistoryRequiresFullReplay;
     }
-    var snapshot = try segmented_event_log.Snapshot.load(
-        allocator,
-        repo_root,
-        slot.relative_path,
-    );
-    defer snapshot.deinit(allocator);
     const revision = try snapshot.head.revisionAlloc(allocator);
     defer allocator.free(revision);
     var replay_stats = try segmentedProjectionReplay(
@@ -4683,6 +4719,112 @@ fn executeSegmentedProjection(
         revision,
         &replay_stats,
     );
+}
+
+fn executeSegmentedHistoryProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    snapshot: *const segmented_event_log.Snapshot,
+) !Result {
+    const effective_limit =
+        try resolveLimit(compiled.limit, parameters, plan.max_records);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+        .streamed = true,
+    };
+    try executeSegmentedJsonlHistory(
+        allocator,
+        compiled,
+        parameters,
+        effective_limit,
+        plan.max_output_bytes,
+        snapshot,
+        &output,
+        &stats,
+    );
+    const revision = try snapshot.head.revisionAlloc(allocator);
+    defer allocator.free(revision);
+    return buildProjectionResult(
+        allocator,
+        definition_plan,
+        compiled,
+        projection_name,
+        slot.relative_path,
+        revision,
+        &output,
+        stats,
+    );
+}
+
+fn executeSegmentedJsonlHistory(
+    allocator: std.mem.Allocator,
+    compiled: *const Projection,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    max_output_bytes: usize,
+    snapshot: *const segmented_event_log.Snapshot,
+    output: *std.Io.Writer.Allocating,
+    stats: *Stats,
+) !void {
+    var latest_value: ?[]u8 = null;
+    defer if (latest_value) |value| allocator.free(value);
+    var latest_key: ?Scalar = null;
+    defer if (latest_key) |*key| key.deinit(allocator);
+    if (!compiled.single) try output.writer.writeByte('[');
+    var history: segmented_event_log.EventHistoryIterator = .{
+        .allocator = allocator,
+        .snapshot = snapshot,
+    };
+    var stop = false;
+    var complete = false;
+    while (!stop) {
+        const segment = try history.next() orelse break;
+        defer allocator.free(segment);
+        var lines = std.mem.splitScalar(u8, segment, '\n');
+        while (lines.next()) |line_with_cr| {
+            const line = std.mem.trim(u8, line_with_cr, " \t\r");
+            if (line.len == 0) continue;
+            stats.records_scanned = std.math.add(
+                usize,
+                stats.records_scanned,
+                1,
+            ) catch return error.ProjectionRecordBoundsExceeded;
+            const flow = try observeJsonlLine(
+                allocator,
+                line,
+                compiled,
+                parameters,
+                effective_limit,
+                &output.writer,
+                stats,
+                &latest_value,
+                &latest_key,
+            );
+            if (output.written().len > max_output_bytes) {
+                return error.ProjectionOutputBoundsExceeded;
+            }
+            if (flow == .complete) complete = true;
+            if (flow != .next) stop = true;
+            if (stop) break;
+        }
+    }
+    while (try history.next()) |segment| allocator.free(segment);
+    try history.finish();
+    if (!complete) {
+        try finishJsonlProjection(compiled, &output.writer, stats, latest_value);
+    }
+    if (output.written().len > max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
 }
 
 fn segmentedProjectionReplay(

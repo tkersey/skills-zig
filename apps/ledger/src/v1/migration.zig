@@ -9,6 +9,7 @@ const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
+const transaction = @import("transaction.zig");
 
 const legacy_event_tombstone =
     "ledger-segmented-custody-tombstone/v1 event-log\n";
@@ -43,6 +44,7 @@ pub fn execute(
     if (!std.fs.path.isAbsolute(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
+    try transaction.recoverRepositoryTransactions(allocator, repo_root);
     var resolved = try storage.resolve(allocator, storage_plan, parameters);
     defer resolved.deinit(allocator);
     const event_plan = event_protocol orelse
@@ -57,8 +59,12 @@ pub fn execute(
         slot.relative_path,
     );
     defer target.deinit(allocator);
-    if (target.head_exists) return existingResult(
+    if (target.head_exists) return validateExistingTarget(
         allocator,
+        definition_plan,
+        repo_root,
+        slot,
+        parameters,
         slot.relative_path,
         &target,
     );
@@ -193,11 +199,44 @@ fn requireRevision(actual: []const u8, expected: []const u8) !void {
     }
 }
 
-fn existingResult(
+fn validateExistingTarget(
     allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
     logical_ref: []const u8,
     target: *const segmented_event_log.Snapshot,
 ) !Result {
+    try segmented_event_log.auditHistory(allocator, target);
+    const logical_revision = try target.head.revisionAlloc(allocator);
+    defer allocator.free(logical_revision);
+    var binding = try custody.parseBindingSegment(
+        allocator,
+        target.binding_bytes,
+        definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        target.head.checkpointRevision() orelse logical_revision,
+        logical_revision,
+        null,
+    );
+    defer binding.deinit(allocator);
+    var stats = try replay.validateSegmentedSnapshot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        target,
+        &binding,
+        parameters,
+        definition_plan.bounds.max_records,
+        true,
+    );
+    defer stats.deinit(allocator);
+    if (stats.protocol_state == null) {
+        return error.SegmentedMigrationCheckpointMissing;
+    }
     const owned_ref = try allocator.dupe(u8, logical_ref);
     errdefer allocator.free(owned_ref);
     const revision = try target.head.revisionAlloc(allocator);
@@ -205,10 +244,7 @@ fn existingResult(
     return .{
         .logical_ref = owned_ref,
         .revision = revision,
-        .records = std.math.cast(
-            usize,
-            target.head.total_event_records,
-        ) orelse return error.CurrentStoreRecordBoundsExceeded,
+        .records = stats.records_validated,
         .transaction_id = null,
         .already_migrated = true,
     };

@@ -72,6 +72,26 @@ pub const Plan = struct {
     }
 };
 
+pub fn checkpointUpperBound(plan: *const Plan) !usize {
+    const per_entry_bytes = 8 + max_text_bytes +
+        8 + max_text_bytes + 1 + 8 + 8;
+    const entry_bytes = std.math.mul(
+        usize,
+        plan.max_entries,
+        per_entry_bytes,
+    ) catch return error.CheckpointCapacityOverflow;
+    const framed_bytes = std.math.add(
+        usize,
+        8,
+        entry_bytes,
+    ) catch return error.CheckpointCapacityOverflow;
+    return std.math.add(
+        usize,
+        framed_bytes,
+        plan.max_retained_total_bytes,
+    ) catch error.CheckpointCapacityOverflow;
+}
+
 const Entry = struct {
     key_bytes: [max_text_bytes]u8 = undefined,
     key_len: u16,

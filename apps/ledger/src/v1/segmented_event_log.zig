@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const checkpoint = @import("checkpoint.zig");
+const custody = @import("custody.zig");
 
 pub const event_segment_bytes: usize = 64 * 1024 * 1024;
 pub const binding_segment_bytes: usize = 16 * 1024 * 1024;
@@ -631,7 +632,7 @@ pub const Snapshot = struct {
     ) !Snapshot {
         var paths = try Paths.init(allocator, repo_root, logical_path);
         errdefer paths.deinit(allocator);
-        const head_read = try readOptionalFile(
+        var head_read = try readOptionalFile(
             allocator,
             paths.manifest,
             64 * 1024,
@@ -644,6 +645,27 @@ pub const Snapshot = struct {
         errdefer head.deinit(allocator);
         if (!std.mem.eql(u8, head.logical_path, logical_path)) {
             return error.SegmentedLogicalPathMismatch;
+        }
+        var generation: ?ReadGeneration = if (head_read.exists)
+            try ReadGeneration.acquire(allocator, &paths, &head)
+        else
+            null;
+        defer if (generation) |*value| value.deinit();
+        if (generation != null) {
+            const locked_head = try readOptionalFile(
+                allocator,
+                paths.manifest,
+                64 * 1024,
+            );
+            errdefer locked_head.deinit(allocator);
+            if (!locked_head.exists or
+                !std.mem.eql(u8, head_read.bytes, locked_head.bytes))
+            {
+                locked_head.deinit(allocator);
+                return error.SegmentedSnapshotGenerationChanged;
+            }
+            head_read.deinit(allocator);
+            head_read = locked_head;
         }
         const active = try ActiveFiles.load(allocator, &paths, &head);
         errdefer active.deinit(allocator);
@@ -696,6 +718,123 @@ pub const Snapshot = struct {
     }
 };
 
+const ReadGeneration = struct {
+    first: durable_store.CasReadLockPair,
+    second: durable_store.CasReadLockPair,
+
+    fn acquire(
+        allocator: std.mem.Allocator,
+        paths: *const Paths,
+        head: *const Head,
+    ) !ReadGeneration {
+        const event_path = try paths.eventSegmentAlloc(
+            allocator,
+            head.event_index,
+        );
+        defer allocator.free(event_path);
+        const binding_path = try paths.bindingSegmentAlloc(
+            allocator,
+            head.binding_index,
+        );
+        defer allocator.free(binding_path);
+        const checkpoint_path = if (head.checkpoint_exists)
+            try paths.checkpointAlloc(allocator, head.checkpoint_index)
+        else
+            null;
+        defer if (checkpoint_path) |path| allocator.free(path);
+        if (!try durable_store.casAdvisoryLockExists(
+            allocator,
+            paths.manifest,
+        )) return error.SegmentedGenerationCustodyMissing;
+        var expected: usize = 1;
+        if (try legacyFileExists(event_path, event_segment_bytes)) {
+            expected += 1;
+        }
+        if (try legacyFileExists(binding_path, binding_segment_bytes)) {
+            expected += 1;
+        }
+        if (checkpoint_path) |path| {
+            if (try legacyFileExists(path, checkpoint.max_checkpoint_bytes)) {
+                expected += 1;
+            }
+        }
+        var ordered = [4][]const u8{
+            paths.manifest,
+            event_path,
+            binding_path,
+            checkpoint_path orelse binding_path,
+        };
+        std.sort.heap([]const u8, &ordered, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.lessThan);
+        var first = try durable_store.acquireCasReadLockPair(
+            allocator,
+            ordered[0],
+            ordered[1],
+        );
+        errdefer first.deinit();
+        var second = try durable_store.acquireCasReadLockPair(
+            allocator,
+            ordered[2],
+            ordered[3],
+        );
+        errdefer second.deinit();
+        if (@as(usize, first.count) + @as(usize, second.count) != expected) {
+            return error.SegmentedGenerationCustodyMissing;
+        }
+        return .{ .first = first, .second = second };
+    }
+
+    fn deinit(self: *ReadGeneration) void {
+        self.second.deinit();
+        self.first.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn requireMigratedCustody(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    logical_path: []const u8,
+    head_exists: bool,
+) !void {
+    if (head_exists) return;
+    const event_path = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", logical_path },
+    );
+    defer allocator.free(event_path);
+    const binding_path = try custody.bindingPathAlloc(
+        allocator,
+        repo_root,
+        logical_path,
+    );
+    defer allocator.free(binding_path);
+    if (try legacyFileExists(event_path, event_segment_bytes) or
+        try legacyFileExists(binding_path, custody.binding_max_bytes))
+    {
+        return error.SegmentedMigrationRequired;
+    }
+}
+
+fn legacyFileExists(path: []const u8, maximum: usize) !bool {
+    try durable_store.rejectSymlinkComponents(path);
+    const stat = std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > maximum) return error.FileTooBig;
+    return true;
+}
+
 pub fn auditHistory(
     allocator: std.mem.Allocator,
     snapshot: *const Snapshot,
@@ -727,6 +866,52 @@ pub fn auditHistory(
         return error.SegmentedHistoryMismatch;
     }
 }
+
+pub const EventHistoryIterator = struct {
+    allocator: std.mem.Allocator,
+    snapshot: *const Snapshot,
+    index: u64 = 0,
+    summary: HistorySummary = .{},
+
+    pub fn next(self: *EventHistoryIterator) !?[]u8 {
+        if (self.index > self.snapshot.head.event_index) return null;
+        const bytes = if (self.index == self.snapshot.head.event_index)
+            try self.allocator.dupe(u8, self.snapshot.event_bytes)
+        else blk: {
+            const path = try self.snapshot.paths.eventSegmentAlloc(
+                self.allocator,
+                self.index,
+            );
+            defer self.allocator.free(path);
+            break :blk try durable_store.readRegularFileNoSymlink(
+                self.allocator,
+                path,
+                event_segment_bytes,
+            );
+        };
+        errdefer self.allocator.free(bytes);
+        if (self.index < self.snapshot.head.event_index and bytes.len == 0) {
+            return error.EmptySealedSegment;
+        }
+        try observeHistoryBytes(&self.summary, bytes);
+        self.index = std.math.add(u64, self.index, 1) catch
+            return error.SegmentedIndexOverflow;
+        return bytes;
+    }
+
+    pub fn finish(self: *const EventHistoryIterator) !void {
+        if (self.index != self.snapshot.head.event_index + 1 or
+            self.summary.bytes != self.snapshot.head.total_event_bytes or
+            self.summary.records != self.snapshot.head.total_event_records or
+            !hashStatesEqual(
+                self.summary.hash,
+                self.snapshot.head.logical_hash,
+            ))
+        {
+            return error.SegmentedHistoryMismatch;
+        }
+    }
+};
 
 const SegmentKind = enum { events, bindings };
 
@@ -1141,23 +1326,183 @@ test "segmented snapshot reads only the active bounded files" {
     defer allocator.free(event_path);
     const binding_path = try paths.bindingSegmentAlloc(allocator, 0);
     defer allocator.free(binding_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = event_path,
-        .data = event,
-    });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = binding_path,
-        .data = binding,
-    });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = paths.manifest,
-        .data = head_bytes,
-    });
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    const writes = [_]durable_store.TransactionMutation{
+        .{
+            .path = event_path,
+            .text = event,
+            .content_mode = .raw,
+            .max_bytes = event_segment_bytes,
+        },
+        .{
+            .path = binding_path,
+            .text = binding,
+            .content_mode = .raw,
+            .max_bytes = binding_segment_bytes,
+        },
+        .{
+            .path = paths.manifest,
+            .text = head_bytes,
+            .content_mode = .raw,
+            .max_bytes = 64 * 1024,
+        },
+    };
+    var receipt = try durable_store.commitTextTransaction(
+        allocator,
+        transactions,
+        &writes,
+        .{ .owner = .{ .process_id = 1, .session_id = "snapshot-fixture", .executor = "test" } },
+    );
+    defer receipt.deinit(allocator);
     var snapshot = try Snapshot.load(allocator, root, logical_path);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqualStrings(event, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding, snapshot.binding_bytes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.head.total_event_records);
+}
+
+const GenerationWriterContext = struct {
+    transactions: []const u8,
+    event_path: []const u8,
+    binding_path: []const u8,
+    manifest_path: []const u8,
+    event_bytes: []const u8,
+    binding_bytes: []const u8,
+    head_bytes: []const u8,
+    started: std.atomic.Value(u8) = .init(0),
+    finished: std.atomic.Value(u8) = .init(0),
+    result: ?anyerror = null,
+};
+
+fn runGenerationWriter(context: *GenerationWriterContext) void {
+    context.started.store(1, .release);
+    const mutations = [_]durable_store.TransactionMutation{
+        .{
+            .path = context.event_path,
+            .text = context.event_bytes,
+            .content_mode = .raw,
+            .max_bytes = event_segment_bytes,
+        },
+        .{
+            .path = context.binding_path,
+            .text = context.binding_bytes,
+            .content_mode = .raw,
+            .max_bytes = binding_segment_bytes,
+        },
+        .{
+            .path = context.manifest_path,
+            .text = context.head_bytes,
+            .content_mode = .raw,
+            .max_bytes = 64 * 1024,
+        },
+    };
+    var receipt = durable_store.commitTextTransaction(
+        std.heap.smp_allocator,
+        context.transactions,
+        &mutations,
+        .{ .owner = .{ .process_id = 2, .session_id = "generation-writer", .executor = "test" } },
+    ) catch |err| {
+        context.result = err;
+        context.finished.store(1, .release);
+        return;
+    };
+    receipt.deinit(std.heap.smp_allocator);
+    context.finished.store(1, .release);
+}
+
+test "segmented snapshot custody excludes mixed writer generations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const logical_path = "actuation/generation/events.jsonl";
+    var paths = try Paths.init(allocator, root, logical_path);
+    defer paths.deinit(allocator);
+    const event_path = try paths.eventSegmentAlloc(allocator, 0);
+    defer allocator.free(event_path);
+    const binding_path = try paths.bindingSegmentAlloc(allocator, 0);
+    defer allocator.free(binding_path);
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    var predecessor = try Head.init(allocator, logical_path);
+    defer predecessor.deinit(allocator);
+    const first_event = "{\"sequence\":1}\n";
+    const first_binding = "{\"binding\":1}\n";
+    _ = try predecessor.append(first_event, first_binding);
+    const predecessor_head = try predecessor.encodeAlloc(allocator);
+    defer allocator.free(predecessor_head);
+    const initial = [_]durable_store.TransactionMutation{
+        .{
+            .path = event_path,
+            .text = first_event,
+            .content_mode = .raw,
+            .max_bytes = event_segment_bytes,
+        },
+        .{
+            .path = binding_path,
+            .text = first_binding,
+            .content_mode = .raw,
+            .max_bytes = binding_segment_bytes,
+        },
+        .{
+            .path = paths.manifest,
+            .text = predecessor_head,
+            .content_mode = .raw,
+            .max_bytes = 64 * 1024,
+        },
+    };
+    var initial_receipt = try durable_store.commitTextTransaction(
+        allocator,
+        transactions,
+        &initial,
+        .{ .owner = .{ .process_id = 1, .session_id = "generation-initial", .executor = "test" } },
+    );
+    defer initial_receipt.deinit(allocator);
+    var generation = try ReadGeneration.acquire(allocator, &paths, &predecessor);
+    var successor = try predecessor.clone(allocator);
+    defer successor.deinit(allocator);
+    const event_bytes = first_event ++ "{\"sequence\":2}\n";
+    const binding_bytes = first_binding ++ "{\"binding\":2}\n";
+    _ = try successor.append("{\"sequence\":2}\n", "{\"binding\":2}\n");
+    const successor_head = try successor.encodeAlloc(allocator);
+    defer allocator.free(successor_head);
+    var context: GenerationWriterContext = .{
+        .transactions = transactions,
+        .event_path = event_path,
+        .binding_path = binding_path,
+        .manifest_path = paths.manifest,
+        .event_bytes = event_bytes,
+        .binding_bytes = binding_bytes,
+        .head_bytes = successor_head,
+    };
+    const thread = try std.Thread.spawn(.{}, runGenerationWriter, .{&context});
+    while (context.started.load(.acquire) == 0) {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
+    try std.testing.expectEqual(@as(u8, 1), context.finished.load(.acquire));
+    thread.join();
+    try std.testing.expectEqual(error.LockBusy, context.result.?);
+    generation.deinit();
+    context.result = null;
+    context.started.store(0, .release);
+    context.finished.store(0, .release);
+    const retry = try std.Thread.spawn(.{}, runGenerationWriter, .{&context});
+    retry.join();
+    if (context.result) |err| return err;
+    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings(event_bytes, snapshot.event_bytes);
+    try std.testing.expectEqualStrings(binding_bytes, snapshot.binding_bytes);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
 }
 
 test "segmented falsifier detects corruption in a sealed segment" {
@@ -1182,6 +1527,7 @@ test "segmented falsifier detects corruption in a sealed segment" {
     _ = try head.append(active_event, active_binding);
     try writeHistoryFixture(
         allocator,
+        root,
         &paths,
         &head,
         sealed_event,
@@ -1224,6 +1570,7 @@ test "segmented falsifier detects corruption in a sealed segment" {
 
 fn writeHistoryFixture(
     allocator: std.mem.Allocator,
+    repo_root: []const u8,
     paths: *const Paths,
     head: *const Head,
     sealed_event: []const u8,
@@ -1251,8 +1598,28 @@ fn writeHistoryFixture(
         .{ .path = checkpoint_path, .bytes = "checkpoint" },
         .{ .path = paths.manifest, .bytes = head_bytes },
     };
-    for (writes) |write| try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = write.path,
-        .data = write.bytes,
-    });
+    var mutations: [writes.len]durable_store.TransactionMutation = undefined;
+    for (writes, 0..) |write, index| mutations[index] = .{
+        .path = write.path,
+        .text = write.bytes,
+        .content_mode = .raw,
+        .max_bytes = if (std.mem.endsWith(u8, write.path, ".bin"))
+            checkpoint.max_checkpoint_bytes
+        else if (std.mem.endsWith(u8, write.path, ".jsonl"))
+            event_segment_bytes
+        else
+            64 * 1024,
+    };
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    var receipt = try durable_store.commitTextTransaction(
+        allocator,
+        transactions,
+        &mutations,
+        .{ .owner = .{ .process_id = 3, .session_id = "history-fixture", .executor = "test" } },
+    );
+    defer receipt.deinit(allocator);
 }

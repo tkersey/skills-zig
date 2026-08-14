@@ -195,6 +195,12 @@ fn inspectSegmentedEventSlot(
         slot.relative_path,
     );
     defer snapshot.deinit(allocator);
+    try segmented_event_log.requireMigratedCustody(
+        allocator,
+        repo_root,
+        slot.relative_path,
+        snapshot.head_exists,
+    );
     if (!snapshot.head_exists) return error.StoreSlotMissing;
     try segmented_event_log.auditHistory(allocator, &snapshot);
     const revision = try snapshot.head.revisionAlloc(allocator);

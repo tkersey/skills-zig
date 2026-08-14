@@ -408,6 +408,8 @@ fn validateSegmentedActive(
         .protocol_state = decoded.state,
         .raw_bytes_observed = @intCast(snapshot.head.checkpoint_event_bytes),
     };
+    const checkpoint_records = validator.protocol_state.?.records;
+    validator.protocol_state.?.records = 0;
     decoded.state = .{ .next_sequence = 0 };
     defer if (validator.historical_parameters) |*bindings| {
         bindings.deinit(allocator);
@@ -424,6 +426,11 @@ fn validateSegmentedActive(
     );
     defer summary.deinit(allocator);
     try validateSegmentedSummary(&validator, binding.rows, &summary, snapshot);
+    validator.protocol_state.?.records = std.math.add(
+        usize,
+        checkpoint_records,
+        validator.protocol_state.?.records,
+    ) catch return error.CurrentStoreRecordBoundsExceeded;
     const protocol_state = validator.protocol_state;
     validator.protocol_state = null;
     return .{

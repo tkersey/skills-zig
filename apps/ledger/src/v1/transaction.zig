@@ -428,6 +428,14 @@ const StartupRecoveryWorker = struct {
     completed: bool = false,
 };
 
+pub fn recoverRepositoryTransactions(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !void {
+    var paths = try TransactionPaths.init(allocator, repo_root, false);
+    defer paths.deinit(allocator);
+}
+
 fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
     var paths = TransactionPaths.init(
         std.heap.smp_allocator,
@@ -1783,10 +1791,10 @@ fn prepareSegmentedEffect(
         slot.relative_path,
     );
     defer snapshot.deinit(allocator);
-    try rejectLegacyCustodyForSegmentedSlot(
+    try segmented_event_log.requireMigratedCustody(
         allocator,
         repo_root,
-        slot,
+        slot.relative_path,
         snapshot.head_exists,
     );
     var idempotency = try EffectIdempotency.init(
@@ -1906,31 +1914,6 @@ fn finishSegmentedSuffixAdmission(
         return error.SegmentedCheckpointStateMissing;
     state.records = std.math.add(usize, protocol_records, 1) catch
         return error.CurrentStoreRecordBoundsExceeded;
-}
-
-fn rejectLegacyCustodyForSegmentedSlot(
-    allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    slot: storage.ResolvedSlot,
-    head_exists: bool,
-) !void {
-    if (head_exists) return;
-    const event_path = try std.fs.path.join(
-        allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
-    );
-    defer allocator.free(event_path);
-    const binding_path = try custody.bindingPathAlloc(
-        allocator,
-        repo_root,
-        slot.relative_path,
-    );
-    defer allocator.free(binding_path);
-    if (try eventLogSlotExists(event_path, slot.max_bytes) or
-        try eventLogSlotExists(binding_path, custody.binding_max_bytes))
-    {
-        return error.SegmentedMigrationRequired;
-    }
 }
 
 fn materializeSegmentedInput(
@@ -5892,7 +5875,7 @@ test "segmented record bound limits suffix replay rather than lifetime" {
     defer parameters.deinit(std.testing.allocator);
     var previous: ?[]u8 = null;
     defer if (previous) |digest| std.testing.allocator.free(digest);
-    for (1..5) |sequence| {
+    for (1..6) |sequence| {
         var event = try chainedEventAlloc(
             std.testing.allocator,
             @intCast(sequence),
@@ -5924,9 +5907,36 @@ test "segmented record bound limits suffix replay rather than lifetime" {
         slot.relative_path,
     );
     defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 4), snapshot.head.total_event_records);
+    try std.testing.expectEqual(@as(u64, 5), snapshot.head.total_event_records);
     try std.testing.expectEqual(@as(u64, 3), snapshot.head.checkpoint_event_records);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.head.event_records);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.head.event_records);
+    const revision = try snapshot.head.revisionAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(revision);
+    var binding = try custody.parseBindingSegment(
+        std.testing.allocator,
+        snapshot.binding_bytes,
+        plans.definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        snapshot.head.checkpointRevision().?,
+        revision,
+        null,
+    );
+    defer binding.deinit(std.testing.allocator);
+    var stats = try replay.validateSegmentedSnapshot(
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        slot,
+        &snapshot,
+        &binding,
+        &parameters,
+        plans.definition_plan.bounds.max_records,
+        true,
+    );
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), stats.records_validated);
+    try std.testing.expectEqual(@as(usize, 5), stats.protocol_state.?.records);
 }
 
 test "segmented transaction refuses unmigrated legacy custody" {

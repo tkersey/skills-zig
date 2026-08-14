@@ -7,6 +7,14 @@ const storage = @import("storage.zig");
 const checkpoint = @import("checkpoint.zig");
 
 const max_event_kinds: usize = 256;
+const replay_checkpoint_base_bytes: usize =
+    8 + checkpoint_schema.len +
+    8 + 71 +
+    8 +
+    1 + 8 + 71 +
+    8 +
+    max_event_kinds * 8 +
+    8;
 
 const chained_required_operator_mask =
     operatorBit(.event_envelope) |
@@ -239,11 +247,11 @@ pub fn decodeCheckpoint(
     }
     var kind_total: usize = 0;
     for (&state.kind_counts) |*count| {
-        count.* = try decoder.readCount(checkpoint.max_collection_items);
+        count.* = try decoder.readUsize();
         kind_total = std.math.add(usize, kind_total, count.*) catch
             return error.InvalidReplayCheckpoint;
     }
-    state.records = try decoder.readCount(checkpoint.max_collection_items);
+    state.records = try decoder.readUsize();
     if (kind_total != state.records) return error.InvalidReplayCheckpoint;
     state.reducer_state = try reducer.State.decodeCheckpoint(
         allocator,
@@ -267,6 +275,25 @@ pub fn decodeCheckpoint(
         .definition_digest = definition_digest,
         .state = state,
     };
+}
+
+test "checkpoint lifetime counters exceed collection bounds" {
+    const allocator = std.testing.allocator;
+    var state = ReplayState{ .next_sequence = 10_000_002 };
+    defer state.deinit(allocator);
+    state.kind_counts[0] = checkpoint.max_collection_items + 1;
+    state.records = checkpoint.max_collection_items + 1;
+    const digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const encoded = try encodeCheckpointAlloc(allocator, &state, digest);
+    defer allocator.free(encoded);
+    var decoded = try decodeCheckpoint(allocator, null, encoded);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(state.records, decoded.state.records);
+    try std.testing.expectEqual(
+        state.kind_counts[0],
+        decoded.state.kind_counts[0],
+    );
 }
 
 pub const GeneratedOutput = struct {
@@ -446,7 +473,14 @@ pub fn compile(
     storage_plan: *const storage.Plan,
 ) !?Plan {
     const present_mask = definition_plan.operator_mask & protocol_operator_mask;
-    if (present_mask == 0) return null;
+    if (present_mask == 0) {
+        try validateSegmentedSupport(
+            definition_plan,
+            storage_plan,
+            null,
+        );
+        return null;
+    }
     if (definition_plan.storage_kind != .event_log) {
         return error.ProtocolRequiresEventLogStorage;
     }
@@ -502,6 +536,11 @@ pub fn compile(
         .state_reducer_plan = reducers.retained,
     };
     try validateStorageMaterializations(&result, storage_plan);
+    try validateSegmentedSupport(
+        definition_plan,
+        storage_plan,
+        &result,
+    );
     return result;
 }
 
@@ -815,6 +854,84 @@ pub fn validateCachePlan(
         return error.CacheProtocolPlanMismatch;
     }
     try validateStorageMaterializations(plan, storage_plan);
+    try validateSegmentedSupport(
+        definition_plan,
+        storage_plan,
+        plan,
+    );
+}
+
+pub fn validateSegmentedSupport(
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    event_protocol: ?*const Plan,
+) !void {
+    var segmented_slots: usize = 0;
+    for (storage_plan.slots) |slot| {
+        if (slot.layout == .segmented) segmented_slots += 1;
+    }
+    if (segmented_slots == 0) return;
+    const event_plan = event_protocol orelse
+        return error.SegmentedLayoutRequiresProtocol;
+    if (segmented_slots != 1 or
+        storage_plan.slots[event_plan.target_slot_index].layout != .segmented)
+    {
+        return error.SegmentedLayoutProtocolTargetMismatch;
+    }
+    for (storage_plan.operations) |operation| {
+        var segmented_effects: usize = 0;
+        for (operation.effects) |effect| {
+            if (storage_plan.slots[effect.slot_index].layout != .segmented) {
+                continue;
+            }
+            segmented_effects += 1;
+            if (effect.kind.isBinding()) continue;
+            if (effect.kind != .compare_append or
+                effect.idempotency_parameter != null or
+                (effect.event != null and
+                    effect.event.?.idempotency != null))
+            {
+                return error.UnsupportedSegmentedEffect;
+            }
+        }
+        if (segmented_effects != 0 and operation.effects.len != 1) {
+            return error.UnsupportedSegmentedMultiEffectOperation;
+        }
+    }
+    try validateSegmentedCheckpointCapacity(event_plan);
+    _ = definition_plan;
+}
+
+fn validateSegmentedCheckpointCapacity(plan: *const Plan) !void {
+    var maximum = replay_checkpoint_base_bytes + 8 + 16;
+    if (plan.reducer_plan) |*reducer_plan| {
+        maximum = try replaceEmptyCheckpointBound(
+            maximum,
+            8,
+            try reducer.checkpointUpperBound(reducer_plan),
+        );
+    }
+    if (plan.state_reducer_plan) |*state_plan| {
+        maximum = try replaceEmptyCheckpointBound(
+            maximum,
+            16,
+            try state_reducer.checkpointUpperBound(state_plan),
+        );
+    }
+    if (maximum > checkpoint.max_checkpoint_bytes) {
+        return error.SegmentedCheckpointCapacityExceeded;
+    }
+}
+
+fn replaceEmptyCheckpointBound(
+    current: usize,
+    empty: usize,
+    populated: usize,
+) !usize {
+    const without_empty = std.math.sub(usize, current, empty) catch
+        return error.CheckpointCapacityOverflow;
+    return std.math.add(usize, without_empty, populated) catch
+        error.CheckpointCapacityOverflow;
 }
 
 pub fn apply(

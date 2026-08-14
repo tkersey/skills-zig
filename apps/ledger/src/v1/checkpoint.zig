@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const max_checkpoint_bytes: usize = 64 * 1024 * 1024;
+pub const max_checkpoint_bytes: usize = 128 * 1024 * 1024;
 pub const max_collection_items: usize = 10_000_000;
 
 pub const Encoder = struct {
@@ -94,12 +94,16 @@ pub const Decoder = struct {
     }
 
     pub fn readCount(self: *Decoder, maximum: usize) !usize {
-        const value = std.math.cast(usize, try self.readU64()) orelse
-            return error.CheckpointBoundsExceeded;
+        const value = try self.readUsize();
         if (value > maximum or value > max_collection_items) {
             return error.CheckpointBoundsExceeded;
         }
         return value;
+    }
+
+    pub fn readUsize(self: *Decoder) !usize {
+        return std.math.cast(usize, try self.readU64()) orelse
+            error.CheckpointBoundsExceeded;
     }
 
     pub fn readBytes(self: *Decoder, maximum: usize) ![]const u8 {

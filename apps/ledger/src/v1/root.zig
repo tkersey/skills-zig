@@ -21,6 +21,7 @@ pub const segmented_event_log = @import("segmented_event_log.zig");
 pub const doctor = @import("doctor.zig");
 pub const migration = @import("migration.zig");
 pub const envelope = @import("envelope.zig");
+pub const checkpoint = @import("checkpoint.zig");
 
 test {
     _ = definition;
@@ -42,6 +43,7 @@ test {
     _ = doctor;
     _ = migration;
     _ = envelope;
+    _ = checkpoint;
 }
 
 const PlainPlans = struct {
@@ -286,6 +288,33 @@ test "segmented migration preserves bytes revision and replay state" {
     defer std.testing.allocator.free(legacy_binding);
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try std.testing.expectError(
+        error.SegmentedMigrationRequired,
+        projection.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+            &plans.projection,
+            "current",
+            repo_root,
+            &plans.parameters,
+        ),
+    );
+    var pre_migration_doctor = try doctor.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer pre_migration_doctor.deinit(std.testing.allocator);
+    try std.testing.expect(!pre_migration_doctor.healthy);
+    try std.testing.expectEqualStrings(
+        "SegmentedMigrationRequired",
+        pre_migration_doctor.slots[0].error_code.?,
+    );
     var migrated = try migration.execute(
         std.testing.allocator,
         &plans.artifact,
@@ -348,6 +377,139 @@ test "segmented migration preserves bytes revision and replay state" {
     defer repeated.deinit(std.testing.allocator);
     try std.testing.expect(repeated.already_migrated);
     try std.testing.expectEqualStrings(legacy_revision, repeated.revision);
+    const original_id = plans.artifact.id;
+    plans.artifact.id = @constCast("example/wrong-definition");
+    defer plans.artifact.id = original_id;
+    try std.testing.expectError(
+        error.DefinitionArchiveOwnerMismatch,
+        migration.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.store,
+            &plans.protocol,
+            repo_root,
+            &plans.parameters,
+        ),
+    );
+}
+
+test "segmented cross-plan admission rejects unsupported surfaces" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try std.testing.expectError(
+        error.SegmentedLayoutRequiresProtocol,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            null,
+        ),
+    );
+    try protocol.validateSegmentedSupport(
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+    );
+    const effect = &plans.store.findOperation("append").?.effects[0];
+    const original_kind = effect.kind;
+    effect.kind = .compare_replace;
+    try std.testing.expectError(
+        error.UnsupportedSegmentedEffect,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    effect.kind = original_kind;
+    effect.idempotency_parameter = try std.testing.allocator.dupe(
+        u8,
+        "request_id",
+    );
+    try std.testing.expectError(
+        error.UnsupportedSegmentedEffect,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    std.testing.allocator.free(effect.idempotency_parameter.?);
+    effect.idempotency_parameter = null;
+    const compiled_projection = &plans.projection.projections[0];
+    const original_fold = compiled_projection.fold;
+    compiled_projection.fold = null;
+    try projection.validateCachePlan(
+        &plans.projection,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+    );
+    const original_source_scope = compiled_projection.source_scope;
+    compiled_projection.source_scope = .matching;
+    try std.testing.expectError(
+        error.SegmentedHistoryProjectionUnsupported,
+        projection.validateCachePlan(
+            &plans.projection,
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    compiled_projection.source_scope = original_source_scope;
+    compiled_projection.fold = original_fold;
+    const original_retained =
+        plans.protocol.reducer_plan.?.max_retained_total_bytes;
+    plans.protocol.reducer_plan.?.max_retained_total_bytes =
+        checkpoint.max_checkpoint_bytes;
+    try std.testing.expectError(
+        error.SegmentedCheckpointCapacityExceeded,
+        protocol.validateSegmentedSupport(
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+        ),
+    );
+    plans.protocol.reducer_plan.?.max_retained_total_bytes = original_retained;
+}
+
+test "segmented migration recovers pending transactions before custody reads" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(
+        std.testing.io,
+        ".ledger/.transactions/dtx-broken",
+    );
+    try repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/.transactions/dtx-broken/transaction.json",
+        .data = "{}",
+    });
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        migration.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.store,
+            &plans.protocol,
+            repo_root,
+            &plans.parameters,
+        ),
+    );
 }
 
 test "event-log projection treats a missing store as an empty relation" {
