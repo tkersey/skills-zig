@@ -3718,6 +3718,10 @@ fn verifyCompletionRace(
         std.mem.count(u8, final_log, "SynopticUnmarkFileViewed"),
     );
 
+    try verifyRenamedCompletionState(allocator, &state);
+}
+
+fn verifyRenamedCompletionState(allocator: std.mem.Allocator, state: *app.App) !void {
     var viewed = try domain.PrGeneration.initFull(allocator, "new", "next");
     try viewed.addFile(.{
         .path = "b.zig",

@@ -1522,6 +1522,14 @@ pub const Server = struct {
             return err;
         };
         refresh_lease.commit();
+        try self.reconcileRefresh(runtime, committed);
+    }
+
+    fn reconcileRefresh(
+        self: *Server,
+        runtime: *Runtime,
+        committed: CommittedRefresh,
+    ) !void {
         runtime.worktree_generation_valid = true;
         runtime.app.action_state_fresh = false;
         runtime.refresh_epoch = .committed_reconciling;

@@ -238,16 +238,20 @@ pub const Settings = struct {
 
     fn tomlSettingIndex(section: Section, key: []const u8) !usize {
         return switch (section) {
-            .file_review => if (std.mem.eql(u8, key, "start_mode")) 0 else error.InvalidSynopticConfig,
-            .browser => if (std.mem.eql(u8, key, "open")) 1 else error.InvalidSynopticConfig,
-            .worktree => if (std.mem.eql(u8, key, "prefer_current_pr_checkout")) 2 else error.InvalidSynopticConfig,
+            .file_review => tomlKeyIndex(key, "start_mode", 0),
+            .browser => tomlKeyIndex(key, "open", 1),
+            .worktree => tomlKeyIndex(key, "prefer_current_pr_checkout", 2),
             .exclusions => if (std.mem.eql(u8, key, "enabled")) 3 else if (std.mem.eql(
                 u8,
                 key,
                 "additional_globs",
-            )) 4 else if (std.mem.eql(u8, key, "removed_default_globs")) 5 else error.InvalidSynopticConfig,
+            )) 4 else tomlKeyIndex(key, "removed_default_globs", 5),
             .none => error.InvalidSynopticConfig,
         };
+    }
+
+    fn tomlKeyIndex(key: []const u8, expected: []const u8, index: usize) !usize {
+        return if (std.mem.eql(u8, key, expected)) index else error.InvalidSynopticConfig;
     }
 
     fn applyTomlSetting(
