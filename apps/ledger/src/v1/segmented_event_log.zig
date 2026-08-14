@@ -723,7 +723,36 @@ pub const Snapshot = struct {
         if (!head_read.exists and try durable_store.casAdvisoryLockExists(
             allocator,
             paths.manifest,
-        )) return error.SegmentedSnapshotGenerationChanged;
+        )) {
+            var initial_custody = durable_store.acquireCasReadLockPair(
+                allocator,
+                paths.manifest,
+                paths.manifest,
+            ) catch |err| switch (err) {
+                error.EventStoreBusy => return error.SegmentedSnapshotGenerationChanged,
+                else => return err,
+            };
+            defer initial_custody.deinit();
+            if (initial_custody.count != 1) {
+                return error.SegmentedGenerationCustodyMissing;
+            }
+            const checked_head = try readOptionalFile(
+                allocator,
+                paths.manifest,
+                64 * 1024,
+            );
+            if (checked_head.exists) {
+                head_read.deinit(allocator);
+                head_read = checked_head;
+                head.deinit(allocator);
+                head = try Head.decode(allocator, head_read.bytes);
+                if (!std.mem.eql(u8, head.logical_path, logical_path)) {
+                    return error.SegmentedLogicalPathMismatch;
+                }
+            } else {
+                checked_head.deinit(allocator);
+            }
+        }
         var generation: ?ReadGeneration = if (head_read.exists)
             try ReadGeneration.acquire(allocator, &paths, &head)
         else
@@ -1797,7 +1826,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
 }
 
-test "segmented snapshot rejects an absent head with writer custody" {
+test "segmented snapshot accepts an absent head with stale advisory custody" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1822,14 +1851,13 @@ test "segmented snapshot rejects an absent head with writer custody" {
         .sub_path = advisory_path,
         .data = "",
     });
-    try std.testing.expectError(
-        error.SegmentedSnapshotGenerationChanged,
-        Snapshot.load(
-            allocator,
-            root,
-            "actuation/initial-writer/events.jsonl",
-        ),
+    var snapshot = try Snapshot.load(
+        allocator,
+        root,
+        "actuation/initial-writer/events.jsonl",
     );
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(!snapshot.head_exists);
 }
 
 test "segmented falsifier detects corruption in a sealed segment" {

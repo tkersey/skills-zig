@@ -40,6 +40,7 @@ const PlanCache = struct {
     plans: std.ArrayList(ArchivedPlan) = .empty,
     indices: std.StringHashMapUnmanaged(usize) = .empty,
     definition_bytes: usize = 0,
+    rolling: bool = false,
 
     fn deinit(self: *PlanCache) void {
         self.indices.deinit(self.allocator);
@@ -52,6 +53,7 @@ const PlanCache = struct {
         if (self.indices.get(digest)) |index| {
             return &self.plans.items[index];
         }
+        if (self.rolling and self.plans.items.len != 0) self.clear();
         if (self.plans.items.len >= max_historical_definition_versions) {
             return error.HistoricalDefinitionVersionBoundExceeded;
         }
@@ -113,6 +115,13 @@ const PlanCache = struct {
         self.definition_bytes = next_definition_bytes;
         return &self.plans.items[index];
     }
+
+    fn clear(self: *PlanCache) void {
+        self.indices.clearRetainingCapacity();
+        for (self.plans.items) |*plan| plan.deinit(self.allocator);
+        self.plans.clearRetainingCapacity();
+        self.definition_bytes = 0;
+    }
 };
 
 pub fn validateSegmentedHistoryArchives(
@@ -121,6 +130,13 @@ pub fn validateSegmentedHistoryArchives(
     definition_id: []const u8,
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = definition_id,
+        .rolling = true,
+    };
+    defer cache.deinit();
     var history = segmented_event_log.BindingHistoryIterator{
         .allocator = allocator,
         .snapshot = snapshot,
@@ -144,12 +160,6 @@ pub fn validateSegmentedHistoryArchives(
                 parsed.value.object,
                 "definition_digest",
             ) catch return error.InvalidSegmentedBindingHistory;
-            var cache = PlanCache{
-                .allocator = allocator,
-                .repo_root = repo_root,
-                .definition_id = definition_id,
-            };
-            defer cache.deinit();
             _ = cache.get(digest) catch |err| switch (err) {
                 error.FileNotFound => return error.HistoricalDefinitionMissing,
                 else => return err,
@@ -157,6 +167,95 @@ pub fn validateSegmentedHistoryArchives(
         }
     }
     try history.finish();
+}
+
+pub fn validateSegmentedHistory(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+) !void {
+    if (!snapshot.head.checkpoint_exists) {
+        return error.SegmentedReplayCheckpointMissing;
+    }
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = definition_id,
+        .rolling = true,
+    };
+    defer cache.deinit();
+    var rows = HistoryRowCursor.init(
+        allocator,
+        snapshot,
+        definition_id,
+        slot,
+    );
+    defer rows.deinit();
+    var observer: IgnoreRecords = .{};
+    var validator = StreamEventValidator{
+        .allocator = allocator,
+        .cache = &cache,
+        .slot = slot,
+        .history_rows = &rows,
+        .parameters = parameters,
+        .protocol_required = protocol_required,
+        .max_records = std.math.maxInt(usize),
+        .observer = eraseReplayObserver(&observer),
+        .checkpoint_records = std.math.cast(
+            usize,
+            snapshot.head.checkpoint_event_records,
+        ) orelse return error.CurrentStoreRecordBoundsExceeded,
+        .checkpoint_bytes = snapshot.checkpoint_bytes,
+    };
+    defer if (validator.historical_parameters) |*bindings| {
+        bindings.deinit(allocator);
+    };
+    defer if (validator.protocol_state) |*state| state.deinit(allocator);
+    var events = segmented_event_log.EventHistoryIterator{
+        .allocator = allocator,
+        .snapshot = snapshot,
+    };
+    while (try events.next()) |bytes| {
+        defer allocator.free(bytes);
+        var backend = try activeMemoryStore(
+            allocator,
+            slot.relative_path,
+            bytes,
+        );
+        defer backend.deinit();
+        var summary = try backend.eventStore().scan(
+            allocator,
+            segmented_event_log.event_segment_bytes,
+            .{
+                .context = &validator,
+                .visitFn = StreamEventValidator.visit,
+                .rawFn = StreamEventValidator.observeRaw,
+            },
+        );
+        defer summary.deinit(allocator);
+        validator.record_offset = std.math.add(
+            usize,
+            validator.record_offset,
+            summary.record_count,
+        ) catch return error.CurrentStoreRecordBoundsExceeded;
+        validator.extent_offset = std.math.add(
+            usize,
+            validator.extent_offset,
+            summary.extent_bytes,
+        ) catch return error.CurrentStoreBoundsExceeded;
+    }
+    try events.finish();
+    try rows.finish();
+    if (validator.record_offset != snapshot.head.total_event_records or
+        validator.raw_bytes_observed != snapshot.head.total_event_bytes or
+        !validator.checkpoint_verified or validator.protocol_state == null)
+    {
+        return error.SegmentedHistoryMismatch;
+    }
 }
 
 pub const Stats = struct {
@@ -646,11 +745,104 @@ fn eraseReplayObserver(observer: anytype) ReplayObserver {
     return .{ .context = observer, .observe_fn = Adapter.observe };
 }
 
+const HistoryRowCursor = struct {
+    allocator: std.mem.Allocator,
+    snapshot: *const segmented_event_log.Snapshot,
+    history: segmented_event_log.BindingHistoryIterator,
+    reader: custody.BindingHistoryReader,
+    segment: []u8 = &.{},
+    offset: usize = 0,
+    current_row: ?custody.BindingRow = null,
+    exhausted: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        snapshot: *const segmented_event_log.Snapshot,
+        definition_id: []const u8,
+        slot: storage.ResolvedSlot,
+    ) HistoryRowCursor {
+        return .{
+            .allocator = allocator,
+            .snapshot = snapshot,
+            .history = .{ .allocator = allocator, .snapshot = snapshot },
+            .reader = .{
+                .allocator = allocator,
+                .definition_id = definition_id,
+                .slot_name = slot.name,
+                .logical_path = slot.relative_path,
+            },
+        };
+    }
+
+    fn deinit(self: *HistoryRowCursor) void {
+        if (self.current_row) |*row| row.deinit(self.allocator);
+        if (self.segment.len != 0) self.allocator.free(self.segment);
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    fn current(self: *HistoryRowCursor) !custody.BindingRow {
+        if (self.current_row == null) try self.loadNext();
+        return self.current_row orelse error.StoreBindingRecordCountMismatch;
+    }
+
+    fn advance(self: *HistoryRowCursor) !void {
+        if (self.current_row) |*row| row.deinit(self.allocator);
+        self.current_row = null;
+    }
+
+    fn loadNext(self: *HistoryRowCursor) !void {
+        while (!self.exhausted) {
+            while (self.offset < self.segment.len) {
+                const remaining = self.segment[self.offset..];
+                const newline = std.mem.indexOfScalar(u8, remaining, '\n') orelse
+                    return error.InvalidSegmentedBindingHistory;
+                const raw = remaining[0..newline];
+                self.offset += newline + 1;
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0) continue;
+                self.current_row = try self.reader.parseRow(line);
+                return;
+            }
+            if (self.segment.len != 0) self.allocator.free(self.segment);
+            self.segment = (try self.history.next()) orelse {
+                self.exhausted = true;
+                break;
+            };
+            self.offset = 0;
+            if (self.segment.len == 0 or
+                self.segment[self.segment.len - 1] != '\n')
+            {
+                return error.InvalidSegmentedBindingHistory;
+            }
+        }
+    }
+
+    fn finish(self: *HistoryRowCursor) !void {
+        if (self.current_row != null) {
+            return error.StoreBindingRecordCountMismatch;
+        }
+        try self.loadNext();
+        if (self.current_row != null) {
+            return error.StoreBindingRecordCountMismatch;
+        }
+        try self.history.finish();
+        const expected_rows = std.math.cast(
+            usize,
+            self.snapshot.head.total_binding_rows,
+        ) orelse return error.TooManyStoreBindings;
+        const revision = try self.snapshot.head.revisionAlloc(self.allocator);
+        defer self.allocator.free(revision);
+        try self.reader.finish(revision, expected_rows);
+    }
+};
+
 const StreamEventValidator = struct {
     allocator: std.mem.Allocator,
     cache: *PlanCache,
     slot: storage.ResolvedSlot,
-    rows: []const custody.BindingRow,
+    rows: []const custody.BindingRow = &.{},
+    history_rows: ?*HistoryRowCursor = null,
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
     max_records: usize,
@@ -667,6 +859,9 @@ const StreamEventValidator = struct {
     historical_parameters_index: ?usize = null,
     resolved_effect: ?ResolvedEffect = null,
     row_parameters: ?*const definition_core.parameters.Bindings = null,
+    checkpoint_records: ?usize = null,
+    checkpoint_bytes: []const u8 = &.{},
+    checkpoint_verified: bool = false,
 
     fn parametersForRow(
         self: *StreamEventValidator,
@@ -697,7 +892,13 @@ const StreamEventValidator = struct {
             self.raw_bytes_observed,
             bytes.len,
         ) catch return error.CurrentStoreBoundsExceeded;
-        if (self.rows[0].kind == .existing_store_binding and
+        const first_row = if (self.history_rows) |history|
+            try history.current()
+        else if (self.rows.len != 0)
+            self.rows[0]
+        else
+            return error.StoreBindingRecordCountMismatch;
+        if (first_row.kind == .existing_store_binding and
             !self.bound_prefix_verified)
         {
             try self.observeBoundPrefix(bytes);
@@ -709,7 +910,10 @@ const StreamEventValidator = struct {
         self: *StreamEventValidator,
         bytes: []const u8,
     ) !void {
-        const row = self.rows[0];
+        const row = if (self.history_rows) |history|
+            try history.current()
+        else
+            self.rows[0];
         const bound_end = row.extent_end;
         if (row.extent_start != 0 or bound_end <= self.raw_bytes_observed) {
             return error.StoreBindingExtentMismatch;
@@ -767,16 +971,53 @@ const StreamEventValidator = struct {
         if (record_index + 1 == end) {
             try self.finishRow(resolved, row, record);
         }
+        if (self.checkpoint_records) |expected| {
+            if (global_ordinal == expected) try self.verifyCheckpoint();
+        }
+    }
+
+    fn verifyCheckpoint(self: *StreamEventValidator) !void {
+        if (self.resolved_effect != null or self.protocol_state == null) {
+            return error.SegmentedCheckpointRecordMismatch;
+        }
+        var identity = try protocol.decodeCheckpoint(
+            self.allocator,
+            null,
+            self.checkpoint_bytes,
+        );
+        defer identity.deinit(self.allocator);
+        const archived = try self.cache.get(identity.definition_digest);
+        const plan = if (archived.protocol_plan) |*value|
+            value
+        else
+            return error.HistoricalProtocolBindingMismatch;
+        try protocol.activateCheckpoint(
+            self.allocator,
+            plan,
+            &self.protocol_state.?,
+        );
+        const encoded = try protocol.encodeCheckpointAlloc(
+            self.allocator,
+            &self.protocol_state.?,
+            identity.definition_digest,
+        );
+        defer self.allocator.free(encoded);
+        if (!std.mem.eql(u8, encoded, self.checkpoint_bytes)) {
+            return error.SegmentedCheckpointStateMismatch;
+        }
+        self.checkpoint_verified = true;
     }
 
     fn rowForRecord(
         self: *StreamEventValidator,
         record_index: usize,
     ) !custody.BindingRow {
-        if (self.row_index >= self.rows.len) {
+        const row = if (self.history_rows) |history|
+            try history.current()
+        else if (self.row_index < self.rows.len)
+            self.rows[self.row_index]
+        else
             return error.StoreBindingRecordCountMismatch;
-        }
-        const row = self.rows[self.row_index];
         const start = row.record_start orelse
             return error.StoreBindingRecordRangeMissing;
         const end = row.record_end orelse
@@ -876,7 +1117,7 @@ const StreamEventValidator = struct {
             }
         }
         if (resolved.effect.kind.isBinding()) {
-            self.advanceRow();
+            try self.advanceRow();
             return;
         }
         var digest: [EventHash.digest_length]u8 = undefined;
@@ -888,13 +1129,14 @@ const StreamEventValidator = struct {
         if (!std.mem.eql(u8, &formatted, row.canonical_input_digest)) {
             return error.HistoricalInputDigestMismatch;
         }
-        self.advanceRow();
+        try self.advanceRow();
     }
 
-    fn advanceRow(self: *StreamEventValidator) void {
+    fn advanceRow(self: *StreamEventValidator) !void {
         self.resolved_effect = null;
         self.row_parameters = null;
         self.row_index += 1;
+        if (self.history_rows) |history| try history.advance();
     }
 };
 
@@ -1071,7 +1313,10 @@ fn resolveEffect(
     current_slot: storage.ResolvedSlot,
     row: custody.BindingRow,
 ) !ResolvedEffect {
-    const archived = try cache.get(row.definition_digest);
+    const archived = cache.get(row.definition_digest) catch |err| switch (err) {
+        error.FileNotFound => return error.HistoricalDefinitionMissing,
+        else => return err,
+    };
     const operation = archived.storage_plan.findOperation(
         row.operation,
     ) orelse return error.HistoricalOperationMissing;

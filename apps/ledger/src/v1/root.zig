@@ -359,6 +359,25 @@ test "segmented migration preserves bytes revision and replay state" {
         "SegmentedMigrationRequired",
         pre_migration_doctor.slots[0].error_code.?,
     );
+    const closure_digest = plans.artifact.closure_digest;
+    plans.artifact.closure_digest[70] = if (closure_digest[70] == '0')
+        '1'
+    else
+        '0';
+    try std.testing.expectError(
+        error.DefinitionClosureDigestMismatch,
+        migration.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.store,
+            &plans.protocol,
+            repo_root,
+            &plans.parameters,
+        ),
+    );
+    plans.artifact.closure_digest = closure_digest;
     var migrated = try migration.execute(
         std.testing.allocator,
         &plans.artifact,
@@ -408,6 +427,56 @@ test "segmented migration preserves bytes revision and replay state" {
     defer std.testing.allocator.free(sealed_bindings);
     try std.testing.expectEqualStrings(legacy_binding, sealed_bindings);
     try expectPlainProjection(&plans, repo_root);
+    var decoded = try protocol.decodeCheckpoint(
+        std.testing.allocator,
+        &plans.protocol,
+        segmented.checkpoint_bytes,
+    );
+    defer decoded.deinit(std.testing.allocator);
+    decoded.state.next_sequence += 1;
+    const invalid_checkpoint = try protocol.encodeCheckpointAlloc(
+        std.testing.allocator,
+        &decoded.state,
+        decoded.definition_digest,
+    );
+    defer std.testing.allocator.free(invalid_checkpoint);
+    const invalid_checkpoint_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            std.testing.allocator,
+            invalid_checkpoint,
+        );
+    defer std.testing.allocator.free(invalid_checkpoint_digest);
+    var invalid_head = try segmented.head.clone(std.testing.allocator);
+    defer invalid_head.deinit(std.testing.allocator);
+    @memcpy(&invalid_head.checkpoint_digest, invalid_checkpoint_digest);
+    const invalid_head_bytes = try invalid_head.encodeAlloc(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(invalid_head_bytes);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.checkpoint_path.?,
+        .data = invalid_checkpoint,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.paths.manifest,
+        .data = invalid_head_bytes,
+    });
+    const checkpoint_projection = &plans.projection.projections[0];
+    const checkpoint_fold = checkpoint_projection.fold;
+    checkpoint_projection.fold = null;
+    try std.testing.expectError(
+        error.SegmentedCheckpointStateMismatch,
+        expectPlainProjection(&plans, repo_root),
+    );
+    checkpoint_projection.fold = checkpoint_fold;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.checkpoint_path.?,
+        .data = segmented.checkpoint_bytes,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = segmented.paths.manifest,
+        .data = segmented.head_bytes,
+    });
     const archive_path = try definition_archive.pathAlloc(
         std.testing.allocator,
         repo_root,

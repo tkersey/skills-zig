@@ -40,6 +40,13 @@ pub fn execute(
     if (!std.fs.path.isAbsolute(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
+    if (!std.mem.eql(
+        u8,
+        definition_plan.closure_digest[0..],
+        definition_closure.digestSlice(),
+    )) {
+        return error.DefinitionClosureDigestMismatch;
+    }
     if (try transaction.recoverRepositoryTransactions(
         allocator,
         repo_root,

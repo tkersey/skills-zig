@@ -4676,11 +4676,14 @@ fn executeSegmentedProjection(
         snapshot.head_exists,
     );
     if (compiled.fold == null) {
-        try replay.validateSegmentedHistoryArchives(
+        try replay.validateSegmentedHistory(
             allocator,
             repo_root,
             definition_plan.id,
+            slot,
             &snapshot,
+            parameters,
+            event_protocol != null,
         );
         return executeSegmentedHistoryProjection(
             allocator,

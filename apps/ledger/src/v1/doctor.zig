@@ -203,11 +203,14 @@ fn inspectSegmentedEventSlot(
     );
     if (!snapshot.head_exists) return error.StoreSlotMissing;
     try segmented_event_log.auditHistory(allocator, &snapshot);
-    try replay.validateSegmentedHistoryArchives(
+    try replay.validateSegmentedHistory(
         allocator,
         repo_root,
         definition_plan.id,
+        slot,
         &snapshot,
+        parameters,
+        protocol_required,
     );
     const revision = try snapshot.head.revisionAlloc(allocator);
     errdefer allocator.free(revision);

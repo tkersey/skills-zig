@@ -57,7 +57,7 @@ pub const BindingRow = struct {
     extent_start: usize,
     extent_end: usize,
 
-    fn deinit(self: *BindingRow, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BindingRow, allocator: std.mem.Allocator) void {
         allocator.free(self.definition_digest);
         allocator.free(self.operation);
         allocator.free(self.input_digest);
@@ -67,6 +67,64 @@ pub const BindingRow = struct {
         allocator.free(self.revision_after);
         if (self.idempotency_key) |key| allocator.free(key);
         self.* = undefined;
+    }
+};
+
+pub const BindingHistoryReader = struct {
+    allocator: std.mem.Allocator,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    last_revision: ?[]u8 = null,
+    rows: usize = 0,
+
+    pub fn deinit(self: *BindingHistoryReader) void {
+        if (self.last_revision) |revision| self.allocator.free(revision);
+        self.* = undefined;
+    }
+
+    pub fn parseRow(
+        self: *BindingHistoryReader,
+        line: []const u8,
+    ) !BindingRow {
+        var accumulator = BindingAccumulator{ .allocator = self.allocator };
+        defer accumulator.deinit();
+        if (self.last_revision) |revision| {
+            accumulator.last_revision = try self.allocator.dupe(u8, revision);
+        }
+        try parseAndAppendBindingRow(
+            &accumulator,
+            line,
+            .{
+                .definition_id = self.definition_id,
+                .slot_name = self.slot_name,
+                .logical_path = self.logical_path,
+            },
+            null,
+        );
+        if (accumulator.rows.items.len != 1) {
+            return error.InvalidStoreBinding;
+        }
+        const row = accumulator.rows.pop().?;
+        const next_revision = accumulator.last_revision.?;
+        accumulator.last_revision = null;
+        if (self.last_revision) |revision| self.allocator.free(revision);
+        self.last_revision = next_revision;
+        self.rows = std.math.add(usize, self.rows, 1) catch
+            return error.TooManyStoreBindings;
+        return row;
+    }
+
+    pub fn finish(
+        self: *const BindingHistoryReader,
+        expected_revision: []const u8,
+        expected_rows: usize,
+    ) !void {
+        if (self.rows != expected_rows or self.last_revision == null or
+            !std.mem.eql(u8, self.last_revision.?, expected_revision))
+        {
+            return error.StoreBindingRevisionMismatch;
+        }
     }
 };
 
