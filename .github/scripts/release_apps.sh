@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note img)
+apps=(seq lift cas synoptic ledger memory-note img)
 
 resolve_ref() {
   local ref=$1
@@ -55,6 +55,11 @@ case "$mode" in
       mark_app cas
     }
 
+    mark_cas_runtime_consumers() {
+      mark_app cas
+      mark_app synoptic
+    }
+
     mark_store_consumers() {
       mark_app seq
       mark_app cas
@@ -64,8 +69,21 @@ case "$mode" in
 
     classify_build_line() {
       local raw=$1
-      local app token
+      local app token dependency_import=0
       local matched=1
+      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
+        dependency_import=1
+      fi
+      if [[ "$dependency_import" -eq 0 ]] &&
+         grep -Eqi 'cas_runtime|cas-runtime|cas_hook_policy|cas-hook-policy' <<<"$raw"; then
+        mark_cas_runtime_consumers
+        matched=0
+      fi
+      # Dependency imports inherit the owner of their surrounding build hunk.
+      # Do not let the imported module's name classify the consuming product.
+      if [[ "$dependency_import" -eq 1 ]]; then
+        return "$matched"
+      fi
       for app in "${apps[@]}"; do
         token=${app//-/_}
         if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}_[A-Za-z0-9_]+|build-$app|test-$app|run-$app" <<<"$raw"; then
@@ -77,12 +95,6 @@ case "$mode" in
           matched=0
         fi
       done
-      # A dependency import is owned by the surrounding app-specific build
-      # hunk. Widening it to every consumer would make adding one CAS import
-      # spuriously require unrelated app releases.
-      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
-        return "$matched"
-      fi
       if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
         mark_definition_consumers
         matched=0
@@ -118,6 +130,10 @@ case "$mode" in
         mark_app cas
         matched=0
       fi
+      if grep -Eq '(^|[^[:alnum:]_])[[:alnum:]_]*[Ss]ynoptic[[:alnum:]_]*([^[:alnum:]_]|$)' <<<"$raw"; then
+        mark_app synoptic
+        matched=0
+      fi
       if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
         mark_ledger
         matched=0
@@ -127,7 +143,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.\{ \.(link_libc|sqlite) = true \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
@@ -151,6 +167,12 @@ case "$mode" in
           ;;
         libs/trace_core/*)
           mark_trace_consumers
+          ;;
+        libs/cas_runtime/*)
+          mark_cas_runtime_consumers
+          ;;
+        apps/cas/scripts/cas_app_server_launch.zig|apps/cas/scripts/cas_hook_policy.zig)
+          mark_cas_runtime_consumers
           ;;
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
@@ -176,6 +198,9 @@ case "$mode" in
         .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
+        .github/workflows/release-synoptic.yml)
+          mark_app synoptic
+          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -190,6 +215,9 @@ case "$mode" in
           for app in "${apps[@]}"; do
             case "$path" in
               "apps/$app/README.md")
+                if [[ "$app" == synoptic ]]; then
+                  mark_app synoptic
+                fi
                 matched=1
                 ;;
               "apps/$app/"*)
@@ -218,18 +246,29 @@ case "$mode" in
         if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
           return
         fi
-        local change raw
+        local change hunk_text raw
         local changed_matched=0
         local context_matched=0
+        local release_safe_runtime_hunk=0
         local substantive_unknown=0
         local retired_app_deletion=0
         local has_addition=0
+        hunk_text=$(printf '%s\n' "${build_hunk[@]}")
+        if grep -Eq 'const core_json_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const cas_hook_policy_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const cas_runtime_release_safe = b\.createModule\(' <<<"$hunk_text" &&
+           grep -Eq 'const synoptic_release_safe_root = b\.createModule\(' <<<"$hunk_text"; then
+          release_safe_runtime_hunk=1
+        fi
         for change in "${build_changed_lines[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
           fi
-          if classify_build_line "$raw"; then
+          if [[ "$release_safe_runtime_hunk" -eq 1 ]] &&
+             grep -Eq '^[[:space:]]*(const core_json_release_safe = b\.createModule\(\.\{|\.root_source_file = b\.path\("libs/core/src/json_helpers\.zig"\),)$' <<<"$raw"; then
+            mark_cas_runtime_consumers
+          elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1

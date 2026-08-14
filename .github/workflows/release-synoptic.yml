@@ -1,0 +1,248 @@
+name: Release synoptic
+
+on:
+  push:
+    tags:
+      - "synoptic-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-synoptic-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      release_commit: ${{ steps.tag.outputs.release_commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: tag
+        name: Resolve release tag to its immutable commit
+        run: |
+          set -euo pipefail
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"${ref_json}")"
+          object_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
+          for _ in 1 2 3 4; do
+            [[ "${object_type}" = commit ]] && break
+            [[ "${object_type}" = tag ]] || { echo "Unsupported tag object: ${object_type}" >&2; exit 1; }
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(jq -r '.object.type' <<<"${tag_json}")"
+            object_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
+          done
+          [[ "${object_type}" = commit ]] || { echo "Release tag did not resolve to a commit" >&2; exit 1; }
+          echo "release_commit=${object_sha}" >> "${GITHUB_OUTPUT}"
+
+  qualify:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            zig_target: aarch64-macos
+            runs_on: macos-15
+            runner_arch: ARM64
+            binary_arch: arm64
+          - target: darwin-x86_64
+            zig_target: x86_64-macos
+            runs_on: macos-15-intel
+            runner_arch: X64
+            binary_arch: x86_64
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.release_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+      - name: Validate Synoptic tag and runner architecture
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_COMMIT}"
+          expected_tag="synoptic-v$(tr -d '[:space:]' < apps/synoptic/VERSION)"
+          if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if [[ "${RUNNER_ARCH}" != "${{ matrix.runner_arch }}" ]]; then
+            echo "Runner architecture mismatch: expected ${{ matrix.runner_arch }}, got ${RUNNER_ARCH}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test Synoptic on the native release runner
+        run: |
+          zig build test-synoptic
+          zig build release-synoptic-safe
+      - name: Build target Synoptic release binary
+        run: >-
+          zig build build-synoptic
+          -Dtarget=${{ matrix.zig_target }}
+          -Dcpu=baseline
+          -Doptimize=ReleaseFast
+      - name: Verify binary architecture, version, and capabilities
+        run: |
+          set -euo pipefail
+          file zig-out/bin/synoptic
+          test "$(lipo -archs zig-out/bin/synoptic)" = "${{ matrix.binary_arch }}"
+          expected_version="$(tr -d '[:space:]' < apps/synoptic/VERSION)"
+          test "$(./zig-out/bin/synoptic version)" = "synoptic ${expected_version}"
+          capabilities="$(./zig-out/bin/synoptic capabilities --format json)"
+          jq -e --arg version "${expected_version}" '
+            .synopticCapabilities.version == $version and
+            .synopticCapabilities.platform == "macos" and
+            .synopticCapabilities.skillAbi == "synoptic-skill-abi/v1" and
+            .synopticCapabilities.uiAbi == "synoptic-ui/v1" and
+            .synopticCapabilities.features == {
+              casRuntimeV1: true,
+              githubViewedQueueV1: true,
+              ephemeralFileSessionsV1: true,
+              githubActionCardsV1: true
+            }
+          ' <<<"${capabilities}"
+      - name: Package exact Synoptic archive
+        run: |
+          set -euo pipefail
+          archive="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          archive_check="${archive}.reproducibility-check"
+          mkdir -p dist
+          install -m 0755 zig-out/bin/synoptic dist/synoptic
+          TZ=UTC touch -t 198001010000 dist/synoptic
+          make_archive() {
+            local output="$1"
+            COPYFILE_DISABLE=1 tar \
+              --format ustar \
+              --uid 0 \
+              --gid 0 \
+              --uname root \
+              --gname root \
+              -cf - \
+              -C dist synoptic \
+              | gzip -n -9 > "${output}"
+          }
+          make_archive "${archive}"
+          make_archive "${archive_check}"
+          cmp "${archive}" "${archive_check}"
+          test "$(tar -tzf "${archive}")" = "synoptic"
+          echo "ARCHIVE=${archive}" >> "${GITHUB_ENV}"
+      - name: Upload Synoptic workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: [resolve, qualify]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.release_commit }}
+    steps:
+      - name: Download Synoptic release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.RELEASE_TAG }}-darwin-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Verify exact Synoptic artifact set
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#synoptic-v}"
+          expected_arm="synoptic-v${version}-darwin-arm64.tar.gz"
+          expected_intel="synoptic-v${version}-darwin-x86_64.tar.gz"
+          mapfile -t actual < <(find release-assets -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | LC_ALL=C sort)
+          expected=("${expected_arm}" "${expected_intel}")
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            echo "Expected exactly ${expected[*]}, got ${actual[*]}" >&2
+            exit 1
+          fi
+          test "$(tar -tzf "release-assets/${expected_arm}")" = "synoptic"
+          test "$(tar -tzf "release-assets/${expected_intel}")" = "synoptic"
+      - name: Bind publication tag to release commit
+        run: |
+          set -euo pipefail
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"${ref_json}")"
+          tag_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
+          for _ in 1 2 3 4; do
+            [[ "${object_type}" = commit ]] && break
+            [[ "${object_type}" = tag ]] || { echo "Unsupported tag object: ${object_type}" >&2; exit 1; }
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")"
+            object_type="$(jq -r '.object.type' <<<"${tag_json}")"
+            tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
+          done
+          if [[ "${object_type}" != commit || "${tag_sha}" != "${RELEASE_COMMIT}" ]]; then
+            echo "Release tag does not resolve to qualified commit ${RELEASE_COMMIT}: ${object_type} ${tag_sha}" >&2
+            exit 1
+          fi
+      - name: Reconcile existing Synoptic release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_arm="${RELEASE_TAG}-darwin-arm64.tar.gz"
+          expected_intel="${RELEASE_TAG}-darwin-x86_64.tar.gz"
+          error_file="${RUNNER_TEMP}/synoptic-release-query.err"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --silent 2>"${error_file}"; then
+            if grep -q 'HTTP 404' "${error_file}"; then
+              exit 0
+            fi
+            cat "${error_file}" >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r asset_id asset_name; do
+            case "${asset_name}" in
+              "${expected_arm}"|"${expected_intel}") ;;
+              *)
+                gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+                ;;
+            esac
+          done < <(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              --jq '.assets[] | [.id, .name] | @tsv'
+          )
+      - name: Publish exact Synoptic release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/${{ env.RELEASE_TAG }}-darwin-arm64.tar.gz
+            release-assets/${{ env.RELEASE_TAG }}-darwin-x86_64.tar.gz
+      - name: Verify exact remote Synoptic release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_arm="${RELEASE_TAG}-darwin-arm64.tar.gz"
+          expected_intel="${RELEASE_TAG}-darwin-x86_64.tar.gz"
+          mapfile -t actual < <(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              --jq '.assets[].name' | LC_ALL=C sort
+          )
+          expected=("${expected_arm}" "${expected_intel}")
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            echo "Expected exact remote assets ${expected[*]}, got ${actual[*]}" >&2
+            exit 1
+          fi

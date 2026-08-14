@@ -6790,7 +6790,10 @@ fn parseTransactionRecord(allocator: std.mem.Allocator, record_path: []const u8)
         allocator,
         bytes,
         .{},
-    ) catch return error.TransactionCorrupt;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.TransactionCorrupt,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.TransactionCorrupt;
     const object = parsed.value.object;

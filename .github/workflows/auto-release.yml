@@ -9,6 +9,7 @@ on:
       - "build.zig.zon"
       - "apps/**"
       - "libs/core/**"
+      - "libs/cas_runtime/**"
       - "libs/definition_compat/**"
       - "libs/definition_core/**"
       - "libs/durable_store/**"
