@@ -7,6 +7,7 @@ const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
 const protocol = @import("protocol.zig");
 const revision_archive = @import("revision_archive.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
@@ -287,6 +288,247 @@ pub fn validateReplaySlotObserved(
     };
 }
 
+pub fn validateSegmentedSnapshot(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    binding: *const custody.BindingSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+) !Stats {
+    var observer: IgnoreRecords = .{};
+    return validateSegmentedSnapshotObserved(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        snapshot,
+        binding,
+        parameters,
+        current_max_records,
+        protocol_required,
+        &observer,
+    );
+}
+
+pub fn validateSegmentedSnapshotObserved(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    binding: *const custody.BindingSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    observer: anytype,
+) !Stats {
+    if (!slot.isSegmented() or slot.kind != .event_log) {
+        return error.SegmentedReplayRequiresSegmentedEventLog;
+    }
+    if (!snapshot.head.checkpoint_exists) {
+        return error.SegmentedReplayCheckpointMissing;
+    }
+    if (current_max_records == 0 or current_max_records > 10_000_000) {
+        return error.InvalidReplayRecordBound;
+    }
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = definition_id,
+    };
+    defer cache.deinit();
+    var decoded = try decodeReplayCheckpoint(
+        allocator,
+        &cache,
+        snapshot.checkpoint_bytes,
+    );
+    defer decoded.deinit(allocator);
+    if (decoded.state.records != snapshot.head.checkpoint_event_records) {
+        return error.SegmentedCheckpointRecordMismatch;
+    }
+    for (binding.rows) |row| _ = try cache.get(row.definition_digest);
+    try requireAppendOnlyRows(&cache, slot, binding.rows);
+    const total_records = std.math.cast(
+        usize,
+        snapshot.head.total_event_records,
+    ) orelse return error.CurrentStoreRecordBoundsExceeded;
+    if (total_records > current_max_records) {
+        return error.CurrentStoreRecordBoundsExceeded;
+    }
+    if (snapshot.event_bytes.len == 0) {
+        if (binding.rows.len != 0) return error.InvalidStoreBinding;
+        return segmentedCheckpointOnlyStats(&cache, &decoded);
+    }
+    return validateSegmentedActive(
+        allocator,
+        &cache,
+        slot,
+        snapshot,
+        binding,
+        parameters,
+        current_max_records,
+        protocol_required,
+        observer,
+        total_records,
+        &decoded,
+    );
+}
+
+fn validateSegmentedActive(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    binding: *const custody.BindingSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    observer: anytype,
+    total_records: usize,
+    decoded: *protocol.DecodedCheckpoint,
+) !Stats {
+    var backend = try activeMemoryStore(
+        allocator,
+        slot.relative_path,
+        snapshot.event_bytes,
+    );
+    defer backend.deinit();
+    var validator = StreamEventValidator{
+        .allocator = allocator,
+        .cache = cache,
+        .slot = slot,
+        .rows = binding.rows,
+        .parameters = parameters,
+        .protocol_required = protocol_required,
+        .max_records = current_max_records,
+        .observer = eraseReplayObserver(observer),
+        .record_offset = @intCast(snapshot.head.checkpoint_event_records),
+        .extent_offset = @intCast(snapshot.head.checkpoint_event_bytes),
+        .protocol_state = decoded.state,
+        .raw_bytes_observed = @intCast(snapshot.head.checkpoint_event_bytes),
+    };
+    decoded.state = .{ .next_sequence = 0 };
+    defer if (validator.historical_parameters) |*bindings| {
+        bindings.deinit(allocator);
+    };
+    errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
+    var summary = try backend.eventStore().scan(
+        allocator,
+        segmented_event_log.event_segment_bytes,
+        .{
+            .context = &validator,
+            .visitFn = StreamEventValidator.visit,
+            .rawFn = StreamEventValidator.observeRaw,
+        },
+    );
+    defer summary.deinit(allocator);
+    try validateSegmentedSummary(&validator, binding.rows, &summary, snapshot);
+    const protocol_state = validator.protocol_state;
+    validator.protocol_state = null;
+    return .{
+        .records_validated = total_records,
+        .definition_versions = cache.plans.items.len,
+        .protocol_state = protocol_state,
+        .append_context = null,
+    };
+}
+
+fn decodeReplayCheckpoint(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    bytes: []const u8,
+) !protocol.DecodedCheckpoint {
+    var identity = try protocol.decodeCheckpoint(allocator, null, bytes);
+    defer identity.deinit(allocator);
+    const archived = try cache.get(identity.definition_digest);
+    const plan = if (archived.protocol_plan) |*value|
+        value
+    else
+        return error.HistoricalProtocolBindingMismatch;
+    return protocol.decodeCheckpoint(allocator, plan, bytes);
+}
+
+fn requireAppendOnlyRows(
+    cache: *PlanCache,
+    slot: storage.ResolvedSlot,
+    rows: []const custody.BindingRow,
+) !void {
+    for (rows) |row| {
+        const resolved = try resolveEffect(cache, slot, row);
+        if (row.kind != .admission or
+            resolved.effect.kind != .compare_append)
+        {
+            return error.HistoricalEffectKindMismatch;
+        }
+    }
+}
+
+fn segmentedCheckpointOnlyStats(
+    cache: *const PlanCache,
+    decoded: *protocol.DecodedCheckpoint,
+) Stats {
+    const state = decoded.state;
+    decoded.state = .{ .next_sequence = 0 };
+    return .{
+        .records_validated = state.records,
+        .definition_versions = cache.plans.items.len,
+        .protocol_state = state,
+        .append_context = null,
+    };
+}
+
+fn activeMemoryStore(
+    allocator: std.mem.Allocator,
+    logical_ref: []const u8,
+    bytes: []const u8,
+) !durable_store.MemoryEventStore {
+    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') {
+        return error.InvalidSegmentedActiveEventFile;
+    }
+    var result = durable_store.MemoryEventStore.init(allocator, logical_ref);
+    errdefer result.deinit();
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (!std.mem.eql(u8, line, std.mem.trim(u8, line, " \t\r"))) {
+            return error.InvalidSegmentedActiveEventFile;
+        }
+        const owned = try allocator.dupe(u8, line);
+        result.records.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+    result.exists = true;
+    return result;
+}
+
+fn validateSegmentedSummary(
+    validator: *const StreamEventValidator,
+    rows: []const custody.BindingRow,
+    summary: *const durable_store.EventScanSummary,
+    snapshot: *const segmented_event_log.Snapshot,
+) !void {
+    if (!summary.exists or summary.record_count != snapshot.head.event_records) {
+        return error.SegmentedActiveRecordMismatch;
+    }
+    if (validator.row_index != rows.len or rows.len == 0) {
+        return error.StoreBindingRecordCountMismatch;
+    }
+    const expected_end = std.math.add(
+        usize,
+        validator.record_offset,
+        summary.record_count,
+    ) catch return error.StoreBindingRecordCountMismatch;
+    if (rows[rows.len - 1].record_end != expected_end) {
+        return error.StoreBindingRecordCountMismatch;
+    }
+}
+
 fn streamReplaySupported(
     cache: *PlanCache,
     slot: storage.ResolvedSlot,
@@ -360,6 +602,8 @@ const StreamEventValidator = struct {
     max_records: usize,
     observer: ReplayObserver,
     row_index: usize = 0,
+    record_offset: usize = 0,
+    extent_offset: usize = 0,
     protocol_state: ?protocol.ReplayState = null,
     row_hash: EventHash = EventHash.init(.{}),
     raw_bytes_observed: usize = 0,
@@ -439,10 +683,15 @@ const StreamEventValidator = struct {
     ) !void {
         const self: *StreamEventValidator = @ptrCast(@alignCast(context));
         if (record.ordinal == 0) return error.StoreBindingRecordCountMismatch;
-        if (record.ordinal > self.max_records) {
+        const global_ordinal = std.math.add(
+            u64,
+            @intCast(self.record_offset),
+            record.ordinal,
+        ) catch return error.CurrentStoreRecordBoundsExceeded;
+        if (global_ordinal > @as(u64, @intCast(self.max_records))) {
             return error.CurrentStoreRecordBoundsExceeded;
         }
-        const record_index: usize = @intCast(record.ordinal - 1);
+        const record_index: usize = @intCast(global_ordinal - 1);
         const row = try self.rowForRecord(record_index);
         const start = row.record_start.?;
         const end = row.record_end.?;
@@ -490,7 +739,12 @@ const StreamEventValidator = struct {
         record: durable_store.EventRecordView,
     ) !void {
         self.row_hash = EventHash.init(.{});
-        if (row.extent_start != record.extent_start) {
+        const extent_start = std.math.add(
+            usize,
+            self.extent_offset,
+            record.extent_start,
+        ) catch return error.StoreBindingExtentMismatch;
+        if (row.extent_start != extent_start) {
             return error.StoreBindingExtentMismatch;
         }
         self.resolved_effect = try resolveEffect(self.cache, self.slot, row);
@@ -513,9 +767,19 @@ const StreamEventValidator = struct {
                 if (row.kind != .admission) {
                     return error.HistoricalEffectKindMismatch;
                 }
+                const extent_start = std.math.add(
+                    usize,
+                    self.extent_offset,
+                    record.extent_start,
+                ) catch return error.StoreBindingExtentMismatch;
+                const extent_end = std.math.add(
+                    usize,
+                    self.extent_offset,
+                    record.extent_end,
+                ) catch return error.StoreBindingExtentMismatch;
                 if (end != start + 1 or
-                    row.extent_start != record.extent_start or
-                    row.extent_end != record.extent_end)
+                    row.extent_start != extent_start or
+                    row.extent_end != extent_end)
                 {
                     return error.StoreBindingExtentMismatch;
                 }
@@ -545,10 +809,17 @@ const StreamEventValidator = struct {
         row: custody.BindingRow,
         record: durable_store.EventRecordView,
     ) !void {
-        if (resolved.effect.kind == .create_new and
-            row.extent_end != record.extent_end + 1)
-        {
-            return error.StoreBindingExtentMismatch;
+        if (resolved.effect.kind == .create_new) {
+            const extent_end = std.math.add(
+                usize,
+                self.extent_offset,
+                record.extent_end,
+            ) catch return error.StoreBindingExtentMismatch;
+            if (extent_end == std.math.maxInt(usize) or
+                row.extent_end != extent_end + 1)
+            {
+                return error.StoreBindingExtentMismatch;
+            }
         }
         if (resolved.effect.kind.isBinding()) {
             self.advanceRow();
