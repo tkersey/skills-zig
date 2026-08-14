@@ -198,7 +198,8 @@ fn validateTransparentWithHead(
 fn transparentMutationHeadField(field: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, field, "addPullRequestReview")) return "commitOID";
     if (std.mem.eql(u8, field, "mergePullRequest") or
-        std.mem.eql(u8, field, "updatePullRequestBranch")) return "expectedHeadOid";
+        std.mem.eql(u8, field, "updatePullRequestBranch") or
+        std.mem.eql(u8, field, "enqueuePullRequest")) return "expectedHeadOid";
     return null;
 }
 
@@ -642,6 +643,9 @@ fn expectTransparentHeadSensitiveMutationBinding() !void {
     const update = "mutation UpdateBranch($input:UpdatePullRequestBranchInput!){" ++
         "updatePullRequestBranch(input:$input){clientMutationId}}";
     try expectTransparentHeadBinding(update, "UpdateBranch", "expectedHeadOid");
+    const enqueue = "mutation Enqueue($input:EnqueuePullRequestInput!){" ++
+        "enqueuePullRequest(input:$input){clientMutationId}}";
+    try expectTransparentHeadBinding(enqueue, "Enqueue", "expectedHeadOid");
 }
 
 fn expectTransparentHeadBinding(

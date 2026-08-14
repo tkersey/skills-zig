@@ -750,22 +750,8 @@ fn validateTurnSchemas(
         const message = "installed Codex {s}: SkillUserInput must require name, path, and type";
         return @as(?[]u8, try std.fmt.allocPrint(allocator, message, .{version}));
     }
-    const notification_files = [_][]const u8{
-        "v2/ThreadStartedNotification.json",
-        "v2/TurnStartedNotification.json",
-        "v2/ItemStartedNotification.json",
-        "v2/AgentMessageDeltaNotification.json",
-    };
-    for (notification_files) |file| {
-        const bytes = readSchema(allocator, io, out_dir, file) catch return @as(
-            ?[]u8,
-            try std.fmt.allocPrint(
-                allocator,
-                "installed Codex {s}: missing notification family {s}",
-                .{ version, file },
-            ),
-        );
-        allocator.free(bytes);
+    if (try notificationSchemaProblemAlloc(allocator, io, out_dir, version)) |problem| {
+        return problem;
     }
     const completed_file = "v2/TurnCompletedNotification.json";
     const completed = readSchema(allocator, io, out_dir, completed_file) catch return @as(
@@ -789,6 +775,99 @@ fn validateTurnSchemas(
         );
     }
     return null;
+}
+
+fn notificationSchemaProblemAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out_dir: []const u8,
+    version: []const u8,
+) !?[]u8 {
+    const files = [_][]const u8{
+        "v2/ThreadStartedNotification.json",
+        "v2/TurnStartedNotification.json",
+        "v2/AgentMessageDeltaNotification.json",
+    };
+    for (files) |file| {
+        const bytes = readSchema(allocator, io, out_dir, file) catch return try std.fmt.allocPrint(
+            allocator,
+            "installed Codex {s}: missing notification family {s}",
+            .{ version, file },
+        );
+        allocator.free(bytes);
+    }
+    return itemLifecycleSchemaProblemAlloc(allocator, io, out_dir, version);
+}
+
+fn itemLifecycleSchemaProblemAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out_dir: []const u8,
+    version: []const u8,
+) !?[]u8 {
+    const schemas = [_][]const u8{
+        "v2/ItemStartedNotification.json",
+        "v2/ItemCompletedNotification.json",
+    };
+    for (schemas) |file| {
+        const bytes = readSchema(allocator, io, out_dir, file) catch return try std.fmt.allocPrint(
+            allocator,
+            "installed Codex {s}: missing notification family {s}",
+            .{ version, file },
+        );
+        defer allocator.free(bytes);
+        if (!itemLifecycleSchemaHasConsumedFields(allocator, bytes)) {
+            return try std.fmt.allocPrint(
+                allocator,
+                "installed Codex {s}: {s} must require threadId, turnId, " ++
+                    "and commandExecution item.id/type",
+                .{ version, file },
+            );
+        }
+    }
+    return null;
+}
+
+fn itemLifecycleSchemaHasConsumedFields(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const root = parsed.value.object;
+    if (!requiredContains(root, "threadId") or
+        !requiredContains(root, "turnId") or
+        !requiredContains(root, "item")) return false;
+    const properties = objectField(root, "properties") orelse return false;
+    if (!stringTypeProperty(properties, "threadId") or
+        !stringTypeProperty(properties, "turnId")) return false;
+    const item = objectField(properties, "item") orelse return false;
+    const item_ref = stringField(item, "$ref") orelse return false;
+    if (!std.mem.eql(u8, item_ref, "#/definitions/ThreadItem")) return false;
+    const definitions = objectField(root, "definitions") orelse return false;
+    const thread_item = objectField(definitions, "ThreadItem") orelse return false;
+    const variants = thread_item.get("oneOf") orelse return false;
+    if (variants != .array) return false;
+    for (variants.array.items) |variant| {
+        if (commandItemVariantHasConsumedFields(variant)) return true;
+    }
+    return false;
+}
+
+fn commandItemVariantHasConsumedFields(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const variant = value.object;
+    if (!requiredContains(variant, "id") or !requiredContains(variant, "type")) return false;
+    const properties = objectField(variant, "properties") orelse return false;
+    if (!stringTypeProperty(properties, "id")) return false;
+    const item_type = objectField(properties, "type") orelse return false;
+    const values = item_type.get("enum") orelse return false;
+    if (values != .array) return false;
+    for (values.array.items) |entry| {
+        if (entry == .string and std.mem.eql(u8, entry.string, "commandExecution")) return true;
+    }
+    return false;
 }
 
 fn turnCompletedSchemaHasConsumedFields(
@@ -1210,7 +1289,15 @@ test "command approvals installed schema requires exact request and response sur
         \\printf '%s' '{"required":["threadId"],"properties":{"threadId":{"type":"string"}}}' > "$out/v2/ThreadDeleteParams.json"
         \\printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
         \\printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
-        \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+        \\for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+        \\for f in ItemStartedNotification ItemCompletedNotification; do
+        \\  printf '%s' '{"required":["threadId","turnId","item"],"properties":{' \
+        \\    '"threadId":{"type":"string"},"turnId":{"type":"string"},' \
+        \\    '"item":{"$ref":"#/definitions/ThreadItem"}},"definitions":{' \
+        \\    '"ThreadItem":{"oneOf":[{"required":["id","type"],"properties":{' \
+        \\    '"id":{"type":"string"},"type":{"enum":["commandExecution"]}}}]}}}' \
+        \\    > "$out/v2/$f.json"
+        \\done
         \\printf '%s' '{"required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}},"definitions":{"Turn":{"required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}}}}' > "$out/v2/TurnCompletedNotification.json"
         \\printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
         \\printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"
@@ -1254,6 +1341,26 @@ test "completed-turn schema requires every consumed completion field" {
     try std.testing.expect(!turnCompletedSchemaHasConsumedFields(
         std.testing.allocator,
         missing_status,
+    ));
+}
+
+test "item lifecycle schema requires consumed command activity fields" {
+    const valid =
+        "{\"required\":[\"threadId\",\"turnId\",\"item\"],\"properties\":{" ++
+        "\"threadId\":{\"type\":\"string\"},\"turnId\":{\"type\":\"string\"}," ++
+        "\"item\":{\"$ref\":\"#/definitions/ThreadItem\"}},\"definitions\":{" ++
+        "\"ThreadItem\":{\"oneOf\":[{\"required\":[\"id\",\"type\"],\"properties\":{" ++
+        "\"id\":{\"type\":\"string\"},\"type\":{\"enum\":[\"commandExecution\"]}}}]}}}";
+    try std.testing.expect(itemLifecycleSchemaHasConsumedFields(std.testing.allocator, valid));
+    const missing_id =
+        "{\"required\":[\"threadId\",\"turnId\",\"item\"],\"properties\":{" ++
+        "\"threadId\":{\"type\":\"string\"},\"turnId\":{\"type\":\"string\"}," ++
+        "\"item\":{\"$ref\":\"#/definitions/ThreadItem\"}},\"definitions\":{" ++
+        "\"ThreadItem\":{\"oneOf\":[{\"required\":[\"type\"],\"properties\":{" ++
+        "\"type\":{\"enum\":[\"commandExecution\"]}}}]}}}";
+    try std.testing.expect(!itemLifecycleSchemaHasConsumedFields(
+        std.testing.allocator,
+        missing_id,
     ));
 }
 

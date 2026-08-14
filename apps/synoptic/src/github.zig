@@ -5,6 +5,9 @@ const tools = @import("tools.zig");
 const worktree = @import("worktree.zig");
 
 const max_pages: usize = 10_000;
+const reconciliation_baseline_page_max: usize = 32;
+const reconciliation_baseline_comment_max: usize = 2_048;
+const reconciliation_baseline_bytes_max: usize = 256 * 1024;
 const paginated_response_bytes_max: usize = 64 * 1024 * 1024;
 const gh_call_timeout_ms: u32 = 30_000;
 const gh_termination_grace_ms: u32 = 250;
@@ -273,18 +276,18 @@ const CapturedPipes = struct {
 
 pub const ReconciliationBaseline = struct {
     allocator: std.mem.Allocator,
-    comment_ids: std.ArrayList([]u8) = .empty,
+    comment_ids: std.StringHashMapUnmanaged(void) = .empty,
+    comment_bytes: usize = 0,
+    page_count: usize = 0,
 
     pub fn deinit(self: *ReconciliationBaseline) void {
-        for (self.comment_ids.items) |id| self.allocator.free(id);
+        var iterator = self.comment_ids.keyIterator();
+        while (iterator.next()) |id| self.allocator.free(id.*);
         self.comment_ids.deinit(self.allocator);
     }
 
     fn contains(self: *const ReconciliationBaseline, id: []const u8) bool {
-        for (self.comment_ids.items) |existing| {
-            if (std.mem.eql(u8, existing, id)) return true;
-        }
-        return false;
+        return self.comment_ids.contains(id);
     }
 };
 
@@ -1318,14 +1321,17 @@ pub const Broker = struct {
         var baseline = ReconciliationBaseline{ .allocator = self.allocator };
         errdefer baseline.deinit();
         if (card.kind != .add_inline_comment and card.kind != .reply_thread) return baseline;
-        var pages = try self.callPages(
+        var pages = try self.callPagesWithLimits(
             graphql.reconcile_query,
             "reviewThreads",
             owner,
             name,
             number,
+            reconciliation_baseline_page_max,
+            reconciliation_baseline_bytes_max,
         );
         defer freePages(self.allocator, &pages);
+        baseline.page_count = pages.items.len;
         for (pages.items) |page| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, page, .{});
             defer parsed.deinit();
@@ -1374,7 +1380,8 @@ pub const Broker = struct {
         const first_cursor = (try nextCursor(initial.object)) orelse return;
         var cursor: ?[]u8 = try self.allocator.dupe(u8, first_cursor);
         defer if (cursor) |value| self.allocator.free(value);
-        for (0..max_pages) |_| {
+        for (0..reconciliation_baseline_page_max) |_| {
+            try claimReconciliationBaselinePage(baseline);
             const thread_id = thread.get("id") orelse return error.InvalidSnapshot;
             if (thread_id != .string) return error.InvalidSnapshot;
             const page = try self.threadCommentPage(owner, name, number, thread_id.string, cursor);
@@ -1392,7 +1399,7 @@ pub const Broker = struct {
             if (cursor) |old| self.allocator.free(old);
             cursor = owned_next;
         }
-        return error.PaginationLimitExceeded;
+        return error.ReconciliationBaselineLimitExceeded;
     }
 
     const CommentSnapshot = struct {
@@ -1618,6 +1625,27 @@ pub const Broker = struct {
         name: []const u8,
         number: u64,
     ) !std.ArrayList([]u8) {
+        return self.callPagesWithLimits(
+            document,
+            connection,
+            owner,
+            name,
+            number,
+            max_pages,
+            paginated_response_bytes_max,
+        );
+    }
+
+    fn callPagesWithLimits(
+        self: Broker,
+        document: []const u8,
+        connection: []const u8,
+        owner: []const u8,
+        name: []const u8,
+        number: u64,
+        page_limit: usize,
+        byte_limit: usize,
+    ) !std.ArrayList([]u8) {
         var pages: std.ArrayList([]u8) = .empty;
         errdefer {
             for (pages.items) |page| self.allocator.free(page);
@@ -1626,7 +1654,7 @@ pub const Broker = struct {
         var cursor: ?[]u8 = null;
         defer if (cursor) |c| self.allocator.free(c);
         var retained_bytes: usize = 0;
-        for (0..max_pages) |_| {
+        for (0..page_limit) |_| {
             const format = "{{\"owner\":{f},\"name\":{f},\"number\":{d},\"after\":{f}}}";
             const vars = try std.fmt.allocPrint(self.allocator, format, .{
                 std.json.fmt(owner, .{}),
@@ -1636,7 +1664,13 @@ pub const Broker = struct {
             });
             defer self.allocator.free(vars);
             const page = try self.call(document, vars);
-            try appendRetainedPage(self.allocator, &pages, &retained_bytes, page);
+            try appendRetainedPageWithLimit(
+                self.allocator,
+                &pages,
+                &retained_bytes,
+                page,
+                byte_limit,
+            );
             const next = try graphql.pageCursor(self.allocator, page, connection);
             if (cursor) |old| self.allocator.free(old);
             cursor = next;
@@ -1863,10 +1897,27 @@ fn appendCommentIds(
     for (try requiredArrayField(comments, "nodes")) |value| {
         const comment = try requiredObject(value);
         const id = try requiredStringField(comment, "id");
+        if (baseline.contains(id)) continue;
+        if (baseline.comment_ids.count() >= reconciliation_baseline_comment_max) {
+            return error.ReconciliationBaselineLimitExceeded;
+        }
+        const next_bytes = std.math.add(usize, baseline.comment_bytes, id.len) catch
+            return error.ReconciliationBaselineLimitExceeded;
+        if (next_bytes > reconciliation_baseline_bytes_max) {
+            return error.ReconciliationBaselineLimitExceeded;
+        }
         const owned = try baseline.allocator.dupe(u8, id);
         errdefer baseline.allocator.free(owned);
-        try baseline.comment_ids.append(baseline.allocator, owned);
+        try baseline.comment_ids.put(baseline.allocator, owned, {});
+        baseline.comment_bytes = next_bytes;
     }
+}
+
+fn claimReconciliationBaselinePage(baseline: *ReconciliationBaseline) !void {
+    if (baseline.page_count >= reconciliation_baseline_page_max) {
+        return error.ReconciliationBaselineLimitExceeded;
+    }
+    baseline.page_count += 1;
 }
 
 fn parseGithubTimestampSeconds(raw: []const u8) ?i64 {
@@ -2064,16 +2115,44 @@ fn appendRetainedPage(
     retained_bytes: *usize,
     page: []u8,
 ) !void {
+    return appendRetainedPageWithLimit(
+        allocator,
+        pages,
+        retained_bytes,
+        page,
+        paginated_response_bytes_max,
+    );
+}
+
+fn appendRetainedPageWithLimit(
+    allocator: std.mem.Allocator,
+    pages: *std.ArrayList([]u8),
+    retained_bytes: *usize,
+    page: []u8,
+    byte_limit: usize,
+) !void {
     errdefer allocator.free(page);
-    const next = try nextRetainedPageBytes(retained_bytes.*, page.len);
+    const next = try nextRetainedPageBytesWithLimit(retained_bytes.*, page.len, byte_limit);
     try pages.append(allocator, page);
     retained_bytes.* = next;
 }
 
 fn nextRetainedPageBytes(retained_bytes: usize, page_bytes: usize) !usize {
+    return nextRetainedPageBytesWithLimit(
+        retained_bytes,
+        page_bytes,
+        paginated_response_bytes_max,
+    );
+}
+
+fn nextRetainedPageBytesWithLimit(
+    retained_bytes: usize,
+    page_bytes: usize,
+    byte_limit: usize,
+) !usize {
     const next = std.math.add(usize, retained_bytes, page_bytes) catch
         return error.PaginationAggregateLimitExceeded;
-    if (next > paginated_response_bytes_max) {
+    if (next > byte_limit) {
         return error.PaginationAggregateLimitExceeded;
     }
     return next;
@@ -2244,7 +2323,7 @@ pub fn loadThreads(
     const data = try requiredObjectField(root, "data");
     const nested_page = data.get("node") != null;
     const nodes: []const std.json.Value = if (data.get("node")) |node|
-        if (node == .null) return else &.{node}
+        if (node == .null) return error.InvalidSnapshot else &.{node}
     else blk: {
         const pull = try pullObject(parsed.value);
         const threads = try requiredObjectField(pull, "reviewThreads");
@@ -2345,6 +2424,47 @@ test "thread loader rejects nullable nested comment nodes" {
     try std.testing.expectError(
         error.InvalidSnapshot,
         loadThreads(std.testing.allocator, raw, &generation),
+    );
+}
+
+test "thread loader rejects a vanished nested thread" {
+    var generation = try domain.PrGeneration.initFull(std.testing.allocator, "base", "head");
+    defer generation.deinit();
+    try std.testing.expectError(
+        error.InvalidSnapshot,
+        loadThreads(std.testing.allocator, "{\"data\":{\"node\":null}}", &generation),
+    );
+}
+
+test "reconciliation baseline bounds and indexes comment identities" {
+    var baseline = ReconciliationBaseline{ .allocator = std.testing.allocator };
+    defer baseline.deinit();
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"nodes\":[{\"id\":\"C_1\"},{\"id\":\"C_1\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+    try appendCommentIds(&baseline, parsed.value.object);
+    try std.testing.expect(baseline.contains("C_1"));
+    try std.testing.expectEqual(@as(usize, 1), baseline.comment_ids.count());
+    baseline.comment_bytes = reconciliation_baseline_bytes_max;
+    var overflow = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"nodes\":[{\"id\":\"C_2\"}]}",
+        .{},
+    );
+    defer overflow.deinit();
+    try std.testing.expectError(
+        error.ReconciliationBaselineLimitExceeded,
+        appendCommentIds(&baseline, overflow.value.object),
+    );
+    baseline.page_count = reconciliation_baseline_page_max;
+    try std.testing.expectError(
+        error.ReconciliationBaselineLimitExceeded,
+        claimReconciliationBaselinePage(&baseline),
     );
 }
 

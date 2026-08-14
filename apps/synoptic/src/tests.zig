@@ -1586,7 +1586,15 @@ const fake_codex_script =
     \\  printf '%s' '{"required":["threadId"],"properties":{"threadId":{"type":"string"}}}' > "$out/v2/ThreadDeleteParams.json"
     \\  printf '%s' '{"properties":{"dynamicTools":{},"approvalPolicy":{},"sandbox":{}}}' > "$out/v2/ThreadStartParams.json"
     \\  printf '%s' '{"SkillUserInput":{"required":["name","path","type"]}}' > "$out/v2/TurnStartParams.json"
-    \\  for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification ItemStartedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+    \\  for f in ThreadStartedNotification TurnStartedNotification TurnCompletedNotification AgentMessageDeltaNotification; do printf '%s' '{}' > "$out/v2/$f.json"; done
+    \\  for f in ItemStartedNotification ItemCompletedNotification; do
+    \\    printf '%s' '{"required":["threadId","turnId","item"],"properties":{' \
+    \\      '"threadId":{"type":"string"},"turnId":{"type":"string"},' \
+    \\      '"item":{"$ref":"#/definitions/ThreadItem"}},"definitions":{' \
+    \\      '"ThreadItem":{"oneOf":[{"required":["id","type"],"properties":{' \
+    \\      '"id":{"type":"string"},"type":{"enum":["commandExecution"]}}}]}}}' \
+    \\      > "$out/v2/$f.json"
+    \\  done
     \\  printf '%s' '{"required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}},"definitions":{"Turn":{"required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}}}}' > "$out/v2/TurnCompletedNotification.json"
     \\  printf '%s' '{"properties":{"threadId":{},"availableDecisions":{}},"required":["threadId"]}' > "$out/CommandExecutionRequestApprovalParams.json"
     \\  printf '%s' '{"properties":{"decision":{"$ref":"#/definitions/Decision"}},"required":["decision"],"definitions":{"Decision":{"enum":["accept","acceptForSession","decline","cancel"]}}}' > "$out/CommandExecutionRequestApprovalResponse.json"

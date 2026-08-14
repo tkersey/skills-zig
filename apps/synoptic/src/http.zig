@@ -257,6 +257,9 @@ fn isRecoveryCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "snapshot.get") or
         std.mem.eql(u8, command, "pr.refresh") or
         std.mem.eql(u8, command, "round.finish") or
+        std.mem.eql(u8, command, "session.interrupt") or
+        std.mem.eql(u8, command, "session.close") or
+        std.mem.eql(u8, command, "action.reject") or
         std.mem.eql(u8, command, "app.stop");
 }
 
@@ -283,8 +286,18 @@ fn requireCommandAdmitted(runtime: *Runtime, command: []const u8) !void {
 }
 
 test "degraded refresh admits recovery commands only" {
-    inline for (.{ "snapshot.get", "pr.refresh", "round.finish", "app.stop" }) |command| {
+    const recovery_commands = .{
+        "snapshot.get",
+        "pr.refresh",
+        "round.finish",
+        "session.interrupt",
+        "session.close",
+        "action.reject",
+        "app.stop",
+    };
+    inline for (recovery_commands) |command| {
         try std.testing.expect(commandAdmitted(.degraded, true, command));
+        try std.testing.expect(commandAdmitted(.current, false, command));
     }
     try std.testing.expect(commandAdmitted(.degraded, true, "approval.resolve"));
     inline for (.{ "file.open", "session.message", "action.confirm" }) |command| {
