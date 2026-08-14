@@ -1325,6 +1325,7 @@ fn updateSelectedSubmodules(
                 allocator,
                 environment,
                 source_url,
+                module.source_intent.root_url,
                 credential_executable,
             );
             defer fetch_environment.deinit();
@@ -1383,9 +1384,10 @@ fn selectedSubmoduleFetchEnvironment(
     allocator: std.mem.Allocator,
     base: *const std.process.Environ.Map,
     url: []const u8,
+    trusted_root_url: ?[]const u8,
     credential_executable: ?[]const u8,
 ) !std.process.Environ.Map {
-    if (!fetchProtocolAllowed(url)) {
+    if (!trustedSubmoduleSource(url, trusted_root_url)) {
         return error.ManagedSubmoduleSourceProtocolRejected;
     }
     var environment = if (credential_executable) |executable|
@@ -1406,6 +1408,26 @@ fn selectedSubmoduleFetchEnvironment(
         url,
     );
     return environment;
+}
+
+fn trustedSubmoduleSource(url: []const u8, trusted_root_url: ?[]const u8) bool {
+    if (!fetchProtocolAllowed(url)) return false;
+    const trusted_url = trusted_root_url orelse return false;
+    if (!fetchProtocolAllowed(trusted_url)) return false;
+    const source = GitRepositoryLocation.parse(url) orelse return false;
+    const trusted = GitRepositoryLocation.parse(trusted_url) orelse return false;
+    if (source.kind == .local or trusted.kind == .local) return false;
+    const source_scheme = if (source.kind == .scp) "ssh" else source.scheme;
+    const trusted_scheme = if (trusted.kind == .scp) "ssh" else trusted.scheme;
+    const source_authority = normalizeAuthorityHost(
+        source.authority,
+        source_scheme,
+    ) orelse return false;
+    const trusted_authority = normalizeAuthorityHost(
+        trusted.authority,
+        trusted_scheme,
+    ) orelse return false;
+    return std.ascii.eqlIgnoreCase(source_authority, trusted_authority);
 }
 
 fn fetchProtocolAllowed(url: []const u8) bool {
@@ -2867,6 +2889,7 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         allocator,
         &base,
         credential_url,
+        "https://git.example/owner/super.git",
         null,
     );
     defer fetch_environment.deinit();
@@ -2882,6 +2905,7 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         allocator,
         &base,
         credential_url,
+        "https://git.example/owner/super.git",
         "/tmp/configured gh",
     );
     defer credential_environment.deinit();
@@ -2924,20 +2948,28 @@ test "worktree integrity selected submodule source rejects external protocols" {
     for ([_][]const u8{
         "ext::sh -c 'touch /tmp/escaped'",
         "helper://host/repository.git",
+        "file:///srv/repository.git",
+        "/srv/repository.git",
+        "https://other.example/repository.git",
     }) |source| try std.testing.expectError(
         error.ManagedSubmoduleSourceProtocolRejected,
-        selectedSubmoduleFetchEnvironment(allocator, &base, source, null),
+        selectedSubmoduleFetchEnvironment(
+            allocator,
+            &base,
+            source,
+            "https://git.example/owner/super.git",
+            null,
+        ),
     );
     for ([_][]const u8{
-        "file:///srv/repository.git",
         "https://git.example/repository.git",
         "git@git.example:repository.git",
-        "/srv/repository.git",
     }) |source| {
         var environment = try selectedSubmoduleFetchEnvironment(
             allocator,
             &base,
             source,
+            "https://git.example/owner/super.git",
             null,
         );
         defer environment.deinit();
@@ -3025,7 +3057,7 @@ test "worktree integrity local selected object does not require parent source" {
     );
 }
 
-test "worktree integrity submodule update selects URL without config mutation" {
+test "worktree integrity submodule update uses existing objects without config mutation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3128,13 +3160,6 @@ fn verifySelectedSubmoduleLifecycle(
 ) !void {
     const config_path = try std.fs.path.join(allocator, &.{ parent, ".git", "config" });
     defer allocator.free(config_path);
-    const config_before = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        config_path,
-        allocator,
-        .limited(64 * 1024),
-    );
-    defer allocator.free(config_before);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     try environment.put("GIT_ALLOW_PROTOCOL", "file");
@@ -3145,6 +3170,20 @@ fn verifySelectedSubmoduleLifecycle(
     defer allocator.free(child);
     const prior_child_raw = try testHeadAlloc(allocator, io, child);
     defer allocator.free(prior_child_raw);
+    allocator.free(try gitOutput(
+        allocator,
+        io,
+        child,
+        &.{ "git", "fetch", "--no-tags", expected_source, selected_oid },
+        error.TestGitFailed,
+    ));
+    const config_before = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        config_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(config_before);
     var baseline = try Baseline.capture(allocator, io, parent);
     defer baseline.deinit();
     var lease = try beginRefresh(

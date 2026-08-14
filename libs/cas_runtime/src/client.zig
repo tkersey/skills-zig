@@ -1579,6 +1579,7 @@ const ActorState = struct {
     pending: std.AutoHashMap(i64, *ActorPending),
     subscriptions: std.ArrayList(protocol.NotificationHandler) = .empty,
     active_notification_callbacks: usize = 0,
+    notification_callback_epoch: std.atomic.Value(u32) = .init(0),
     server_request_handler: ?protocol.ServerRequestHandler,
     next_request_id: i64 = 1,
     default_request_timeout_ms: u32,
@@ -1775,9 +1776,14 @@ pub const Actor = struct {
         while (true) {
             state.mutex.lock();
             const callbacks_active = state.active_notification_callbacks != 0;
+            const callback_epoch = state.notification_callback_epoch.load(.acquire);
             state.mutex.unlock();
             if (!callbacks_active) return;
-            std.atomic.spinLoopHint();
+            state.client.io.futexWaitUncancelable(
+                u32,
+                &state.notification_callback_epoch.raw,
+                callback_epoch,
+            );
         }
     }
 
@@ -2332,16 +2338,42 @@ fn actorInvokeNotificationHandlers(
         state.mutex.lock();
         std.debug.assert(state.active_notification_callbacks > 0);
         state.active_notification_callbacks -= 1;
+        _ = state.notification_callback_epoch.fetchAdd(1, .release);
         state.mutex.unlock();
+        state.client.io.futexWake(
+            u32,
+            &state.notification_callback_epoch.raw,
+            std.math.maxInt(u32),
+        );
     }
     const notification = protocol.Notification{ .method = method, .raw_json = line };
     for (subscriptions) |subscription| {
-        subscription.handle(subscription.context, notification);
         state.mutex.lock();
+        const still_subscribed = actorHasNotificationSubscriptionLocked(
+            state,
+            subscription,
+        );
         const teardown_started = state.teardown_started;
         state.mutex.unlock();
         if (teardown_started) break;
+        if (!still_subscribed) continue;
+        subscription.handle(subscription.context, notification);
+        state.mutex.lock();
+        const teardown_after_callback = state.teardown_started;
+        state.mutex.unlock();
+        if (teardown_after_callback) break;
     }
+}
+
+fn actorHasNotificationSubscriptionLocked(
+    state: *const ActorState,
+    subscription: protocol.NotificationHandler,
+) bool {
+    for (state.subscriptions.items) |candidate| {
+        if (candidate.context == subscription.context and
+            candidate.handle == subscription.handle) return true;
+    }
+    return false;
 }
 
 fn actorDispatchServerRequest(
@@ -4522,6 +4554,30 @@ const NotificationProbe = struct {
     }
 };
 
+const RemovingNotificationProbe = struct {
+    actor: *Actor,
+    target: protocol.NotificationHandler,
+    completed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn observe(context: *anyopaque, notification: protocol.Notification) void {
+        const self: *RemovingNotificationProbe = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, notification.method, "turn/started")) return;
+        self.actor.unsubscribe(self.target) catch |err| {
+            self.failure = err;
+        };
+        self.completed.store(true, .release);
+    }
+
+    fn wait(self: *RemovingNotificationProbe) !void {
+        for (0..1_000) |_| {
+            if (self.completed.load(.acquire)) return;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+        }
+        return error.NotificationDeadlineExceeded;
+    }
+};
+
 const NestedNotificationProbe = struct {
     actor: *Actor,
     allocator: std.mem.Allocator,
@@ -4759,6 +4815,42 @@ test "actor notification subscriptions can be removed before owner teardown" {
     notifications.mutex.lock();
     defer notifications.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), notifications.count);
+}
+
+test "callback unsubscription suppresses later handlers in the active dispatch" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try ActorFixture.init(allocator, "concurrent");
+    defer fixture.deinit();
+    var actor = try fixture.start(.{ .outbound_queue_capacity = 2 });
+    defer actor.deinit();
+    var target_probe = NotificationProbe{};
+    const target = protocol.NotificationHandler{
+        .context = &target_probe,
+        .handle = NotificationProbe.observe,
+    };
+    var remover = RemovingNotificationProbe{ .actor = &actor, .target = target };
+    const removing_subscription = protocol.NotificationHandler{
+        .context = &remover,
+        .handle = RemovingNotificationProbe.observe,
+    };
+    try actor.subscribe(removing_subscription);
+    try actor.subscribe(target);
+    var first = ActorCall{ .actor = &actor, .method = "actor/first" };
+    var second = ActorCall{ .actor = &actor, .method = "actor/second" };
+    const first_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(second.failure == null);
+    defer allocator.free(first.result.?);
+    defer allocator.free(second.result.?);
+    try remover.wait();
+    try std.testing.expect(remover.failure == null);
+    target_probe.mutex.lock();
+    defer target_probe.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), target_probe.count);
 }
 
 test "actor falsifier dispatches server requests through configured handler and bounded writer" {
