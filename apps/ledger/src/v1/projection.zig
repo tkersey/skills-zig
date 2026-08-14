@@ -7,6 +7,7 @@ const protocol = @import("protocol.zig");
 const ranked_relevance = @import("ranked_relevance.zig");
 const reducer = @import("reducer.zig");
 const replay = @import("replay.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 
@@ -4564,6 +4565,17 @@ fn executeResolvedProjection(
         try storage.resolve(allocator, storage_plan, parameters);
     defer resolved_storage.deinit(allocator);
     const slot = resolved_storage.slot(compiled.slot_index);
+    if (slot.isSegmented()) return executeSegmentedProjection(
+        allocator,
+        definition_plan,
+        event_protocol,
+        plan,
+        compiled,
+        projection_name,
+        repo_root,
+        slot,
+        parameters,
+    );
     const effective_limit =
         try resolveLimit(compiled.limit, parameters, plan.max_records);
     const stream_candidate = slot.kind == .event_log and
@@ -4614,6 +4626,147 @@ fn executeResolvedProjection(
         effective_limit,
         &fold_history,
         &fused_sorted,
+    );
+}
+
+fn executeSegmentedProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+) !Result {
+    if (compiled.fold == null) {
+        return error.SegmentedProjectionRequiresFold;
+    }
+    var fold_history = try initFoldHistory(
+        allocator,
+        compiled,
+        event_protocol,
+    );
+    defer if (fold_history) |*history| history.deinit();
+    if (fold_history != null) {
+        return error.SegmentedProjectionHistoryRequiresFullReplay;
+    }
+    var snapshot = try segmented_event_log.Snapshot.load(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(allocator);
+    const revision = try snapshot.head.revisionAlloc(allocator);
+    defer allocator.free(revision);
+    var replay_stats = try segmentedProjectionReplay(
+        allocator,
+        definition_plan,
+        event_protocol,
+        repo_root,
+        slot,
+        parameters,
+        &snapshot,
+        revision,
+    );
+    defer replay_stats.deinit(allocator);
+    return renderSegmentedFold(
+        allocator,
+        definition_plan,
+        event_protocol,
+        plan,
+        compiled,
+        projection_name,
+        slot,
+        parameters,
+        revision,
+        &replay_stats,
+    );
+}
+
+fn segmentedProjectionReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    snapshot: *const segmented_event_log.Snapshot,
+    revision: []const u8,
+) !replay.Stats {
+    const event_plan = event_protocol orelse
+        return error.SegmentedProjectionRequiresProtocol;
+    if (!snapshot.head.checkpoint_exists) return .{
+        .records_validated = 0,
+        .definition_versions = 0,
+        .protocol_state = protocol.ReplayState.init(event_plan),
+        .append_context = null,
+    };
+    var binding = try custody.parseBindingSegment(
+        allocator,
+        snapshot.binding_bytes,
+        definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        snapshot.head.checkpointRevision().?,
+        revision,
+        null,
+    );
+    defer binding.deinit(allocator);
+    return replay.validateSegmentedSnapshot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        snapshot,
+        &binding,
+        parameters,
+        definition_plan.bounds.max_records,
+        true,
+    );
+}
+
+fn renderSegmentedFold(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    revision: []const u8,
+    replay_stats: *replay.Stats,
+) !Result {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeFoldProjection(
+        allocator,
+        event_protocol,
+        compiled,
+        replay_stats,
+        null,
+        parameters,
+        try resolveLimit(compiled.limit, parameters, plan.max_records),
+        plan.max_output_bytes,
+        &output,
+        &stats,
+    );
+    return buildProjectionResult(
+        allocator,
+        definition_plan,
+        compiled,
+        projection_name,
+        slot.relative_path,
+        revision,
+        &output,
+        stats,
     );
 }
 
