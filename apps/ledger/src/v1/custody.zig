@@ -57,7 +57,7 @@ pub const BindingRow = struct {
     extent_start: usize,
     extent_end: usize,
 
-    fn deinit(self: *BindingRow, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BindingRow, allocator: std.mem.Allocator) void {
         allocator.free(self.definition_digest);
         allocator.free(self.operation);
         allocator.free(self.input_digest);
@@ -67,6 +67,67 @@ pub const BindingRow = struct {
         allocator.free(self.revision_after);
         if (self.idempotency_key) |key| allocator.free(key);
         self.* = undefined;
+    }
+};
+
+pub const BindingHistoryReader = struct {
+    allocator: std.mem.Allocator,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    accepted_genesis_revision: ?[]const u8 = null,
+    last_revision: ?[]u8 = null,
+    rows: usize = 0,
+
+    pub fn deinit(self: *BindingHistoryReader) void {
+        if (self.last_revision) |revision| self.allocator.free(revision);
+        self.* = undefined;
+    }
+
+    pub fn parseRow(
+        self: *BindingHistoryReader,
+        line: []const u8,
+    ) !BindingRow {
+        var accumulator = BindingAccumulator{ .allocator = self.allocator };
+        accumulator.accepted_genesis_revision =
+            self.accepted_genesis_revision;
+        defer accumulator.deinit();
+        if (self.last_revision) |revision| {
+            accumulator.last_revision = try self.allocator.dupe(u8, revision);
+        }
+        try parseAndAppendBindingRow(
+            &accumulator,
+            line,
+            .{
+                .definition_id = self.definition_id,
+                .slot_name = self.slot_name,
+                .logical_path = self.logical_path,
+            },
+            null,
+        );
+        if (accumulator.rows.items.len != 1) {
+            return error.InvalidStoreBinding;
+        }
+        const row = accumulator.rows.pop().?;
+        const next_revision = accumulator.last_revision.?;
+        accumulator.last_revision = null;
+        if (self.last_revision) |revision| self.allocator.free(revision);
+        self.last_revision = next_revision;
+        self.rows = std.math.add(usize, self.rows, 1) catch
+            return error.TooManyStoreBindings;
+        return row;
+    }
+
+    pub fn finish(
+        self: *const BindingHistoryReader,
+        expected_revision: []const u8,
+        expected_rows: usize,
+    ) !void {
+        if (self.rows != expected_rows or self.last_revision == null or
+            !std.mem.eql(u8, self.last_revision.?, expected_revision))
+        {
+            return error.StoreBindingRevisionMismatch;
+        }
     }
 };
 
@@ -558,6 +619,66 @@ pub fn readBindingSnapshotBeforeReplay(
     );
 }
 
+pub fn parseBindingSegment(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    prior_revision: []const u8,
+    current_revision: []const u8,
+    idempotency: ?IdempotencyQuery,
+) !BindingSnapshot {
+    try definition_core.json.digest(prior_revision);
+    try definition_core.json.digest(current_revision);
+    if (bytes.len == 0) {
+        if (!std.mem.eql(u8, prior_revision, current_revision)) {
+            return error.StoreBindingRevisionMismatch;
+        }
+        var missing = try missingBindingSnapshot(allocator);
+        missing.last_revision = try allocator.dupe(u8, prior_revision);
+        return missing;
+    }
+    var accumulator = BindingAccumulator{ .allocator = allocator };
+    errdefer accumulator.deinit();
+    accumulator.last_revision = try allocator.dupe(u8, prior_revision);
+    const context = BindingContext{
+        .definition_id = definition_id,
+        .slot_name = slot_name,
+        .logical_path = logical_path,
+    };
+    try accumulateBindingRows(&accumulator, bytes, context, idempotency);
+    if (accumulator.rows.items.len == 0 or
+        !std.mem.eql(
+            u8,
+            accumulator.last_revision orelse
+                return error.InvalidStoreBinding,
+            current_revision,
+        ))
+    {
+        return error.StoreBindingRevisionMismatch;
+    }
+    const owned_bytes = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned_bytes);
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        bytes,
+    );
+    errdefer allocator.free(digest);
+    const rows = try accumulator.rows.toOwnedSlice(allocator);
+    const last_revision = accumulator.last_revision;
+    accumulator.last_revision = null;
+    return .{
+        .exists = true,
+        .bytes = owned_bytes,
+        .digest = digest,
+        .last_revision = last_revision,
+        .rows = rows,
+        .idempotency_match = accumulator.idempotency_match,
+        .idempotency_match_index = accumulator.idempotency_match_index,
+    };
+}
+
 fn readBindingSnapshotInternal(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -669,6 +790,7 @@ const BindingAccumulator = struct {
     allocator: std.mem.Allocator,
     rows: std.ArrayList(BindingRow) = .empty,
     last_revision: ?[]u8 = null,
+    accepted_genesis_revision: ?[]const u8 = null,
     idempotency_match: bool = false,
     idempotency_match_index: ?usize = null,
 
@@ -684,7 +806,16 @@ const BindingAccumulator = struct {
         row: BorrowedBindingRow,
         query: ?IdempotencyQuery,
     ) !void {
-        try validateRevisionLink(self.last_revision, row.revision_before);
+        const accepted_genesis = self.last_revision == null and
+            self.accepted_genesis_revision != null and
+            row.revision_before != null and std.mem.eql(
+            u8,
+            self.accepted_genesis_revision.?,
+            row.revision_before.?,
+        );
+        if (!accepted_genesis) {
+            try validateRevisionLink(self.last_revision, row.revision_before);
+        }
         const matches = try matchesIdempotency(row, query);
         if (matches and self.idempotency_match_index != null) {
             return error.DuplicateIdempotencyMatch;
@@ -1195,6 +1326,63 @@ test "missing slot rejects an orphaned custody binding" {
             root,
             "example/events",
             slot,
+        ),
+    );
+}
+
+test "binding segment continues the checkpoint revision" {
+    const prior = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const current = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const row =
+        "{\"abi\":\"ledger-artifact-abi/v1\",\"binding_kind\":\"admission\"," ++
+        "\"canonical_input_digest\":\"" ++ digest ++ "\"," ++
+        "\"definition_digest\":\"" ++ digest ++ "\"," ++
+        "\"definition_id\":\"example/events\",\"extent_end\":119," ++
+        "\"extent_start\":100,\"idempotency_key\":null," ++
+        "\"input_digest\":\"" ++ digest ++ "\"," ++
+        "\"logical_path\":\"example/events.jsonl\",\"operation\":\"append\"," ++
+        "\"parameters\":{},\"record_end\":6,\"record_start\":5," ++
+        "\"revision_after\":\"" ++ current ++ "\"," ++
+        "\"revision_before\":\"" ++ prior ++ "\"," ++
+        "\"schema\":\"ledger-store-binding/v1\",\"slot\":\"events\"}\n";
+    var snapshot = try parseBindingSegment(
+        std.testing.allocator,
+        row,
+        "example/events",
+        "events",
+        "example/events.jsonl",
+        prior,
+        current,
+        null,
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.rows.len);
+    try std.testing.expectEqual(@as(?usize, 5), snapshot.rows[0].record_start);
+    try std.testing.expectError(
+        error.StoreBindingChainMismatch,
+        parseBindingSegment(
+            std.testing.allocator,
+            row ++ row,
+            "example/events",
+            "events",
+            "example/events.jsonl",
+            prior,
+            current,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.StoreBindingChainMismatch,
+        parseBindingSegment(
+            std.testing.allocator,
+            row,
+            "example/events",
+            "events",
+            "example/events.jsonl",
+            current,
+            current,
+            null,
         ),
     );
 }

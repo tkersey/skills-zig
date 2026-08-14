@@ -831,7 +831,21 @@ pub fn build(b: *std.Build) void {
         b,
         ledger_v1_core,
         "test-ledger-core",
-        "Run Ledger 1.0 artifact-definition compiler tests",
+        "Run Ledger 1.1 artifact-definition compiler tests",
+    );
+    const run_ledger_segmented_tests = addTestStepWithOptions(
+        b,
+        ledger_v1_core,
+        "test-ledger-segmented",
+        "Run Ledger segmented event-log tests",
+        .{ .filters = &.{"segmented"} },
+    );
+    const run_ledger_segmented_falsifiers = addTestStepWithOptions(
+        b,
+        ledger_v1_core,
+        "test-ledger-segmented-falsifiers",
+        "Run Ledger segmented event-log falsifiers",
+        .{ .filters = &.{"segmented falsifier"} },
     );
     const ledger_cli_smoke_cmd = b.addSystemCommand(&.{
         "bash",
@@ -840,9 +854,27 @@ pub fn build(b: *std.Build) void {
     ledger_cli_smoke_cmd.addArtifactArg(ledger);
     const run_ledger_cli_smoke = b.step(
         "test-ledger-cli-smoke",
-        "Run Ledger 1.0 definition, validation, and materialization smoke tests",
+        "Run Ledger 1.1 definition, validation, and materialization smoke tests",
     );
     run_ledger_cli_smoke.dependOn(&ledger_cli_smoke_cmd.step);
+    test_ledger.dependOn(&run_ledger_core_tests.step);
+    test_ledger.dependOn(run_ledger_cli_smoke);
+    const release_ledger_safe = b.step(
+        "release-ledger-safe",
+        "Run the Ledger release-safety gate",
+    );
+    release_ledger_safe.dependOn(&ledger_install.step);
+    release_ledger_safe.dependOn(&run_ledger_core_tests.step);
+    release_ledger_safe.dependOn(&run_ledger_tests.step);
+    release_ledger_safe.dependOn(run_ledger_cli_smoke);
+    release_ledger_safe.dependOn(&run_ledger_segmented_tests.step);
+    release_ledger_safe.dependOn(&run_ledger_segmented_falsifiers.step);
+    const ledger_command_surface = b.addSystemCommand(&.{
+        "bash",
+        "apps/ledger/scripts/release/command_surface_gate.sh",
+    });
+    ledger_command_surface.addArtifactArg(ledger);
+    release_ledger_safe.dependOn(&ledger_command_surface.step);
     const run_jsonl_large_tests = addTestStep(
         b,
         jsonl_large_tests_root,

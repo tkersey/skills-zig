@@ -8,7 +8,7 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 32;
+const payload_version: u16 = 33;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -26,6 +26,7 @@ pub const RouteKind = enum {
     transact,
     project,
     doctor,
+    migration,
 };
 
 pub const Route = struct {
@@ -230,6 +231,7 @@ fn compileRoutePlans(
         .transact => try compileTransaction(allocator, result, route.name.?),
         .project => try compileProjection(allocator, result, route.name.?),
         .doctor => try compileDurablePlans(allocator, result),
+        .migration => try compileDurablePlans(allocator, result),
     }
 }
 
@@ -593,7 +595,7 @@ fn encodePlanSet(
     try encoder.writeBytes(plan_set.entry_path);
     try encodeClosure(
         &plan_set.closure,
-        route.kind == .transact,
+        routeNeedsSources(route),
         encoder,
     );
     try definition.encodeCacheWithDetail(
@@ -677,7 +679,7 @@ fn decodePlanCore(
         decoder,
         entry_path,
         closure_limits,
-        route.kind == .transact,
+        routeNeedsSources(route),
     );
     errdefer closure.deinit(allocator);
     var definition_plan = try definition.decodeCacheWithDetail(
@@ -954,7 +956,7 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
         &plan_set.definition_plan.closure_digest,
         &plan_set.closure.digest,
     )) return error.CacheClosureDigestMismatch;
-    if (route.kind == .transact) {
+    if (routeNeedsSources(route)) {
         for (plan_set.closure.files) |file| {
             if (file.path.len == 0 or file.canonical_json.len == 0) {
                 return error.CacheDefinitionSourceMissing;
@@ -976,7 +978,8 @@ fn validatePlanShape(plan_set: *const PlanSet, route: Route) !void {
     const required_storage = route.kind == .definition_check or
         route.kind == .transact or
         route.kind == .project or
-        route.kind == .doctor;
+        route.kind == .doctor or
+        route.kind == .migration;
     const required_projection = route.kind == .definition_check or
         route.kind == .project;
     const required_protocol = required_storage and
@@ -1010,6 +1013,13 @@ fn validateNestedPlans(plan_set: *const PlanSet) !void {
             plan,
             &plan_set.definition_plan,
             &plan_set.storage_plan.?,
+        );
+    }
+    if (plan_set.storage_plan) |*storage_plan| {
+        try protocol.validateSegmentedSupport(
+            &plan_set.definition_plan,
+            storage_plan,
+            if (plan_set.protocol_plan) |*plan| plan else null,
         );
     }
     if (plan_set.projection_plan) |*plan| {
@@ -1074,6 +1084,10 @@ fn definitionCacheDetail(route: Route) definition.CacheDetail {
         .validation, .materialization => .runtime_metadata,
         else => .full,
     };
+}
+
+fn routeNeedsSources(route: Route) bool {
+    return route.kind == .transact or route.kind == .migration;
 }
 
 fn planKey(
@@ -1308,6 +1322,48 @@ test "transaction cache retains canonical definition archive sources" {
     );
     defer warm.deinit(std.testing.allocator);
 
+    try std.testing.expect(warm.stats.cache_hit);
+    try std.testing.expectEqualStrings(
+        cold.closure.files[0].canonical_json,
+        warm.closure.files[0].canonical_json,
+    );
+}
+
+test "migration cache retains canonical definition archive sources" {
+    const source_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(source_root);
+    var cache_tmp = std.testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    const cache_root = try cache_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(cache_root);
+    const entry = "apps/ledger/src/v1/fixtures/event-definition.json";
+    const route: Route = .{ .kind = .migration };
+    var cold = try load(
+        std.testing.allocator,
+        source_root,
+        entry,
+        route,
+        "1.0.0-test",
+        .{ .cache_dir = cache_root },
+    );
+    defer cold.deinit(std.testing.allocator);
+    var warm = try load(
+        std.testing.allocator,
+        source_root,
+        entry,
+        route,
+        "1.0.0-test",
+        .{ .cache_dir = cache_root },
+    );
+    defer warm.deinit(std.testing.allocator);
     try std.testing.expect(warm.stats.cache_hit);
     try std.testing.expectEqualStrings(
         cold.closure.files[0].canonical_json,

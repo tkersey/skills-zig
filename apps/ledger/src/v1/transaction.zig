@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
+const checkpoint = @import("checkpoint.zig");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
@@ -9,6 +10,7 @@ const materialization = @import("materialization.zig");
 const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const revision_archive = @import("revision_archive.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
@@ -74,6 +76,7 @@ const PreparedEffect = struct {
     revision_archive: ?revision_archive.Candidate,
     idempotency_match: bool,
     append_only: bool,
+    segmented: ?SegmentedPrepared = null,
 
     fn deinit(self: *PreparedEffect, allocator: std.mem.Allocator) void {
         allocator.free(self.slot_path);
@@ -88,6 +91,41 @@ const PreparedEffect = struct {
         for (self.generated_outputs) |*output| output.deinit(allocator);
         allocator.free(self.generated_outputs);
         if (self.revision_archive) |*archive| archive.deinit(allocator);
+        if (self.segmented) |*segmented| segmented.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const SegmentedPrepared = struct {
+    head_path: []u8,
+    head_before_digest: ?[]u8,
+    head_before_exists: bool,
+    head_after: []u8,
+    head_after_digest: []u8,
+    event_before_digest: ?[]u8,
+    event_before_exists: bool,
+    event_after_digest: []u8,
+    binding_before_digest: ?[]u8,
+    binding_before_exists: bool,
+    binding_after_digest: []u8,
+    checkpoint_path: ?[]u8,
+    checkpoint_bytes: ?[]u8,
+    legacy_event_path: ?[]u8,
+    legacy_binding_path: ?[]u8,
+
+    fn deinit(self: *SegmentedPrepared, allocator: std.mem.Allocator) void {
+        allocator.free(self.head_path);
+        if (self.head_before_digest) |digest| allocator.free(digest);
+        allocator.free(self.head_after);
+        allocator.free(self.head_after_digest);
+        if (self.event_before_digest) |digest| allocator.free(digest);
+        allocator.free(self.event_after_digest);
+        if (self.binding_before_digest) |digest| allocator.free(digest);
+        allocator.free(self.binding_after_digest);
+        if (self.checkpoint_path) |path| allocator.free(path);
+        if (self.checkpoint_bytes) |bytes| allocator.free(bytes);
+        if (self.legacy_event_path) |path| allocator.free(path);
+        if (self.legacy_binding_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -99,6 +137,18 @@ pub fn installRuntimeIo(io: std.Io) void {
 
 pub fn lastMutationState() ?bool {
     return last_mutation_state;
+}
+
+pub fn resetMutationState() void {
+    last_mutation_state = false;
+}
+
+pub fn markStorageMutated() void {
+    last_mutation_state = true;
+}
+
+pub fn markStorageMutationUnknown() void {
+    if (last_mutation_state != true) last_mutation_state = null;
 }
 
 pub fn transact(
@@ -182,6 +232,7 @@ fn transactResolved(
     transaction_generated: []const protocol.GeneratedOutput,
 ) !Result {
     if (isBindingOperation(operation)) {
+        try rejectSegmentedRebindOperation(storage_plan, operation);
         if (documents.len != 0) {
             return error.BindingOperationRejectsExternalInput;
         }
@@ -392,6 +443,32 @@ const StartupRecoveryWorker = struct {
     result: ?anyerror = null,
     completed: bool = false,
 };
+
+pub fn recoverRepositoryTransactions(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) !bool {
+    var paths = try TransactionPaths.init(allocator, repo_root, false);
+    defer paths.deinit(allocator);
+    return paths.created_control_paths or paths.recovery_mutated_storage;
+}
+
+test "startup recovery exposes control path mutations to its caller" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    resetMutationState();
+    if (try recoverRepositoryTransactions(
+        std.testing.allocator,
+        root,
+    )) markStorageMutated();
+    try std.testing.expect(lastMutationState().?);
+}
 
 fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
     var paths = TransactionPaths.init(
@@ -831,7 +908,6 @@ const PreparedBinding = struct {
     slot_index: u16,
     input_index: u8,
     slot_path: []u8,
-    slot_content: []u8,
     slot_digest: []u8,
     binding_path: []u8,
     binding_before_digest: ?[]u8,
@@ -839,7 +915,6 @@ const PreparedBinding = struct {
 
     fn deinit(self: *PreparedBinding, allocator: std.mem.Allocator) void {
         allocator.free(self.slot_path);
-        allocator.free(self.slot_content);
         allocator.free(self.slot_digest);
         allocator.free(self.binding_path);
         if (self.binding_before_digest) |digest| allocator.free(digest);
@@ -854,6 +929,19 @@ fn isBindingOperation(operation: *const storage.Operation) bool {
         if (!effect.kind.isBinding()) return false;
     }
     return true;
+}
+
+fn rejectSegmentedRebindOperation(
+    storage_plan: *const storage.ResolvedPlan,
+    operation: *const storage.Operation,
+) !void {
+    for (operation.effects) |effect| {
+        if (effect.kind == .rebind_existing and
+            storage_plan.slot(effect.slot_index).isSegmented())
+        {
+            return error.UnsupportedSegmentedEffect;
+        }
+    }
 }
 
 fn operationNeedsRevisionArchive(operation: *const storage.Operation) bool {
@@ -991,7 +1079,7 @@ fn buildExistingBindingMutationsAlloc(
                 .expected_exists = true,
             },
             .content_mode = .raw,
-            .max_bytes = slot.max_bytes,
+            .max_bytes = bindingSourceMaxBytes(slot),
             .action = .check_only,
         };
         mutations[index * 2 + 1] = .{
@@ -1101,7 +1189,7 @@ fn finishBindingResult(
 
 const ExistingBindingSource = struct {
     slot_path: []u8,
-    slot_content: []u8,
+    content: ExistingContent,
     slot_digest: []u8,
     binding_path: []u8,
     before: custody.BindingSnapshot,
@@ -1111,10 +1199,25 @@ const ExistingBindingSource = struct {
         allocator: std.mem.Allocator,
     ) void {
         allocator.free(self.slot_path);
-        allocator.free(self.slot_content);
+        self.content.deinit(allocator);
         allocator.free(self.slot_digest);
         allocator.free(self.binding_path);
         self.before.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ExistingContent = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+    memory_map: ?std.Io.File.MemoryMap = null,
+
+    fn deinit(self: *ExistingContent, allocator: std.mem.Allocator) void {
+        if (self.memory_map) |*memory_map| {
+            memory_map.destroy(std.Io.Threaded.global_single_threaded.io());
+        } else if (self.owned) |bytes| {
+            allocator.free(bytes);
+        }
         self.* = undefined;
     }
 };
@@ -1164,7 +1267,7 @@ fn prepareExistingBinding(
         slot,
         event_protocol,
         effect.slot_index,
-        source.slot_content,
+        source.content.bytes,
         parameters,
     );
     const replay_parameter_names = try replayParameterNamesAlloc(
@@ -1190,12 +1293,12 @@ fn prepareExistingBinding(
         null;
     errdefer if (binding_before_digest) |digest| allocator.free(digest);
     source.before.deinit(allocator);
+    source.content.deinit(allocator);
     return .{
         .kind = effect.kind,
         .slot_index = effect.slot_index,
         .input_index = effect.input_index,
         .slot_path = source.slot_path,
-        .slot_content = source.slot_content,
         .slot_digest = source.slot_digest,
         .binding_path = source.binding_path,
         .binding_before_digest = binding_before_digest,
@@ -1227,7 +1330,7 @@ fn appendExistingBindingAlloc(
             .record_start = if (record_count) |_| 0 else null,
             .record_end = record_count,
             .extent_start = 0,
-            .extent_end = source.slot_content.len,
+            .extent_end = source.content.bytes.len,
         },
         null,
         source.slot_digest,
@@ -1250,15 +1353,16 @@ fn readExistingBindingSource(
     );
     errdefer allocator.free(slot_path);
     try durable_store.rejectSymlinkComponents(slot_path);
-    const slot_content = try durable_store.readRegularFileNoSymlink(
+    var content = try readExistingContent(
         allocator,
+        slot,
         slot_path,
-        slot.max_bytes,
+        bindingSourceMaxBytes(slot),
     );
-    errdefer allocator.free(slot_content);
+    errdefer content.deinit(allocator);
     const slot_digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
-        slot_content,
+        content.bytes,
     );
     errdefer allocator.free(slot_digest);
     const binding_path = try custody.bindingPathAlloc(
@@ -1289,11 +1393,60 @@ fn readExistingBindingSource(
     errdefer before.deinit(allocator);
     return .{
         .slot_path = slot_path,
-        .slot_content = slot_content,
+        .content = content,
         .slot_digest = slot_digest,
         .binding_path = binding_path,
         .before = before,
     };
+}
+
+fn readExistingContent(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    path: []const u8,
+    maximum: usize,
+) !ExistingContent {
+    if (!slot.isSegmented()) {
+        const bytes = try durable_store.readRegularFileNoSymlink(
+            allocator,
+            path,
+            maximum,
+        );
+        return .{ .bytes = bytes, .owned = bytes };
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file_stat = try std.Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    );
+    const length = std.math.cast(usize, file_stat.size) orelse
+        return error.FileTooBig;
+    if (length > maximum) return error.FileTooBig;
+    if (length == 0) {
+        const bytes = try allocator.alloc(u8, 0);
+        return .{ .bytes = bytes, .owned = bytes };
+    }
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var memory_map = try std.Io.File.MemoryMap.create(io, file, .{
+        .len = length,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    errdefer memory_map.destroy(io);
+    try memory_map.read(io);
+    return .{
+        .bytes = memory_map.memory,
+        .memory_map = memory_map,
+    };
+}
+
+fn bindingSourceMaxBytes(slot: storage.ResolvedSlot) usize {
+    return if (slot.isSegmented())
+        segmented_event_log.legacy_event_max_bytes
+    else
+        slot.max_bytes;
 }
 
 fn validateExistingContent(
@@ -1649,6 +1802,20 @@ fn prepareEffect(
     transaction_generated: []const protocol.GeneratedOutput,
 ) !PreparedEffect {
     const slot = storage_plan.slot(effect.slot_index);
+    if (slot.isSegmented()) {
+        return prepareSegmentedEffect(
+            allocator,
+            definition_plan,
+            event_protocol,
+            effect,
+            operation_name,
+            repo_root,
+            execution,
+            parameters,
+            transaction_generated,
+            slot,
+        );
+    }
     var source = try EffectSlotSource.init(
         allocator,
         slot,
@@ -1697,6 +1864,628 @@ fn prepareEffect(
     );
     source.releaseReadCustody();
     return prepared;
+}
+
+fn prepareSegmentedEffect(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    effect: storage.Effect,
+    operation_name: []const u8,
+    repo_root: []const u8,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+    transaction_generated: []const protocol.GeneratedOutput,
+    slot: storage.ResolvedSlot,
+) !PreparedEffect {
+    _ = transaction_generated;
+    if (effect.kind != .compare_append or
+        !protocolTargetsSlot(event_protocol, effect.slot_index))
+    {
+        return error.UnsupportedSegmentedEffect;
+    }
+    var snapshot = try segmented_event_log.Snapshot.load(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(allocator);
+    try segmented_event_log.requireMigratedCustody(
+        allocator,
+        repo_root,
+        slot.relative_path,
+        snapshot.head_exists,
+    );
+    if (snapshot.head_exists and !snapshot.head.checkpoint_exists) {
+        return error.SegmentedReplayCheckpointMissing;
+    }
+    var idempotency = try EffectIdempotency.init(
+        allocator,
+        definition_plan,
+        effect,
+        execution,
+        parameters,
+    );
+    defer idempotency.deinit(allocator);
+    if (idempotency.key() != null) {
+        return error.SegmentedIdempotencyRequiresRetainedProtocolState;
+    }
+    const logical_before = try snapshot.head.revisionAlloc(allocator);
+    defer allocator.free(logical_before);
+    try validateEffectSlotPreconditions(
+        effect,
+        snapshot.head_exists,
+        if (snapshot.head_exists) logical_before else null,
+        parameters,
+    );
+    var binding = try segmentedBindingBefore(
+        allocator,
+        definition_plan,
+        slot,
+        &snapshot,
+        logical_before,
+    );
+    errdefer binding.deinit(allocator);
+    var replay_context = try segmentedReplayBefore(
+        allocator,
+        definition_plan,
+        event_protocol.?,
+        slot,
+        repo_root,
+        parameters,
+        &snapshot,
+        &binding,
+    );
+    defer replay_context.deinit(allocator);
+    var head = try snapshot.head.clone(allocator);
+    defer head.deinit(allocator);
+    const protocol_records = try beginSegmentedSuffixAdmission(
+        &replay_context,
+        &snapshot.head,
+        definition_plan.bounds.max_records,
+    );
+    var input = try materializeSegmentedInput(
+        allocator,
+        definition_plan,
+        event_protocol,
+        effect,
+        execution,
+        parameters,
+        &replay_context,
+    );
+    errdefer input.deinit(allocator);
+    if (input.canonical.len > definition_plan.bounds.max_output_bytes) {
+        return error.OutputBoundsExceeded;
+    }
+    const separator_bytes = head.eventAppendSeparatorBytes();
+    const event_suffix = try segmentedEventSuffix(
+        allocator,
+        input.canonical,
+        separator_bytes,
+    );
+    errdefer allocator.free(event_suffix);
+    const record_start = std.math.cast(
+        usize,
+        head.total_event_records,
+    ) orelse return error.TransactionRecordBoundsExceeded;
+    const extent_start_unframed = std.math.cast(
+        usize,
+        head.total_event_bytes,
+    ) orelse return error.StorageSlotBoundsExceeded;
+    const extent_start = std.math.add(
+        usize,
+        extent_start_unframed,
+        separator_bytes,
+    ) catch return error.StorageSlotBoundsExceeded;
+    var probe = try head.clone(allocator);
+    defer probe.deinit(allocator);
+    _ = try probe.appendEvent(event_suffix);
+    const logical_after = try probe.revisionAlloc(allocator);
+    errdefer allocator.free(logical_after);
+    const binding_suffix = try segmentedBindingAfter(
+        allocator,
+        definition_plan,
+        event_protocol.?,
+        effect,
+        operation_name,
+        slot,
+        idempotency.input_digest,
+        input.canonical,
+        record_start,
+        extent_start,
+        logical_before,
+        logical_after,
+        parameters,
+    );
+    errdefer allocator.free(binding_suffix);
+    var checkpoint_candidate: ?[]u8 = null;
+    if (try head.requiresCheckpointBeforeAppend(
+        event_suffix.len,
+        binding_suffix.len,
+        definition_plan.bounds.max_records,
+    )) {
+        const suffix_records = replay_context.state.?.records;
+        replay_context.state.?.records = protocol_records;
+        try protocol.activateCheckpoint(
+            allocator,
+            event_protocol.?,
+            &replay_context.state.?,
+        );
+        checkpoint_candidate = try encodeSegmentedCheckpoint(
+            allocator,
+            definition_plan,
+            &replay_context,
+        );
+        replay_context.state.?.records = suffix_records;
+    }
+    errdefer if (checkpoint_candidate) |bytes| allocator.free(bytes);
+    try admitSegmentedInput(
+        allocator,
+        event_protocol.?,
+        effect,
+        execution,
+        parameters,
+        &replay_context,
+        input.canonical,
+    );
+    try finishSegmentedSuffixAdmission(&replay_context, protocol_records);
+    return assembleSegmentedEffect(
+        allocator,
+        effect,
+        &snapshot,
+        &head,
+        &binding,
+        logical_before,
+        logical_after,
+        event_suffix,
+        binding_suffix,
+        checkpoint_candidate,
+        &input,
+    );
+}
+
+fn admitSegmentedInput(
+    allocator: std.mem.Allocator,
+    event_plan: *const protocol.Plan,
+    effect: storage.Effect,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_context: *EffectReplayContext,
+    canonical_input: []const u8,
+) !void {
+    if (effect.event != null) {
+        return protocol.admitBound(
+            allocator,
+            event_plan,
+            &replay_context.state.?,
+            canonical_input,
+            parameters,
+        );
+    }
+    return protocol.admitValueBound(
+        allocator,
+        event_plan,
+        &replay_context.state.?,
+        execution.inputJson(effect.input_index) orelse
+            return error.ProtocolInputMustBeJson,
+        parameters,
+    );
+}
+
+fn beginSegmentedSuffixAdmission(
+    replay_context: *EffectReplayContext,
+    head: *const segmented_event_log.Head,
+    max_suffix_records: usize,
+) !usize {
+    const state = if (replay_context.state) |*value|
+        value
+    else
+        return error.SegmentedCheckpointStateMissing;
+    const suffix_records = std.math.sub(
+        u64,
+        head.total_event_records,
+        head.checkpoint_event_records,
+    ) catch return error.InvalidSegmentedHead;
+    const protocol_records = state.records;
+    state.records = if (suffix_records >= @as(u64, @intCast(max_suffix_records)))
+        0
+    else
+        std.math.cast(usize, suffix_records) orelse
+            return error.CurrentStoreRecordBoundsExceeded;
+    return protocol_records;
+}
+
+fn finishSegmentedSuffixAdmission(
+    replay_context: *EffectReplayContext,
+    protocol_records: usize,
+) !void {
+    const state = if (replay_context.state) |*value|
+        value
+    else
+        return error.SegmentedCheckpointStateMissing;
+    state.records = std.math.add(usize, protocol_records, 1) catch
+        return error.CurrentStoreRecordBoundsExceeded;
+}
+
+fn materializeSegmentedInput(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    effect: storage.Effect,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_context: *EffectReplayContext,
+) !EffectMaterializedInput {
+    if (effect.event) |*event| return materializeEventEffectInput(
+        allocator,
+        event_protocol,
+        effect.slot_index,
+        event,
+        execution,
+        effect.input_index,
+        parameters,
+        replay_context,
+        false,
+    );
+    const request = try materialization.canonicalizeInputAlloc(
+        allocator,
+        execution,
+        effect.input_index,
+        definition_plan.inputs[effect.input_index].codec,
+    );
+    defer allocator.free(request);
+    return materializeRawEffectInput(
+        allocator,
+        event_protocol,
+        effect.slot_index,
+        execution,
+        effect.input_index,
+        parameters,
+        replay_context,
+        request,
+        false,
+        false,
+    );
+}
+
+fn segmentedBindingBefore(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    logical_revision: []const u8,
+) !custody.BindingSnapshot {
+    const checkpoint_revision = snapshot.head.checkpointRevision() orelse
+        logical_revision;
+    return custody.parseBindingSegment(
+        allocator,
+        snapshot.binding_bytes,
+        definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        checkpoint_revision,
+        logical_revision,
+        null,
+    );
+}
+
+fn segmentedReplayBefore(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_plan: *const protocol.Plan,
+    slot: storage.ResolvedSlot,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    snapshot: *const segmented_event_log.Snapshot,
+    binding: *const custody.BindingSnapshot,
+) !EffectReplayContext {
+    if (!snapshot.head.checkpoint_exists) {
+        if (snapshot.head_exists) {
+            return error.SegmentedReplayCheckpointMissing;
+        }
+        return .{
+            .existing_records = 0,
+            .state = protocol.ReplayState.init(event_plan),
+            .derived_match = null,
+            .append_context = null,
+        };
+    }
+    var stats = try replay.validateSegmentedSnapshot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        snapshot,
+        binding,
+        parameters,
+        definition_plan.bounds.max_records,
+        true,
+    );
+    defer stats.deinit(allocator);
+    if (stats.protocol_state) |*state| {
+        try protocol.activateCheckpoint(allocator, event_plan, state);
+    }
+    return .{
+        .existing_records = stats.records_validated,
+        .state = stats.takeProtocolState(),
+        .derived_match = null,
+        .append_context = null,
+    };
+}
+
+fn encodeSegmentedCheckpoint(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    replay_context: *EffectReplayContext,
+) ![]u8 {
+    const state = if (replay_context.state) |*value|
+        value
+    else
+        return error.SegmentedCheckpointStateMissing;
+    return protocol.encodeCheckpointAlloc(
+        allocator,
+        state,
+        definition_plan.closure_digest[0..],
+    );
+}
+
+fn assembleSegmentedEffect(
+    allocator: std.mem.Allocator,
+    effect: storage.Effect,
+    snapshot: *const segmented_event_log.Snapshot,
+    head: *segmented_event_log.Head,
+    binding: *custody.BindingSnapshot,
+    logical_before: []const u8,
+    logical_after: []u8,
+    event_suffix: []u8,
+    binding_suffix: []u8,
+    checkpoint_candidate: ?[]u8,
+    input: *EffectMaterializedInput,
+) !PreparedEffect {
+    if (checkpoint_candidate) |bytes| try head.installCheckpoint(bytes);
+    const disposition = try head.append(event_suffix, binding_suffix);
+    return finishSegmentedPrepared(
+        allocator,
+        effect,
+        snapshot,
+        head,
+        binding,
+        logical_before,
+        logical_after,
+        event_suffix,
+        disposition.event_rolled,
+        binding_suffix,
+        disposition.binding_rolled,
+        checkpoint_candidate,
+        input,
+    );
+}
+
+fn segmentedEventSuffix(
+    allocator: std.mem.Allocator,
+    canonical_input: []const u8,
+    separator_bytes: usize,
+) ![]u8 {
+    if (canonical_input.len > segmented_event_log.event_max_bytes or
+        separator_bytes > 1)
+    {
+        return error.SegmentedAppendBoundsExceeded;
+    }
+    const framed_length = std.math.add(usize, canonical_input.len, 1) catch
+        return error.SegmentedAppendBoundsExceeded;
+    const length = std.math.add(usize, framed_length, separator_bytes) catch
+        return error.SegmentedAppendBoundsExceeded;
+    const result = try allocator.alloc(u8, length);
+    if (separator_bytes == 1) result[0] = '\n';
+    @memcpy(
+        result[separator_bytes .. separator_bytes + canonical_input.len],
+        canonical_input,
+    );
+    result[length - 1] = '\n';
+    return result;
+}
+
+fn segmentedBindingAfter(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_plan: *const protocol.Plan,
+    effect: storage.Effect,
+    operation_name: []const u8,
+    slot: storage.ResolvedSlot,
+    input_digest: []const u8,
+    canonical_input: []const u8,
+    record_start: usize,
+    extent_start: usize,
+    revision_before: []const u8,
+    revision_after: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) ![]u8 {
+    const canonical_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            canonical_input,
+        );
+    defer allocator.free(canonical_digest);
+    const replay_names = try replayParameterNamesAlloc(
+        allocator,
+        event_plan,
+        effect.slot_index,
+    );
+    defer allocator.free(replay_names);
+    return custody.appendBindingRowAlloc(
+        allocator,
+        "",
+        definition_plan,
+        slot,
+        operation_name,
+        input_digest,
+        canonical_digest,
+        .{
+            .kind = .admission,
+            .record_start = record_start,
+            .record_end = record_start + 1,
+            .extent_start = extent_start,
+            .extent_end = extent_start + canonical_input.len,
+        },
+        revision_before,
+        revision_after,
+        null,
+        parameters,
+        replay_names,
+    );
+}
+
+fn finishSegmentedPrepared(
+    allocator: std.mem.Allocator,
+    effect: storage.Effect,
+    snapshot: *const segmented_event_log.Snapshot,
+    head: *const segmented_event_log.Head,
+    binding: *custody.BindingSnapshot,
+    logical_before: []const u8,
+    logical_after: []u8,
+    event_suffix: []u8,
+    event_rolled: bool,
+    binding_suffix: []u8,
+    binding_rolled: bool,
+    checkpoint_bytes: ?[]u8,
+    input: *EffectMaterializedInput,
+) !PreparedEffect {
+    const event_path = try snapshot.paths.eventSegmentAlloc(
+        allocator,
+        head.event_index,
+    );
+    errdefer allocator.free(event_path);
+    const binding_path = try snapshot.paths.bindingSegmentAlloc(
+        allocator,
+        head.binding_index,
+    );
+    errdefer allocator.free(binding_path);
+    var segmented = try buildSegmentedPrepared(
+        allocator,
+        snapshot,
+        head,
+        event_rolled,
+        binding_rolled,
+        checkpoint_bytes,
+    );
+    errdefer segmented.deinit(allocator);
+    const semantic_exists = snapshot.head_exists or
+        snapshot.head.total_event_records != 0;
+    const before_digest = if (semantic_exists)
+        try allocator.dupe(u8, logical_before)
+    else
+        null;
+    errdefer if (before_digest) |digest| allocator.free(digest);
+    const prepared: PreparedEffect = .{
+        .slot_index = effect.slot_index,
+        .kind = effect.kind,
+        .slot_path = event_path,
+        .binding_path = binding_path,
+        .slot_before = null,
+        .slot_before_digest = before_digest,
+        .slot_before_exists = semantic_exists,
+        .slot_after = event_suffix,
+        .slot_after_digest = logical_after,
+        .binding_before = binding.*,
+        .binding_after = binding_suffix,
+        .canonical_input = input.canonical,
+        .generated_outputs = input.outputs,
+        .revision_archive = null,
+        .idempotency_match = false,
+        .append_only = true,
+        .segmented = segmented,
+    };
+    binding.* = undefined;
+    input.* = undefined;
+    segmented = undefined;
+    return prepared;
+}
+
+fn buildSegmentedPrepared(
+    allocator: std.mem.Allocator,
+    snapshot: *const segmented_event_log.Snapshot,
+    head: *const segmented_event_log.Head,
+    event_rolled: bool,
+    binding_rolled: bool,
+    checkpoint_bytes: ?[]u8,
+) !SegmentedPrepared {
+    const same_event = !event_rolled and
+        head.event_index == snapshot.head.event_index;
+    const same_binding = !binding_rolled and
+        head.binding_index == snapshot.head.binding_index;
+    const head_after = try head.encodeAlloc(allocator);
+    errdefer allocator.free(head_after);
+    const head_after_digest = try digestBytesAlloc(allocator, head_after);
+    errdefer allocator.free(head_after_digest);
+    const event_after_digest = try head.eventSegmentDigestAlloc(allocator);
+    errdefer allocator.free(event_after_digest);
+    const binding_after_digest = try head.bindingSegmentDigestAlloc(allocator);
+    errdefer allocator.free(binding_after_digest);
+    const head_path = try allocator.dupe(u8, snapshot.paths.manifest);
+    errdefer allocator.free(head_path);
+    const head_before_digest = try optionalDupe(
+        allocator,
+        snapshot.head_digest,
+    );
+    errdefer if (head_before_digest) |digest| allocator.free(digest);
+    const event_before_digest = try optionalDupe(
+        allocator,
+        if (same_event) snapshot.event_digest else null,
+    );
+    errdefer if (event_before_digest) |digest| allocator.free(digest);
+    const binding_before_digest = try optionalDupe(
+        allocator,
+        if (same_binding) snapshot.binding_digest else null,
+    );
+    errdefer if (binding_before_digest) |digest| allocator.free(digest);
+    const checkpoint_path = if (checkpoint_bytes != null)
+        try snapshot.paths.checkpointAlloc(
+            allocator,
+            head.checkpoint_index,
+        )
+    else
+        null;
+    errdefer if (checkpoint_path) |path| allocator.free(path);
+    const legacy_event_path = if (!snapshot.head_exists)
+        try allocator.dupe(u8, snapshot.paths.legacy_event)
+    else
+        null;
+    errdefer if (legacy_event_path) |path| allocator.free(path);
+    const legacy_binding_path = if (!snapshot.head_exists)
+        try allocator.dupe(u8, snapshot.paths.legacy_binding)
+    else
+        null;
+    return .{
+        .head_path = head_path,
+        .head_before_digest = head_before_digest,
+        .head_before_exists = snapshot.head_exists,
+        .head_after = head_after,
+        .head_after_digest = head_after_digest,
+        .event_before_digest = event_before_digest,
+        .event_before_exists = same_event and snapshot.event_exists,
+        .event_after_digest = event_after_digest,
+        .binding_before_digest = binding_before_digest,
+        .binding_before_exists = same_binding and snapshot.binding_exists,
+        .binding_after_digest = binding_after_digest,
+        .checkpoint_path = checkpoint_path,
+        .checkpoint_bytes = checkpoint_bytes,
+        .legacy_event_path = legacy_event_path,
+        .legacy_binding_path = legacy_binding_path,
+    };
+}
+
+fn optionalDupe(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !?[]u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
+}
+
+fn digestBytesAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    return definition_core.canonical_json.digestBytesAlloc(allocator, bytes);
 }
 
 fn prepareEffectWithBinding(
@@ -2434,6 +3223,7 @@ fn materializeEffectInputAlloc(
             effect.input_index,
             parameters,
             replay_context,
+            true,
         );
     }
     return materializeNonEventEffectInput(
@@ -2490,6 +3280,7 @@ fn materializeNonEventEffectInput(
         replay_context,
         request,
         idempotency_match,
+        true,
     );
 }
 
@@ -2543,6 +3334,7 @@ fn materializeEventEffectInput(
     input_index: u8,
     parameters: *const definition_core.parameters.Bindings,
     replay_context: *EffectReplayContext,
+    admit_protocol: bool,
 ) !EffectMaterializedInput {
     const protocol_required = protocolTargetsSlot(
         event_protocol,
@@ -2571,7 +3363,7 @@ fn materializeEventEffectInput(
         ),
     };
     errdefer materialized_event.deinit(allocator);
-    if (protocol_required) {
+    if (protocol_required and admit_protocol) {
         try protocol.admitBound(
             allocator,
             event_protocol.?,
@@ -2726,13 +3518,15 @@ fn materializeRawEffectInput(
     replay_context: *EffectReplayContext,
     request: []const u8,
     idempotency_match: bool,
+    admit_protocol: bool,
 ) !EffectMaterializedInput {
     const result = try effectInputWithNoOutputs(allocator, request);
     errdefer {
         var owned = result;
         owned.deinit(allocator);
     }
-    if (protocolTargetsSlot(event_protocol, slot_index) and
+    if (admit_protocol and
+        protocolTargetsSlot(event_protocol, slot_index) and
         !idempotency_match)
     {
         const current_protocol = event_protocol.?;
@@ -3166,13 +3960,68 @@ fn buildMutations(
 ) ![]durable_store.TransactionMutation {
     const archive_count: usize = if (archive.exists) 0 else 1;
     const revision_count = countMissingRevisionArchives(prepared);
+    const effect_mutation_count = countEffectMutations(prepared);
     const mutations = try allocator.alloc(
         durable_store.TransactionMutation,
-        prepared.len * 2 + revision_count + archive_count,
+        effect_mutation_count + revision_count + archive_count,
     );
-    for (prepared, 0..) |effect, index| {
+    var mutation_index: usize = 0;
+    for (prepared) |effect| {
         const slot = storage_plan.slot(effect.slot_index);
-        mutations[index * 2] = .{
+        if (effect.segmented) |segmented| {
+            mutations[mutation_index] = segmentedEventMutation(
+                effect,
+                segmented,
+            );
+            mutation_index += 1;
+            mutations[mutation_index] = segmentedBindingMutation(
+                effect,
+                segmented,
+            );
+            mutation_index += 1;
+            if (segmented.checkpoint_path) |checkpoint_path| {
+                mutations[mutation_index] = .{
+                    .path = checkpoint_path,
+                    .text = segmented.checkpoint_bytes.?,
+                    .expectation = .{ .expected_exists = false },
+                    .content_mode = .raw,
+                    .max_bytes = checkpoint.max_checkpoint_bytes,
+                };
+                mutation_index += 1;
+            }
+            if (segmented.legacy_event_path) |legacy_event_path| {
+                mutations[mutation_index] = .{
+                    .path = legacy_event_path,
+                    .text = segmented_event_log.legacy_event_tombstone,
+                    .expectation = .{ .expected_exists = false },
+                    .content_mode = .raw,
+                    .max_bytes = segmented_event_log.event_segment_bytes,
+                };
+                mutation_index += 1;
+                mutations[mutation_index] = .{
+                    .path = segmented.legacy_binding_path.?,
+                    .text = segmented_event_log.legacy_binding_tombstone,
+                    .expectation = .{ .expected_exists = false },
+                    .content_mode = .raw,
+                    .max_bytes = segmented_event_log.binding_segment_bytes,
+                };
+                mutation_index += 1;
+            }
+            mutations[mutation_index] = .{
+                .path = segmented.head_path,
+                .text = segmented.head_after,
+                .expectation = .{
+                    .expected_digest = segmented.head_before_digest,
+                    .expected_exists = segmented.head_before_exists,
+                },
+                .content_mode = .raw,
+                .max_bytes = 64 * 1024,
+                .expected_digest_after = segmented.head_after_digest,
+            };
+            mutation_index += 1;
+            continue;
+        }
+        mutations[mutation_index] = .{
             .path = effect.slot_path,
             .text = effect.slot_after,
             .expectation = .{
@@ -3184,7 +4033,8 @@ fn buildMutations(
             .action = if (effect.append_only) .append else .write,
             .expected_digest_after = effect.slot_after_digest,
         };
-        mutations[index * 2 + 1] = .{
+        mutation_index += 1;
+        mutations[mutation_index] = .{
             .path = effect.binding_path,
             .text = effect.binding_after,
             .expectation = .{
@@ -3194,8 +4044,8 @@ fn buildMutations(
             .content_mode = .raw,
             .max_bytes = custody.binding_max_bytes,
         };
+        mutation_index += 1;
     }
-    var mutation_index = prepared.len * 2;
     for (prepared, 0..) |effect, index| {
         const revision = effect.revision_archive orelse continue;
         if (revision.exists or revisionAppearedEarlier(prepared, index)) {
@@ -3223,6 +4073,54 @@ fn buildMutations(
     }
     std.debug.assert(mutation_index == mutations.len);
     return mutations;
+}
+
+fn countEffectMutations(prepared: []const PreparedEffect) usize {
+    var count: usize = 0;
+    for (prepared) |effect| {
+        count += if (effect.segmented) |segmented|
+            @as(usize, if (segmented.checkpoint_path == null) 3 else 4) +
+                @as(usize, if (segmented.legacy_event_path == null) 0 else 2)
+        else
+            2;
+    }
+    return count;
+}
+
+fn segmentedEventMutation(
+    effect: PreparedEffect,
+    segmented: SegmentedPrepared,
+) durable_store.TransactionMutation {
+    return .{
+        .path = effect.slot_path,
+        .text = effect.slot_after,
+        .expectation = .{
+            .expected_digest = segmented.event_before_digest,
+            .expected_exists = segmented.event_before_exists,
+        },
+        .content_mode = .raw,
+        .max_bytes = segmented_event_log.event_segment_bytes,
+        .action = .append,
+        .expected_digest_after = segmented.event_after_digest,
+    };
+}
+
+fn segmentedBindingMutation(
+    effect: PreparedEffect,
+    segmented: SegmentedPrepared,
+) durable_store.TransactionMutation {
+    return .{
+        .path = effect.binding_path,
+        .text = effect.binding_after,
+        .expectation = .{
+            .expected_digest = segmented.binding_before_digest,
+            .expected_exists = segmented.binding_before_exists,
+        },
+        .content_mode = .raw,
+        .max_bytes = segmented_event_log.binding_segment_bytes,
+        .action = .append,
+        .expected_digest_after = segmented.binding_after_digest,
+    };
 }
 
 fn countMissingRevisionArchives(prepared: []const PreparedEffect) usize {
@@ -4921,6 +5819,69 @@ const definition_bound_event_definition =
     "\"max_store_bytes\":65536,\"max_records\":3,\"max_output_bytes\":4096," ++
     "\"max_diagnostics\":8,\"max_reducer_states\":4}}";
 
+fn segmentedDefinitionBoundAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        definition_bound_event_definition,
+        "\"kind\":\"event-log\",\"codec\":\"jsonl\",\"max_bytes\":65536",
+        "\"kind\":\"event-log\",\"codec\":\"jsonl\"," ++
+            "\"layout\":\"segmented\",\"max_bytes\":67108864",
+    );
+}
+
+test "segmented definitions reject inputs that can exceed one event" {
+    const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    plans.definition_plan.inputs[0].max_bytes =
+        segmented_event_log.event_max_bytes + 1;
+    try std.testing.expectError(
+        error.SegmentedEventInputBoundsExceeded,
+        protocol.compile(
+            std.testing.allocator,
+            &plans.definition_plan,
+            &plans.storage_plan,
+        ),
+    );
+}
+
+test "segmented bind existing maps its admitted source read only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "{\"kind\":\"created\"}\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "source.jsonl",
+        .data = bytes,
+    });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "source.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "source.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = segmented_event_log.event_segment_bytes,
+        .layout = .segmented,
+    };
+    var content = try readExistingContent(
+        std.testing.allocator,
+        slot,
+        path,
+        segmented_event_log.legacy_event_max_bytes,
+    );
+    defer content.deinit(std.testing.allocator);
+    try std.testing.expect(content.memory_map != null);
+    try std.testing.expect(content.owned == null);
+    try std.testing.expectEqualStrings(bytes, content.bytes);
+}
+
 fn appendDefinitionBoundPair(
     plans: *const TransactionTestPlans,
     protocol_plan: *const protocol.Plan,
@@ -5067,6 +6028,310 @@ test "transaction admits and replays a definition-bound event chain" {
         &protocol_plan,
         &parameters,
         second_event.digest,
+    );
+}
+
+test "segmented transaction checkpoints and appends bounded active files" {
+    const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(std.testing.allocator);
+    var second = try appendDefinitionBoundPair(
+        &plans,
+        &protocol_plan,
+        &parameters,
+    );
+    defer second.deinit(std.testing.allocator);
+    var resolved = try storage.resolve(
+        std.testing.allocator,
+        &plans.storage_plan,
+        &parameters,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const slot = resolved.slot(protocol_plan.target_slot_index);
+    var snapshot = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        plans.repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    const legacy_event = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        snapshot.paths.legacy_event,
+        segmented_event_log.legacy_event_tombstone.len,
+    );
+    defer std.testing.allocator.free(legacy_event);
+    try std.testing.expectEqualStrings(
+        segmented_event_log.legacy_event_tombstone,
+        legacy_event,
+    );
+    const legacy_binding = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        snapshot.paths.legacy_binding,
+        segmented_event_log.legacy_binding_tombstone.len,
+    );
+    defer std.testing.allocator.free(legacy_binding);
+    try std.testing.expectEqualStrings(
+        segmented_event_log.legacy_binding_tombstone,
+        legacy_binding,
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = snapshot.paths.legacy_event,
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.SegmentedLegacyCustodyMismatch,
+        segmented_event_log.requireMigratedCustody(
+            std.testing.allocator,
+            plans.repo_root,
+            slot.relative_path,
+            true,
+        ),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = snapshot.paths.legacy_event,
+        .data = segmented_event_log.legacy_event_tombstone,
+    });
+    try segmented_event_log.requireMigratedCustody(
+        std.testing.allocator,
+        plans.repo_root,
+        slot.relative_path,
+        true,
+    );
+    const revision = try snapshot.head.revisionAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(revision);
+    var binding = try custody.parseBindingSegment(
+        std.testing.allocator,
+        snapshot.binding_bytes,
+        plans.definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        snapshot.head.checkpointRevision().?,
+        revision,
+        null,
+    );
+    defer binding.deinit(std.testing.allocator);
+    var stats = try replay.validateSegmentedSnapshot(
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        slot,
+        &snapshot,
+        &binding,
+        &parameters,
+        plans.definition_plan.bounds.max_records,
+        true,
+    );
+    defer stats.deinit(std.testing.allocator);
+    try replay.validateSegmentedHistoryArchives(
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        &snapshot,
+    );
+    const archive_path = try definition_archive.pathAlloc(
+        std.testing.allocator,
+        plans.repo_root,
+        &plans.definition_plan.closure_digest,
+    );
+    defer std.testing.allocator.free(archive_path);
+    const archive_bytes = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        archive_path,
+        definition_archive.max_bytes,
+    );
+    defer std.testing.allocator.free(archive_bytes);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, archive_path);
+    try std.testing.expectError(
+        error.HistoricalDefinitionMissing,
+        replay.validateSegmentedHistoryArchives(
+            std.testing.allocator,
+            plans.repo_root,
+            plans.definition_plan.id,
+            &snapshot,
+        ),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = archive_path,
+        .data = archive_bytes,
+    });
+    try std.testing.expectEqual(@as(usize, 2), stats.records_validated);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
+    try std.testing.expect(snapshot.event_bytes.len <
+        segmented_event_log.event_segment_bytes);
+    try std.testing.expect(snapshot.binding_bytes.len <
+        segmented_event_log.binding_segment_bytes);
+}
+
+test "segmented record bound limits suffix replay rather than lifetime" {
+    const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(std.testing.allocator);
+    var previous: ?[]u8 = null;
+    defer if (previous) |digest| std.testing.allocator.free(digest);
+    for (1..6) |sequence| {
+        var event = try chainedEventAlloc(
+            std.testing.allocator,
+            @intCast(sequence),
+            if (sequence == 1) "created" else "updated",
+            previous,
+            "{\"id\":\"item-1\",\"status\":\"open\"}",
+        );
+        defer event.deinit(std.testing.allocator);
+        var result = try plans.execute(
+            &protocol_plan,
+            "append",
+            &.{.{ .name = "event", .bytes = event.bytes }},
+            &parameters,
+        );
+        defer result.deinit(std.testing.allocator);
+        if (previous) |digest| std.testing.allocator.free(digest);
+        previous = try std.testing.allocator.dupe(u8, event.digest);
+    }
+    var resolved = try storage.resolve(
+        std.testing.allocator,
+        &plans.storage_plan,
+        &parameters,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const slot = resolved.slot(protocol_plan.target_slot_index);
+    var snapshot = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        plans.repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 5), snapshot.head.total_event_records);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.head.checkpoint_event_records);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.head.event_records);
+    const revision = try snapshot.head.revisionAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(revision);
+    var binding = try custody.parseBindingSegment(
+        std.testing.allocator,
+        snapshot.binding_bytes,
+        plans.definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        snapshot.head.checkpointRevision().?,
+        revision,
+        null,
+    );
+    defer binding.deinit(std.testing.allocator);
+    var stats = try replay.validateSegmentedSnapshot(
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        slot,
+        &snapshot,
+        &binding,
+        &parameters,
+        plans.definition_plan.bounds.max_records,
+        true,
+    );
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), stats.records_validated);
+    try std.testing.expectEqual(@as(usize, 5), stats.protocol_state.?.records);
+}
+
+test "segmented transaction refuses unmigrated legacy custody" {
+    const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    try plans.repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try plans.repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/chained-events.jsonl",
+        .data = "{}\n",
+    });
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(std.testing.allocator);
+    var event = try chainedEventAlloc(
+        std.testing.allocator,
+        1,
+        "created",
+        null,
+        "{\"id\":\"item-1\"}",
+    );
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.SegmentedMigrationRequired,
+        plans.execute(
+            &protocol_plan,
+            "append",
+            &.{.{ .name = "event", .bytes = event.bytes }},
+            &parameters,
+        ),
+    );
+}
+
+test "segmented compare append enforces its expected revision" {
+    const with_parameter = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        definition_bound_event_definition,
+        "\"parameters\":{},\"inputs\"",
+        "\"parameters\":{\"revision\":{\"type\":\"digest\"," ++
+            "\"required\":true}},\"inputs\"",
+    );
+    defer std.testing.allocator.free(with_parameter);
+    const source = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_parameter,
+        "\"slot\":\"events\",\"input\":\"event\"",
+        "\"slot\":\"events\",\"input\":\"event\"," ++
+            "\"expected_revision_param\":\"revision\"",
+    );
+    defer std.testing.allocator.free(source);
+    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    defer plans.deinit();
+    const expected =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const actual =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var parameters = try plans.bind(&.{.{
+        .name = "revision",
+        .raw_value = expected,
+    }});
+    defer parameters.deinit(std.testing.allocator);
+    const operation = plans.storage_plan.findOperation("append").?;
+    try std.testing.expectError(
+        error.RevisionMismatch,
+        validateEffectSlotPreconditions(
+            operation.effects[0],
+            true,
+            actual,
+            &parameters,
+        ),
+    );
+    try validateEffectSlotPreconditions(
+        operation.effects[0],
+        true,
+        expected,
+        &parameters,
     );
 }
 

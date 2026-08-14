@@ -127,7 +127,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.\{ \.(link_libc|sqlite) = true \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.\{ \.(link_libc|sqlite) = true \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
