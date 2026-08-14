@@ -4,6 +4,7 @@ const fetch_timeout_ms: u32 = 30_000;
 const fetch_termination_grace_ms: u32 = 250;
 const fetch_output_limit: usize = 1024 * 1024;
 const default_credential_executable = "gh";
+const allowed_fetch_protocols = "file:http:https:ssh:git";
 const git_selector_environment_keys = [_][]const u8{
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -41,6 +42,21 @@ fn effectiveGitEnvironment(
     const helper = try credentialHelperAlloc(allocator, credential_executable);
     defer allocator.free(helper);
     try environment.put("GIT_CONFIG_VALUE_1", helper);
+    return environment;
+}
+
+fn fetchGitEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: ?*const std.process.Environ.Map,
+    credential_executable: []const u8,
+) !std.process.Environ.Map {
+    var environment = try effectiveGitEnvironment(
+        allocator,
+        inherited,
+        credential_executable,
+    );
+    errdefer environment.deinit();
+    try environment.put("GIT_ALLOW_PROTOCOL", allowed_fetch_protocols);
     return environment;
 }
 
@@ -317,6 +333,7 @@ fn remoteMatchesRepository(
     owner: []const u8,
     repository: []const u8,
 ) bool {
+    if (!fetchProtocolAllowed(url)) return false;
     const location = GitRepositoryLocation.parse(url) orelse return false;
     if (location.kind == .local) return false;
     const scheme = if (location.kind == .url) location.scheme else "ssh";
@@ -1343,7 +1360,6 @@ fn updateSelectedSubmodules(
 }
 
 const selected_submodule_remote = "synoptic-selected-source";
-const selected_submodule_protocols = "file:http:https:ssh:git";
 
 const SelectedSubmoduleFetchCommand = struct {
     argv: [9][]const u8,
@@ -1369,7 +1385,7 @@ fn selectedSubmoduleFetchEnvironment(
     url: []const u8,
     credential_executable: ?[]const u8,
 ) !std.process.Environ.Map {
-    if (!selectedSubmoduleProtocolAllowed(url)) {
+    if (!fetchProtocolAllowed(url)) {
         return error.ManagedSubmoduleSourceProtocolRejected;
     }
     var environment = if (credential_executable) |executable|
@@ -1379,7 +1395,7 @@ fn selectedSubmoduleFetchEnvironment(
     errdefer environment.deinit();
     if (credential_executable == null) sanitizeGitEnvironment(&environment);
     try environment.put("GIT_NO_REPLACE_OBJECTS", "1");
-    try environment.put("GIT_ALLOW_PROTOCOL", selected_submodule_protocols);
+    try environment.put("GIT_ALLOW_PROTOCOL", allowed_fetch_protocols);
     try environment.put("GIT_CONFIG_COUNT", if (credential_executable == null) "1" else "3");
     try environment.put(
         if (credential_executable == null) "GIT_CONFIG_KEY_0" else "GIT_CONFIG_KEY_2",
@@ -1392,8 +1408,10 @@ fn selectedSubmoduleFetchEnvironment(
     return environment;
 }
 
-fn selectedSubmoduleProtocolAllowed(url: []const u8) bool {
-    if (std.mem.indexOf(u8, url, "::") != null) return false;
+fn fetchProtocolAllowed(url: []const u8) bool {
+    if (scpSeparator(url)) |separator| {
+        if (separator + 1 < url.len and url[separator + 1] == ':') return false;
+    }
     const location = GitRepositoryLocation.parse(url) orelse return false;
     if (location.kind != .url) return true;
     inline for (.{ "file", "http", "https", "ssh", "git" }) |allowed| {
@@ -2403,19 +2421,16 @@ const FetchWatchdog = struct {
             else => {},
         };
         for (0..@max(@as(u32, 1), self.termination_grace_ms / 5)) |_| {
-            if (self.finished.load(.acquire)) return;
             std.Io.sleep(io, tick, .awake) catch |ignored_error| switch (ignored_error) {
                 else => {},
             };
         }
-        if (!self.finished.load(.acquire)) {
-            std.posix.kill(
-                -self.pid,
-                std.posix.SIG.KILL,
-            ) catch |ignored_error| switch (ignored_error) {
-                else => {},
-            };
-        }
+        std.posix.kill(
+            -self.pid,
+            std.posix.SIG.KILL,
+        ) catch |ignored_error| switch (ignored_error) {
+            else => {},
+        };
     }
 };
 
@@ -2533,7 +2548,7 @@ fn spawnFetchProcess(
     source: FetchSource,
     operation: FetchOperation,
 ) !std.process.Child {
-    var environment = try effectiveGitEnvironment(
+    var environment = try fetchGitEnvironment(
         allocator,
         source.environment,
         source.credential_executable,
@@ -2867,7 +2882,7 @@ test "worktree integrity selected submodule source is Git-relative and argv-conf
         fetch_environment.get("GIT_CONFIG_VALUE_0").?,
     );
     try std.testing.expectEqualStrings(
-        selected_submodule_protocols,
+        allowed_fetch_protocols,
         fetch_environment.get("GIT_ALLOW_PROTOCOL").?,
     );
     var credential_environment = try selectedSubmoduleFetchEnvironment(
@@ -2903,6 +2918,16 @@ test "worktree integrity selected submodule source rejects external protocols" {
     var base = std.process.Environ.Map.init(allocator);
     defer base.deinit();
     try base.put("GIT_ALLOW_PROTOCOL", "ext:file");
+    var top_level_environment = try fetchGitEnvironment(
+        allocator,
+        &base,
+        default_credential_executable,
+    );
+    defer top_level_environment.deinit();
+    try std.testing.expectEqualStrings(
+        allowed_fetch_protocols,
+        top_level_environment.get("GIT_ALLOW_PROTOCOL").?,
+    );
     for ([_][]const u8{
         "ext::sh -c 'touch /tmp/escaped'",
         "helper://host/repository.git",
@@ -2924,7 +2949,7 @@ test "worktree integrity selected submodule source rejects external protocols" {
         );
         defer environment.deinit();
         try std.testing.expectEqualStrings(
-            selected_submodule_protocols,
+            allowed_fetch_protocols,
             environment.get("GIT_ALLOW_PROTOCOL").?,
         );
     }
@@ -3443,6 +3468,12 @@ test "repository remote matching separates SSH and API port semantics" {
     try std.testing.expect(!remoteMatchesRepository(
         "ssh://git@other.example.test:2222/owner/repo.git",
         "github.example.test:8443",
+        "owner",
+        "repo",
+    ));
+    try std.testing.expect(!remoteMatchesRepository(
+        "helper://github.example.test/owner/repo.git",
+        "github.example.test",
         "owner",
         "repo",
     ));

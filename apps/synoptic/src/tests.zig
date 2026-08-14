@@ -3527,6 +3527,48 @@ test "viewed mutation crossing generation preserves external state and stays loc
     try verifyCompletionRace(allocator, io, &tmp, broker, log_path);
 }
 
+test "viewed mutation ambiguity survives an unchanged unviewed readback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const gh_path = try std.fs.path.join(allocator, &.{ root, "fake-gh-ambiguous-viewed" });
+    defer allocator.free(gh_path);
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\input=$(cat)
+        \\if printf '%s' "$input" | grep -q SynopticMarkFileViewed; then
+        \\  exit 1
+        \\fi
+        \\printf '%s\n' '{"data":{"repository":{"pullRequest":{"baseRefOid":"base","headRefOid":"head","files":{"nodes":[{"path":"a.zig","viewerViewedState":"UNVIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-gh-ambiguous-viewed", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        gh_path,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const broker = github.Broker{ .allocator = allocator, .io = io, .gh_path = gh_path };
+    const result = broker.synchronizeViewed(
+        "o",
+        "r",
+        1,
+        "PR_1",
+        "base",
+        "head",
+        "a.zig",
+        "mark-ambiguous",
+    );
+    try std.testing.expect(!result.viewed);
+    try std.testing.expectEqualStrings("GitHubTransportAmbiguous", result.error_name.?);
+    try std.testing.expect(result.outcome_unknown);
+}
+
 fn verifyViewedBatchRace(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4942,6 +4984,7 @@ test "worktree integrity stalled TERM-resistant fetch is bounded and reaped" {
             io,
             root,
             .{
+                .environment = &fixture.environment,
                 .remote_name = fixture.url,
                 .remote_url = fixture.url,
                 .timeout_ms = 100,
@@ -4980,11 +5023,13 @@ test "worktree integrity stalled TERM-resistant fetch is bounded and reaped" {
 
 const StalledFetchFixture = struct {
     allocator: std.mem.Allocator,
+    environment: std.process.Environ.Map,
     url: []u8,
     shell_pid_path: []u8,
     child_pid_path: []u8,
 
     fn deinit(self: *StalledFetchFixture) void {
+        self.environment.deinit();
         self.allocator.free(self.url);
         self.allocator.free(self.shell_pid_path);
         self.allocator.free(self.child_pid_path);
@@ -5018,13 +5063,17 @@ fn prepareStalledFetchFixture(
         std.Io.File.Permissions.fromMode(0o755),
         .{},
     );
-    for ([_][]const []const u8{
-        &.{ "git", "init", "-q" },
-        &.{ "git", "config", "protocol.ext.allow", "always" },
-    }) |argv| allocator.free(try runGit(allocator, io, root, argv));
-    const stalled_url = try std.fmt.allocPrint(allocator, "ext::{s}", .{script});
+    allocator.free(try runGit(allocator, io, root, &.{ "git", "init", "-q" }));
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    try environment.put("GIT_SSH_COMMAND", script);
+    const stalled_url = try allocator.dupe(
+        u8,
+        "ssh://github.example.test/owner/repo.git",
+    );
     return .{
         .allocator = allocator,
+        .environment = environment,
         .url = stalled_url,
         .shell_pid_path = shell_pid_path,
         .child_pid_path = child_pid_path,

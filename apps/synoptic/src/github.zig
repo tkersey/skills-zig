@@ -954,9 +954,15 @@ pub const Broker = struct {
                 .outcome_unknown = mutation_may_have_reached,
             };
         };
+        const mutation_may_have_reached = mutation_error == null or std.mem.eql(
+            u8,
+            mutation_error.?,
+            @errorName(error.GitHubTransportAmbiguous),
+        );
         return .{
             .viewed = viewed,
             .error_name = if (viewed) null else mutation_error orelse "MarkViewedReadbackFailed",
+            .outcome_unknown = !viewed and mutation_may_have_reached,
         };
     }
 
