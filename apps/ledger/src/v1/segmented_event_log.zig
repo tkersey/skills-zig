@@ -7,7 +7,7 @@ pub const event_segment_bytes: usize = 64 * 1024 * 1024;
 pub const binding_segment_bytes: usize = 16 * 1024 * 1024;
 pub const checkpoint_interval_bytes: usize = 16 * 1024 * 1024;
 pub const event_max_bytes: usize = 4 * 1024 * 1024;
-const head_schema = "ledger-segmented-event-head/v2";
+const head_schema = "ledger-segmented-event-head/v3";
 const Hash = std.crypto.hash.sha2.Sha256;
 
 const HashState = struct {
@@ -87,6 +87,7 @@ pub const Head = struct {
     checkpoint_digest: [71]u8 = undefined,
     checkpoint_revision: [71]u8 = undefined,
     logical_hash: HashState = HashState.init(),
+    total_binding_hash: HashState = HashState.init(),
     event_hash: HashState = HashState.init(),
     binding_hash: HashState = HashState.init(),
 
@@ -133,6 +134,7 @@ pub const Head = struct {
         self.total_binding_bytes = @intCast(binding_bytes.len);
         self.total_binding_rows = @intCast(binding_rows);
         self.logical_hash.update(event_bytes);
+        self.total_binding_hash.update(binding_bytes);
         self.event_hash.update(event_bytes);
         self.binding_hash.update(binding_bytes);
     }
@@ -156,6 +158,13 @@ pub const Head = struct {
         allocator: std.mem.Allocator,
     ) ![]u8 {
         return self.binding_hash.digestAlloc(allocator);
+    }
+
+    pub fn bindingRevisionAlloc(
+        self: *const Head,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        return self.total_binding_hash.digestAlloc(allocator);
     }
 
     pub fn installCheckpoint(
@@ -277,6 +286,7 @@ pub const Head = struct {
             binding.len,
         );
         self.total_binding_rows = try addU64(self.total_binding_rows, 1);
+        self.total_binding_hash.update(binding);
         self.binding_hash.update(binding);
         return binding_roll;
     }
@@ -291,6 +301,7 @@ pub const Head = struct {
         try encoder.writeBytes(self.logical_path);
         try encodeHeadCounts(self, &encoder);
         try self.logical_hash.encode(&encoder);
+        try self.total_binding_hash.encode(&encoder);
         try self.event_hash.encode(&encoder);
         try self.binding_hash.encode(&encoder);
         return encoder.toOwnedSlice();
@@ -310,6 +321,7 @@ pub const Head = struct {
         errdefer result.deinit(allocator);
         try decodeHeadCounts(&result, &decoder);
         result.logical_hash = try HashState.decode(&decoder);
+        result.total_binding_hash = try HashState.decode(&decoder);
         result.event_hash = try HashState.decode(&decoder);
         result.binding_hash = try HashState.decode(&decoder);
         try decoder.finish();
@@ -324,7 +336,11 @@ pub const Head = struct {
             self.binding_rows > self.total_binding_rows or
             self.event_bytes > self.total_event_bytes or
             self.binding_bytes > self.total_binding_bytes or
+            self.event_index > self.total_event_bytes or
+            self.binding_index > self.total_binding_bytes or
             self.logical_hash.value.total_len != self.total_event_bytes or
+            self.total_binding_hash.value.total_len !=
+                self.total_binding_bytes or
             self.event_hash.value.total_len != self.event_bytes or
             self.binding_hash.value.total_len != self.binding_bytes)
         {
@@ -634,6 +650,101 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 };
+
+pub fn auditHistory(
+    allocator: std.mem.Allocator,
+    snapshot: *const Snapshot,
+) !void {
+    const events = try auditSegmentSequence(
+        allocator,
+        &snapshot.paths,
+        snapshot.head.event_index,
+        snapshot.event_bytes,
+        .events,
+    );
+    const bindings = try auditSegmentSequence(
+        allocator,
+        &snapshot.paths,
+        snapshot.head.binding_index,
+        snapshot.binding_bytes,
+        .bindings,
+    );
+    if (events.bytes != snapshot.head.total_event_bytes or
+        events.records != snapshot.head.total_event_records or
+        bindings.bytes != snapshot.head.total_binding_bytes or
+        bindings.records != snapshot.head.total_binding_rows or
+        !hashStatesEqual(events.hash, snapshot.head.logical_hash) or
+        !hashStatesEqual(
+            bindings.hash,
+            snapshot.head.total_binding_hash,
+        ))
+    {
+        return error.SegmentedHistoryMismatch;
+    }
+}
+
+const SegmentKind = enum { events, bindings };
+
+const HistorySummary = struct {
+    hash: HashState = HashState.init(),
+    bytes: u64 = 0,
+    records: u64 = 0,
+};
+
+fn auditSegmentSequence(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    active_index: u64,
+    active_bytes: []const u8,
+    kind: SegmentKind,
+) !HistorySummary {
+    var summary: HistorySummary = .{};
+    var index: u64 = 0;
+    while (index < active_index) {
+        const path = switch (kind) {
+            .events => try paths.eventSegmentAlloc(allocator, index),
+            .bindings => try paths.bindingSegmentAlloc(allocator, index),
+        };
+        defer allocator.free(path);
+        const maximum = switch (kind) {
+            .events => event_segment_bytes,
+            .bindings => binding_segment_bytes,
+        };
+        const bytes = try durable_store.readRegularFileNoSymlink(
+            allocator,
+            path,
+            maximum,
+        );
+        defer allocator.free(bytes);
+        if (bytes.len == 0) return error.EmptySealedSegment;
+        try observeHistoryBytes(&summary, bytes);
+        index = std.math.add(u64, index, 1) catch
+            return error.SegmentedIndexOverflow;
+    }
+    try observeHistoryBytes(&summary, active_bytes);
+    return summary;
+}
+
+fn observeHistoryBytes(
+    summary: *HistorySummary,
+    bytes: []const u8,
+) !void {
+    if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') {
+        return error.InvalidSegmentedHistoryRecord;
+    }
+    summary.hash.update(bytes);
+    summary.bytes = std.math.add(
+        u64,
+        summary.bytes,
+        @intCast(bytes.len),
+    ) catch return error.SegmentedLengthOverflow;
+    const records = std.mem.count(u8, bytes, "\n");
+    summary.records = std.math.add(
+        u64,
+        summary.records,
+        @intCast(records),
+    ) catch return error.SegmentedLengthOverflow;
+}
 
 const CheckpointFile = struct {
     path: ?[]u8,
@@ -982,4 +1093,101 @@ test "segmented snapshot reads only the active bounded files" {
     try std.testing.expectEqualStrings(event, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding, snapshot.binding_bytes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.head.total_event_records);
+}
+
+test "full history audit detects corruption in a sealed segment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    var paths = try Paths.init(allocator, root, "actuation/a/events.jsonl");
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    var head = try Head.init(allocator, "actuation/a/events.jsonl");
+    defer head.deinit(allocator);
+    const sealed_event = "{\"sequence\":1}\n";
+    const sealed_binding = "{\"binding\":1}\n";
+    _ = try head.append(sealed_event, sealed_binding);
+    try head.installCheckpoint("checkpoint");
+    const active_event = "{\"sequence\":2}\n";
+    const active_binding = "{\"binding\":2}\n";
+    _ = try head.append(active_event, active_binding);
+    try writeHistoryFixture(
+        allocator,
+        &paths,
+        &head,
+        sealed_event,
+        sealed_binding,
+        active_event,
+        active_binding,
+    );
+    var snapshot = try Snapshot.load(
+        allocator,
+        root,
+        "actuation/a/events.jsonl",
+    );
+    defer snapshot.deinit(allocator);
+    try auditHistory(allocator, &snapshot);
+    const sealed_path = try paths.eventSegmentAlloc(allocator, 0);
+    defer allocator.free(sealed_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = sealed_path,
+        .data = "{\"sequence\":9}\n",
+    });
+    try std.testing.expectError(
+        error.SegmentedHistoryMismatch,
+        auditHistory(allocator, &snapshot),
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = sealed_path,
+        .data = sealed_event,
+    });
+    const sealed_binding_path = try paths.bindingSegmentAlloc(allocator, 0);
+    defer allocator.free(sealed_binding_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = sealed_binding_path,
+        .data = "{\"binding\":9}\n",
+    });
+    try std.testing.expectError(
+        error.SegmentedHistoryMismatch,
+        auditHistory(allocator, &snapshot),
+    );
+}
+
+fn writeHistoryFixture(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    head: *const Head,
+    sealed_event: []const u8,
+    sealed_binding: []const u8,
+    active_event: []const u8,
+    active_binding: []const u8,
+) !void {
+    const event_zero = try paths.eventSegmentAlloc(allocator, 0);
+    defer allocator.free(event_zero);
+    const event_one = try paths.eventSegmentAlloc(allocator, 1);
+    defer allocator.free(event_one);
+    const binding_zero = try paths.bindingSegmentAlloc(allocator, 0);
+    defer allocator.free(binding_zero);
+    const binding_one = try paths.bindingSegmentAlloc(allocator, 1);
+    defer allocator.free(binding_one);
+    const checkpoint_path = try paths.checkpointAlloc(allocator, 0);
+    defer allocator.free(checkpoint_path);
+    const head_bytes = try head.encodeAlloc(allocator);
+    defer allocator.free(head_bytes);
+    const writes = [_]struct { path: []const u8, bytes: []const u8 }{
+        .{ .path = event_zero, .bytes = sealed_event },
+        .{ .path = event_one, .bytes = active_event },
+        .{ .path = binding_zero, .bytes = sealed_binding },
+        .{ .path = binding_one, .bytes = active_binding },
+        .{ .path = checkpoint_path, .bytes = "checkpoint" },
+        .{ .path = paths.manifest, .bytes = head_bytes },
+    };
+    for (writes) |write| try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = write.path,
+        .data = write.bytes,
+    });
 }

@@ -196,6 +196,7 @@ fn inspectSegmentedEventSlot(
     );
     defer snapshot.deinit(allocator);
     if (!snapshot.head_exists) return error.StoreSlotMissing;
+    try segmented_event_log.auditHistory(allocator, &snapshot);
     const revision = try snapshot.head.revisionAlloc(allocator);
     errdefer allocator.free(revision);
     var binding = try custody.parseBindingSegment(
