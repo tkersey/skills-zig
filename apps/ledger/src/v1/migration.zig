@@ -97,34 +97,28 @@ fn migrateLegacySlot(
         true,
     );
     defer stats.deinit(allocator);
-    const state = if (stats.protocol_state) |*value| value else return error.SegmentedMigrationCheckpointMissing;
+    if (stats.protocol_state == null) return error.SegmentedMigrationCheckpointMissing;
+    const state = &stats.protocol_state.?;
     const checkpoint_bytes = try protocol.encodeCheckpointAlloc(
         allocator,
         state,
         definition_plan.closure_digest[0..],
     );
     defer allocator.free(checkpoint_bytes);
-    var head = try segmented_event_log.Head.init(
+    var head = try prepareHead(
         allocator,
         slot.relative_path,
-    );
-    defer head.deinit(allocator);
-    try head.importLegacy(
         legacy.content,
         stats.records_validated,
         legacy.binding.bytes,
         legacy.binding.rows.len,
+        checkpoint_bytes,
     );
-    try head.installCheckpoint(checkpoint_bytes);
+    defer head.deinit(allocator);
     const revision = try head.revisionAlloc(allocator);
     errdefer allocator.free(revision);
-    if (!std.mem.eql(u8, revision, legacy.revision)) {
-        return error.SegmentedMigrationRevisionMismatch;
-    }
-    if (legacy.read_custody) |*read_custody| {
-        read_custody.deinit();
-        legacy.read_custody = null;
-    }
+    try requireRevision(revision, legacy.revision);
+    releaseReadCustody(&legacy);
     const transaction_id = try commitMigration(
         allocator,
         definition_plan,
@@ -137,13 +131,61 @@ fn migrateLegacySlot(
         checkpoint_bytes,
     );
     errdefer allocator.free(transaction_id);
+    return migratedResult(
+        allocator,
+        slot.relative_path,
+        stats.records_validated,
+        revision,
+        transaction_id,
+    );
+}
+
+fn migratedResult(
+    allocator: std.mem.Allocator,
+    logical_ref: []const u8,
+    records: usize,
+    revision: []u8,
+    transaction_id: []u8,
+) !Result {
     return .{
-        .logical_ref = try allocator.dupe(u8, slot.relative_path),
+        .logical_ref = try allocator.dupe(u8, logical_ref),
         .revision = revision,
-        .records = stats.records_validated,
+        .records = records,
         .transaction_id = transaction_id,
         .already_migrated = false,
     };
+}
+
+fn prepareHead(
+    allocator: std.mem.Allocator,
+    logical_path: []const u8,
+    event_bytes: []const u8,
+    event_records: usize,
+    binding_bytes: []const u8,
+    binding_rows: usize,
+    checkpoint_bytes: []const u8,
+) !segmented_event_log.Head {
+    var head = try segmented_event_log.Head.init(allocator, logical_path);
+    errdefer head.deinit(allocator);
+    try head.importLegacy(
+        event_bytes,
+        event_records,
+        binding_bytes,
+        binding_rows,
+    );
+    try head.installCheckpoint(checkpoint_bytes);
+    return head;
+}
+
+fn releaseReadCustody(legacy: *custody.SlotSnapshot) void {
+    if (legacy.read_custody) |*read_custody| read_custody.deinit();
+    legacy.read_custody = null;
+}
+
+fn requireRevision(actual: []const u8, expected: []const u8) !void {
+    if (!std.mem.eql(u8, actual, expected)) {
+        return error.SegmentedMigrationRevisionMismatch;
+    }
 }
 
 fn existingResult(
