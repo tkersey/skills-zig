@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const durable_store = @import("durable_store");
 const checkpoint = @import("checkpoint.zig");
 
 pub const event_segment_bytes: usize = 64 * 1024 * 1024;
@@ -117,6 +118,18 @@ pub const Head = struct {
         {
             return error.SegmentedAppendBoundsExceeded;
         }
+        const event_rolled = try self.appendEvent(event);
+        const binding_rolled = try self.appendBinding(binding);
+        return .{
+            .event_rolled = event_rolled,
+            .binding_rolled = binding_rolled,
+        };
+    }
+
+    pub fn appendEvent(self: *Head, event: []const u8) !bool {
+        if (event.len == 0 or event.len > event_max_bytes + 1) {
+            return error.SegmentedAppendBoundsExceeded;
+        }
         const event_roll = needsRollover(
             self.event_bytes,
             event.len,
@@ -128,6 +141,22 @@ pub const Head = struct {
             self.event_bytes = 0;
             self.event_records = 0;
             self.event_hash = HashState.init();
+        }
+        self.event_bytes = try addUsize(self.event_bytes, event.len);
+        self.event_records = try addUsize(self.event_records, 1);
+        self.total_event_bytes = try addU64(
+            self.total_event_bytes,
+            event.len,
+        );
+        self.total_event_records = try addU64(self.total_event_records, 1);
+        self.logical_hash.update(event);
+        self.event_hash.update(event);
+        return event_roll;
+    }
+
+    pub fn appendBinding(self: *Head, binding: []const u8) !bool {
+        if (binding.len == 0 or binding.len > binding_segment_bytes) {
+            return error.SegmentedAppendBoundsExceeded;
         }
         const binding_roll = needsRollover(
             self.binding_bytes,
@@ -144,32 +173,15 @@ pub const Head = struct {
             self.binding_rows = 0;
             self.binding_hash = HashState.init();
         }
-        try self.commitLengths(event.len, binding.len);
-        self.logical_hash.update(event);
-        self.event_hash.update(event);
-        self.binding_hash.update(binding);
-        return .{ .event_rolled = event_roll, .binding_rolled = binding_roll };
-    }
-
-    fn commitLengths(
-        self: *Head,
-        event_length: usize,
-        binding_length: usize,
-    ) !void {
-        self.event_bytes = try addUsize(self.event_bytes, event_length);
-        self.event_records = try addUsize(self.event_records, 1);
-        self.binding_bytes = try addUsize(self.binding_bytes, binding_length);
+        self.binding_bytes = try addUsize(self.binding_bytes, binding.len);
         self.binding_rows = try addUsize(self.binding_rows, 1);
-        self.total_event_bytes = try addU64(
-            self.total_event_bytes,
-            event_length,
-        );
-        self.total_event_records = try addU64(self.total_event_records, 1);
         self.total_binding_bytes = try addU64(
             self.total_binding_bytes,
-            binding_length,
+            binding.len,
         );
         self.total_binding_rows = try addU64(self.total_binding_rows, 1);
+        self.binding_hash.update(binding);
+        return binding_roll;
     }
 
     pub fn encodeAlloc(
@@ -356,6 +368,218 @@ pub const Paths = struct {
     }
 };
 
+pub const Snapshot = struct {
+    paths: Paths,
+    head_exists: bool,
+    head_bytes: []u8,
+    head_digest: ?[]u8,
+    head: Head,
+    event_path: []u8,
+    event_exists: bool,
+    event_bytes: []u8,
+    event_digest: ?[]u8,
+    binding_path: []u8,
+    binding_exists: bool,
+    binding_bytes: []u8,
+    binding_digest: ?[]u8,
+
+    pub fn load(
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        logical_path: []const u8,
+    ) !Snapshot {
+        var paths = try Paths.init(allocator, repo_root, logical_path);
+        errdefer paths.deinit(allocator);
+        const head_read = try readOptionalFile(
+            allocator,
+            paths.manifest,
+            64 * 1024,
+        );
+        errdefer head_read.deinit(allocator);
+        var head = if (head_read.exists)
+            try Head.decode(allocator, head_read.bytes)
+        else
+            try Head.init(allocator, logical_path);
+        errdefer head.deinit(allocator);
+        if (!std.mem.eql(u8, head.logical_path, logical_path)) {
+            return error.SegmentedLogicalPathMismatch;
+        }
+        const active = try ActiveFiles.load(allocator, &paths, &head);
+        errdefer active.deinit(allocator);
+        const head_digest = if (head_read.exists)
+            try digestAlloc(allocator, head_read.bytes)
+        else
+            null;
+        errdefer if (head_digest) |digest| allocator.free(digest);
+        return .{
+            .paths = paths,
+            .head_exists = head_read.exists,
+            .head_bytes = head_read.bytes,
+            .head_digest = head_digest,
+            .head = head,
+            .event_path = active.event_path,
+            .event_exists = active.event.exists,
+            .event_bytes = active.event.bytes,
+            .event_digest = active.event_digest,
+            .binding_path = active.binding_path,
+            .binding_exists = active.binding.exists,
+            .binding_bytes = active.binding.bytes,
+            .binding_digest = active.binding_digest,
+        };
+    }
+
+    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+        self.paths.deinit(allocator);
+        allocator.free(self.head_bytes);
+        if (self.head_digest) |digest| allocator.free(digest);
+        self.head.deinit(allocator);
+        allocator.free(self.event_path);
+        allocator.free(self.event_bytes);
+        if (self.event_digest) |digest| allocator.free(digest);
+        allocator.free(self.binding_path);
+        allocator.free(self.binding_bytes);
+        if (self.binding_digest) |digest| allocator.free(digest);
+        self.* = undefined;
+    }
+};
+
+const ActiveFiles = struct {
+    event_path: []u8,
+    event: OptionalFile,
+    event_digest: ?[]u8,
+    binding_path: []u8,
+    binding: OptionalFile,
+    binding_digest: ?[]u8,
+
+    fn load(
+        allocator: std.mem.Allocator,
+        paths: *const Paths,
+        head: *const Head,
+    ) !ActiveFiles {
+        const event_path = try paths.eventSegmentAlloc(allocator, head.event_index);
+        errdefer allocator.free(event_path);
+        const event = try readOptionalFile(
+            allocator,
+            event_path,
+            event_segment_bytes,
+        );
+        errdefer event.deinit(allocator);
+        const binding_path = try paths.bindingSegmentAlloc(
+            allocator,
+            head.binding_index,
+        );
+        errdefer allocator.free(binding_path);
+        const binding = try readOptionalFile(
+            allocator,
+            binding_path,
+            binding_segment_bytes,
+        );
+        errdefer binding.deinit(allocator);
+        try validateActiveFiles(head, event, binding);
+        const event_digest = try optionalDigestAlloc(allocator, event);
+        errdefer if (event_digest) |digest| allocator.free(digest);
+        const binding_digest = try optionalDigestAlloc(allocator, binding);
+        return .{
+            .event_path = event_path,
+            .event = event,
+            .event_digest = event_digest,
+            .binding_path = binding_path,
+            .binding = binding,
+            .binding_digest = binding_digest,
+        };
+    }
+
+    fn deinit(self: *const ActiveFiles, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_path);
+        self.event.deinit(allocator);
+        if (self.event_digest) |digest| allocator.free(digest);
+        allocator.free(self.binding_path);
+        self.binding.deinit(allocator);
+        if (self.binding_digest) |digest| allocator.free(digest);
+    }
+};
+
+const OptionalFile = struct {
+    exists: bool,
+    bytes: []u8,
+
+    fn deinit(self: *const OptionalFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+    }
+};
+
+fn readOptionalFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    maximum: usize,
+) !OptionalFile {
+    const bytes = durable_store.readRegularFileNoSymlink(
+        allocator,
+        path,
+        maximum,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .exists = false,
+            .bytes = try allocator.alloc(u8, 0),
+        },
+        else => return err,
+    };
+    return .{ .exists = true, .bytes = bytes };
+}
+
+fn validateActiveFiles(
+    head: *const Head,
+    event: OptionalFile,
+    binding: OptionalFile,
+) !void {
+    if (event.exists != (head.event_bytes != 0) or
+        binding.exists != (head.binding_bytes != 0) or
+        event.bytes.len != head.event_bytes or
+        binding.bytes.len != head.binding_bytes)
+    {
+        return error.SegmentedActiveFileMismatch;
+    }
+    if (event.exists) {
+        var event_hash = HashState.init();
+        event_hash.update(event.bytes);
+        if (!hashStatesEqual(event_hash, head.event_hash)) {
+            return error.SegmentedActiveFileMismatch;
+        }
+    }
+    if (binding.exists) {
+        var binding_hash = HashState.init();
+        binding_hash.update(binding.bytes);
+        if (!hashStatesEqual(binding_hash, head.binding_hash)) {
+            return error.SegmentedActiveFileMismatch;
+        }
+    }
+}
+
+fn hashStatesEqual(left: HashState, right: HashState) bool {
+    return std.mem.eql(u32, &left.value.s, &right.value.s) and
+        left.value.buf_len == right.value.buf_len and
+        left.value.total_len == right.value.total_len and
+        std.mem.eql(
+            u8,
+            left.value.buf[0..left.value.buf_len],
+            right.value.buf[0..right.value.buf_len],
+        );
+}
+
+fn digestAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    return definition_core.canonical_json.digestBytesAlloc(allocator, bytes);
+}
+
+fn optionalDigestAlloc(
+    allocator: std.mem.Allocator,
+    file: OptionalFile,
+) !?[]u8 {
+    return if (file.exists) try digestAlloc(allocator, file.bytes) else null;
+}
+
 fn segmentPathAlloc(
     allocator: std.mem.Allocator,
     directory: []const u8,
@@ -429,4 +653,60 @@ test "segmented head rolls only before a nonempty overflow" {
         2,
         event_segment_bytes,
     ));
+}
+
+test "segmented combined append validates both records before mutation" {
+    const allocator = std.testing.allocator;
+    var head = try Head.init(allocator, "actuation/a/events.jsonl");
+    defer head.deinit(allocator);
+    const oversized_binding = try allocator.alloc(u8, binding_segment_bytes + 1);
+    defer allocator.free(oversized_binding);
+    try std.testing.expectError(
+        error.SegmentedAppendBoundsExceeded,
+        head.append("{\"sequence\":1}\n", oversized_binding),
+    );
+    try std.testing.expectEqual(@as(u64, 0), head.total_event_records);
+    try std.testing.expectEqual(@as(u64, 0), head.total_binding_rows);
+}
+
+test "segmented snapshot reads only the active bounded files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const logical_path = "actuation/a/events.jsonl";
+    var paths = try Paths.init(allocator, root, logical_path);
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    var head = try Head.init(allocator, logical_path);
+    defer head.deinit(allocator);
+    const event = "{\"sequence\":1}\n";
+    const binding = "{\"binding\":1}\n";
+    _ = try head.append(event, binding);
+    const head_bytes = try head.encodeAlloc(allocator);
+    defer allocator.free(head_bytes);
+    const event_path = try paths.eventSegmentAlloc(allocator, 0);
+    defer allocator.free(event_path);
+    const binding_path = try paths.bindingSegmentAlloc(allocator, 0);
+    defer allocator.free(binding_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = event_path,
+        .data = event,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = binding_path,
+        .data = binding,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = paths.manifest,
+        .data = head_bytes,
+    });
+    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings(event, snapshot.event_bytes);
+    try std.testing.expectEqualStrings(binding, snapshot.binding_bytes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.head.total_event_records);
 }
