@@ -1,6 +1,6 @@
 # Ledger
 
-Ledger 1.0 compiles passive artifact definitions into bounded native plans for
+Ledger 1.1 compiles passive artifact definitions into bounded native plans for
 validation, canonicalization, identity, durable transactions, replay, and
 projection.
 
@@ -24,6 +24,7 @@ From the repository root:
 ```bash
 zig build build-ledger -Doptimize=ReleaseFast
 zig build test-ledger -Doptimize=ReleaseFast
+zig build test-ledger-segmented -Doptimize=ReleaseFast
 ```
 
 The binary is written to `zig-out/bin/ledger`.
@@ -88,13 +89,30 @@ ledger doctor \
   --definition <protocol-definition.json> \
   --repo <repo> \
   --format json
+
+ledger migrate-segmented \
+  --definition <protocol-definition.json> \
+  --repo <repo> \
+  --format json
 ```
+
+Segmented event-log slots use 64 MiB event segments, resumable checkpoints,
+and an explicit atomic migration. Ordinary replay reads only the checkpoint and
+active suffix; `doctor` walks every segment sequentially and verifies the full
+event and binding history without imposing a lifetime-size ceiling.
 
 Transactions write only declared logical slots under the selected repository's
 `.ledger/` root. Definitions cannot select absolute output paths or escape the
 control root. Current reads fail closed for unbound stores; an owning
 definition may expose an explicit one-shot binding operation for an existing
 validated store.
+
+When an authoritative external transport such as Git replaces an already-bound
+store with another complete valid revision, the owner may expose a separate
+`rebind-existing` operation. It validates the complete current store, requires
+an existing stale binding, atomically replaces only Ledger's binding metadata,
+and leaves the store bytes unchanged. It rejects invalid stores, missing
+bindings, and already-current bindings.
 
 Use `ledger project --payload-only` only for explicit structural piping. Normal
 JSON projections preserve the `ledger-projection-result/v1` envelope and its

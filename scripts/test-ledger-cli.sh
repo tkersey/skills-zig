@@ -57,6 +57,7 @@ grep -Fq '"id":"event-envelope","version":4' <<<"$capabilities"
 grep -Fq '"id":"cross-input-equal","version":2' <<<"$capabilities"
 grep -Fq '"id":"compare-and-append","version":2' <<<"$capabilities"
 grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
+grep -Fq '"id":"rebind-existing","version":1' <<<"$capabilities"
 grep -Fq '"id":"fold","version":6' <<<"$capabilities"
 grep -Fq '"id":"relevance","version":3' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
@@ -379,6 +380,70 @@ set -e
 test "$tamper_status" -eq 2
 grep -Fq '"healthy":false' <<<"$tamper_output"
 grep -Fq '"error_code":"StoreBindingRevisionMismatch"' <<<"$tamper_output"
+
+cp "$repo_dir/.ledger/example/events.jsonl" "$repo_dir/events.before-rebind"
+rebind_output=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation rebind-existing \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"result":"rebound"' <<<"$rebind_output"
+grep -Fq '"storage_mutated":true' <<<"$rebind_output"
+cmp -s \
+  "$repo_dir/events.before-rebind" \
+  "$repo_dir/.ledger/example/events.jsonl"
+
+rebound_doctor=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$rebound_doctor"
+grep -Fq '"binding_rows":1' <<<"$rebound_doctor"
+
+rebound_projection=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"data":[{"kind":"one","value":9}]' <<<"$rebound_projection"
+
+printf '%s\n' '{"kind":"invalid"}' \
+  >"$repo_dir/.ledger/example/events.jsonl"
+cp "$repo_dir/.ledger/example/events.jsonl" "$repo_dir/events.invalid"
+set +e
+invalid_rebind_output=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation rebind-existing \
+  --repo "$repo_dir" \
+  --format json)
+invalid_rebind_status=$?
+set -e
+test "$invalid_rebind_status" -eq 2
+grep -Fq '"code":"ExistingStoreValidationFailed"' \
+  <<<"$invalid_rebind_output"
+grep -Fq '"storage_mutation_state":"known"' <<<"$invalid_rebind_output"
+cmp -s \
+  "$repo_dir/events.invalid" \
+  "$repo_dir/.ledger/example/events.jsonl"
+
+cp "$repo_dir/events.before-rebind" \
+  "$repo_dir/.ledger/example/events.jsonl"
+restored_doctor=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$restored_doctor"
+
+set +e
+duplicate_rebind=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation rebind-existing \
+  --repo "$repo_dir" \
+  --format json)
+duplicate_rebind_status=$?
+set -e
+test "$duplicate_rebind_status" -eq 2
+grep -Fq '"code":"StoreAlreadyBound"' <<<"$duplicate_rebind"
 
 mkdir -p "$legacy_repo/.ledger/example"
 printf '%s\n' \

@@ -143,7 +143,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do

@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
+const checkpoint = @import("checkpoint.zig");
 
 const max_text_bytes = 256;
 const max_states = 65_536;
@@ -70,6 +71,26 @@ pub const Plan = struct {
         self.* = undefined;
     }
 };
+
+pub fn checkpointUpperBound(plan: *const Plan) !usize {
+    const per_entry_bytes = 8 + max_text_bytes +
+        8 + max_text_bytes + 1 + 8 + 8;
+    const entry_bytes = std.math.mul(
+        usize,
+        plan.max_entries,
+        per_entry_bytes,
+    ) catch return error.CheckpointCapacityOverflow;
+    const framed_bytes = std.math.add(
+        usize,
+        8,
+        entry_bytes,
+    ) catch return error.CheckpointCapacityOverflow;
+    return std.math.add(
+        usize,
+        framed_bytes,
+        plan.max_retained_total_bytes,
+    ) catch error.CheckpointCapacityOverflow;
+}
 
 const Entry = struct {
     key_bytes: [max_text_bytes]u8 = undefined,
@@ -146,6 +167,102 @@ pub const State = struct {
 
     pub fn count(self: *const State) usize {
         return self.entries.count();
+    }
+
+    pub fn validateCheckpoint(self: *const State, plan: *const Plan) !void {
+        if (self.entries.count() > plan.max_entries or
+            self.retained_bytes > plan.max_retained_total_bytes)
+        {
+            return error.ReducerStateBoundsExceeded;
+        }
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| {
+            if (!containsSorted(plan.states, entry.state())) {
+                return error.UnknownReducerState;
+            }
+            if (entry.retained) |value| {
+                if (value.len > plan.max_retained_value_bytes) {
+                    return error.ReducerRetainedValueBoundsExceeded;
+                }
+            }
+        }
+    }
+
+    pub fn encodeCheckpoint(
+        self: *State,
+        allocator: std.mem.Allocator,
+        encoder: *checkpoint.Encoder,
+    ) !void {
+        const views = try self.sortedViewsAlloc(allocator);
+        defer allocator.free(views);
+        try encoder.writeU64(@intCast(views.len));
+        for (views) |entry| {
+            try encoder.writeBytes(entry.key);
+            try encoder.writeBytes(entry.state);
+            try encoder.writeOptionalBytes(entry.retained);
+            try encoder.writeU64(@intCast(entry.event_count));
+        }
+    }
+
+    pub fn decodeCheckpoint(
+        allocator: std.mem.Allocator,
+        decoder: *checkpoint.Decoder,
+        plan: ?*const Plan,
+    ) !State {
+        var result: State = .{};
+        errdefer result.deinit(allocator);
+        const maximum = if (plan) |value| value.max_entries else 0;
+        const entry_count = try decoder.readCountBoundedByRemaining(
+            maximum,
+            8 + 1 + 8 + 1 + 8,
+        );
+        try result.entries.ensureTotalCapacity(
+            allocator,
+            @intCast(entry_count),
+        );
+        var previous_key: ?[]const u8 = null;
+        for (0..entry_count) |_| {
+            const key = try decoder.readBytes(max_text_bytes);
+            if (key.len == 0 or
+                (previous_key != null and
+                    std.mem.order(u8, previous_key.?, key) != .lt))
+            {
+                return error.InvalidReducerCheckpoint;
+            }
+            const state_text = try decoder.readBytes(max_text_bytes);
+            const retained_source = try decoder.readOptionalBytes(
+                checkpoint.max_checkpoint_bytes,
+            );
+            const event_count = try decoder.readUsize();
+            if (event_count == 0) return error.InvalidReducerCheckpoint;
+            var retained: ?[]u8 = null;
+            if (retained_source) |source| {
+                const next = std.math.add(
+                    usize,
+                    result.retained_bytes,
+                    source.len,
+                ) catch return error.ReducerRetainedBytesBoundsExceeded;
+                if (next > checkpoint.max_checkpoint_bytes) {
+                    return error.ReducerRetainedBytesBoundsExceeded;
+                }
+                retained = try allocator.dupe(u8, source);
+                result.retained_bytes = next;
+            }
+            errdefer if (retained) |value| allocator.free(value);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+            if (result.entries.contains(digest)) {
+                return error.ReducerKeyDigestCollision;
+            }
+            result.entries.putAssumeCapacityNoClobber(
+                digest,
+                Entry.init(key, state_text, retained),
+            );
+            retained = null;
+            result.entries.getPtr(digest).?.event_count = event_count;
+            previous_key = key;
+        }
+        return result;
     }
 
     pub fn nextMonotonicSuffix(

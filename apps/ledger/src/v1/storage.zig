@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const document = @import("document.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 
 pub const SlotKind = enum {
     document,
@@ -12,6 +13,17 @@ pub const SlotKind = enum {
         if (std.mem.eql(u8, text, "document")) return .document;
         if (std.mem.eql(u8, text, "event-log")) return .event_log;
         return error.UnsupportedSlotKind;
+    }
+};
+
+pub const SlotLayout = enum {
+    monolithic,
+    segmented,
+
+    fn parse(text: []const u8) !SlotLayout {
+        if (std.mem.eql(u8, text, "monolithic")) return .monolithic;
+        if (std.mem.eql(u8, text, "segmented")) return .segmented;
+        return error.UnsupportedSlotLayout;
     }
 };
 
@@ -37,6 +49,7 @@ pub const Slot = struct {
     kind: SlotKind,
     codec: definition.Codec,
     max_bytes: usize,
+    layout: SlotLayout = .monolithic,
 
     fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -54,6 +67,11 @@ pub const ResolvedSlot = struct {
     kind: SlotKind,
     codec: definition.Codec,
     max_bytes: usize,
+    layout: SlotLayout = .monolithic,
+
+    pub fn isSegmented(self: ResolvedSlot) bool {
+        return self.layout == .segmented;
+    }
 
     fn deinit(self: *ResolvedSlot, allocator: std.mem.Allocator) void {
         if (self.owned_path) |path| allocator.free(path);
@@ -66,6 +84,11 @@ pub const EffectKind = enum {
     compare_append,
     compare_replace,
     bind_existing,
+    rebind_existing,
+
+    pub fn isBinding(self: EffectKind) bool {
+        return self == .bind_existing or self == .rebind_existing;
+    }
 
     fn fromOperator(operator: definition.Operator) !EffectKind {
         return switch (operator) {
@@ -73,6 +96,7 @@ pub const EffectKind = enum {
             .compare_append => .compare_append,
             .compare_replace => .compare_replace,
             .bind_existing => .bind_existing,
+            .rebind_existing => .rebind_existing,
             else => error.UnsupportedStorageEffect,
         };
     }
@@ -636,6 +660,7 @@ pub fn resolveWithGenerated(
             .kind = slot.kind,
             .codec = slot.codec,
             .max_bytes = slot.max_bytes,
+            .layout = slot.layout,
         };
         resolved.slot_count += 1;
     }
@@ -676,7 +701,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(13);
+    try encoder.writeU16(14);
     try encoder.writeEnum(plan.storage_kind);
     try encodeCacheSlots(plan.slots, encoder);
     try encodeCacheOperations(plan.operations, encoder);
@@ -698,6 +723,7 @@ fn encodeCacheSlots(
         try encoder.writeEnum(slot.kind);
         try encoder.writeEnum(slot.codec);
         try encoder.writeUsize(slot.max_bytes);
+        try encoder.writeEnum(slot.layout);
     }
 }
 
@@ -825,7 +851,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 13) {
+    if (try decoder.readU16() != 14) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -894,7 +920,9 @@ fn validateCacheSlots(
     definition_plan: *const definition.Plan,
 ) !void {
     for (slots) |slot| {
-        if (slot.max_bytes > definition_plan.bounds.max_store_bytes) {
+        if (slot.layout == .monolithic and
+            slot.max_bytes > definition_plan.bounds.max_store_bytes)
+        {
             return error.CacheStoragePlanMismatch;
         }
         for (slot.path_segments) |segment| switch (segment.kind) {
@@ -930,6 +958,7 @@ fn validateCacheEffect(
         .compare_append => .compare_append,
         .compare_replace => .compare_replace,
         .bind_existing => .bind_existing,
+        .rebind_existing => .rebind_existing,
     };
     if (!definition_plan.requires(required_operator)) {
         return error.CacheStoragePlanMismatch;
@@ -960,7 +989,7 @@ fn validateCacheEffectCodec(
     input: definition.Input,
 ) !void {
     const event_log_append = effect.kind == .compare_append or
-        (effect.kind == .bind_existing and slot.kind == .event_log);
+        (effect.kind.isBinding() and slot.kind == .event_log);
     if (event_log_append and input.codec != .json) {
         return error.CacheStoragePlanMismatch;
     }
@@ -1022,9 +1051,7 @@ fn validateCacheEvent(
     event: *const EventMaterialization,
     definition_plan: *const definition.Plan,
 ) !void {
-    if (effect.kind != .compare_append and
-        effect.kind != .bind_existing)
-    {
+    if (effect.kind != .compare_append and !effect.kind.isBinding()) {
         return error.CacheStoragePlanMismatch;
     }
     try validateCachedEventMaterialization(event);
@@ -1131,6 +1158,8 @@ fn decodeCacheSlot(
     if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
         return error.StorageSlotBoundsExceeded;
     }
+    const layout = try decoder.readEnum(SlotLayout);
+    try validateSlotLayout(kind, codec, layout, max_bytes);
     for (prior_slots) |prior| {
         if (slotPathsAmbiguous(
             prior.relative_path,
@@ -1144,6 +1173,7 @@ fn decodeCacheSlot(
         .kind = kind,
         .codec = codec,
         .max_bytes = max_bytes,
+        .layout = layout,
     };
 }
 
@@ -1334,15 +1364,13 @@ fn validateDecodedEffect(
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
-    if (kind == .bind_existing and
+    if (kind.isBinding() and
         (expected_revision_parameter != null or
             idempotency_parameter != null))
     {
         return error.BindingEffectHasAdmissionParameter;
     }
-    if (event != null and kind != .compare_append and
-        kind != .bind_existing)
-    {
+    if (event != null and kind != .compare_append and !kind.isBinding()) {
         return error.EventMaterializationRequiresAppend;
     }
     if (idempotency_parameter != null and
@@ -2149,7 +2177,7 @@ fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
     if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
     var binding_effects: usize = 0;
     for (effects, 0..) |left, index| {
-        if (left.kind == .bind_existing) binding_effects += 1;
+        if (left.kind.isBinding()) binding_effects += 1;
         for (effects[index + 1 ..]) |right| {
             if (left.slot_index == right.slot_index) {
                 return error.DuplicateOperationSlot;
@@ -2217,7 +2245,7 @@ fn compileSlot(
     const object = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "path", "kind", "codec", "max_bytes" },
+        &.{ "path", "kind", "codec", "max_bytes", "layout" },
     );
     try definition_core.json.requireFields(
         object,
@@ -2249,6 +2277,11 @@ fn compileSlot(
     if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
         return error.StorageSlotBoundsExceeded;
     }
+    const layout = if (object.get("layout")) |value|
+        try SlotLayout.parse(try definition_core.json.string(value))
+    else
+        .monolithic;
+    try validateSlotLayout(kind, codec, layout, max_bytes);
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
     const owned_path = try allocator.dupe(u8, relative_path);
@@ -2260,7 +2293,26 @@ fn compileSlot(
         .kind = kind,
         .codec = codec,
         .max_bytes = max_bytes,
+        .layout = layout,
     };
+}
+
+fn validateSlotLayout(
+    kind: SlotKind,
+    codec: definition.Codec,
+    layout: SlotLayout,
+    max_bytes: usize,
+) !void {
+    if (layout == .segmented and
+        (kind != .event_log or codec != .jsonl))
+    {
+        return error.SegmentedLayoutRequiresEventLog;
+    }
+    if (layout == .segmented and
+        max_bytes != segmented_event_log.event_segment_bytes)
+    {
+        return error.SegmentedEventSegmentBoundsInvalid;
+    }
 }
 
 fn validateSlotPathAmbiguity(slots: []const Slot) !void {
@@ -2563,12 +2615,12 @@ fn compileEffectTarget(
     }
     const input_codec = definition_plan.inputs[input_index].codec;
     const event_log_append = kind == .compare_append or
-        (kind == .bind_existing and slots[slot_index].kind == .event_log);
+        (kind.isBinding() and slots[slot_index].kind == .event_log);
     if (event_log_append and input_codec != .json) {
         return error.AppendInputMustBeJson;
     }
     if (kind != .compare_append and object.get("document") == null and
-        !(kind == .bind_existing and slots[slot_index].kind == .event_log) and
+        !(kind.isBinding() and slots[slot_index].kind == .event_log) and
         input_codec != slots[slot_index].codec)
     {
         return error.StorageInputCodecMismatch;
@@ -2654,15 +2706,13 @@ fn validateCompiledEffectSources(
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
-    if (kind == .bind_existing and
+    if (kind.isBinding() and
         (expected_revision_parameter != null or
             idempotency_parameter != null))
     {
         return error.BindingEffectHasAdmissionParameter;
     }
-    if (event != null and kind != .compare_append and
-        kind != .bind_existing)
-    {
+    if (event != null and kind != .compare_append and !kind.isBinding()) {
         return error.EventMaterializationRequiresAppend;
     }
     if (idempotency_parameter != null and
@@ -5614,6 +5664,21 @@ const storage_parameterized_definition =
     "\"max_records\":10,\"max_output_bytes\":1024,\"max_diagnostics\":8," ++
     "\"max_reducer_states\":4}}";
 
+const storage_segmented_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/segmented\",\"owner\":\"example\",\"requires\":{" ++
+    "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"parameters\":{},\"inputs\":{\"event\":{" ++
+    "\"codec\":\"json\",\"max_bytes\":4194304}},\"canonicalization\":{}," ++
+    "\"shape\":{},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"example/events.jsonl\",\"codec\":\"jsonl\"," ++
+    "\"layout\":\"segmented\",\"max_bytes\":67108864}}}," ++
+    "\"operations\":{},\"projections\":{},\"bounds\":{" ++
+    "\"max_input_bytes\":4194304,\"max_store_bytes\":4194304," ++
+    "\"max_records\":10,\"max_output_bytes\":4194304," ++
+    "\"max_diagnostics\":8,\"max_reducer_states\":4}}";
+
 const storage_reserved_definition =
     "{\"schema\":\"ledger-artifact-definition/v1\"," ++
     "\"id\":\"example/reserved\",\"owner\":\"example\",\"requires\":{" ++
@@ -5804,6 +5869,27 @@ test "storage compiler binds generic slots and atomic effects" {
         &parameters,
     );
     defer resolved.deinit(failing.allocator());
+}
+
+test "segmented event layout is explicit and cache stable" {
+    var test_plan = try StorageTestPlan.init(storage_segmented_definition);
+    defer test_plan.deinit();
+    try std.testing.expectEqual(
+        SlotLayout.segmented,
+        test_plan.plan.slots[0].layout,
+    );
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &test_plan.definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    try expectStorageCacheRoundTrip(
+        &test_plan.plan,
+        &test_plan.definition_plan,
+        &parameters,
+        "example/events.jsonl",
+    );
 }
 
 test "storage path parameters compile once and resolve as safe components" {

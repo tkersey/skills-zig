@@ -5,6 +5,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
+const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 
 pub const SlotState = enum {
@@ -127,6 +128,14 @@ fn inspectSlot(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
+    if (slot.isSegmented()) return inspectSegmentedEventSlot(
+        allocator,
+        definition_plan,
+        repo_root,
+        slot,
+        parameters,
+        protocol_required,
+    );
     if (slot.kind == .event_log) {
         return inspectEventSlot(
             allocator,
@@ -167,6 +176,81 @@ fn inspectSlot(
         .state = .current,
         .revision = revision,
         .binding_rows = snapshot.binding.rows.len,
+        .healthy = true,
+        .error_code = null,
+    };
+}
+
+fn inspectSegmentedEventSlot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+) !SlotStatus {
+    var snapshot = try segmented_event_log.Snapshot.load(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer snapshot.deinit(allocator);
+    try segmented_event_log.requireMigratedCustody(
+        allocator,
+        repo_root,
+        slot.relative_path,
+        snapshot.head_exists,
+    );
+    if (!snapshot.head_exists) return error.StoreSlotMissing;
+    try segmented_event_log.auditHistory(allocator, &snapshot);
+    try replay.validateSegmentedHistory(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        &snapshot,
+        parameters,
+        protocol_required,
+    );
+    const revision = try snapshot.head.revisionAlloc(allocator);
+    errdefer allocator.free(revision);
+    var binding = try custody.parseBindingSegment(
+        allocator,
+        snapshot.binding_bytes,
+        definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        snapshot.head.checkpointRevision() orelse revision,
+        revision,
+        null,
+    );
+    defer binding.deinit(allocator);
+    var replay_stats = try replay.validateSegmentedSnapshot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        &snapshot,
+        &binding,
+        parameters,
+        definition_plan.bounds.max_records,
+        protocol_required,
+    );
+    defer replay_stats.deinit(allocator);
+    const name = try allocator.dupe(u8, slot.name);
+    errdefer allocator.free(name);
+    const logical_ref = try allocator.dupe(u8, slot.relative_path);
+    errdefer allocator.free(logical_ref);
+    const binding_rows = std.math.cast(
+        usize,
+        snapshot.head.total_binding_rows,
+    ) orelse return error.StoreBindingRecordCountMismatch;
+    return .{
+        .name = name,
+        .logical_ref = logical_ref,
+        .state = .current,
+        .revision = revision,
+        .binding_rows = binding_rows,
         .healthy = true,
         .error_code = null,
     };

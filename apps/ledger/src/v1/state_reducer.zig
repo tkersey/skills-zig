@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
+const checkpoint = @import("checkpoint.zig");
 
 const max_registers: usize = 1024;
 const max_sets: usize = 1024;
@@ -162,6 +163,30 @@ pub const Plan = struct {
     }
 };
 
+pub fn checkpointUpperBound(plan: *const Plan) !usize {
+    var total: usize = 16;
+    for (plan.registers) |register| {
+        total = try addCheckpointBound(total, 8 + 128 + 1 + 8);
+        total = try addCheckpointBound(total, register.max_bytes);
+    }
+    for (plan.sets) |set| {
+        total = try addCheckpointBound(total, 8 + 128 + 8);
+        total = try addCheckpointBound(total, set.max_bytes);
+        const framing = std.math.mul(
+            usize,
+            set.max_entries,
+            8,
+        ) catch return error.CheckpointCapacityOverflow;
+        total = try addCheckpointBound(total, framing);
+    }
+    return total;
+}
+
+fn addCheckpointBound(left: usize, right: usize) !usize {
+    return std.math.add(usize, left, right) catch
+        error.CheckpointCapacityOverflow;
+}
+
 const OwnedValue = struct {
     bytes: []u8,
     parsed: std.json.Parsed(std.json.Value),
@@ -251,7 +276,246 @@ pub const State = struct {
         const index = registerIndex(plan, name) orelse return null;
         return getByIndex(self, plan, index);
     }
+
+    pub fn encodeCheckpoint(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        encoder: *checkpoint.Encoder,
+    ) !void {
+        const registers = try allocator.alloc(
+            *const NamedRegisterState,
+            self.registers.items.len,
+        );
+        defer allocator.free(registers);
+        for (self.registers.items, 0..) |*item, index| {
+            registers[index] = item;
+        }
+        std.sort.heap(
+            *const NamedRegisterState,
+            registers,
+            {},
+            namedRegisterLessThan,
+        );
+        try encoder.writeU64(@intCast(registers.len));
+        for (registers) |register| {
+            try encoder.writeBytes(register.name);
+            try encoder.writeOptionalBytes(if (register.value) |owned|
+                owned.bytes
+            else
+                null);
+        }
+
+        const sets = try allocator.alloc(
+            *const NamedSetState,
+            self.sets.items.len,
+        );
+        defer allocator.free(sets);
+        for (self.sets.items, 0..) |*item, index| sets[index] = item;
+        std.sort.heap(*const NamedSetState, sets, {}, namedSetLessThan);
+        try encoder.writeU64(@intCast(sets.len));
+        for (sets) |set| {
+            try encoder.writeBytes(set.name);
+            const keys = try allocator.alloc(
+                []const u8,
+                set.value.entries.count(),
+            );
+            defer allocator.free(keys);
+            var iterator = set.value.entries.valueIterator();
+            var key_index: usize = 0;
+            while (iterator.next()) |key| : (key_index += 1) {
+                keys[key_index] = key.*;
+            }
+            std.sort.heap([]const u8, keys, {}, bytesLessThan);
+            try encoder.writeU64(@intCast(keys.len));
+            for (keys) |key| try encoder.writeBytes(key);
+        }
+    }
+
+    pub fn decodeCheckpoint(
+        allocator: std.mem.Allocator,
+        decoder: *checkpoint.Decoder,
+        plan: ?*const Plan,
+    ) !State {
+        var result: State = .{};
+        errdefer result.deinit(allocator);
+        try decodeCheckpointRegisters(allocator, decoder, plan, &result);
+        try decodeCheckpointSets(allocator, decoder, plan, &result);
+        return result;
+    }
 };
+
+fn decodeCheckpointRegisters(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+    plan: ?*const Plan,
+    state: *State,
+) !void {
+    const maximum = if (plan) |value| value.registers.len else 0;
+    const count = try decoder.readCountBoundedByRemaining(
+        @min(max_registers, maximum),
+        8 + 1,
+    );
+    try state.registers.ensureTotalCapacity(allocator, count);
+    var previous_name: ?[]const u8 = null;
+    for (0..count) |_| {
+        const name = try decoder.readBytes(256);
+        try validateCheckpointName(name, previous_name);
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        var owned_value: ?OwnedValue = null;
+        const source = try decoder.readOptionalBytes(
+            checkpoint.max_checkpoint_bytes,
+        );
+        if (source) |value| {
+            owned_value = try decodeOwnedValue(allocator, value);
+        }
+        state.registers.appendAssumeCapacity(.{
+            .name = owned_name,
+            .value = owned_value,
+        });
+        previous_name = name;
+    }
+}
+
+fn decodeCheckpointSets(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+    plan: ?*const Plan,
+    state: *State,
+) !void {
+    const maximum = if (plan) |value| value.sets.len else 0;
+    const count = try decoder.readCountBoundedByRemaining(
+        @min(max_sets, maximum),
+        8 + 8,
+    );
+    try state.sets.ensureTotalCapacity(allocator, count);
+    var previous_name: ?[]const u8 = null;
+    for (0..count) |_| {
+        const name = try decoder.readBytes(256);
+        try validateCheckpointName(name, previous_name);
+        if (findNamedRegister(state.registers.items, name) != null) {
+            return error.InvalidRetainedStateCheckpoint;
+        }
+        const set_maximum = if (plan) |value|
+            if (findSet(value.sets, name)) |index|
+                value.sets[index].max_entries
+            else
+                return error.InvalidRetainedStateCheckpoint
+        else
+            0;
+        var set_state = try decodeCheckpointSet(
+            allocator,
+            decoder,
+            set_maximum,
+        );
+        errdefer set_state.deinit(allocator);
+        const owned_name = try allocator.dupe(u8, name);
+        state.sets.appendAssumeCapacity(.{
+            .name = owned_name,
+            .value = set_state,
+        });
+        set_state = .{};
+        previous_name = name;
+    }
+}
+
+fn decodeCheckpointSet(
+    allocator: std.mem.Allocator,
+    decoder: *checkpoint.Decoder,
+    maximum: usize,
+) !RetainedSetState {
+    var result: RetainedSetState = .{};
+    errdefer result.deinit(allocator);
+    const count = try decoder.readCountBoundedByRemaining(
+        maximum,
+        8,
+    );
+    try result.entries.ensureTotalCapacity(allocator, @intCast(count));
+    var previous_key: ?[]const u8 = null;
+    for (0..count) |_| {
+        const key = try decoder.readBytes(checkpoint.max_checkpoint_bytes);
+        if (previous_key != null and
+            std.mem.order(u8, previous_key.?, key) != .lt)
+        {
+            return error.InvalidRetainedStateCheckpoint;
+        }
+        const owned_key = try allocator.dupe(u8, key);
+        const digest = retainedKeyDigest(key);
+        if (result.entries.contains(digest)) {
+            allocator.free(owned_key);
+            return error.RetainedSetDigestCollision;
+        }
+        result.insertAssumeCapacity(owned_key);
+        previous_key = key;
+    }
+    return result;
+}
+
+pub fn activateCheckpoint(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+) !void {
+    try ensureState(allocator, plan, state);
+}
+
+fn namedRegisterLessThan(
+    _: void,
+    left: *const NamedRegisterState,
+    right: *const NamedRegisterState,
+) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
+fn namedSetLessThan(
+    _: void,
+    left: *const NamedSetState,
+    right: *const NamedSetState,
+) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
+fn bytesLessThan(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn validateCheckpointName(
+    name: []const u8,
+    previous: ?[]const u8,
+) !void {
+    definition_core.json.safeIdentifier(name, 256) catch
+        return error.InvalidRetainedStateCheckpoint;
+    if (previous != null and
+        std.mem.order(u8, previous.?, name) != .lt)
+    {
+        return error.InvalidRetainedStateCheckpoint;
+    }
+}
+
+fn decodeOwnedValue(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedValue {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    errdefer parsed.deinit();
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        parsed.value,
+    );
+    errdefer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) {
+        return error.InvalidRetainedStateCheckpoint;
+    }
+    return .{ .bytes = canonical, .parsed = parsed };
+}
 
 pub fn hasRegister(plan: *const Plan, name: []const u8) bool {
     return findRegister(plan.registers, name) != null;
@@ -1033,7 +1297,40 @@ fn applyMode(
     event: std.json.Value,
     mode: ApplyMode,
 ) !void {
-    try ensureState(allocator, plan, state);
+    if (state.has_active_layout and std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &plan.layout_digest,
+    )) return applyModeWithActiveLayout(
+        allocator,
+        plan,
+        state,
+        event,
+        mode,
+    );
+    var staged = try cloneStateCarriers(allocator, state);
+    errdefer staged.deinit(allocator);
+    try ensureStateInPlace(allocator, plan, &staged);
+    try applyModeWithActiveLayout(
+        allocator,
+        plan,
+        &staged,
+        event,
+        mode,
+    );
+    const previous = state.*;
+    state.* = staged;
+    staged = previous;
+    staged.deinit(allocator);
+}
+
+fn applyModeWithActiveLayout(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+    event: std.json.Value,
+    mode: ApplyMode,
+) !void {
     const kind_value = definition_core.json_pointer.lookup(
         event,
         plan.event_kind,
@@ -2713,6 +3010,22 @@ fn ensureState(
         &state.active_layout_digest,
         &plan.layout_digest,
     )) return;
+    var staged = try cloneStateCarriers(allocator, state);
+    errdefer staged.deinit(allocator);
+    try ensureStateInPlace(allocator, plan, &staged);
+    const previous = state.*;
+    state.* = staged;
+    staged = previous;
+    staged.deinit(allocator);
+}
+
+fn ensureStateInPlace(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+) !void {
+    try validateStateCarriers(plan, state);
+    pruneInactiveState(allocator, plan, state);
     const register_map = try allocator.alloc(u16, plan.registers.len);
     errdefer allocator.free(register_map);
     const set_map = try allocator.alloc(u16, plan.sets.len);
@@ -2748,6 +3061,110 @@ fn ensureState(
         &missing_registers,
         &missing_sets,
     );
+}
+
+fn cloneStateCarriers(
+    allocator: std.mem.Allocator,
+    source: *const State,
+) !State {
+    var result: State = .{};
+    errdefer result.deinit(allocator);
+    try result.registers.ensureTotalCapacity(
+        allocator,
+        source.registers.items.len,
+    );
+    for (source.registers.items) |register| {
+        const name = try allocator.dupe(u8, register.name);
+        errdefer allocator.free(name);
+        var value: ?OwnedValue = null;
+        if (register.value) |owned| {
+            value = try decodeOwnedValue(allocator, owned.bytes);
+        }
+        result.registers.appendAssumeCapacity(.{
+            .name = name,
+            .value = value,
+        });
+    }
+    try result.sets.ensureTotalCapacity(allocator, source.sets.items.len);
+    for (source.sets.items) |set| {
+        const name = try allocator.dupe(u8, set.name);
+        errdefer allocator.free(name);
+        var value: RetainedSetState = .{};
+        errdefer value.deinit(allocator);
+        try value.entries.ensureTotalCapacity(
+            allocator,
+            set.value.entries.count(),
+        );
+        var iterator = set.value.entries.valueIterator();
+        while (iterator.next()) |key| {
+            const owned = try allocator.dupe(u8, key.*);
+            value.insertAssumeCapacity(owned);
+        }
+        result.sets.appendAssumeCapacity(.{
+            .name = name,
+            .value = value,
+        });
+        value = .{};
+    }
+    return result;
+}
+
+fn validateStateCarriers(plan: *const Plan, state: *const State) !void {
+    for (plan.registers) |register| {
+        if (findNamedSet(state.sets.items, register.name) != null) {
+            return error.RetainedStateKindMismatch;
+        }
+        const index = findNamedRegister(
+            state.registers.items,
+            register.name,
+        ) orelse continue;
+        if (state.registers.items[index].value) |owned| {
+            if (owned.bytes.len > register.max_bytes) {
+                return error.RetainedRegisterBoundsExceeded;
+            }
+        }
+    }
+    for (plan.sets) |set| {
+        if (findNamedRegister(state.registers.items, set.name) != null) {
+            return error.RetainedStateKindMismatch;
+        }
+        const index = findNamedSet(state.sets.items, set.name) orelse continue;
+        const existing = &state.sets.items[index].value;
+        if (existing.entries.count() > set.max_entries or
+            existing.bytes > set.max_bytes)
+        {
+            return error.RetainedSetBoundsExceeded;
+        }
+        var iterator = existing.entries.valueIterator();
+        while (iterator.next()) |key| {
+            if (key.*.len > set.max_key_bytes) {
+                return error.RetainedSetKeyBoundsExceeded;
+            }
+        }
+    }
+}
+
+fn pruneInactiveState(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+) void {
+    var register_index = state.registers.items.len;
+    while (register_index > 0) {
+        register_index -= 1;
+        const item = &state.registers.items[register_index];
+        if (registerIndex(plan, item.name) != null) continue;
+        var removed = state.registers.orderedRemove(register_index);
+        removed.deinit(allocator);
+    }
+    var set_index = state.sets.items.len;
+    while (set_index > 0) {
+        set_index -= 1;
+        const item = &state.sets.items[set_index];
+        if (findSet(plan.sets, item.name) != null) continue;
+        var removed = state.sets.orderedRemove(set_index);
+        removed.deinit(allocator);
+    }
 }
 
 fn mapStateRegisters(
@@ -3373,9 +3790,12 @@ fn applyEvolutionForAllocationFailure(
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };
-    apply(allocator, second, &state, updated) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
+    apply(allocator, second, &state, updated) catch |err| {
+        try expectRetainedStatus(first, &state, "open");
+        return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => err,
+        };
     };
 }
 
@@ -3879,6 +4299,49 @@ const retained_evolution_second =
     \\    }]
     ++ retained_test_suffix;
 
+const retained_evolution_third =
+    retained_test_prefix ++
+    \\    ["reducer",{
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"latest","max_bytes":4096}],
+    \\      "admissions":[{
+    \\        "on":"archived",
+    \\        "requires":[],
+    \\        "forbids":[],
+    \\        "rules":[],
+    \\        "actions":[{
+    \\          "op":"set",
+    \\          "register":"latest",
+    \\          "input":"event",
+    \\          "path":"/body"
+    \\        }]
+    \\      }]
+    \\    }]
+    ++ retained_test_suffix;
+
+const retained_evolution_cross_kind =
+    retained_test_prefix ++
+    \\    ["reducer",{
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"other","max_bytes":4096}],
+    \\      "sets":[{
+    \\        "name":"current",
+    \\        "max_entries":4,
+    \\        "max_key_bytes":16,
+    \\        "max_bytes":64
+    \\      }],
+    \\      "admissions":[{
+    \\        "on":"updated",
+    \\        "requires":[],
+    \\        "forbids":[],
+    \\        "rules":[],
+    \\        "actions":[]
+    \\      }]
+    \\    }]
+    ++ retained_test_suffix;
+
 const upsert_created_event =
     "{\"kind\":\"created\",\"body\":{\"items\":[]}}";
 
@@ -4209,4 +4672,106 @@ test "retained state follows carrier names across definition plans" {
             updated.value,
         },
     );
+}
+
+test "rejected event does not commit a new retained layout" {
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var second = try TestPlan.init(retained_evolution_second);
+    defer second.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var created = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"status\":\"open\"}}",
+    );
+    defer created.deinit();
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &first.reducer.layout_digest,
+    ));
+    var rejected = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"status\":\"closed\"}}",
+    );
+    defer rejected.deinit();
+    try std.testing.expectError(
+        error.IllegalRetainedTransition,
+        apply(
+            std.testing.allocator,
+            &second.reducer,
+            &state,
+            rejected.value,
+        ),
+    );
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &state.active_layout_digest,
+        &first.reducer.layout_digest,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), state.sets.items.len);
+    try expectRetainedStatus(&first.reducer, &state, "open");
+}
+
+test "retained state prunes carriers absent from the active plan" {
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var second = try TestPlan.init(retained_evolution_second);
+    defer second.deinit();
+    var third = try TestPlan.init(retained_evolution_third);
+    defer third.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var created = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+    );
+    defer created.deinit();
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    var updated = try parseTestEvent(
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"item-2\"}}",
+    );
+    defer updated.deinit();
+    try apply(std.testing.allocator, &second.reducer, &state, updated.value);
+    try std.testing.expectEqual(@as(usize, 1), state.sets.items.len);
+    var archived = try parseTestEvent(
+        "{\"kind\":\"archived\",\"body\":{\"id\":\"item-3\"}}",
+    );
+    defer archived.deinit();
+    try apply(std.testing.allocator, &third.reducer, &state, archived.value);
+    try std.testing.expectEqual(@as(usize, 1), state.registers.items.len);
+    try std.testing.expectEqualStrings(
+        "latest",
+        state.registers.items[0].name,
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.sets.items.len);
+}
+
+test "retained layout rejects cross-kind reuse without pruning" {
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var cross_kind = try TestPlan.init(retained_evolution_cross_kind);
+    defer cross_kind.deinit();
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var created = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"status\":\"open\"}}",
+    );
+    defer created.deinit();
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    var updated = try parseTestEvent(
+        "{\"kind\":\"updated\",\"body\":{}}",
+    );
+    defer updated.deinit();
+    try std.testing.expectError(
+        error.RetainedStateKindMismatch,
+        apply(
+            std.testing.allocator,
+            &cross_kind.reducer,
+            &state,
+            updated.value,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.registers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.sets.items.len);
+    try expectRetainedStatus(&first.reducer, &state, "open");
 }

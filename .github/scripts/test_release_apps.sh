@@ -286,6 +286,10 @@ write_ledger_module_build() {
   printf 'const ledger_v1_core = b.createModule(.{ .optimize = .ReleaseFast });\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 }
 
+write_ledger_filtered_test_build() {
+  printf 'const ledger_v1_core = b.createModule(.{});\nconst img_meta = "apps/img/VERSION";\npub fn build() void {\n  const run_ledger_segmented_tests = addTestStepWithOptions(\n    b,\n    ledger_v1_core,\n    "test-ledger-segmented",\n    "Run Ledger segmented event-log tests",\n    .{ .filters = &.{"segmented"} },\n  );\n  _ = run_ledger_segmented_tests;\n}\n' >build.zig
+}
+
 write_universalist_build() {
   printf 'const universalist_plan = b.createModule(.{});\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 }
@@ -390,6 +394,7 @@ assert_affected synoptic write_synoptic_formatted_build
 assert_affected synoptic write_synoptic_install_guard_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
+assert_affected ledger write_ledger_filtered_test_build
 assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected img move_build_line
