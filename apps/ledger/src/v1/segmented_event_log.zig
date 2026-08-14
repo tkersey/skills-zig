@@ -102,6 +102,15 @@ pub const Head = struct {
         self.* = undefined;
     }
 
+    pub fn clone(
+        self: *const Head,
+        allocator: std.mem.Allocator,
+    ) !Head {
+        const bytes = try self.encodeAlloc(allocator);
+        defer allocator.free(bytes);
+        return Head.decode(allocator, bytes);
+    }
+
     pub fn revisionAlloc(
         self: *const Head,
         allocator: std.mem.Allocator,
