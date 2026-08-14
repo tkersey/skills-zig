@@ -139,6 +139,10 @@ pub fn lastMutationState() ?bool {
     return last_mutation_state;
 }
 
+pub fn resetMutationState() void {
+    last_mutation_state = false;
+}
+
 pub fn markStorageMutated() void {
     last_mutation_state = true;
 }
@@ -443,9 +447,27 @@ const StartupRecoveryWorker = struct {
 pub fn recoverRepositoryTransactions(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
-) !void {
+) !bool {
     var paths = try TransactionPaths.init(allocator, repo_root, false);
     defer paths.deinit(allocator);
+    return paths.created_control_paths or paths.recovery_mutated_storage;
+}
+
+test "startup recovery exposes control path mutations to its caller" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    resetMutationState();
+    if (try recoverRepositoryTransactions(
+        std.testing.allocator,
+        root,
+    )) markStorageMutated();
+    try std.testing.expect(lastMutationState().?);
 }
 
 fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
@@ -2309,6 +2331,7 @@ fn buildSegmentedPrepared(
         )
     else
         null;
+    errdefer if (checkpoint_path) |path| allocator.free(path);
     const legacy_event_path = if (!snapshot.head_exists)
         try allocator.dupe(u8, snapshot.paths.legacy_event)
     else

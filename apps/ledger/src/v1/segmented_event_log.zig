@@ -8,6 +8,7 @@ pub const event_segment_bytes: usize = 64 * 1024 * 1024;
 pub const binding_segment_bytes: usize = 16 * 1024 * 1024;
 pub const checkpoint_interval_bytes: usize = 16 * 1024 * 1024;
 pub const event_max_bytes: usize = 4 * 1024 * 1024;
+pub const legacy_event_max_bytes: usize = 4 * 1024 * 1024 * 1024;
 pub const legacy_event_tombstone =
     "ledger-segmented-custody-tombstone/v1 event-log\n";
 pub const legacy_binding_tombstone =
@@ -546,10 +547,10 @@ fn encodeHeadCounts(
 
 fn decodeHeadCounts(head: *Head, decoder: *checkpoint.Decoder) !void {
     head.event_index = try decoder.readU64();
-    head.event_bytes = try decoder.readCount(event_segment_bytes);
+    head.event_bytes = try decoder.readBoundedUsize(event_segment_bytes);
     head.event_records = try decoder.readCount(checkpoint.max_collection_items);
     head.binding_index = try decoder.readU64();
-    head.binding_bytes = try decoder.readCount(binding_segment_bytes);
+    head.binding_bytes = try decoder.readBoundedUsize(binding_segment_bytes);
     head.binding_rows = try decoder.readCount(checkpoint.max_collection_items);
     head.total_event_bytes = try decoder.readU64();
     head.total_event_records = try decoder.readU64();
@@ -815,22 +816,6 @@ const ReadGeneration = struct {
         else
             null;
         defer if (checkpoint_path) |path| allocator.free(path);
-        if (!try durable_store.casAdvisoryLockExists(
-            allocator,
-            paths.manifest,
-        )) return error.SegmentedGenerationCustodyMissing;
-        var expected: usize = 1;
-        if (try legacyFileExists(event_path, event_segment_bytes)) {
-            expected += 1;
-        }
-        if (try legacyFileExists(binding_path, binding_segment_bytes)) {
-            expected += 1;
-        }
-        if (checkpoint_path) |path| {
-            if (try legacyFileExists(path, checkpoint.max_checkpoint_bytes)) {
-                expected += 1;
-            }
-        }
         var ordered = [4][]const u8{
             paths.manifest,
             event_path,
@@ -842,6 +827,14 @@ const ReadGeneration = struct {
                 return std.mem.lessThan(u8, left, right);
             }
         }.lessThan);
+        const expected = try expectedReadCustodyCount(
+            allocator,
+            &ordered,
+        );
+        if (expected == 0 or !try durable_store.casAdvisoryLockExists(
+            allocator,
+            paths.manifest,
+        )) return error.SegmentedGenerationCustodyMissing;
         var first = try durable_store.acquireCasReadLockPair(
             allocator,
             ordered[0],
@@ -866,6 +859,23 @@ const ReadGeneration = struct {
         self.* = undefined;
     }
 };
+
+fn expectedReadCustodyCount(
+    allocator: std.mem.Allocator,
+    ordered: []const []const u8,
+) !usize {
+    var result: usize = 0;
+    for (ordered, 0..) |path, index| {
+        if (index != 0 and std.mem.eql(u8, ordered[index - 1], path)) {
+            continue;
+        }
+        result += @intFromBool(try durable_store.casAdvisoryLockExists(
+            allocator,
+            path,
+        ));
+    }
+    return result;
+}
 
 pub fn requireMigratedCustody(
     allocator: std.mem.Allocator,
@@ -897,7 +907,7 @@ pub fn requireMigratedCustody(
         );
         return;
     }
-    if (try legacyFileExists(event_path, event_segment_bytes) or
+    if (try legacyFileExists(event_path, legacy_event_max_bytes) or
         try legacyFileExists(binding_path, custody.binding_max_bytes))
     {
         return error.SegmentedMigrationRequired;
@@ -1434,6 +1444,25 @@ test "segmented checkpoint seals active files and bounds the suffix" {
     try std.testing.expectEqual(@as(usize, 1), restored.event_records);
 }
 
+test "segmented head byte extents use byte bounds" {
+    const allocator = std.testing.allocator;
+    var head = try Head.init(allocator, "actuation/a/events.jsonl");
+    defer head.deinit(allocator);
+    head.event_bytes = checkpoint.max_collection_items + 1;
+    head.total_event_bytes = head.event_bytes;
+    head.event_hash.value.total_len = head.event_bytes;
+    head.event_hash.value.buf_len = @intCast(
+        head.event_bytes % Hash.block_length,
+    );
+    head.logical_hash.value.total_len = head.total_event_bytes;
+    head.logical_hash.value.buf_len = head.event_hash.value.buf_len;
+    const encoded = try head.encodeAlloc(allocator);
+    defer allocator.free(encoded);
+    var restored = try Head.decode(allocator, encoded);
+    defer restored.deinit(allocator);
+    try std.testing.expectEqual(head.event_bytes, restored.event_bytes);
+}
+
 test "checkpoint admission jointly bounds both streams and record suffix" {
     const allocator = std.testing.allocator;
     var head = try Head.init(allocator, "actuation/a/events.jsonl");
@@ -1514,6 +1543,114 @@ test "segmented snapshot reads only the active bounded files" {
     try std.testing.expectEqualStrings(event, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding, snapshot.binding_bytes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.head.total_event_records);
+}
+
+test "segmented snapshot counts persistent active-file sidecars" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const logical_path = "actuation/sidecars/events.jsonl";
+    var paths = try Paths.init(allocator, root, logical_path);
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    var head = try Head.init(allocator, logical_path);
+    defer head.deinit(allocator);
+    try head.installCheckpoint("checkpoint");
+    const head_bytes = try head.encodeAlloc(allocator);
+    defer allocator.free(head_bytes);
+    const checkpoint_path = try paths.checkpointAlloc(allocator, 0);
+    defer allocator.free(checkpoint_path);
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    const writes = [_]durable_store.TransactionMutation{
+        .{
+            .path = checkpoint_path,
+            .text = "checkpoint",
+            .content_mode = .raw,
+            .max_bytes = checkpoint.max_checkpoint_bytes,
+        },
+        .{
+            .path = paths.manifest,
+            .text = head_bytes,
+            .content_mode = .raw,
+            .max_bytes = 64 * 1024,
+        },
+    };
+    var receipt = try durable_store.commitTextTransaction(
+        allocator,
+        transactions,
+        &writes,
+        .{ .owner = .{
+            .process_id = 1,
+            .session_id = "sidecar-fixture",
+            .executor = "test",
+        } },
+    );
+    defer receipt.deinit(allocator);
+    const event_path = try paths.eventSegmentAlloc(allocator, 1);
+    defer allocator.free(event_path);
+    const binding_path = try paths.bindingSegmentAlloc(allocator, 1);
+    defer allocator.free(binding_path);
+    for ([_][]const u8{ event_path, binding_path }) |path| {
+        const sidecar = try std.fmt.allocPrint(
+            allocator,
+            "{s}.cas.lock.advisory",
+            .{path},
+        );
+        defer allocator.free(sidecar);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = sidecar,
+            .data = "",
+        });
+    }
+    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    defer snapshot.deinit(allocator);
+    try expectSidecarSnapshot(&snapshot);
+}
+
+fn expectSidecarSnapshot(snapshot: *const Snapshot) !void {
+    try std.testing.expectEqual(@as(usize, 0), snapshot.event_bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.binding_bytes.len);
+    try std.testing.expectEqualStrings("checkpoint", snapshot.checkpoint_bytes);
+}
+
+test "oversized legacy log routes to explicit migration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const logical_path = "actuation/legacy/events.jsonl";
+    const event_path = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", logical_path },
+    );
+    defer allocator.free(event_path);
+    try durable_store.ensureDirectoryPathNoSymlinks(
+        std.fs.path.dirname(event_path).?,
+    );
+    var file = try std.Io.Dir.createFileAbsolute(
+        std.testing.io,
+        event_path,
+        .{ .read = true },
+    );
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(
+        std.testing.io,
+        "\n",
+        event_segment_bytes,
+    );
+    try std.testing.expectError(
+        error.SegmentedMigrationRequired,
+        requireMigratedCustody(allocator, root, logical_path, false),
+    );
 }
 
 const GenerationWriterContext = struct {

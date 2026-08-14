@@ -11,8 +11,6 @@ const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 const transaction = @import("transaction.zig");
 
-const legacy_event_max_bytes: usize = 4 * 1024 * 1024 * 1024;
-
 pub const Result = struct {
     logical_ref: []u8,
     revision: []u8,
@@ -38,10 +36,14 @@ pub fn execute(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
+    transaction.resetMutationState();
     if (!std.fs.path.isAbsolute(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
-    try transaction.recoverRepositoryTransactions(allocator, repo_root);
+    if (try transaction.recoverRepositoryTransactions(
+        allocator,
+        repo_root,
+    )) transaction.markStorageMutated();
     var resolved = try storage.resolve(allocator, storage_plan, parameters);
     defer resolved.deinit(allocator);
     const event_plan = event_protocol orelse
@@ -70,6 +72,7 @@ pub fn execute(
         definition_plan,
         definition_closure,
         definition_entry_path,
+        event_plan,
         repo_root,
         slot,
         parameters,
@@ -82,6 +85,7 @@ fn migrateLegacySlot(
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
     definition_entry_path: []const u8,
+    event_plan: *const protocol.Plan,
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
     parameters: *const definition_core.parameters.Bindings,
@@ -89,7 +93,7 @@ fn migrateLegacySlot(
 ) !Result {
     var legacy_slot = slot;
     legacy_slot.layout = .monolithic;
-    legacy_slot.max_bytes = legacy_event_max_bytes;
+    legacy_slot.max_bytes = segmented_event_log.legacy_event_max_bytes;
     var legacy = try custody.readSlot(
         allocator,
         repo_root,
@@ -110,6 +114,7 @@ fn migrateLegacySlot(
     defer stats.deinit(allocator);
     if (stats.protocol_state == null) return error.SegmentedMigrationCheckpointMissing;
     const state = &stats.protocol_state.?;
+    try protocol.activateCheckpoint(allocator, event_plan, state);
     const checkpoint_bytes = try protocol.encodeCheckpointAlloc(
         allocator,
         state,
@@ -358,7 +363,7 @@ fn reconcileExistingTombstones(
     const legacy_events = try durable_store.readRegularFileNoSymlink(
         allocator,
         paths.legacy_event,
-        legacy_event_max_bytes,
+        segmented_event_log.legacy_event_max_bytes,
     );
     defer allocator.free(legacy_events);
     const legacy_bindings = try durable_store.readRegularFileNoSymlink(
@@ -407,7 +412,7 @@ fn installTombstones(
         tombstoneMutation(
             paths.legacy_event,
             segmented_event_log.legacy_event_tombstone,
-            segmented_event_log.event_segment_bytes,
+            legacyEventMutationMaximum(event_digest),
             event_digest,
         ),
         tombstoneMutation(
@@ -434,6 +439,13 @@ fn installTombstones(
     defer commit.deinit(allocator);
     transaction.markStorageMutated();
     return @as(?[]u8, try allocator.dupe(u8, commit.transaction_id));
+}
+
+fn legacyEventMutationMaximum(expected_digest: ?[]const u8) usize {
+    return if (expected_digest == null)
+        segmented_event_log.event_segment_bytes
+    else
+        segmented_event_log.legacy_event_max_bytes;
 }
 
 fn eventHistoryEquals(
@@ -777,7 +789,7 @@ fn sourceEventMutation(
             .expected_exists = true,
         },
         .content_mode = .raw,
-        .max_bytes = legacy_event_max_bytes,
+        .max_bytes = segmented_event_log.legacy_event_max_bytes,
         .expected_digest_after = owned.legacy_event_tombstone_digest,
     };
 }
@@ -952,6 +964,17 @@ test "explicit migration reserves absent legacy paths for segmented stores" {
             paths.legacy_event,
             segmented_event_log.legacy_event_tombstone,
         ),
+    );
+}
+
+test "legacy reconciliation retains the migration source bound" {
+    try std.testing.expectEqual(
+        segmented_event_log.event_segment_bytes,
+        legacyEventMutationMaximum(null),
+    );
+    try std.testing.expectEqual(
+        segmented_event_log.legacy_event_max_bytes,
+        legacyEventMutationMaximum("sha256:source"),
     );
 }
 

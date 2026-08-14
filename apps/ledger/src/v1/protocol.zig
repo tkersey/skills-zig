@@ -216,6 +216,20 @@ pub fn encodeCheckpointAlloc(
     return encoder.toOwnedSlice();
 }
 
+pub fn activateCheckpoint(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+) !void {
+    if (plan.state_reducer_plan) |*state_plan| {
+        try state_reducer.activateCheckpoint(
+            allocator,
+            state_plan,
+            &state.state_reducer_state,
+        );
+    }
+}
+
 pub fn decodeCheckpoint(
     allocator: std.mem.Allocator,
     current_plan: ?*const Plan,
@@ -263,15 +277,7 @@ pub fn decodeCheckpoint(
         &decoder,
     );
     try decoder.finish();
-    if (current_plan) |plan| {
-        if (plan.state_reducer_plan) |*state_plan| {
-            try state_reducer.activateCheckpoint(
-                allocator,
-                state_plan,
-                &state.state_reducer_state,
-            );
-        }
-    }
+    if (current_plan) |plan| try activateCheckpoint(allocator, plan, &state);
     return .{
         .definition_digest = definition_digest,
         .state = state,
@@ -606,6 +612,11 @@ fn compilePlain(
     };
     try validatePlan(&result);
     try validateStorageMaterializations(&result, storage_plan);
+    try validateSegmentedSupport(
+        definition_plan,
+        storage_plan,
+        &result,
+    );
     return result;
 }
 

@@ -101,13 +101,22 @@ pub const Decoder = struct {
         return value;
     }
 
+    pub fn readBoundedUsize(
+        self: *Decoder,
+        maximum: usize,
+    ) !usize {
+        const value = try self.readUsize();
+        if (value > maximum) return error.CheckpointBoundsExceeded;
+        return value;
+    }
+
     pub fn readUsize(self: *Decoder) !usize {
         return std.math.cast(usize, try self.readU64()) orelse
             error.CheckpointBoundsExceeded;
     }
 
     pub fn readBytes(self: *Decoder, maximum: usize) ![]const u8 {
-        const length = try self.readCount(maximum);
+        const length = try self.readBoundedUsize(maximum);
         return self.readExact(length);
     }
 
