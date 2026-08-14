@@ -1868,7 +1868,20 @@ fn rollbackReused(
     if (std.mem.eql(u8, current_head, baseline.head_oid)) {
         return requireReusedUnchanged(allocator, io, cwd, baseline);
     }
-    return error.ReusedCheckoutRollbackUnsafe;
+    const reset = try runGitCommand(allocator, io, cwd, &.{
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "reset",
+        "--keep",
+        baseline.head_oid,
+    });
+    defer allocator.free(reset.stdout);
+    defer allocator.free(reset.stderr);
+    if (reset.term != .exited or reset.term.exited != 0) {
+        return error.ReusedCheckoutRollbackUnsafe;
+    }
+    return requireReusedUnchanged(allocator, io, cwd, baseline);
 }
 
 fn requireReusedUnchanged(
@@ -3602,6 +3615,8 @@ test "worktree integrity reused rollback restores exact branch and head" {
     }) |argv| allocator.free(try gitOutput(allocator, io, root, argv, error.TestGitFailed));
     var baseline = try Baseline.capture(allocator, io, root);
     defer baseline.deinit();
+    const original_head = try allocator.dupe(u8, baseline.head_oid);
+    defer allocator.free(original_head);
     allocator.free(try gitOutput(
         allocator,
         io,
@@ -3640,8 +3655,8 @@ test "worktree integrity reused rollback restores exact branch and head" {
         null,
     );
     try std.testing.expectEqualStrings(next_head, baseline.head_oid);
-    try std.testing.expectError(error.ReusedCheckoutRollbackFailed, lease.rollback());
-    try std.testing.expectEqualStrings(next_head, baseline.head_oid);
+    try lease.rollback();
+    try std.testing.expectEqualStrings(original_head, baseline.head_oid);
     try requireReusedUnchanged(allocator, io, root, &baseline);
 
     try expectRollbackRefusesExternalCommit(allocator, io, root, next_head, &baseline);

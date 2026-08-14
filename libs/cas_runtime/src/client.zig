@@ -2329,7 +2329,13 @@ fn actorInvokeNotificationHandlers(
         state.subscriptions.items,
     ) catch |err| {
         state.active_notification_callbacks -= 1;
+        _ = state.notification_callback_epoch.fetchAdd(1, .release);
         state.mutex.unlock();
+        state.client.io.futexWake(
+            u32,
+            &state.notification_callback_epoch.raw,
+            std.math.maxInt(u32),
+        );
         return err;
     };
     state.mutex.unlock();

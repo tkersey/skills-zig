@@ -1686,11 +1686,10 @@ pub const Broker = struct {
             for (try requiredArrayField(files, "nodes")) |node| {
                 const file = try requiredObject(node);
                 if (std.mem.eql(u8, try requiredStringField(file, "path"), path)) {
-                    return std.mem.eql(
-                        u8,
+                    return viewedStateMatchesExpected(
                         try requiredStringField(file, "viewerViewedState"),
-                        "VIEWED",
-                    ) == expected_viewed;
+                        expected_viewed,
+                    );
                 }
             }
         }
@@ -1758,6 +1757,11 @@ fn validateBatchPaths(
         }
     }
     for (found) |present| if (!present) return error.ExclusionPathNotCurrent;
+}
+
+fn viewedStateMatchesExpected(state: []const u8, expected_viewed: bool) bool {
+    const expected_state = if (expected_viewed) "VIEWED" else "UNVIEWED";
+    return std.mem.eql(u8, state, expected_state);
 }
 
 fn validateGenerationObject(
@@ -4868,6 +4872,11 @@ test "pull request metadata owns every refresh-visible field" {
     try std.testing.expectEqualStrings("trunk", metadata.base_ref_name);
     try std.testing.expectEqualStrings("h2", metadata.head_oid);
     try std.testing.expect(metadata.is_draft);
+}
+test "unmark readback requires exact unviewed state" {
+    try std.testing.expect(viewedStateMatchesExpected("VIEWED", true));
+    try std.testing.expect(viewedStateMatchesExpected("UNVIEWED", false));
+    try std.testing.expect(!viewedStateMatchesExpected("DISMISSED", false));
 }
 test "canonical RIGHT anchor accepts only represented new lines" {
     try std.testing.expect(validateRightLine("@@ -1 +10,2 @@\n+x\n y\n", 10));

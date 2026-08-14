@@ -564,6 +564,22 @@ fn serveReview(
         repository_cwd,
         repository_identity,
     );
+    const stop_request_path = try std.fs.path.join(
+        allocator,
+        &.{ runtime_root, launch_id, "stop.request" },
+    );
+    defer allocator.free(stop_request_path);
+    var startup_cancelled: std.atomic.Value(bool) = .init(false);
+    var stop_monitor = StopRequestMonitor{
+        .stop_request_path = stop_request_path,
+        .cancelled = &startup_cancelled,
+        .stop_cancelled = &startup_cancelled,
+    };
+    const stop_thread = try std.Thread.spawn(.{}, StopRequestMonitor.run, .{&stop_monitor});
+    defer {
+        stop_monitor.finished.store(true, .release);
+        stop_thread.join();
+    }
     return serveValidatedReview(
         allocator,
         io,
@@ -572,6 +588,7 @@ fn serveReview(
         launch_id,
         runtime_root,
         repository_identity,
+        &startup_cancelled,
     );
 }
 
@@ -608,6 +625,7 @@ fn serveValidatedReview(
     launch_id: []const u8,
     runtime_root: []const u8,
     repository_identity: []const u8,
+    startup_cancelled: *const std.atomic.Value(bool),
 ) !void {
     var options = options_value;
     const canonical_skill_root = try canonicalPathFromDirAlloc(
@@ -651,6 +669,7 @@ fn serveValidatedReview(
         launch_id,
         runtime_root,
         repository_identity,
+        startup_cancelled,
     );
 }
 
@@ -685,12 +704,14 @@ fn serveResolvedPullRequest(
     launch_id: []const u8,
     runtime_root: []const u8,
     repository_identity: []const u8,
+    startup_cancelled: *const std.atomic.Value(bool),
 ) !void {
     const broker = github.Broker{
         .allocator = allocator,
         .io = io,
         .gh_path = gh_resolved,
         .host = identity.host,
+        .stop_cancelled = startup_cancelled,
     };
     var pages = try broker.readGenerationPages(
         identity.owner,
@@ -1831,7 +1852,7 @@ fn stop(
         return printStopResult(io, json, null, false);
     }
     if (record.phase == .starting) {
-        try stopStartingProcess(record);
+        try stopStartingProcess(allocator, io, record);
         try retireDeadStop(allocator, io, runtime_root, current_path, record);
         return printStopResult(io, json, record.launch_id, true);
     }
@@ -1898,14 +1919,7 @@ fn stopStartingBeforeClaim(
     if (observed.phase != .starting) return false;
     const was_running = try verifiedProcess(allocator, io, observed);
     if (was_running) {
-        try writeLaunchError(
-            allocator,
-            io,
-            observed.runtime_root,
-            observed.launch_id,
-            error.SynopticLaunchStopped,
-        );
-        try signalStartingProcess(observed);
+        try stopStartingProcess(allocator, io, observed);
     }
     var claim = try awaitLaunchClaim(io, claim_path);
     defer claim.close(io);
@@ -1968,7 +1982,22 @@ fn finalizeStoppedLaunch(
     removeCurrentIfLaunch(allocator, io, current_path, record.launch_id);
 }
 
-fn stopStartingProcess(record: LifecycleRecord) !void {
+fn stopStartingProcess(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record: LifecycleRecord,
+) !void {
+    const stop_request_path = try std.fs.path.join(
+        allocator,
+        &.{ record.runtime_root, record.launch_id, "stop.request" },
+    );
+    defer allocator.free(stop_request_path);
+    try writeOperationalFile(allocator, io, stop_request_path, "{}\n");
+    if (@import("cas_runtime").websocket.waitForProcessGroupExit(
+        record.pid,
+        launch_shutdown_grace_ms,
+    )) return;
+    if (@import("cas_runtime").websocket.waitForProcessExit(record.pid, 0)) return;
     try signalStartingProcess(record);
     try settleStartingProcessGroup(record);
 }
@@ -1978,6 +2007,7 @@ fn signalStartingProcess(record: LifecycleRecord) !void {
         return error.InvalidLifecycleRecord;
     std.posix.kill(-group, std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
+        error.PermissionDenied => {},
         else => return err,
     };
     std.posix.kill(group, std.posix.SIG.TERM) catch |err| switch (err) {

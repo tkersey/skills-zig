@@ -986,7 +986,7 @@ test "post-authority lifecycle settlement does not re-read process arguments" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         source,
-        "try signalStartingProcess(observed);",
+        "try stopStartingProcess(allocator, io, observed);",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -5379,8 +5379,8 @@ test "refresh lease restores reused checkout after a downstream failure" {
         lease.fetch_source.?.remote_url,
     );
     try std.testing.expectEqualStrings(next_head, baseline.head_oid);
-    try std.testing.expectError(error.ReusedCheckoutRollbackFailed, lease.rollback());
-    try std.testing.expectEqualStrings(next_head, baseline.head_oid);
+    try lease.rollback();
+    try std.testing.expectEqualStrings(original_head, baseline.head_oid);
 }
 
 fn verifyReusedCustodyDrift(
