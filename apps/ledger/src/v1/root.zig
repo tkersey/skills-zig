@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const durable_store = @import("durable_store");
 
 pub const definition = @import("definition.zig");
 pub const compiled_plan = @import("compiled_plan.zig");
@@ -16,7 +17,9 @@ pub const replay = @import("replay.zig");
 pub const protocol = @import("protocol.zig");
 pub const reducer = @import("reducer.zig");
 pub const state_reducer = @import("state_reducer.zig");
+pub const segmented_event_log = @import("segmented_event_log.zig");
 pub const doctor = @import("doctor.zig");
+pub const migration = @import("migration.zig");
 pub const envelope = @import("envelope.zig");
 
 test {
@@ -35,7 +38,9 @@ test {
     _ = protocol;
     _ = reducer;
     _ = state_reducer;
+    _ = segmented_event_log;
     _ = doctor;
+    _ = migration;
     _ = envelope;
 }
 
@@ -233,6 +238,116 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try std.testing.expectEqualStrings(original, after_binding);
     try appendPlainEvent(&plans, repo_root);
     try expectPlainProjection(&plans, repo_root);
+}
+
+test "segmented migration preserves bytes revision and replay state" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const original =
+        "{\"kind\":\"created\",\"value\":{\"id\":\"item-1\",\"revision\":1}}\n";
+    try repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/plain.jsonl",
+        .data = original,
+    });
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try bindPlainStore(&plans, repo_root);
+    try appendPlainEvent(&plans, repo_root);
+    const legacy_bytes = try repo_tmp.dir.readFileAlloc(
+        std.testing.io,
+        ".ledger/example/plain.jsonl",
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(legacy_bytes);
+    const legacy_revision = try definition_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        legacy_bytes,
+    );
+    defer std.testing.allocator.free(legacy_revision);
+    const binding_path = try custody.bindingPathAlloc(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    defer std.testing.allocator.free(binding_path);
+    const legacy_binding = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        binding_path,
+        1024 * 1024,
+    );
+    defer std.testing.allocator.free(legacy_binding);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try std.testing.expect(!migrated.already_migrated);
+    try std.testing.expectEqualStrings(legacy_revision, migrated.revision);
+    try std.testing.expectEqual(@as(usize, 2), migrated.records);
+    var segmented = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    defer segmented.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), segmented.head.event_index);
+    try std.testing.expectEqual(@as(u64, 1), segmented.head.binding_index);
+    try std.testing.expectEqual(@as(usize, 0), segmented.event_bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), segmented.binding_bytes.len);
+    const sealed_event_path = try segmented.paths.eventSegmentAlloc(
+        std.testing.allocator,
+        0,
+    );
+    defer std.testing.allocator.free(sealed_event_path);
+    const sealed_events = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        sealed_event_path,
+        segmented_event_log.event_segment_bytes,
+    );
+    defer std.testing.allocator.free(sealed_events);
+    try std.testing.expectEqualStrings(legacy_bytes, sealed_events);
+    const sealed_binding_path = try segmented.paths.bindingSegmentAlloc(
+        std.testing.allocator,
+        0,
+    );
+    defer std.testing.allocator.free(sealed_binding_path);
+    const sealed_bindings = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        sealed_binding_path,
+        segmented_event_log.binding_segment_bytes,
+    );
+    defer std.testing.allocator.free(sealed_bindings);
+    try std.testing.expectEqualStrings(legacy_binding, sealed_bindings);
+    try expectPlainProjection(&plans, repo_root);
+    var repeated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer repeated.deinit(std.testing.allocator);
+    try std.testing.expect(repeated.already_migrated);
+    try std.testing.expectEqualStrings(legacy_revision, repeated.revision);
 }
 
 test "event-log projection treats a missing store as an empty relation" {

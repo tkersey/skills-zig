@@ -47,6 +47,8 @@ const Help =
     \\    [--format json|jsonl|table|text|markdown]
     \\  ledger doctor --definition <file> --repo <path>
     \\    [--param <name>=<value>]... [--format json|text]
+    \\  ledger migrate-segmented --definition <file> --repo <path>
+    \\    [--param <name>=<value>]... [--format json|text]
     \\
     \\recovery commands:
     \\  ledger recovery inspect --repo <path> --transaction <id>
@@ -232,6 +234,7 @@ fn requiresDurableIo(argv: []const []const u8) bool {
     return std.mem.eql(u8, argv[1], "transact") or
         std.mem.eql(u8, argv[1], "project") or
         std.mem.eql(u8, argv[1], "doctor") or
+        std.mem.eql(u8, argv[1], "migrate-segmented") or
         std.mem.eql(u8, argv[1], "recovery");
 }
 
@@ -329,6 +332,9 @@ fn runOperationCommand(
     if (std.mem.eql(u8, command, "doctor")) {
         return runDoctor(allocator, environment, argv);
     }
+    if (std.mem.eql(u8, command, "migrate-segmented")) {
+        return runSegmentedMigration(allocator, environment, argv);
+    }
     return error.UnknownCommand;
 }
 
@@ -337,7 +343,8 @@ fn isOperationCommand(command: []const u8) bool {
         std.mem.eql(u8, command, "materialize") or
         std.mem.eql(u8, command, "transact") or
         std.mem.eql(u8, command, "project") or
-        std.mem.eql(u8, command, "doctor");
+        std.mem.eql(u8, command, "doctor") or
+        std.mem.eql(u8, command, "migrate-segmented");
 }
 
 fn runRecoveryCommand(
@@ -526,6 +533,48 @@ fn runDoctor(
     defer result.deinit(allocator);
     try emitDoctor(allocator, args.format, &result, context.stats);
     return if (result.healthy) 0 else 2;
+}
+
+fn runSegmentedMigration(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    argv: []const []const u8,
+) !u8 {
+    var args = try parseDoctorArgs(allocator, argv);
+    defer args.deinit(allocator);
+    var context = try loadDefinition(
+        allocator,
+        environment,
+        args.definition_path,
+        .{ .kind = .doctor },
+    );
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.definition_plan.parameter_declarations,
+        args.parameter_specs,
+    );
+    defer bindings.deinit(allocator);
+    try durable_store.rejectSymlinkComponents(args.repo_path);
+    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        args.repo_path,
+        allocator,
+    );
+    defer allocator.free(repo_root);
+    var result = try ledger.migration.execute(
+        allocator,
+        &context.definition_plan,
+        &context.closure,
+        context.entry_path,
+        &context.storage_plan.?,
+        if (context.protocol_plan) |*plan| plan else null,
+        repo_root,
+        &bindings,
+    );
+    defer result.deinit(allocator);
+    try emitSegmentedMigration(args.format, &result);
+    return 0;
 }
 
 fn runProject(
@@ -2132,6 +2181,55 @@ fn emitDoctor(
     }
 }
 
+fn emitSegmentedMigration(
+    format: Format,
+    result: *const ledger.migration.Result,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    switch (format) {
+        .json => {
+            try stdout_writer.interface.writeAll(
+                "{\"schema\":\"ledger-segmented-migration-result/v1\"," ++
+                    "\"already_migrated\":",
+            );
+            try stdout_writer.interface.writeAll(
+                if (result.already_migrated) "true" else "false",
+            );
+            try stdout_writer.interface.writeAll(",\"logical_ref\":");
+            try definition_core.canonical_json.writeCanonicalString(
+                &stdout_writer.interface,
+                result.logical_ref,
+            );
+            try stdout_writer.interface.writeAll(",\"records\":");
+            try stdout_writer.interface.print("{d}", .{result.records});
+            try stdout_writer.interface.writeAll(",\"revision\":");
+            try definition_core.canonical_json.writeCanonicalString(
+                &stdout_writer.interface,
+                result.revision,
+            );
+            try stdout_writer.interface.writeAll(",\"transaction_id\":");
+            if (result.transaction_id) |transaction_id| {
+                try definition_core.canonical_json.writeCanonicalString(
+                    &stdout_writer.interface,
+                    transaction_id,
+                );
+            } else {
+                try stdout_writer.interface.writeAll("null");
+            }
+            try stdout_writer.interface.writeAll("}\n");
+        },
+        .text => try stdout_writer.interface.print(
+            "{s}: {s} records={d} revision={s}\n",
+            .{
+                if (result.already_migrated) "already migrated" else "migrated",
+                result.logical_ref,
+                result.records,
+                result.revision,
+            },
+        ),
+    }
+}
+
 fn emitCapabilities(argv: []const []const u8) !u8 {
     const format = try parseCapabilitiesFormat(argv);
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
@@ -2413,6 +2511,10 @@ test "only store-backed commands install durable runtime IO" {
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "transact" }));
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "project" }));
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "doctor" }));
+    try std.testing.expect(requiresDurableIo(&.{
+        "ledger",
+        "migrate-segmented",
+    }));
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "recovery" }));
 }
 

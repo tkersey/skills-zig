@@ -111,6 +111,32 @@ pub const Head = struct {
         return Head.decode(allocator, bytes);
     }
 
+    pub fn importLegacy(
+        self: *Head,
+        event_bytes: []const u8,
+        event_records: usize,
+        binding_bytes: []const u8,
+        binding_rows: usize,
+    ) !void {
+        if (self.total_event_bytes != 0 or self.total_binding_bytes != 0 or
+            event_bytes.len > event_segment_bytes or
+            binding_bytes.len > binding_segment_bytes)
+        {
+            return error.SegmentedLegacyImportBoundsExceeded;
+        }
+        self.event_bytes = event_bytes.len;
+        self.event_records = event_records;
+        self.binding_bytes = binding_bytes.len;
+        self.binding_rows = binding_rows;
+        self.total_event_bytes = @intCast(event_bytes.len);
+        self.total_event_records = @intCast(event_records);
+        self.total_binding_bytes = @intCast(binding_bytes.len);
+        self.total_binding_rows = @intCast(binding_rows);
+        self.logical_hash.update(event_bytes);
+        self.event_hash.update(event_bytes);
+        self.binding_hash.update(binding_bytes);
+    }
+
     pub fn revisionAlloc(
         self: *const Head,
         allocator: std.mem.Allocator,
