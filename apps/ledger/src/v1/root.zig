@@ -376,6 +376,81 @@ test "segmented full history admits missing genesis and lifetime states" {
     try std.testing.expect(lifetime_doctor.healthy);
 }
 
+test "segmented present head requires its checkpoint" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    try appendPlainCreatedEvent(&plans, repo_root);
+    var snapshot = try segmented_event_log.Snapshot.load(
+        std.testing.allocator,
+        repo_root,
+        "example/plain.jsonl",
+    );
+    var head = try snapshot.head.clone(std.testing.allocator);
+    defer head.deinit(std.testing.allocator);
+    head.checkpoint_exists = false;
+    head.checkpoint_index = 0;
+    head.checkpoint_event_bytes = 0;
+    head.checkpoint_event_records = 0;
+    head.checkpoint_binding_bytes = 0;
+    head.checkpoint_binding_rows = 0;
+    const head_bytes = try head.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(head_bytes);
+    const manifest_path = try std.testing.allocator.dupe(
+        u8,
+        snapshot.paths.manifest,
+    );
+    defer std.testing.allocator.free(manifest_path);
+    snapshot.deinit(std.testing.allocator);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = head_bytes,
+    });
+    try std.testing.expectError(
+        error.SegmentedProjectionCheckpointMissing,
+        projection.execute(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.store,
+            &plans.protocol,
+            &plans.projection,
+            "current",
+            repo_root,
+            &plans.parameters,
+        ),
+    );
+    try std.testing.expectError(
+        error.SegmentedReplayCheckpointMissing,
+        transaction.transact(
+            std.testing.allocator,
+            &plans.artifact,
+            &plans.closure,
+            "plain.json",
+            &plans.validator,
+            &plans.store,
+            &plans.protocol,
+            "append",
+            repo_root,
+            &.{.{
+                .name = "event",
+                .bytes = "{\"kind\":\"updated\",\"value\":{" ++
+                    "\"id\":\"item-1\",\"revision\":2}}",
+            }},
+            &plans.parameters,
+        ),
+    );
+}
+
 test "segmented migration preserves bytes revision and replay state" {
     var plans = try compilePlainPlans();
     defer plans.deinit();

@@ -53,10 +53,6 @@ const PlanCache = struct {
         if (self.indices.get(digest)) |index| {
             return &self.plans.items[index];
         }
-        if (self.rolling and self.plans.items.len != 0) self.clear();
-        if (self.plans.items.len >= max_historical_definition_versions) {
-            return error.HistoricalDefinitionVersionBoundExceeded;
-        }
         var archive = try definition_archive.load(
             self.allocator,
             self.repo_root,
@@ -66,10 +62,27 @@ const PlanCache = struct {
         if (!std.mem.eql(u8, archive.definition_id, self.definition_id)) {
             return error.DefinitionArchiveOwnerMismatch;
         }
+        const archive_bytes = archive.closure.total_definition_bytes;
+        if (archive_bytes > max_historical_definition_bytes) {
+            return error.HistoricalDefinitionBytesBoundExceeded;
+        }
+        if (self.rolling) {
+            while (self.plans.items.len >=
+                max_historical_definition_versions or
+                archive_bytes >
+                    max_historical_definition_bytes - self.definition_bytes)
+            {
+                self.evictOldest();
+            }
+        } else if (self.plans.items.len >=
+            max_historical_definition_versions)
+        {
+            return error.HistoricalDefinitionVersionBoundExceeded;
+        }
         const next_definition_bytes = std.math.add(
             usize,
             self.definition_bytes,
-            archive.closure.total_definition_bytes,
+            archive_bytes,
         ) catch return error.HistoricalDefinitionBytesBoundExceeded;
         if (next_definition_bytes > max_historical_definition_bytes) {
             return error.HistoricalDefinitionBytesBoundExceeded;
@@ -114,6 +127,23 @@ const PlanCache = struct {
         try self.indices.put(self.allocator, owned_digest, index);
         self.definition_bytes = next_definition_bytes;
         return &self.plans.items[index];
+    }
+
+    fn evictOldest(self: *PlanCache) void {
+        std.debug.assert(self.rolling);
+        std.debug.assert(self.plans.items.len != 0);
+        const oldest = &self.plans.items[0];
+        const archive_bytes = oldest.archive.closure.total_definition_bytes;
+        std.debug.assert(self.indices.remove(oldest.digest));
+        var removed = self.plans.orderedRemove(0);
+        var values = self.indices.valueIterator();
+        while (values.next()) |index| {
+            std.debug.assert(index.* > 0);
+            index.* -= 1;
+        }
+        std.debug.assert(archive_bytes <= self.definition_bytes);
+        self.definition_bytes -= archive_bytes;
+        removed.deinit(self.allocator);
     }
 
     fn clear(self: *PlanCache) void {
@@ -603,14 +633,7 @@ fn decodeReplayCheckpoint(
     cache: *PlanCache,
     bytes: []const u8,
 ) !protocol.DecodedCheckpoint {
-    var identity = try protocol.decodeCheckpoint(allocator, null, bytes);
-    if (identity.definition_digest.len != 71) {
-        identity.deinit(allocator);
-        return error.InvalidReplayCheckpoint;
-    }
-    var definition_digest: [71]u8 = undefined;
-    @memcpy(&definition_digest, identity.definition_digest);
-    identity.deinit(allocator);
+    const definition_digest = try protocol.checkpointDefinitionDigest(bytes);
     const archived = try cache.get(&definition_digest);
     const plan = if (archived.protocol_plan) |*value|
         value
@@ -1001,13 +1024,10 @@ const StreamEventValidator = struct {
         if (self.resolved_effect != null) {
             return error.SegmentedCheckpointRecordMismatch;
         }
-        var identity = try protocol.decodeCheckpoint(
-            self.allocator,
-            null,
+        const definition_digest = try protocol.checkpointDefinitionDigest(
             self.checkpoint_bytes,
         );
-        defer identity.deinit(self.allocator);
-        const archived = try self.cache.get(identity.definition_digest);
+        const archived = try self.cache.get(&definition_digest);
         const plan = if (archived.protocol_plan) |*value|
             value
         else
@@ -1023,7 +1043,7 @@ const StreamEventValidator = struct {
         const encoded = try protocol.encodeCheckpointAlloc(
             self.allocator,
             &self.protocol_state.?,
-            identity.definition_digest,
+            &definition_digest,
         );
         defer self.allocator.free(encoded);
         if (!std.mem.eql(u8, encoded, self.checkpoint_bytes)) {
@@ -2009,4 +2029,80 @@ fn findEffectForSlot(
         )) return effect;
     }
     return null;
+}
+
+test "segmented rolling replay retains a bounded recent plan set" {
+    const allocator = std.testing.allocator;
+    const first_source = @embedFile("fixtures/plain-event-definition.json");
+    const second_source = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        first_source,
+        "\"max_output_bytes\":4096",
+        "\"max_output_bytes\":4097",
+    );
+    defer allocator.free(second_source);
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    try definitions.dir.writeFile(std.testing.io, .{
+        .sub_path = "first.json",
+        .data = first_source,
+    });
+    try definitions.dir.writeFile(std.testing.io, .{
+        .sub_path = "second.json",
+        .data = second_source,
+    });
+    var first = try definition_core.closure.loadFromDir(
+        allocator,
+        &definitions.dir,
+        "first.json",
+        .{},
+    );
+    defer first.deinit(allocator);
+    var second = try definition_core.closure.loadFromDir(
+        allocator,
+        &definitions.dir,
+        "second.json",
+        .{},
+    );
+    defer second.deinit(allocator);
+    var repo = std.testing.tmpDir(.{});
+    defer repo.cleanup();
+    try repo.dir.createDirPath(std.testing.io, ".ledger/.definitions");
+    const repo_root = try repo.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(repo_root);
+    const closures = [_]*const definition_core.Closure{ &first, &second };
+    const entries = [_][]const u8{ "first.json", "second.json" };
+    for (closures, entries) |closure, entry| {
+        const content = try definition_archive.renderAlloc(
+            allocator,
+            "example/plain-protocol",
+            entry,
+            closure,
+        );
+        defer allocator.free(content);
+        const path = try definition_archive.pathAlloc(
+            allocator,
+            repo_root,
+            closure.digestSlice(),
+        );
+        defer allocator.free(path);
+        try durable_store.writeTextAtomic(allocator, path, content);
+    }
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = "example/plain-protocol",
+        .rolling = true,
+    };
+    defer cache.deinit();
+    _ = try cache.get(first.digestSlice());
+    _ = try cache.get(second.digestSlice());
+    _ = try cache.get(first.digestSlice());
+    _ = try cache.get(second.digestSlice());
+    try std.testing.expectEqual(@as(usize, 2), cache.plans.items.len);
 }

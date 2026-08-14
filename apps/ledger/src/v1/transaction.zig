@@ -908,7 +908,6 @@ const PreparedBinding = struct {
     slot_index: u16,
     input_index: u8,
     slot_path: []u8,
-    slot_content: []u8,
     slot_digest: []u8,
     binding_path: []u8,
     binding_before_digest: ?[]u8,
@@ -916,7 +915,6 @@ const PreparedBinding = struct {
 
     fn deinit(self: *PreparedBinding, allocator: std.mem.Allocator) void {
         allocator.free(self.slot_path);
-        allocator.free(self.slot_content);
         allocator.free(self.slot_digest);
         allocator.free(self.binding_path);
         if (self.binding_before_digest) |digest| allocator.free(digest);
@@ -1191,7 +1189,7 @@ fn finishBindingResult(
 
 const ExistingBindingSource = struct {
     slot_path: []u8,
-    slot_content: []u8,
+    content: ExistingContent,
     slot_digest: []u8,
     binding_path: []u8,
     before: custody.BindingSnapshot,
@@ -1201,10 +1199,25 @@ const ExistingBindingSource = struct {
         allocator: std.mem.Allocator,
     ) void {
         allocator.free(self.slot_path);
-        allocator.free(self.slot_content);
+        self.content.deinit(allocator);
         allocator.free(self.slot_digest);
         allocator.free(self.binding_path);
         self.before.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ExistingContent = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+    memory_map: ?std.Io.File.MemoryMap = null,
+
+    fn deinit(self: *ExistingContent, allocator: std.mem.Allocator) void {
+        if (self.memory_map) |*memory_map| {
+            memory_map.destroy(std.Io.Threaded.global_single_threaded.io());
+        } else if (self.owned) |bytes| {
+            allocator.free(bytes);
+        }
         self.* = undefined;
     }
 };
@@ -1254,7 +1267,7 @@ fn prepareExistingBinding(
         slot,
         event_protocol,
         effect.slot_index,
-        source.slot_content,
+        source.content.bytes,
         parameters,
     );
     const replay_parameter_names = try replayParameterNamesAlloc(
@@ -1280,12 +1293,12 @@ fn prepareExistingBinding(
         null;
     errdefer if (binding_before_digest) |digest| allocator.free(digest);
     source.before.deinit(allocator);
+    source.content.deinit(allocator);
     return .{
         .kind = effect.kind,
         .slot_index = effect.slot_index,
         .input_index = effect.input_index,
         .slot_path = source.slot_path,
-        .slot_content = source.slot_content,
         .slot_digest = source.slot_digest,
         .binding_path = source.binding_path,
         .binding_before_digest = binding_before_digest,
@@ -1317,7 +1330,7 @@ fn appendExistingBindingAlloc(
             .record_start = if (record_count) |_| 0 else null,
             .record_end = record_count,
             .extent_start = 0,
-            .extent_end = source.slot_content.len,
+            .extent_end = source.content.bytes.len,
         },
         null,
         source.slot_digest,
@@ -1340,15 +1353,16 @@ fn readExistingBindingSource(
     );
     errdefer allocator.free(slot_path);
     try durable_store.rejectSymlinkComponents(slot_path);
-    const slot_content = try durable_store.readRegularFileNoSymlink(
+    var content = try readExistingContent(
         allocator,
+        slot,
         slot_path,
         bindingSourceMaxBytes(slot),
     );
-    errdefer allocator.free(slot_content);
+    errdefer content.deinit(allocator);
     const slot_digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
-        slot_content,
+        content.bytes,
     );
     errdefer allocator.free(slot_digest);
     const binding_path = try custody.bindingPathAlloc(
@@ -1379,10 +1393,52 @@ fn readExistingBindingSource(
     errdefer before.deinit(allocator);
     return .{
         .slot_path = slot_path,
-        .slot_content = slot_content,
+        .content = content,
         .slot_digest = slot_digest,
         .binding_path = binding_path,
         .before = before,
+    };
+}
+
+fn readExistingContent(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    path: []const u8,
+    maximum: usize,
+) !ExistingContent {
+    if (!slot.isSegmented()) {
+        const bytes = try durable_store.readRegularFileNoSymlink(
+            allocator,
+            path,
+            maximum,
+        );
+        return .{ .bytes = bytes, .owned = bytes };
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file_stat = try std.Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    );
+    const length = std.math.cast(usize, file_stat.size) orelse
+        return error.FileTooBig;
+    if (length > maximum) return error.FileTooBig;
+    if (length == 0) {
+        const bytes = try allocator.alloc(u8, 0);
+        return .{ .bytes = bytes, .owned = bytes };
+    }
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var memory_map = try std.Io.File.MemoryMap.create(io, file, .{
+        .len = length,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    errdefer memory_map.destroy(io);
+    try memory_map.read(io);
+    return .{
+        .bytes = memory_map.memory,
+        .memory_map = memory_map,
     };
 }
 
@@ -1840,6 +1896,9 @@ fn prepareSegmentedEffect(
         slot.relative_path,
         snapshot.head_exists,
     );
+    if (snapshot.head_exists and !snapshot.head.checkpoint_exists) {
+        return error.SegmentedReplayCheckpointMissing;
+    }
     var idempotency = try EffectIdempotency.init(
         allocator,
         definition_plan,
@@ -2110,12 +2169,17 @@ fn segmentedReplayBefore(
     snapshot: *const segmented_event_log.Snapshot,
     binding: *const custody.BindingSnapshot,
 ) !EffectReplayContext {
-    if (!snapshot.head.checkpoint_exists) return .{
-        .existing_records = 0,
-        .state = protocol.ReplayState.init(event_plan),
-        .derived_match = null,
-        .append_context = null,
-    };
+    if (!snapshot.head.checkpoint_exists) {
+        if (snapshot.head_exists) {
+            return error.SegmentedReplayCheckpointMissing;
+        }
+        return .{
+            .existing_records = 0,
+            .state = protocol.ReplayState.init(event_plan),
+            .derived_match = null,
+            .append_context = null,
+        };
+    }
     var stats = try replay.validateSegmentedSnapshot(
         allocator,
         repo_root,
@@ -5759,6 +5823,41 @@ test "segmented definitions reject inputs that can exceed one event" {
             &plans.storage_plan,
         ),
     );
+}
+
+test "segmented bind existing maps its admitted source read only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "{\"kind\":\"created\"}\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "source.jsonl",
+        .data = bytes,
+    });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "source.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "source.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = segmented_event_log.event_segment_bytes,
+        .layout = .segmented,
+    };
+    var content = try readExistingContent(
+        std.testing.allocator,
+        slot,
+        path,
+        segmented_event_log.legacy_event_max_bytes,
+    );
+    defer content.deinit(std.testing.allocator);
+    try std.testing.expect(content.memory_map != null);
+    try std.testing.expect(content.owned == null);
+    try std.testing.expectEqualStrings(bytes, content.bytes);
 }
 
 fn appendDefinitionBoundPair(

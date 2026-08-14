@@ -4852,12 +4852,17 @@ fn segmentedProjectionReplay(
 ) !replay.Stats {
     const event_plan = event_protocol orelse
         return error.SegmentedProjectionRequiresProtocol;
-    if (!snapshot.head.checkpoint_exists) return .{
-        .records_validated = 0,
-        .definition_versions = 0,
-        .protocol_state = protocol.ReplayState.init(event_plan),
-        .append_context = null,
-    };
+    if (!snapshot.head.checkpoint_exists) {
+        if (snapshot.head_exists) {
+            return error.SegmentedProjectionCheckpointMissing;
+        }
+        return .{
+            .records_validated = 0,
+            .definition_versions = 0,
+            .protocol_state = protocol.ReplayState.init(event_plan),
+            .append_context = null,
+        };
+    }
     var binding = try custody.parseBindingSegment(
         allocator,
         snapshot.binding_bytes,

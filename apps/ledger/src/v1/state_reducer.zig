@@ -334,11 +334,12 @@ pub const State = struct {
     pub fn decodeCheckpoint(
         allocator: std.mem.Allocator,
         decoder: *checkpoint.Decoder,
+        plan: ?*const Plan,
     ) !State {
         var result: State = .{};
         errdefer result.deinit(allocator);
-        try decodeCheckpointRegisters(allocator, decoder, &result);
-        try decodeCheckpointSets(allocator, decoder, &result);
+        try decodeCheckpointRegisters(allocator, decoder, plan, &result);
+        try decodeCheckpointSets(allocator, decoder, plan, &result);
         return result;
     }
 };
@@ -346,9 +347,14 @@ pub const State = struct {
 fn decodeCheckpointRegisters(
     allocator: std.mem.Allocator,
     decoder: *checkpoint.Decoder,
+    plan: ?*const Plan,
     state: *State,
 ) !void {
-    const count = try decoder.readCount(max_registers);
+    const maximum = if (plan) |value| value.registers.len else 0;
+    const count = try decoder.readCountBoundedByRemaining(
+        @min(max_registers, maximum),
+        8 + 1,
+    );
     try state.registers.ensureTotalCapacity(allocator, count);
     var previous_name: ?[]const u8 = null;
     for (0..count) |_| {
@@ -374,9 +380,14 @@ fn decodeCheckpointRegisters(
 fn decodeCheckpointSets(
     allocator: std.mem.Allocator,
     decoder: *checkpoint.Decoder,
+    plan: ?*const Plan,
     state: *State,
 ) !void {
-    const count = try decoder.readCount(max_sets);
+    const maximum = if (plan) |value| value.sets.len else 0;
+    const count = try decoder.readCountBoundedByRemaining(
+        @min(max_sets, maximum),
+        8 + 8,
+    );
     try state.sets.ensureTotalCapacity(allocator, count);
     var previous_name: ?[]const u8 = null;
     for (0..count) |_| {
@@ -385,7 +396,18 @@ fn decodeCheckpointSets(
         if (findNamedRegister(state.registers.items, name) != null) {
             return error.InvalidRetainedStateCheckpoint;
         }
-        var set_state = try decodeCheckpointSet(allocator, decoder);
+        const set_maximum = if (plan) |value|
+            if (findSet(value.sets, name)) |index|
+                value.sets[index].max_entries
+            else
+                return error.InvalidRetainedStateCheckpoint
+        else
+            0;
+        var set_state = try decodeCheckpointSet(
+            allocator,
+            decoder,
+            set_maximum,
+        );
         errdefer set_state.deinit(allocator);
         const owned_name = try allocator.dupe(u8, name);
         state.sets.appendAssumeCapacity(.{
@@ -400,11 +422,13 @@ fn decodeCheckpointSets(
 fn decodeCheckpointSet(
     allocator: std.mem.Allocator,
     decoder: *checkpoint.Decoder,
+    maximum: usize,
 ) !RetainedSetState {
     var result: RetainedSetState = .{};
     errdefer result.deinit(allocator);
-    const count = try decoder.readCount(
-        @min(checkpoint.max_collection_items, std.math.maxInt(u32)),
+    const count = try decoder.readCountBoundedByRemaining(
+        maximum,
+        8,
     );
     try result.entries.ensureTotalCapacity(allocator, @intCast(count));
     var previous_key: ?[]const u8 = null;

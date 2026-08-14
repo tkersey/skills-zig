@@ -194,6 +194,26 @@ pub const DecodedCheckpoint = struct {
 
 const checkpoint_schema = "ledger-replay-checkpoint/v1";
 
+fn readCheckpointDefinitionDigest(
+    decoder: *checkpoint.Decoder,
+) ![71]u8 {
+    const schema = try decoder.readBytes(checkpoint_schema.len);
+    if (!std.mem.eql(u8, schema, checkpoint_schema)) {
+        return error.UnsupportedReplayCheckpoint;
+    }
+    const source = try decoder.readBytes(71);
+    definition_core.json.digest(source) catch
+        return error.InvalidReplayCheckpoint;
+    var digest: [71]u8 = undefined;
+    @memcpy(&digest, source);
+    return digest;
+}
+
+pub fn checkpointDefinitionDigest(bytes: []const u8) ![71]u8 {
+    var decoder = try checkpoint.Decoder.init(bytes);
+    return readCheckpointDefinitionDigest(&decoder);
+}
+
 pub fn encodeCheckpointAlloc(
     allocator: std.mem.Allocator,
     state: *ReplayState,
@@ -236,14 +256,8 @@ pub fn decodeCheckpoint(
     bytes: []const u8,
 ) !DecodedCheckpoint {
     var decoder = try checkpoint.Decoder.init(bytes);
-    const schema = try decoder.readBytes(checkpoint_schema.len);
-    if (!std.mem.eql(u8, schema, checkpoint_schema)) {
-        return error.UnsupportedReplayCheckpoint;
-    }
-    const digest_source = try decoder.readBytes(71);
-    definition_core.json.digest(digest_source) catch
-        return error.InvalidReplayCheckpoint;
-    const definition_digest = try allocator.dupe(u8, digest_source);
+    const checkpoint_digest = try readCheckpointDefinitionDigest(&decoder);
+    const definition_digest = try allocator.dupe(u8, &checkpoint_digest);
     errdefer allocator.free(definition_digest);
     var state = if (current_plan) |plan|
         ReplayState.init(plan)
@@ -271,10 +285,18 @@ pub fn decodeCheckpoint(
     state.reducer_state = try reducer.State.decodeCheckpoint(
         allocator,
         &decoder,
+        if (current_plan) |plan|
+            if (plan.reducer_plan) |*value| value else null
+        else
+            null,
     );
     state.state_reducer_state = try state_reducer.State.decodeCheckpoint(
         allocator,
         &decoder,
+        if (current_plan) |plan|
+            if (plan.state_reducer_plan) |*value| value else null
+        else
+            null,
     );
     try decoder.finish();
     if (current_plan) |plan| try activateCheckpoint(allocator, plan, &state);
@@ -300,6 +322,23 @@ test "checkpoint lifetime counters exceed collection bounds" {
     try std.testing.expectEqual(
         state.kind_counts[0],
         decoded.state.kind_counts[0],
+    );
+}
+
+test "segmented checkpoint identity reads only the bounded header" {
+    const digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var encoder = checkpoint.Encoder.init(std.testing.allocator);
+    defer encoder.deinit();
+    try encoder.writeBytes(checkpoint_schema);
+    try encoder.writeBytes(digest);
+    const encoded = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(encoded);
+    const actual = try checkpointDefinitionDigest(encoded);
+    try std.testing.expectEqualStrings(digest, &actual);
+    try std.testing.expectError(
+        error.CheckpointTruncated,
+        decodeCheckpoint(std.testing.allocator, null, encoded),
     );
 }
 

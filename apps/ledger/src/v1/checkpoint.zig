@@ -101,6 +101,23 @@ pub const Decoder = struct {
         return value;
     }
 
+    pub fn readCountBoundedByRemaining(
+        self: *Decoder,
+        maximum: usize,
+        minimum_item_bytes: usize,
+    ) !usize {
+        std.debug.assert(minimum_item_bytes > 0);
+        const value = try self.readCount(maximum);
+        if (value > self.remainingBytes() / minimum_item_bytes) {
+            return error.CheckpointBoundsExceeded;
+        }
+        return value;
+    }
+
+    pub fn remainingBytes(self: *const Decoder) usize {
+        return self.bytes.len - self.offset;
+    }
+
     pub fn readBoundedUsize(
         self: *Decoder,
         maximum: usize,
@@ -167,5 +184,18 @@ test "checkpoint codec rejects truncation and trailing bytes" {
     try std.testing.expectError(
         error.CheckpointTrailingBytes,
         trailing.finish(),
+    );
+}
+
+test "segmented checkpoint count is bounded before allocation" {
+    var encoder = Encoder.init(std.testing.allocator);
+    defer encoder.deinit();
+    try encoder.writeU64(1_000_000);
+    const encoded = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(encoded);
+    var decoder = try Decoder.init(encoded);
+    try std.testing.expectError(
+        error.CheckpointBoundsExceeded,
+        decoder.readCountBoundedByRemaining(max_collection_items, 8),
     );
 }

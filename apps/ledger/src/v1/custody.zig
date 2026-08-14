@@ -1363,6 +1363,19 @@ test "binding segment continues the checkpoint revision" {
         error.StoreBindingChainMismatch,
         parseBindingSegment(
             std.testing.allocator,
+            row ++ row,
+            "example/events",
+            "events",
+            "example/events.jsonl",
+            prior,
+            current,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.StoreBindingChainMismatch,
+        parseBindingSegment(
+            std.testing.allocator,
             row,
             "example/events",
             "events",

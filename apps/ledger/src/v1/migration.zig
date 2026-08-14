@@ -495,6 +495,14 @@ fn eventHistoryEquals(
         .allocator = allocator,
         .snapshot = snapshot,
     };
+    return streamedHistoryEquals(allocator, &iterator, legacy);
+}
+
+fn streamedHistoryEquals(
+    allocator: std.mem.Allocator,
+    iterator: anytype,
+    legacy: []const u8,
+) !bool {
     var offset: usize = 0;
     while (try iterator.next()) |bytes| {
         defer allocator.free(bytes);
@@ -503,10 +511,9 @@ fn eventHistoryEquals(
             return false;
         }
         offset = end;
-        if (offset == legacy.len) return true;
     }
     try iterator.finish();
-    return false;
+    return offset == legacy.len;
 }
 
 fn bindingHistoryEquals(
@@ -518,18 +525,7 @@ fn bindingHistoryEquals(
         .allocator = allocator,
         .snapshot = snapshot,
     };
-    var offset: usize = 0;
-    while (try iterator.next()) |bytes| {
-        defer allocator.free(bytes);
-        const end = std.math.add(usize, offset, bytes.len) catch return false;
-        if (end > legacy.len or !std.mem.eql(u8, legacy[offset..end], bytes)) {
-            return false;
-        }
-        offset = end;
-        if (offset == legacy.len) return true;
-    }
-    try iterator.finish();
-    return false;
+    return streamedHistoryEquals(allocator, &iterator, legacy);
 }
 
 fn tombstoneState(
@@ -1014,6 +1010,46 @@ test "legacy reconciliation retains the migration source bound" {
         segmented_event_log.legacy_event_max_bytes,
         legacyEventMutationMaximum("sha256:source"),
     );
+}
+
+test "segmented migration equality rejects a strict legacy prefix" {
+    const TestIterator = struct {
+        allocator: std.mem.Allocator,
+        items: []const []const u8,
+        index: usize = 0,
+
+        fn next(self: *@This()) !?[]u8 {
+            if (self.index == self.items.len) return null;
+            defer self.index += 1;
+            return @as(
+                ?[]u8,
+                try self.allocator.dupe(u8, self.items[self.index]),
+            );
+        }
+
+        fn finish(self: *const @This()) !void {
+            if (self.index != self.items.len) return error.IteratorIncomplete;
+        }
+    };
+    const items = [_][]const u8{ "first\n", "second\n" };
+    var prefix = TestIterator{
+        .allocator = std.testing.allocator,
+        .items = &items,
+    };
+    try std.testing.expect(!try streamedHistoryEquals(
+        std.testing.allocator,
+        &prefix,
+        "first\n",
+    ));
+    var exact = TestIterator{
+        .allocator = std.testing.allocator,
+        .items = &items,
+    };
+    try std.testing.expect(try streamedHistoryEquals(
+        std.testing.allocator,
+        &exact,
+        "first\nsecond\n",
+    ));
 }
 
 fn digestAlloc(

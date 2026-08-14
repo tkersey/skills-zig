@@ -188,11 +188,14 @@ pub const State = struct {
     pub fn decodeCheckpoint(
         allocator: std.mem.Allocator,
         decoder: *checkpoint.Decoder,
+        plan: ?*const Plan,
     ) !State {
         var result: State = .{};
         errdefer result.deinit(allocator);
-        const entry_count = try decoder.readCount(
-            @min(checkpoint.max_collection_items, std.math.maxInt(u32)),
+        const maximum = if (plan) |value| value.max_entries else 0;
+        const entry_count = try decoder.readCountBoundedByRemaining(
+            maximum,
+            8 + 1 + 8 + 1 + 8,
         );
         try result.entries.ensureTotalCapacity(
             allocator,
