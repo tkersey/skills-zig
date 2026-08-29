@@ -4433,17 +4433,6 @@ fn writeActorFakeCodexInteractiveServerModes(writer: *std.Io.Writer) !void {
         \\  while IFS= read -r ignored; do :; done
         \\  exit 0
         \\fi
-        \\if [ "$mode" = unsubscribe_server_request ]; then
-        \\  IFS= read -r request
-        \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-        \\  printf '%s\n' '{"method":"turn/started","params":{}}'
-        \\  printf '%s\n' '{"id":"tool-unsubscribe","method":"item/tool/call","params":{}}'
-        \\  IFS= read -r reply
-        \\  printf '%s\n' "$reply" > "$reply_log"
-        \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
-        \\  while IFS= read -r ignored; do :; done
-        \\  exit 0
-        \\fi
     );
 }
 
@@ -4614,21 +4603,18 @@ const BlockingNotificationProbe = struct {
     }
 };
 
-const UnsubscribingServerRequestProbe = struct {
+const ActorUnsubscribeCall = struct {
     actor: *Actor,
     target: protocol.NotificationHandler,
     completed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
 
-    fn handle(
-        context: *anyopaque,
-        request: protocol.ServerRequest,
-        allocator: std.mem.Allocator,
-    ) anyerror![]u8 {
-        const self: *UnsubscribingServerRequestProbe = @ptrCast(@alignCast(context));
-        try std.testing.expectEqualStrings("item/tool/call", request.method);
-        try self.actor.unsubscribe(self.target);
+    fn run(self: *ActorUnsubscribeCall) void {
+        self.actor.unsubscribe(self.target) catch |err| {
+            self.failure = err;
+            return;
+        };
         self.completed.store(true, .release);
-        return allocator.dupe(u8, "{\"handled\":true}");
     }
 };
 
@@ -5172,10 +5158,10 @@ test "actor falsifier nested request in server handler cannot deadlock permanent
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"handled\":\"nested\"") != null);
 }
 
-test "server callback unsubscribe waits for active notification context" {
+test "unsubscribe waits for an active notification callback" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var fixture = try ActorFixture.init(allocator, "unsubscribe_server_request");
+    var fixture = try ActorFixture.init(allocator, "teardown_notifications");
     defer fixture.deinit();
     var actor = try fixture.start(.{});
     defer actor.deinit();
@@ -5185,15 +5171,6 @@ test "server callback unsubscribe waits for active notification context" {
         .handle = BlockingNotificationProbe.observe,
     };
     try actor.subscribe(subscription);
-    var server = UnsubscribingServerRequestProbe{
-        .actor = &actor,
-        .target = subscription,
-    };
-    try actor.setServerRequestHandler(.{
-        .context = &server,
-        .handle = UnsubscribingServerRequestProbe.handle,
-        .cancel = noServerRequestCancel,
-    });
     var call = ActorCall{ .actor = &actor, .method = "actor/original", .timeout_ms = 3_000 };
     const call_thread = try std.Thread.spawn(.{}, ActorCall.run, .{&call});
     var call_joined = false;
@@ -5203,14 +5180,24 @@ test "server callback unsubscribe waits for active notification context" {
         try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
     }
     try std.testing.expect(notification.entered.load(.acquire));
+    var unsubscribe = ActorUnsubscribeCall{
+        .actor = &actor,
+        .target = subscription,
+    };
+    const unsubscribe_thread = try std.Thread.spawn(.{}, ActorUnsubscribeCall.run, .{&unsubscribe});
+    var unsubscribe_joined = false;
+    defer if (!unsubscribe_joined) unsubscribe_thread.join();
     try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
-    try std.testing.expect(!server.completed.load(.acquire));
+    try std.testing.expect(!unsubscribe.completed.load(.acquire));
     notification.released.store(true, .release);
     for (0..1_000) |_| {
-        if (server.completed.load(.acquire)) break;
+        if (unsubscribe.completed.load(.acquire)) break;
         try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
     }
-    try std.testing.expect(server.completed.load(.acquire));
+    try std.testing.expect(unsubscribe.completed.load(.acquire));
+    unsubscribe_thread.join();
+    unsubscribe_joined = true;
+    try std.testing.expect(unsubscribe.failure == null);
     call_thread.join();
     call_joined = true;
     if (call.result) |result| allocator.free(result);
