@@ -2688,7 +2688,7 @@ test "profiles select only their experimental client and shape obligations" {
     try expectExperimentalMethodProfiles(
         &baseline.value,
         "thread/turns/list",
-        &.{ .session_inquiry, .full },
+        &.{ .review, .session_inquiry, .full },
     );
     try expectExperimentalShapeProfiles(&baseline.value);
 }
