@@ -5,12 +5,12 @@ const proxy_client = @import("cas_proxy_client");
 pub const baseline_json = @import("cas_app_server_contract_data").json;
 
 const max_methods = 256;
-const max_shapes = 64;
+const max_shapes = 96;
 const max_documents = 64;
 const max_document_bytes = 8 * 1024 * 1024;
 
 const cache_schema = "cas-app-server-schema-cache/v1";
-pub const app_server_contract_id = "codex-app-server-capabilities-v1";
+pub const app_server_contract_id = "codex-app-server-capabilities-v2";
 const max_cache_documents: usize = 768;
 const max_cache_file_bytes: u64 = 8 * 1024 * 1024;
 const max_cache_total_bytes: u64 = 64 * 1024 * 1024;
@@ -1041,7 +1041,7 @@ pub const behavioral_probe_descriptors = [_]BehavioralProbeDescriptor{
     .{ .id = "unix-websocket-transport", .transport = .unix_websocket },
     .{ .id = "remote-code-mode-host", .code_mode_host = true },
     .{ .id = "server-request-coverage", .common = true },
-    .{ .id = "thread-pinning-round-trip", .full = true },
+    .{ .id = "thread-sections-round-trip", .full = true },
     .{ .id = "paginated-fork", .session_inquiry = true, .full = true },
     .{ .id = "ephemeral-fork", .session_inquiry = true, .full = true },
     .{ .id = "executor-skill-resources", .full = true },
@@ -1263,7 +1263,7 @@ fn validateBaselineHeader(root: std.json.Value) !void {
     if (!std.mem.eql(
         u8,
         try stringField(root, "schema"),
-        "cas-app-server-contract/v1",
+        "cas-app-server-contract/v2",
     )) return error.InvalidContract;
     if (!std.mem.eql(
         u8,
@@ -1321,16 +1321,16 @@ fn validateBaselineMethodSets(
     stable: std.json.Value,
     experimental: std.json.Value,
 ) !void {
-    if ((try arrayField(stable, "requiredClientMethods")).items.len != 90) {
+    if ((try arrayField(stable, "requiredClientMethods")).items.len != 98) {
         return error.InvalidContract;
     }
     if ((try arrayField(stable, "requiredServerRequests")).items.len != 10) {
         return error.InvalidContract;
     }
-    if ((try arrayField(stable, "requiredNotifications")).items.len != 70) {
+    if ((try arrayField(stable, "requiredNotifications")).items.len != 79) {
         return error.InvalidContract;
     }
-    if ((try arrayField(experimental, "requiredClientMethods")).items.len != 127) {
+    if ((try arrayField(experimental, "requiredClientMethods")).items.len != 154) {
         return error.InvalidContract;
     }
     if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {
@@ -2432,15 +2432,15 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"type":"object","required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"TurnStatus":{"type":"string","enum":["completed","interrupted","failed","inProgress"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"ThreadSection":{"type":"object"},"ThreadHistoryMode":{"type":"string"},"Thread":{"properties":{"section":{"anyOf":[{"$ref":"#/definitions/ThreadSection"},{"type":"null"}]},"sectionEnteredAt":{"type":["integer","null"]},"path":{"type":["string","null"]},"historyMode":{"$ref":"#/definitions/ThreadHistoryMode"}}},"ThreadSectionMoveParams":{"type":"object","required":["threadId","sectionId"]},"ThreadSectionListParams":{"type":"object"},"ThreadSectionCreateParams":{"type":"object","required":["name"]},"ThreadSectionUpdateParams":{"type":"object","required":["sectionId","name"]},"ThreadSectionDeleteParams":{"type":"object","required":["sectionId"]},"ThreadListParams":{"properties":{"sectionId":{"type":["string","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"}}},"ThreadResumeParams":{"type":"object","required":["threadId"],"properties":{"excludeTurns":{"type":"boolean"}}},"ThreadResumeResponse":{"properties":{"turnsBackwardsCursor":{"type":["string","null"]},"itemsBackwardsCursor":{"type":["string","null"]}}},"ThreadRevertParams":{"type":"object","required":["threadId","beforeTurnId"]},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"type":"object","required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"TurnStatus":{"type":"string","enum":["completed","interrupted","failed","inProgress"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"FunctionCallOutputBody":{"type":"object"},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}},{"type":"object","required":["id","name","output","type"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{"$ref":"#/definitions/FunctionCallOutputBody"},"type":{"type":"string","enum":["functionCallOutput"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"BrowserUseRequirements":{"type":"object"},"FeedbackRequirements":{"type":"object"},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"CodexErrorInfo":{"oneOf":[{"type":"string","enum":["usageLimitExceeded","rateLimitExceeded"]}]},"MisalignmentErrorDetails":{"type":"object"},"TurnError":{"properties":{"misalignment":{"anyOf":[{"$ref":"#/definitions/MisalignmentErrorDetails"},{"type":"null"}]}}},"ResponseUsageMetadata":{"type":"object"},"RawResponseCompletedNotification":{"properties":{"usageMetadata":{"anyOf":[{"$ref":"#/definitions/ResponseUsageMetadata"},{"type":"null"}]}}},"TurnToolOutput":{"type":"object"},"TurnStartParams":{"properties":{"serviceTierForTurn":{"type":["string","null"]},"toolOutput":{"anyOf":[{"$ref":"#/definitions/TurnToolOutput"},{"type":"null"}]},"turnTrigger":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const stable_profile_shapes =
-    \\{"definitions":{"ThreadStartParams":{"properties":{"developerInstructions":{"type":["string","null"]}}},"ThreadReadParams":{"properties":{"includeTurns":{"type":"boolean"}}},"ThreadResumeParams":{"type":"object","required":["threadId"]}}}
+    \\{"definitions":{"ThreadStartParams":{"properties":{"developerInstructions":{"type":["string","null"]}}},"ThreadReadParams":{"properties":{"includeTurns":{"type":"boolean"}}}}}
 ;
 
 const experimental_shapes =
-    \\{"definitions":{"ThreadForkParams":{"type":"object","required":["threadId"],"properties":{"beforeTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"},"deferGoalContinuation":{"type":"boolean"}}},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]}}}
+    \\{"definitions":{"ThreadForkParams":{"type":"object","required":["threadId"],"properties":{"beforeTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"},"deferGoalContinuation":{"type":"boolean"}}},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]},"TurnSettingsUpdateParams":{"type":"object","required":["threadId","turnId"]}}}
 ;
 
 const TestBundles = struct {
@@ -2785,7 +2785,7 @@ test "stable obligations remain fail closed within their selected profiles" {
         "experimentalApi",
         &.{ .core, .review, .session_inquiry, .full },
     );
-    try expectStableShapeProfiles(&baseline.value, "isPinned", &.{.full});
+    try expectStableShapeProfiles(&baseline.value, "sectionEnteredAt", &.{.full});
     try expectStableShapeProfiles(&baseline.value, "ReviewStartParams", &.{ .review, .full });
     try expectStableShapeProfiles(
         &baseline.value,
@@ -2916,7 +2916,7 @@ test "behavioral probe descriptors exactly cover contract and select required pr
     try expectProbeRequirement(.required, .review, stdio, "structured-review");
     try expectProbeRequirement(.required, .session_inquiry, stdio, "paginated-fork");
     try expectProbeRequirement(.not_applicable, .review, stdio, "paginated-fork");
-    try expectProbeRequirement(.required, .full, stdio, "thread-pinning-round-trip");
+    try expectProbeRequirement(.required, .full, stdio, "thread-sections-round-trip");
     try expectProbeRequirement(
         .required,
         .core,
@@ -3000,20 +3000,22 @@ test "required shape kind and nullability drift are incompatible" {
     defer baseline.deinit();
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
     defer bundles.deinit(std.testing.allocator);
-    const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
-    defer std.testing.allocator.free(drifted);
-    const kind_needle = "\"isPinned\":{\"type\":\"boolean\"";
-    const kind_offset = std.mem.indexOf(u8, drifted, kind_needle) orelse
-        return error.TestExpectedEqual;
-    @memcpy(
-        drifted[kind_offset + kind_needle.len - 8 .. kind_offset + kind_needle.len - 1],
-        "integer",
+    const kind_drifted = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        stable_shapes,
+        "\"sectionEnteredAt\":{\"type\":[\"integer\",\"null\"]}",
+        "\"sectionEnteredAt\":{\"type\":[\"boolean\",\"null\"]}",
     );
-    const nullability_needle = "\"path\":{\"type\":[\"string\",\"null\"]}";
-    const nullability_offset = std.mem.indexOf(u8, drifted, nullability_needle) orelse
-        return error.TestExpectedEqual;
-    const null_offset = nullability_offset + nullability_needle.len - 7;
-    @memcpy(drifted[null_offset .. null_offset + 4], "bool");
+    defer std.testing.allocator.free(kind_drifted);
+    const drifted = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        kind_drifted,
+        "\"path\":{\"type\":[\"string\",\"null\"]}",
+        "\"path\":{\"type\":\"string\"}",
+    );
+    defer std.testing.allocator.free(drifted);
     var report = try inspectTestBundles(
         std.testing.allocator,
         &baseline.value,
@@ -3035,8 +3037,8 @@ test "required scalar shape rejects an additive union kind" {
         u8,
         std.testing.allocator,
         stable_shapes,
-        "\"isPinned\":{\"type\":\"boolean\",\"future\":true}",
-        "\"isPinned\":{\"type\":[\"boolean\",\"string\"],\"future\":true}",
+        "\"excludeTurns\":{\"type\":\"boolean\"}",
+        "\"excludeTurns\":{\"type\":[\"boolean\",\"string\"]}",
     );
     defer std.testing.allocator.free(widened);
     var report = try inspectTestBundles(
@@ -3048,8 +3050,9 @@ test "required scalar shape rejects an additive union kind" {
     );
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.incompatible, report.status);
-    try std.testing.expectEqual(@as(usize, 1), report.shape_failures.items.len);
-    try std.testing.expectEqualStrings("thread-is-pinned", report.shape_failures.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
+    try std.testing.expect(contains(report.shape_failures.items, "fork-exclude-turns-stable"));
+    try std.testing.expect(contains(report.shape_failures.items, "thread-resume-exclude-turns"));
 }
 
 test "review target branch and commit identity remain strings" {
