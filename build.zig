@@ -242,62 +242,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cas_hook_policy", .module = cas_hook_policy_root },
         },
     });
-    const core_json_release_safe = b.createModule(.{
-        .root_source_file = b.path("libs/core/src/json_helpers.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-    });
-    const cas_hook_policy_release_safe = b.createModule(.{
-        .root_source_file = b.path("apps/cas/scripts/cas_hook_policy.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .imports = &.{
-            .{ .name = "core_json", .module = core_json_release_safe },
-        },
-    });
-    const cas_runtime_release_safe = b.createModule(.{
-        .root_source_file = b.path("libs/cas_runtime/src/root.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .imports = &.{
-            .{ .name = "core_json", .module = core_json_release_safe },
-            .{ .name = "cas_hook_policy", .module = cas_hook_policy_release_safe },
-        },
-    });
-    const synoptic_version = std.mem.trim(
-        u8,
-        @embedFile("apps/synoptic/VERSION"),
-        " \t\r\n",
-    );
-    const synoptic_meta = addVersionModule(b, synoptic_version);
-    const synoptic_root = b.createModule(.{
-        .root_source_file = b.path("apps/synoptic/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
-        .imports = &.{
-            .{ .name = "app_meta", .module = synoptic_meta },
-            .{ .name = "cas_runtime", .module = cas_runtime_root },
-        },
-    });
-    const synoptic_tests_root = b.createModule(.{
-        .root_source_file = b.path("apps/synoptic/src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "app_meta", .module = synoptic_meta },
-            .{ .name = "cas_runtime", .module = cas_runtime_root },
-        },
-    });
-    const synoptic_release_safe_root = b.createModule(.{
-        .root_source_file = b.path("apps/synoptic/src/main.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .imports = &.{
-            .{ .name = "app_meta", .module = synoptic_meta },
-            .{ .name = "cas_runtime", .module = cas_runtime_release_safe },
-        },
-    });
     const cas_proxy_client_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
         .target = target,
@@ -557,14 +501,6 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
-    const synoptic = addExecutable(b, "synoptic", synoptic_root);
-    synoptic.root_module.linkSystemLibrary("c", .{});
-    const synoptic_release_safe = addExecutable(
-        b,
-        "synoptic-release-safe",
-        synoptic_release_safe_root,
-    );
-    synoptic_release_safe.root_module.linkSystemLibrary("c", .{});
     cas_release.configureAutomation(cas_automation.root_module, target.result.os.tag);
     cas_release.configureExecutables(&.{
         cas,
@@ -609,8 +545,6 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cas_automation_install = addInstallStep(b, cas_automation);
-    const synoptic_install = addInstallStep(b, synoptic);
-    const synoptic_release_safe_install = addInstallStep(b, synoptic_release_safe);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
@@ -632,9 +566,6 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cas_automation_install.step);
-    if (installsSynopticByDefault(target.result.os.tag)) {
-        install_all.dependOn(&synoptic_install.step);
-    }
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
     install_all.dependOn(&img_install.step);
@@ -849,161 +780,6 @@ pub fn build(b: *std.Build) void {
     );
     test_cas.dependOn(&run_cas_automation_tests.step);
 
-    const run_synoptic_tests = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-unit",
-        "Run Synoptic unit and vertical state tests",
-        .{ .link_libc = true },
-    );
-    run_synoptic_tests.step.dependOn(&synoptic_install.step);
-    const run_synoptic_falsifiers = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-falsifiers-only",
-        "Run Synoptic security and authority falsifiers",
-        .{ .link_libc = true, .filters = &.{"falsifier"} },
-    );
-    const run_synoptic_e2e = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-e2e-only",
-        "Run the bounded Synoptic lifecycle fixture",
-        .{ .link_libc = true, .filters = &.{"e2e"} },
-    );
-    run_synoptic_e2e.step.dependOn(&synoptic_install.step);
-    const run_synoptic_action_broker = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-action-broker-only",
-        "Run Synoptic typed and transparent GitHub action broker tests",
-        .{ .link_libc = true, .filters = &.{"action broker"} },
-    );
-    const run_synoptic_session_context = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-session-context-only",
-        "Run installed-schema and authoritative session-context tests",
-        .{ .link_libc = true, .filters = &.{"session context"} },
-    );
-    run_synoptic_session_context.step.dependOn(&synoptic_install.step);
-    const run_synoptic_worktree_integrity = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-worktree-integrity-only",
-        "Run Synoptic custody cleanup and command-quiescence tests",
-        .{ .link_libc = true, .filters = &.{"worktree integrity"} },
-    );
-    run_synoptic_worktree_integrity.step.dependOn(&synoptic_install.step);
-    const run_synoptic_exclusions_config = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-exclusions-config-only",
-        "Run Synoptic config, exclusion synchronization, and start-mode tests",
-        .{ .link_libc = true, .filters = &.{"exclusions config"} },
-    );
-    run_synoptic_exclusions_config.step.dependOn(&synoptic_install.step);
-    const run_synoptic_command_approvals = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-command-approvals-only",
-        "Run Synoptic command and permission approval authority fixtures",
-        .{ .link_libc = true, .filters = &.{"command approvals"} },
-    );
-    run_synoptic_command_approvals.step.dependOn(&synoptic_install.step);
-    const run_synoptic_ui_domain = addTestStepWithOptions(
-        b,
-        synoptic_tests_root,
-        "test-synoptic-ui-domain-only",
-        "Run Synoptic owned PR, queue, tab, and canonical diff payload fixtures",
-        .{ .link_libc = true, .filters = &.{"ui domain"} },
-    );
-    run_synoptic_ui_domain.step.dependOn(&synoptic_install.step);
-    const test_synoptic = b.step(
-        "test-synoptic",
-        "Run the complete Synoptic test root once",
-    );
-    test_synoptic.dependOn(&run_synoptic_tests.step);
-    const synoptic_version_smoke = b.addRunArtifact(synoptic);
-    synoptic_version_smoke.addArg("--version");
-    synoptic_version_smoke.expectStdOutEqual(b.fmt(
-        "synoptic {s}\n",
-        .{synoptic_version},
-    ));
-    synoptic_version_smoke.step.dependOn(&synoptic_install.step);
-    test_synoptic.dependOn(&synoptic_version_smoke.step);
-    const synoptic_usage =
-        \\Usage:
-        \\  synoptic launch [--pr SELECTOR] --cwd PATH --skill-root PATH [--json]
-        \\  synoptic capabilities [--format json]
-        \\  synoptic version
-        \\  synoptic status [--json]
-        \\  synoptic stop [--json]
-        \\
-    ;
-    const synoptic_help_smoke = b.addRunArtifact(synoptic);
-    synoptic_help_smoke.addArg("--help");
-    synoptic_help_smoke.expectStdOutEqual(synoptic_usage);
-    synoptic_help_smoke.expectStdErrEqual("");
-    synoptic_help_smoke.step.dependOn(&synoptic_install.step);
-    test_synoptic.dependOn(&synoptic_help_smoke.step);
-    const synoptic_no_args_smoke = b.addRunArtifact(synoptic);
-    synoptic_no_args_smoke.expectStdErrEqual(synoptic_usage);
-    synoptic_no_args_smoke.expectExitCode(2);
-    synoptic_no_args_smoke.step.dependOn(&synoptic_install.step);
-    test_synoptic.dependOn(&synoptic_no_args_smoke.step);
-    const synoptic_invalid_command_smoke = b.addRunArtifact(synoptic);
-    synoptic_invalid_command_smoke.addArg("not-a-command");
-    synoptic_invalid_command_smoke.expectStdErrEqual(synoptic_usage);
-    synoptic_invalid_command_smoke.expectExitCode(2);
-    synoptic_invalid_command_smoke.step.dependOn(&synoptic_install.step);
-    test_synoptic.dependOn(&synoptic_invalid_command_smoke.step);
-    const test_synoptic_falsifiers = b.step(
-        "test-synoptic-falsifiers",
-        "Run Synoptic falsifiers",
-    );
-    test_synoptic_falsifiers.dependOn(&run_synoptic_falsifiers.step);
-    const test_synoptic_e2e = b.step(
-        "test-synoptic-e2e",
-        "Run the real masked-WebSocket fake-Codex/fake-GitHub product fixture",
-    );
-    test_synoptic_e2e.dependOn(&run_synoptic_e2e.step);
-    const test_synoptic_action_broker = b.step(
-        "test-synoptic-action-broker",
-        "Run typed action and bounded transparent GraphQL fixtures",
-    );
-    test_synoptic_action_broker.dependOn(&run_synoptic_action_broker.step);
-    const test_synoptic_session_context = b.step(
-        "test-synoptic-session-context",
-        "Run installed-schema and authoritative session-context fixtures",
-    );
-    test_synoptic_session_context.dependOn(&run_synoptic_session_context.step);
-    const test_synoptic_worktree_integrity = b.step(
-        "test-synoptic-worktree-integrity",
-        "Run safe-boundary and custody-integrity fixtures",
-    );
-    test_synoptic_worktree_integrity.dependOn(&run_synoptic_worktree_integrity.step);
-    const test_synoptic_exclusions_config = b.step(
-        "test-synoptic-exclusions-config",
-        "Run config precedence, exclusion sync, and session start-mode fixtures",
-    );
-    test_synoptic_exclusions_config.dependOn(&run_synoptic_exclusions_config.step);
-    const test_synoptic_command_approvals = b.step(
-        "test-synoptic-command-approvals",
-        "Run server-request approval routing and cleanup fixtures",
-    );
-    test_synoptic_command_approvals.dependOn(&run_synoptic_command_approvals.step);
-    const test_synoptic_ui_domain = b.step(
-        "test-synoptic-ui-domain",
-        "Run owned browser-domain payload and diff continuity fixtures",
-    );
-    test_synoptic_ui_domain.dependOn(&run_synoptic_ui_domain.step);
-    const release_synoptic_safe = b.step(
-        "release-synoptic-safe",
-        "Build Synoptic with ReleaseSafe optimization",
-    );
-    release_synoptic_safe.dependOn(&synoptic_release_safe_install.step);
-
     const cas_automation_oracle = b.addSystemCommand(&.{"sh"});
     cas_automation_oracle.addFileArg(b.path("apps/cas/testdata/automation/cron-0.2.13/verify.sh"));
     cas_automation_oracle.addFileArg(b.path("zig-out/bin/cas"));
@@ -1174,8 +950,6 @@ pub fn build(b: *std.Build) void {
             &cas_install.step,
             &cas_automation_install.step,
         };
-    const synoptic_aggregate_test_deps: []const *std.Build.Step =
-        if (target.result.os.tag == .macos) &.{test_synoptic} else &.{};
     const app_surfaces = [_]AppSurface{
         .{
             .path = b.path("apps/seq"),
@@ -1197,13 +971,6 @@ pub fn build(b: *std.Build) void {
             .build_description = "Build cas binaries",
             .build_deps = cas_build_deps,
             .test_deps = &.{test_cas},
-        },
-        .{
-            .path = b.path("apps/synoptic"),
-            .build_step_name = "build-synoptic",
-            .build_description = "Build the native Synoptic executable",
-            .build_deps = &.{&synoptic_install.step},
-            .test_deps = synoptic_aggregate_test_deps,
         },
         .{
             .path = b.path("apps/ledger"),
@@ -1297,16 +1064,6 @@ pub fn build(b: *std.Build) void {
         "Verify and summarize the current perf capsule",
         &.{"report"},
     );
-}
-
-fn installsSynopticByDefault(os_tag: std.Target.Os.Tag) bool {
-    return os_tag == .macos;
-}
-
-test "default install admits Synoptic only for macOS targets" {
-    try std.testing.expect(installsSynopticByDefault(.macos));
-    try std.testing.expect(!installsSynopticByDefault(.linux));
-    try std.testing.expect(!installsSynopticByDefault(.windows));
 }
 
 fn addExecutable(

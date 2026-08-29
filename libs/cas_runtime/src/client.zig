@@ -4457,7 +4457,7 @@ fn writeActorFakeCodexTerminalModes(writer: *std.Io.Writer) !void {
         \\if [ "$mode" = server_request ]; then
         \\  IFS= read -r request
         \\  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-        \\  printf '%s\n' '{"id":"tool-1","method":"item/tool/call","params":{"tool":"synoptic"}}'
+        \\  printf '%s\n' '{"id":"tool-1","method":"item/tool/call","params":{"tool":"sample"}}'
         \\  IFS= read -r reply
         \\  printf '%s\n' "$reply" > "$reply_log"
         \\  printf '{"id":%s,"result":{"ok":true}}\n' "$request_id"
