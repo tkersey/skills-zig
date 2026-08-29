@@ -155,8 +155,14 @@ pub fn main(init: std.process.Init) !void {
         (std.mem.eql(u8, argv[2], "session") or std.mem.eql(u8, argv[2], "daemon")))
     {
         const exit_code = runAppServerDelegate(allocator, init.io, argv[2..]) catch |err| {
-            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stderr_writer.interface.print("failed to launch Codex app-server: {s}\n", .{@errorName(err)});
+            var stderr_writer = std.Io.File.stderr().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
+            try stderr_writer.interface.print(
+                "failed to launch Codex app-server: {s}\n",
+                .{@errorName(err)},
+            );
             std.process.exit(1);
         };
         std.process.exit(exit_code);
@@ -418,7 +424,11 @@ test "app-server session and daemon delegate without version pinning" {
     );
     try std.testing.expectError(
         error.MissingCodexPath,
-        appendAppServerDelegateArgs(std.testing.allocator, &daemon, &.{ "session", "--codex-path" }),
+        appendAppServerDelegateArgs(
+            std.testing.allocator,
+            &daemon,
+            &.{ "session", "--codex-path" },
+        ),
     );
 }
 

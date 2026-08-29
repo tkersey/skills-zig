@@ -618,7 +618,8 @@ fn structuredReviewTerminalProbe(
             if (now_ms - observed_ms >= structured_review_materialization_grace_ms) {
                 return LiveWitness.failed(
                     "structured_review_terminal_read_failed",
-                    "thread/turns/list did not materialize the completed review within the grace bound",
+                    "thread/turns/list did not materialize the completed review " ++
+                        "within the grace bound",
                 );
             }
         }

@@ -293,18 +293,22 @@ assert_ci_affected seq,lift,cas,ledger,memory-note,img write_ci_helper
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.
 git reset --hard -q "$base"
+mkdir -p apps/retired
+printf '1.0.0\n' >apps/retired/VERSION
 printf 'const retired_root = "apps/retired/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
-git add build.zig
+git add build.zig apps/retired/VERSION
 git commit -qm retired-build-owner
 retired_build_base=$(git rev-parse HEAD)
 write_cas_control_plane_build
-git add build.zig
+rm apps/retired/VERSION
+git add build.zig apps/retired/VERSION
 git commit -qm replace-retired-build-owner
 test "$(bash "$classifier" affected "$retired_build_base" HEAD)" = cas
 
 git reset --hard -q "$retired_build_base"
 printf 'const img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
-git add build.zig
+rm apps/retired/VERSION
+git add build.zig apps/retired/VERSION
 git commit -qm remove-retired-build-owner
 test -z "$(bash "$classifier" affected "$retired_build_base" HEAD)"
 

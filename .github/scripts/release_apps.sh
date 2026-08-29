@@ -28,6 +28,16 @@ case "$mode" in
     declare -A affected=()
     build_changed=0
     package_changed=0
+    retired_apps=()
+
+    while IFS=$'\t' read -r status path; do
+      if [[ "$status" != D || "$path" != apps/*/VERSION ]]; then
+        continue
+      fi
+      retired_app=${path#apps/}
+      retired_app=${retired_app%/VERSION}
+      retired_apps+=("$retired_app")
+    done < <(git diff --name-status "$base" "$head" -- 'apps/*/VERSION')
 
     mark_app() {
       affected["$1"]=1
@@ -64,6 +74,18 @@ case "$mode" in
       mark_app cas
       mark_app ledger
       mark_app memory-note
+    }
+
+    is_retired_build_line() {
+      local raw=$1
+      local app token
+      for app in "${retired_apps[@]}"; do
+        token=${app//-/_}
+        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])" <<<"$raw"; then
+          return 0
+        fi
+      done
+      return 1
     }
 
     classify_build_line() {
@@ -247,7 +269,9 @@ case "$mode" in
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
           fi
-          if classify_build_line "$raw"; then
+          if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
+            retired_app_deletion=1
+          elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1
