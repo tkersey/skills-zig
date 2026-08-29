@@ -51,7 +51,7 @@ pub const Witnesses = struct {
     handler_coverage_passed: bool = false,
     retry_passed: bool = false,
     remote_code_mode_host: LiveWitness = .{},
-    thread_pinning: LiveWitness = .{},
+    thread_sections: LiveWitness = .{},
     paginated_fork: LiveWitness = .{},
     ephemeral_fork: LiveWitness = .{},
     paginated_session_inquiry: LiveWitness = .{},
@@ -141,7 +141,7 @@ fn liveWitness(id: []const u8, witnesses: Witnesses) ?LiveWitness {
     if (std.mem.eql(u8, id, "remote-code-mode-host")) {
         return witnesses.remote_code_mode_host;
     }
-    if (std.mem.eql(u8, id, "thread-pinning-round-trip")) return witnesses.thread_pinning;
+    if (std.mem.eql(u8, id, "thread-sections-round-trip")) return witnesses.thread_sections;
     if (std.mem.eql(u8, id, "paginated-fork")) return witnesses.paginated_fork;
     if (std.mem.eql(u8, id, "ephemeral-fork")) return witnesses.ephemeral_fork;
     if (std.mem.eql(u8, id, "paginated-session-inquiry")) {
@@ -243,130 +243,104 @@ pub fn retryKernelProbe(allocator: std.mem.Allocator) bool {
     return proxy.isStructuredOverloadError(parsed.value);
 }
 
-pub fn threadPinningProbe(
+pub fn threadSectionsProbe(
     allocator: std.mem.Allocator,
     client: *proxy.Client,
     cwd: []const u8,
     thread_id: []const u8,
 ) LiveWitness {
-    defer deleteThread(allocator, client, thread_id);
-
-    const pin_result = pinThreadProbe(allocator, client, cwd, thread_id);
-    if (pin_result.status != .passed) return pin_result;
-    return unpinThreadProbe(allocator, client, cwd, thread_id);
-}
-
-fn pinThreadProbe(
-    allocator: std.mem.Allocator,
-    client: *proxy.Client,
-    cwd: []const u8,
-    thread_id: []const u8,
-) LiveWitness {
-    const pin_params = stringifyAnyAlloc(
+    const section_id = createThreadSectionIdAlloc(
         allocator,
-        .{ .threadId = thread_id, .isPinned = true },
+        client,
+        "CAS preflight section",
+    ) catch
+        return LiveWitness.failed(
+            "thread_section_create_failed",
+            "threadSection/create rejected the probe section or omitted its identity",
+        );
+    defer allocator.free(section_id);
+    defer cleanupThreadSection(allocator, client, thread_id, section_id);
+    const other_section_id = createThreadSectionIdAlloc(
+        allocator,
+        client,
+        "CAS preflight opposite section",
     ) catch return LiveWitness.failed(
-        "thread_pinning_request_encode_failed",
-        "pin parameters could not be encoded",
+        "thread_section_create_failed",
+        "threadSection/create rejected the opposite-filter control section",
     );
-    defer allocator.free(pin_params);
-    const pin_json = client.requestJson(
-        "thread/metadata/update",
-        pin_params,
-    ) catch return LiveWitness.failed(
-        "thread_pin_failed",
-        "thread/metadata/update rejected isPinned=true",
-    );
-    defer allocator.free(pin_json);
-    if (!responseThreadBool(pin_json, "isPinned", true)) return LiveWitness.failed(
-        "thread_pin_response_failed",
-        "pin response did not witness isPinned=true",
-    );
+    defer allocator.free(other_section_id);
+    defer _ = deleteThreadSection(allocator, client, other_section_id);
 
-    const pinned_list = listThreadPinState(
+    const moved = moveThreadToSection(allocator, client, thread_id, section_id);
+    if (!moved) return LiveWitness.failed(
+        "thread_section_move_failed",
+        "thread/section/move could not assign the probe thread",
+    );
+    const assigned_filter_state = threadListSectionFilterState(
         allocator,
         client,
         cwd,
-        true,
         thread_id,
+        section_id,
     ) catch return LiveWitness.failed(
-        "thread_pin_list_failed",
-        "thread/list isPinned=true filter could not be established",
+        "thread_section_list_filter_failed",
+        "thread/list could not prove the exact section assignment",
     );
-    if (pinned_list == null or !pinned_list.?) return LiveWitness.failed(
-        "thread_pin_list_missing",
-        "pinned thread was absent from the isPinned=true filter",
-    );
-    const pinned_opposite = listThreadPinState(
+    if (assigned_filter_state != .exact) {
+        return LiveWitness.failed(
+            "thread_section_list_filter_failed",
+            "thread/list did not preserve the exact section assignment",
+        );
+    }
+    const opposite_filter_state = threadListSectionFilterState(
         allocator,
         client,
         cwd,
-        false,
         thread_id,
+        other_section_id,
     ) catch return LiveWitness.failed(
-        "thread_pin_opposite_list_failed",
-        "thread/list isPinned=false exclusion could not be established",
+        "thread_section_list_filter_failed",
+        "thread/list could not prove opposite-section exclusion",
     );
-    if (pinned_opposite != null) return LiveWitness.failed(
-        "thread_pin_filter_ignored",
-        "pinned thread remained visible through the isPinned=false filter",
+    if (opposite_filter_state != .absent) {
+        return LiveWitness.failed(
+            "thread_section_list_filter_failed",
+            "thread/list ignored the opposite section filter",
+        );
+    }
+    if (!updateThreadSection(allocator, client, section_id)) return LiveWitness.failed(
+        "thread_section_update_failed",
+        "threadSection/update could not rename the probe section",
     );
-    return LiveWitness.passed();
-}
-
-fn unpinThreadProbe(
-    allocator: std.mem.Allocator,
-    client: *proxy.Client,
-    cwd: []const u8,
-    thread_id: []const u8,
-) LiveWitness {
-    const unpin_params = stringifyAnyAlloc(
-        allocator,
-        .{ .threadId = thread_id, .isPinned = false },
-    ) catch return LiveWitness.failed(
-        "thread_pinning_request_encode_failed",
-        "unpin parameters could not be encoded",
+    if (!sectionListContains(allocator, client, section_id, "CAS preflight section updated")) {
+        return LiveWitness.failed(
+            "thread_section_list_failed",
+            "threadSection/list did not return the updated section",
+        );
+    }
+    if (!moveThreadToSection(allocator, client, thread_id, null)) return LiveWitness.failed(
+        "thread_section_clear_failed",
+        "thread/section/move could not clear the probe assignment",
     );
-    defer allocator.free(unpin_params);
-    const unpin_json = client.requestJson(
-        "thread/metadata/update",
-        unpin_params,
-    ) catch return LiveWitness.failed(
-        "thread_unpin_failed",
-        "thread/metadata/update rejected isPinned=false",
+    if (!threadHasNoSection(allocator, client, thread_id)) return LiveWitness.failed(
+        "thread_section_clear_readback_failed",
+        "thread/read retained section membership after it was cleared",
     );
-    defer allocator.free(unpin_json);
-    if (!responseThreadBool(unpin_json, "isPinned", false)) return LiveWitness.failed(
-        "thread_unpin_response_failed",
-        "unpin response did not witness isPinned=false",
+    if (!deleteThreadSection(allocator, client, section_id)) return LiveWitness.failed(
+        "thread_section_delete_failed",
+        "threadSection/delete could not remove the probe section",
     );
-    const unpinned_list = listThreadPinState(
+    const deleted_section_present = sectionListContainsId(
         allocator,
         client,
-        cwd,
-        false,
-        thread_id,
+        section_id,
     ) catch return LiveWitness.failed(
-        "thread_unpin_list_failed",
-        "thread/list isPinned=false filter could not be established",
+        "thread_section_delete_readback_failed",
+        "threadSection/list could not prove deletion",
     );
-    if (unpinned_list == null or unpinned_list.?) return LiveWitness.failed(
-        "thread_unpin_list_missing",
-        "unpinned thread was absent from the isPinned=false filter",
-    );
-    const unpinned_opposite = listThreadPinState(
-        allocator,
-        client,
-        cwd,
-        true,
-        thread_id,
-    ) catch return LiveWitness.failed(
-        "thread_unpin_opposite_list_failed",
-        "thread/list isPinned=true exclusion could not be established",
-    );
-    if (unpinned_opposite != null) return LiveWitness.failed(
-        "thread_unpin_filter_ignored",
-        "unpinned thread remained visible through the isPinned=true filter",
+    if (deleted_section_present) return LiveWitness.failed(
+        "thread_section_delete_readback_failed",
+        "threadSection/list retained the deleted section",
     );
     return LiveWitness.passed();
 }
@@ -497,6 +471,12 @@ pub fn structuredReviewProbe(
             "thread/start did not return a thread identity",
         );
     defer allocator.free(thread_id);
+    const rollout_path = threadPathAlloc(allocator, thread_json) catch
+        return LiveWitness.failed(
+            "structured_review_thread_shape_failed",
+            "thread/start did not return a durable rollout path",
+        );
+    defer allocator.free(rollout_path);
     defer deleteThread(allocator, client, thread_id);
 
     const instructions = "CAS structured-review dispatch conformance probe.";
@@ -540,6 +520,7 @@ pub fn structuredReviewProbe(
         client,
         thread_id,
         turn_id,
+        rollout_path,
         &notifications,
     );
 }
@@ -550,14 +531,17 @@ fn structuredReviewTerminalProbe(
     client: *proxy.Client,
     thread_id: []const u8,
     turn_id: []const u8,
+    rollout_path: []const u8,
     notifications: *std.ArrayList([]u8),
 ) LiveWitness {
     const read_params = stringifyAnyAlloc(allocator, .{
         .threadId = thread_id,
-        .includeTurns = true,
+        .limit = @as(u32, 10),
+        .sortDirection = "desc",
+        .itemsView = "full",
     }) catch return LiveWitness.failed(
         "structured_review_read_encode_failed",
-        "production thread/read parameters could not be encoded",
+        "production thread/turns/list parameters could not be encoded",
     );
     defer allocator.free(read_params);
     const deadline_ms = monotonicMilliseconds(io) + structured_review_probe_timeout_ms;
@@ -566,7 +550,7 @@ fn structuredReviewTerminalProbe(
     var completion_observed_ms: ?i64 = null;
     while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
         const read_json = client.requestJsonCaptureNotifications(
-            "thread/read",
+            "thread/turns/list",
             read_params,
             notifications,
         ) catch |err| {
@@ -599,7 +583,7 @@ fn structuredReviewTerminalProbe(
             );
             return LiveWitness.failed(
                 "structured_review_terminal_read_failed",
-                "thread/read could not observe the completed review turn",
+                "thread/turns/list could not observe the completed review turn",
             );
         };
         defer allocator.free(read_json);
@@ -616,7 +600,13 @@ fn structuredReviewTerminalProbe(
         if (notification_state == .passed and completion_observed_ms == null) {
             completion_observed_ms = now_ms;
         }
-        switch (completedReviewTurnState(allocator, io, read_json, turn_id)) {
+        switch (completedReviewTurnPageState(
+            allocator,
+            io,
+            read_json,
+            rollout_path,
+            turn_id,
+        )) {
             .passed => if (notification_state == .passed) return LiveWitness.passed(),
             .failed => return LiveWitness.failed(
                 "structured_review_terminal_shape_failed",
@@ -628,7 +618,8 @@ fn structuredReviewTerminalProbe(
             if (now_ms - observed_ms >= structured_review_materialization_grace_ms) {
                 return LiveWitness.failed(
                     "structured_review_terminal_read_failed",
-                    "thread/read did not materialize the completed review within the grace bound",
+                    "thread/turns/list did not materialize the completed review " ++
+                        "within the grace bound",
                 );
             }
         }
@@ -1845,6 +1836,25 @@ fn threadIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return allocator.dupe(u8, id);
 }
 
+fn threadPathAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const thread = switch (root.get("thread") orelse return error.InvalidResponse) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const path = switch (thread.get("path") orelse return error.InvalidResponse) {
+        .string => |value| value,
+        else => return error.InvalidResponse,
+    };
+    if (path.len == 0) return error.InvalidResponse;
+    return allocator.dupe(u8, path);
+}
+
 fn structuredReviewTurnIdAlloc(
     allocator: std.mem.Allocator,
     raw: []const u8,
@@ -1900,25 +1910,6 @@ fn structuredReviewTurnIdAlloc(
         return error.InvalidResponse;
     }
     return allocator.dupe(u8, turn_id);
-}
-
-fn responseThreadBool(raw: []const u8, field: []const u8, expected: bool) bool {
-    var parsed = parsePageJson(raw) catch return false;
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |value| value,
-        else => return false,
-    };
-    const thread_value = root.get("thread") orelse return false;
-    const thread = switch (thread_value) {
-        .object => |value| value,
-        else => return false,
-    };
-    const field_value = thread.get(field) orelse return false;
-    return switch (field_value) {
-        .bool => |value| value == expected,
-        else => false,
-    };
 }
 
 fn responseHasArray(raw: []const u8, field: []const u8) bool {
@@ -2099,64 +2090,232 @@ fn objectStringEquals(object: std.json.ObjectMap, field: []const u8, expected: [
     return std.mem.eql(u8, value, expected);
 }
 
-fn listThreadPinState(
-    allocator: std.mem.Allocator,
-    client: *proxy.Client,
-    cwd: []const u8,
-    is_pinned: bool,
-    thread_id: []const u8,
-) !?bool {
-    const params = try threadListParamsAlloc(allocator, cwd, is_pinned);
-    defer allocator.free(params);
-    const raw = try client.requestJson("thread/list", params);
-    defer allocator.free(raw);
-    return threadPinStateFromList(allocator, raw, thread_id);
-}
-
-fn threadPinStateFromList(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    thread_id: []const u8,
-) !?bool {
+fn sectionIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |value| value,
         else => return error.InvalidResponse,
     };
-    const data_value = root.get("data") orelse return error.InvalidResponse;
-    const data = switch (data_value) {
+    const section = switch (root.get("section") orelse return error.InvalidResponse) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const id = switch (section.get("id") orelse return error.InvalidResponse) {
+        .string => |value| value,
+        else => return error.InvalidResponse,
+    };
+    return allocator.dupe(u8, id);
+}
+
+fn createThreadSectionIdAlloc(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    name: []const u8,
+) ![]u8 {
+    const params = try stringifyAnyAlloc(allocator, .{ .name = name });
+    defer allocator.free(params);
+    const raw = try client.requestJson("threadSection/create", params);
+    defer allocator.free(raw);
+    return sectionIdAlloc(allocator, raw);
+}
+
+fn moveThreadToSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    section_id: ?[]const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .sectionId = section_id,
+        .beforeThreadId = @as(?[]const u8, null),
+    }) catch return false;
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/section/move", params) catch return false;
+    allocator.free(raw);
+    return true;
+}
+
+const ThreadSectionFilterState = enum { absent, exact, mismatched };
+
+fn threadListSectionFilterState(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    cwd: []const u8,
+    thread_id: []const u8,
+    section_id: []const u8,
+) !ThreadSectionFilterState {
+    const params = try stringifyAnyAlloc(allocator, .{
+        .cwd = cwd,
+        .sectionId = section_id,
+        .limit = @as(u32, 100),
+        .useStateDbOnly = false,
+    });
+    defer allocator.free(params);
+    const raw = try client.requestJson("thread/list", params);
+    defer allocator.free(raw);
+    return threadListResponseSectionFilterState(allocator, raw, thread_id, section_id);
+}
+
+fn threadListResponseSectionFilterState(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    thread_id: []const u8,
+    section_id: []const u8,
+) !ThreadSectionFilterState {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const data = switch (root.get("data") orelse return error.InvalidResponse) {
         .array => |value| value,
         else => return error.InvalidResponse,
     };
     for (data.items) |item| {
-        const object = switch (item) {
+        const thread = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidResponse,
+        };
+        if (!objectStringEquals(thread, "id", thread_id)) continue;
+        const section_value = thread.get("section") orelse return error.InvalidResponse;
+        if (section_value == .null) return .mismatched;
+        const section = switch (section_value) {
+            .object => |value| value,
+            else => return error.InvalidResponse,
+        };
+        return if (objectStringEquals(section, "id", section_id)) .exact else .mismatched;
+    }
+    return .absent;
+}
+
+fn threadHasNoSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .includeTurns = false,
+    }) catch return false;
+    defer allocator.free(params);
+    const raw = client.requestJson("thread/read", params) catch return false;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const thread = switch (parsed.value.object.get("thread") orelse return false) {
+        .object => |value| value,
+        else => return false,
+    };
+    return (thread.get("section") orelse return false) == .null;
+}
+
+fn updateThreadSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    section_id: []const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{
+        .sectionId = section_id,
+        .name = "CAS preflight section updated",
+    }) catch return false;
+    defer allocator.free(params);
+    const raw = client.requestJson("threadSection/update", params) catch return false;
+    defer allocator.free(raw);
+    return responseSectionMatches(allocator, raw, section_id, "CAS preflight section updated");
+}
+
+fn sectionListContains(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    section_id: []const u8,
+    name: []const u8,
+) bool {
+    const raw = client.requestJson("threadSection/list", "{\"limit\":100}") catch return false;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const data = switch (parsed.value.object.get("data") orelse return false) {
+        .array => |value| value,
+        else => return false,
+    };
+    for (data.items) |item| {
+        const section = switch (item) {
             .object => |value| value,
             else => continue,
         };
-        const id_value = object.get("id") orelse continue;
-        const id = switch (id_value) {
-            .string => |value| value,
-            else => continue,
-        };
-        if (!std.mem.eql(u8, id, thread_id)) continue;
-        const pinned_value = object.get("isPinned") orelse return error.InvalidResponse;
-        return switch (pinned_value) {
-            .bool => |value| value,
-            else => error.InvalidResponse,
-        };
+        if (objectStringEquals(section, "id", section_id) and
+            objectStringEquals(section, "name", name)) return true;
     }
-    return null;
+    return false;
 }
 
-fn threadListParamsAlloc(allocator: std.mem.Allocator, cwd: []const u8, is_pinned: bool) ![]u8 {
-    return stringifyAnyAlloc(allocator, .{
-        .cwd = cwd,
-        .isPinned = is_pinned,
-        .limit = @as(u32, 100),
-        .sourceKinds = &[_][]const u8{"cli"},
-        .useStateDbOnly = false,
-    });
+fn sectionListContainsId(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    section_id: []const u8,
+) !bool {
+    const raw = try client.requestJson("threadSection/list", "{\"limit\":100}");
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const data = switch (root.get("data") orelse return error.InvalidResponse) {
+        .array => |value| value,
+        else => return error.InvalidResponse,
+    };
+    for (data.items) |item| {
+        const section = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidResponse,
+        };
+        if (objectStringEquals(section, "id", section_id)) return true;
+    }
+    return false;
+}
+
+fn responseSectionMatches(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    section_id: []const u8,
+    name: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const section = switch (parsed.value.object.get("section") orelse return false) {
+        .object => |value| value,
+        else => return false,
+    };
+    return objectStringEquals(section, "id", section_id) and
+        objectStringEquals(section, "name", name);
+}
+
+fn deleteThreadSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    section_id: []const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{ .sectionId = section_id }) catch return false;
+    defer allocator.free(params);
+    const raw = client.requestJson("threadSection/delete", params) catch return false;
+    allocator.free(raw);
+    return true;
+}
+
+fn cleanupThreadSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    section_id: []const u8,
+) void {
+    _ = moveThreadToSection(allocator, client, thread_id, null);
+    _ = deleteThreadSection(allocator, client, section_id);
+    deleteThread(allocator, client, thread_id);
 }
 
 fn deleteThread(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: []const u8) void {
@@ -2271,6 +2430,48 @@ fn completedReviewTurnState(
     return .pending;
 }
 
+fn completedReviewTurnPageState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    raw: []const u8,
+    rollout_path: []const u8,
+    expected_turn_id: []const u8,
+) ReviewCompletionState {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return .failed;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return .failed,
+    };
+    const turns = switch (root.get("data") orelse return .failed) {
+        .array => |value| value,
+        else => return .failed,
+    };
+    for (turns.items) |turn_value| {
+        const turn = switch (turn_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (!objectStringEquals(turn, "id", expected_turn_id)) continue;
+        if (objectStringEquals(turn, "status", "inProgress")) return .pending;
+        if (!objectStringEquals(turn, "status", "completed")) return .failed;
+        if (!reviewModeItemsComplete(turn)) return .pending;
+        const rollout = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            rollout_path,
+            allocator,
+            .limited(8 * 1024 * 1024),
+        ) catch return .pending;
+        defer allocator.free(rollout);
+        return if (rolloutHasValidReviewOutput(allocator, rollout, expected_turn_id))
+            .passed
+        else
+            .pending;
+    }
+    return .pending;
+}
+
 fn reviewModeItemsComplete(turn: std.json.ObjectMap) bool {
     const items_value = turn.get("items") orelse return false;
     const items = switch (items_value) {
@@ -2338,8 +2539,16 @@ fn rolloutHasValidReviewOutput(
             break :blk matches;
         } else active_turn_matches;
         if (!event_turn_matches) continue;
-        if (!objectStringEquals(payload, "type", "exited_review_mode")) continue;
-        const output_value = payload.get("review_output") orelse continue;
+        const output_value = if (objectStringEquals(payload, "type", "exited_review_mode"))
+            payload.get("review_output") orelse continue
+        else if (objectStringEquals(payload, "type", "item_completed")) blk: {
+            const item = switch (payload.get("item") orelse continue) {
+                .object => |value| value,
+                else => continue,
+            };
+            if (!objectStringEquals(item, "type", "ExitedReviewMode")) continue;
+            break :blk item.get("review_output") orelse continue;
+        } else continue;
         const output = switch (output_value) {
             .object => |value| value,
             else => continue,
@@ -2500,11 +2709,11 @@ test "live witnesses replace only their exact fail-closed rows" {
         .lifecycle_passed = true,
         .handler_coverage_passed = true,
         .retry_passed = true,
-        .thread_pinning = LiveWitness.passed(),
+        .thread_sections = LiveWitness.passed(),
         .external_import_history = LiveWitness.passed(),
     });
     try std.testing.expectEqualStrings("passed", report.rows[7].status);
-    try std.testing.expectEqualStrings("thread-pinning-round-trip", report.rows[7].id);
+    try std.testing.expectEqualStrings("thread-sections-round-trip", report.rows[7].id);
     try std.testing.expectEqualStrings("unavailable", report.rows[8].status);
     try std.testing.expectEqualStrings("paginated-fork", report.rows[8].id);
     try std.testing.expectEqualStrings("unavailable", report.rows[9].status);
@@ -2519,7 +2728,7 @@ test "complete live witness set closes the full profile" {
         .lifecycle_passed = true,
         .handler_coverage_passed = true,
         .retry_passed = true,
-        .thread_pinning = LiveWitness.passed(),
+        .thread_sections = LiveWitness.passed(),
         .paginated_fork = LiveWitness.passed(),
         .ephemeral_fork = LiveWitness.passed(),
         .paginated_session_inquiry = LiveWitness.passed(),
@@ -2583,19 +2792,15 @@ test "probe anchor digest binds prefix count order and completion" {
 
 test "probe response helpers require exact fields and types" {
     const allocator = std.testing.allocator;
-    const id = try threadIdAlloc(allocator, "{\"thread\":{\"id\":\"thread-1\",\"isPinned\":true}}");
+    const id = try threadIdAlloc(allocator, "{\"thread\":{\"id\":\"thread-1\"}}");
     defer allocator.free(id);
     try std.testing.expectEqualStrings("thread-1", id);
-    try std.testing.expect(responseThreadBool(
-        "{\"thread\":{\"isPinned\":true}}",
-        "isPinned",
-        true,
-    ));
-    try std.testing.expect(!responseThreadBool(
-        "{\"thread\":{\"isPinned\":\"true\"}}",
-        "isPinned",
-        true,
-    ));
+    const section_id = try sectionIdAlloc(
+        allocator,
+        "{\"section\":{\"id\":\"section-1\",\"name\":\"Probe\"}}",
+    );
+    defer allocator.free(section_id);
+    try std.testing.expectEqualStrings("section-1", section_id);
     try std.testing.expect(responseHasArray("{\"items\":[]}", "items"));
     try std.testing.expect(!responseHasArray("{\"items\":{}}", "items"));
     try std.testing.expect(responseHasString("{\"importId\":\"import-1\"}", "importId"));
@@ -2622,30 +2827,44 @@ test "probe response helpers require exact fields and types" {
     ));
 }
 
-test "pin list parsing distinguishes absence from the opposite state" {
+test "thread list section parsing binds thread and section identities" {
     const allocator = std.testing.allocator;
+    const valid = "{\"data\":[{\"id\":\"thread-1\",\"section\":{" ++
+        "\"id\":\"section-1\",\"name\":\"Probe\"}}]}";
     try std.testing.expectEqual(
-        @as(?bool, true),
-        try threadPinStateFromList(
+        ThreadSectionFilterState.exact,
+        try threadListResponseSectionFilterState(
             allocator,
-            "{\"data\":[{\"id\":\"thread-1\",\"isPinned\":true}]}",
+            valid,
             "thread-1",
+            "section-1",
         ),
     );
     try std.testing.expectEqual(
-        @as(?bool, false),
-        try threadPinStateFromList(
+        ThreadSectionFilterState.mismatched,
+        try threadListResponseSectionFilterState(
             allocator,
-            "{\"data\":[{\"id\":\"thread-1\",\"isPinned\":false}]}",
+            valid,
             "thread-1",
+            "section-2",
         ),
     );
     try std.testing.expectEqual(
-        @as(?bool, null),
-        try threadPinStateFromList(
+        ThreadSectionFilterState.absent,
+        try threadListResponseSectionFilterState(
             allocator,
-            "{\"data\":[{\"id\":\"thread-2\",\"isPinned\":true}]}",
+            valid,
+            "thread-2",
+            "section-1",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        threadListResponseSectionFilterState(
+            allocator,
+            "{\"data\":{}}",
             "thread-1",
+            "section-1",
         ),
     );
 }
@@ -2666,20 +2885,22 @@ test "import history readback requires provider and exact grouped success" {
     ));
 }
 
-test "pin list filter selects the isolated CLI fixture within a bounded page" {
+test "section list response requires the exact section identity and name" {
     const allocator = std.testing.allocator;
-    const raw = try threadListParamsAlloc(allocator, "/tmp/probe", true);
-    defer allocator.free(raw);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expectEqualStrings("/tmp/probe", root.get("cwd").?.string);
-    try std.testing.expect(root.get("isPinned").?.bool);
-    try std.testing.expectEqual(@as(i64, 100), root.get("limit").?.integer);
-    try std.testing.expect(!root.get("useStateDbOnly").?.bool);
-    const source_kinds = root.get("sourceKinds").?.array;
-    try std.testing.expectEqual(@as(usize, 1), source_kinds.items.len);
-    try std.testing.expectEqualStrings("cli", source_kinds.items[0].string);
+    const valid = "{\"section\":{\"id\":\"section-1\"," ++
+        "\"name\":\"CAS preflight section updated\"}}";
+    try std.testing.expect(responseSectionMatches(
+        allocator,
+        valid,
+        "section-1",
+        "CAS preflight section updated",
+    ));
+    try std.testing.expect(!responseSectionMatches(
+        allocator,
+        valid,
+        "section-2",
+        "CAS preflight section updated",
+    ));
 }
 
 test "fork response helpers require exact lineage path and completed prefix" {
@@ -2800,6 +3021,20 @@ test "structured review terminal read requires completed rollout review output" 
         duplicate,
         "turn-review",
     ));
+    const paginated_rollout =
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"type\":\"item_completed\",\"turn_id\":\"turn-review\",\"item\":{" ++
+        "\"type\":\"ExitedReviewMode\",\"review_output\":{" ++
+        "\"findings\":[{\"title\":\"[P2] probe\",\"body\":\"complete shape\"," ++
+        "\"confidence_score\":1,\"priority\":2,\"code_location\":{" ++
+        "\"absolute_file_path\":\"/cas/probe.zig\",\"line_range\":{" ++
+        "\"start\":1,\"end\":1}}}],\"overall_correctness\":\"patch is incorrect\"," ++
+        "\"overall_explanation\":\"intentional\",\"overall_confidence_score\":1}}}}";
+    try std.testing.expect(rolloutHasValidReviewOutput(
+        allocator,
+        paginated_rollout,
+        "turn-review",
+    ));
     const completed = try std.fmt.allocPrint(
         allocator,
         "{{\"thread\":{{\"path\":\"{s}\",\"turns\":[{{" ++
@@ -2812,6 +3047,20 @@ test "structured review terminal read requires completed rollout review output" 
     try std.testing.expectEqual(
         ReviewCompletionState.passed,
         completedReviewTurnState(allocator, io, completed, "turn-review"),
+    );
+    const completed_page =
+        "{\"data\":[{\"id\":\"turn-review\",\"status\":\"completed\",\"items\":[" ++
+        "{\"type\":\"enteredReviewMode\"},{\"type\":\"exitedReviewMode\"}]}]," ++
+        "\"nextCursor\":null,\"backwardsCursor\":null}";
+    try std.testing.expectEqual(
+        ReviewCompletionState.passed,
+        completedReviewTurnPageState(
+            allocator,
+            io,
+            completed_page,
+            rollout_path,
+            "turn-review",
+        ),
     );
     try std.testing.expectEqual(
         ReviewCompletionState.pending,

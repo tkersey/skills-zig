@@ -19,7 +19,7 @@ const MaxInquiryTokens: u64 = 1_000_000;
 const MaxInquiryTimeoutMs: u64 = 2_700_000;
 const MaxThreadHistoryPages: usize = 1024;
 const ThreadHistoryPageLimit: u32 = 100;
-const AppServerContractId = "codex-app-server-capabilities-v1";
+const AppServerContractId = "codex-app-server-capabilities-v2";
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas_session_inquiry",
@@ -61,7 +61,7 @@ const UsageText =
     \\  --max-total-tokens N
     \\  --transport auto|managed-ws
     \\  --codex-path PATH
-    \\  --code-mode-host ws://LOOPBACK|wss://HOST
+    \\  --code-mode-host http://LOOPBACK|https://HOST
     \\  --store-root DIR
     \\  --json
     \\  --verdict-only
@@ -6382,13 +6382,13 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
 test "shared session inquiry preflight parser preserves exact profile evidence" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"compatible","contractId":"codex-app-server-capabilities-v1",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"compatible","contractId":"codex-app-server-capabilities-v2",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":[]},
         \\ "handlerCoverage":{"status":"passed","failures":[]},
         \\ "shapeChecks":{"status":"passed","failures":[]},
-        \\ "transport":{"selected":"managed-ws","codeModeHost":{"origin":"wss://example.test","sha256":"3333333333333333333333333333333333333333333333333333333333333333"}},
+        \\ "transport":{"selected":"managed-ws","codeModeHost":{"origin":"https://example.test","sha256":"3333333333333333333333333333333333333333333333333333333333333333"}},
         \\ "behavioralProbes":[
         \\  {"id":"initialize-lifecycle","requirement":"required","status":"passed"},
         \\  {"id":"managed-websocket-transport","requirement":"required","status":"passed"},
@@ -6418,7 +6418,7 @@ test "shared session inquiry preflight parser preserves exact profile evidence" 
 test "failed fork witnesses preserve route neutral transcript compatibility" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v1",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v2",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":[]},
@@ -6447,7 +6447,7 @@ test "failed fork witnesses preserve route neutral transcript compatibility" {
 test "structural incompatibility blocks route neutral transcript compatibility" {
     const allocator = std.testing.allocator;
     const raw =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v1",
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"session-inquiry","status":"incompatible","contractId":"codex-app-server-capabilities-v2",
         \\ "codex":{"path":"/tmp/codex-0.146.0","version":"0.146.0"},
         \\ "schemas":{"stableDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","experimentalDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","experimentalPath":"/tmp/cache/0.146.0/experimental"},
         \\ "methods":{"missingRequired":["thread/start"]},

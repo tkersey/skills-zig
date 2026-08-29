@@ -27,7 +27,7 @@ const UsageText =
     \\  --codex-path PATH                Codex executable for CAS-owned launches (default: codex).
     \\  --app-server-transport MODE      auto|stdio|managed-ws|ws|unix (default: auto).
     \\  --app-server-endpoint ENDPOINT   Required for ws; optional unix:// path for unix.
-    \\  --code-mode-host WS_URL          Outbound Code Mode host (CAS-owned launches only).
+    \\  --code-mode-host HTTP_URL        Outbound HTTP(S) Code Mode host (CAS-owned launches only).
     \\  --thread-id THREAD_ID            Existing thread id to reuse (optional).
     \\  --request-timeout-ms N           Timeout per request (accepted for parity).
     \\  --opt-out-notification-method M  Suppress notification method (repeatable).
@@ -846,7 +846,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
         "--app-server-endpoint",
         "unix:///tmp/cas.sock",
         "--code-mode-host",
-        "wss://example.com/code?token=redacted",
+        "https://example.com/",
         "--thread-id",
         "thr_123",
         "--request-timeout-ms",
@@ -866,7 +866,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expectEqual(launch.RequestedTransport.unix_socket, parsed.requested_transport);
     try std.testing.expectEqualStrings("unix:///tmp/cas.sock", parsed.transport_endpoint.?);
     try std.testing.expectEqualStrings(
-        "wss://example.com/code?token=redacted",
+        "https://example.com/",
         parsed.code_mode_host.?,
     );
     try std.testing.expectEqual(@as(?[]const u8, "thr_123"), parsed.thread_id);

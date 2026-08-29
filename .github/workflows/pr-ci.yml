@@ -9,7 +9,6 @@ on:
       - "apps/seq/**"
       - "apps/lift/**"
       - "apps/cas/**"
-      - "apps/synoptic/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
       - "apps/img/**"
@@ -44,7 +43,6 @@ jobs:
       seq: ${{ steps.classify.outputs.seq }}
       lift: ${{ steps.classify.outputs.lift }}
       cas: ${{ steps.classify.outputs.cas }}
-      synoptic: ${{ steps.classify.outputs.synoptic }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
       img: ${{ steps.classify.outputs.img }}
@@ -72,7 +70,7 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas synoptic ledger memory-note img; do
+          for app in seq lift cas ledger memory-note img; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -239,15 +237,15 @@ jobs:
             zig_target: x86_64-linux-musl
             cas_static: true
             runner_arch: X64
-            codex_asset: codex-x86_64-unknown-linux-musl.tar.gz
-            codex_archive_sha256: 5ba3b9405543953081f661d0854d266f76e2abbe51d41349355a36de7673776a
+            codex_asset: codex-package-x86_64-unknown-linux-musl.tar.gz
+            codex_archive_sha256: 6e35ac60b86c0e8c7f8bcf797be8b92206199f6253200b66ff0547276f8cfa5c
           - os: macos-14
             platform: macos-aarch64
             zig_target: aarch64-macos
             cas_static: false
             runner_arch: ARM64
-            codex_asset: codex-aarch64-apple-darwin.tar.gz
-            codex_archive_sha256: 2750132d300e64f1dbffb95e3d913fd9c9dc7812bc8e1bce5c61357248b7929e
+            codex_asset: codex-package-aarch64-apple-darwin.tar.gz
+            codex_archive_sha256: cb6e78eba80c1bc310a533f6f1c6c948377733bc06f9e837949334e04abde9c6
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -271,13 +269,14 @@ jobs:
             exit 1
           fi
 
-          release_url="https://github.com/openai/codex/releases/download/rust-v0.146.0/${CODEX_ASSET}"
+          qualification_version="0.151.0"
+          release_url="https://github.com/openai/codex/releases/download/rust-v${qualification_version}/${CODEX_ASSET}"
           archive="${RUNNER_TEMP}/${CODEX_ASSET}"
-          extract_dir="${RUNNER_TEMP}/codex-0.146.0"
+          extract_dir="${RUNNER_TEMP}/codex-${qualification_version}"
           bin_dir="${RUNNER_TEMP}/codex-bin"
           stable_schema_dir="${RUNNER_TEMP}/codex-schema/stable"
           experimental_schema_dir="${RUNNER_TEMP}/codex-schema/experimental"
-          evidence="${RUNNER_TEMP}/cas-codex-0.146.0-${CODEX_PLATFORM}.txt"
+          evidence="${RUNNER_TEMP}/cas-codex-${qualification_version}-${CODEX_PLATFORM}.txt"
 
           curl --fail --location --retry 3 --output "${archive}" "${release_url}"
           archive_sha256="$(shasum -a 256 "${archive}" | awk '{print $1}')"
@@ -288,18 +287,17 @@ jobs:
 
           mkdir -p "${extract_dir}" "${bin_dir}" "${stable_schema_dir}" "${experimental_schema_dir}"
           tar -xzf "${archive}" -C "${extract_dir}"
-          extracted_file_count="$(find "${extract_dir}" -type f -print | wc -l | tr -d ' ')"
-          if [[ "${extracted_file_count}" -ne 1 ]]; then
-            echo "Expected exactly one file in ${CODEX_ASSET}, found ${extracted_file_count}" >&2
+          package_bin="$(find "${extract_dir}" -type d -path '*/bin' -print -quit)"
+          if [[ -z "${package_bin}" || ! -x "${package_bin}/codex" || ! -x "${package_bin}/codex-code-mode-host" ]]; then
+            echo "Expected Codex app-server package binaries in ${CODEX_ASSET}" >&2
             exit 1
           fi
-          extracted_file="$(find "${extract_dir}" -type f -print)"
-          cp "${extracted_file}" "${bin_dir}/codex"
-          chmod +x "${bin_dir}/codex"
+          cp "${package_bin}/codex" "${package_bin}/codex-code-mode-host" "${bin_dir}/"
+          chmod +x "${bin_dir}/codex" "${bin_dir}/codex-code-mode-host"
 
           codex_version="$("${bin_dir}/codex" --version)"
-          if [[ "${codex_version}" != "codex-cli 0.146.0" ]]; then
-            echo "Expected codex-cli 0.146.0, got ${codex_version}" >&2
+          if [[ "${codex_version}" != "codex-cli ${qualification_version}" ]]; then
+            echo "Expected qualification baseline codex-cli ${qualification_version}, got ${codex_version}" >&2
             exit 1
           fi
           binary_sha256="$(shasum -a 256 "${bin_dir}/codex" | awk '{print $1}')"
@@ -325,7 +323,7 @@ jobs:
             echo "runner_os=${RUNNER_OS}"
             echo "runner_arch=${RUNNER_ARCH}"
             echo "uname=$(uname -a)"
-            echo "release=rust-v0.146.0"
+            echo "release=rust-v${qualification_version}"
             echo "archive=${CODEX_ASSET}"
             echo "archive_sha256=${archive_sha256}"
             echo "codex_version=${codex_version}"
@@ -429,8 +427,8 @@ jobs:
       - name: Upload exact Codex evidence
         uses: actions/upload-artifact@v4
         with:
-          name: cas-codex-0.146.0-${{ matrix.platform }}
-          path: ${{ runner.temp }}/cas-codex-0.146.0-${{ matrix.platform }}.txt
+          name: cas-codex-0.151.0-${{ matrix.platform }}
+          path: ${{ runner.temp }}/cas-codex-0.151.0-${{ matrix.platform }}.txt
           if-no-files-found: error
 
   cas-fuzz-linux:
@@ -445,41 +443,6 @@ jobs:
           version: 0.16.0
       - name: Fuzz CAS budget governor (Linux)
         run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
-
-  synoptic:
-    needs: changes
-    if: needs.changes.outputs.synoptic == 'true'
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Test Synoptic behavior and falsifiers
-        run: |
-          zig build test-synoptic
-      - name: Build Synoptic ReleaseSafe command surface
-        run: zig build release-synoptic-safe
-      - name: Verify Synoptic version and capabilities
-        run: |
-          set -euo pipefail
-          binary="./zig-out/bin/synoptic-release-safe"
-          test -x "${binary}"
-          expected_version="$(tr -d '[:space:]' < apps/synoptic/VERSION)"
-          test "$("${binary}" version)" = "synoptic ${expected_version}"
-          capabilities="$("${binary}" capabilities --format json)"
-          jq -e --arg version "${expected_version}" '
-            .synopticCapabilities.version == $version and
-            .synopticCapabilities.platform == "macos" and
-            .synopticCapabilities.skillAbi == "synoptic-skill-abi/v1" and
-            .synopticCapabilities.uiAbi == "synoptic-ui/v1" and
-            .synopticCapabilities.features == {
-              casRuntimeV1: true,
-              githubViewedQueueV1: true,
-              ephemeralFileSessionsV1: true,
-              githubActionCardsV1: true
-            }
-          ' <<<"${capabilities}"
 
   perf-hub:
     needs: changes

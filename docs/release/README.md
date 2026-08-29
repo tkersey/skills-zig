@@ -5,7 +5,6 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `seq`: `.github/workflows/release-seq.yml` on tag `seq-v*`
 - `lift`: `.github/workflows/release-lift.yml` on tag `lift-v*`
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
-- `synoptic`: `.github/workflows/release-synoptic.yml` on tag `synoptic-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
 - `img`: `.github/workflows/release-img.yml` on tag `img-v*`
@@ -19,7 +18,6 @@ Per-app VERSION files:
 - `apps/seq/VERSION`
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
-- `apps/synoptic/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/img/VERSION`
@@ -28,13 +26,13 @@ Release contract:
 
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
-   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI. Synoptic's README carries its macOS artifact and capability contract, so `apps/synoptic/README.md` is release-relevant too.
+   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - `build.zig` and `build.zig.zon` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
    - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
    - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
    - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.
-   - `libs/cas_runtime/**` counts for both shipped consumers, `cas` and `synoptic`, in that stable release order. A material runtime change requires both VERSION bumps because it changes the CAS substrate and the Synoptic process that embeds it.
+   - `libs/cas_runtime/**` counts for CAS, its sole shipped consumer.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; the workflow qualifies both release targets before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.
@@ -46,7 +44,6 @@ Release tags must match file versions:
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
-- `synoptic-v<version>` where `<version>` equals `apps/synoptic/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
@@ -56,17 +53,6 @@ Each workflow publishes two release archives for its independently versioned CLI
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`
 
-Synoptic is the macOS-only exception to the generic Linux-plus-Apple artifact
-pair. Its workflow uses native `macos-15` arm64 and `macos-15-intel` x86_64
-runners, verifies both runner and binary architectures, and publishes exactly:
-
-- `synoptic-v<version>-darwin-arm64.tar.gz`
-- `synoptic-v<version>-darwin-x86_64.tar.gz`
-
-Each Synoptic archive contains only the root `synoptic` executable. Publication
-also proves the exact version plus skill ABI, UI ABI, and advertised v1 feature
-set. No Linux or Windows Synoptic archive is produced.
-
 Examples:
 
 - `seq-v1.2.3-linux-x86_64.tar.gz`
@@ -75,8 +61,6 @@ Examples:
 - `lift-v1.2.3-darwin-arm64.tar.gz`
 - `cas-v1.2.3-linux-x86_64.tar.gz`
 - `cas-v1.2.3-darwin-arm64.tar.gz`
-- `synoptic-v0.1.0-darwin-arm64.tar.gz`
-- `synoptic-v0.1.0-darwin-x86_64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
@@ -125,9 +109,8 @@ If GitHub Actions is degraded/outage and tag runs remain queued, publish manuall
 propagation is not blocked:
 
 1. On a clean checkout of the exact release tag, run the affected CLI's build and test lanes and retain the successful command output with the tag commit SHA.
-2. Build and package the exact two release archives for the CLI. Synoptic uses
-   `<tag>-darwin-arm64.tar.gz` and `<tag>-darwin-x86_64.tar.gz`; every other
-   current CLI uses `<tag>-darwin-arm64.tar.gz` and `<tag>-linux-x86_64.tar.gz`.
+2. Build and package the exact two release archives for the CLI:
+   `<tag>-darwin-arm64.tar.gz` and `<tag>-linux-x86_64.tar.gz`.
 3. Create the release directly on the existing tag:
    - `gh release create <tag> <asset1> <asset2> --verify-tag`
 4. Update `homebrew-tap` formula version + SHA256 from the published assets.

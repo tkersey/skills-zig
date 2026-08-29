@@ -249,7 +249,7 @@ test "appendAppServerArgs disables hooks only for off policy" {
     defer argv.deinit(std.testing.allocator);
     var code_mode_host = try app_server_launch.CodeModeHost.init(
         std.testing.allocator,
-        "wss://example.com:443/code?token=secret",
+        "https://example.com:443/",
     );
     defer code_mode_host.deinit();
     try appendAppServerArgs(
@@ -266,6 +266,17 @@ test "appendAppServerArgs disables hooks only for off policy" {
     try std.testing.expectEqualStrings("--listen", argv.items[3]);
     try std.testing.expectEqualStrings("--code-mode-host", argv.items[5]);
     try std.testing.expectEqualStrings(code_mode_host.raw, argv.items[6]);
+
+    for ([_][]const u8{
+        "https://example.com:invalid/",
+        "https://example.com:/",
+        "https://::1/",
+    }) |invalid| {
+        try std.testing.expectError(
+            error.InvalidCodeModeHost,
+            app_server_launch.CodeModeHost.init(std.testing.allocator, invalid),
+        );
+    }
 }
 
 test "HookAccumulator summarizes failure precedence" {

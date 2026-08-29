@@ -590,34 +590,54 @@ test "unix path resolution is lexical and bounded" {
     try std.testing.expectError(error.UnixSocketPathTooLong, launch.validateUnixPath(&too_long));
 }
 
-test "code mode host enforces TLS remotely and never exposes secrets in identity" {
+test "code mode host accepts only released HTTP root endpoints" {
     var loopback = try launch.CodeModeHost.init(
         std.testing.allocator,
-        "ws://user:secret@127.0.0.1:9090/path?token=hidden",
+        "http://127.0.0.1:9090/",
     );
     defer loopback.deinit();
-    try std.testing.expectEqualStrings("ws://127.0.0.1:9090", loopback.redacted_origin);
-    try std.testing.expect(std.mem.indexOf(u8, loopback.redacted_origin, "secret") == null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9090", loopback.redacted_origin);
     var digest_hex: [64]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 64), loopback.digestHex(&digest_hex).len);
-    try std.testing.expectEqualStrings(
-        "ws://user:secret@127.0.0.1:9090/path?token=hidden",
-        loopback.raw,
-    );
+    try std.testing.expectEqualStrings("http://127.0.0.1:9090/", loopback.raw);
 
     var remote = try launch.CodeModeHost.init(
         std.testing.allocator,
-        "wss://user:secret@example.com:443/mode?token=hidden",
+        "https://example.com:443/",
     );
     defer remote.deinit();
-    try std.testing.expectEqualStrings("wss://example.com:443", remote.redacted_origin);
+    try std.testing.expectEqualStrings("https://example.com:443", remote.redacted_origin);
     try std.testing.expectError(
         error.InsecureRemoteCodeModeHost,
-        launch.CodeModeHost.init(std.testing.allocator, "ws://example.com/mode"),
+        launch.CodeModeHost.init(std.testing.allocator, "http://example.com/"),
     );
     try std.testing.expectError(
         error.UnsafeUrlByte,
-        launch.CodeModeHost.init(std.testing.allocator, "wss://example.com/a\tb"),
+        launch.CodeModeHost.init(std.testing.allocator, "https://example.com/a\tb"),
+    );
+    try std.testing.expectError(
+        error.CodeModeHostUserinfoForbidden,
+        launch.CodeModeHost.init(std.testing.allocator, "https://user:secret@example.com/"),
+    );
+    try std.testing.expectError(
+        error.CodeModeHostRootRequired,
+        launch.CodeModeHost.init(std.testing.allocator, "https://example.com/code-mode"),
+    );
+    try std.testing.expectError(
+        error.InvalidCodeModeHost,
+        launch.CodeModeHost.init(std.testing.allocator, "wss://example.com/"),
+    );
+    try std.testing.expectError(
+        error.InvalidCodeModeHost,
+        launch.CodeModeHost.init(std.testing.allocator, "https://example.com:invalid/"),
+    );
+    try std.testing.expectError(
+        error.InvalidCodeModeHost,
+        launch.CodeModeHost.init(std.testing.allocator, "https://example.com:/"),
+    );
+    try std.testing.expectError(
+        error.InvalidCodeModeHost,
+        launch.CodeModeHost.init(std.testing.allocator, "https://::1/"),
     );
 
     var argv: std.ArrayList([]const u8) = .empty;

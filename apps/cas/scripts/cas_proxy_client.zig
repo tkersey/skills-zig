@@ -70,7 +70,7 @@ test "compatibility hooks accept the canonical launch type" {
     const std = @import("std");
     var host = try app_server_launch.CodeModeHost.init(
         std.testing.allocator,
-        "ws://127.0.0.1:3210",
+        "http://127.0.0.1:3210/",
     );
     defer host.deinit();
     var argv: std.ArrayList([]const u8) = .empty;

@@ -16,7 +16,8 @@ const HelpSurface = core_cli.HelpSurface{
 
 const default_control_timeout_ms: u32 = 300_000;
 const default_review_timeout_ms: u32 = 2_700_000;
-const app_server_contract_id = "codex-app-server-capabilities-v1";
+const app_server_contract_id = "codex-app-server-capabilities-v2";
+const legacy_app_server_contract_id = "codex-app-server-capabilities-v1";
 const structured_review_capability = "cas_structured_review_v1";
 
 const UsageText =
@@ -35,7 +36,7 @@ const UsageText =
     \\Run/start options:
     \\  --cwd DIR                        Workspace for the app-server.
     \\  --codex-path PATH                Exact Codex executable for this attempt.
-    \\  --code-mode-host URL             Explicit outbound Code Mode WebSocket host.
+    \\  --code-mode-host URL             Explicit outbound HTTP(S) Code Mode host.
     \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
     \\  --parent-mode MODE               Parent strategy: auto|fresh|reuse (default: auto).
     \\  --wait                           Keep the start process alive until the review turn reaches a terminal status;
@@ -2474,7 +2475,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const current_codex_path = runtime_gate.resolved_path;
     const current_codex_version = runtime_gate.version;
     if (!std.mem.eql(u8, record.codex_binary_digest orelse "", runtime_gate.binary_digest) or
-        !std.mem.eql(u8, record.app_server_contract_id orelse "", app_server_contract_id))
+        !reviewRecordContractSupported(record.app_server_contract_id))
     {
         try renderErrorAndExit(
             parsed.json,
@@ -2497,7 +2498,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             .{
                 .code = "review_tuple_mismatch",
                 .hint = "the recorded review attempt is bound to a different Codex binary " ++
-                    "digest or app-server contract",
+                    "digest or supported app-server record contract",
             },
         );
     }
@@ -2559,7 +2560,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             );
             defer current_tuple_for_replay.deinit(allocator);
             current_tuple_for_replay.codex_binary_digest = runtime_gate.binary_digest;
-            current_tuple_for_replay.app_server_contract_id = app_server_contract_id;
+            current_tuple_for_replay.app_server_contract_id =
+                record.app_server_contract_id orelse app_server_contract_id;
             current_tuple_for_replay.transport_kind = record.transport_kind orelse "websocket";
             current_tuple_for_replay.code_mode_host_digest = record.code_mode_host_digest;
             break :validation try reviewTupleCurrentnessFailureAlloc(
@@ -2808,7 +2810,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     };
     defer current_tuple.deinit(allocator);
     current_tuple.codex_binary_digest = runtime_gate.binary_digest;
-    current_tuple.app_server_contract_id = app_server_contract_id;
+    current_tuple.app_server_contract_id =
+        record.app_server_contract_id orelse app_server_contract_id;
     current_tuple.transport_kind = record.transport_kind orelse "websocket";
     current_tuple.code_mode_host_digest = record.code_mode_host_digest;
     var terminal_status_from_grace = false;
@@ -3051,7 +3054,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         current_codex_path,
         current_codex_version,
         runtime_gate.binary_digest,
-        app_server_contract_id,
+        record.app_server_contract_id orelse app_server_contract_id,
         record.transport_kind orelse "websocket",
         record.code_mode_host_digest,
     );
@@ -5929,11 +5932,7 @@ fn validateCurrentSessionRecordAlloc(
         nonEmptyOptional(record.event_log_path) == null or
         nonEmptyOptional(record.codex_version) == null or
         nonEmptyOptional(record.codex_binary_digest) == null or
-        !std.mem.eql(
-            u8,
-            record.app_server_contract_id orelse "",
-            app_server_contract_id,
-        ) or
+        !reviewRecordContractSupported(record.app_server_contract_id) or
         !code_mode_identity_complete or
         nonEmptyOptional(record.compatibility_verdict) == null or
         nonEmptyOptional(record.base_sha) == null or
@@ -5972,6 +5971,12 @@ fn validateCurrentSessionRecordAlloc(
     {
         return error.InvalidSessionRecord;
     }
+}
+
+fn reviewRecordContractSupported(contract_id: ?[]const u8) bool {
+    const value = contract_id orelse return false;
+    return std.mem.eql(u8, value, app_server_contract_id) or
+        std.mem.eql(u8, value, legacy_app_server_contract_id);
 }
 
 fn latestSessionRecordPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
@@ -12529,7 +12534,7 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v2\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\"," ++
@@ -12577,7 +12582,7 @@ test "session record owns and validates workflow binding across reload" {
             "\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\"," ++
             "\"codex_version\":\"codex-cli 0.146.0\",\"resolved_codex_path\":\"/bin/codex\"," ++
             "\"codex_binary_digest\":\"sha256:test\"," ++
-            "\"app_server_contract_id\":\"codex-app-server-capabilities-v1\"," ++
+            "\"app_server_contract_id\":\"codex-app-server-capabilities-v2\"," ++
             "\"compatibility_verdict\":\"compatible\",\"managed_server_pid\":1," ++
             "\"managed_server_listen_url\":\"ws://127.0.0.1:1\",\"orphan_ttl_seconds\":1," ++
             "\"accountFingerprint\":\"acct:test\",\"accountFingerprintReducedProtection\":false," ++
@@ -12673,6 +12678,23 @@ test "current session record rejects relocation and incomplete custody" {
         std.testing.allocator,
         "/repo/.ledger/cas/review_sessions/thr.json",
         record,
+    );
+    var legacy_contract = record;
+    legacy_contract.app_server_contract_id = legacy_app_server_contract_id;
+    try validateCurrentSessionRecordAlloc(
+        std.testing.allocator,
+        "/repo/.ledger/cas/review_sessions/thr.json",
+        legacy_contract,
+    );
+    var unknown_contract = record;
+    unknown_contract.app_server_contract_id = "codex-app-server-capabilities-v0";
+    try std.testing.expectError(
+        error.InvalidSessionRecord,
+        validateCurrentSessionRecordAlloc(
+            std.testing.allocator,
+            "/repo/.ledger/cas/review_sessions/thr.json",
+            unknown_contract,
+        ),
     );
     var missing_identity = record;
     missing_identity.codex_version = "codex-cli 0.1.0";
@@ -16358,6 +16380,25 @@ test "review tuple currentness rejects runtime principal and thread drift" {
         stored,
     )) == null);
 
+    var legacy_stored = stored;
+    legacy_stored.app_server_contract_id = legacy_app_server_contract_id;
+    const legacy_current = legacy_stored;
+    try std.testing.expect((try reviewTupleCurrentnessFailureAlloc(
+        std.testing.allocator,
+        legacy_stored,
+        legacy_current,
+    )) == null);
+    var rewritten_contract = legacy_current;
+    rewritten_contract.app_server_contract_id = app_server_contract_id;
+    try std.testing.expectEqualStrings(
+        "review_tuple_mismatch",
+        (try reviewTupleCurrentnessFailureAlloc(
+            std.testing.allocator,
+            legacy_stored,
+            rewritten_contract,
+        )).?.code,
+    );
+
     var runtime_drift = stored;
     runtime_drift.resolved_codex_version = "codex 0.2.0";
     try std.testing.expectEqualStrings(
@@ -17725,7 +17766,7 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
 test "review runtime gate requires live managed structured-review preflight" {
     const allocator = std.testing.allocator;
     const valid =
-        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v2","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
     var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
     defer gate.deinit(allocator);
@@ -17733,7 +17774,7 @@ test "review runtime gate requires live managed structured-review preflight" {
     try std.testing.expectEqualStrings("custom Codex development build", gate.version);
 
     const schema_only =
-        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v1","codex":{"path":"/tmp/codex","version":"0.146.0","banner":"codex-cli 0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
+        \\{"schema":"cas-app-server-preflight/v1","action":"schema","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v2","codex":{"path":"/tmp/codex","version":"0.146.0","banner":"codex-cli 0.146.0","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[]}
     ;
     try std.testing.expectError(
         error.IncompatibleReviewRuntime,

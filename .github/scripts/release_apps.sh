@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas synoptic ledger memory-note img)
+apps=(seq lift cas ledger memory-note img)
 
 resolve_ref() {
   local ref=$1
@@ -28,6 +28,16 @@ case "$mode" in
     declare -A affected=()
     build_changed=0
     package_changed=0
+    retired_apps=()
+
+    while IFS=$'\t' read -r status path; do
+      if [[ "$status" != D || "$path" != apps/*/VERSION ]]; then
+        continue
+      fi
+      retired_app=${path#apps/}
+      retired_app=${retired_app%/VERSION}
+      retired_apps+=("$retired_app")
+    done < <(git diff --name-status "$base" "$head" -- 'apps/*/VERSION')
 
     mark_app() {
       affected["$1"]=1
@@ -57,7 +67,6 @@ case "$mode" in
 
     mark_cas_runtime_consumers() {
       mark_app cas
-      mark_app synoptic
     }
 
     mark_store_consumers() {
@@ -65,6 +74,18 @@ case "$mode" in
       mark_app cas
       mark_app ledger
       mark_app memory-note
+    }
+
+    is_retired_build_line() {
+      local raw=$1
+      local app token
+      for app in "${retired_apps[@]}"; do
+        token=${app//-/_}
+        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])" <<<"$raw"; then
+          return 0
+        fi
+      done
+      return 1
     }
 
     classify_build_line() {
@@ -128,10 +149,6 @@ case "$mode" in
       fi
       if grep -Eqi '(^|[^[:alnum:]_])cas([^[:alnum:]_]|$)|cas[_\.]' <<<"$raw"; then
         mark_app cas
-        matched=0
-      fi
-      if grep -Eq '(^|[^[:alnum:]_])[[:alnum:]_]*[Ss]ynoptic[[:alnum:]_]*([^[:alnum:]_]|$)' <<<"$raw"; then
-        mark_app synoptic
         matched=0
       fi
       if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
@@ -198,9 +215,6 @@ case "$mode" in
         .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
-        .github/workflows/release-synoptic.yml)
-          mark_app synoptic
-          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -215,9 +229,6 @@ case "$mode" in
           for app in "${apps[@]}"; do
             case "$path" in
               "apps/$app/README.md")
-                if [[ "$app" == synoptic ]]; then
-                  mark_app synoptic
-                fi
                 matched=1
                 ;;
               "apps/$app/"*)
@@ -249,25 +260,17 @@ case "$mode" in
         local change hunk_text raw
         local changed_matched=0
         local context_matched=0
-        local release_safe_runtime_hunk=0
         local substantive_unknown=0
         local retired_app_deletion=0
         local has_addition=0
         hunk_text=$(printf '%s\n' "${build_hunk[@]}")
-        if grep -Eq 'const core_json_release_safe = b\.createModule\(' <<<"$hunk_text" &&
-           grep -Eq 'const cas_hook_policy_release_safe = b\.createModule\(' <<<"$hunk_text" &&
-           grep -Eq 'const cas_runtime_release_safe = b\.createModule\(' <<<"$hunk_text" &&
-           grep -Eq 'const synoptic_release_safe_root = b\.createModule\(' <<<"$hunk_text"; then
-          release_safe_runtime_hunk=1
-        fi
         for change in "${build_changed_lines[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
           fi
-          if [[ "$release_safe_runtime_hunk" -eq 1 ]] &&
-             grep -Eq '^[[:space:]]*(const core_json_release_safe = b\.createModule\(\.\{|\.root_source_file = b\.path\("libs/core/src/json_helpers\.zig"\),)$' <<<"$raw"; then
-            mark_cas_runtime_consumers
+          if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
+            retired_app_deletion=1
           elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then

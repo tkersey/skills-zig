@@ -540,7 +540,7 @@ fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenari
 }
 
 const app_server_feature_probe_ids = [_][]const u8{
-    "thread-pinning-round-trip",
+    "thread-sections-round-trip",
     "paginated-fork",
     "ephemeral-fork",
     "external-import-history",
@@ -981,7 +981,7 @@ test "feature probe summary consumes exact live preflight rows" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "[{\"id\":\"thread-pinning-round-trip\",\"status\":\"passed\"}," ++
+        "[{\"id\":\"thread-sections-round-trip\",\"status\":\"passed\"}," ++
             "{\"id\":\"paginated-fork\",\"status\":\"passed\"}," ++
             "{\"id\":\"ephemeral-fork\",\"status\":\"failed\"}," ++
             "{\"id\":\"external-import-history\",\"status\":\"passed\"}]",

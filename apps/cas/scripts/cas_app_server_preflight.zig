@@ -23,7 +23,7 @@ const Usage =
 
 const Action = enum { schema, preflight };
 
-const pinning_probe_thread_id = "019dd901-0000-7000-8000-000000000146";
+const section_probe_thread_id = "019dd901-0000-7000-8000-000000000146";
 const internal_model_fixture_marker = "CAS_INTERNAL_MODEL_FIXTURE";
 const code_mode_fixture_marker_value = "code-mode-owner-probe-v1";
 const review_fixture_marker_value = "structured-review-probe-v1";
@@ -212,7 +212,7 @@ const ProbeState = struct {
     remote_code_mode_host: probes.LiveWitness = .{},
     endpoint_identity: ?[]u8 = null,
     endpoint_runtime: ?EndpointRuntimeIdentity = null,
-    thread_pinning: probes.LiveWitness = .{},
+    thread_sections: probes.LiveWitness = .{},
     paginated_fork: probes.LiveWitness = .{},
     ephemeral_fork: probes.LiveWitness = .{},
     paginated_session_inquiry: probes.LiveWitness = .{},
@@ -226,7 +226,7 @@ const ProbeState = struct {
     }
 
     fn setFeatures(self: *ProbeState, witnesses: FeatureWitnesses) void {
-        self.thread_pinning = witnesses.thread_pinning;
+        self.thread_sections = witnesses.thread_sections;
         self.paginated_fork = witnesses.paginated_fork;
         self.ephemeral_fork = witnesses.ephemeral_fork;
         self.paginated_session_inquiry = witnesses.paginated_session_inquiry;
@@ -386,7 +386,7 @@ fn probeInputs(
         .handler_coverage_passed = handler_coverage_passed,
         .retry_passed = probes.retryKernelProbe(allocator),
         .remote_code_mode_host = state.remote_code_mode_host,
-        .thread_pinning = state.thread_pinning,
+        .thread_sections = state.thread_sections,
         .paginated_fork = state.paginated_fork,
         .ephemeral_fork = state.ephemeral_fork,
         .paginated_session_inquiry = state.paginated_session_inquiry,
@@ -1274,7 +1274,7 @@ fn collectLifecycle(
 fn isolatedFailures(err: anyerror) FeatureWitnesses {
     const error_name = @errorName(err);
     return .{
-        .thread_pinning = probes.LiveWitness.failed(
+        .thread_sections = probes.LiveWitness.failed(
             "isolated_thread_probe_setup_failed",
             error_name,
         ),
@@ -1309,8 +1309,8 @@ fn externalEndpointUnboundWitnesses() FeatureWitnesses {
     const hint = "required behavior cannot be credited without a CAS-owned " ++
         "isolated endpoint";
     return .{
-        .thread_pinning = probes.LiveWitness.failed(
-            "endpoint_thread_pinning_unbound",
+        .thread_sections = probes.LiveWitness.failed(
+            "endpoint_thread_sections_unbound",
             hint,
         ),
         .paginated_fork = probes.LiveWitness.failed(
@@ -1675,7 +1675,7 @@ fn connectManagedLifecycle(
 }
 
 const FeatureWitnesses = struct {
-    thread_pinning: probes.LiveWitness,
+    thread_sections: probes.LiveWitness,
     paginated_fork: probes.LiveWitness,
     ephemeral_fork: probes.LiveWitness,
     paginated_session_inquiry: probes.LiveWitness,
@@ -1841,11 +1841,11 @@ fn runIsolatedWitnessClient(
         client.deinit();
     }
     return .{
-        .thread_pinning = probes.threadPinningProbe(
+        .thread_sections = probes.threadSectionsProbe(
             allocator,
             &client,
             cwd,
-            pinning_probe_thread_id,
+            section_probe_thread_id,
         ),
         .paginated_fork = probes.paginatedForkProbe(allocator, &client),
         .ephemeral_fork = probes.ephemeralForkProbe(allocator, &client),
@@ -1943,8 +1943,8 @@ fn createPinningProbeRollout(
         .timestamp = timestamp,
         .type = "session_meta",
         .payload = .{
-            .session_id = pinning_probe_thread_id,
-            .id = pinning_probe_thread_id,
+            .session_id = section_probe_thread_id,
+            .id = section_probe_thread_id,
             .timestamp = timestamp,
             .cwd = cwd,
             .originator = "cas-app-server-preflight",
@@ -1958,11 +1958,11 @@ fn createPinningProbeRollout(
     const response_item =
         "{\"timestamp\":\"2026-08-04T00:00:00Z\",\"type\":\"response_item\"," ++
         "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{" ++
-        "\"type\":\"input_text\",\"text\":\"CAS pinning conformance fixture\"}]}}";
+        "\"type\":\"input_text\",\"text\":\"CAS section conformance fixture\"}]}}";
     const event =
         "{\"timestamp\":\"2026-08-04T00:00:00Z\",\"type\":\"event_msg\"," ++
         "\"payload\":{\"type\":\"user_message\"," ++
-        "\"message\":\"CAS pinning conformance fixture\",\"kind\":\"plain\"}}";
+        "\"message\":\"CAS section conformance fixture\",\"kind\":\"plain\"}}";
     const contents = try std.fmt.allocPrint(
         allocator,
         "{s}\n{s}\n{s}\n",
@@ -1972,7 +1972,7 @@ fn createPinningProbeRollout(
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}/rollout-2026-08-04T00-00-00-{s}.jsonl",
-        .{ day, pinning_probe_thread_id },
+        .{ day, section_probe_thread_id },
     );
     defer allocator.free(path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
@@ -2282,7 +2282,7 @@ test "external endpoint keeps transport proof separate from unbound feature proo
         .lifecycle_passed = true,
         .handler_coverage_passed = true,
         .retry_passed = true,
-        .thread_pinning = feature.thread_pinning,
+        .thread_sections = feature.thread_sections,
         .paginated_fork = feature.paginated_fork,
         .ephemeral_fork = feature.ephemeral_fork,
         .paginated_session_inquiry = feature.paginated_session_inquiry,
