@@ -4156,7 +4156,9 @@ fn fetchPaginatedReviewStatus(
             "thread/read",
             "error",
             detail,
-        ) catch {};
+        ) catch |append_err| switch (append_err) {
+            else => {},
+        };
         if (live_notifications) |notifications| {
             try absorbLiveReviewNotifications(
                 allocator,
@@ -4233,7 +4235,9 @@ fn fetchPaginatedReviewStatus(
             "thread/turns/list",
             "error",
             detail,
-        ) catch {};
+        ) catch |append_err| switch (append_err) {
+            else => {},
+        };
         if (live_notifications) |notifications| {
             try absorbLiveReviewNotifications(
                 allocator,
