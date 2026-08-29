@@ -16,6 +16,7 @@ const HelpSurface = core_cli.HelpSurface{
 
 const default_control_timeout_ms: u32 = 300_000;
 const default_review_timeout_ms: u32 = 2_700_000;
+const review_result_materialization_grace_ms: i64 = 2_000;
 const app_server_contract_id = "codex-app-server-capabilities-v2";
 const legacy_app_server_contract_id = "codex-app-server-capabilities-v1";
 const structured_review_capability = "cas_structured_review_v1";
@@ -3931,6 +3932,17 @@ fn fetchReviewStatus(
     live_notifications: ?*LiveReviewNotificationState,
     thread_read_persistence: ThreadReadPersistence,
 ) !ReviewStatus {
+    if (live_notifications != null or review_turn_id != null) {
+        return fetchPaginatedReviewStatus(
+            allocator,
+            client,
+            review_thread_id,
+            review_turn_id,
+            event_log_path,
+            live_notifications,
+            thread_read_persistence,
+        );
+    }
     const params_json = try stringifyAnyAlloc(allocator, .{
         .threadId = review_thread_id,
         .includeTurns = true,
@@ -4108,6 +4120,322 @@ fn fetchReviewStatus(
         return resumed_status;
     }
     return status;
+}
+
+fn fetchPaginatedReviewStatus(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    review_thread_id: []const u8,
+    review_turn_id: ?[]const u8,
+    event_log_path: []const u8,
+    live_notifications: ?*LiveReviewNotificationState,
+    persistence: ThreadReadPersistence,
+) !ReviewStatus {
+    const thread_params = try stringifyAnyAlloc(allocator, .{
+        .threadId = review_thread_id,
+        .includeTurns = false,
+    });
+    defer allocator.free(thread_params);
+    var captured_notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (captured_notifications.items) |line| allocator.free(line);
+        captured_notifications.deinit(allocator);
+    }
+    const thread_json = (if (live_notifications != null)
+        client.requestJsonCaptureNotifications(
+            "thread/read",
+            thread_params,
+            &captured_notifications,
+        )
+    else
+        client.requestJson("thread/read", thread_params)) catch |err| {
+        const detail = client.lastError() orelse @errorName(err);
+        appendLogRecord(
+            allocator,
+            event_log_path,
+            "thread/read",
+            "error",
+            detail,
+        ) catch {};
+        if (live_notifications) |notifications| {
+            try absorbLiveReviewNotifications(
+                allocator,
+                &captured_notifications,
+                event_log_path,
+                notifications,
+            );
+        }
+        if (err != error.RequestFailed or !reviewHistoryIsNotMaterialized(detail)) {
+            return err;
+        }
+        var pending = try unmaterializedReviewStatusAlloc(allocator, detail);
+        errdefer pending.deinit(allocator);
+        try populateReviewEvidenceFromLiveNotifications(
+            allocator,
+            &pending,
+            live_notifications,
+        );
+        return pending;
+    };
+    defer allocator.free(thread_json);
+    if (live_notifications) |notifications| {
+        try absorbLiveReviewNotifications(
+            allocator,
+            &captured_notifications,
+            event_log_path,
+            notifications,
+        );
+    }
+    var status = try parseReviewStatusAlloc(
+        allocator,
+        thread_json,
+        false,
+        review_thread_id,
+        review_turn_id,
+    );
+    errdefer status.deinit(allocator);
+    try populateReviewEvidenceFromLiveNotifications(
+        allocator,
+        &status,
+        live_notifications,
+    );
+    var resume_attempted = try maybeResumeMaterializedThread(
+        allocator,
+        client,
+        review_thread_id,
+        event_log_path,
+        &status,
+    );
+
+    const turns_params = try stringifyAnyAlloc(allocator, .{
+        .threadId = review_thread_id,
+        .limit = @as(u32, 10),
+        .sortDirection = "desc",
+        .itemsView = "full",
+    });
+    defer allocator.free(turns_params);
+    for (captured_notifications.items) |line| allocator.free(line);
+    captured_notifications.clearRetainingCapacity();
+    const turns_json = requestPaginatedReviewTurns(
+        allocator,
+        client,
+        review_thread_id,
+        event_log_path,
+        turns_params,
+        live_notifications,
+        &captured_notifications,
+        &resume_attempted,
+    ) catch |err| {
+        const detail = client.lastError() orelse @errorName(err);
+        appendLogRecord(
+            allocator,
+            event_log_path,
+            "thread/turns/list",
+            "error",
+            detail,
+        ) catch {};
+        if (live_notifications) |notifications| {
+            try absorbLiveReviewNotifications(
+                allocator,
+                &captured_notifications,
+                event_log_path,
+                notifications,
+            );
+        }
+        try populateReviewEvidenceFromLiveNotifications(
+            allocator,
+            &status,
+            live_notifications,
+        );
+        if (err != error.RequestFailed) return err;
+        try populateReviewResult(allocator, &status, review_turn_id);
+        try persistPaginatedReviewStatus(
+            allocator,
+            event_log_path,
+            thread_json,
+            null,
+            persistence,
+            &status,
+        );
+        return status;
+    };
+    defer allocator.free(turns_json);
+    if (live_notifications) |notifications| {
+        try absorbLiveReviewNotifications(
+            allocator,
+            &captured_notifications,
+            event_log_path,
+            notifications,
+        );
+    }
+    try populatePaginatedReviewTurn(
+        allocator,
+        turns_json,
+        review_turn_id,
+        &status,
+    );
+    try populateReviewEvidenceFromLiveNotifications(
+        allocator,
+        &status,
+        live_notifications,
+    );
+    try populateReviewResult(allocator, &status, review_turn_id);
+    try persistPaginatedReviewStatus(
+        allocator,
+        event_log_path,
+        thread_json,
+        turns_json,
+        persistence,
+        &status,
+    );
+    return status;
+}
+
+fn requestPaginatedReviewTurns(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    review_thread_id: []const u8,
+    event_log_path: []const u8,
+    turns_params: []const u8,
+    live_notifications: ?*LiveReviewNotificationState,
+    captured_notifications: *std.ArrayList([]u8),
+    resume_attempted: *bool,
+) ![]u8 {
+    return requestPaginatedReviewTurnsOnce(
+        client,
+        turns_params,
+        live_notifications,
+        captured_notifications,
+    ) catch |request_err| retry: {
+        if (request_err != error.RequestFailed or resume_attempted.*) {
+            return request_err;
+        }
+        resume_attempted.* = true;
+        if (!try resumeReviewThread(
+            allocator,
+            client,
+            review_thread_id,
+            event_log_path,
+        )) return request_err;
+        break :retry requestPaginatedReviewTurnsOnce(
+            client,
+            turns_params,
+            live_notifications,
+            captured_notifications,
+        );
+    };
+}
+
+fn requestPaginatedReviewTurnsOnce(
+    client: *cas.Client,
+    turns_params: []const u8,
+    live_notifications: ?*LiveReviewNotificationState,
+    captured_notifications: *std.ArrayList([]u8),
+) ![]u8 {
+    return if (live_notifications != null)
+        client.requestJsonCaptureNotifications(
+            "thread/turns/list",
+            turns_params,
+            captured_notifications,
+        )
+    else
+        client.requestJson("thread/turns/list", turns_params);
+}
+
+fn populatePaginatedReviewTurn(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    expected_turn_id: ?[]const u8,
+    status: *ReviewStatus,
+) !void {
+    const expected = expected_turn_id orelse return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidResponse,
+    };
+    const turns = switch (root.get("data") orelse return error.InvalidResponse) {
+        .array => |value| value,
+        else => return error.InvalidResponse,
+    };
+    status.turn_count = turns.items.len;
+    var selected: ?std.json.ObjectMap = null;
+    for (turns.items) |turn_value| {
+        const turn = switch (turn_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        const observed = core_json.stringField(turn, "id") orelse continue;
+        if (!std.mem.eql(u8, observed, expected)) continue;
+        if (selected != null) return error.DuplicateReviewTurn;
+        selected = turn;
+    }
+    const turn = selected orelse return;
+    const turn_status = core_json.stringField(turn, "status") orelse
+        return error.InvalidResponse;
+    const owned_turn_status = try allocator.dupe(u8, turn_status);
+    allocator.free(status.turn_status);
+    status.turn_status = owned_turn_status;
+    status.materialized = true;
+    if (status.turn_error_message) |message| {
+        allocator.free(message);
+        status.turn_error_message = null;
+    }
+    if (turn.get("error")) |error_value| {
+        status.turn_error_message = try extractErrorMessageAlloc(
+            allocator,
+            error_value,
+        );
+    }
+    if (turn.get("items")) |items_value| switch (items_value) {
+        .array => |items| for (items.items) |item_value| {
+            const item = switch (item_value) {
+                .object => |value| value,
+                else => continue,
+            };
+            const item_type = core_json.stringField(item, "type") orelse continue;
+            if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
+                status.last_turn_has_entered_review_mode = true;
+            }
+            if (std.mem.eql(u8, item_type, "exitedReviewMode")) {
+                status.last_turn_has_exited_review_mode = true;
+                if (status.review_text == null) {
+                    if (core_json.stringField(item, "review")) |review_text| {
+                        status.review_text = try allocator.dupe(u8, review_text);
+                    }
+                }
+            }
+        },
+        else => {},
+    };
+}
+
+fn persistPaginatedReviewStatus(
+    allocator: std.mem.Allocator,
+    event_log_path: []const u8,
+    thread_json: []const u8,
+    turns_json: ?[]const u8,
+    persistence: ThreadReadPersistence,
+    status: *const ReviewStatus,
+) !void {
+    if (persistence == .terminal_only and !reviewStatusCompletesWait(status)) return;
+    try appendLogRecord(
+        allocator,
+        event_log_path,
+        "thread/read",
+        "response",
+        thread_json,
+    );
+    if (turns_json) |page| {
+        try appendLogRecord(
+            allocator,
+            event_log_path,
+            "thread/turns/list",
+            "response",
+            page,
+        );
+    }
 }
 
 fn fetchReviewStatusAfterWaitTimeout(
@@ -4416,8 +4744,9 @@ fn populateReviewEvidenceFromLiveNotifications(
     status.last_turn_has_exited_review_mode =
         status.last_turn_has_exited_review_mode or state.saw_exited_review_mode;
     if (state.observed_terminal_status) |observed_status| {
+        const owned_turn_status = try allocator.dupe(u8, observed_status);
         allocator.free(status.turn_status);
-        status.turn_status = try allocator.dupe(u8, observed_status);
+        status.turn_status = owned_turn_status;
     }
     if (status.turn_error_message == null) {
         if (state.observed_turn_error_message) |message| {
@@ -4437,9 +4766,22 @@ fn maybeResumeMaterializedThread(
     event_log_path: []const u8,
     status: *const ReviewStatus,
 ) !bool {
-    if (!status.materialized) return false;
     if (!std.mem.eql(u8, status.thread_status, "notLoaded")) return false;
 
+    return resumeReviewThread(
+        allocator,
+        client,
+        review_thread_id,
+        event_log_path,
+    );
+}
+
+fn resumeReviewThread(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    review_thread_id: []const u8,
+    event_log_path: []const u8,
+) !bool {
     const params_json = try buildThreadResumeParamsJson(
         allocator,
         review_thread_id,
@@ -4894,7 +5236,6 @@ fn reviewStatusAwaitsStructuredCompletion(
 ) bool {
     return std.mem.eql(u8, status.turn_status, "completed") and
         status.last_turn_has_entered_review_mode and
-        !status.last_turn_has_exited_review_mode and
         !status.review_result_available;
 }
 
@@ -4946,6 +5287,7 @@ fn waitForReviewCompletion(
         .review_turn_id = review_turn_id,
     };
     defer live_notifications.deinit(allocator);
+    var completed_without_result_since_ms: ?i64 = null;
     while (true) {
         // The bound review thread is the sole authority for both liveness and
         // completion. Poll it directly so an unrelated app-server method can
@@ -4962,14 +5304,20 @@ fn waitForReviewCompletion(
             error.ConnectionTimedOut => return error.WaitTimedOut,
             else => return err,
         };
+        const now_ms = monotonicMilliseconds();
         if (reviewStatusCompletesWait(&latest)) return latest;
+        if (reviewStatusAwaitsStructuredCompletion(&latest)) {
+            if (completed_without_result_since_ms == null) {
+                completed_without_result_since_ms = now_ms;
+            } else if (now_ms - completed_without_result_since_ms.? >=
+                review_result_materialization_grace_ms)
+            {
+                return latest;
+            }
+        } else {
+            completed_without_result_since_ms = null;
+        }
         latest.deinit(allocator);
-        const now_ms = @divFloor(
-            std.Io.Clock.awake.now(
-                std.Io.Threaded.global_single_threaded.io(),
-            ).nanoseconds,
-            1_000_000,
-        );
         if (now_ms >= deadline_ms) return error.WaitTimedOut;
         const remaining_ms: u32 = @intCast(deadline_ms - now_ms);
         std.Io.sleep(
@@ -5787,8 +6135,9 @@ fn applyRecordedStatusOverlay(allocator: std.mem.Allocator, record: SessionRecor
     if (std.mem.eql(u8, record.last_observed_status, "interruptRequested") and
         std.mem.eql(u8, status.turn_status, "inProgress"))
     {
+        const owned_turn_status = try allocator.dupe(u8, "interruptRequested");
         allocator.free(status.turn_status);
-        status.turn_status = try allocator.dupe(u8, "interruptRequested");
+        status.turn_status = owned_turn_status;
     }
 }
 
@@ -9545,10 +9894,15 @@ fn readReviewResultJsonFromRolloutAlloc(
         if (!event_turn_matches) continue;
 
         const payload_type = core_json.stringField(payload_obj, "type") orelse continue;
-        if (!std.mem.eql(u8, payload_type, "exited_review_mode")) continue;
-
-        const review_output = payload_obj.get("review_output") orelse
-            return error.InvalidReviewOutput;
+        const review_output = if (std.mem.eql(u8, payload_type, "exited_review_mode"))
+            payload_obj.get("review_output") orelse return error.InvalidReviewOutput
+        else if (std.mem.eql(u8, payload_type, "item_completed")) new_item: {
+            const item_obj = core_json.objectField(payload_obj, "item") orelse continue;
+            const item_type = core_json.stringField(item_obj, "type") orelse continue;
+            if (!std.mem.eql(u8, item_type, "ExitedReviewMode")) continue;
+            break :new_item item_obj.get("review_output") orelse
+                return error.InvalidReviewOutput;
+        } else continue;
         const review_output_obj = switch (review_output) {
             .object => |obj| obj,
             else => return error.InvalidReviewOutput,
@@ -15597,6 +15951,66 @@ test "parseReviewStatusAlloc handles materialized and pending states" {
     try std.testing.expect(!inline_pending.materialized);
 }
 
+test "populatePaginatedReviewTurn binds exact live review turn" {
+    const allocator = std.testing.allocator;
+    var pending = try makeDisconnectedReviewStatus(allocator);
+    defer pending.deinit(allocator);
+    try populatePaginatedReviewTurn(
+        allocator,
+        "{\"data\":[{\"id\":\"turn-review\",\"status\":\"inProgress\"," ++
+            "\"error\":null,\"items\":[{\"type\":\"enteredReviewMode\"}]}]}",
+        "turn-review",
+        &pending,
+    );
+    try std.testing.expect(pending.materialized);
+    try std.testing.expectEqualStrings("inProgress", pending.turn_status);
+    try std.testing.expect(pending.last_turn_has_entered_review_mode);
+    try std.testing.expect(!pending.last_turn_has_exited_review_mode);
+
+    var completed = try makeDisconnectedReviewStatus(allocator);
+    defer completed.deinit(allocator);
+    try populatePaginatedReviewTurn(
+        allocator,
+        "{\"data\":[{\"id\":\"turn-review\",\"status\":\"completed\"," ++
+            "\"error\":null,\"items\":[{\"type\":\"enteredReviewMode\"}," ++
+            "{\"type\":\"exitedReviewMode\",\"review\":\"clean\"}]}]}",
+        "turn-review",
+        &completed,
+    );
+    try std.testing.expectEqualStrings("completed", completed.turn_status);
+    try std.testing.expect(completed.last_turn_has_entered_review_mode);
+    try std.testing.expect(completed.last_turn_has_exited_review_mode);
+    try std.testing.expectEqualStrings("clean", completed.review_text.?);
+}
+
+test "populatePaginatedReviewTurn ignores pending omission and rejects duplicates" {
+    const allocator = std.testing.allocator;
+    var omitted = try makeDisconnectedReviewStatus(allocator);
+    defer omitted.deinit(allocator);
+    try populatePaginatedReviewTurn(
+        allocator,
+        "{\"data\":[{\"id\":\"turn-other\",\"status\":\"completed\"," ++
+            "\"items\":[]}]}",
+        "turn-review",
+        &omitted,
+    );
+    try std.testing.expect(!omitted.materialized);
+
+    var duplicate = try makeDisconnectedReviewStatus(allocator);
+    defer duplicate.deinit(allocator);
+    try std.testing.expectError(
+        error.DuplicateReviewTurn,
+        populatePaginatedReviewTurn(
+            allocator,
+            "{\"data\":[{\"id\":\"turn-review\",\"status\":\"completed\"," ++
+                "\"items\":[]},{\"id\":\"turn-review\",\"status\":\"completed\"," ++
+                "\"items\":[]}]}",
+            "turn-review",
+            &duplicate,
+        ),
+    );
+}
+
 test "review history materialization classifier is narrow" {
     try std.testing.expect(reviewHistoryIsNotMaterialized(
         "includeTurns is unavailable while thread is not materialized yet",
@@ -15654,10 +16068,11 @@ test "inline partial review completion remains pending until structured exit" {
     try std.testing.expect(reviewStatusAwaitsStructuredCompletion(&status));
 
     status.last_turn_has_exited_review_mode = true;
-    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion(&status));
-    status.last_turn_has_exited_review_mode = false;
+    try std.testing.expect(reviewStatusAwaitsStructuredCompletion(&status));
+    try std.testing.expect(!reviewStatusCompletesWait(&status));
     status.review_result_available = true;
     try std.testing.expect(!reviewStatusAwaitsStructuredCompletion(&status));
+    try std.testing.expect(reviewStatusCompletesWait(&status));
     status.review_result_available = false;
     std.testing.allocator.free(status.turn_status);
     status.turn_status = try std.testing.allocator.dupe(u8, "failed");
@@ -15795,6 +16210,41 @@ test "readReviewResultJsonFromRolloutAlloc accepts event-local turn identity" {
         std.testing.allocator,
         rollout_path,
         "turn_1",
+    )).?;
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(
+        std.testing.allocator,
+        json,
+    ));
+}
+
+test "readReviewResultJsonFromRolloutAlloc accepts Codex 0.151 item completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rollout =
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"type\":\"item_completed\",\"thread_id\":\"thread-review\"," ++
+        "\"turn_id\":\"turn-review\",\"item\":{" ++
+        "\"type\":\"ExitedReviewMode\",\"review_output\":{" ++
+        "\"findings\":[],\"overall_correctness\":\"patch is correct\"," ++
+        "\"overall_explanation\":\"Clean.\"," ++
+        "\"overall_confidence_score\":1}}}}";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = rollout,
+    });
+    const rollout_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(rollout_path);
+
+    const json = (try readReviewResultJsonFromRolloutAlloc(
+        std.testing.allocator,
+        rollout_path,
+        "turn-review",
     )).?;
     defer std.testing.allocator.free(json);
     try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(

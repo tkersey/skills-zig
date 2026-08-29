@@ -3,7 +3,7 @@
   "contractId": "codex-app-server-capabilities-v2",
   "profiles": {
     "core": {"stableClientMethods":["initialize"],"stableServerRequests":[],"stableNotifications":[],"experimentalClientMethods":[]},
-    "review": {"stableClientMethods":["initialize","thread/start","thread/resume","thread/read","thread/delete","turn/interrupt","review/start"],"stableServerRequests":[],"stableNotifications":["turn/completed"],"experimentalClientMethods":[]},
+    "review": {"stableClientMethods":["initialize","thread/start","thread/resume","thread/read","thread/turns/list","thread/delete","turn/interrupt","review/start"],"stableServerRequests":[],"stableNotifications":["turn/completed"],"experimentalClientMethods":[]},
     "session-inquiry": {"stableClientMethods":["initialize","thread/start","thread/resume","thread/fork","thread/read","thread/delete","thread/revert","thread/turns/list","thread/items/list","turn/start","turn/interrupt"],"stableServerRequests":[],"stableNotifications":[],"experimentalClientMethods":[]},
     "full": {"fullSnapshot":true,"stableClientMethods":[],"stableServerRequests":[],"stableNotifications":[],"experimentalClientMethods":[]}
   },
@@ -33,7 +33,7 @@
       {"id":"thread-resume-turn-cursor","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadResumeResponse/properties/turnsBackwardsCursor","kind":"string","nullable":true},
       {"id":"thread-resume-item-cursor","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadResumeResponse/properties/itemsBackwardsCursor","kind":"string","nullable":true},
       {"id":"thread-revert-shape","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadRevertParams","kind":"object","nullable":false,"required":["threadId","beforeTurnId"]},
-      {"id":"thread-turns-list-stable","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadTurnsListParams","kind":"object","nullable":false,"required":["threadId"]},
+      {"id":"thread-turns-list-stable","profiles":["review","session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadTurnsListParams","kind":"object","nullable":false,"required":["threadId"]},
       {"id":"thread-items-list-stable","profiles":["session-inquiry","full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadItemsListParams","kind":"object","nullable":false,"required":["threadId"]},
       {"id":"review-start-shape","profiles":["review","full"],"document":"ClientRequest.json","pointer":"/definitions/ReviewStartParams","kind":"object","nullable":false,"required":["threadId","target"]},
       {"id":"review-start-wire-params","profiles":["review","full"],"document":"ClientRequest.json","variantPointer":"/oneOf","discriminator":"method","discriminatorValue":"review/start","pointer":"/properties/params","kind":"ref","nullable":false,"refEquals":"#/definitions/ReviewStartParams"},
@@ -97,7 +97,7 @@
       {"id":"fork-exclude-turns","profiles":["session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams/properties/excludeTurns","kind":"boolean","nullable":false},
       {"id":"fork-defer-goal-continuation","profiles":["session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams/properties/deferGoalContinuation","kind":"boolean","nullable":false},
       {"id":"fork-thread-id","profiles":["session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams","kind":"object","nullable":false,"required":["threadId"]},
-      {"id":"thread-turns-list-shape","profiles":["session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadTurnsListParams","kind":"object","nullable":false,"required":["threadId"]},
+      {"id":"thread-turns-list-shape","profiles":["review","session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadTurnsListParams","kind":"object","nullable":false,"required":["threadId"]},
       {"id":"thread-items-list-shape","profiles":["session-inquiry","full"],"document":"ClientRequest.json","pointer":"/definitions/ThreadItemsListParams","kind":"object","nullable":false,"required":["threadId"]},
       {"id":"turn-settings-update","profiles":["full"],"document":"ClientRequest.json","pointer":"/definitions/TurnSettingsUpdateParams","kind":"object","nullable":false,"required":["threadId","turnId"]}
     ]
