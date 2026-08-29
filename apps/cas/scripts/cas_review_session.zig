@@ -5443,6 +5443,10 @@ fn workflowDeadOwnerFailureInfo(lock: ReviewTupleLock) FailureInfo {
 
 fn workflowOwnedPostStartFailure(err: anyerror) FailureInfo {
     if (serverRequestProviderFailure(err)) |failure| return failure;
+    if (err == error.InvalidReviewOutput) return .{
+        .code = "review_output_invalid",
+        .hint = "structured reviewResult is malformed or internally inconsistent",
+    };
     if (err == error.ConnectionTimedOut or err == error.WaitTimedOut) {
         return terminalReviewTransportFailure("review_transport_timeout").?;
     }
@@ -10027,7 +10031,7 @@ fn validateReviewResultObject(
     const is_correct = std.mem.eql(u8, correctness, "patch is correct");
     const is_incorrect = std.mem.eql(u8, correctness, "patch is incorrect");
     if (!is_correct and !is_incorrect) return error.InvalidReviewOutput;
-    if ((findings.items.len == 0) != is_correct) return error.InvalidReviewOutput;
+    if (is_incorrect and findings.items.len == 0) return error.InvalidReviewOutput;
     return findings.items.len;
 }
 
@@ -12739,6 +12743,12 @@ test "proven pre-review-start failure is structurally retryable" {
 test "workflow owner failures are total and owner-active remains waiting" {
     const timeout = workflowOwnedPostStartFailure(error.ConnectionTimedOut);
     try std.testing.expectEqualStrings("review_transport_timeout", timeout.code);
+    const invalid_output = workflowOwnedPostStartFailure(error.InvalidReviewOutput);
+    try std.testing.expectEqualStrings("review_output_invalid", invalid_output.code);
+    try std.testing.expectEqualStrings(
+        "review_output",
+        failureClassForCode(invalid_output.code).?,
+    );
     const protocol = workflowOwnedPostStartFailure(error.InvalidAppServerResponse);
     try std.testing.expectEqualStrings("review_owner_failed", protocol.code);
     try std.testing.expectEqual(true, retryableSameTupleNowForCode(protocol.code).?);
@@ -15415,6 +15425,69 @@ test "structured result alone determines clean despite diagnostic prose" {
     try std.testing.expectEqualStrings("thr", verdict.get("reviewThreadId").?.string);
 }
 
+test "non-blocking structured finding remains a findings verdict" {
+    const review_result =
+        "{\"findings\":[{\"title\":\"[P2] Update documentation\"," ++
+        "\"body\":\"The behavior and documentation differ.\"," ++
+        "\"confidenceScore\":0.99,\"priority\":2,\"codeLocation\":{" ++
+        "\"absoluteFilePath\":\"/tmp/docs.md\",\"lineRange\":{" ++
+        "\"start\":5,\"end\":6}}}],\"overallCorrectness\":" ++
+        "\"patch is correct\",\"overallExplanation\":" ++
+        "\"Only a non-blocking issue remains.\",\"overallConfidenceScore\":0.97}";
+    var status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "loaded"),
+        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = true,
+        .review_result_available = true,
+        .review_result_source = "rollout_exited_review_mode",
+        .review_result_json = try std.testing.allocator.dupe(u8, review_result),
+        .review_text = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    const verdict_json = (try startWaitReviewVerdictJsonAlloc(
+        std.testing.allocator,
+        identity,
+        "thr",
+        "turn",
+        "/tmp/record.json",
+        "/tmp/events.jsonl",
+        .{
+            .account_fingerprint_reduced_protection = false,
+            .workflow_binding = testWorkflowBinding(),
+        },
+        status,
+        false,
+        true,
+        null,
+    )).?;
+    defer std.testing.allocator.free(verdict_json);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        verdict_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const verdict = parsed.value.object;
+    try std.testing.expectEqualStrings("findings", verdict.get("status").?.string);
+    try std.testing.expect(!verdict.get("clean").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), verdict.get("findingCount").?.integer);
+    try std.testing.expect(verdict.get("tupleVerdictExists").?.bool);
+}
+
 test "start wait verdict builder rejects notification-only proof" {
     const review_result =
         \\{"findings":[],"overallCorrectness":"patch is correct","overallExplanation":"No issues found.","overallConfidenceScore":0.92}
@@ -16257,6 +16330,46 @@ test "readReviewResultJsonFromRolloutAlloc accepts Codex 0.151 item completion" 
     ));
 }
 
+test "readReviewResultJsonFromRolloutAlloc accepts non-blocking finding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rollout =
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"type\":\"item_completed\",\"thread_id\":\"thread-review\"," ++
+        "\"turn_id\":\"turn-review\",\"item\":{" ++
+        "\"type\":\"ExitedReviewMode\",\"review_output\":{" ++
+        "\"findings\":[{\"title\":\"[P2] Update documentation\"," ++
+        "\"body\":\"The behavior and documentation differ.\"," ++
+        "\"confidence_score\":0.99,\"priority\":2,\"code_location\":{" ++
+        "\"absolute_file_path\":\"/tmp/docs.md\"," ++
+        "\"line_range\":{\"start\":5,\"end\":6}}}]," ++
+        "\"overall_correctness\":\"patch is correct\"," ++
+        "\"overall_explanation\":\"Only a non-blocking issue remains.\"," ++
+        "\"overall_confidence_score\":0.97}}}}";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = rollout,
+    });
+    const rollout_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(rollout_path);
+
+    const json = (try readReviewResultJsonFromRolloutAlloc(
+        std.testing.allocator,
+        rollout_path,
+        "turn-review",
+    )).?;
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqual(@as(usize, 1), try reviewFindingCount(
+        std.testing.allocator,
+        json,
+    ));
+}
+
 test "readReviewResultJsonFromRolloutAlloc event-local turn overrides legacy context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -16480,11 +16593,6 @@ const test_invalid_review_results = [_][]const u8{
         "\"overallExplanation\":\"issue\",\"overallConfidenceScore\":0.8}",
     "{\"findings\":[],\"overallCorrectness\":\"patch is incorrect\"," ++
         "\"overallExplanation\":\"issue\",\"overallConfidenceScore\":0.8}",
-    "{\"findings\":[{\"title\":\"title\",\"body\":\"body\"," ++
-        "\"confidenceScore\":0.8,\"priority\":1,\"codeLocation\":{" ++
-        "\"absoluteFilePath\":\"/tmp/a.zig\",\"lineRange\":{" ++
-        "\"start\":1,\"end\":1}}}],\"overallCorrectness\":\"patch is correct\"," ++
-        "\"overallExplanation\":\"issue\",\"overallConfidenceScore\":0.8}",
 };
 
 test "reviewFindingCount rejects malformed and inconsistent structured verdicts" {
@@ -16494,6 +16602,21 @@ test "reviewFindingCount rejects malformed and inconsistent structured verdicts"
             reviewFindingCount(std.testing.allocator, invalid),
         );
     }
+}
+
+test "reviewFindingCount retains non-blocking findings on correct patch" {
+    const result =
+        "{\"findings\":[{\"title\":\"[P2] Update documentation\"," ++
+        "\"body\":\"The behavior and documentation differ.\"," ++
+        "\"confidenceScore\":0.99,\"priority\":2,\"codeLocation\":{" ++
+        "\"absoluteFilePath\":\"/tmp/docs.md\",\"lineRange\":{" ++
+        "\"start\":5,\"end\":6}}}],\"overallCorrectness\":" ++
+        "\"patch is correct\",\"overallExplanation\":" ++
+        "\"Only a non-blocking issue remains.\",\"overallConfidenceScore\":0.97}";
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reviewFindingCount(std.testing.allocator, result),
+    );
 }
 
 test "terminalLockFailureForStatus maps malformed structured verdict to invalid output" {
