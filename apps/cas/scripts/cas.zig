@@ -17,12 +17,16 @@ const CapabilitiesText =
     \\cas_rer_opaque_request_binding_v1=true
     \\cas_workflow_bound_owner_lived_review_v1=true
     \\cas_review_scoped_instructions_v1=true
-    \\cas_app_server_contract_v1=true
+    \\cas_app_server_contract_v2=true
     \\cas_app_server_schema_probe_v1=true
-    \\cas_app_server_thread_pinning_v1=true
+    \\cas_app_server_thread_sections_v1=true
+    \\cas_app_server_stateful_session_v1=true
+    \\cas_app_server_daemon_v1=true
+    \\cas_app_server_authenticated_websocket_listener_v1=true
+    \\cas_app_server_grpc_code_mode_host_v1=true
+    \\cas_app_server_structured_errors_v1=true
     \\cas_app_server_paginated_fork_v1=true
     \\cas_app_server_ephemeral_paginated_fork_v1=true
-    \\cas_app_server_remote_code_mode_host_v1=true
     \\cas_app_server_executor_skill_resources_v1=true
     \\cas_app_server_external_import_history_v1=true
     \\cas_structured_review_v1=true
@@ -45,12 +49,16 @@ const CapabilitiesJson =
     \\      "cas_rer_opaque_request_binding_v1": true,
     \\      "cas_workflow_bound_owner_lived_review_v1": true,
     \\      "cas_review_scoped_instructions_v1": true,
-    \\      "cas_app_server_contract_v1": true,
+    \\      "cas_app_server_contract_v2": true,
     \\      "cas_app_server_schema_probe_v1": true,
-    \\      "cas_app_server_thread_pinning_v1": true,
+    \\      "cas_app_server_thread_sections_v1": true,
+    \\      "cas_app_server_stateful_session_v1": true,
+    \\      "cas_app_server_daemon_v1": true,
+    \\      "cas_app_server_authenticated_websocket_listener_v1": true,
+    \\      "cas_app_server_grpc_code_mode_host_v1": true,
+    \\      "cas_app_server_structured_errors_v1": true,
     \\      "cas_app_server_paginated_fork_v1": true,
     \\      "cas_app_server_ephemeral_paginated_fork_v1": true,
-    \\      "cas_app_server_remote_code_mode_host_v1": true,
     \\      "cas_app_server_executor_skill_resources_v1": true,
     \\      "cas_app_server_external_import_history_v1": true,
     \\      "cas_structured_review_v1": true,
@@ -61,10 +69,14 @@ const CapabilitiesJson =
 ;
 
 const CurrentContractCapabilities = [_][]const u8{
-    "cas_app_server_thread_pinning_v1",
+    "cas_app_server_thread_sections_v1",
+    "cas_app_server_stateful_session_v1",
+    "cas_app_server_daemon_v1",
+    "cas_app_server_authenticated_websocket_listener_v1",
+    "cas_app_server_grpc_code_mode_host_v1",
+    "cas_app_server_structured_errors_v1",
     "cas_app_server_paginated_fork_v1",
     "cas_app_server_ephemeral_paginated_fork_v1",
-    "cas_app_server_remote_code_mode_host_v1",
     "cas_app_server_executor_skill_resources_v1",
     "cas_app_server_external_import_history_v1",
     "cas_structured_review_v1",
@@ -96,6 +108,8 @@ const UsageText =
     \\  cas account status --cwd /path/to/repo --json
     \\  cas app-server schema --profile core --json
     \\  cas app-server preflight --profile core --app-server-transport stdio --json
+    \\  cas app-server session --listen stdio://
+    \\  cas app-server daemon version
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
@@ -137,6 +151,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, argv[1], "app-server") and argv.len > 2 and
+        (std.mem.eql(u8, argv[2], "session") or std.mem.eql(u8, argv[2], "daemon")))
+    {
+        const exit_code = runAppServerDelegate(allocator, init.io, argv[2..]) catch |err| {
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            try stderr_writer.interface.print("failed to launch Codex app-server: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.process.exit(exit_code);
+    }
+
     const target_name = resolveTarget(argv[1]) orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSubcommand", argv[1]);
     };
@@ -162,6 +187,47 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.process.exit(exit_code);
+}
+
+fn runAppServerDelegate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+) !u8 {
+    var child_argv: std.ArrayList([]const u8) = .empty;
+    defer child_argv.deinit(allocator);
+    try appendAppServerDelegateArgs(allocator, &child_argv, args);
+    return runCommand(allocator, io, child_argv.items);
+}
+
+fn appendAppServerDelegateArgs(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    args: []const []const u8,
+) !void {
+    if (args.len == 0 or
+        (!std.mem.eql(u8, args[0], "session") and !std.mem.eql(u8, args[0], "daemon")))
+    {
+        return error.InvalidAppServerDelegate;
+    }
+    var codex_path: []const u8 = "codex";
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], "--codex-path")) continue;
+        if (i + 1 >= args.len) return error.MissingCodexPath;
+        codex_path = args[i + 1];
+        i += 1;
+    }
+    try out.appendSlice(allocator, &.{ codex_path, "app-server" });
+    if (std.mem.eql(u8, args[0], "daemon")) try out.append(allocator, "daemon");
+    i = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--codex-path")) {
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, args[i]);
+    }
 }
 
 fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
@@ -202,7 +268,10 @@ fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) 
 
     var pid: std.c.pid_t = undefined;
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = std.c.posix_spawn(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp);
+    const spawn_rc = if (std.mem.indexOfScalar(u8, args[0], '/') == null)
+        std.c.posix_spawnp(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp)
+    else
+        std.c.posix_spawn(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp);
     if (spawn_rc != 0) return posixSpawnError(spawn_rc);
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
@@ -321,6 +390,38 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expect(resolveTarget("unknown") == null);
 }
 
+test "app-server session and daemon delegate without version pinning" {
+    var session: std.ArrayList([]const u8) = .empty;
+    defer session.deinit(std.testing.allocator);
+    try appendAppServerDelegateArgs(
+        std.testing.allocator,
+        &session,
+        &.{ "session", "--codex-path", "/opt/codex", "--listen", "stdio://" },
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/opt/codex", "app-server", "--listen", "stdio://" },
+        session.items,
+    );
+
+    var daemon: std.ArrayList([]const u8) = .empty;
+    defer daemon.deinit(std.testing.allocator);
+    try appendAppServerDelegateArgs(
+        std.testing.allocator,
+        &daemon,
+        &.{ "daemon", "version", "--codex-path", "codex-next" },
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "codex-next", "app-server", "daemon", "version" },
+        daemon.items,
+    );
+    try std.testing.expectError(
+        error.MissingCodexPath,
+        appendAppServerDelegateArgs(std.testing.allocator, &daemon, &.{ "session", "--codex-path" }),
+    );
+}
+
 test "review dispatcher advertises only the current public route" {
     try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas review run") != null);
     try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas review start") != null);
@@ -361,7 +462,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
-        "cas_app_server_contract_v1=true",
+        "cas_app_server_contract_v2=true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -399,7 +500,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),
-        "\"cas_app_server_contract_v1\": true",
+        "\"cas_app_server_contract_v2\": true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -429,7 +530,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);
     try std.testing.expect(features.get("cas_workflow_bound_owner_lived_review_v1").?.bool);
     try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
-    try std.testing.expect(features.get("cas_app_server_contract_v1").?.bool);
+    try std.testing.expect(features.get("cas_app_server_contract_v2").?.bool);
     try std.testing.expect(features.get("cas_app_server_schema_probe_v1").?.bool);
     try std.testing.expect(features.get("cas_automation_v1").?.bool);
     try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);

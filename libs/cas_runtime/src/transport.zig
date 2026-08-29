@@ -183,7 +183,7 @@ pub const CodeModeHost = struct {
     pub fn init(allocator: std.mem.Allocator, raw: []const u8) !CodeModeHost {
         if (raw.len == 0 or raw.len > max_endpoint_bytes) return error.InvalidCodeModeHost;
         try rejectUnsafeUrlBytes(raw);
-        const authority = try websocketAuthority(raw, true);
+        const authority = try codeModeAuthority(raw);
         if (authority.secure) {
             // Remote Code Mode is allowed only over TLS.
         } else if (!isLoopbackHost(authority.host)) {
@@ -192,8 +192,8 @@ pub const CodeModeHost = struct {
         const raw_owned = try allocator.dupe(u8, raw);
         errdefer allocator.free(raw_owned);
         const origin = try std.fmt.allocPrint(allocator, "{s}://{s}", .{
-            if (authority.secure) "wss" else "ws",
-            authority.authority_no_userinfo,
+            if (authority.secure) "https" else "http",
+            authority.authority,
         });
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
@@ -218,6 +218,60 @@ pub const CodeModeHost = struct {
         return out;
     }
 };
+
+const CodeModeAuthority = struct {
+    secure: bool,
+    authority: []const u8,
+    host: []const u8,
+};
+
+fn codeModeAuthority(raw: []const u8) !CodeModeAuthority {
+    const secure = std.mem.startsWith(u8, raw, "https://");
+    const prefix_len: usize = if (secure)
+        "https://".len
+    else if (std.mem.startsWith(u8, raw, "http://"))
+        "http://".len
+    else
+        return error.InvalidCodeModeHost;
+    const remainder = raw[prefix_len..];
+    const end = std.mem.indexOfAny(u8, remainder, "/?#") orelse remainder.len;
+    const authority = remainder[0..end];
+    if (authority.len == 0) return error.InvalidCodeModeHost;
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) {
+        return error.CodeModeHostUserinfoForbidden;
+    }
+    if (end != remainder.len and !std.mem.eql(u8, remainder[end..], "/")) {
+        return error.CodeModeHostRootRequired;
+    }
+    const host = if (authority[0] == '[') blk: {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse
+            return error.InvalidCodeModeHost;
+        const suffix = authority[close + 1 ..];
+        if (suffix.len > 0) {
+            if (suffix[0] != ':' or suffix.len == 1) return error.InvalidCodeModeHost;
+            const port = std.fmt.parseInt(u16, suffix[1..], 10) catch
+                return error.InvalidCodeModeHost;
+            if (port == 0) return error.InvalidCodeModeHost;
+        }
+        break :blk authority[0 .. close + 1];
+    } else blk: {
+        const colon = std.mem.lastIndexOfScalar(u8, authority, ':');
+        if (colon) |index| {
+            if (std.mem.indexOfScalar(u8, authority[0..index], ':') != null or
+                index + 1 == authority.len)
+            {
+                return error.InvalidCodeModeHost;
+            }
+            const port = std.fmt.parseInt(u16, authority[index + 1 ..], 10) catch
+                return error.InvalidCodeModeHost;
+            if (port == 0) return error.InvalidCodeModeHost;
+            break :blk authority[0..index];
+        }
+        break :blk authority;
+    };
+    if (host.len == 0) return error.InvalidCodeModeHost;
+    return .{ .secure = secure, .authority = authority, .host = host };
+}
 
 fn rejectUnsafeUrlBytes(raw: []const u8) !void {
     for (raw) |byte| if (byte <= 0x20 or byte == 0x7f) return error.UnsafeUrlByte;

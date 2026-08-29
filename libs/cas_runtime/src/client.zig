@@ -5818,7 +5818,7 @@ test "actor rejects a response recorded at or after its request deadline" {
 test "code mode host cannot be silently ignored by existing endpoint transports" {
     var host = try app_server_launch.CodeModeHost.init(
         std.testing.allocator,
-        "ws://127.0.0.1:9911",
+        "http://127.0.0.1:9911/",
     );
     defer host.deinit();
     try std.testing.expectError(
@@ -5851,7 +5851,7 @@ test "public hooks accept the canonical launch CodeModeHost" {
     const allocator = std.testing.allocator;
     var host = try app_server_launch.CodeModeHost.init(
         allocator,
-        "ws://127.0.0.1:9911",
+        "http://127.0.0.1:9911/",
     );
     defer host.deinit();
     var argv: std.ArrayList([]const u8) = .empty;

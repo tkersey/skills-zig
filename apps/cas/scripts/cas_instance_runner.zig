@@ -46,7 +46,7 @@ const UsageText =
     \\  --codex-path PATH                   Codex executable path or name (default: codex).
     \\  --app-server-transport MODE         auto|stdio|managed-ws|ws|unix (default: auto).
     \\  --app-server-endpoint ENDPOINT      Required by ws; optional unix:// path for unix.
-    \\  --code-mode-host URL                Outbound ws:// loopback or wss:// remote host.
+    \\  --code-mode-host URL                Outbound http:// loopback or https:// remote root.
     \\  --read-only                         Decline exec + file approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
     \\  --hooks MODE                        Hook policy: inherit|off|require-observed (default: inherit).
@@ -1120,7 +1120,7 @@ test "parseArgs accepts typed transport initialization and secret sources" {
         "--app-server-endpoint",
         "unix:///tmp/codex.sock",
         "--code-mode-host",
-        "wss://code.example:443/path?credential=redacted-at-output",
+        "https://code.example:443/",
         "--experimental-api",
         "false",
         "--init-capabilities-json",

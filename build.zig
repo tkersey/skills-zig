@@ -492,12 +492,6 @@ pub fn build(b: *std.Build) void {
         cas_app_server_preflight_root,
     );
     cas_app_server_preflight.root_module.linkSystemLibrary("c", .{});
-    const cas_code_mode_host_fixture = addExecutable(
-        b,
-        "cas_code_mode_host_fixture",
-        cas_transport_tests_root,
-    );
-    cas_code_mode_host_fixture.root_module.linkSystemLibrary("c", .{});
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cas_automation = addExecutable(b, "cas_automation", cas_automation_root);
@@ -533,15 +527,6 @@ pub fn build(b: *std.Build) void {
     const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_account_install = addInstallStep(b, cas_account);
     const cas_app_server_preflight_install = addInstallStep(b, cas_app_server_preflight);
-    const cas_code_mode_host_fixture_install = addInstallStep(
-        b,
-        cas_code_mode_host_fixture,
-    );
-    const build_cas_code_mode_host_fixture = b.step(
-        "build-cas-code-mode-host-fixture",
-        "Build the deterministic CAS Code Mode host fixture",
-    );
-    build_cas_code_mode_host_fixture.dependOn(&cas_code_mode_host_fixture_install.step);
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cas_automation_install = addInstallStep(b, cas_automation);
