@@ -46,6 +46,30 @@ set -e
 [[ ${public_surface_status} -eq 2 ]]
 grep -Fq 'UnknownAction' "${public_surface_stderr}"
 
+conformance_json="${fixture_root}/conformance.json"
+if ! ./zig-out/bin/cas conformance \
+  --cwd "${fixture_root}/repo" \
+  --scenario overload_backoff \
+  --skip-smoke-check \
+  --backoff-base-ms 1 \
+  --max-retries 2 \
+  --json >"${conformance_json}"; then
+  cat "${conformance_json}" >&2
+  exit 1
+fi
+json_filter -e '
+  .check == "cas-conformance-suite" and
+  .ok == true and
+  .smoke_preflight.status == "skipped" and
+  (.scenarios | length) == 1 and
+  .scenarios[0].name == "overload_backoff" and
+  .scenarios[0].mode == "integration" and
+  .scenarios[0].ok == true and
+  .scenarios[0].attempts == 3 and
+  .scenarios[0].retries == 2 and
+  (.scenarios[0].delays_ms | length) == 2
+' "${conformance_json}" >/dev/null
+
 schema_json="${fixture_root}/schema.json"
 preflight_json="${fixture_root}/preflight.json"
 
@@ -278,4 +302,4 @@ grep -Fq -- '--code-mode-host' "${fixture_root}/session-help.txt"
 grep -Fq 'enable-remote-control' "${fixture_root}/daemon-help.txt"
 grep -Fq 'disable-remote-control' "${fixture_root}/daemon-help.txt"
 
-echo "CAS app-server review contract and Code Mode host boundary: compatible (${codex_banner})"
+echo "CAS app-server, conformance, and Code Mode host boundary: compatible (${codex_banner})"
