@@ -238,14 +238,14 @@ jobs:
             cas_static: true
             runner_arch: X64
             codex_asset: codex-package-x86_64-unknown-linux-musl.tar.gz
-            codex_archive_sha256: 6e35ac60b86c0e8c7f8bcf797be8b92206199f6253200b66ff0547276f8cfa5c
+            codex_archive_sha256: e10fa0cee78e9f0bd395880f03fd4fd227d903ca7af649bbc08d1649101e9225
           - os: macos-14
             platform: macos-aarch64
             zig_target: aarch64-macos
             cas_static: false
             runner_arch: ARM64
             codex_asset: codex-package-aarch64-apple-darwin.tar.gz
-            codex_archive_sha256: cb6e78eba80c1bc310a533f6f1c6c948377733bc06f9e837949334e04abde9c6
+            codex_archive_sha256: 287e2dd0a9bbfb58581b0a9150399458b4f094ea42caf02860f1e8cb5a202a0b
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -269,7 +269,7 @@ jobs:
             exit 1
           fi
 
-          qualification_version="0.151.0"
+          qualification_version="0.153.2"
           release_url="https://github.com/openai/codex/releases/download/rust-v${qualification_version}/${CODEX_ASSET}"
           archive="${RUNNER_TEMP}/${CODEX_ASSET}"
           extract_dir="${RUNNER_TEMP}/codex-${qualification_version}"
@@ -427,8 +427,8 @@ jobs:
       - name: Upload exact Codex evidence
         uses: actions/upload-artifact@v4
         with:
-          name: cas-codex-0.151.0-${{ matrix.platform }}
-          path: ${{ runner.temp }}/cas-codex-0.151.0-${{ matrix.platform }}.txt
+          name: cas-codex-0.153.2-${{ matrix.platform }}
+          path: ${{ runner.temp }}/cas-codex-0.153.2-${{ matrix.platform }}.txt
           if-no-files-found: error
 
   cas-fuzz-linux:

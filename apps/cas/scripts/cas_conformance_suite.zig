@@ -89,6 +89,7 @@ const ParsedArgs = struct {
 };
 
 const Context = struct {
+    io: std.Io,
     cwd: []const u8,
     smoke_binary: []const u8,
     preflight_binary: []const u8 = "cas_app_server_preflight",
@@ -155,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const ctx = Context{
+        .io = init.io,
         .cwd = cwd,
         .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
         .preflight_binary = try resolveExecutable(
@@ -648,7 +650,13 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         };
         allocator.free(temp_root);
     }
-    const success = try runProductionRetryCase(allocator, temp_root, "success", success_policy);
+    const success = try runProductionRetryCase(
+        allocator,
+        ctx.io,
+        temp_root,
+        "success",
+        success_policy,
+    );
     const tiny_policy = cas_proxy_client.OverloadRetryPolicy{
         .max_retries = 2,
         .base_delay_ms = 1,
@@ -657,11 +665,18 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
     };
     const nonoverload = try runProductionRetryCase(
         allocator,
+        ctx.io,
         temp_root,
         "nonoverload",
         tiny_policy,
     );
-    const exhaustion = try runProductionRetryCase(allocator, temp_root, "exhaust", tiny_policy);
+    const exhaustion = try runProductionRetryCase(
+        allocator,
+        ctx.io,
+        temp_root,
+        "exhaust",
+        tiny_policy,
+    );
     if (success.wire_attempts != 3 or
         success.retries != 2 or
         success.notifications != 2 or
@@ -752,11 +767,11 @@ fn retryFixtureScriptAlloc(
 
 fn runProductionRetryCase(
     allocator: std.mem.Allocator,
+    io: std.Io,
     root: []const u8,
     mode: []const u8,
     policy: cas_proxy_client.OverloadRetryPolicy,
 ) !RetryCaseProof {
-    const io = if (builtin.is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io();
     const executable = try std.fmt.allocPrint(allocator, "{s}/fake-codex-{s}", .{ root, mode });
     defer allocator.free(executable);
     const log_path = try std.fmt.allocPrint(allocator, "{s}/requests-{s}.jsonl", .{ root, mode });
@@ -1039,6 +1054,7 @@ test "overload classification delegates to structured proxy policy" {
 test "overload scenario route drives production proxy retry integration" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const ctx = Context{
+        .io = std.testing.io,
         .cwd = "/tmp",
         .smoke_binary = "unused",
         .hook_policy = .inherit,
