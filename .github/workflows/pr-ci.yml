@@ -287,7 +287,7 @@ jobs:
 
           mkdir -p "${extract_dir}" "${bin_dir}" "${stable_schema_dir}" "${experimental_schema_dir}"
           tar -xzf "${archive}" -C "${extract_dir}"
-          package_bin="$(find "${extract_dir}" -type d -path '*/bin' -print -quit)"
+          package_bin="${extract_dir}/bin"
           if [[ -z "${package_bin}" || ! -x "${package_bin}/codex" || ! -x "${package_bin}/codex-code-mode-host" ]]; then
             echo "Expected Codex app-server package binaries in ${CODEX_ASSET}" >&2
             exit 1
