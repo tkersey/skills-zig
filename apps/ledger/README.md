@@ -167,3 +167,70 @@ ledger version
 `ledger capabilities --format json` reports only artifact ABIs, native
 operators, codecs, storage adapters, cache format, generic bounds, and result
 schemas. Every result keeps structural claims distinct from semantic authority.
+
+## Directed relations (Ledger 1.2)
+
+Keyed reducers may declare one bounded directed relation over their retained
+records. The definition chooses the discriminator, vertex/edge tags, endpoint
+paths, active edge states, and whether the active relation must be acyclic:
+
+```json
+"relation": {
+  "discriminator": "/type",
+  "vertex_tag": "vertex",
+  "edge_tag": "arc",
+  "source": "/source",
+  "target": "/target",
+  "active_states": ["linked"],
+  "acyclic": true,
+  "max_vertices": 128,
+  "max_edges": 1024
+}
+```
+
+This is an optional field of the existing `reducer` law (operator version 6).
+Vertices use their reducer keys as identity. Endpoint paths are relative to the
+retained record. Every edge resolves to two vertices, and each ordered pair has
+one retained identity, including inactive edges. Unknown roles, dangling
+endpoints, duplicate pairs, and capacity violations fail closed. With `acyclic`
+enabled, active self-edges and cycles are rejected. An inactive edge remains in
+history but does not participate in cycle checks or target queries.
+
+Admission checks the whole prospective relation before committing the keyed
+transition. Replay and checkpoint validation enforce the same relation. Reuse
+normal expected-revision and idempotency controls; a refreshed revision does not
+bypass the relation law. No second store, persistent index, domain scheduler, or
+external effect is introduced. The index is reconstructed from the selected
+reducer state, using iterative O(vertices + edges) cycle checking.
+
+A keyed `fold` (operator version 7) can select vertices or edges and optionally
+match the states of outgoing targets:
+
+```json
+"relation": {
+  "select": "vertices",
+  "target_states": ["satisfied"],
+  "match": "all",
+  "unmatched_field": "missing_targets"
+}
+```
+
+`match` is `any` (no target predicate), `all` (no unsatisfied outgoing targets),
+or `not_all` (at least one unsatisfied target). A vertex without outgoing active
+edges satisfies `all`. `unmatched_field` optionally returns exact, key-sorted
+unsatisfied target IDs. Ordinary keyed-fold filters may select vertex lifecycle
+states afterwards; reference resolution always uses the complete state, not the
+filtered subset. `select: "edges"` supports the ordinary fold fields and state
+filters, without target-state predicates.
+
+Queries reject unknown state names, collisions with existing output fields,
+undeclared relations, and unsupported compositions with keyed history or
+constructed exports. Limits and byte bounds remain the normal projection
+contract; native result envelopes bind results to the definition and revision.
+No result is permission to execute, publish, or close a domain object.
+
+See `src/v1/fixtures/relation-definition.json` and
+`scripts/test-ledger-relations.sh` for a complete generic example. Existing
+relation-free definitions retain their behavior. Cache payload versions are
+advanced; stale caches rebuild through the normal source path. This feature
+requires the Ledger 1.2 release before production consumers depend on it.
