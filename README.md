@@ -9,7 +9,6 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and Codex automation)
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
-- `img` (pure-Zig document and source-code PNG rendering)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 Codex automation is owned by CAS 0.4 and is invoked through `cas automation`;
@@ -23,7 +22,6 @@ separate compatibility alias.
 - `apps/cas`
 - `apps/ledger`
 - `apps/memory-note`
-- `apps/img`
 - `libs/core`
 - `libs/definition_core`
 - `libs/durable_store`
@@ -53,7 +51,6 @@ zig build build-lift -Doptimize=ReleaseFast
 zig build build-cas -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
-zig build build-img -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -64,7 +61,6 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/cas_smoke_check --help
 ./zig-out/bin/cas automation --help
-./zig-out/bin/img --help
 ```
 
 ## Local Perf
@@ -105,7 +101,6 @@ Per-app VERSION files are the source of truth:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/img/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that
@@ -129,7 +124,6 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cas-v*` -> `.github/workflows/release-cas.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
-- `img-v*` -> `.github/workflows/release-img.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -141,7 +135,6 @@ Required tag forms:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
 
 Artifacts are published as:
 
