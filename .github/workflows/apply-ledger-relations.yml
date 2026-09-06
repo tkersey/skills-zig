@@ -1,0 +1,26 @@
+name: Apply reviewed plain-text Ledger source changes
+on:
+  push:
+    branches: [codex/ledger-relations]
+    paths: [ledger-relations-source.patch]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'tkersey/skills-zig' && github.ref == 'refs/heads/codex/ledger-relations'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - name: Apply the visible source diff to this feature branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed 's/^ diff --git /diff --git /' ledger-relations-source.patch > "$RUNNER_TEMP/ledger.patch"
+          echo "afb04783fd694bed1fde2e64cb6bcf57e43ea166d45df8df49b719779748b0de  $RUNNER_TEMP/ledger.patch" | sha256sum -c -
+          git apply --index --check "$RUNNER_TEMP/ledger.patch"
+          git apply --index "$RUNNER_TEMP/ledger.patch"
+          git rm ledger-relations-source.patch
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(ledger): integrate bounded relations into native reducers and folds'
+          git push origin HEAD:refs/heads/codex/ledger-relations

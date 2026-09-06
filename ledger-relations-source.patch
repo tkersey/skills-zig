@@ -1,0 +1,860 @@
+diff --git a/apps/ledger/README.md b/apps/ledger/README.md
+index 17189f3..366d3e1 100644
+--- a/apps/ledger/README.md
++++ b/apps/ledger/README.md
+@@ -1,6 +1,6 @@
+ # Ledger
+ 
+-Ledger 1.1 compiles passive artifact definitions into bounded native plans for
++Ledger 1.2 compiles passive artifact definitions into bounded native plans for
+ validation, canonicalization, identity, durable transactions, replay, and
+ projection.
+ 
+@@ -49,6 +49,62 @@ text inputs, imports under an admitted definition root, native structural
+ operators, identity, logical storage, transactions, reducers, and projections.
+ They cannot name hooks or executable code.
+ 
++## Bounded relations on keyed reducers
++
++Ledger 1.2 adds optional `relation` facets to `reducer` v6 and keyed `fold` v7.
++They introduce no task-specific commands, workflow authority, arbitrary queries,
++or executable hooks. Definitions without the facet retain their existing behavior.
++
++A reducer with `retain_once` may declare this generic directed graph view over its
++retained records (paths are relative to the retained value):
++
++```json
++{
++  "discriminator": "/type",
++  "vertex_value": "component",
++  "edge_value": "relation",
++  "source": "/from",
++  "target": "/to",
++  "active_states": ["present"],
++  "max_vertices": 128,
++  "max_edges": 1024,
++  "acyclic": true
++}
++```
++
++Every record is classified as a vertex or edge. Every edge resolves both endpoint
++keys; active ordered pairs are unique. With `acyclic: true`, active self-edges and
++cycles are rejected. Admission validates the prospective successor under existing
++transaction custody before committing the keyed change. Replay, checkpoint
++activation, and relation projection revalidate the graph. No independent graph
++store or derived-state cache is introduced.
++
++An optional relation query on a keyed fold selects `vertices` or active `edges`:
++
++```json
++{"select":"vertices","target_states":["satisfied"],"match":"all","unmatched_field":"unmatched"}
++```
++
++`match` is `any` (no relation filtering, the default), `all` (no unmatched direct
++target), or `not-all` (at least one unmatched direct target). `unmatched_field`
++adds sorted target keys not in `target_states`. Zero outgoing edges satisfies
++`all`. An `edges` query cannot request target predicates. Existing keyed filters,
++ID lookup, and limits compose with the relation fold; constructed exports and
++keyed history annotations are explicitly rejected for this facet.
++
++Vertices and edges share the reducer identity space. Definitions own unambiguous
++identity construction, event shapes, legal lifecycle transitions, and interpretation
++of states. Inactive edges still count toward identity bounds and must resolve their
++endpoints. Runtime maxima are 4,096 vertices, 65,536 edges, 256 state labels, and
++64 KiB per relation/query configuration; normal retained-byte and output bounds
++also apply. Cycles are checked by an iterative bounded topological traversal.
++
++The motivating integration is an owner-defined mutable work graph. The added
++mechanism is a bounded relational interpretation of existing keyed state, not a
++registry of task semantics or a general-purpose graph query language. Native
++fixtures use component/relationship labels, and existing definitions require no
++changes. The compiled cache payload changes to prevent reuse of older plans.
++
+ ## Pure operations
+ 
+ ```bash
+ diff --git a/apps/ledger/VERSION b/apps/ledger/VERSION
+index 524cb55..26aaba0 100644
+--- a/apps/ledger/VERSION
++++ b/apps/ledger/VERSION
+@@ -1 +1 @@
+-1.1.1
++1.2.0
+ diff --git a/apps/ledger/src/v1/compiled_plan.zig b/apps/ledger/src/v1/compiled_plan.zig
+index d00a3b7..7c6f96d 100644
+--- a/apps/ledger/src/v1/compiled_plan.zig
++++ b/apps/ledger/src/v1/compiled_plan.zig
+@@ -8,7 +8,7 @@ const projection = @import("projection.zig");
+ const storage = @import("storage.zig");
+ const validation = @import("validation.zig");
+ 
+-const payload_version: u16 = 33;
++const payload_version: u16 = 34;
+ const locator_version: u16 = 1;
+ const cache_limits: definition_core.cache.Limits = .{};
+ const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
+@@ -1408,11 +1408,19 @@ fn compilePlanSetForAllocationFailure(
+ }
+ 
+ test "compiled plan cache releases every allocation on compile and decode failure" {
++    try checkFixtureAllocationFailures(@embedFile("fixtures/chained-event-definition.json"));
++}
++
++test "relation compiled plans release every allocation on compile and decode failure" {
++    try checkFixtureAllocationFailures(@embedFile("fixtures/related-event-definition.json"));
++}
++
++fn checkFixtureAllocationFailures(fixture: []const u8) !void {
+     var source_tmp = std.testing.tmpDir(.{});
+     defer source_tmp.cleanup();
+     try source_tmp.dir.writeFile(std.testing.io, .{
+         .sub_path = "artifact.json",
+-        .data = @embedFile("fixtures/chained-event-definition.json"),
++        .data = fixture,
+     });
+     const source_root = try source_tmp.dir.realPathFileAlloc(
+         std.testing.io,
+ diff --git a/apps/ledger/src/v1/definition.zig b/apps/ledger/src/v1/definition.zig
+index c14c472..7642816 100644
+--- a/apps/ledger/src/v1/definition.zig
++++ b/apps/ledger/src/v1/definition.zig
+@@ -198,12 +198,12 @@ pub const Operator = enum {
+             .sha256 => 5,
+             .event_materialization => 5,
+             .idempotency_key => 2,
+-            .reducer => 5,
++            .reducer => 6,
+             .append_only_log => 3,
+             .compare_append, .bind_existing => 2,
+             .event_envelope => 4,
+             .cross_input_equal => 2,
+-            .fold => 6,
++            .fold => 7,
+             .filter => 2,
+             .id_lookup, .latest => 2,
+             .relevance => 3,
+ diff --git a/apps/ledger/src/v1/projection.zig b/apps/ledger/src/v1/projection.zig
+index 6ddf862..1db3342 100644
+--- a/apps/ledger/src/v1/projection.zig
++++ b/apps/ledger/src/v1/projection.zig
+@@ -6,6 +6,7 @@ const projection_value = @import("projection_value.zig");
+ const protocol = @import("protocol.zig");
+ const ranked_relevance = @import("ranked_relevance.zig");
+ const reducer = @import("reducer.zig");
++const relation = @import("relation.zig");
+ const replay = @import("replay.zig");
+ const segmented_event_log = @import("segmented_event_log.zig");
+ const state_reducer = @import("state_reducer.zig");
+@@ -290,6 +291,7 @@ const KeyedFold = struct {
+     retained_unwrap_path: ?definition_core.json_pointer.Pointer,
+     event_count_field: ?[]u8,
+     history: KeyedHistory,
++    relation_query: ?relation.Query = null,
+ 
+     fn deinit(self: *KeyedFold, allocator: std.mem.Allocator) void {
+         allocator.free(self.key_field);
+@@ -298,6 +300,7 @@ const KeyedFold = struct {
+         if (self.retained_unwrap_path) |*pointer| pointer.deinit(allocator);
+         if (self.event_count_field) |field| allocator.free(field);
+         self.history.deinit(allocator);
++        if (self.relation_query) |*query| query.deinit(allocator);
+         self.* = undefined;
+     }
+ };
+@@ -1120,7 +1123,7 @@ pub fn encodeCache(
+     plan: *const Plan,
+     encoder: *definition_core.cache.Encoder,
+ ) !void {
+-    try encoder.writeU16(14);
++    try encoder.writeU16(15);
+     try encoder.writeUsize(plan.max_records);
+     try encoder.writeUsize(plan.max_output_bytes);
+     try encoder.writeCount(plan.projections.len);
+@@ -1274,6 +1277,10 @@ fn encodeProjectionFold(
+                 null);
+             try encoder.writeOptionalBytes(keyed.event_count_field);
+             try encodeKeyedHistory(&keyed.history, encoder);
++            try encoder.writeOptionalBytes(if (keyed.relation_query) |query|
++                query.canonical
++            else
++                null);
+         },
+         .retained => |retained| try encodeRetainedFold(retained, encoder),
+     }
+@@ -1306,7 +1313,7 @@ pub fn decodeCache(
+     allocator: std.mem.Allocator,
+     decoder: *definition_core.cache.Decoder,
+ ) !Plan {
+-    if (try decoder.readU16() != 14) {
++    if (try decoder.readU16() != 15) {
+         return error.LedgerProjectionCacheVersionMismatch;
+     }
+     const max_records = try decoder.readUsize();
+@@ -1652,6 +1659,10 @@ fn validateCachedKeyedFold(
+         event_protocol,
+         error.CacheProjectionPlanMismatch,
+     );
++    try validateRelationFold(&keyed, keyed_plan);
++    if (keyed.relation_query != null and projection.constructed_value != null) {
++        return error.RelationConstructedProjectionUnsupported;
++    }
+     const composed = projection.predicates.len != 0 or
+         projection.constructed_value != null;
+     if (projection.constructed_value != null) {
+@@ -1666,10 +1677,30 @@ fn validateCachedKeyedFold(
+     }
+ }
+ 
++fn validateRelationFold(keyed: *const KeyedFold, reducer_plan: *const reducer.Plan) !void {
++    const query = if (keyed.relation_query) |*value| value else return;
++    if (reducer_plan.relation_plan == null) return error.RelationFoldRequiresRelation;
++    if (keyed.history.active()) return error.RelationFoldHistoryUnsupported;
++    for (query.target_states) |state| {
++        if (!relation.contains(reducer_plan.states, state)) return error.UnknownRelationTargetState;
++    }
++    const field = query.unmatched_field orelse return;
++    const configured = [_]?[]const u8{
++        keyed.key_field,
++        keyed.state_field,
++        keyed.retained_field,
++        keyed.event_count_field,
++    };
++    for (configured) |name| {
++        if (name) |text| if (std.mem.eql(u8, field, text)) return error.ProjectionFieldsConflict;
++    }
++}
++
+ fn validateConstructedKeyedFold(
+     projection: Projection,
+     keyed: KeyedFold,
+ ) !void {
++    if (keyed.relation_query != null) return error.RelationConstructedProjectionUnsupported;
+     if (projection.predicates.len != 1 or
+         !projection.single or
+         !projection.require_match or
+@@ -2210,6 +2241,9 @@ fn decodeKeyedFold(
+         &history,
+         error.CacheProjectionFieldsConflict,
+     );
++    const query_bytes = try decoder.readOptionalBytesAlloc(allocator, 65536);
++    defer if (query_bytes) |bytes| allocator.free(bytes);
++    const query = if (query_bytes) |bytes| try relation.decodeQuery(allocator, bytes) else null;
+     return .{
+         .key_field = key_field,
+         .state_field = state_field,
+@@ -2217,6 +2251,7 @@ fn decodeKeyedFold(
+         .retained_unwrap_path = retained_unwrap_path,
+         .event_count_field = event_count_field,
+         .history = history,
++        .relation_query = query,
+     };
+ }
+ 
+@@ -2705,16 +2740,15 @@ const ProjectionCompiler = struct {
+             return error.FoldRequiresReducerSlot;
+         }
+         if (step.get("fields")) |fields_value| {
+-            self.fold = .{ .retained = try self.compileRetainedFoldStep(
++            const retained = try self.compileRetainedFoldStep(
+                 event_protocol,
+                 step,
+                 fields_value,
+-            ) };
++            );
++            self.fold = .{ .retained = retained };
+         } else {
+-            self.fold = .{ .keyed = try self.compileKeyedFoldStep(
+-                event_protocol,
+-                step,
+-            ) };
++            const keyed = try self.compileKeyedFoldStep(event_protocol, step);
++            self.fold = .{ .keyed = keyed };
+         }
+     }
+ 
+@@ -2772,14 +2806,6 @@ const ProjectionCompiler = struct {
+             "event_count_field",
+         );
+         errdefer if (event_count_field) |field| self.allocator.free(field);
+-        try validateKeyedFoldFields(
+-            key_field,
+-            state_field,
+-            retained_field,
+-            event_count_field,
+-            null,
+-            error.ProjectionFieldsConflict,
+-        );
+         if (retained_field != null and
+             event_protocol.reducer_plan.?.retain_once == null and
+             event_protocol.reducer_plan.?.retain_latest == null)
+@@ -2808,6 +2834,8 @@ const ProjectionCompiler = struct {
+             retained_unwrap_path,
+             event_count_field,
+             history,
++            step.get("relation"),
++            &event_protocol.reducer_plan.?,
+         );
+     }
+ 
+@@ -2850,18 +2878,30 @@ const ProjectionCompiler = struct {
+         retained_unwrap_path: ?definition_core.json_pointer.Pointer,
+         event_count_field: ?[]u8,
+         history: KeyedHistory,
++        raw_relation: ?std.json.Value,
++        reducer_plan: *const reducer.Plan,
+     ) !KeyedFold {
+         const owned_key = try self.allocator.dupe(u8, key_field);
+         errdefer self.allocator.free(owned_key);
+         const owned_state = try self.allocator.dupe(u8, state_field);
+-        return .{
++        errdefer self.allocator.free(owned_state);
++        var query = if (raw_relation) |raw|
++            try relation.compileQuery(self.allocator, raw)
++        else
++            null;
++        errdefer if (query) |*value| value.deinit(self.allocator);
++        const result: KeyedFold = .{
+             .key_field = owned_key,
+             .state_field = owned_state,
+             .retained_field = retained_field,
+             .retained_unwrap_path = retained_unwrap_path,
+             .event_count_field = event_count_field,
+             .history = history,
++            .relation_query = query,
+         };
++        // The caller still owns retained fields/history until successful return.
++        try validateRelationFold(&result, reducer_plan);
++        return result;
+     }
+ 
+     fn applyLimit(
+@@ -3043,6 +3083,7 @@ const ProjectionCompiler = struct {
+         self: *const ProjectionCompiler,
+         keyed: KeyedFold,
+     ) !void {
++        if (keyed.relation_query != null) return error.RelationConstructedProjectionUnsupported;
+         if (self.predicates.items.len != 1 or
+             !self.single or !self.require_match or
+             self.fields.len != 0 or self.value_path != null or
+@@ -3114,6 +3155,7 @@ fn requireKeyedFoldStep(step: std.json.ObjectMap) !void {
+             "event_kind_counts",
+             "event_chain",
+             "snapshot",
++            "relation",
+         },
+     );
+     try definition_core.json.requireFields(
+@@ -5382,6 +5424,7 @@ fn executeFoldProjection(
+             allocator,
+             compiled,
+             &keyed,
++            event_plan,
+             replay_state,
+             fold_history,
+             parameters,
+@@ -5417,6 +5460,7 @@ fn executeKeyedFoldProjection(
+     allocator: std.mem.Allocator,
+     compiled: *const Projection,
+     keyed: *const KeyedFold,
++    event_plan: *const protocol.Plan,
+     replay_state: *protocol.ReplayState,
+     fold_history: ?*FoldHistoryAccumulator,
+     parameters: *const definition_core.parameters.Bindings,
+@@ -5426,6 +5470,18 @@ fn executeKeyedFoldProjection(
+     stats: *Stats,
+     records_validated: usize,
+ ) !void {
++    if (keyed.relation_query != null) return executeRelationFold(
++        allocator,
++        compiled,
++        keyed,
++        event_plan,
++        &replay_state.reducer_state,
++        parameters,
++        effective_limit,
++        max_output_bytes,
++        output,
++        stats,
++    );
+     if (compiled.constructed_value != null) {
+         stats.records_emitted = try writeConstructedKeyedFold(
+             allocator,
+@@ -5469,6 +5525,42 @@ fn executeKeyedFoldProjection(
+     );
+ }
+ 
++fn executeRelationFold(
++    allocator: std.mem.Allocator,
++    compiled: *const Projection,
++    keyed: *const KeyedFold,
++    event_plan: *const protocol.Plan,
++    state: *const reducer.State,
++    parameters: *const definition_core.parameters.Bindings,
++    effective_limit: usize,
++    max_output_bytes: usize,
++    output: *std.Io.Writer.Allocating,
++    stats: *Stats,
++) !void {
++    const reducer_plan = if (event_plan.reducer_plan) |*value|
++        value
++    else
++        return error.FoldRequiresKeyedReducer;
++    const graph_plan = if (reducer_plan.relation_plan) |*value|
++        value
++    else
++        return error.RelationFoldRequiresRelation;
++    const counts = try writeRelationFold(
++        allocator,
++        output,
++        compiled,
++        keyed,
++        &keyed.relation_query.?,
++        graph_plan,
++        state,
++        parameters,
++        effective_limit,
++        max_output_bytes,
++    );
++    stats.records_matched = counts.matched;
++    stats.records_emitted = counts.emitted;
++}
++
+ fn writeCompleteKeyedFold(
+     allocator: std.mem.Allocator,
+     output: *std.Io.Writer.Allocating,
+@@ -6036,6 +6128,116 @@ const FilteredFoldCounts = struct {
+     emitted: usize,
+ };
+ 
++fn writeRelationFold(
++    allocator: std.mem.Allocator,
++    output: *std.Io.Writer.Allocating,
++    projection: *const Projection,
++    keyed: *const KeyedFold,
++    query: *const relation.Query,
++    graph_plan: *const relation.Plan,
++    state: *const reducer.State,
++    parameters: *const definition_core.parameters.Bindings,
++    limit: usize,
++    max_output_bytes: usize,
++) !FilteredFoldCounts {
++    const views = try state.sortedViewsAlloc(allocator);
++    defer allocator.free(views);
++    var graph = try relation.Graph.build(allocator, graph_plan, views, null);
++    defer graph.deinit();
++    var counts: FilteredFoldCounts = .{ .matched = 0, .emitted = 0 };
++    try output.writer.writeByte('[');
++    if (query.select == .vertices) {
++        for (graph.vertices, 0..) |view, index| {
++            const unmatched = if (query.target_states.len == 0) &.{} else try graph.unmatched(
++                index,
++                query.target_states,
++            );
++            if (!query.accepts(unmatched.len)) continue;
++            try writeRelationRow(
++                allocator,
++                output,
++                projection,
++                keyed,
++                query,
++                view,
++                unmatched,
++                parameters,
++                limit,
++                max_output_bytes,
++                &counts,
++            );
++        }
++    } else {
++        for (graph.edges) |edge| {
++            if (!edge.active) continue;
++            try writeRelationRow(
++                allocator,
++                output,
++                projection,
++                keyed,
++                query,
++                edge.record,
++                &.{},
++                parameters,
++                limit,
++                max_output_bytes,
++                &counts,
++            );
++        }
++    }
++    try output.writer.writeByte(']');
++    if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
++    return counts;
++}
++
++fn writeRelationRow(
++    allocator: std.mem.Allocator,
++    output: *std.Io.Writer.Allocating,
++    projection: *const Projection,
++    keyed: *const KeyedFold,
++    query: *const relation.Query,
++    view: reducer.EntryView,
++    unmatched: []const []const u8,
++    parameters: *const definition_core.parameters.Bindings,
++    limit: usize,
++    max_output_bytes: usize,
++    counts: *FilteredFoldCounts,
++) !void {
++    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
++    const fields = keyedHistoryFields(&field_storage, keyed);
++    var row: std.Io.Writer.Allocating = .init(allocator);
++    defer row.deinit();
++    try writeKeyedHistoryRow(
++        allocator,
++        &row.writer,
++        fields,
++        view,
++        null,
++        if (keyed.retained_unwrap_path) |*pointer| pointer else null,
++    );
++    var parsed = try std.json.parseFromSlice(
++        std.json.Value,
++        allocator,
++        row.written(),
++        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error", .parse_numbers = false },
++    );
++    defer parsed.deinit();
++    if (query.unmatched_field) |field| {
++        var targets = std.json.Array.init(parsed.arena.allocator());
++        for (unmatched) |key| try targets.append(.{ .string = key });
++        try parsed.value.object.put(parsed.arena.allocator(), field, .{ .array = targets });
++    }
++    if (!matches(projection, parsed.value, parameters)) return;
++    counts.matched += 1;
++    if (counts.emitted == limit) return;
++    const bytes = try definition_core.canonical_json.canonicalJsonAlloc(allocator, parsed.value);
++    defer allocator.free(bytes);
++    if (counts.emitted != 0) try output.writer.writeByte(',');
++    try output.writer.writeAll(bytes);
++    counts.emitted += 1;
++    if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
++}
++
+ fn writeFilteredKeyedFold(
+     allocator: std.mem.Allocator,
+     output: *std.Io.Writer.Allocating,
+ diff --git a/apps/ledger/src/v1/protocol.zig b/apps/ledger/src/v1/protocol.zig
+index 897a842..5ce982a 100644
+--- a/apps/ledger/src/v1/protocol.zig
++++ b/apps/ledger/src/v1/protocol.zig
+@@ -289,7 +289,7 @@ pub fn activateCheckpoint(
+     state.event_kinds_digest = current_event_kinds_digest;
+     state.has_event_kinds_digest = true;
+     if (plan.reducer_plan) |*reducer_plan| {
+-        state.reducer_state.validateCheckpoint(reducer_plan) catch
++        state.reducer_state.validateCheckpoint(allocator, reducer_plan) catch
+             return error.CheckpointBoundsExceeded;
+     } else if (state.reducer_state.count() != 0) {
+         return error.CheckpointReducerMissing;
+ diff --git a/apps/ledger/src/v1/reducer.zig b/apps/ledger/src/v1/reducer.zig
+index b2a96f7..383f9f4 100644
+--- a/apps/ledger/src/v1/reducer.zig
++++ b/apps/ledger/src/v1/reducer.zig
+@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
+ const definition = @import("definition.zig");
+ const validation = @import("validation.zig");
+ const checkpoint = @import("checkpoint.zig");
++const relation = @import("relation.zig");
+ 
+ const max_text_bytes = 256;
+ const max_states = 65_536;
+@@ -54,6 +55,7 @@ pub const Plan = struct {
+     max_entries: usize,
+     max_retained_value_bytes: usize,
+     max_retained_total_bytes: usize,
++    relation_plan: ?relation.Plan = null,
+ 
+     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+         deinitStringSet(allocator, self.states);
+@@ -68,6 +70,7 @@ pub const Plan = struct {
+         if (self.retain_latest) |*pointer| pointer.deinit(allocator);
+         if (self.assert_from) |*pointer| pointer.deinit(allocator);
+         if (self.assert_to) |*pointer| pointer.deinit(allocator);
++        if (self.relation_plan) |*plan| plan.deinit(allocator);
+         self.* = undefined;
+     }
+ };
+@@ -147,12 +150,7 @@ const ProjectionField = struct {
+     kind: ProjectionFieldKind,
+ };
+ 
+-pub const EntryView = struct {
+-    key: []const u8,
+-    state: []const u8,
+-    retained: ?[]const u8,
+-    event_count: usize,
+-};
++pub const EntryView = relation.Record;
+ 
+ pub const State = struct {
+     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+@@ -169,7 +167,11 @@ pub const State = struct {
+         return self.entries.count();
+     }
+ 
+-    pub fn validateCheckpoint(self: *const State, plan: *const Plan) !void {
++    pub fn validateCheckpoint(
++        self: *const State,
++        allocator: std.mem.Allocator,
++        plan: *const Plan,
++    ) !void {
+         if (self.entries.count() > plan.max_entries or
+             self.retained_bytes > plan.max_retained_total_bytes)
+         {
+@@ -186,6 +188,7 @@ pub const State = struct {
+                 }
+             }
+         }
++        try validateRelation(allocator, plan, self, null);
+     }
+ 
+     pub fn encodeCheckpoint(
+@@ -303,7 +306,7 @@ pub const State = struct {
+     }
+ 
+     pub fn sortedViewsAlloc(
+-        self: *State,
++        self: *const State,
+         allocator: std.mem.Allocator,
+     ) ![]EntryView {
+         const views = try allocator.alloc(EntryView, self.entries.count());
+@@ -453,6 +456,7 @@ pub fn compile(
+         .max_entries = max_entries,
+         .max_retained_value_bytes = bounds.max_input_bytes,
+         .max_retained_total_bytes = bounds.max_store_bytes,
++        .relation_plan = reducer.relation_plan,
+     };
+     try validatePlan(&result);
+     return result;
+@@ -510,6 +514,7 @@ const ReducerConfig = struct {
+     assert_to: ?definition_core.json_pointer.Pointer,
+     assertion_presence: AssertionPresence,
+     guards: []Guard,
++    relation_plan: ?relation.Plan = null,
+ 
+     fn deinit(self: *ReducerConfig, allocator: std.mem.Allocator) void {
+         self.key.deinit(allocator);
+@@ -521,6 +526,7 @@ const ReducerConfig = struct {
+         if (self.assert_to) |*pointer| pointer.deinit(allocator);
+         for (self.guards) |*guard| guard.deinit(allocator);
+         allocator.free(self.guards);
++        if (self.relation_plan) |*plan| plan.deinit(allocator);
+         self.* = undefined;
+     }
+ };
+@@ -535,33 +541,19 @@ fn compileReducerConfig(
+     const reducer = reducer_parsed.value.object;
+     try validateReducerConfigObject(reducer);
+     try requireOperator(reducer, .reducer);
+-    var key = try compilePointer(
+-        allocator,
+-        try definition_core.json.requiredString(reducer, "key"),
+-    );
++    const key_name = try definition_core.json.requiredString(reducer, "key");
++    var key = try compilePointer(allocator, key_name);
+     errdefer key.deinit(allocator);
+     var on = try compilePointer(
+         allocator,
+         try definition_core.json.requiredString(reducer, "on"),
+     );
+     errdefer on.deinit(allocator);
+-    var event_kind = try compileOptionalPointer(
+-        allocator,
+-        reducer,
+-        "event_kind",
+-    );
++    var event_kind = try compileOptionalPointer(allocator, reducer, "event_kind");
+     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
+-    var retain_once = try compileOptionalPointer(
+-        allocator,
+-        reducer,
+-        "retain_once",
+-    );
++    var retain_once = try compileOptionalPointer(allocator, reducer, "retain_once");
+     errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
+-    var retain_latest = try compileOptionalPointer(
+-        allocator,
+-        reducer,
+-        "retain_latest",
+-    );
++    var retain_latest = try compileOptionalPointer(allocator, reducer, "retain_latest");
+     errdefer if (retain_latest) |*pointer| pointer.deinit(allocator);
+     if (retain_once != null and retain_latest != null) {
+         return error.ConflictingReducerRetention;
+@@ -583,6 +575,11 @@ fn compileReducerConfig(
+         for (guards) |*guard| guard.deinit(allocator);
+         allocator.free(guards);
+     }
++    var relation_plan = if (reducer.get("relation")) |raw| try relation.compile(
++        allocator,
++        raw,
++    ) else null;
++    errdefer if (relation_plan) |*plan| plan.deinit(allocator);
+     return .{
+         .key = key,
+         .on = on,
+@@ -593,6 +590,7 @@ fn compileReducerConfig(
+         .assert_to = assert_to,
+         .assertion_presence = try compileAssertionPresence(reducer),
+         .guards = guards,
++        .relation_plan = relation_plan,
+     };
+ }
+ 
+@@ -610,6 +608,7 @@ fn validateReducerConfigObject(reducer: std.json.ObjectMap) !void {
+             "to",
+             "assertion_presence",
+             "guards",
++            "relation",
+         },
+     );
+     try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
+@@ -733,7 +732,7 @@ pub fn encodeCache(
+     plan: *const Plan,
+     encoder: *definition_core.cache.Encoder,
+ ) !void {
+-    try encoder.writeU16(5);
++    try encoder.writeU16(6);
+     try encodeStringSet(plan.states, encoder);
+     try encoder.writeCount(plan.transitions.len);
+     for (plan.transitions) |transition| {
+@@ -773,13 +772,14 @@ pub fn encodeCache(
+     try encoder.writeUsize(plan.max_entries);
+     try encoder.writeUsize(plan.max_retained_value_bytes);
+     try encoder.writeUsize(plan.max_retained_total_bytes);
++    try encoder.writeOptionalBytes(if (plan.relation_plan) |graph| graph.canonical else null);
+ }
+ 
+ pub fn decodeCache(
+     allocator: std.mem.Allocator,
+     decoder: *definition_core.cache.Decoder,
+ ) !Plan {
+-    if (try decoder.readU16() != 5) {
++    if (try decoder.readU16() != 6) {
+         return error.LedgerReducerCacheVersionMismatch;
+     }
+     const states = try decodeStringSet(allocator, decoder, max_states);
+@@ -802,7 +802,7 @@ pub fn decodeCache(
+     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
+     var assert_to = try decodeOptionalPointer(allocator, decoder);
+     errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
+-    const result: Plan = .{
++    var result: Plan = .{
+         .states = states,
+         .transitions = transitions,
+         .guards = guards,
+@@ -818,6 +818,13 @@ pub fn decodeCache(
+         .max_retained_value_bytes = try decoder.readUsize(),
+         .max_retained_total_bytes = try decoder.readUsize(),
+     };
++    const relation_bytes = try decoder.readOptionalBytesAlloc(allocator, 65536);
++    defer if (relation_bytes) |bytes| allocator.free(bytes);
++    result.relation_plan = if (relation_bytes) |bytes| try relation.decodePlan(
++        allocator,
++        bytes,
++    ) else null;
++    errdefer if (result.relation_plan) |*graph| graph.deinit(allocator);
+     try validatePlan(&result);
+     return result;
+ }
+@@ -913,6 +920,16 @@ pub fn apply(
+     );
+     defer if (retained_value) |value| allocator.free(value);
+     try validateReducerCapacity(plan, state, context.prior, retained_value);
++    try validateRelation(allocator, plan, state, .{
++        .key = context.key,
++        .state = context.transition.to,
++        .retained = retained_value orelse if (context.prior) |prior| prior.retained else null,
++        .event_count = if (context.prior) |prior|
++            std.math.add(usize, prior.event_count, 1) catch
++                return error.ReducerEventCountOverflow
++        else
++            1,
++    });
+     try commitReducerTransition(
+         allocator,
+         state,
+@@ -921,6 +938,19 @@ pub fn apply(
+     );
+ }
+ 
++fn validateRelation(
++    allocator: std.mem.Allocator,
++    plan: *const Plan,
++    state: *const State,
++    successor: ?EntryView,
++) !void {
++    const graph_plan = if (plan.relation_plan) |*value| value else return;
++    const records = try state.sortedViewsAlloc(allocator);
++    defer allocator.free(records);
++    var graph = try relation.Graph.build(allocator, graph_plan, records, successor);
++    defer graph.deinit();
++}
++
+ fn validateTransitionGuard(
+     allocator: std.mem.Allocator,
+     plan: *const Plan,
+@@ -1251,6 +1281,17 @@ pub fn validatePlan(plan: *const Plan) !void {
+     {
+         return error.InvalidReducerPlan;
+     }
++    if (plan.relation_plan) |graph| {
++        if (plan.retain_once == null or plan.retain_latest != null) {
++            return error.RelationRequiresImmutableRetention;
++        }
++        if (graph.max_vertices + graph.max_edges > plan.max_entries) {
++            return error.RelationReducerBoundMismatch;
++        }
++        for (graph.active_states) |state| {
++            if (!containsSorted(plan.states, state)) return error.UnknownRelationState;
++        }
++    }
+     try validateSortedStringSet(plan.states);
+     for (plan.transitions, 0..) |transition, index| {
+         if (transition.from) |from| {
+ diff --git a/apps/ledger/src/v1/root.zig b/apps/ledger/src/v1/root.zig
+index 40660e7..9636afc 100644
+--- a/apps/ledger/src/v1/root.zig
++++ b/apps/ledger/src/v1/root.zig
+@@ -16,6 +16,7 @@ pub const projection = @import("projection.zig");
+ pub const replay = @import("replay.zig");
+ pub const protocol = @import("protocol.zig");
+ pub const reducer = @import("reducer.zig");
++pub const relation = @import("relation.zig");
+ pub const state_reducer = @import("state_reducer.zig");
+ pub const segmented_event_log = @import("segmented_event_log.zig");
+ pub const doctor = @import("doctor.zig");
+@@ -38,6 +39,7 @@ test {
+     _ = replay;
+     _ = protocol;
+     _ = reducer;
++    _ = relation;
+     _ = state_reducer;
+     _ = segmented_event_log;
+     _ = doctor;
+ diff --git a/scripts/test-ledger-cli.sh b/scripts/test-ledger-cli.sh
+index 457cc09..ef3bb0c 100755
+--- a/scripts/test-ledger-cli.sh
++++ b/scripts/test-ledger-cli.sh
+@@ -52,13 +52,13 @@ grep -Fq '"id":"any","version":1' <<<"$capabilities"
+ grep -Fq '"id":"none","version":1' <<<"$capabilities"
+ grep -Fq '"id":"composite-identity","version":1' <<<"$capabilities"
+ grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
+-grep -Fq '"id":"reducer","version":5' <<<"$capabilities"
++grep -Fq '"id":"reducer","version":6' <<<"$capabilities"
+ grep -Fq '"id":"event-envelope","version":4' <<<"$capabilities"
+ grep -Fq '"id":"cross-input-equal","version":2' <<<"$capabilities"
+ grep -Fq '"id":"compare-and-append","version":2' <<<"$capabilities"
+ grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
+ grep -Fq '"id":"rebind-existing","version":1' <<<"$capabilities"
+-grep -Fq '"id":"fold","version":6' <<<"$capabilities"
++grep -Fq '"id":"fold","version":7' <<<"$capabilities"
+ grep -Fq '"id":"relevance","version":3' <<<"$capabilities"
+ grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
+ grep -Fq '"id":"text-render","version":1' <<<"$capabilities"
