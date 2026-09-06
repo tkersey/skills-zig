@@ -1,0 +1,44 @@
+name: Ledger consolidation inputs
+on:
+  push:
+    branches: [codex/ledger-directed-relations]
+    paths: [.github/workflows/ledger-consolidation-inputs.yml]
+permissions:
+  contents: read
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: b4d0a79c5ebc4b927e23d1e5977017cf006a6dfe
+          path: pr116
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 8fcd7f4c8ce0e2ed86bd8bc7d0634ce9f6f43558
+          path: pr115
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: tkersey/dotfiles
+          ref: f96a0a704f737720328c2ff9f7cdf1b3a53b8466
+          path: ergon
+          persist-credentials: false
+      - name: Archive exact source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir sources
+          git -C pr116 archive HEAD > sources/pr116.tar
+          git -C pr115 archive HEAD > sources/pr115.tar
+          git -C ergon archive HEAD codex/skills/ergon codex/skills/ledger codex/AGENTS.md .github/workflows/ergon.yml > sources/ergon.tar
+          for repo in pr115 pr116 ergon; do printf '%s %s\n' "$repo" "$(git -C "$repo" rev-parse HEAD)"; done > sources/REVISIONS
+          (cd sources && sha256sum *.tar > SHA256SUMS)
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ledger-consolidation-sources
+          path: sources
+          retention-days: 3
+          if-no-files-found: error
