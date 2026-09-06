@@ -6,6 +6,7 @@ const projection_value = @import("projection_value.zig");
 const protocol = @import("protocol.zig");
 const ranked_relevance = @import("ranked_relevance.zig");
 const reducer = @import("reducer.zig");
+const relation = @import("relation.zig");
 const replay = @import("replay.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 const state_reducer = @import("state_reducer.zig");
@@ -290,6 +291,7 @@ const KeyedFold = struct {
     retained_unwrap_path: ?definition_core.json_pointer.Pointer,
     event_count_field: ?[]u8,
     history: KeyedHistory,
+    relation_query: ?relation.Query = null,
 
     fn deinit(self: *KeyedFold, allocator: std.mem.Allocator) void {
         allocator.free(self.key_field);
@@ -298,6 +300,7 @@ const KeyedFold = struct {
         if (self.retained_unwrap_path) |*pointer| pointer.deinit(allocator);
         if (self.event_count_field) |field| allocator.free(field);
         self.history.deinit(allocator);
+        if (self.relation_query) |*value| value.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -1120,7 +1123,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(14);
+    try encoder.writeU16(15);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
@@ -1274,6 +1277,7 @@ fn encodeProjectionFold(
                 null);
             try encoder.writeOptionalBytes(keyed.event_count_field);
             try encodeKeyedHistory(&keyed.history, encoder);
+            try encoder.writeOptionalBytes(if (keyed.relation_query) |query| query.raw else null);
         },
         .retained => |retained| try encodeRetainedFold(retained, encoder),
     }
@@ -1306,7 +1310,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 14) {
+    if (try decoder.readU16() != 15) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const max_records = try decoder.readUsize();
@@ -1652,6 +1656,19 @@ fn validateCachedKeyedFold(
         event_protocol,
         error.CacheProjectionPlanMismatch,
     );
+    if (keyed.relation_query) |*query| {
+        if (keyed_plan.relation_plan == null or keyed.history.active() or
+            projection.constructed_value != null)
+        {
+            return error.InvalidRelationFoldComposition;
+        }
+        try query.validate(keyed_plan.states, &.{
+            keyed.key_field,
+            keyed.state_field,
+            keyed.retained_field,
+            keyed.event_count_field,
+        });
+    }
     const composed = projection.predicates.len != 0 or
         projection.constructed_value != null;
     if (projection.constructed_value != null) {
@@ -2202,6 +2219,13 @@ fn decodeKeyedFold(
     errdefer if (event_count_field) |field| allocator.free(field);
     var history = try decodeKeyedHistory(allocator, decoder);
     errdefer history.deinit(allocator);
+    const relation_raw = try decoder.readOptionalBytesAlloc(allocator, relation.max_config_bytes);
+    defer if (relation_raw) |raw| allocator.free(raw);
+    var relation_query = if (relation_raw) |raw|
+        try relation.Query.compileBytes(allocator, raw)
+    else
+        null;
+    errdefer if (relation_query) |*value| value.deinit(allocator);
     try validateKeyedFoldFields(
         key_field,
         state_field,
@@ -2217,6 +2241,7 @@ fn decodeKeyedFold(
         .retained_unwrap_path = retained_unwrap_path,
         .event_count_field = event_count_field,
         .history = history,
+        .relation_query = relation_query,
     };
 }
 
@@ -2705,16 +2730,15 @@ const ProjectionCompiler = struct {
             return error.FoldRequiresReducerSlot;
         }
         if (step.get("fields")) |fields_value| {
-            self.fold = .{ .retained = try self.compileRetainedFoldStep(
+            const retained = try self.compileRetainedFoldStep(
                 event_protocol,
                 step,
                 fields_value,
-            ) };
+            );
+            self.fold = .{ .retained = retained };
         } else {
-            self.fold = .{ .keyed = try self.compileKeyedFoldStep(
-                event_protocol,
-                step,
-            ) };
+            const keyed = try self.compileKeyedFoldStep(event_protocol, step);
+            self.fold = .{ .keyed = keyed };
         }
     }
 
@@ -2801,6 +2825,22 @@ const ProjectionCompiler = struct {
             &history,
             error.ProjectionFieldsConflict,
         );
+        var relation_query = if (step.get("relation")) |raw|
+            try relation.Query.compile(self.allocator, raw)
+        else
+            null;
+        errdefer if (relation_query) |*value| value.deinit(self.allocator);
+        if (relation_query) |*query| {
+            if (event_protocol.reducer_plan.?.relation_plan == null or history.active()) {
+                return error.RelationFoldRequiresDeclaredRelation;
+            }
+            try query.validate(event_protocol.reducer_plan.?.states, &.{
+                key_field,
+                state_field,
+                retained_field,
+                event_count_field,
+            });
+        }
         return self.ownKeyedFold(
             key_field,
             state_field,
@@ -2808,6 +2848,7 @@ const ProjectionCompiler = struct {
             retained_unwrap_path,
             event_count_field,
             history,
+            relation_query,
         );
     }
 
@@ -2850,6 +2891,7 @@ const ProjectionCompiler = struct {
         retained_unwrap_path: ?definition_core.json_pointer.Pointer,
         event_count_field: ?[]u8,
         history: KeyedHistory,
+        relation_query: ?relation.Query,
     ) !KeyedFold {
         const owned_key = try self.allocator.dupe(u8, key_field);
         errdefer self.allocator.free(owned_key);
@@ -2861,6 +2903,7 @@ const ProjectionCompiler = struct {
             .retained_unwrap_path = retained_unwrap_path,
             .event_count_field = event_count_field,
             .history = history,
+            .relation_query = relation_query,
         };
     }
 
@@ -3014,6 +3057,11 @@ const ProjectionCompiler = struct {
 
     fn validateFold(self: *const ProjectionCompiler) !void {
         const fold = self.fold orelse return;
+        if (fold == .keyed and fold.keyed.relation_query != null and
+            self.constructed_value != null)
+        {
+            return error.InvalidRelationFoldComposition;
+        }
         if (fold != .keyed and self.predicates.items.len != 0) {
             return error.InvalidFoldProjectionComposition;
         }
@@ -3114,6 +3162,7 @@ fn requireKeyedFoldStep(step: std.json.ObjectMap) !void {
             "event_kind_counts",
             "event_chain",
             "snapshot",
+            "relation",
         },
     );
     try definition_core.json.requireFields(
@@ -5382,6 +5431,7 @@ fn executeFoldProjection(
             allocator,
             compiled,
             &keyed,
+            event_plan,
             replay_state,
             fold_history,
             parameters,
@@ -5417,6 +5467,7 @@ fn executeKeyedFoldProjection(
     allocator: std.mem.Allocator,
     compiled: *const Projection,
     keyed: *const KeyedFold,
+    event_plan: *const protocol.Plan,
     replay_state: *protocol.ReplayState,
     fold_history: ?*FoldHistoryAccumulator,
     parameters: *const definition_core.parameters.Bindings,
@@ -5426,6 +5477,31 @@ fn executeKeyedFoldProjection(
     stats: *Stats,
     records_validated: usize,
 ) !void {
+    if (keyed.relation_query) |*query| {
+        const reducer_plan = if (event_plan.reducer_plan) |*value|
+            value
+        else
+            return error.FoldRequiresKeyedReducer;
+        const relation_plan = if (reducer_plan.relation_plan) |*value|
+            value
+        else
+            return error.RelationFoldRequiresDeclaredRelation;
+        const counts = try writeRelationFold(
+            allocator,
+            output,
+            compiled,
+            keyed,
+            query,
+            relation_plan,
+            &replay_state.reducer_state,
+            parameters,
+            effective_limit,
+            max_output_bytes,
+        );
+        stats.records_matched = counts.matched;
+        stats.records_emitted = counts.emitted;
+        return;
+    }
     if (compiled.constructed_value != null) {
         stats.records_emitted = try writeConstructedKeyedFold(
             allocator,
@@ -5467,6 +5543,103 @@ fn executeKeyedFoldProjection(
         max_output_bytes,
         records_validated,
     );
+}
+
+fn writeRelationFold(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    projection: *const Projection,
+    keyed: *const KeyedFold,
+    query: *const relation.Query,
+    plan: *const relation.Plan,
+    state: *reducer.State,
+    parameters: *const definition_core.parameters.Bindings,
+    limit: usize,
+    max_output_bytes: usize,
+) !FilteredFoldCounts {
+    const views = try state.sortedViewsAlloc(allocator);
+    defer allocator.free(views);
+    const records = try allocator.alloc(relation.Record, views.len);
+    defer allocator.free(records);
+    for (views, records) |view, *record| record.* = .{
+        .key = view.key,
+        .state = view.state,
+        .retained = view.retained,
+    };
+    var index = try relation.Index.init(allocator, plan, records);
+    defer index.deinit(allocator);
+    const marks = try allocator.alloc(bool, index.vertices.items.len);
+    defer allocator.free(marks);
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    const fields = keyedHistoryFields(&field_storage, keyed);
+    const config = query.config;
+    var counts: FilteredFoldCounts = .{ .matched = 0, .emitted = 0 };
+    try output.writer.writeByte('[');
+    for (views, 0..) |view, i| {
+        const wanted: relation.Role = if (config.select == .vertices) .vertex else .edge;
+        if (index.roles[i] != wanted) continue;
+        const unmatched = if (config.target_states.len != 0)
+            try index.unmatched(view.key, config.target_states, marks)
+        else
+            0;
+        if ((config.match == .all and unmatched != 0) or
+            (config.match == .not_all and unmatched == 0)) continue;
+        if (projection.predicates.len == 0 and counts.emitted == limit) {
+            counts.matched += 1;
+            continue;
+        }
+        var row = try relationRowAlloc(
+            allocator,
+            keyed,
+            fields,
+            view,
+            config.unmatched_field,
+            &index,
+            marks,
+        );
+        defer row.deinit();
+        // Predicates and output observe the same complete, relation-enriched row.
+        if (!matches(projection, row.value, parameters)) continue;
+        counts.matched += 1;
+        if (counts.emitted == limit) continue;
+        if (counts.emitted != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalJson(allocator, &output.writer, row.value);
+        counts.emitted += 1;
+        if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
+    }
+    try output.writer.writeByte(']');
+    if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
+    return counts;
+}
+
+fn relationRowAlloc(
+    allocator: std.mem.Allocator,
+    keyed: *const KeyedFold,
+    fields: []const KeyedHistoryField,
+    view: reducer.EntryView,
+    unmatched_field: ?[]const u8,
+    index: *const relation.Index,
+    marks: []const bool,
+) !std.json.Parsed(std.json.Value) {
+    const unwrap = if (keyed.retained_unwrap_path) |*pointer| pointer else null;
+    var row: std.Io.Writer.Allocating = .init(allocator);
+    defer row.deinit();
+    try writeKeyedHistoryRow(allocator, &row.writer, fields, view, null, unwrap);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.written(), .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+    });
+    errdefer parsed.deinit();
+    if (unmatched_field) |field| {
+        const arena = parsed.arena.allocator();
+        var targets = std.json.Array.init(arena);
+        for (index.vertices.items, marks) |vertex, unmatched| {
+            if (unmatched) try targets.append(.{ .string = try arena.dupe(u8, vertex.key) });
+        }
+        try parsed.value.object.put(arena, try arena.dupe(u8, field), .{ .array = targets });
+    }
+    return parsed;
 }
 
 fn writeCompleteKeyedFold(
@@ -8182,4 +8355,56 @@ fn verifyRequiredLookupFailure(plans: *ProjectionTestPlans) !void {
         ),
     );
     try std.testing.expectEqual(@as(usize, 2), stats.records_scanned);
+}
+
+test "relation rows preserve opaque numbers and unwind every allocation failure" {
+    var plans = try ProjectionTestPlans.init(@embedFile("fixtures/related-event-definition.json"));
+    defer plans.deinit();
+    const keyed = &plans.cached.find("current").?.fold.?.keyed;
+    const relation_plan = &plans.protocol_plan.?.reducer_plan.?.relation_plan.?;
+    const records = [_]relation.Record{
+        .{ .key = "A", .state = "pending", .retained = "{\"type\":\"component\"}" },
+        .{ .key = "B", .state = "pending", .retained = "{\"type\":\"component\"}" },
+        .{
+            .key = "ab",
+            .state = "present",
+            .retained = "{\"type\":\"relation\",\"from\":\"A\",\"to\":\"B\"}",
+        },
+    };
+    var index = try relation.Index.init(std.testing.allocator, relation_plan, &records);
+    defer index.deinit(std.testing.allocator);
+    var marks: [2]bool = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.unmatched("A", &.{"satisfied"}, &marks));
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        relationRowAllocationProbe,
+        .{ keyed, &index, &marks },
+    );
+}
+
+fn relationRowAllocationProbe(
+    allocator: std.mem.Allocator,
+    keyed: *const KeyedFold,
+    index: *const relation.Index,
+    marks: []const bool,
+) !void {
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    const fields = keyedHistoryFields(&field_storage, keyed);
+    var row = relationRowAlloc(allocator, keyed, fields, .{
+        .key = "A",
+        .state = "pending",
+        .retained = "{\"type\":\"component\",\"opaque\":1e999}",
+        .event_count = 1,
+    }, "unmatched", index, marks) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer row.deinit();
+    const object = row.value.object;
+    const target = object.get("unmatched").?.array.items[0].string;
+    try std.testing.expectEqualStrings("B", target);
+    try std.testing.expectEqualStrings(
+        "1e999",
+        object.get("current").?.object.get("opaque").?.number_string,
+    );
 }

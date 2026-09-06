@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
 const checkpoint = @import("checkpoint.zig");
+const relation = @import("relation.zig");
 
 const max_text_bytes = 256;
 const max_states = 65_536;
@@ -54,6 +55,7 @@ pub const Plan = struct {
     max_entries: usize,
     max_retained_value_bytes: usize,
     max_retained_total_bytes: usize,
+    relation_plan: ?relation.Plan = null,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         deinitStringSet(allocator, self.states);
@@ -68,6 +70,7 @@ pub const Plan = struct {
         if (self.retain_latest) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
+        if (self.relation_plan) |*value| value.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -169,7 +172,11 @@ pub const State = struct {
         return self.entries.count();
     }
 
-    pub fn validateCheckpoint(self: *const State, plan: *const Plan) !void {
+    pub fn validateCheckpoint(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        plan: *const Plan,
+    ) !void {
         if (self.entries.count() > plan.max_entries or
             self.retained_bytes > plan.max_retained_total_bytes)
         {
@@ -186,6 +193,7 @@ pub const State = struct {
                 }
             }
         }
+        try validateRelationState(allocator, plan, self, null);
     }
 
     pub fn encodeCheckpoint(
@@ -453,6 +461,7 @@ pub fn compile(
         .max_entries = max_entries,
         .max_retained_value_bytes = bounds.max_input_bytes,
         .max_retained_total_bytes = bounds.max_store_bytes,
+        .relation_plan = reducer.relation_plan,
     };
     try validatePlan(&result);
     return result;
@@ -510,6 +519,7 @@ const ReducerConfig = struct {
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
     guards: []Guard,
+    relation_plan: ?relation.Plan,
 
     fn deinit(self: *ReducerConfig, allocator: std.mem.Allocator) void {
         self.key.deinit(allocator);
@@ -521,6 +531,7 @@ const ReducerConfig = struct {
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         for (self.guards) |*guard| guard.deinit(allocator);
         allocator.free(self.guards);
+        if (self.relation_plan) |*value| value.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -583,7 +594,13 @@ fn compileReducerConfig(
         for (guards) |*guard| guard.deinit(allocator);
         allocator.free(guards);
     }
+    var relation_plan = if (reducer.get("relation")) |value|
+        try relation.compile(allocator, value)
+    else
+        null;
+    errdefer if (relation_plan) |*value| value.deinit(allocator);
     return .{
+        .relation_plan = relation_plan,
         .key = key,
         .on = on,
         .event_kind = event_kind,
@@ -610,6 +627,7 @@ fn validateReducerConfigObject(reducer: std.json.ObjectMap) !void {
             "to",
             "assertion_presence",
             "guards",
+            "relation",
         },
     );
     try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
@@ -733,7 +751,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
@@ -773,13 +791,14 @@ pub fn encodeCache(
     try encoder.writeUsize(plan.max_entries);
     try encoder.writeUsize(plan.max_retained_value_bytes);
     try encoder.writeUsize(plan.max_retained_total_bytes);
+    try encoder.writeOptionalBytes(if (plan.relation_plan) |value| value.raw else null);
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) {
+    if (try decoder.readU16() != 6) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
@@ -802,7 +821,7 @@ pub fn decodeCache(
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try decodeOptionalPointer(allocator, decoder);
     errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
-    const result: Plan = .{
+    var result: Plan = .{
         .states = states,
         .transitions = transitions,
         .guards = guards,
@@ -818,6 +837,10 @@ pub fn decodeCache(
         .max_retained_value_bytes = try decoder.readUsize(),
         .max_retained_total_bytes = try decoder.readUsize(),
     };
+    const relation_raw = try decoder.readOptionalBytesAlloc(allocator, relation.max_config_bytes);
+    defer if (relation_raw) |raw| allocator.free(raw);
+    if (relation_raw) |raw| result.relation_plan = try relation.compileBytes(allocator, raw);
+    errdefer if (result.relation_plan) |*value| value.deinit(allocator);
     try validatePlan(&result);
     return result;
 }
@@ -913,6 +936,11 @@ pub fn apply(
     );
     defer if (retained_value) |value| allocator.free(value);
     try validateReducerCapacity(plan, state, context.prior, retained_value);
+    try validateRelationState(allocator, plan, state, .{
+        .key = context.key,
+        .state = context.transition.to,
+        .retained = retained_value orelse if (context.prior) |prior| prior.retained else null,
+    });
     try commitReducerTransition(
         allocator,
         state,
@@ -1240,7 +1268,39 @@ fn compileTransitions(
     return transitions;
 }
 
+fn validateRelationState(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    successor: ?relation.Record,
+) !void {
+    const configured = if (plan.relation_plan) |*value| value else return;
+    var records: std.ArrayList(relation.Record) = .empty;
+    defer records.deinit(allocator);
+    try records.ensureTotalCapacity(allocator, state.count() + @intFromBool(successor != null));
+    var iterator = state.entries.valueIterator();
+    while (iterator.next()) |entry| {
+        if (successor) |candidate| {
+            if (std.mem.eql(u8, entry.key(), candidate.key)) continue;
+        }
+        records.appendAssumeCapacity(.{
+            .key = entry.key(),
+            .state = entry.state(),
+            .retained = entry.retained,
+        });
+    }
+    if (successor) |candidate| records.appendAssumeCapacity(candidate);
+    var index = try relation.Index.init(allocator, configured, records.items);
+    defer index.deinit(allocator);
+}
+
 pub fn validatePlan(plan: *const Plan) !void {
+    if (plan.relation_plan) |*configured| {
+        if (plan.retain_once == null and plan.retain_latest == null) {
+            return error.RelationRequiresRetention;
+        }
+        try configured.validate(plan.max_entries, plan.states);
+    }
     if (plan.states.len == 0 or plan.states.len > max_states or
         plan.transitions.len == 0 or
         plan.transitions.len > max_transitions or
