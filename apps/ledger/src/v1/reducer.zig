@@ -177,7 +177,6 @@ pub const State = struct {
         allocator: std.mem.Allocator,
         plan: *const Plan,
     ) !void {
-        try validateRelationState(allocator, plan, self, null);
         if (self.entries.count() > plan.max_entries or
             self.retained_bytes > plan.max_retained_total_bytes)
         {
@@ -194,6 +193,7 @@ pub const State = struct {
                 }
             }
         }
+        try validateRelationState(allocator, plan, self, null);
     }
 
     pub fn encodeCheckpoint(

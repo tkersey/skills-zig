@@ -2730,16 +2730,15 @@ const ProjectionCompiler = struct {
             return error.FoldRequiresReducerSlot;
         }
         if (step.get("fields")) |fields_value| {
-            self.fold = .{ .retained = try self.compileRetainedFoldStep(
+            const retained = try self.compileRetainedFoldStep(
                 event_protocol,
                 step,
                 fields_value,
-            ) };
+            );
+            self.fold = .{ .retained = retained };
         } else {
-            self.fold = .{ .keyed = try self.compileKeyedFoldStep(
-                event_protocol,
-                step,
-            ) };
+            const keyed = try self.compileKeyedFoldStep(event_protocol, step);
+            self.fold = .{ .keyed = keyed };
         }
     }
 

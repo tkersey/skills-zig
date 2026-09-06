@@ -16,6 +16,7 @@ pub const projection = @import("projection.zig");
 pub const replay = @import("replay.zig");
 pub const protocol = @import("protocol.zig");
 pub const reducer = @import("reducer.zig");
+pub const relation = @import("relation.zig");
 pub const state_reducer = @import("state_reducer.zig");
 pub const segmented_event_log = @import("segmented_event_log.zig");
 pub const doctor = @import("doctor.zig");
@@ -38,6 +39,7 @@ test {
     _ = replay;
     _ = protocol;
     _ = reducer;
+    _ = relation;
     _ = state_reducer;
     _ = segmented_event_log;
     _ = doctor;

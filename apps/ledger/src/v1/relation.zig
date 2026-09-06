@@ -529,3 +529,53 @@ test "relation query rejects incoherent fields instead of weakening selection" {
     );
     try std.testing.expectError(error.RelationUnknownTargetState, query.validate(&.{}, &.{"id"}));
 }
+
+test "compiled relation owners survive relocation of the parent cache arena" {
+    var original = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var plan = try compileBytes(original.allocator(), fixture_config);
+    var query = try Query.compileBytes(original.allocator(), "{\"select\":\"vertices\"}");
+    var relocated = original.state.promote(std.testing.allocator);
+    original = undefined;
+    defer relocated.deinit();
+    query.deinit(relocated.allocator());
+    plan.deinit(relocated.allocator());
+}
+
+test "relation inspection does not narrow opaque JSON numbers" {
+    const allocator = std.testing.allocator;
+    var plan = try compileBytes(allocator, fixture_config);
+    defer plan.deinit(allocator);
+    var vertex = fixture_vertices[0];
+    vertex.retained = "{\"type\":\"vertex\",\"opaque\":1e999}";
+    var index = try Index.init(allocator, &plan, &.{vertex});
+    defer index.deinit(allocator);
+    try std.testing.expectEqualStrings("A", index.vertices.items[0].key);
+    const source = index.vertices.items[0].record_index;
+    const records = [_]Record{vertex};
+    try std.testing.expectEqualStrings(vertex.retained.?, records[source].retained.?);
+}
+
+test "relation bounds retain inactive identities and missing sources fail closed" {
+    const allocator = std.testing.allocator;
+    var plan = try compileBytes(allocator, fixture_config);
+    defer plan.deinit(allocator);
+    try std.testing.expectError(
+        error.RelationSourceMissing,
+        Index.init(allocator, &plan, &.{ fixture_vertices[1], fixture_edges[0] }),
+    );
+    var missing = fixture_vertices[0];
+    missing.retained = null;
+    try std.testing.expectError(
+        error.RelationRetainedValueMissing,
+        Index.init(allocator, &plan, &.{missing}),
+    );
+    plan.config.max_edges = 1;
+    var inactive = fixture_edges[0];
+    inactive.state = "inactive";
+    var index = try Index.init(allocator, &plan, &(fixture_vertices ++ .{inactive}));
+    index.deinit(allocator);
+    try std.testing.expectError(
+        error.RelationEdgeBounds,
+        Index.init(allocator, &plan, &(fixture_vertices ++ .{ inactive, fixture_edges[1] })),
+    );
+}

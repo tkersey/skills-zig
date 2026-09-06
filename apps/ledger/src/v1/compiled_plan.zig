@@ -1408,11 +1408,19 @@ fn compilePlanSetForAllocationFailure(
 }
 
 test "compiled plan cache releases every allocation on compile and decode failure" {
+    try checkFixtureAllocationFailures(@embedFile("fixtures/chained-event-definition.json"));
+}
+
+test "relation compiled plans release every allocation on compile and decode failure" {
+    try checkFixtureAllocationFailures(@embedFile("fixtures/related-event-definition.json"));
+}
+
+fn checkFixtureAllocationFailures(fixture: []const u8) !void {
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     try source_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data = @embedFile("fixtures/chained-event-definition.json"),
+        .data = fixture,
     });
     const source_root = try source_tmp.dir.realPathFileAlloc(
         std.testing.io,
