@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
 const checkpoint = @import("checkpoint.zig");
+const relation = @import("relation.zig");
 
 const max_text_bytes = 256;
 const max_states = 65_536;
@@ -54,6 +55,7 @@ pub const Plan = struct {
     max_entries: usize,
     max_retained_value_bytes: usize,
     max_retained_total_bytes: usize,
+    relation_plan: ?relation.Plan = null,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         deinitStringSet(allocator, self.states);
@@ -68,6 +70,7 @@ pub const Plan = struct {
         if (self.retain_latest) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
+        if (self.relation_plan) |*plan| plan.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -147,12 +150,7 @@ const ProjectionField = struct {
     kind: ProjectionFieldKind,
 };
 
-pub const EntryView = struct {
-    key: []const u8,
-    state: []const u8,
-    retained: ?[]const u8,
-    event_count: usize,
-};
+pub const EntryView = relation.Record;
 
 pub const State = struct {
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
@@ -169,7 +167,11 @@ pub const State = struct {
         return self.entries.count();
     }
 
-    pub fn validateCheckpoint(self: *const State, plan: *const Plan) !void {
+    pub fn validateCheckpoint(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        plan: *const Plan,
+    ) !void {
         if (self.entries.count() > plan.max_entries or
             self.retained_bytes > plan.max_retained_total_bytes)
         {
@@ -186,6 +188,7 @@ pub const State = struct {
                 }
             }
         }
+        try validateRelation(allocator, plan, self, null);
     }
 
     pub fn encodeCheckpoint(
@@ -303,7 +306,7 @@ pub const State = struct {
     }
 
     pub fn sortedViewsAlloc(
-        self: *State,
+        self: *const State,
         allocator: std.mem.Allocator,
     ) ![]EntryView {
         const views = try allocator.alloc(EntryView, self.entries.count());
@@ -453,6 +456,7 @@ pub fn compile(
         .max_entries = max_entries,
         .max_retained_value_bytes = bounds.max_input_bytes,
         .max_retained_total_bytes = bounds.max_store_bytes,
+        .relation_plan = reducer.relation_plan,
     };
     try validatePlan(&result);
     return result;
@@ -510,6 +514,7 @@ const ReducerConfig = struct {
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
     guards: []Guard,
+    relation_plan: ?relation.Plan = null,
 
     fn deinit(self: *ReducerConfig, allocator: std.mem.Allocator) void {
         self.key.deinit(allocator);
@@ -521,6 +526,7 @@ const ReducerConfig = struct {
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         for (self.guards) |*guard| guard.deinit(allocator);
         allocator.free(self.guards);
+        if (self.relation_plan) |*plan| plan.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -535,33 +541,19 @@ fn compileReducerConfig(
     const reducer = reducer_parsed.value.object;
     try validateReducerConfigObject(reducer);
     try requireOperator(reducer, .reducer);
-    var key = try compilePointer(
-        allocator,
-        try definition_core.json.requiredString(reducer, "key"),
-    );
+    const key_name = try definition_core.json.requiredString(reducer, "key");
+    var key = try compilePointer(allocator, key_name);
     errdefer key.deinit(allocator);
     var on = try compilePointer(
         allocator,
         try definition_core.json.requiredString(reducer, "on"),
     );
     errdefer on.deinit(allocator);
-    var event_kind = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "event_kind",
-    );
+    var event_kind = try compileOptionalPointer(allocator, reducer, "event_kind");
     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
-    var retain_once = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "retain_once",
-    );
+    var retain_once = try compileOptionalPointer(allocator, reducer, "retain_once");
     errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
-    var retain_latest = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "retain_latest",
-    );
+    var retain_latest = try compileOptionalPointer(allocator, reducer, "retain_latest");
     errdefer if (retain_latest) |*pointer| pointer.deinit(allocator);
     if (retain_once != null and retain_latest != null) {
         return error.ConflictingReducerRetention;
@@ -583,6 +575,11 @@ fn compileReducerConfig(
         for (guards) |*guard| guard.deinit(allocator);
         allocator.free(guards);
     }
+    var relation_plan = if (reducer.get("relation")) |raw| try relation.compile(
+        allocator,
+        raw,
+    ) else null;
+    errdefer if (relation_plan) |*plan| plan.deinit(allocator);
     return .{
         .key = key,
         .on = on,
@@ -593,6 +590,7 @@ fn compileReducerConfig(
         .assert_to = assert_to,
         .assertion_presence = try compileAssertionPresence(reducer),
         .guards = guards,
+        .relation_plan = relation_plan,
     };
 }
 
@@ -610,6 +608,7 @@ fn validateReducerConfigObject(reducer: std.json.ObjectMap) !void {
             "to",
             "assertion_presence",
             "guards",
+            "relation",
         },
     );
     try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
@@ -733,7 +732,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
@@ -773,13 +772,14 @@ pub fn encodeCache(
     try encoder.writeUsize(plan.max_entries);
     try encoder.writeUsize(plan.max_retained_value_bytes);
     try encoder.writeUsize(plan.max_retained_total_bytes);
+    try encoder.writeOptionalBytes(if (plan.relation_plan) |graph| graph.canonical else null);
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) {
+    if (try decoder.readU16() != 6) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
@@ -802,7 +802,7 @@ pub fn decodeCache(
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try decodeOptionalPointer(allocator, decoder);
     errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
-    const result: Plan = .{
+    var result: Plan = .{
         .states = states,
         .transitions = transitions,
         .guards = guards,
@@ -818,6 +818,13 @@ pub fn decodeCache(
         .max_retained_value_bytes = try decoder.readUsize(),
         .max_retained_total_bytes = try decoder.readUsize(),
     };
+    const relation_bytes = try decoder.readOptionalBytesAlloc(allocator, 65536);
+    defer if (relation_bytes) |bytes| allocator.free(bytes);
+    result.relation_plan = if (relation_bytes) |bytes| try relation.decodePlan(
+        allocator,
+        bytes,
+    ) else null;
+    errdefer if (result.relation_plan) |*graph| graph.deinit(allocator);
     try validatePlan(&result);
     return result;
 }
@@ -913,12 +920,35 @@ pub fn apply(
     );
     defer if (retained_value) |value| allocator.free(value);
     try validateReducerCapacity(plan, state, context.prior, retained_value);
+    try validateRelation(allocator, plan, state, .{
+        .key = context.key,
+        .state = context.transition.to,
+        .retained = retained_value orelse if (context.prior) |prior| prior.retained else null,
+        .event_count = if (context.prior) |prior|
+            std.math.add(usize, prior.event_count, 1) catch
+                return error.ReducerEventCountOverflow
+        else
+            1,
+    });
     try commitReducerTransition(
         allocator,
         state,
         context,
         &retained_value,
     );
+}
+
+fn validateRelation(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    successor: ?EntryView,
+) !void {
+    const graph_plan = if (plan.relation_plan) |*value| value else return;
+    const records = try state.sortedViewsAlloc(allocator);
+    defer allocator.free(records);
+    var graph = try relation.Graph.build(allocator, graph_plan, records, successor);
+    defer graph.deinit();
 }
 
 fn validateTransitionGuard(
@@ -1250,6 +1280,17 @@ pub fn validatePlan(plan: *const Plan) !void {
         plan.max_retained_value_bytes > plan.max_retained_total_bytes)
     {
         return error.InvalidReducerPlan;
+    }
+    if (plan.relation_plan) |graph| {
+        if (plan.retain_once == null or plan.retain_latest != null) {
+            return error.RelationRequiresImmutableRetention;
+        }
+        if (graph.max_vertices + graph.max_edges > plan.max_entries) {
+            return error.RelationReducerBoundMismatch;
+        }
+        for (graph.active_states) |state| {
+            if (!containsSorted(plan.states, state)) return error.UnknownRelationState;
+        }
     }
     try validateSortedStringSet(plan.states);
     for (plan.transitions, 0..) |transition, index| {

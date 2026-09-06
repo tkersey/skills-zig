@@ -289,7 +289,7 @@ pub fn activateCheckpoint(
     state.event_kinds_digest = current_event_kinds_digest;
     state.has_event_kinds_digest = true;
     if (plan.reducer_plan) |*reducer_plan| {
-        state.reducer_state.validateCheckpoint(reducer_plan) catch
+        state.reducer_state.validateCheckpoint(allocator, reducer_plan) catch
             return error.CheckpointBoundsExceeded;
     } else if (state.reducer_state.count() != 0) {
         return error.CheckpointReducerMissing;
