@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note img)
+apps=(seq lift cas ledger memory-note)
 
 resolve_ref() {
   local ref=$1
@@ -220,9 +220,6 @@ case "$mode" in
           ;;
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
-          ;;
-        .github/workflows/release-img.yml)
-          mark_app img
           ;;
         apps/*)
           matched=0

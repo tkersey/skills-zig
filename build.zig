@@ -157,7 +157,6 @@ pub fn build(b: *std.Build) void {
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
-    const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
     const ledger_root = b.createModule(.{
         .root_source_file = b.path("apps/ledger/src/v1/main.zig"),
         .target = target,
@@ -170,30 +169,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ledger_v1_core", .module = ledger_v1_core },
         },
     });
-    const img_atlas = b.createModule(.{
-        .root_source_file = b.path("apps/img/assets/atlas.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const img_root = b.createModule(.{
-        .root_source_file = b.path("apps/img/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "app_meta", .module = img_meta },
-            .{ .name = "img_atlas", .module = img_atlas },
-        },
-    });
-    const img_tests_root = b.createModule(.{
-        .root_source_file = b.path("apps/img/src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "img_atlas", .module = img_atlas },
-        },
-    });
-
     const lift_bench_root = b.createModule(.{
         .root_source_file = b.path("apps/lift/scripts/bench_stats.zig"),
         .target = target,
@@ -511,7 +486,6 @@ pub fn build(b: *std.Build) void {
     });
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
-    const img = addExecutable(b, "img", img_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
     const durable_store_perf = addExecutable(b, "durable-store-perf", durable_store_perf_root);
 
@@ -532,7 +506,6 @@ pub fn build(b: *std.Build) void {
     const cas_automation_install = addInstallStep(b, cas_automation);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
-    const img_install = addInstallStep(b, img);
     const perf_hub_install = addInstallStep(b, perf_hub);
 
     const install_all = b.getInstallStep();
@@ -553,7 +526,6 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_automation_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
-    install_all.dependOn(&img_install.step);
     install_all.dependOn(&perf_hub_install.step);
 
     const run_seq_tests = addTestStep(
@@ -788,12 +760,6 @@ pub fn build(b: *std.Build) void {
         "test-memory-note",
         "Run memory-note tests",
     );
-    const run_img_tests = addTestStep(
-        b,
-        img_tests_root,
-        "test-img",
-        "Run img tests",
-    );
     const run_perf_hub_tests = addTestStep(
         b,
         perf_hub_root,
@@ -971,13 +937,6 @@ pub fn build(b: *std.Build) void {
             .build_deps = &.{&memory_note_install.step},
             .test_deps = &.{&run_memory_note_tests.step},
         },
-        .{
-            .path = b.path("apps/img"),
-            .build_step_name = "build-img",
-            .build_description = "Build img binary",
-            .build_deps = &.{&img_install.step},
-            .test_deps = &.{&run_img_tests.step},
-        },
     };
 
     for (app_surfaces) |surface| {
@@ -1024,7 +983,6 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, ledger, "run-ledger", "Run ledger", &.{"--help"});
     addRunStep(b, memory_note, "run-memory-note", "Run memory-note", &.{"--help"});
-    addRunStep(b, img, "run-img", "Run img", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});
