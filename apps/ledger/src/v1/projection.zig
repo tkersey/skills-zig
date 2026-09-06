@@ -5578,19 +5578,18 @@ fn writeRelationFold(
     for (views, 0..) |view, i| {
         const wanted: relation.Role = if (config.select == .vertices) .vertex else .edge;
         if (index.roles[i] != wanted) continue;
-        if (!try matchesKeyedFold(allocator, projection, fields, view, null, parameters)) continue;
         const unmatched = if (config.target_states.len != 0)
             try index.unmatched(view.key, config.target_states, marks)
         else
             0;
         if ((config.match == .all and unmatched != 0) or
             (config.match == .not_all and unmatched == 0)) continue;
-        counts.matched += 1;
-        if (counts.emitted == limit) continue;
-        if (counts.emitted != 0) try output.writer.writeByte(',');
-        try writeRelationRow(
+        if (projection.predicates.len == 0 and counts.emitted == limit) {
+            counts.matched += 1;
+            continue;
+        }
+        var row = try relationRowAlloc(
             allocator,
-            &output.writer,
             keyed,
             fields,
             view,
@@ -5598,6 +5597,13 @@ fn writeRelationFold(
             &index,
             marks,
         );
+        defer row.deinit();
+        // Predicates and output observe the same complete, relation-enriched row.
+        if (!matches(projection, row.value, parameters)) continue;
+        counts.matched += 1;
+        if (counts.emitted == limit) continue;
+        if (counts.emitted != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalJson(allocator, &output.writer, row.value);
         counts.emitted += 1;
         if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
     }
@@ -5606,19 +5612,16 @@ fn writeRelationFold(
     return counts;
 }
 
-fn writeRelationRow(
+fn relationRowAlloc(
     allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
     keyed: *const KeyedFold,
     fields: []const KeyedHistoryField,
     view: reducer.EntryView,
     unmatched_field: ?[]const u8,
     index: *const relation.Index,
     marks: []const bool,
-) !void {
+) !std.json.Parsed(std.json.Value) {
     const unwrap = if (keyed.retained_unwrap_path) |*pointer| pointer else null;
-    const field = unmatched_field orelse
-        return writeKeyedHistoryRow(allocator, writer, fields, view, null, unwrap);
     var row: std.Io.Writer.Allocating = .init(allocator);
     defer row.deinit();
     try writeKeyedHistoryRow(allocator, &row.writer, fields, view, null, unwrap);
@@ -5627,15 +5630,16 @@ fn writeRelationRow(
         .duplicate_field_behavior = .@"error",
         .parse_numbers = false,
     });
-    defer parsed.deinit();
-    var targets = std.json.Array.init(allocator);
-    defer targets.deinit();
-    for (index.vertices.items, marks) |vertex, unmatched| {
-        if (unmatched) try targets.append(.{ .string = vertex.key });
+    errdefer parsed.deinit();
+    if (unmatched_field) |field| {
+        const arena = parsed.arena.allocator();
+        var targets = std.json.Array.init(arena);
+        for (index.vertices.items, marks) |vertex, unmatched| {
+            if (unmatched) try targets.append(.{ .string = try arena.dupe(u8, vertex.key) });
+        }
+        try parsed.value.object.put(arena, try arena.dupe(u8, field), .{ .array = targets });
     }
-    // Put using the parsed value's arena: map expansion must not escape its lifetime.
-    try parsed.value.object.put(parsed.arena.allocator(), field, .{ .array = targets });
-    try definition_core.canonical_json.writeCanonicalJson(allocator, writer, parsed.value);
+    return parsed;
 }
 
 fn writeCompleteKeyedFold(
@@ -8351,4 +8355,56 @@ fn verifyRequiredLookupFailure(plans: *ProjectionTestPlans) !void {
         ),
     );
     try std.testing.expectEqual(@as(usize, 2), stats.records_scanned);
+}
+
+test "relation rows preserve opaque numbers and unwind every allocation failure" {
+    var plans = try ProjectionTestPlans.init(@embedFile("fixtures/related-event-definition.json"));
+    defer plans.deinit();
+    const keyed = &plans.cached.find("current").?.fold.?.keyed;
+    const relation_plan = &plans.protocol_plan.?.reducer_plan.?.relation_plan.?;
+    const records = [_]relation.Record{
+        .{ .key = "A", .state = "pending", .retained = "{\"type\":\"component\"}" },
+        .{ .key = "B", .state = "pending", .retained = "{\"type\":\"component\"}" },
+        .{
+            .key = "ab",
+            .state = "present",
+            .retained = "{\"type\":\"relation\",\"from\":\"A\",\"to\":\"B\"}",
+        },
+    };
+    var index = try relation.Index.init(std.testing.allocator, relation_plan, &records);
+    defer index.deinit(std.testing.allocator);
+    var marks: [2]bool = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.unmatched("A", &.{"satisfied"}, &marks));
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        relationRowAllocationProbe,
+        .{ keyed, &index, &marks },
+    );
+}
+
+fn relationRowAllocationProbe(
+    allocator: std.mem.Allocator,
+    keyed: *const KeyedFold,
+    index: *const relation.Index,
+    marks: []const bool,
+) !void {
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    const fields = keyedHistoryFields(&field_storage, keyed);
+    var row = relationRowAlloc(allocator, keyed, fields, .{
+        .key = "A",
+        .state = "pending",
+        .retained = "{\"type\":\"component\",\"opaque\":1e999}",
+        .event_count = 1,
+    }, "unmatched", index, marks) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer row.deinit();
+    const object = row.value.object;
+    const target = object.get("unmatched").?.array.items[0].string;
+    try std.testing.expectEqualStrings("B", target);
+    try std.testing.expectEqualStrings(
+        "1e999",
+        object.get("current").?.object.get("opaque").?.number_string,
+    );
 }

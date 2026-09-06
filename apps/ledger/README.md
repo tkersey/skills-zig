@@ -222,6 +222,7 @@ unsatisfied target IDs. Ordinary keyed-fold filters may select vertex lifecycle
 states afterwards; reference resolution always uses the complete state, not the
 filtered subset. `select: "edges"` supports the ordinary fold fields and state
 filters, without target-state predicates.
+Following filters observe the emitted row, including its unmatched-target field.
 
 Queries reject unknown state names, collisions with existing output fields,
 undeclared relations, and unsupported compositions with keyed history or
