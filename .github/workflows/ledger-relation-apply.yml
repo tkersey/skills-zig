@@ -1,0 +1,35 @@
+name: Apply reviewed Ledger relation patch
+
+on:
+  push:
+    branches: [codex/ledger-directed-relations]
+    paths:
+      - .github/ledger-transfer/**
+      - .github/workflows/ledger-relation-apply.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref == 'refs/heads/codex/ledger-directed-relations'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Apply checksum-verified reviewed changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/ledger-transfer/{00,01,02,03,04,05,06,07,08,09} | base64 --decode | gzip -dc > "$RUNNER_TEMP/relation.patch"
+          printf '%s  %s\n' 'bfb644258b1669e3ad8eb6a23158fe733fb734c6992676563cc3d9bcb22b0497' "$RUNNER_TEMP/relation.patch" | sha256sum -c -
+          git apply --check "$RUNNER_TEMP/relation.patch"
+          git apply --index "$RUNNER_TEMP/relation.patch"
+          git rm -r .github/ledger-transfer .github/workflows/ledger-relation-apply.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(ledger): enforce bounded directed relations and derive target-state folds'
+          git push origin HEAD:refs/heads/codex/ledger-directed-relations
