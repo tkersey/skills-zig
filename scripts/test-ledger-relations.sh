@@ -2,7 +2,8 @@
 set -euo pipefail
 binary=$1
 definition=apps/ledger/src/v1/fixtures/relation-definition.json
-repo=$(mktemp -d "${TMPDIR:-/tmp}/ledger-relation.XXXXXX")
+temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+repo=$(mktemp -d "$temp_base/ledger-relation.XXXXXX")
 trap 'rm -rf -- "$repo"' EXIT
 
 project() {
