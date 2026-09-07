@@ -259,7 +259,8 @@ pub fn threadSectionsProbe(
             "threadSection/create rejected the probe section or omitted its identity",
         );
     defer allocator.free(section_id);
-    defer cleanupThreadSection(allocator, client, thread_id, section_id);
+    var section_exists = true;
+    defer cleanupThreadSection(allocator, client, thread_id, section_id, section_exists);
     const other_section_id = createThreadSectionIdAlloc(
         allocator,
         client,
@@ -269,8 +270,28 @@ pub fn threadSectionsProbe(
         "threadSection/create rejected the opposite-filter control section",
     );
     defer allocator.free(other_section_id);
-    defer _ = deleteThreadSection(allocator, client, other_section_id);
+    defer cleanupUnusedThreadSection(allocator, client, other_section_id);
 
+    const filters = threadSectionFiltersProbe(
+        allocator,
+        client,
+        cwd,
+        thread_id,
+        section_id,
+        other_section_id,
+    );
+    if (filters.status != .passed) return filters;
+    return threadSectionMutationProbe(allocator, client, thread_id, section_id, &section_exists);
+}
+
+fn threadSectionFiltersProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    cwd: []const u8,
+    thread_id: []const u8,
+    section_id: []const u8,
+    other_section_id: []const u8,
+) LiveWitness {
     const moved = moveThreadToSection(allocator, client, thread_id, section_id);
     if (!moved) return LiveWitness.failed(
         "thread_section_move_failed",
@@ -308,6 +329,16 @@ pub fn threadSectionsProbe(
             "thread/list ignored the opposite section filter",
         );
     }
+    return LiveWitness.passed();
+}
+
+fn threadSectionMutationProbe(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    section_id: []const u8,
+    section_exists: *bool,
+) LiveWitness {
     if (!updateThreadSection(allocator, client, section_id)) return LiveWitness.failed(
         "thread_section_update_failed",
         "threadSection/update could not rename the probe section",
@@ -342,6 +373,7 @@ pub fn threadSectionsProbe(
         "thread_section_delete_readback_failed",
         "threadSection/list retained the deleted section",
     );
+    section_exists.* = false;
     return LiveWitness.passed();
 }
 
@@ -479,6 +511,16 @@ pub fn structuredReviewProbe(
     defer allocator.free(rollout_path);
     defer deleteThread(allocator, client, thread_id);
 
+    return dispatchStructuredReviewProbe(allocator, io, client, thread_id, rollout_path);
+}
+
+fn dispatchStructuredReviewProbe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *proxy.Client,
+    thread_id: []const u8,
+    rollout_path: []const u8,
+) LiveWitness {
     const instructions = "CAS structured-review dispatch conformance probe.";
     const review_params = stringifyAnyAlloc(allocator, .{
         .threadId = thread_id,
@@ -547,66 +589,86 @@ fn structuredReviewTerminalProbe(
     const deadline_ms = monotonicMilliseconds(io) + structured_review_probe_timeout_ms;
     const previous_deadline_ms = client.swapRequestDeadlineMs(deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_deadline_ms);
-    var completion_observed_ms: ?i64 = null;
-    while (true) { // tiger: event-loop -- bounded by structured_review_probe_timeout_ms.
+    var poll = StructuredReviewPoll{ .deadline_ms = deadline_ms };
+    var now_ms = monotonicMilliseconds(io);
+    while (now_ms < deadline_ms) : (now_ms = monotonicMilliseconds(io)) {
         const read_json = client.requestJsonCaptureNotifications(
             "thread/turns/list",
             read_params,
             notifications,
         ) catch |err| {
-            const notification_state = reviewCompletionNotificationState(
-                notifications.items,
-                thread_id,
-                turn_id,
-            );
-            if (notification_state == .failed) return LiveWitness.failed(
-                "structured_review_turn_failed",
-                "the exact structured review turn terminated without completion",
-            );
-            const now_ms = monotonicMilliseconds(io);
-            if (notification_state == .passed and completion_observed_ms == null) {
-                completion_observed_ms = now_ms;
-            }
-            if (err == error.RequestFailed and
-                (completion_observed_ms == null or
-                    now_ms - completion_observed_ms.? <
-                        structured_review_materialization_grace_ms))
-            {
-                if (now_ms >= deadline_ms) return structuredReviewTimeout();
-                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
-                    return structuredReviewPollFailed();
-                continue;
-            }
-            if (err == error.ConnectionTimedOut) return LiveWitness.failed(
-                "structured_review_completion_timeout",
-                "the deterministic structured review did not complete within the probe bound",
-            );
-            return LiveWitness.failed(
-                "structured_review_terminal_read_failed",
-                "thread/turns/list could not observe the completed review turn",
-            );
+            const observed_ms = monotonicMilliseconds(io);
+            const state = poll.observe(notifications.items, thread_id, turn_id, observed_ms);
+            if (poll.readFailure(err, state, observed_ms)) |failure| return failure;
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
+                return structuredReviewPollFailed();
+            continue;
         };
         defer allocator.free(read_json);
-        const notification_state = reviewCompletionNotificationState(
+        const observed_ms = monotonicMilliseconds(io);
+        const notification_state = poll.observe(
             notifications.items,
             thread_id,
             turn_id,
+            observed_ms,
         );
-        if (notification_state == .failed) return LiveWitness.failed(
-            "structured_review_turn_failed",
-            "the exact structured review turn terminated without completion",
-        );
-        const now_ms = monotonicMilliseconds(io);
-        if (notification_state == .passed and completion_observed_ms == null) {
-            completion_observed_ms = now_ms;
-        }
-        switch (completedReviewTurnPageState(
+        if (notification_state == .failed) return structuredReviewTurnFailed();
+        const page_state = completedReviewTurnPageState(
             allocator,
             io,
             read_json,
             rollout_path,
             turn_id,
-        )) {
+        );
+        if (poll.pageWitness(page_state, notification_state, observed_ms)) |witness| return witness;
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
+            return structuredReviewPollFailed();
+    }
+    return structuredReviewTimeout();
+}
+
+const StructuredReviewPoll = struct {
+    deadline_ms: i64,
+    completion_observed_ms: ?i64 = null,
+
+    fn observe(
+        self: *StructuredReviewPoll,
+        notifications: []const []const u8,
+        thread_id: []const u8,
+        turn_id: []const u8,
+        now_ms: i64,
+    ) ReviewCompletionState {
+        const state = reviewCompletionNotificationState(notifications, thread_id, turn_id);
+        if (state == .passed and self.completion_observed_ms == null) {
+            self.completion_observed_ms = now_ms;
+        }
+        return state;
+    }
+
+    fn readFailure(
+        self: StructuredReviewPoll,
+        err: anyerror,
+        notification_state: ReviewCompletionState,
+        now_ms: i64,
+    ) ?LiveWitness {
+        if (notification_state == .failed) return structuredReviewTurnFailed();
+        if (err == error.RequestFailed and !self.graceExpired(now_ms)) {
+            return if (now_ms >= self.deadline_ms) structuredReviewTimeout() else null;
+        }
+        if (err == error.ConnectionTimedOut) return structuredReviewTimeout();
+        return LiveWitness.failed(
+            "structured_review_terminal_read_failed",
+            "thread/turns/list could not observe the completed review turn",
+        );
+    }
+
+    fn pageWitness(
+        self: StructuredReviewPoll,
+        page_state: ReviewCompletionState,
+        notification_state: ReviewCompletionState,
+        now_ms: i64,
+    ) ?LiveWitness {
+        switch (page_state) {
             .passed => if (notification_state == .passed) return LiveWitness.passed(),
             .failed => return LiveWitness.failed(
                 "structured_review_terminal_shape_failed",
@@ -614,19 +676,24 @@ fn structuredReviewTerminalProbe(
             ),
             .pending => {},
         }
-        if (completion_observed_ms) |observed_ms| {
-            if (now_ms - observed_ms >= structured_review_materialization_grace_ms) {
-                return LiveWitness.failed(
-                    "structured_review_terminal_read_failed",
-                    "thread/turns/list did not materialize the completed review " ++
-                        "within the grace bound",
-                );
-            }
-        }
-        if (now_ms >= deadline_ms) return structuredReviewTimeout();
-        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch
-            return structuredReviewPollFailed();
+        if (self.graceExpired(now_ms)) return LiveWitness.failed(
+            "structured_review_terminal_read_failed",
+            "thread/turns/list did not materialize the completed review within the grace bound",
+        );
+        return if (now_ms >= self.deadline_ms) structuredReviewTimeout() else null;
     }
+
+    fn graceExpired(self: StructuredReviewPoll, now_ms: i64) bool {
+        const observed_ms = self.completion_observed_ms orelse return false;
+        return now_ms - observed_ms >= structured_review_materialization_grace_ms;
+    }
+};
+
+fn structuredReviewTurnFailed() LiveWitness {
+    return LiveWitness.failed(
+        "structured_review_turn_failed",
+        "the exact structured review turn terminated without completion",
+    );
 }
 
 fn structuredReviewTimeout() LiveWitness {
@@ -2312,16 +2379,41 @@ fn cleanupThreadSection(
     client: *proxy.Client,
     thread_id: []const u8,
     section_id: []const u8,
+    section_exists: bool,
 ) void {
-    _ = moveThreadToSection(allocator, client, thread_id, null);
-    _ = deleteThreadSection(allocator, client, section_id);
+    if (section_exists) {
+        if (!moveThreadToSection(allocator, client, thread_id, null)) {
+            std.log.warn("CAS probe could not clear section membership for {s}", .{thread_id});
+        }
+        cleanupUnusedThreadSection(allocator, client, section_id);
+    }
     deleteThread(allocator, client, thread_id);
 }
 
+fn cleanupUnusedThreadSection(
+    allocator: std.mem.Allocator,
+    client: *proxy.Client,
+    section_id: []const u8,
+) void {
+    if (!deleteThreadSection(allocator, client, section_id)) {
+        std.log.warn("CAS probe could not delete section {s}", .{section_id});
+    }
+}
+
 fn deleteThread(allocator: std.mem.Allocator, client: *proxy.Client, thread_id: []const u8) void {
-    const params = stringifyAnyAlloc(allocator, .{ .threadId = thread_id }) catch return;
+    const params = stringifyAnyAlloc(allocator, .{ .threadId = thread_id }) catch |err| {
+        std.log.warn("CAS probe could not encode deletion for {s}: {s}", .{
+            thread_id, @errorName(err),
+        });
+        return;
+    };
     defer allocator.free(params);
-    const response = client.requestJson("thread/delete", params) catch return;
+    const response = client.requestJson("thread/delete", params) catch |err| {
+        std.log.warn("CAS probe could not delete thread {s}: {s}", .{
+            thread_id, @errorName(err),
+        });
+        return;
+    };
     allocator.free(response);
 }
 
@@ -2339,7 +2431,10 @@ fn reviewCompletionNotificationState(
             std.heap.page_allocator,
             line,
             .{},
-        ) catch continue;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return .failed,
+            else => continue,
+        };
         defer parsed.deinit();
         const root = switch (parsed.value) {
             .object => |value| value,
@@ -2420,7 +2515,10 @@ fn completedReviewTurnState(
             path,
             allocator,
             .limited(8 * 1024 * 1024),
-        ) catch return .pending;
+        ) catch |err| switch (err) {
+            error.FileNotFound => return .pending,
+            else => return .failed,
+        };
         defer allocator.free(rollout);
         return if (rolloutHasValidReviewOutput(allocator, rollout, expected_turn_id))
             .passed
@@ -2462,7 +2560,10 @@ fn completedReviewTurnPageState(
             rollout_path,
             allocator,
             .limited(8 * 1024 * 1024),
-        ) catch return .pending;
+        ) catch |err| switch (err) {
+            error.FileNotFound => return .pending,
+            else => return .failed,
+        };
         defer allocator.free(rollout);
         return if (rolloutHasValidReviewOutput(allocator, rollout, expected_turn_id))
             .passed
@@ -2502,7 +2603,11 @@ fn rolloutHasValidReviewOutput(
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return false,
+                else => continue,
+            };
         defer parsed.deinit();
         const root = switch (parsed.value) {
             .object => |value| value,
@@ -2539,25 +2644,29 @@ fn rolloutHasValidReviewOutput(
             break :blk matches;
         } else active_turn_matches;
         if (!event_turn_matches) continue;
-        const output_value = if (objectStringEquals(payload, "type", "exited_review_mode"))
-            payload.get("review_output") orelse continue
-        else if (objectStringEquals(payload, "type", "item_completed")) blk: {
-            const item = switch (payload.get("item") orelse continue) {
-                .object => |value| value,
-                else => continue,
-            };
-            if (!objectStringEquals(item, "type", "ExitedReviewMode")) continue;
-            break :blk item.get("review_output") orelse continue;
-        } else continue;
-        const output = switch (output_value) {
-            .object => |value| value,
-            else => continue,
-        };
+        const output = reviewOutputObject(payload) orelse continue;
         if (!validReviewOutput(output)) return false;
         matching_outputs += 1;
         if (matching_outputs > 1) return false;
     }
     return saw_expected_turn and matching_outputs == 1;
+}
+
+fn reviewOutputObject(payload: std.json.ObjectMap) ?std.json.ObjectMap {
+    const output_value = if (objectStringEquals(payload, "type", "exited_review_mode"))
+        payload.get("review_output") orelse return null
+    else if (objectStringEquals(payload, "type", "item_completed")) blk: {
+        const item = switch (payload.get("item") orelse return null) {
+            .object => |value| value,
+            else => return null,
+        };
+        if (!objectStringEquals(item, "type", "ExitedReviewMode")) return null;
+        break :blk item.get("review_output") orelse return null;
+    } else return null;
+    return switch (output_value) {
+        .object => |value| value,
+        else => return null,
+    };
 }
 
 fn validReviewOutput(output: std.json.ObjectMap) bool {
@@ -2975,35 +3084,80 @@ test "structured review response requires exact inline identity and echoed item"
     );
 }
 
-test "structured review terminal read requires completed rollout review output" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    const rollout_path = try std.fs.path.join(allocator, &.{ root, "review.jsonl" });
-    defer allocator.free(rollout_path);
-    const review_event =
-        "{\"type\":\"event_msg\",\"payload\":{" ++
-        "\"type\":\"exited_review_mode\",\"review_output\":{" ++
-        "\"findings\":[{\"title\":\"[P2] probe\",\"body\":\"complete shape\"," ++
-        "\"confidence_score\":1,\"priority\":2,\"code_location\":{" ++
-        "\"absolute_file_path\":\"/cas/probe.zig\",\"line_range\":{" ++
-        "\"start\":1,\"end\":1}}}],\"overall_correctness\":\"patch is incorrect\"," ++
-        "\"overall_explanation\":\"intentional\",\"overall_confidence_score\":1}}}";
-    const rollout = try std.fmt.allocPrint(
+test "structured review polling preserves deadline and materialization precedence" {
+    const poll = StructuredReviewPoll{ .deadline_ms = 15_000, .completion_observed_ms = 1_000 };
+    try std.testing.expect(poll.readFailure(error.RequestFailed, .passed, 2_999) == null);
+    const expired_read = poll.readFailure(error.RequestFailed, .passed, 3_000).?;
+    try std.testing.expectEqualStrings(
+        "structured_review_terminal_read_failed",
+        expired_read.failure_code.?,
+    );
+    try std.testing.expect(poll.pageWitness(.pending, .passed, 2_999) == null);
+    const expired_page = poll.pageWitness(.pending, .passed, 3_000).?;
+    try std.testing.expectEqualStrings(
+        "structured_review_terminal_read_failed",
+        expired_page.failure_code.?,
+    );
+    const completed = poll.pageWitness(.passed, .passed, 3_000).?;
+    try std.testing.expectEqual(ProbeStatus.passed, completed.status);
+    const waiting = StructuredReviewPoll{ .deadline_ms = 15_000 };
+    try std.testing.expect(waiting.readFailure(error.RequestFailed, .pending, 14_999) == null);
+    const timeout = waiting.readFailure(error.RequestFailed, .pending, 15_000).?;
+    try std.testing.expectEqualStrings(
+        "structured_review_completion_timeout",
+        timeout.failure_code.?,
+    );
+    const aborted = waiting.readFailure(error.ConnectionTimedOut, .failed, 15_000).?;
+    try std.testing.expectEqualStrings("structured_review_turn_failed", aborted.failure_code.?);
+}
+
+test "structured review grace starts at first exact completion observation" {
+    const notification = "{\"method\":\"turn/completed\",\"params\":{" ++
+        "\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}";
+    var poll = StructuredReviewPoll{ .deadline_ms = 15_000 };
+    try std.testing.expectEqual(
+        ReviewCompletionState.pending,
+        poll.observe(&.{notification}, "thread-other", "turn-1", 10),
+    );
+    try std.testing.expect(poll.completion_observed_ms == null);
+    try std.testing.expectEqual(
+        ReviewCompletionState.passed,
+        poll.observe(&.{notification}, "thread-1", "turn-1", 100),
+    );
+    try std.testing.expectEqual(
+        ReviewCompletionState.passed,
+        poll.observe(&.{notification}, "thread-1", "turn-1", 200),
+    );
+    try std.testing.expectEqual(@as(?i64, 100), poll.completion_observed_ms);
+    try std.testing.expectEqual(
+        ReviewCompletionState.failed,
+        poll.observe(&.{ notification, notification }, "thread-1", "turn-1", 300),
+    );
+}
+
+const structured_review_event =
+    "{\"type\":\"event_msg\",\"payload\":{" ++
+    "\"type\":\"exited_review_mode\",\"review_output\":{" ++
+    "\"findings\":[{\"title\":\"[P2] probe\",\"body\":\"complete shape\"," ++
+    "\"confidence_score\":1,\"priority\":2,\"code_location\":{" ++
+    "\"absolute_file_path\":\"/cas/probe.zig\",\"line_range\":{" ++
+    "\"start\":1,\"end\":1}}}],\"overall_correctness\":\"patch is incorrect\"," ++
+    "\"overall_explanation\":\"intentional\",\"overall_confidence_score\":1}}}";
+
+fn structuredReviewRolloutAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-other\"}}}}\n" ++
             "{s}\n{{\"type\":\"turn_context\",\"payload\":{{" ++
             "\"turn_id\":\"turn-review\"}}}}\n{s}\n",
-        .{ review_event, review_event },
+        .{ structured_review_event, structured_review_event },
     );
+}
+
+test "structured review rollout binds turn identity and unique output" {
+    const allocator = std.testing.allocator;
+    const rollout = try structuredReviewRolloutAlloc(allocator);
     defer allocator.free(rollout);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "review.jsonl",
-        .data = rollout,
-    });
     try std.testing.expect(rolloutHasValidReviewOutput(
         allocator,
         rollout,
@@ -3014,13 +3168,21 @@ test "structured review terminal read requires completed rollout review output" 
         rollout,
         "turn-missing",
     ));
-    const duplicate = try std.fmt.allocPrint(allocator, "{s}{s}\n", .{ rollout, review_event });
+    const duplicate = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}\n",
+        .{ rollout, structured_review_event },
+    );
     defer allocator.free(duplicate);
     try std.testing.expect(!rolloutHasValidReviewOutput(
         allocator,
         duplicate,
         "turn-review",
     ));
+}
+
+test "structured review accepts exact paginated completed item" {
+    const allocator = std.testing.allocator;
     const paginated_rollout =
         "{\"type\":\"event_msg\",\"payload\":{" ++
         "\"type\":\"item_completed\",\"turn_id\":\"turn-review\",\"item\":{" ++
@@ -3035,6 +3197,23 @@ test "structured review terminal read requires completed rollout review output" 
         paginated_rollout,
         "turn-review",
     ));
+}
+
+test "structured review terminal read requires completed rollout review output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const rollout_path = try std.fs.path.join(allocator, &.{ root, "review.jsonl" });
+    defer allocator.free(rollout_path);
+    const rollout = try structuredReviewRolloutAlloc(allocator);
+    defer allocator.free(rollout);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "review.jsonl",
+        .data = rollout,
+    });
     const completed = try std.fmt.allocPrint(
         allocator,
         "{{\"thread\":{{\"path\":\"{s}\",\"turns\":[{{" ++

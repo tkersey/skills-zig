@@ -43,12 +43,18 @@ test "broad deterministic f64 corpus is round-trip stable and byte locked" {
         }
 
         finite_count += 1;
-        const encoded = try canonical_json.canonicalJsonAlloc(std.testing.allocator, .{ .float = number });
+        const encoded = try canonical_json.canonicalJsonAlloc(
+            std.testing.allocator,
+            .{ .float = number },
+        );
         defer std.testing.allocator.free(encoded);
         const reparsed = try std.fmt.parseFloat(f64, encoded);
         const expected_bits: u64 = if (number == 0) 0 else bits;
         try std.testing.expectEqual(expected_bits, @as(u64, @bitCast(reparsed)));
-        const repeated = try canonical_json.canonicalJsonAlloc(std.testing.allocator, .{ .float = number });
+        const repeated = try canonical_json.canonicalJsonAlloc(
+            std.testing.allocator,
+            .{ .float = number },
+        );
         defer std.testing.allocator.free(repeated);
         try std.testing.expectEqualStrings(encoded, repeated);
         try expectCanonicalParseClosure(encoded);

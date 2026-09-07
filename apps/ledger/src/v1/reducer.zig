@@ -556,23 +556,11 @@ fn compileReducerConfig(
         try definition_core.json.requiredString(reducer, "on"),
     );
     errdefer on.deinit(allocator);
-    var event_kind = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "event_kind",
-    );
+    var event_kind = try compileOptionalPointer(allocator, reducer, "event_kind");
     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
-    var retain_once = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "retain_once",
-    );
+    var retain_once = try compileOptionalPointer(allocator, reducer, "retain_once");
     errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
-    var retain_latest = try compileOptionalPointer(
-        allocator,
-        reducer,
-        "retain_latest",
-    );
+    var retain_latest = try compileOptionalPointer(allocator, reducer, "retain_latest");
     errdefer if (retain_latest) |*pointer| pointer.deinit(allocator);
     if (retain_once != null and retain_latest != null) {
         return error.ConflictingReducerRetention;

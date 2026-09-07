@@ -106,128 +106,184 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.input_path != null and cfg.input_path.?.len == 0) cfg.input_path = null;
     if (cfg.compare_path != null and cfg.compare_path.?.len == 0) cfg.compare_path = null;
 
-    if (cfg.compare_path) |compare_path| {
-        const ci_samples = cfg.ci_samples orelse 1000;
-        if (!(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
-            core_cli.exitUsageFailure(HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha");
-        }
+    if (cfg.compare_path) |path| return runComparison(allocator, cfg, path);
+    return runSummary(allocator, cfg);
+}
 
-        const baseline_text = readInputAlloc(allocator, cfg.input_path) catch |err| switch (err) {
-            error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "baseline input exceeds 16 MiB"),
-            else => return err,
-        };
-        defer allocator.free(baseline_text);
-        const variant_text = readFileWithLimitAlloc(allocator, compare_path) catch |err| switch (err) {
-            error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "compare input exceeds 16 MiB"),
-            else => return err,
-        };
-        defer allocator.free(variant_text);
-
-        var baseline_values: std.ArrayList(f64) = .empty;
-        defer baseline_values.deinit(allocator);
-        var variant_values: std.ArrayList(f64) = .empty;
-        defer variant_values.deinit(allocator);
-
-        try parseValuesFromText(baseline_text, cfg.parse_all, cfg.scale, allocator, &baseline_values);
-        try parseValuesFromText(variant_text, cfg.parse_all, cfg.scale, allocator, &variant_values);
-
-        if (baseline_values.items.len == 0) {
-            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric baseline samples found.\n");
-            std.process.exit(1);
-        }
-        if (variant_values.items.len == 0) {
-            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric variant samples found.\n");
-            std.process.exit(1);
-        }
-
-        const baseline_report = computeReport(baseline_values.items, cfg.unit);
-        const variant_report = computeReport(variant_values.items, cfg.unit);
-        const delta = computeDelta(baseline_report, variant_report);
-        const delta_pct = computeDeltaPct(baseline_report, delta);
-
-        var ci: CiDelta = .{};
-        if (ci_samples > 0) {
-            const seed = cfg.seed orelse defaultSeed();
-            var prng = std.Random.DefaultPrng.init(seed);
-            ci.p50 = try bootstrapCiDelta(
-                allocator,
-                baseline_values.items,
-                variant_values.items,
-                50.0,
-                ci_samples,
-                cfg.ci_alpha,
-                &prng,
-            );
-            ci.p95 = try bootstrapCiDelta(
-                allocator,
-                baseline_values.items,
-                variant_values.items,
-                95.0,
-                ci_samples,
-                cfg.ci_alpha,
-                &prng,
-            );
-            ci.p99 = try bootstrapCiDelta(
-                allocator,
-                baseline_values.items,
-                variant_values.items,
-                99.0,
-                ci_samples,
-                cfg.ci_alpha,
-                &prng,
-            );
-        }
-
-        var output: std.ArrayList(u8) = .empty;
-        defer output.deinit(allocator);
-        var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
-        const writer = &writer_alloc.writer;
-
-        if (cfg.output_json) {
-            try writeCompareJson(
-                writer,
-                baseline_report,
-                variant_report,
-                delta,
-                delta_pct,
-                ci_samples,
-                cfg.ci_alpha,
-                ci,
-            );
-            try writer.writeAll("\n");
-            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
-            return;
-        }
-
-        try printReportBlock(allocator, writer, "baseline", baseline_report, cfg.unit);
-        try writer.writeAll("\n");
-        try printReportBlock(allocator, writer, "variant", variant_report, cfg.unit);
-        try writer.writeAll("\n");
-        try writer.writeAll("delta (variant - baseline)\n");
-        try printDeltaMetric(allocator, writer, "min", delta.min, delta_pct.min, cfg.unit);
-        try printDeltaMetric(allocator, writer, "p50", delta.p50, delta_pct.p50, cfg.unit);
-        try printDeltaMetric(allocator, writer, "p90", delta.p90, delta_pct.p90, cfg.unit);
-        try printDeltaMetric(allocator, writer, "p95", delta.p95, delta_pct.p95, cfg.unit);
-        try printDeltaMetric(allocator, writer, "p99", delta.p99, delta_pct.p99, cfg.unit);
-        try printDeltaMetric(allocator, writer, "max", delta.max, delta_pct.max, cfg.unit);
-        try printDeltaMetric(allocator, writer, "mean", delta.mean, delta_pct.mean, cfg.unit);
-        try printDeltaMetric(allocator, writer, "median", delta.median, delta_pct.median, cfg.unit);
-        try printDeltaMetric(allocator, writer, "stdev", delta.stdev, delta_pct.stdev, cfg.unit);
-
-        if (ci.p50 != null and ci.p95 != null and ci.p99 != null) {
-            const ci_pct: u32 = @intFromFloat(@round((1.0 - cfg.ci_alpha) * 100.0));
-            try writer.print("\nci{d} (bootstrap; samples={d})\n", .{ ci_pct, ci_samples });
-            try printCiMetric(allocator, writer, "p50", ci.p50.?, cfg.unit);
-            try printCiMetric(allocator, writer, "p95", ci.p95.?, cfg.unit);
-            try printCiMetric(allocator, writer, "p99", ci.p99.?, cfg.unit);
-        }
-
-        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
-        return;
+fn runComparison(allocator: std.mem.Allocator, cfg: Config, compare_path: []const u8) !void {
+    if (!(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
+        core_cli.exitUsageFailure(HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha");
     }
 
+    var baseline_values = try readSamples(allocator, cfg, cfg.input_path, "baseline");
+    defer baseline_values.deinit(allocator);
+    var variant_values = try readSamples(allocator, cfg, compare_path, "compare");
+    defer variant_values.deinit(allocator);
+
+    const baseline_report = computeReport(baseline_values.items, cfg.unit);
+    const variant_report = computeReport(variant_values.items, cfg.unit);
+
+    const ci = try comparisonIntervals(allocator, cfg, baseline_values.items, variant_values.items);
+
+    const output = try renderComparisonAlloc(allocator, cfg, baseline_report, variant_report, ci);
+    defer allocator.free(output);
+    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output);
+}
+
+fn renderComparisonAlloc(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    baseline_report: Report,
+    variant_report: Report,
+    ci: CiDelta,
+) ![]u8 {
+    const ci_samples = cfg.ci_samples orelse 1000;
+    const delta = computeDelta(baseline_report, variant_report);
+    const delta_pct = computeDeltaPct(baseline_report, delta);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    if (cfg.output_json) {
+        writeCompareJson(
+            writer,
+            baseline_report,
+            variant_report,
+            delta,
+            delta_pct,
+            ci_samples,
+            cfg.ci_alpha,
+            ci,
+        ) catch return error.OutOfMemory;
+        writer.writeAll("\n") catch return error.OutOfMemory;
+        return writer_alloc.toOwnedSlice();
+    }
+
+    writeComparisonText(allocator, writer, cfg, baseline_report, variant_report, ci) catch |err|
+        switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+
+    return writer_alloc.toOwnedSlice();
+}
+
+fn comparisonIntervals(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    baseline_values: []const f64,
+    variant_values: []const f64,
+) !CiDelta {
+    const ci_samples = cfg.ci_samples orelse 1000;
+    var ci: CiDelta = .{};
+    if (ci_samples > 0) {
+        const seed = cfg.seed orelse defaultSeed();
+        var prng = std.Random.DefaultPrng.init(seed);
+        ci.p50 = try bootstrapCiDelta(
+            allocator,
+            baseline_values,
+            variant_values,
+            50.0,
+            ci_samples,
+            cfg.ci_alpha,
+            &prng,
+        );
+        ci.p95 = try bootstrapCiDelta(
+            allocator,
+            baseline_values,
+            variant_values,
+            95.0,
+            ci_samples,
+            cfg.ci_alpha,
+            &prng,
+        );
+        ci.p99 = try bootstrapCiDelta(
+            allocator,
+            baseline_values,
+            variant_values,
+            99.0,
+            ci_samples,
+            cfg.ci_alpha,
+            &prng,
+        );
+    }
+
+    return ci;
+}
+
+fn writeComparisonText(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    cfg: Config,
+    baseline_report: Report,
+    variant_report: Report,
+    ci: CiDelta,
+) !void {
+    const ci_samples = cfg.ci_samples orelse 1000;
+    const delta = computeDelta(baseline_report, variant_report);
+    const delta_pct = computeDeltaPct(baseline_report, delta);
+    try printReportBlock(allocator, writer, "baseline", baseline_report, cfg.unit);
+    try writer.writeAll("\n");
+    try printReportBlock(allocator, writer, "variant", variant_report, cfg.unit);
+    try writer.writeAll("\n");
+    try writer.writeAll("delta (variant - baseline)\n");
+    try printDeltaMetric(allocator, writer, "min", delta.min, delta_pct.min, cfg.unit);
+    try printDeltaMetric(allocator, writer, "p50", delta.p50, delta_pct.p50, cfg.unit);
+    try printDeltaMetric(allocator, writer, "p90", delta.p90, delta_pct.p90, cfg.unit);
+    try printDeltaMetric(allocator, writer, "p95", delta.p95, delta_pct.p95, cfg.unit);
+    try printDeltaMetric(allocator, writer, "p99", delta.p99, delta_pct.p99, cfg.unit);
+    try printDeltaMetric(allocator, writer, "max", delta.max, delta_pct.max, cfg.unit);
+    try printDeltaMetric(allocator, writer, "mean", delta.mean, delta_pct.mean, cfg.unit);
+    try printDeltaMetric(allocator, writer, "median", delta.median, delta_pct.median, cfg.unit);
+    try printDeltaMetric(allocator, writer, "stdev", delta.stdev, delta_pct.stdev, cfg.unit);
+
+    if (ci.p50 != null and ci.p95 != null and ci.p99 != null) {
+        const ci_pct: u32 = @intFromFloat(@round((1.0 - cfg.ci_alpha) * 100.0));
+        try writer.print("\nci{d} (bootstrap; samples={d})\n", .{ ci_pct, ci_samples });
+        try printCiMetric(allocator, writer, "p50", ci.p50.?, cfg.unit);
+        try printCiMetric(allocator, writer, "p95", ci.p95.?, cfg.unit);
+        try printCiMetric(allocator, writer, "p99", ci.p99.?, cfg.unit);
+    }
+}
+
+fn readSamples(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    path: ?[]const u8,
+    comptime label: []const u8,
+) !std.ArrayList(f64) {
+    const input = readInputAlloc(allocator, path) catch |err| switch (err) {
+        error.InputTooLarge => core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "InputTooLarge",
+            label ++ " input exceeds 16 MiB",
+        ),
+        else => return err,
+    };
+    defer allocator.free(input);
+    var values: std.ArrayList(f64) = .empty;
+    errdefer values.deinit(allocator);
+    try parseValuesFromText(input, cfg.parse_all, cfg.scale, allocator, &values);
+    if (values.items.len == 0) {
+        const sample_label = if (comptime std.mem.eql(u8, label, "compare")) "variant" else label;
+        try core_io.writeToStreamAllowBrokenPipe(
+            std.Io.File.stdout(),
+            "No numeric " ++ sample_label ++ " samples found.\n",
+        );
+        std.process.exit(1);
+    }
+    return values;
+}
+
+fn runSummary(allocator: std.mem.Allocator, cfg: Config) !void {
     const input_text = readInputAlloc(allocator, cfg.input_path) catch |err| switch (err) {
-        error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "input exceeds 16 MiB"),
+        error.InputTooLarge => core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "InputTooLarge",
+            "input exceeds 16 MiB",
+        ),
         else => return err,
     };
     defer allocator.free(input_text);
@@ -237,21 +293,39 @@ pub fn main(init: std.process.Init) !void {
     try parseValuesFromText(input_text, cfg.parse_all, cfg.scale, allocator, &values);
 
     if (values.items.len == 0) {
-        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric samples found.\n");
+        try core_io.writeToStreamAllowBrokenPipe(
+            std.Io.File.stdout(),
+            "No numeric samples found.\n",
+        );
         std.process.exit(1);
     }
 
     const report = computeReport(values.items, cfg.unit);
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
-    const writer = &writer_alloc.writer;
+    const output = try renderSummaryAlloc(allocator, cfg, report);
+    defer allocator.free(output);
+    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output);
+}
 
+fn renderSummaryAlloc(allocator: std.mem.Allocator, cfg: Config, report: Report) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    writeSummary(allocator, &output.writer, cfg, report) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    return output.toOwnedSlice();
+}
+
+fn writeSummary(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    cfg: Config,
+    report: Report,
+) !void {
     if (cfg.output_json) {
         try writeReportJson(writer, report);
         try writer.writeAll("\n");
-        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
         return;
     }
 
@@ -265,8 +339,6 @@ pub fn main(init: std.process.Init) !void {
     try printMetric(allocator, writer, "mean", report.mean, cfg.unit);
     try printMetric(allocator, writer, "median", report.median, cfg.unit);
     try printMetric(allocator, writer, "stdev", report.stdev, cfg.unit);
-
-    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
 }
 
 fn parseArgs(argv: []const []const u8) !Config {
@@ -275,40 +347,22 @@ fn parseArgs(argv: []const []const u8) !Config {
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
-        }
-        if (std.mem.eql(u8, arg, "--input")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            cfg.input_path = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--compare")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            cfg.compare_path = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--scale")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            cfg.scale = std.fmt.parseFloat(f64, argv[i]) catch return error.InvalidScale;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--unit")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            cfg.unit = argv[i];
-            continue;
         }
         if (std.mem.eql(u8, arg, "--all")) {
             cfg.parse_all = true;
@@ -318,30 +372,42 @@ fn parseArgs(argv: []const []const u8) !Config {
             cfg.output_json = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ci-samples")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            const parsed = std.fmt.parseInt(i64, argv[i], 10) catch return error.InvalidCiSamples;
-            if (parsed < 0) return error.InvalidCiSamples;
-            cfg.ci_samples = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--ci-alpha")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            cfg.ci_alpha = std.fmt.parseFloat(f64, argv[i]) catch return error.InvalidCiAlpha;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--seed")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            const parsed = std.fmt.parseInt(i64, argv[i], 10) catch return error.InvalidSeed;
-            cfg.seed = @bitCast(parsed);
-            continue;
-        }
-        return error.UnknownArg;
+        if (!isValueArgument(arg)) return error.UnknownArg;
+        i += 1;
+        if (i >= argv.len) return error.MissingValue;
+        try setValueArgument(&cfg, arg, argv[i]);
     }
     return cfg;
+}
+
+fn isValueArgument(arg: []const u8) bool {
+    for ([_][]const u8{
+        "--input", "--compare", "--scale", "--unit", "--ci-samples", "--ci-alpha", "--seed",
+    }) |candidate| {
+        if (std.mem.eql(u8, arg, candidate)) return true;
+    }
+    return false;
+}
+
+fn setValueArgument(cfg: *Config, arg: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, arg, "--input")) {
+        cfg.input_path = value;
+    } else if (std.mem.eql(u8, arg, "--compare")) {
+        cfg.compare_path = value;
+    } else if (std.mem.eql(u8, arg, "--scale")) {
+        cfg.scale = std.fmt.parseFloat(f64, value) catch return error.InvalidScale;
+    } else if (std.mem.eql(u8, arg, "--unit")) {
+        cfg.unit = value;
+    } else if (std.mem.eql(u8, arg, "--ci-samples")) {
+        const parsed = std.fmt.parseInt(i64, value, 10) catch return error.InvalidCiSamples;
+        if (parsed < 0) return error.InvalidCiSamples;
+        cfg.ci_samples = @intCast(parsed);
+    } else if (std.mem.eql(u8, arg, "--ci-alpha")) {
+        cfg.ci_alpha = std.fmt.parseFloat(f64, value) catch return error.InvalidCiAlpha;
+    } else if (std.mem.eql(u8, arg, "--seed")) {
+        const parsed = std.fmt.parseInt(i64, value, 10) catch return error.InvalidSeed;
+        cfg.seed = @bitCast(parsed);
+    } else unreachable; // isValueArgument admits the complete set above.
 }
 
 fn readInputAlloc(allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
@@ -436,7 +502,7 @@ fn percentile(sorted_values: []const f64, p: f64) f64 {
 }
 
 fn defaultSeed() u64 {
-    const ts: i64 = @intCast(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds);
+    const ts: i64 = @intCast(std.Io.Clock.awake.now(defaultIo()).nanoseconds);
     return @bitCast(ts);
 }
 
@@ -747,7 +813,10 @@ fn writeCompareJson(
     try writeDeltaJson(writer, delta);
     try writer.writeAll(",\"delta_pct\":");
     try writeDeltaPctJson(writer, delta_pct);
-    try writer.print(",\"ci\":{{\"samples\":{d},\"alpha\":{d:.6},\"delta\":", .{ ci_samples, ci_alpha });
+    try writer.print(
+        ",\"ci\":{{\"samples\":{d},\"alpha\":{d:.6},\"delta\":",
+        .{ ci_samples, ci_alpha },
+    );
     try writeCiDeltaJson(writer, ci);
     try writer.writeAll("}");
     try writer.writeAll("}");
@@ -910,7 +979,12 @@ test "compare json output is valid json" {
     const delta_pct = computeDeltaPct(baseline, delta);
     try writeCompareJson(&writer_alloc.writer, baseline, variant, delta, delta_pct, 0, 0.05, .{});
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer_alloc.written(), .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer_alloc.written(),
+        .{},
+    );
     defer parsed.deinit();
 }
 
@@ -940,7 +1014,10 @@ test "readFileWithLimitAlloc rejects oversized files" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "oversized.txt" });
     defer std.testing.allocator.free(path);
 
-    try std.testing.expectError(error.InputTooLarge, readFileWithLimitAlloc(std.testing.allocator, path));
+    try std.testing.expectError(
+        error.InputTooLarge,
+        readFileWithLimitAlloc(std.testing.allocator, path),
+    );
 }
 
 fn parseLineWithAlloc(alloc: std.mem.Allocator, line: []const u8) !void {
@@ -961,9 +1038,89 @@ fn fuzzParseLineTarget(_: void, smith: *std.testing.Smith) !void {
     const input = storage[0..len];
     var list: std.ArrayList(f64) = .empty;
     defer list.deinit(std.testing.allocator);
-    _ = parseNumbersFromLine(input, true, std.testing.allocator, &list) catch {};
+    try parseNumbersFromLine(input, true, std.testing.allocator, &list);
 }
 
 test "fuzz parse numbers from arbitrary input" {
     try std.testing.fuzz({}, fuzzParseLineTarget, .{});
+}
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn renderSummaryWithAllocator(allocator: std.mem.Allocator, output_json: bool) !void {
+    var values = [_]f64{ 1, 2, 3 };
+    const report = computeReport(&values, "ms");
+    const output = try renderSummaryAlloc(allocator, .{ .output_json = output_json }, report);
+    defer allocator.free(output);
+    if (output_json) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("count").?.integer);
+    } else {
+        try std.testing.expect(std.mem.startsWith(u8, output, "count  : 3\n"));
+        try std.testing.expect(std.mem.indexOf(u8, output, "median") != null);
+    }
+}
+
+test "CLI summary renderer publishes its owned bytes in text and JSON modes" {
+    for ([_]bool{ false, true }) |output_json| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            renderSummaryWithAllocator,
+            .{output_json},
+        );
+    }
+}
+
+test "comparison renderer preserves fields and deterministic seeded intervals" {
+    const allocator = std.testing.allocator;
+    var baseline = [_]f64{ 1, 2, 3, 4, 5 };
+    var variant = [_]f64{ 2, 3, 4, 5, 6 };
+    const base_report = computeReport(&baseline, "");
+    const variant_report = computeReport(&variant, "");
+    const cfg = Config{ .output_json = true, .ci_samples = 200, .seed = 42 };
+    const ci = try comparisonIntervals(allocator, cfg, &baseline, &variant);
+    const repeated = try comparisonIntervals(allocator, cfg, &baseline, &variant);
+    try std.testing.expectEqualDeep(ci, repeated);
+    // Pin the existing p50 -> p95 -> p99 RNG consumption order.
+    try std.testing.expectEqual(CiInterval{ .lo = -2, .hi = 4 }, ci.p50.?);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.805), ci.p95.?.lo, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), ci.p95.?.hi, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, -1.001), ci.p99.?.lo, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.922), ci.p99.?.hi, 1e-9);
+    const output = try renderComparisonAlloc(allocator, cfg, base_report, variant_report, ci);
+    defer allocator.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.contains("baseline"));
+    try std.testing.expect(parsed.value.object.contains("variant"));
+    try std.testing.expect(parsed.value.object.contains("delta"));
+}
+
+fn renderComparisonWithAllocator(allocator: std.mem.Allocator, output_json: bool) !void {
+    var baseline = [_]f64{ 1, 2, 3 };
+    var variant = [_]f64{ 2, 3, 4 };
+    const base_report = computeReport(&baseline, "");
+    const variant_report = computeReport(&variant, "");
+    const output = try renderComparisonAlloc(
+        allocator,
+        .{ .output_json = output_json, .ci_samples = 0 },
+        base_report,
+        variant_report,
+        .{},
+    );
+    defer allocator.free(output);
+    try std.testing.expect(output.len > 0);
+}
+
+test "comparison renderer cleans up its output on every allocation failure" {
+    for ([_]bool{ false, true }) |output_json| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            renderComparisonWithAllocator,
+            .{output_json},
+        );
+    }
 }

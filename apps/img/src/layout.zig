@@ -66,9 +66,12 @@ fn appendWrappedRange(
     var units: usize = 0;
 
     while (byte_index < range_end) {
-        const sequence_len = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch unreachable;
+        const sequence_len = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch
+            return error.InvalidUtf8;
         const next = byte_index + sequence_len;
-        const codepoint = std.unicode.utf8Decode(text[byte_index..next]) catch unreachable;
+        const codepoint = std.unicode.utf8Decode(
+            text[byte_index..next],
+        ) catch return error.InvalidUtf8;
         const width = font.cellsFor(codepoint);
         if (columns + width > cols) {
             try lines.append(allocator, .{
@@ -103,11 +106,12 @@ pub fn wrap(
     cols: usize,
 ) ![]Line {
     if (cols == 0) return error.InvalidColumns;
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(allocator);
 
     var start: usize = 0;
-    while (true) {
+    while (start <= text.len) {
         const relative_end = std.mem.indexOfScalar(u8, text[start..], '\n');
         const end = if (relative_end) |relative| start + relative else text.len;
         try appendWrappedRange(allocator, &lines, text, start, end, cols);
@@ -132,4 +136,9 @@ test "astral scalars retain JavaScript UTF-16 budget accounting" {
     defer std.testing.allocator.free(lines);
     try std.testing.expectEqual(@as(usize, 3), lines[0].scalar_count);
     try std.testing.expectEqual(@as(usize, 4), lines[0].utf16_units);
+}
+
+test "wrapping rejects malformed UTF-8 without trapping" {
+    try std.testing.expectError(error.InvalidUtf8, wrap(std.testing.allocator, "\xff", 10));
+    try std.testing.expectError(error.InvalidUtf8, wrap(std.testing.allocator, "\xf0\x9f", 10));
 }

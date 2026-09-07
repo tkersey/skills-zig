@@ -656,6 +656,15 @@ pub fn compile(
     {
         return try compilePlain(allocator, definition_plan, storage_plan, rules);
     }
+    return try compileChained(allocator, definition_plan, storage_plan, rules);
+}
+
+fn compileChained(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    rules: ProtocolRules,
+) !Plan {
     try validateChainedRules(definition_plan, rules);
     var envelope = try compileEnvelope(
         allocator,
@@ -990,6 +999,20 @@ pub fn validateCachePlan(
     {
         return error.CacheProtocolPlanMismatch;
     }
+    try validateCachedReducers(plan, definition_plan);
+    if (plan.mode == .chained) {
+        try validatePartitionBindingsAgainstDefinition(
+            plan.envelope.partition_bindings,
+            definition_plan,
+        );
+    }
+    const expected_slot = try compileTargetSlot(storage_plan, plan.envelope.input_index);
+    if (plan.target_slot_index != expected_slot) return error.CacheProtocolPlanMismatch;
+    try validateStorageMaterializations(plan, storage_plan);
+    try validateSegmentedSupport(definition_plan, storage_plan, plan);
+}
+
+fn validateCachedReducers(plan: *const Plan, definition_plan: *const definition.Plan) !void {
     if (plan.reducer_plan) |*compiled| {
         if (compiled.max_entries !=
             definition_plan.bounds.max_reducer_states or
@@ -1011,25 +1034,6 @@ pub fn validateCachePlan(
         );
         try state_reducer.validateEventKinds(compiled, plan.event_kinds);
     }
-    if (plan.mode == .chained) {
-        try validatePartitionBindingsAgainstDefinition(
-            plan.envelope.partition_bindings,
-            definition_plan,
-        );
-    }
-    const expected_slot = try compileTargetSlot(
-        storage_plan,
-        plan.envelope.input_index,
-    );
-    if (plan.target_slot_index != expected_slot) {
-        return error.CacheProtocolPlanMismatch;
-    }
-    try validateStorageMaterializations(plan, storage_plan);
-    try validateSegmentedSupport(
-        definition_plan,
-        storage_plan,
-        plan,
-    );
 }
 
 pub fn validateSegmentedSupport(

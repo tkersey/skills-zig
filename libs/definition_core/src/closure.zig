@@ -177,6 +177,26 @@ const VisitState = enum {
     complete,
 };
 
+/// The path borrows an admitted file; unvisited import paths belong to this frame.
+const ImportFrame = struct {
+    path: []const u8,
+    imports: std.ArrayList([]u8),
+    next_import: usize = 0,
+
+    fn deinit(self: *ImportFrame, allocator: std.mem.Allocator) void {
+        for (self.imports.items[self.next_import..]) |path| allocator.free(path);
+        self.imports.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn takeNext(self: *ImportFrame) ?[]u8 {
+        if (self.next_import == self.imports.items.len) return null;
+        const path = self.imports.items[self.next_import];
+        self.next_import += 1;
+        return path;
+    }
+};
+
 const Builder = struct {
     allocator: std.mem.Allocator,
     root: *std.Io.Dir,
@@ -193,16 +213,35 @@ const Builder = struct {
     }
 
     fn visit(self: *Builder, relative_path: []u8, depth: usize) !void {
-        var path_owned = true;
-        errdefer if (path_owned) self.allocator.free(relative_path);
-        if (try self.visitComplete(relative_path, depth)) {
-            self.allocator.free(relative_path);
-            path_owned = false;
-            return;
+        var frames: std.ArrayList(ImportFrame) = .empty;
+        defer {
+            for (frames.items) |*frame| frame.deinit(self.allocator);
+            frames.deinit(self.allocator);
         }
+        try self.enter(&frames, relative_path, depth);
+        while (frames.items.len != 0) {
+            const frame = &frames.items[frames.items.len - 1];
+            if (frame.takeNext()) |path| {
+                try self.enter(&frames, path, depth + frames.items.len);
+            } else {
+                self.states.getPtr(frame.path).?.* = .complete;
+                var complete = frames.pop().?;
+                complete.deinit(self.allocator);
+            }
+        }
+    }
+
+    fn enter(
+        self: *Builder,
+        frames: *std.ArrayList(ImportFrame),
+        relative_path: []u8,
+        depth: usize,
+    ) !void {
+        var path_owned = true;
+        defer if (path_owned) self.allocator.free(relative_path);
+        if (try self.visitComplete(relative_path, depth)) return;
         var loaded = try self.loadDefinition(relative_path);
         defer loaded.deinit(self.allocator);
-
         try self.states.put(self.allocator, relative_path, .visiting);
         errdefer _ = self.states.remove(relative_path);
         try self.files.append(self.allocator, .{
@@ -215,12 +254,14 @@ const Builder = struct {
         loaded.canonical_owned = false;
         self.total_definition_bytes = loaded.next_total;
         std.sort.heap([]u8, loaded.imports.items, {}, lessThanPath);
-        for (loaded.imports.items) |*import_path| {
-            const owned = import_path.*;
-            import_path.* = try self.allocator.dupe(u8, "");
-            try self.visit(owned, depth + 1);
-        }
-        self.states.getPtr(relative_path).?.* = .complete;
+        // Each live frame owns a distinct admitted file, bounded by both limits.
+        std.debug.assert(frames.items.len < self.limits.max_files);
+        std.debug.assert(depth <= self.limits.max_import_depth);
+        try frames.append(self.allocator, .{
+            .path = relative_path,
+            .imports = loaded.imports,
+        });
+        loaded.imports = .empty;
     }
 
     fn visitComplete(
@@ -317,6 +358,7 @@ fn parseDefinition(
             .parse_numbers = false,
         },
     ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
         error.DuplicateField => return error.DuplicateDefinitionField,
         else => return error.InvalidDefinitionJson,
     };
@@ -489,7 +531,10 @@ fn cloneCanonicalFile(
             .duplicate_field_behavior = .@"error",
             .parse_numbers = false,
         },
-    ) catch return error.InvalidDefinitionJson;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDefinitionJson,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.DefinitionRootNotObject;
     const canonical = try canonical_json.canonicalJsonAlloc(
@@ -716,20 +761,39 @@ const CanonicalClosureValidator = struct {
     states: std.StringHashMapUnmanaged(VisitState) = .empty,
     complete_count: usize = 0,
 
-    fn visit(
+    fn visit(self: *CanonicalClosureValidator, path: []const u8, depth: usize) !void {
+        var frames: std.ArrayList(ImportFrame) = .empty;
+        defer {
+            for (frames.items) |*frame| frame.deinit(self.allocator);
+            frames.deinit(self.allocator);
+        }
+        try self.enter(&frames, try self.allocator.dupe(u8, path), depth);
+        while (frames.items.len != 0) {
+            const frame = &frames.items[frames.items.len - 1];
+            if (frame.takeNext()) |import_path| {
+                try self.enter(&frames, import_path, depth + frames.items.len);
+            } else {
+                self.states.getPtr(frame.path).?.* = .complete;
+                self.complete_count += 1;
+                var complete = frames.pop().?;
+                complete.deinit(self.allocator);
+            }
+        }
+    }
+
+    fn enter(
         self: *CanonicalClosureValidator,
-        path: []const u8,
+        frames: *std.ArrayList(ImportFrame),
+        path: []u8,
         depth: usize,
     ) !void {
-        if (depth > self.limits.max_import_depth) {
-            return error.ImportDepthExceeded;
-        }
+        defer self.allocator.free(path);
+        if (depth > self.limits.max_import_depth) return error.ImportDepthExceeded;
         if (self.states.get(path)) |state| {
             if (state == .visiting) return error.ImportCycle;
             return;
         }
-        const file = findFile(self.files, path) orelse
-            return error.ImportedDefinitionMissing;
+        const file = findFile(self.files, path) orelse return error.ImportedDefinitionMissing;
         try self.states.put(self.allocator, file.path, .visiting);
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
@@ -739,7 +803,7 @@ const CanonicalClosureValidator = struct {
         );
         defer parsed.deinit();
         var imports: std.ArrayList([]u8) = .empty;
-        defer {
+        errdefer {
             for (imports.items) |item| self.allocator.free(item);
             imports.deinit(self.allocator);
         }
@@ -750,11 +814,9 @@ const CanonicalClosureValidator = struct {
             &imports,
         );
         std.sort.heap([]u8, imports.items, {}, lessThanPath);
-        for (imports.items) |import_path| {
-            try self.visit(import_path, depth + 1);
-        }
-        self.states.getPtr(file.path).?.* = .complete;
-        self.complete_count += 1;
+        std.debug.assert(frames.items.len < self.files.len);
+        std.debug.assert(depth <= self.limits.max_import_depth);
+        try frames.append(self.allocator, .{ .path = file.path, .imports = imports });
     }
 };
 
@@ -1205,5 +1267,156 @@ test "closure rejects symlink traversal and non-regular files" {
     try std.testing.expectError(
         error.DefinitionNotRegularFile,
         loadFromDir(std.testing.allocator, &tmp.dir, "directory.json", .{}),
+    );
+}
+
+fn chainFixture(allocator: std.mem.Allocator, count: usize) !Closure {
+    std.debug.assert(count > 0 and count < 1000);
+    const files = try allocator.alloc(ClosureFile, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    var total: usize = 0;
+    for (files, 0..) |*file, index| {
+        const path = try std.fmt.allocPrint(allocator, "f{d:0>3}.json", .{index});
+        errdefer allocator.free(path);
+        const bytes = if (index + 1 == count)
+            try allocator.dupe(u8, "{}")
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{{\"imports\":[\"f{d:0>3}.json\"]}}",
+                .{index + 1},
+            );
+        file.* = .{
+            .path = path,
+            .canonical_json = bytes,
+            .source_digest = undefined,
+            .source_bytes = bytes.len,
+        };
+        std.crypto.hash.sha2.Sha256.hash(bytes, &file.source_digest, .{});
+        total += bytes.len;
+        initialized += 1;
+    }
+    return .{ .files = files, .digest = digestFiles(files), .total_definition_bytes = total };
+}
+
+test "iterative import traversal preserves deep source and canonical closure bytes" {
+    var source = try chainFixture(std.testing.allocator, 96);
+    defer source.deinit(std.testing.allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (source.files) |file| {
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = file.path,
+            .data = file.canonical_json,
+        });
+    }
+    const limits: Limits = .{ .max_import_depth = 96, .max_files = 96 };
+    var loaded = try loadFromDir(std.testing.allocator, &tmp.dir, "f000.json", limits);
+    defer loaded.deinit(std.testing.allocator);
+    var canonical = try fromCanonicalFiles(
+        std.testing.allocator,
+        source.files,
+        "f000.json",
+        limits,
+    );
+    defer canonical.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(&source.digest, &loaded.digest);
+    try std.testing.expectEqualStrings(&source.digest, &canonical.digest);
+    const shallow: Limits = .{ .max_import_depth = 95 };
+    try std.testing.expectError(
+        error.ImportDepthExceeded,
+        loadFromDir(std.testing.allocator, &tmp.dir, "f000.json", shallow),
+    );
+    try std.testing.expectError(
+        error.ImportDepthExceeded,
+        fromCanonicalFiles(std.testing.allocator, source.files, "f000.json", shallow),
+    );
+}
+
+test "import depth precedes cycles and cycles precede new-file admission" {
+    const bytes = "{\"imports\":[\"a.json\"]}";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.json", .data = bytes });
+    const files = [_]ClosureFile{.{
+        .path = @constCast("a.json"),
+        .canonical_json = @constCast(bytes),
+        .source_digest = [_]u8{0} ** 32,
+        .source_bytes = bytes.len,
+    }};
+    const shallow: Limits = .{ .max_import_depth = 1, .max_files = 1 };
+    try std.testing.expectError(
+        error.ImportDepthExceeded,
+        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", shallow),
+    );
+    try std.testing.expectError(
+        error.ImportDepthExceeded,
+        fromCanonicalFiles(std.testing.allocator, &files, "a.json", shallow),
+    );
+    const deep: Limits = .{ .max_import_depth = 2, .max_files = 1 };
+    try std.testing.expectError(
+        error.ImportCycle,
+        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", deep),
+    );
+    try std.testing.expectError(
+        error.ImportCycle,
+        fromCanonicalFiles(std.testing.allocator, &files, "a.json", deep),
+    );
+}
+
+fn loadChainForAllocationFailure(allocator: std.mem.Allocator, root: *std.Io.Dir) !void {
+    var loaded = loadFromDir(allocator, root, "f000.json", .{}) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer loaded.deinit(allocator);
+}
+
+fn canonicalChainForAllocationFailure(
+    allocator: std.mem.Allocator,
+    files: []const ClosureFile,
+) !void {
+    var loaded = fromCanonicalFiles(allocator, files, "f000.json", .{}) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer loaded.deinit(allocator);
+}
+
+test "import frames free pending siblings at every failed allocation" {
+    var source = try chainFixture(std.testing.allocator, 3);
+    defer source.deinit(std.testing.allocator);
+    const root = &source.files[0];
+    const branched = try std.testing.allocator.dupe(
+        u8,
+        "{\"imports\":[\"f001.json\",\"f002.json\"]}",
+    );
+    source.total_definition_bytes += branched.len - root.source_bytes;
+    std.testing.allocator.free(root.canonical_json);
+    root.canonical_json = branched;
+    root.source_bytes = branched.len;
+    std.crypto.hash.sha2.Sha256.hash(branched, &root.source_digest, .{});
+    source.digest = digestFiles(source.files);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (source.files) |file| {
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = file.path,
+            .data = file.canonical_json,
+        });
+    }
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        loadChainForAllocationFailure,
+        .{&tmp.dir},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        canonicalChainForAllocationFailure,
+        .{source.files},
     );
 }

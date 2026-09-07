@@ -1,3 +1,4 @@
+const core_calendar = @import("core_calendar");
 const output = @import("output.zig");
 const std = @import("std");
 
@@ -9,19 +10,25 @@ pub fn setAutomationRootOverride(path: ?[]const u8) void {
 
 pub fn parseCwdsJson(allocator: std.mem.Allocator, raw_json: []const u8) !std.ArrayList([]u8) {
     var result = std.ArrayList([]u8).empty;
+    errdefer freeOwnedStrings(allocator, result);
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
         raw_json,
         .{},
-    ) catch return userErrorFmt("cwds_json must be valid JSON", .{});
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return userErrorFmt("cwds_json must be valid JSON", .{}),
+    };
     defer parsed.deinit();
     if (parsed.value != .array) {
         return userErrorFmt("cwds_json must be a JSON array of strings", .{});
     }
     for (parsed.value.array.items) |item| {
         if (item != .string) return userErrorFmt("cwds_json must be a JSON array of strings", .{});
-        try result.append(allocator, try allocator.dupe(u8, item.string));
+        const owned = try allocator.dupe(u8, item.string);
+        errdefer allocator.free(owned);
+        try result.append(allocator, owned);
     }
     return result;
 }
@@ -274,24 +281,11 @@ fn readExistingMemory(allocator: std.mem.Allocator, memory_path: []const u8) ![]
 const CivilDate = struct { year: i64, month: u8, day: u8 };
 
 fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
-    const z = days_since_unix_epoch + 719_468;
-    const era = @divFloor(z, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(
-        doe - @divFloor(doe, 1_460) +
-            @divFloor(doe, 36_524) -
-            @divFloor(doe, 146_096),
-        365,
-    );
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const m = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
+    const date = core_calendar.civilFromDays(days_since_unix_epoch, .gregorian);
     return .{
-        .year = y + (if (m <= 2) @as(i64, 1) else @as(i64, 0)),
-        .month = @intCast(m),
-        .day = @intCast(d),
+        .year = @intCast(date.year),
+        .month = @intCast(date.month),
+        .day = @intCast(date.day),
     };
 }
 
@@ -413,5 +407,23 @@ test "memory summary rejects symlink and non-file memory targets" {
     try std.testing.expectError(
         error.UserInput,
         writeMemorySummary(allocator, "row", "must stay a file", 0),
+    );
+}
+
+fn parseCwdsWithAllocator(allocator: std.mem.Allocator) !void {
+    const result = try parseCwdsJson(allocator, "[\"one\",\"two\",\"three\"]");
+    defer freeOwnedStrings(allocator, result);
+    try std.testing.expectEqual(@as(usize, 3), result.items.len);
+    try std.testing.expectEqualStrings("three", result.items[2]);
+}
+
+test "cwd JSON releases partially built output under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseCwdsWithAllocator, .{});
+}
+
+test "cwd JSON rejects a malformed later element without leaking prior strings" {
+    try std.testing.expectError(
+        error.UserInput,
+        parseCwdsJson(std.testing.allocator, "[\"one\",\"two\",3]"),
     );
 }

@@ -85,8 +85,18 @@ pub fn main(init: std.process.Init) !void {
     const config = loadConfig(allocator, cli.config_path) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), cli.config_path);
     };
-    if (config.rounds < 3) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidRounds", cli.config_path);
-    if (config.iterations < 100) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidIterations", cli.config_path);
+    if (config.rounds < 3) core_cli.exitUsageFailure(
+        HelpSurface,
+        Version,
+        "InvalidRounds",
+        cli.config_path,
+    );
+    if (config.iterations < 100) core_cli.exitUsageFailure(
+        HelpSurface,
+        Version,
+        "InvalidIterations",
+        cli.config_path,
+    );
 
     const summary = try benchmarkBenchStats(allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
@@ -95,7 +105,10 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     try stdout.print("rounds={d}\n", .{summary.rounds});
     try stdout.print("line_count={d}\n", .{summary.line_count});
@@ -104,13 +117,18 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("p50_alloc_calls_per_round={d}\n", .{summary.p50_alloc_calls_per_round});
     if (previous_artifact) |artifact| {
         try stdout.print("trend_previous_p95_ns_per_line={d}\n", .{artifact.p95_ns_per_line});
-        try stdout.print("trend_previous_p50_alloc_calls_per_round={d}\n", .{artifact.p50_alloc_calls_per_round});
+        try stdout.print(
+            "trend_previous_p50_alloc_calls_per_round={d}\n",
+            .{artifact.p50_alloc_calls_per_round},
+        );
         try stdout.print("trend_tolerance_pct={d:.2}\n", .{trend_tolerance_pct});
     }
 
     if (!cli.report_only) {
         if (summary.p95_ns_per_line > config.max_p95_ns_per_line) return error.PerfGateFailed;
-        if (summary.p50_alloc_calls_per_round > config.max_p50_alloc_calls_per_round) return error.AllocGateFailed;
+        if (summary.p50_alloc_calls_per_round > config.max_p50_alloc_calls_per_round) {
+            return error.AllocGateFailed;
+        }
         if (previous_artifact) |artifact| {
             try enforceTrendGate(summary, artifact, trend_tolerance_pct);
         }
@@ -127,18 +145,25 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
     var out = CliOptions{
         .config_path = try allocator.dupe(u8, "perf/bench_stats/workload_config.json"),
     };
+    errdefer freeCliOptions(allocator, &out);
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
@@ -147,16 +172,18 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
             i += 1;
             if (i >= argv.len) return error.MissingConfigPath;
             const path = argv[i];
+            const owned = try allocator.dupe(u8, path);
             allocator.free(out.config_path);
-            out.config_path = try allocator.dupe(u8, path);
+            out.config_path = owned;
             continue;
         }
         if (std.mem.eql(u8, arg, "--artifact")) {
             i += 1;
             if (i >= argv.len) return error.MissingArtifactPath;
             const path = argv[i];
+            const owned = try allocator.dupe(u8, path);
             if (out.artifact_path) |existing| allocator.free(existing);
-            out.artifact_path = try allocator.dupe(u8, path);
+            out.artifact_path = owned;
             continue;
         }
         if (std.mem.eql(u8, arg, "--trend-tolerance-pct")) {
@@ -183,7 +210,12 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
 }
 
 fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(1 * 1024 * 1024),
+    );
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -197,13 +229,23 @@ fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
     var out = PerfConfig{};
     if (root.get("iterations")) |v| out.iterations = try core_perf.intFieldToUsize(v);
     if (root.get("rounds")) |v| out.rounds = try core_perf.intFieldToUsize(v);
-    if (root.get("max_p95_ns_per_line")) |v| out.max_p95_ns_per_line = try core_perf.intFieldToU64(v);
-    if (root.get("max_p50_alloc_calls_per_round")) |v| out.max_p50_alloc_calls_per_round = try core_perf.intFieldToU64(v);
-    if (root.get("trend_tolerance_pct")) |v| out.trend_tolerance_pct = try core_perf.floatFieldToF64(v);
+    if (root.get("max_p95_ns_per_line")) |v| {
+        out.max_p95_ns_per_line = try core_perf.intFieldToU64(v);
+    }
+    if (root.get("max_p50_alloc_calls_per_round")) |v| {
+        out.max_p50_alloc_calls_per_round = try core_perf.intFieldToU64(v);
+    }
+    if (root.get("trend_tolerance_pct")) |v| {
+        out.trend_tolerance_pct = try core_perf.floatFieldToF64(v);
+    }
     return out;
 }
 
-fn benchmarkBenchStats(allocator: std.mem.Allocator, iterations: usize, rounds: usize) !PerfSummary {
+fn benchmarkBenchStats(
+    allocator: std.mem.Allocator,
+    iterations: usize,
+    rounds: usize,
+) !PerfSummary {
     var ns_per_line_samples: std.ArrayList(u64) = .empty;
     defer ns_per_line_samples.deinit(allocator);
     try ns_per_line_samples.ensureTotalCapacity(allocator, rounds);
@@ -217,7 +259,10 @@ fn benchmarkBenchStats(allocator: std.mem.Allocator, iterations: usize, rounds: 
     while (round_idx < rounds) : (round_idx += 1) {
         const stats = try runRound(allocator, iterations);
         line_count = stats.line_count;
-        try ns_per_line_samples.append(allocator, divideRounded(stats.elapsed_ns, stats.line_count));
+        try ns_per_line_samples.append(
+            allocator,
+            divideRounded(stats.elapsed_ns, stats.line_count),
+        );
         try alloc_calls_samples.append(allocator, stats.alloc_calls);
     }
 
@@ -239,16 +284,16 @@ fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
 
     var values: std.ArrayList(f64) = .empty;
     defer values.deinit(bench_allocator);
-    try values.ensureTotalCapacity(bench_allocator, expectedParsedValueCount(iterations));
+    try values.ensureTotalCapacity(bench_allocator, try expectedParsedValueCount(iterations));
 
-    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+    const start_ns = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const line = sample_lines[i % sample_lines.len];
         try bench_stats.parseNumbersFromLine(line, true, bench_allocator, &values);
     }
     std.mem.sort(f64, values.items, {}, comptime std.sort.asc(f64));
-    const elapsed_ns_signed = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns;
+    const elapsed_ns_signed = std.Io.Clock.awake.now(defaultIo()).nanoseconds - start_ns;
     const elapsed_ns: u64 = @intCast(if (elapsed_ns_signed > 0) elapsed_ns_signed else 1);
 
     return .{
@@ -258,14 +303,14 @@ fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
     };
 }
 
-fn expectedParsedValueCount(iterations: usize) usize {
+fn expectedParsedValueCount(iterations: usize) !usize {
     const full_cycles = iterations / sample_lines.len;
     const remainder = iterations % sample_lines.len;
 
-    var total: usize = full_cycles * 8;
+    var total = try std.math.mul(usize, full_cycles, 8);
     var i: usize = 0;
     while (i < remainder) : (i += 1) {
-        total += sample_value_counts[i];
+        total = try std.math.add(usize, total, sample_value_counts[i]);
     }
     return total;
 }
@@ -367,7 +412,10 @@ test "trend gate rejects p95 regression" {
         .p95_ns_per_line = 500,
         .p50_alloc_calls_per_round = 20,
     };
-    try std.testing.expectError(error.TrendPerfGateFailed, enforceTrendGate(summary, previous, 20.0));
+    try std.testing.expectError(
+        error.TrendPerfGateFailed,
+        enforceTrendGate(summary, previous, 20.0),
+    );
 }
 
 test "trend gate rejects alloc regression" {
@@ -382,7 +430,10 @@ test "trend gate rejects alloc regression" {
         .p95_ns_per_line = 500,
         .p50_alloc_calls_per_round = 20,
     };
-    try std.testing.expectError(error.TrendAllocGateFailed, enforceTrendGate(summary, previous, 20.0));
+    try std.testing.expectError(
+        error.TrendAllocGateFailed,
+        enforceTrendGate(summary, previous, 20.0),
+    );
 }
 
 test "benchmark summary has sane values" {
@@ -390,4 +441,32 @@ test "benchmark summary has sane values" {
     try std.testing.expectEqual(@as(usize, 3), summary.rounds);
     try std.testing.expectEqual(@as(usize, 500), summary.line_count);
     try std.testing.expect(summary.p95_ns_per_line >= summary.p50_ns_per_line);
+}
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn parseRepeatedOptions(allocator: std.mem.Allocator) !void {
+    var options = try parseCliOptions(allocator, &.{
+        "perf",       "--config", "first",      "--config", "second",
+        "--artifact", "one",      "--artifact", "two",
+    });
+    defer freeCliOptions(allocator, &options);
+    try std.testing.expectEqualStrings("second", options.config_path);
+    try std.testing.expectEqualStrings("two", options.artifact_path.?);
+}
+
+test "repeated CLI paths preserve ownership under every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseRepeatedOptions, .{});
+}
+
+test "invalid CLI option releases previously parsed paths" {
+    try std.testing.expectError(error.UnknownArgument, parseCliOptions(std.testing.allocator, &.{
+        "perf", "--config", "first", "--artifact", "one", "--unknown",
+    }));
+}
+
+test "benchmark capacity reports arithmetic overflow before allocation" {
+    try std.testing.expectError(error.Overflow, expectedParsedValueCount(std.math.maxInt(usize)));
 }

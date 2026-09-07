@@ -986,11 +986,11 @@ fn headMutation(
 }
 
 test "legacy custody tombstones are fail-closed for monolithic readers" {
-    const event_result = durable_store.validateJsonlBytes(
+    const event_result = try durable_store.validateJsonlBytes(
         std.testing.allocator,
         segmented_event_log.legacy_event_tombstone,
     );
-    const binding_result = durable_store.validateJsonlBytes(
+    const binding_result = try durable_store.validateJsonlBytes(
         std.testing.allocator,
         segmented_event_log.legacy_binding_tombstone,
     );

@@ -1,5 +1,5 @@
 const core_json = @import("core_json");
-const legacy_hooks = @import("cas_hook_policy");
+const legacy_hooks = @import("hook_policy.zig");
 pub const app_server_launch = @import("transport.zig");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
@@ -14,6 +14,7 @@ pub const hooks = struct {
     pub const unsupportedSummary = legacy_hooks.unsupportedSummary;
     pub const isHookNotificationLine = legacy_hooks.isHookNotificationLine;
     pub const ensureLaunchSupportsPolicy = legacy_hooks.ensureLaunchSupportsPolicy;
+    pub const ensureLaunchSupportsPolicyUntil = legacy_hooks.ensureLaunchSupportsPolicyUntil;
     pub const defaultHookLogPathAlloc = legacy_hooks.defaultHookLogPathAlloc;
 
     pub fn appendAppServerArgs(
@@ -66,8 +67,11 @@ pub const InitializeCapabilityBuilder = struct {
         if (raw.len > max_initialize_capabilities_bytes) {
             return error.InitializeCapabilitiesTooLarge;
         }
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
-            return error.InvalidInitializeCapabilities;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidInitializeCapabilities,
+            };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |value| value,
@@ -85,7 +89,21 @@ pub const InitializeCapabilityBuilder = struct {
         try self.validate(allocator);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        const writer = &output.writer;
+        self.writeJson(allocator, &output.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        if (output.written().len > max_initialize_capabilities_bytes) {
+            return error.InitializeCapabilitiesTooLarge;
+        }
+        return output.toOwnedSlice();
+    }
+
+    fn writeJson(
+        self: InitializeCapabilityBuilder,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
         try writer.writeAll("{\"experimentalApi\":");
         try std.json.Stringify.value(self.experimental_api, .{}, writer);
         try writer.writeAll(",\"optOutNotificationMethods\":");
@@ -107,10 +125,6 @@ pub const InitializeCapabilityBuilder = struct {
             }
         }
         try writer.writeByte('}');
-        if (output.written().len > max_initialize_capabilities_bytes) {
-            return error.InitializeCapabilitiesTooLarge;
-        }
-        return output.toOwnedSlice();
     }
 
     fn isTypedCapability(key: []const u8) bool {
@@ -466,39 +480,23 @@ pub const Client = struct {
         opts: ClientOptions,
         overload_retry_seed: u64,
     ) !Client {
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(allocator);
-
         const resolved_codex_path = try resolveExecutableAlloc(allocator, opts.codex_path);
         defer allocator.free(resolved_codex_path);
-        try hooks.ensureLaunchSupportsPolicy(
+        const startup_deadline_ms = @min(
+            opts.request_deadline_ms orelse std.math.maxInt(i64),
+            monotonicMillis() + handshake_timeout_ms,
+        );
+        try hooks.ensureLaunchSupportsPolicyUntil(
             allocator,
             opts.io,
             resolved_codex_path,
             opts.cwd,
             opts.hook_policy,
-        );
-
-        try argv.append(allocator, resolved_codex_path);
-        try appendCodexEnableFeatureArgs(allocator, &argv, opts.codex_enable_features);
-        try app_server_launch.appendAppServerArgs(
-            allocator,
-            &argv,
-            opts.hook_policy == .off,
-            null,
-            opts.code_mode_host,
+            startup_deadline_ms,
         );
 
         const io = opts.io;
-        var child = try std.process.spawn(io, .{
-            .argv = argv.items,
-            .cwd = .{ .path = opts.cwd },
-            .environ_map = opts.child_environment,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .ignore,
-            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-        });
+        var child = try spawnStdioChild(allocator, opts, resolved_codex_path);
         const process_group_id: ?u64 = switch (builtin.os.tag) {
             .windows, .wasi => null,
             else => @intCast(child.id.?),
@@ -526,8 +524,38 @@ pub const Client = struct {
             client.close();
             client.deinit();
         }
+        const request_deadline_ms = client.swapRequestDeadlineMs(startup_deadline_ms);
         try client.handshake(opts);
+        _ = client.swapRequestDeadlineMs(request_deadline_ms);
         return client;
+    }
+
+    fn spawnStdioChild(
+        allocator: std.mem.Allocator,
+        opts: ClientOptions,
+        resolved_codex_path: []const u8,
+    ) !std.process.Child {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(allocator);
+        try argv.append(allocator, resolved_codex_path);
+        try appendCodexEnableFeatureArgs(allocator, &argv, opts.codex_enable_features);
+        try app_server_launch.appendAppServerArgs(
+            allocator,
+            &argv,
+            opts.hook_policy == .off,
+            null,
+            opts.code_mode_host,
+        );
+
+        return std.process.spawn(opts.io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = opts.cwd },
+            .environ_map = opts.child_environment,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        });
     }
 
     fn initStdioClient(
@@ -874,7 +902,10 @@ pub const Client = struct {
                 self.allocator,
                 line,
                 .{},
-            ) catch continue;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             defer parsed.deinit();
             const msg_obj = switch (parsed.value) {
                 .object => |obj| obj,
@@ -892,7 +923,9 @@ pub const Client = struct {
                         captured_notification_bytes.*,
                         line.len,
                     );
-                    try lines.append(self.allocator, try self.allocator.dupe(u8, line));
+                    const owned_line = try self.allocator.dupe(u8, line);
+                    errdefer self.allocator.free(owned_line);
+                    try lines.append(self.allocator, owned_line);
                     captured_notification_bytes.* = updated_bytes;
                 }
             }
@@ -957,7 +990,10 @@ pub const Client = struct {
                 self.allocator,
                 line,
                 .{},
-            ) catch continue;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             defer parsed.deinit();
             const msg_obj = switch (parsed.value) {
                 .object => |obj| obj,
@@ -1042,7 +1078,8 @@ pub const Client = struct {
     ) !void {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
-        try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
+        std.json.Stringify.value(msg, .{}, &payload_writer.writer) catch
+            return error.OutOfMemory;
         try self.sendPayload(payload_writer.written(), send_observer, null, true);
     }
 
@@ -1206,18 +1243,19 @@ pub const Client = struct {
     ) !void {
         const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
             monotonicMillis() + default_request_timeout_ms;
-        var remaining_ms = deadline_ms - monotonicMillis();
-        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
         if (send_observer) |observer| {
             try observer.before_send(observer.context);
             // Crossing the durable observer boundary owns every subsequent
             // outcome, including a deadline that expires before socket write.
             self.request_send_started = true;
         }
-        remaining_ms = deadline_ms - monotonicMillis();
-        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
         if (send_observer == null) self.request_send_started = true;
-        self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
+        self.websocket.?.sendTextDeadline(
+            payload,
+            awakeDeadline(deadline_ms),
+        ) catch |err| switch (err) {
             error.Timeout => return error.ConnectionTimedOut,
             else => return err,
         };
@@ -1426,10 +1464,9 @@ pub const Client = struct {
             .websocket, .unix_socket => {
                 const deadline_ms = self.request_deadline_ms orelse
                     return try self.websocket.?.readTextAlloc();
-                const remaining_ms = deadline_ms - monotonicMillis();
-                if (remaining_ms <= 0) return error.ConnectionTimedOut;
-                return self.websocket.?.readTextAllocTimeout(
-                    @intCast(remaining_ms),
+                if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
+                return self.websocket.?.readTextAllocDeadline(
+                    awakeDeadline(deadline_ms),
                 ) catch |err| switch (err) {
                     error.Timeout => return error.ConnectionTimedOut,
                     else => err,
@@ -2758,14 +2795,11 @@ fn retireStdioChild(
     child: *std.process.Child,
     process_group_id: ?u64,
 ) void {
-    if (process_group_id) |group_id| websocket_transport.forceKillProcessGroup(group_id);
-    child.kill(io);
-    if (process_group_id) |group_id| {
-        _ = websocket_transport.waitForProcessGroupExit(
-            group_id,
-            websocket_transport.owner_watchdog_shutdown_grace_ms,
-        );
-    }
+    websocket_transport.retireProcessChild(io, child, process_group_id);
+}
+
+fn awakeDeadline(deadline_ms: i64) std.Io.Clock.Timestamp {
+    return .{ .raw = .fromNanoseconds(@as(i96, deadline_ms) * 1_000_000), .clock = .awake };
 }
 
 pub fn validateClientOptions(allocator: std.mem.Allocator, opts: ClientOptions) !void {
@@ -2832,16 +2866,21 @@ fn waitFileWritableUntil(file: std.Io.File, deadline_ms: i64) !void {
 }
 
 fn waitFileEventUntil(file: std.Io.File, deadline_ms: i64, events: i16) !void {
-    const remaining_ms = deadline_ms - monotonicMillis();
-    if (remaining_ms <= 0) return error.ConnectionTimedOut;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = file.handle,
-        .events = events,
-        .revents = 0,
-    }};
-    const timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
-    if (try std.posix.poll(&fds, timeout) == 0) return error.ConnectionTimedOut;
-    if ((fds[0].revents & std.posix.POLL.NVAL) != 0) return error.AppServerClosed;
+    const poll_quantum_ms: i64 = 1_000;
+    var now_ms = monotonicMillis();
+    while (now_ms < deadline_ms) : (now_ms = monotonicMillis()) {
+        const remaining_ms = deadline_ms - now_ms;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = file.handle,
+            .events = events,
+            .revents = 0,
+        }};
+        const timeout: i32 = @intCast(@min(remaining_ms, poll_quantum_ms));
+        if (try std.posix.poll(&fds, timeout) == 0) continue;
+        if ((fds[0].revents & std.posix.POLL.NVAL) != 0) return error.AppServerClosed;
+        return;
+    }
+    return error.ConnectionTimedOut;
 }
 
 fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !void {
@@ -2924,17 +2963,17 @@ fn initializePayloadAlloc(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     const writer = &output.writer;
-    try writer.writeAll("{\"method\":\"initialize\",\"id\":");
-    try std.json.Stringify.value(id, .{}, writer);
-    try writer.writeAll(",\"params\":{\"clientInfo\":{\"name\":");
-    try std.json.Stringify.value(client_name, .{}, writer);
-    try writer.writeAll(",\"title\":");
-    try std.json.Stringify.value(client_title, .{}, writer);
-    try writer.writeAll(",\"version\":");
-    try std.json.Stringify.value(client_version, .{}, writer);
-    try writer.writeAll("},\"capabilities\":");
-    try writer.writeAll(capabilities_json);
-    try writer.writeAll("}}");
+    writer.writeAll("{\"method\":\"initialize\",\"id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(id, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll(",\"params\":{\"clientInfo\":{\"name\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(client_name, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll(",\"title\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(client_title, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll(",\"version\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(client_version, .{}, writer) catch return error.OutOfMemory;
+    writer.writeAll("},\"capabilities\":") catch return error.OutOfMemory;
+    writer.writeAll(capabilities_json) catch return error.OutOfMemory;
+    writer.writeAll("}}") catch return error.OutOfMemory;
     if (output.written().len > websocket_transport.max_message_bytes) {
         return error.AppServerMessageTooLarge;
     }
@@ -3530,6 +3569,70 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
     try std.testing.expect(!websocket_transport.processAlive(sleep_process_id));
 }
 
+test "stdio startup deadline includes the hook capability probe" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "codex" });
+    defer allocator.free(executable);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "codex",
+        .data = "#!/bin/sh\nprintf '%s' \"$$\" > pid\nexec sleep 600\n",
+    });
+    try tmp.dir.setFilePermissions(io, "codex", .fromMode(0o755), .{});
+    const started_ms = monotonicMillis();
+    try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .hook_policy = .off,
+        .request_deadline_ms = started_ms + 100,
+    }));
+    try std.testing.expect(monotonicMillis() - started_ms < 2_000);
+    const pid_bytes = try tmp.dir.readFileAlloc(io, "pid", allocator, .limited(64));
+    defer allocator.free(pid_bytes);
+    const pid = try std.fmt.parseInt(u64, pid_bytes, 10);
+    try std.testing.expect(!websocket_transport.processAlive(pid));
+}
+
+test "stdio hook admission and handshake restore the caller request deadline" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "codex" });
+    defer allocator.free(executable);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "codex",
+        .data = "#!/bin/sh\nif [ \"$2\" = --help ]; then\n" ++
+            "  printf '%s\\n' '--disable generate-json-schema'; exit 0\nfi\n" ++
+            "IFS= read -r request\nprintf '%s\\n' '{\"id\":-1,\"result\":{}}'\n" ++
+            "while IFS= read -r request; do :; done\n",
+    });
+    try tmp.dir.setFilePermissions(io, "codex", .fromMode(0o755), .{});
+    const deadline = monotonicMillis() + @as(i64, std.math.maxInt(u32)) + 1_000;
+    var client = try Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .hook_policy = .off,
+        .request_deadline_ms = deadline,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+    try std.testing.expectEqual(@as(?i64, deadline), client.request_deadline_ms);
+    try std.testing.expectEqualStrings("{}", client.initialize_response_json.?);
+}
+
 test "stdio request deadline bounds a blocked write and reaps the app-server" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -3759,6 +3862,32 @@ test "initialize capability builder has one typed owner and preserves additive f
         .cwd = ".",
         .attestation_response_json = "{\"token\":\"exact\"}",
     }).request_attestation);
+}
+
+test "initialize capabilities propagate every validation and writer allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseInitializeCapabilityAllocations,
+        .{},
+    );
+}
+
+fn exerciseInitializeCapabilityAllocations(allocator: std.mem.Allocator) !void {
+    const builder = InitializeCapabilityBuilder{
+        .opt_out_notification_methods = &.{"thread/started"},
+        .additional_json = "{\"futureCapability\":{\"enabled\":true}}",
+    };
+    const raw = try builder.buildAlloc(allocator);
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("experimentalApi").?.bool);
+    try std.testing.expect(object.get("futureCapability").?.object.get("enabled").?.bool);
+    try std.testing.expectEqualStrings(
+        "thread/started",
+        object.get("optOutNotificationMethods").?.array.items[0].string,
+    );
 }
 
 test "initialize payload carries the single capability object" {
@@ -5891,6 +6020,111 @@ test "notification capture has an aggregate byte bound" {
         error.AppServerNotificationBytesLimitExceeded,
         addCapturedNotificationBytes(max_captured_notification_bytes, 1),
     );
+}
+
+test "response parsing and notification capture propagate every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseRequestAttemptAllocations,
+        .{},
+    );
+}
+
+fn exerciseRequestAttemptAllocations(allocator: std.mem.Allocator) !void {
+    var client = serverRequestTestClient();
+    client.allocator = allocator;
+    defer client.deinit();
+    try client.line_buf.appendSlice(
+        allocator,
+        "not-json\n{\"method\":\"fixture/event\",\"params\":{}}\n" ++
+            "{\"id\":1,\"result\":{\"ok\":true}}\n",
+    );
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+    var captured_bytes: usize = 0;
+    var interleaved: usize = 0;
+    const response = try client.awaitRequestAttempt(
+        1,
+        &notifications,
+        &captured_bytes,
+        &interleaved,
+    );
+    switch (response) {
+        .success => |json| {
+            defer allocator.free(json);
+            try std.testing.expectEqualStrings("{\"ok\":true}", json);
+        },
+        .rpc_error => |failure| {
+            allocator.free(failure.json);
+            return error.UnexpectedRpcError;
+        },
+    }
+    try std.testing.expectEqual(@as(usize, 1), notifications.items.len);
+    try std.testing.expectEqual(notifications.items[0].len, captured_bytes);
+}
+
+test "handshake parsing propagates allocation failure after consuming its response" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseHandshakeAllocations,
+        .{},
+    );
+}
+
+fn exerciseHandshakeAllocations(allocator: std.mem.Allocator) !void {
+    const io = std.testing.io;
+    var descriptors: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&descriptors) != 0) return error.SystemResources;
+    const reader = std.Io.File{ .handle = descriptors[0], .flags = .{ .nonblocking = false } };
+    defer reader.close(io);
+    const sink = std.Io.File{ .handle = descriptors[1], .flags = .{ .nonblocking = false } };
+    defer sink.close(io);
+    var client = serverRequestTestClient();
+    client.allocator = allocator;
+    client.io = io;
+    client.stdin_file = sink;
+    defer client.deinit();
+    try client.line_buf.appendSlice(allocator, "not-json\n{\"id\":-1,\"result\":{}}\n");
+    try client.handshake(.{ .cwd = ".", .io = io });
+    try std.testing.expectEqualStrings("{}", client.initialize_response_json.?);
+}
+
+test "far future websocket deadlines preserve immediate successful requests and reads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const peer = try std.Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort());
+    const stream = try peer.connect(io, .{ .mode = .stream });
+    var server = try listener.accept(io);
+    defer server.close(io);
+    var client = serverRequestTestClient();
+    client.io = io;
+    client.transport_kind = .websocket;
+    client.websocket = .{ .allocator = allocator, .stream = stream, .read_buf = .empty };
+    client.request_deadline_ms = monotonicMillis() + @as(i64, std.math.maxInt(u32)) + 1_000;
+    defer {
+        client.close();
+        client.deinit();
+    }
+    const response = "{\"id\":1,\"result\":{\"ok\":true}}";
+    var writer = server.writer(io, &.{});
+    try writer.interface.writeAll(&.{ 0x81, response.len });
+    try writer.interface.writeAll(response);
+    try writer.interface.flush();
+    const result = try client.requestJson("fixture/request", "{}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{\"ok\":true}", result);
+    try writer.interface.writeAll(&.{ 0x81, 2, 'o', 'k' });
+    try writer.interface.flush();
+    const line = (try client.readLineAlloc()).?;
+    defer allocator.free(line);
+    try std.testing.expectEqualStrings("ok", line);
 }
 
 test "resolveExecDecision honors read_only and explicit approvals" {

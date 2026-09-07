@@ -80,7 +80,9 @@ test "grayscale PNG has one valid IDAT with filter zero" {
     try std.testing.expectEqualSlices(u8, &signature, encoded[0..signature.len]);
     var chunk_offset: usize = signature.len;
     while (chunk_offset < encoded.len) {
-        const chunk_length: usize = @intCast(std.mem.readInt(u32, encoded[chunk_offset..][0..4], .big));
+        const chunk_length: usize = @intCast(
+            std.mem.readInt(u32, encoded[chunk_offset..][0..4], .big),
+        );
         const crc_start = chunk_offset + 4;
         const crc_end = crc_start + 4 + chunk_length;
         try std.testing.expectEqual(

@@ -117,9 +117,10 @@ fn validCodeModeProbeNonce(nonce: []const u8) bool {
 }
 
 pub fn main(init: std.process.Init) void {
-    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch |err| fatal(err, false);
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch |err|
+        fatal(init.io, err, false);
     const fixture = internalModelFixtureOptions(argv, init.environ_map) catch |err|
-        fatal(err, false);
+        fatal(init.io, err, false);
     if (fixture) |options| {
         serveInternalModelFixture(
             init.gpa,
@@ -128,12 +129,14 @@ pub fn main(init: std.process.Init) void {
             options.evidence_path,
             options.mode,
             options.nonce,
-        ) catch |err| fatal(err, false);
+        ) catch |err| fatal(init.io, err, false);
         return;
     }
-    const options = parseArgs(argv[1..]) catch |err| fatal(err, jsonRequested(argv[1..]));
+    exitForRootRequest(init.io, argv[1..]);
+    const options = parseArgs(argv[1..]) catch |err|
+        fatal(init.io, err, jsonRequested(argv[1..]));
     const compatible = run(init.gpa, init.io, init.environ_map, options) catch |err|
-        fatal(err, options.json);
+        fatal(init.io, err, options.json);
     if (!compatible) std.process.exit(1);
 }
 
@@ -516,9 +519,10 @@ fn codeModeHostOwnerProbeFallible(
     );
     defer allocator.free(probe_root);
     try std.Io.Dir.cwd().createDir(io, probe_root, .default_dir);
-    defer std.Io.Dir.cwd().deleteTree(io, probe_root) catch |err| ignoreError(err);
+    errdefer std.Io.Dir.cwd().deleteTree(io, probe_root) catch |err|
+        reportProbeCleanupFailure(probe_root, err);
 
-    return codeModeHostOwnerProbeInRoot(
+    const observed = try codeModeHostOwnerProbeInRoot(
         allocator,
         io,
         parent_environment,
@@ -528,6 +532,8 @@ fn codeModeHostOwnerProbeFallible(
         host,
         nonce,
     );
+    try std.Io.Dir.cwd().deleteTree(io, probe_root);
+    return observed;
 }
 
 fn codeModeHostOwnerProbeInRoot(
@@ -800,7 +806,8 @@ fn waitForBoundedFileAlloc(
     timeout_ms: i64,
 ) ![]u8 {
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
-    while (true) { // tiger: event-loop -- bounded by timeout_ms.
+    var elapsed_ms: i128 = 0;
+    while (elapsed_ms <= timeout_ms) {
         if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
             return std.Io.Dir.cwd().readFileAlloc(
                 io,
@@ -808,11 +815,16 @@ fn waitForBoundedFileAlloc(
                 allocator,
                 .limited(max_bytes),
             );
-        } else |_| {}
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
         if (now_ms - started_ms >= timeout_ms) return error.ModelFixtureTimedOut;
         try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+        elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     }
+    return error.ModelFixtureTimedOut;
 }
 
 fn modelEvidencePassed(allocator: std.mem.Allocator, raw: []const u8) !bool {
@@ -1702,46 +1714,92 @@ fn runIsolatedFullProbes(
     defer allocator.free(requested_codex_home);
     try std.Io.Dir.cwd().createDir(io, requested_codex_home, .default_dir);
     errdefer std.Io.Dir.cwd().deleteTree(io, requested_codex_home) catch |err|
-        ignoreError(err);
+        reportProbeCleanupFailure(requested_codex_home, err);
     const codex_home = try std.Io.Dir.cwd().realPathFileAlloc(io, requested_codex_home, allocator);
     defer allocator.free(codex_home);
+    const review_required = profile == .review or profile == .full;
+    const witnesses = if (review_required)
+        try runIsolatedReviewProbes(allocator, io, parent_environment, codex_home, cwd, codex_path)
+    else
+        try runConfiguredIsolatedProbes(
+            allocator,
+            io,
+            parent_environment,
+            codex_home,
+            cwd,
+            codex_path,
+            "http://127.0.0.1:1/v1",
+            false,
+        );
+    try std.Io.Dir.cwd().deleteTree(io, codex_home);
+    return witnesses;
+}
+
+fn runIsolatedReviewProbes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    codex_home: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+) !FeatureWitnesses {
     const ready_path = try std.fs.path.join(allocator, &.{ codex_home, "model.ready" });
     defer allocator.free(ready_path);
     const evidence_path = try std.fs.path.join(allocator, &.{ codex_home, "model.evidence.json" });
     defer allocator.free(evidence_path);
-    const review_required = profile == .review or profile == .full;
-    var model_fixture: ?std.process.Child = null;
-    var model_fixture_running = false;
-    defer if (model_fixture_running) model_fixture.?.kill(io);
-    var model_base_url_raw: ?[]u8 = null;
-    defer if (model_base_url_raw) |value| allocator.free(value);
-    if (review_required) {
-        const self_path = try std.process.executablePathAlloc(io, allocator);
-        defer allocator.free(self_path);
-        model_fixture = try spawnInternalModelFixture(
-            allocator,
-            io,
-            parent_environment,
-            self_path,
-            cwd,
-            ready_path,
-            evidence_path,
-            .structured_review,
-            null,
-        );
-        model_fixture_running = true;
-        model_base_url_raw = try waitForBoundedFileAlloc(
-            allocator,
-            io,
-            ready_path,
-            1024,
-            5_000,
-        );
-    }
-    const model_base_url = if (model_base_url_raw) |value|
-        std.mem.trim(u8, value, " \t\r\n")
-    else
-        "http://127.0.0.1:1/v1";
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_path);
+    var model_fixture = try spawnInternalModelFixture(
+        allocator,
+        io,
+        parent_environment,
+        self_path,
+        cwd,
+        ready_path,
+        evidence_path,
+        .structured_review,
+        null,
+    );
+    var model_fixture_running = true;
+    defer if (model_fixture_running) model_fixture.kill(io);
+    const model_base_url_raw = try waitForBoundedFileAlloc(allocator, io, ready_path, 1024, 5_000);
+    defer allocator.free(model_base_url_raw);
+    const witnesses = try runConfiguredIsolatedProbes(
+        allocator,
+        io,
+        parent_environment,
+        codex_home,
+        cwd,
+        codex_path,
+        std.mem.trim(u8, model_base_url_raw, " \t\r\n"),
+        true,
+    );
+    if (witnesses.structured_review.status != .passed) return witnesses;
+    const evidence = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        evidence_path,
+        4096,
+        code_mode_probe_timeout_ms,
+    );
+    defer allocator.free(evidence);
+    if (!try modelEvidencePassed(allocator, evidence)) return error.ModelFixtureFailed;
+    const term = try model_fixture.wait(io);
+    model_fixture_running = false;
+    if (term != .exited or term.exited != 0) return error.ModelFixtureFailed;
+    return witnesses;
+}
+
+fn runConfiguredIsolatedProbes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    codex_home: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+    model_base_url: []const u8,
+    review_required: bool,
+) !FeatureWitnesses {
     try createIsolatedProbeConfig(
         allocator,
         io,
@@ -1758,6 +1816,26 @@ fn runIsolatedFullProbes(
     _ = child_environment.swapRemove("OPENAI_ORG_ID");
     _ = child_environment.swapRemove("OPENAI_PROJECT_ID");
 
+    return runIsolatedFixtureProbes(
+        allocator,
+        io,
+        &child_environment,
+        codex_home,
+        cwd,
+        codex_path,
+        review_required,
+    );
+}
+
+fn runIsolatedFixtureProbes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child_environment: *const std.process.Environ.Map,
+    codex_home: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+    review_required: bool,
+) !FeatureWitnesses {
     try createPinningProbeRollout(allocator, io, codex_home, cwd);
     try createPaginatedForkProbeRollout(allocator, io, codex_home, cwd);
     const executor_root = try std.fs.path.join(allocator, &.{ codex_home, "executor-root" });
@@ -1776,41 +1854,17 @@ fn runIsolatedFullProbes(
     defer allocator.free(executor_resource);
     try createExecutorSkillProbeFixture(io, executor_skill, executor_manifest, executor_resource);
 
-    const witnesses = try runIsolatedWitnessClient(
+    return runIsolatedWitnessClient(
         allocator,
         io,
         cwd,
         codex_path,
-        &child_environment,
+        child_environment,
         executor_root,
         executor_manifest,
         executor_resource,
         review_required,
     );
-    if (review_required and witnesses.structured_review.status != .passed) {
-        model_fixture.?.kill(io);
-        model_fixture_running = false;
-        try std.Io.Dir.cwd().deleteTree(io, codex_home);
-        return witnesses;
-    }
-    if (!review_required) {
-        try std.Io.Dir.cwd().deleteTree(io, codex_home);
-        return witnesses;
-    }
-    const evidence = try waitForBoundedFileAlloc(
-        allocator,
-        io,
-        evidence_path,
-        4096,
-        code_mode_probe_timeout_ms,
-    );
-    defer allocator.free(evidence);
-    if (!try modelEvidencePassed(allocator, evidence)) return error.ModelFixtureFailed;
-    const term = try model_fixture.?.wait(io);
-    model_fixture_running = false;
-    if (term != .exited or term.exited != 0) return error.ModelFixtureFailed;
-    try std.Io.Dir.cwd().deleteTree(io, codex_home);
-    return witnesses;
 }
 
 fn runIsolatedWitnessClient(
@@ -2370,9 +2424,35 @@ test "Code Mode owner evidence requires nonce in custom tool output" {
     ));
 }
 
+test "fixture readiness reads exact bounded content and expires missing paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ready", .data = "ready" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const ready = try std.fs.path.join(allocator, &.{ root, "ready" });
+    defer allocator.free(ready);
+    const contents = try waitForBoundedFileAlloc(allocator, io, ready, 6, 0);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("ready", contents);
+    for ([_]usize{ 4, 5 }) |limit| {
+        try std.testing.expectError(
+            error.StreamTooLong,
+            waitForBoundedFileAlloc(allocator, io, ready, limit, 0),
+        );
+    }
+    const absent = try std.fs.path.join(allocator, &.{ root, "absent" });
+    defer allocator.free(absent);
+    try std.testing.expectError(
+        error.ModelFixtureTimedOut,
+        waitForBoundedFileAlloc(allocator, io, absent, 5, 0),
+    );
+}
+
 fn parseArgs(args: []const []const u8) !Options {
     if (args.len == 0) return error.MissingAction;
-    exitForRootRequest(args);
     var options = Options{ .action = if (std.mem.eql(u8, args[0], "schema"))
         .schema
     else if (std.mem.eql(u8, args[0], "preflight"))
@@ -2425,30 +2505,31 @@ fn parseArgs(args: []const []const u8) !Options {
     return options;
 }
 
-fn exitForRootRequest(args: []const []const u8) void {
+fn exitForRootRequest(io: std.Io, args: []const []const u8) void {
     if (isRootHelpRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
-        stdout_writer.interface.writeAll(Usage) catch |err| ignoreError(err);
-        stdout_writer.interface.flush() catch |err| ignoreError(err);
+        stdout_writer.interface.writeAll(Usage) catch |err| fatal(io, err, false);
+        stdout_writer.interface.flush() catch |err| fatal(io, err, false);
         std.process.exit(0);
     }
     if (isRootVersionRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         stdout_writer.interface.print("{s}\n", .{app_meta.version}) catch |err|
-            ignoreError(err);
-        stdout_writer.interface.flush() catch |err| ignoreError(err);
+            fatal(io, err, false);
+        stdout_writer.interface.flush() catch |err| fatal(io, err, false);
         std.process.exit(0);
     }
 }
 
-fn ignoreError(err: anyerror) void {
-    _ = @errorName(err);
+fn reportProbeCleanupFailure(path: []const u8, err: anyerror) void {
+    // Preserve the original failure after all child owners have been released.
+    std.log.warn("CAS probe cleanup failed for {s}: {s}", .{ path, @errorName(err) });
 }
 
 fn isRootHelpRequest(args: []const []const u8) bool {
@@ -2528,24 +2609,21 @@ fn probeTransport(value: proxy.app_server_launch.RequestedTransport) contract.Pr
     };
 }
 
-fn fatal(err: anyerror, json: bool) noreturn {
-    var stderr_writer = std.Io.File.stderr().writer(
-        std.Io.Threaded.global_single_threaded.io(),
-        &.{},
-    );
+fn fatal(io: std.Io, err: anyerror, json: bool) noreturn {
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
     if (json) {
         stderr_writer.interface.print(
             "{{\"schema\":\"cas-app-server-error/v1\",\"status\":\"error\"," ++
                 "\"failureCode\":\"preflight_error\",\"failureHint\":\"{s}\"}}\n",
             .{@errorName(err)},
-        ) catch |write_err| ignoreError(write_err);
+        ) catch std.process.exit(2);
     } else {
         stderr_writer.interface.print(
             "cas app-server: {s}\n{s}",
             .{ @errorName(err), Usage },
-        ) catch |write_err| ignoreError(write_err);
+        ) catch std.process.exit(2);
     }
-    stderr_writer.interface.flush() catch |flush_err| ignoreError(flush_err);
+    stderr_writer.interface.flush() catch std.process.exit(2);
     std.process.exit(2);
 }
 

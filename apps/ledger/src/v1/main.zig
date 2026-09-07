@@ -1150,40 +1150,22 @@ fn parseRecoveryArgs(
     while (index < argv.len) : (index += 1) {
         const token = argv[index];
         if (std.mem.eql(u8, token, "--repo")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (repo_path != null) return error.DuplicateRepositoryOption;
-            repo_path = argv[index];
+            try readRecoveryString(argv, &index, &repo_path, error.DuplicateRepositoryOption);
             continue;
         }
         if (std.mem.eql(u8, token, "--transaction")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (transaction_id != null) {
-                return error.DuplicateTransactionOption;
-            }
-            transaction_id = argv[index];
+            try readRecoveryString(argv, &index, &transaction_id, error.DuplicateTransactionOption);
             continue;
         }
         if (std.mem.eql(u8, token, "--lock-id")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (lock_id != null) return error.DuplicateLockIdOption;
-            lock_id = argv[index];
+            try readRecoveryString(argv, &index, &lock_id, error.DuplicateLockIdOption);
             continue;
         }
         if (std.mem.eql(u8, token, "--resource")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (resource != null) return error.DuplicateResourceOption;
-            resource = argv[index];
+            try readRecoveryString(argv, &index, &resource, error.DuplicateResourceOption);
             continue;
         }
-        if (std.mem.eql(
-            u8,
-            token,
-            "--confirm-no-legacy-writers",
-        )) {
+        if (std.mem.eql(u8, token, "--confirm-no-legacy-writers")) {
             if (confirm_no_legacy_writers) {
                 return error.DuplicateConfirmationOption;
             }
@@ -1191,24 +1173,19 @@ fn parseRecoveryArgs(
             continue;
         }
         if (std.mem.eql(u8, token, "--fencing-token")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
+            const raw = try nextRecoveryValue(argv, &index);
             if (fencing_token != null) {
                 return error.DuplicateFencingTokenOption;
             }
-            fencing_token = std.fmt.parseUnsigned(
-                u64,
-                argv[index],
-                10,
-            ) catch return error.InvalidFencingToken;
+            fencing_token = std.fmt.parseUnsigned(u64, raw, 10) catch
+                return error.InvalidFencingToken;
             continue;
         }
         if (std.mem.eql(u8, token, "--format")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
+            const raw = try nextRecoveryValue(argv, &index);
             if (format_seen) return error.DuplicateFormatOption;
             format_seen = true;
-            format = try Format.parse(argv[index]);
+            format = try Format.parse(raw);
             continue;
         }
         return error.UnknownOption;
@@ -1223,6 +1200,23 @@ fn parseRecoveryArgs(
         format,
         reclaim,
     );
+}
+
+fn nextRecoveryValue(argv: []const []const u8, index: *usize) ![]const u8 {
+    index.* += 1;
+    if (index.* >= argv.len) return error.MissingOptionValue;
+    return argv[index.*];
+}
+
+fn readRecoveryString(
+    argv: []const []const u8,
+    index: *usize,
+    target: *?[]const u8,
+    comptime duplicate: anyerror,
+) !void {
+    const value = try nextRecoveryValue(argv, index);
+    if (target.* != null) return duplicate;
+    target.* = value;
 }
 
 fn finishRecoveryArgs(

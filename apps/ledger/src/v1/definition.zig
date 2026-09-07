@@ -5,6 +5,10 @@ const source_graph = @import("source_graph.zig");
 pub const schema = "ledger-artifact-definition/v1";
 pub const abi = "ledger-artifact-abi/v1";
 
+const max_rule_depth: usize = 64;
+const max_import_depth: usize = 32;
+const max_imported_definitions: usize = 128;
+
 pub const Operator = enum {
     exact_object,
     required_field,
@@ -317,12 +321,31 @@ pub const Plan = struct {
     storage_json: []u8,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+        const Frame = struct { plan: *Plan, next_import: usize = 0 };
+        var frames: [max_import_depth + 1]Frame = undefined;
+        frames[0] = .{ .plan = self };
+        var count: usize = 1;
+        while (count != 0) {
+            const frame = &frames[count - 1];
+            if (frame.next_import < frame.plan.imports.len) {
+                std.debug.assert(count < frames.len);
+                const child = &frame.plan.imports[frame.next_import];
+                frame.next_import += 1;
+                frames[count] = .{ .plan = child };
+                count += 1;
+            } else {
+                frame.plan.deinitFields(allocator);
+                count -= 1;
+            }
+        }
+    }
+
+    fn deinitFields(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.owner);
         self.parameter_declarations.deinit(allocator);
         for (self.inputs) |*input| input.deinit(allocator);
         allocator.free(self.inputs);
-        for (self.imports) |*imported| imported.deinit(allocator);
         allocator.free(self.imports);
         for (self.pointers) |pointer| allocator.free(pointer);
         allocator.free(self.pointers);
@@ -359,51 +382,80 @@ const Compiler = struct {
     }
 
     fn compileValue(self: *Compiler, value: std.json.Value, depth: usize) !void {
-        if (depth > 64) return error.ArtifactRuleDepthExceeded;
+        const Frame = struct {
+            children: []const std.json.Value,
+            depth: usize,
+            next: usize = 1,
+        };
+        var frames: [max_rule_depth + 1]Frame = undefined;
+        var count: usize = 0;
+        var pending: ?std.json.Value = value;
+        var current_depth = depth;
+        while (pending) |current| {
+            if (current_depth > max_rule_depth) return error.ArtifactRuleDepthExceeded;
+            const children = try self.compileValueChildren(current);
+            if (children.len != 0) {
+                std.debug.assert(count < frames.len);
+                frames[count] = .{ .children = children, .depth = current_depth };
+                count += 1;
+                pending = children[0];
+                current_depth += 1;
+                continue;
+            }
+            pending = null;
+            while (count != 0) {
+                const frame = &frames[count - 1];
+                if (frame.next < frame.children.len) {
+                    pending = frame.children[frame.next];
+                    frame.next += 1;
+                    current_depth = frame.depth + 1;
+                    break;
+                }
+                count -= 1;
+            }
+        }
+    }
+
+    fn compileValueChildren(self: *Compiler, value: std.json.Value) ![]const std.json.Value {
         switch (value) {
             .object => |object| {
                 try rejectExecutableKeys(object);
                 if (object.get("op")) |raw_operator| {
-                    const operator = try Operator.parse(
-                        try definition_core.json.string(raw_operator),
-                    );
-                    if ((self.operator_mask & operatorBit(operator)) == 0) {
-                        return error.UndeclaredArtifactOperator;
-                    }
-                    const pointer_id = if (object.get("path")) |raw_path|
-                        try self.internPointer(try definition_core.json.string(raw_path))
-                    else
-                        null;
-                    const import_index = if (operator == .definition_ref)
-                        try self.importIndex(try definition_core.json.requiredString(
-                            object,
-                            "definition",
-                        ))
-                    else
-                        null;
-                    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
-                        self.allocator,
-                        value,
-                    );
-                    errdefer self.allocator.free(canonical);
-                    try self.rules.append(self.allocator, .{
-                        .operator = operator,
-                        .pointer_id = pointer_id,
-                        .import_index = import_index,
-                        .canonical_config = canonical,
-                    });
-                    return;
+                    try self.compileRule(value, raw_operator);
+                    return &.{};
                 }
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    try self.compileValue(entry.value_ptr.*, depth + 1);
-                }
+                return object.values();
             },
-            .array => |items| for (items.items) |item| {
-                try self.compileValue(item, depth + 1);
-            },
-            else => {},
+            .array => |items| return items.items,
+            else => return &.{},
         }
+    }
+
+    fn compileRule(self: *Compiler, value: std.json.Value, raw_operator: std.json.Value) !void {
+        const object = value.object;
+        const operator = try Operator.parse(try definition_core.json.string(raw_operator));
+        if ((self.operator_mask & operatorBit(operator)) == 0) {
+            return error.UndeclaredArtifactOperator;
+        }
+        const pointer_id = if (object.get("path")) |raw_path|
+            try self.internPointer(try definition_core.json.string(raw_path))
+        else
+            null;
+        const import_index = if (operator == .definition_ref)
+            try self.importIndex(try definition_core.json.requiredString(object, "definition"))
+        else
+            null;
+        const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+            self.allocator,
+            value,
+        );
+        errdefer self.allocator.free(canonical);
+        try self.rules.append(self.allocator, .{
+            .operator = operator,
+            .pointer_id = pointer_id,
+            .import_index = import_index,
+            .canonical_config = canonical,
+        });
     }
 
     fn internPointer(self: *Compiler, pointer: []const u8) !u16 {
@@ -412,10 +464,9 @@ const Compiler = struct {
             if (std.mem.eql(u8, prior, pointer)) return @intCast(index);
         }
         if (self.pointers.items.len == 65_535) return error.TooManyJsonPointers;
-        try self.pointers.append(
-            self.allocator,
-            try self.allocator.dupe(u8, pointer),
-        );
+        const owned = try self.allocator.dupe(u8, pointer);
+        errdefer self.allocator.free(owned);
+        try self.pointers.append(self.allocator, owned);
         return @intCast(self.pointers.items.len - 1);
     }
 
@@ -432,27 +483,74 @@ pub fn compile(
     closure: *const definition_core.Closure,
     entry_path: []const u8,
 ) !Plan {
+    var result: Plan = undefined;
     var compiled_count: usize = 0;
-    return compileAtDepth(
+    var frames: [max_import_depth + 1]CompileFrame = undefined;
+    frames[0] = try initCompileFrame(
         allocator,
         closure,
         entry_path,
         0,
         &compiled_count,
+        &result,
     );
+    var count: usize = 1;
+    errdefer {
+        while (count != 0) {
+            count -= 1;
+            frames[count].deinit(allocator);
+        }
+    }
+    while (count != 0) {
+        const frame = &frames[count - 1];
+        if (frame.initialized < frame.import_sources.len) {
+            const child = try childCompileFrame(allocator, closure, frame, count, &compiled_count);
+            std.debug.assert(count < frames.len);
+            frames[count] = child;
+            count += 1;
+        } else {
+            frame.target.* = try finishCompiledPlan(allocator, closure.digest, frame);
+            frame.parsed.deinit();
+            allocator.free(frame.entry_path);
+            count -= 1;
+            if (count != 0) frames[count - 1].initialized += 1;
+        }
+    }
+    return result;
 }
 
-fn compileAtDepth(
+const CompileFrame = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    entry_path: []u8,
+    header: DefinitionHeader,
+    import_sources: []const std.json.Value,
+    initialized: usize = 0,
+    target: *Plan,
+    declared_id: ?[]const u8 = null,
+
+    fn deinit(self: *CompileFrame, allocator: std.mem.Allocator) void {
+        for (self.header.imports[0..self.initialized]) |*imported| imported.deinit(allocator);
+        allocator.free(self.header.imports);
+        self.header.imports = &.{};
+        self.header.deinit(allocator);
+        self.parsed.deinit();
+        allocator.free(self.entry_path);
+        self.* = undefined;
+    }
+};
+
+fn initCompileFrame(
     allocator: std.mem.Allocator,
     closure: *const definition_core.Closure,
     entry_path: []const u8,
     depth: usize,
     compiled_count: *usize,
-) anyerror!Plan {
-    if (depth > 32) return error.ImportDepthExceeded;
+    target: *Plan,
+) !CompileFrame {
+    if (depth > max_import_depth) return error.ImportDepthExceeded;
     compiled_count.* = std.math.add(usize, compiled_count.*, 1) catch
         return error.TooManyImportedDefinitions;
-    if (compiled_count.* > 128) return error.TooManyImportedDefinitions;
+    if (compiled_count.* > max_imported_definitions) return error.TooManyImportedDefinitions;
     const entry = closure.find(entry_path) orelse
         return error.EntryDefinitionMissing;
     var parsed = try std.json.parseFromSlice(
@@ -465,21 +563,67 @@ fn compileAtDepth(
             .parse_numbers = false,
         },
     );
-    defer parsed.deinit();
+    errdefer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
     try rejectExecutableFields(allocator, parsed.value);
     try validateDefinitionRoot(root);
-    const id = try definition_core.json.requiredString(root, "id");
-    const owner = try definition_core.json.requiredString(root, "owner");
-    var header = try compileDefinitionHeader(
+    var header = try compileDefinitionHeader(allocator, root);
+    errdefer header.deinit(allocator);
+    const import_sources = if (root.get("imports")) |raw|
+        (try definition_core.json.array(raw)).items
+    else
+        &.{};
+    if (import_sources.len > max_imported_definitions) return error.TooManyImportedDefinitions;
+    header.imports = try allocator.alloc(Plan, import_sources.len);
+    const owned_path = allocator.dupe(u8, entry_path) catch |err| {
+        allocator.free(header.imports);
+        header.imports = &.{};
+        return err;
+    };
+    return .{
+        .parsed = parsed,
+        .entry_path = owned_path,
+        .header = header,
+        .import_sources = import_sources,
+        .target = target,
+    };
+}
+
+fn childCompileFrame(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    parent: *CompileFrame,
+    depth: usize,
+    compiled_count: *usize,
+) !CompileFrame {
+    const spec = try parseImportSpec(parent.import_sources[parent.initialized]);
+    const normalized = try definition_core.closure.normalizeRelativeAlloc(
+        allocator,
+        std.fs.path.dirname(parent.entry_path) orelse "",
+        spec.path,
+    );
+    defer allocator.free(normalized);
+    var child = try initCompileFrame(
         allocator,
         closure,
-        entry_path,
-        root,
+        normalized,
         depth,
         compiled_count,
+        &parent.header.imports[parent.initialized],
     );
-    errdefer header.deinit(allocator);
+    child.declared_id = spec.declared_id;
+    return child;
+}
+
+fn finishCompiledPlan(
+    allocator: std.mem.Allocator,
+    closure_digest: [71]u8,
+    frame: *CompileFrame,
+) !Plan {
+    const root = frame.parsed.value.object;
+    const header = &frame.header;
+    sortImportedPlans(header.imports);
+    try validateImportedPlans(header.imports);
     var body = try compileDefinitionBody(
         allocator,
         root,
@@ -488,14 +632,18 @@ fn compileAtDepth(
         header.inputs,
     );
     errdefer body.deinit(allocator);
-    const owned_id = try allocator.dupe(u8, id);
+    const owned_id = try allocator.dupe(u8, try definition_core.json.requiredString(root, "id"));
     errdefer allocator.free(owned_id);
+    const owner = try definition_core.json.requiredString(root, "owner");
     const owned_owner = try allocator.dupe(u8, owner);
     errdefer allocator.free(owned_owner);
+    if (frame.declared_id) |expected| {
+        if (!std.mem.eql(u8, expected, owned_id)) return error.ImportedDefinitionIdMismatch;
+    }
     return .{
         .id = owned_id,
         .owner = owned_owner,
-        .closure_digest = closure.digest,
+        .closure_digest = closure_digest,
         .operator_mask = header.operator_mask,
         .parameter_declarations = header.parameter_declarations,
         .inputs = header.inputs,
@@ -575,12 +723,8 @@ const DefinitionHeader = struct {
 
 fn compileDefinitionHeader(
     allocator: std.mem.Allocator,
-    closure: *const definition_core.Closure,
-    entry_path: []const u8,
     root: std.json.ObjectMap,
-    depth: usize,
-    compiled_count: *usize,
-) anyerror!DefinitionHeader {
+) !DefinitionHeader {
     const operator_mask = try parseRequires(try definition_core.json.object(
         try definition_core.json.field(root, "requires"),
     ));
@@ -606,22 +750,13 @@ fn compileDefinitionHeader(
     const bounds = try parseBounds(try definition_core.json.object(
         try definition_core.json.field(root, "bounds"),
     ));
-    const imports = try parseImportedPlans(
-        allocator,
-        closure,
-        entry_path,
-        root.get("imports"),
-        depth,
-        compiled_count,
-    );
-    errdefer deinitPlans(allocator, imports);
     return .{
         .operator_mask = operator_mask,
         .parameter_declarations = parameter_declarations,
         .inputs = inputs,
         .storage_kind = storage_kind,
         .bounds = bounds,
-        .imports = imports,
+        .imports = &.{},
     };
 }
 
@@ -809,8 +944,8 @@ fn encodeCachePlan(
     detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    const step_limit: usize = 384;
-    var frames: [33]EncodeFrame = undefined;
+    const step_limit = max_imported_definitions * 3;
+    var frames: [max_import_depth + 1]EncodeFrame = undefined;
     frames[0] = .{ .plan = plan };
     var frame_count: usize = 1;
     var steps: usize = 0;
@@ -925,10 +1060,10 @@ fn decodeCachePlan(
     detail: CacheDetail,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    const step_limit: usize = 384;
+    const step_limit = max_imported_definitions * 3;
     var root: Plan = undefined;
     var decoded_count: usize = 0;
-    var frames: [33]DecodeFrame = undefined;
+    var frames: [max_import_depth + 1]DecodeFrame = undefined;
     frames[0] = .{
         .prefix = try decodePlanPrefix(
             allocator,
@@ -1021,7 +1156,7 @@ fn decodePlanPrefix(
         decoded_count.*,
         1,
     ) catch return error.CacheImportCountExceeded;
-    if (decoded_count.* > 128) return error.CacheImportCountExceeded;
+    if (decoded_count.* > max_imported_definitions) return error.CacheImportCountExceeded;
     const id = try decoder.readBytesAlloc(allocator, 256);
     errdefer allocator.free(id);
     try definition_core.json.safeIdentifier(id, 256);
@@ -1043,7 +1178,7 @@ fn decodePlanPrefix(
     const inputs = try decodeInputs(allocator, decoder);
     errdefer deinitInputs(allocator, inputs);
     const storage_kind = try decoder.readEnum(StorageKind);
-    const import_count = try decoder.readCount(128);
+    const import_count = try decoder.readCount(max_imported_definitions);
     const imports = try allocator.alloc(Plan, import_count);
     errdefer allocator.free(imports);
     return .{
@@ -1390,42 +1525,12 @@ fn parseRequires(object: std.json.ObjectMap) !u128 {
     return mask;
 }
 
-fn parseImportedPlans(
-    allocator: std.mem.Allocator,
-    closure: *const definition_core.Closure,
-    entry_path: []const u8,
-    raw: ?std.json.Value,
-    depth: usize,
-    compiled_count: *usize,
-) anyerror![]Plan {
-    const value = raw orelse return allocator.alloc(Plan, 0);
-    const items = try definition_core.json.array(value);
-    if (items.items.len > 128) return error.TooManyImportedDefinitions;
-    const imports = try allocator.alloc(Plan, items.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (imports[0..initialized]) |*imported| imported.deinit(allocator);
-        allocator.free(imports);
-    }
-    const base_dir = std.fs.path.dirname(entry_path) orelse "";
-    for (items.items, 0..) |item, index| {
-        imports[index] = try compileImportedPlan(
-            allocator,
-            closure,
-            base_dir,
-            item,
-            depth,
-            compiled_count,
-        );
-        initialized += 1;
-    }
+fn sortImportedPlans(imports: []Plan) void {
     std.sort.heap(Plan, imports, {}, struct {
         fn lessThan(_: void, left: Plan, right: Plan) bool {
             return std.mem.lessThan(u8, left.id, right.id);
         }
     }.lessThan);
-    try validateImportedPlans(imports);
-    return imports;
 }
 
 const ImportSpec = struct {
@@ -1458,37 +1563,6 @@ fn parseImportSpec(value: std.json.Value) !ImportSpec {
         },
         else => error.InvalidImports,
     };
-}
-
-fn compileImportedPlan(
-    allocator: std.mem.Allocator,
-    closure: *const definition_core.Closure,
-    base_dir: []const u8,
-    value: std.json.Value,
-    depth: usize,
-    compiled_count: *usize,
-) anyerror!Plan {
-    const spec = try parseImportSpec(value);
-    const normalized = try definition_core.closure.normalizeRelativeAlloc(
-        allocator,
-        base_dir,
-        spec.path,
-    );
-    defer allocator.free(normalized);
-    var plan = try compileAtDepth(
-        allocator,
-        closure,
-        normalized,
-        depth + 1,
-        compiled_count,
-    );
-    errdefer plan.deinit(allocator);
-    if (spec.declared_id) |expected| {
-        if (!std.mem.eql(u8, expected, plan.id)) {
-            return error.ImportedDefinitionIdMismatch;
-        }
-    }
-    return plan;
 }
 
 fn validateImportedPlans(imports: []const Plan) !void {
@@ -1525,13 +1599,16 @@ fn parseInputs(
         if (max_bytes == 0 or max_bytes > 256 * 1024 * 1024) {
             return error.InputBoundsExceeded;
         }
+        const raw_codec = try definition_core.json.requiredString(declaration, "codec");
+        const codec = try Codec.parse(raw_codec);
+        const required = if (declaration.get("required")) |raw|
+            try definition_core.json.boolean(raw)
+        else
+            true;
         var input: Input = .{
             .name = try allocator.dupe(u8, entry.key_ptr.*),
-            .codec = try Codec.parse(try definition_core.json.requiredString(declaration, "codec")),
-            .required = if (declaration.get("required")) |raw|
-                try definition_core.json.boolean(raw)
-            else
-                true,
+            .codec = codec,
+            .required = required,
             .max_bytes = max_bytes,
         };
         errdefer input.deinit(allocator);
@@ -1685,7 +1762,7 @@ fn rejectExecutableFields(
     var visited: usize = 0;
     while (pending.items.len != 0 and visited < node_limit) : (visited += 1) {
         const node = pending.pop().?;
-        if (node.depth > 64) return error.ArtifactRuleDepthExceeded;
+        if (node.depth > max_rule_depth) return error.ArtifactRuleDepthExceeded;
         switch (node.value) {
             .object => |object| {
                 if (!node.keys_are_data) try rejectExecutableKeys(object);
@@ -2008,4 +2085,214 @@ test "artifact definition permits inert command data fields" {
     var plan = try compile(std.testing.allocator, &closure, "inert.json");
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), plan.rules.len);
+}
+
+fn compileRuleAllocationProbe(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    var compiler: Compiler = .{
+        .allocator = allocator,
+        .operator_mask = operatorBit(.scalar_type),
+        .imports = &.{},
+    };
+    defer compiler.deinit();
+    compiler.compileValue(value, 0) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 3), compiler.rules.items.len);
+    for (compiler.rules.items, 0..) |rule, index| {
+        try std.testing.expectEqual(@as(u16, @intCast(index)), rule.pointer_id.?);
+    }
+}
+
+test "artifact rule frames preserve traversal order and unwind allocation failures" {
+    const source =
+        \\{"left":[{"op":"scalar-type","path":"/a"},{"op":"scalar-type","path":"/b"}],
+        \\ "right":{"op":"scalar-type","path":"/c","data":{"op":"unknown"}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, source, .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileRuleAllocationProbe,
+        .{parsed.value},
+    );
+}
+
+fn compileRuleDepthProbe(depth: usize) !void {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.splatByteAll('[', depth);
+    try writer.writeAll("{\"op\":\"scalar-type\",\"path\":\"/value\"}");
+    try writer.splatByteAll(']', depth);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer.buffered(),
+        .{},
+    );
+    defer parsed.deinit();
+    var compiler: Compiler = .{
+        .allocator = std.testing.allocator,
+        .operator_mask = operatorBit(.scalar_type),
+        .imports = &.{},
+    };
+    defer compiler.deinit();
+    if (depth > max_rule_depth) {
+        try std.testing.expectError(
+            error.ArtifactRuleDepthExceeded,
+            compiler.compileValue(parsed.value, 0),
+        );
+    } else {
+        try compiler.compileValue(parsed.value, 0);
+        try std.testing.expectEqual(@as(usize, 1), compiler.rules.items.len);
+    }
+}
+
+test "artifact rule frames preserve the inclusive depth limit" {
+    for ([_]usize{ 0, 1, 63, 64, 65 }) |depth| try compileRuleDepthProbe(depth);
+}
+
+const ImportTestClosure = struct {
+    arena: std.heap.ArenaAllocator,
+    closure: definition_core.Closure,
+
+    fn init(count: usize, chain: bool) !ImportTestClosure {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const files = try allocator.alloc(definition_core.closure.ClosureFile, count);
+        var total_bytes: usize = 0;
+        for (files, 0..) |*file, index| {
+            file.path = try std.fmt.allocPrint(allocator, "d{d:0>3}.json", .{index});
+            file.canonical_json = try importTestSource(allocator, index, count, chain);
+            file.source_bytes = file.canonical_json.len;
+            std.crypto.hash.sha2.Sha256.hash(file.canonical_json, &file.source_digest, .{});
+            total_bytes += file.source_bytes;
+        }
+        return .{
+            .arena = arena,
+            .closure = .{
+                .files = files,
+                .digest = definition_core.closure.digestFiles(files),
+                .total_definition_bytes = total_bytes,
+            },
+        };
+    }
+
+    fn deinit(self: *ImportTestClosure) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn importTestSource(
+    allocator: std.mem.Allocator,
+    index: usize,
+    count: usize,
+    chain: bool,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        compiled_definition_json,
+        .{},
+    );
+    defer parsed.deinit();
+    parsed.value.object.getPtr("id").?.* = .{
+        .string = try std.fmt.allocPrint(allocator, "example/d{d:0>3}", .{index}),
+    };
+    var imports = std.json.Array.init(allocator);
+    const first = if (chain) index + 1 else if (index == 0) @as(usize, 1) else count;
+    const last = if (chain) @min(first + 1, count) else count;
+    for (first..last) |import_index| {
+        try imports.append(.{
+            .string = try std.fmt.allocPrint(allocator, "d{d:0>3}.json", .{import_index}),
+        });
+    }
+    try parsed.value.object.put(allocator, "imports", .{ .array = imports });
+    return definition_core.canonical_json.canonicalJsonAlloc(allocator, parsed.value);
+}
+
+fn compileImportAllocationProbe(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+) !void {
+    var plan = compile(allocator, closure, "d000.json") catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.imports.len);
+    try std.testing.expectEqualStrings("example/d001", plan.imports[0].id);
+}
+
+test "artifact import frames and ownership unwind every allocation failure" {
+    var fixture = try ImportTestClosure.init(2, true);
+    defer fixture.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileImportAllocationProbe,
+        .{&fixture.closure},
+    );
+}
+
+test "artifact import frames preserve depth count order and owned output" {
+    var chain = try ImportTestClosure.init(max_import_depth + 1, true);
+    var chain_owned = true;
+    defer if (chain_owned) chain.deinit();
+    var plan = try compile(std.testing.allocator, &chain.closure, "d000.json");
+    defer plan.deinit(std.testing.allocator);
+    chain.deinit();
+    chain_owned = false;
+    var cursor = &plan;
+    for (0..max_import_depth) |_| {
+        try std.testing.expectEqual(@as(usize, 1), cursor.imports.len);
+        cursor = &cursor.imports[0];
+    }
+    try std.testing.expectEqualStrings("example/d032", cursor.id);
+    try std.testing.expectEqual(@as(usize, 0), cursor.imports.len);
+    var excessive_depth = try ImportTestClosure.init(max_import_depth + 2, true);
+    defer excessive_depth.deinit();
+    try std.testing.expectError(
+        error.ImportDepthExceeded,
+        compile(std.testing.allocator, &excessive_depth.closure, "d000.json"),
+    );
+    var maximum = try ImportTestClosure.init(max_imported_definitions, false);
+    defer maximum.deinit();
+    var wide = try compile(std.testing.allocator, &maximum.closure, "d000.json");
+    defer wide.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_imported_definitions - 1, wide.imports.len);
+    try validateImportedPlans(wide.imports);
+    var excessive_count = try ImportTestClosure.init(max_imported_definitions + 1, false);
+    defer excessive_count.deinit();
+    try std.testing.expectError(
+        error.TooManyImportedDefinitions,
+        compile(std.testing.allocator, &excessive_count.closure, "d000.json"),
+    );
+}
+
+test "artifact input declarations validate fields before acquiring names" {
+    const cases = [_]struct { source: []const u8, expected: anyerror }{
+        .{
+            .source = "{\"input\":{\"codec\":\"unknown\",\"max_bytes\":1}}",
+            .expected = error.UnsupportedCodec,
+        },
+        .{
+            .source = "{\"input\":{\"codec\":\"json\",\"required\":0,\"max_bytes\":1}}",
+            .expected = error.ExpectedBoolean,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.source,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            case.expected,
+            parseInputs(std.testing.allocator, parsed.value.object),
+        );
+    }
 }

@@ -64,52 +64,61 @@ pub const Stream = struct {
 
     pub fn next(self: *Stream) !?Line {
         self.line.clearRetainingCapacity();
-
-        while (true) {
+        // readSliceShort fills a chunk unless EOF is reached. Allow the current
+        // partial chunk, every full chunk in one record, and the final EOF check.
+        var chunks_left = self.max_line_bytes / chunk_size + 3;
+        while (chunks_left > 0) : (chunks_left -= 1) {
+            std.debug.assert(self.chunk_pos <= self.chunk_len);
+            std.debug.assert(self.chunk_len <= self.chunk.len);
             if (self.chunk_pos < self.chunk_len) {
                 const remaining = self.chunk[self.chunk_pos..self.chunk_len];
                 if (std.mem.indexOfScalar(u8, remaining, '\n')) |newline_rel| {
                     try self.append(remaining[0..newline_rel]);
+                    const record = try self.finishLine(true);
                     self.chunk_pos += newline_rel + 1;
-                    self.line_number += 1;
-                    const start_offset = self.line_start_offset;
-                    const end_offset = start_offset + self.line.items.len;
-                    self.line_start_offset = end_offset + 1;
-                    return .{
-                        .bytes = self.line.items,
-                        .number = self.line_number,
-                        .start_offset = start_offset,
-                        .end_offset = end_offset,
-                    };
+                    return record;
                 }
                 try self.append(remaining);
                 self.chunk_pos = self.chunk_len;
             }
-
             if (self.eof) {
                 if (self.line.items.len == 0) return null;
-                self.line_number += 1;
-                const start_offset = self.line_start_offset;
-                const end_offset = start_offset + self.line.items.len;
-                self.line_start_offset = end_offset;
-                return .{
-                    .bytes = self.line.items,
-                    .number = self.line_number,
-                    .start_offset = start_offset,
-                    .end_offset = end_offset,
-                };
+                return try self.finishLine(false);
             }
-
             self.chunk_len = try self.reader.readSliceShort(self.chunk[0..]);
             self.chunk_pos = 0;
-            self.bytes_read += self.chunk_len;
-            if (self.chunk_observer) |observer| try observer.observe(self.chunk[0..self.chunk_len]);
+            self.bytes_read = std.math.add(usize, self.bytes_read, self.chunk_len) catch
+                return error.SourceOffsetOverflow;
+            if (self.chunk_observer) |observer| {
+                try observer.observe(self.chunk[0..self.chunk_len]);
+            }
             if (self.chunk_len == 0) self.eof = true;
         }
+        return error.LineTooLong;
+    }
+
+    fn finishLine(self: *Stream, terminated: bool) !Line {
+        std.debug.assert(self.line.items.len <= self.max_line_bytes);
+        const number = std.math.add(usize, self.line_number, 1) catch
+            return error.SourceLineOverflow;
+        const end_offset = std.math.add(usize, self.line_start_offset, self.line.items.len) catch
+            return error.SourceOffsetOverflow;
+        const next_offset = std.math.add(usize, end_offset, @intFromBool(terminated)) catch
+            return error.SourceOffsetOverflow;
+        const record = Line{
+            .bytes = self.line.items,
+            .number = number,
+            .start_offset = self.line_start_offset,
+            .end_offset = end_offset,
+        };
+        self.line_number = number;
+        self.line_start_offset = next_offset;
+        return record;
     }
 
     fn append(self: *Stream, bytes: []const u8) !void {
-        if (bytes.len > self.max_line_bytes -| self.line.items.len) {
+        std.debug.assert(self.line.items.len <= self.max_line_bytes);
+        if (bytes.len > self.max_line_bytes - self.line.items.len) {
             return error.LineTooLong;
         }
         try self.line.appendSlice(self.allocator, bytes);
@@ -180,4 +189,38 @@ test "stream observes each raw byte exactly once" {
     defer stream.deinit();
     while (try stream.next()) |_| {}
     try std.testing.expectEqualStrings("first\n\nlast", observer.bytes.items);
+}
+
+test "stream accepts exact record limits with and without a delimiter" {
+    const allocator = std.testing.allocator;
+    const lengths = [_]usize{ 1, chunk_size - 1, chunk_size, chunk_size + 1 };
+    for (lengths) |length| {
+        const input = try allocator.alloc(u8, length + 1);
+        defer allocator.free(input);
+        @memset(input[0..length], 'a');
+        input[length] = '\n';
+        for ([_]bool{ false, true }) |terminated| {
+            var reader = std.Io.Reader.fixed(input[0 .. length + @intFromBool(terminated)]);
+            var stream = try Stream.init(allocator, &reader, .{ .max_line_bytes = length });
+            defer stream.deinit();
+            const record = (try stream.next()).?;
+            try std.testing.expectEqual(length, record.bytes.len);
+            try std.testing.expectEqual(@as(usize, 0), record.start_offset);
+            try std.testing.expectEqual(length, record.end_offset);
+            try std.testing.expect((try stream.next()) == null);
+        }
+    }
+}
+
+test "stream reports counter exhaustion without wrapping provenance" {
+    var reader = std.Io.Reader.fixed("x\n");
+    var stream = try Stream.init(std.testing.allocator, &reader, .{});
+    defer stream.deinit();
+    stream.line_number = std.math.maxInt(usize);
+    try std.testing.expectError(error.SourceLineOverflow, stream.next());
+    try std.testing.expectEqual(std.math.maxInt(usize), stream.line_number);
+    stream.line_number = 0;
+    stream.line_start_offset = std.math.maxInt(usize);
+    try std.testing.expectError(error.SourceOffsetOverflow, stream.next());
+    try std.testing.expectEqual(@as(usize, 0), stream.line_number);
 }

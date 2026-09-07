@@ -6,6 +6,23 @@ pub const Diagnostic = struct {
     path: []u8,
     message: []u8,
 
+    fn clone(
+        allocator: std.mem.Allocator,
+        code: []const u8,
+        path: []const u8,
+        message: []const u8,
+    ) !Diagnostic {
+        const owned_code = try allocator.dupe(u8, code);
+        errdefer allocator.free(owned_code);
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        return .{
+            .code = owned_code,
+            .path = owned_path,
+            .message = try allocator.dupe(u8, message),
+        };
+    }
+
     fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.path);
@@ -51,10 +68,14 @@ pub const Collector = struct {
             self.truncated = true;
             return;
         }
-        const bounded_message = message[0..@min(message.len, self.limits.max_message_bytes)];
+        const bounded_message = utf8Prefix(message, self.limits.max_message_bytes);
+        const metadata_bytes = std.math.add(usize, code.len, path.len) catch {
+            self.truncated = true;
+            return;
+        };
         const added = std.math.add(
             usize,
-            code.len + path.len,
+            metadata_bytes,
             bounded_message.len,
         ) catch {
             self.truncated = true;
@@ -64,15 +85,56 @@ pub const Collector = struct {
             self.truncated = true;
             return;
         }
-        try self.items.append(self.allocator, .{
-            .code = try self.allocator.dupe(u8, code),
-            .path = try self.allocator.dupe(u8, path),
-            .message = try self.allocator.dupe(u8, bounded_message),
-        });
+        var owned = try Diagnostic.clone(self.allocator, code, path, bounded_message);
+        errdefer owned.deinit(self.allocator);
+        try self.items.append(self.allocator, owned);
         self.total_bytes += added;
         if (bounded_message.len != message.len) self.truncated = true;
     }
 };
+
+fn utf8Prefix(text: []const u8, maximum: usize) []const u8 {
+    var end = @min(text.len, maximum);
+    if (end == text.len) return text;
+    while (end > 0 and text[end] & 0xc0 == 0x80) end -= 1;
+    return text[0..end];
+}
+
+fn addForAllocationFailure(allocator: std.mem.Allocator) !void {
+    var collector = Collector.init(allocator, .{});
+    defer collector.deinit();
+    try collector.add("initial", "/", "first");
+    const prior_bytes = collector.total_bytes;
+    collector.add("next", "/second", "second") catch |err| {
+        try std.testing.expectEqual(@as(usize, 1), collector.items.items.len);
+        try std.testing.expectEqual(prior_bytes, collector.total_bytes);
+        try std.testing.expect(!collector.truncated);
+        try std.testing.expectEqualStrings("initial", collector.items.items[0].code);
+        return err;
+    };
+}
+
+test "diagnostic admission remains unchanged and leak free after allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        addForAllocationFailure,
+        .{},
+    );
+}
+
+test "bounded diagnostic messages end on UTF-8 boundaries" {
+    const message = "a\xc3\xa9\xf0\x9f\x98\x80z";
+    for (0..message.len + 1) |maximum| {
+        var collector = Collector.init(std.testing.allocator, .{ .max_message_bytes = maximum });
+        defer collector.deinit();
+        try collector.add("valid", "/", message);
+        const bounded = collector.items.items[0].message;
+        try std.testing.expect(bounded.len <= maximum);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(bounded));
+        try std.testing.expect(std.mem.startsWith(u8, message, bounded));
+        try std.testing.expectEqual(maximum < message.len, collector.truncated);
+    }
+}
 
 test "diagnostics are bounded and stable-code only" {
     var collector = Collector.init(std.testing.allocator, .{

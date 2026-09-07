@@ -237,6 +237,15 @@ fn inspectSegmentedEventSlot(
         protocol_required,
     );
     defer replay_stats.deinit(allocator);
+    return segmentedSlotStatus(allocator, slot, &snapshot, revision);
+}
+
+fn segmentedSlotStatus(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    revision: []u8,
+) !SlotStatus {
     const name = try allocator.dupe(u8, slot.name);
     errdefer allocator.free(name);
     const logical_ref = try allocator.dupe(u8, slot.relative_path);

@@ -28,9 +28,14 @@ pub const Report = struct {
             if (entry.count >= 2) break true;
         } else false;
         const open = if (repeated)
-            "[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: "
+            "[Exact identifiers from the rendered context above " ++
+                "(paths, ids, versions, numbers) — " ++
+                "quote these verbatim instead of transcribing them from the image; " ++
+                "×N marks a token that occurs N times within the imaged content: "
         else
-            "[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: ";
+            "[Exact identifiers from the rendered context above " ++
+                "(paths, ids, versions, numbers) — " ++
+                "quote these verbatim instead of transcribing them from the image: ";
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -113,6 +118,7 @@ const Builder = struct {
 /// globally reranked so a high-priority token on a late page cannot be evicted
 /// by early URLs or paths.
 pub fn extract(allocator: std.mem.Allocator, text: []const u8) !Report {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
     var merged: std.ArrayList(Candidate) = .empty;
     defer {
         for (merged.items) |candidate| allocator.free(candidate.token);
@@ -169,10 +175,7 @@ pub fn extract(allocator: std.mem.Allocator, text: []const u8) !Report {
     return .{ .entries = try kept.toOwnedSlice(allocator), .dropped = dropped };
 }
 
-fn extractSinglePage(allocator: std.mem.Allocator, text: []const u8) !Report {
-    var builder = Builder.init(allocator);
-    defer builder.deinit();
-
+fn scanPage(builder: *Builder, text: []const u8) !void {
     var cursor: usize = 0;
     while (cursor < text.len) {
         while (cursor < text.len) {
@@ -181,13 +184,23 @@ fn extractSinglePage(allocator: std.mem.Allocator, text: []const u8) !Report {
             cursor += ws_len;
         }
         const start = cursor;
-        while (cursor < text.len and unicodeWhitespaceLen(text, cursor) == 0) cursor += utf8SequenceLen(text[cursor]);
+        while (cursor < text.len and unicodeWhitespaceLen(
+            text,
+            cursor,
+        ) == 0) cursor += utf8SequenceLen(text[cursor]);
         const chunk_units = utf16Units(text[start..cursor]);
         if (cursor == start or chunk_units < 3 or chunk_units > max_chunk_len) continue;
         builder.startChunk();
-        try scanChunk(&builder, text, start, cursor);
+        try scanChunk(builder, text, start, cursor);
         if (builder.candidates.items.len >= max_seen) break;
     }
+}
+
+fn extractSinglePage(allocator: std.mem.Allocator, text: []const u8) !Report {
+    var builder = Builder.init(allocator);
+    defer builder.deinit();
+
+    try scanPage(&builder, text);
 
     builder.by_token.deinit();
     builder.by_token = std.StringHashMap(usize).init(allocator);
@@ -274,7 +287,9 @@ const Utf16Pager = struct {
         while (self.byte_index < self.text.len) {
             const cp_start = self.byte_index;
             const len = utf8SequenceLen(self.text[self.byte_index]);
-            const cp = std.unicode.utf8Decode(self.text[self.byte_index..][0..len]) catch self.text[self.byte_index];
+            const cp = std.unicode.utf8Decode(
+                self.text[self.byte_index..][0..len],
+            ) catch self.text[self.byte_index];
             const cp_units: usize = if (cp > 0xffff) 2 else 1;
             if (units + cp_units > page_utf16_units) {
                 // JavaScript slice bisects this scalar into isolated surrogate
@@ -283,7 +298,11 @@ const Utf16Pager = struct {
                 std.debug.assert(cp_units == 2 and units + 1 == page_utf16_units);
                 self.byte_index += len;
                 self.pending_low_surrogate = true;
-                return .{ .text = self.text[start..cp_start], .prefix_half = prefix_half, .suffix_half = true };
+                return .{
+                    .text = self.text[start..cp_start],
+                    .prefix_half = prefix_half,
+                    .suffix_half = true,
+                };
             }
             units += cp_units;
             self.byte_index += len;
@@ -325,13 +344,13 @@ fn unicodeWhitespaceLen(text: []const u8, index: usize) usize {
     return if (whitespace) len else 0;
 }
 
-fn scanChunk(builder: *Builder, text: []const u8, start: usize, end: usize) !void {
+fn scanAssignmentsAndUrls(builder: *Builder, text: []const u8, start: usize, end: usize) !void {
     // Semantic LABEL=value pairs.
     var i = start;
     while (i < end) : (i += 1) {
-        if (!std.ascii.isUpper(text[i]) or (i > start and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_'))) continue;
+        if (!std.ascii.isUpper(text[i]) or (i > start and (isJsWord(text[i - 1])))) continue;
         var j = i;
-        while (j < end and (std.ascii.isUpper(text[j]) or std.ascii.isDigit(text[j]) or text[j] == '_')) j += 1;
+        while (j < end and (isUpperWord(text[j]))) j += 1;
         if (j - i < 3 or j >= end or text[j] != '=') continue;
         var value_end = j + 1;
         while (value_end < end and !isAssignmentStop(text[value_end])) value_end += 1;
@@ -341,19 +360,30 @@ fn scanChunk(builder: *Builder, text: []const u8, start: usize, end: usize) !voi
     // URLs are retained whole; any path-shaped substring is collapsed later.
     i = start;
     while (i < end) : (i += 1) {
-        const has_word_prefix = i > start and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_');
-        const prefix_len: usize = if (!has_word_prefix and std.mem.startsWith(u8, text[i..end], "https://")) 8 else if (!has_word_prefix and std.mem.startsWith(u8, text[i..end], "http://")) 7 else 0;
+        const has_word_prefix = i > start and (isJsWord(text[i - 1]));
+        const prefix_len: usize = if (!has_word_prefix and std.mem.startsWith(
+            u8,
+            text[i..end],
+            "https://",
+        )) 8 else if (!has_word_prefix and std.mem.startsWith(
+            u8,
+            text[i..end],
+            "http://",
+        )) 7 else 0;
         if (prefix_len == 0) continue;
         var url_end = i + prefix_len;
         while (url_end < end and !isAssignmentStop(text[url_end])) url_end += 1;
         try builder.add(text, i, url_end);
         i = url_end - 1;
     }
+}
 
+fn scanChunk(builder: *Builder, text: []const u8, start: usize, end: usize) !void {
+    try scanAssignmentsAndUrls(builder, text, start, end);
     try scanUuids(builder, text, start, end);
 
     // File paths.
-    i = start;
+    var i = start;
     while (i < end) {
         if (!isPathChar(text[i])) {
             i += 1;
@@ -415,7 +445,12 @@ fn scanFilePathRun(builder: *Builder, text: []const u8, run_start: usize, run_en
     }
 }
 
-fn scanDirectoryPathRun(builder: *Builder, text: []const u8, run_start: usize, run_end: usize) !void {
+fn scanDirectoryPathRun(
+    builder: *Builder,
+    text: []const u8,
+    run_start: usize,
+    run_end: usize,
+) !void {
     var cursor = run_start;
     while (cursor < run_end) {
         const relative_start = std.mem.indexOfScalar(u8, text[cursor..run_end], '/') orelse return;
@@ -468,7 +503,9 @@ fn scanVersions(builder: *Builder, text: []const u8, start: usize, end: usize) !
     var candidate_start = start;
     while (candidate_start < end) : (candidate_start += 1) {
         if (!(std.ascii.isDigit(text[candidate_start]) or
-            (text[candidate_start] == 'v' and candidate_start + 1 < end and std.ascii.isDigit(text[candidate_start + 1]))) or
+            (text[candidate_start] == 'v' and candidate_start + 1 < end and std.ascii.isDigit(
+                text[candidate_start + 1],
+            ))) or
             !wordBoundaryBefore(text, start, candidate_start)) continue;
 
         var i = candidate_start;
@@ -490,14 +527,20 @@ fn scanVersions(builder: *Builder, text: []const u8, start: usize, end: usize) !
             (isJsWord(text[i + 1]) or text[i + 1] == '.'))
         {
             var suffix_end = i + 1;
-            while (suffix_end < end and (isJsWord(text[suffix_end]) or text[suffix_end] == '.')) suffix_end += 1;
+            while (suffix_end < end and (isJsWord(text[suffix_end]) or text[suffix_end] == '.')) {
+                suffix_end += 1;
+            }
             while (suffix_end > i + 1 and text[suffix_end - 1] == '.') suffix_end -= 1;
             if (suffix_end > i + 1 and wordBoundaryAfter(text, end, suffix_end) and
                 shapeVersion(text[candidate_start..suffix_end])) match_end = suffix_end;
         }
         if (match_end == null and wordBoundaryAfter(text, end, core_end) and
             shapeVersion(text[candidate_start..core_end])) match_end = core_end;
-        if (match_end == null and base_end != core_end and wordBoundaryAfter(text, end, base_end) and
+        if (match_end == null and base_end != core_end and wordBoundaryAfter(
+            text,
+            end,
+            base_end,
+        ) and
             shapeVersion(text[candidate_start..base_end])) match_end = base_end;
         if (match_end) |matched| {
             try builder.add(text, candidate_start, matched);
@@ -509,13 +552,16 @@ fn scanVersions(builder: *Builder, text: []const u8, start: usize, end: usize) !
 fn scanFlags(builder: *Builder, text: []const u8, start: usize, end: usize) !void {
     var i = start;
     while (i < end) : (i += 1) {
-        if (text[i] != '-' or (i > start and (isJsWord(text[i - 1]) or text[i - 1] == '-'))) continue;
+        const prefixed = i > start and (isJsWord(text[i - 1]) or text[i - 1] == '-');
+        if (text[i] != '-' or prefixed) continue;
         var token_end = i + 1;
         if (token_end < end and text[token_end] == '-') token_end += 1;
         if (token_end >= end or !std.ascii.isAlphabetic(text[token_end])) continue;
         token_end += 1;
         const tail_start = token_end;
-        while (token_end < end and (isJsWord(text[token_end]) or text[token_end] == '-')) token_end += 1;
+        while (token_end < end and (isJsWord(text[token_end]) or text[token_end] == '-')) {
+            token_end += 1;
+        }
         if (token_end == tail_start) continue;
         try builder.add(text, i, token_end);
         i = token_end - 1;
@@ -533,7 +579,11 @@ fn scanLargeNumbers(builder: *Builder, text: []const u8, start: usize, end: usiz
         while (i < end and (std.ascii.isDigit(text[i]) or text[i] == ',' or text[i] == '_')) i += 1;
         var token_end = i;
         while (token_end > token_start and text[token_end - 1] == ',') token_end -= 1;
-        if (wordBoundaryBefore(text, start, token_start) and wordBoundaryAfter(text, end, token_end) and
+        if (wordBoundaryBefore(
+            text,
+            start,
+            token_start,
+        ) and wordBoundaryAfter(text, end, token_end) and
             shapeNumber(text[token_start..token_end]))
         {
             try builder.add(text, token_start, token_end);
@@ -582,7 +632,7 @@ fn scanTickets(builder: *Builder, text: []const u8, start: usize, end: usize) !v
         if (!std.ascii.isUpper(text[i]) or !wordBoundaryBefore(text, start, i)) continue;
         const token_start = i;
         var run_end = i;
-        while (run_end < end and (std.ascii.isUpper(text[run_end]) or std.ascii.isDigit(text[run_end]) or text[run_end] == '-')) run_end += 1;
+        while (run_end < end and (isTicketChar(text[run_end]))) run_end += 1;
         var token_end = run_end;
         while (token_end > token_start) : (token_end -= 1) {
             if (!wordBoundaryAfter(text, end, token_end)) continue;
@@ -608,7 +658,8 @@ fn wordBoundaryBefore(text: []const u8, chunk_start: usize, index: usize) bool {
 }
 
 fn wordBoundaryAfter(text: []const u8, chunk_end: usize, index: usize) bool {
-    return index > 0 and isJsWord(text[index - 1]) and (index == chunk_end or !isJsWord(text[index]));
+    const at_end = index == chunk_end or !isJsWord(text[index]);
+    return index > 0 and isJsWord(text[index - 1]) and at_end;
 }
 
 fn candidateSpecificLessThan(_: void, left: Candidate, right: Candidate) bool {
@@ -662,10 +713,15 @@ fn isFilePath(token: []const u8) bool {
     }
     var segment_start = first_slash + 1;
     while (segment_start < token.len) {
-        const segment_end = std.mem.indexOfScalarPos(u8, token, segment_start, '/') orelse token.len;
+        const segment_end = std.mem.indexOfScalarPos(
+            u8,
+            token,
+            segment_start,
+            '/',
+        ) orelse token.len;
         if (segment_end == segment_start) return false;
         for (token[segment_start..segment_end]) |c| {
-            if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '@' or c == '+' or c == '-')) return false;
+            if (!isDirectorySegmentChar(c)) return false;
         }
         if (segment_end == token.len) break;
         segment_start = segment_end + 1;
@@ -725,7 +781,7 @@ const Utf16Iterator = struct {
 fn utf16Order(left: []const u8, right: []const u8) std.math.Order {
     var left_it = Utf16Iterator{ .text = left };
     var right_it = Utf16Iterator{ .text = right };
-    while (true) {
+    while (left_it.index < left.len or left_it.pending_low != null) {
         const left_unit = left_it.next();
         const right_unit = right_it.next();
         if (left_unit == null or right_unit == null) {
@@ -735,12 +791,13 @@ fn utf16Order(left: []const u8, right: []const u8) std.math.Order {
         if (left_unit.? < right_unit.?) return .lt;
         if (left_unit.? > right_unit.?) return .gt;
     }
+    return if (right_it.next() == null) .eq else .lt;
 }
 
 fn shapeAssignment(token: []const u8) bool {
     const eq = std.mem.indexOfScalar(u8, token, '=') orelse return false;
     if (eq < 3 or eq + 1 >= token.len or !std.ascii.isUpper(token[0])) return false;
-    for (token[0..eq]) |c| if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_')) return false;
+    for (token[0..eq]) |c| if (!isUpperWord(c)) return false;
     return true;
 }
 
@@ -787,7 +844,7 @@ fn shapeVersion(token: []const u8) bool {
     if (i < token.len and (token[i] == '-' or token[i] == '+')) {
         i += 1;
         const suffix_start = i;
-        while (i < token.len and (std.ascii.isAlphanumeric(token[i]) or token[i] == '_' or token[i] == '.')) i += 1;
+        while (i < token.len and (isJsWord(token[i]) or token[i] == '.')) i += 1;
         if (i == suffix_start) return false;
     }
     return i == token.len;
@@ -798,7 +855,7 @@ fn shapeFlag(token: []const u8) bool {
     var i: usize = 1;
     if (i < token.len and token[i] == '-') i += 1;
     if (i >= token.len or !std.ascii.isAlphabetic(token[i]) or i + 1 >= token.len) return false;
-    for (token[i + 1 ..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    for (token[i + 1 ..]) |c| if (!(isJsWord(c) or c == '-')) return false;
     return true;
 }
 
@@ -839,7 +896,9 @@ fn shapeCamel(token: []const u8) bool {
     } else {
         i = 1;
         const initial_tail = i;
-        while (i < token.len and (std.ascii.isLower(token[i]) or std.ascii.isDigit(token[i]))) i += 1;
+        while (i < token.len and (std.ascii.isLower(token[i]) or std.ascii.isDigit(token[i]))) {
+            i += 1;
+        }
         if (i == initial_tail) return false;
     }
     var groups: usize = 0;
@@ -847,7 +906,9 @@ fn shapeCamel(token: []const u8) bool {
         if (!std.ascii.isUpper(token[i])) return false;
         groups += 1;
         i += 1;
-        while (i < token.len and (std.ascii.isLower(token[i]) or std.ascii.isDigit(token[i]))) i += 1;
+        while (i < token.len and (std.ascii.isLower(token[i]) or std.ascii.isDigit(token[i]))) {
+            i += 1;
+        }
     }
     return groups >= 1;
 }
@@ -903,13 +964,17 @@ test "facts reject pure-letter hex and digit-free hyphenated prose" {
 }
 
 test "facts match regex prefix and boundary edge cases" {
-    const text = "-FOO=bar foo/bar.a-b .src/x.ts abc1234-def v1.2.3,foo PROJ-1482,foo --flag,foo 1234x " ++
+    const text = "-FOO=bar foo/bar.a-b .src/x.ts abc1234-def v1.2.3,foo " ++
+        "PROJ-1482,foo --flag,foo 1234x " ++
         "ABC1234 -x --x A-1 a1B ABcD 1234";
     var report = try extract(std.testing.allocator, text);
     defer report.deinit(std.testing.allocator);
     const sheet = try report.textAlloc(std.testing.allocator);
     defer std.testing.allocator.free(sheet);
-    for ([_][]const u8{ "FOO=bar", "foo/bar.a", "src/x.ts", "abc1234", "v1.2.3", "PROJ-1482", "--flag", "1234" }) |expected| {
+    for ([_][]const u8{
+        "FOO=bar", "foo/bar.a", "src/x.ts", "abc1234",
+        "v1.2.3",  "PROJ-1482", "--flag",   "1234",
+    }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, sheet, expected) != null);
     }
     for ([_][]const u8{ "ABC1234", "-x", "--x", "A-1", "a1B", "ABcD", "1234x" }) |unexpected| {
@@ -933,7 +998,10 @@ test "facts match each precision shape before interior punctuation" {
         "v1.2.3",
     };
     try std.testing.expectEqual(expected.len, report.entries.len);
-    for (expected, report.entries) |token, entry| try std.testing.expectEqualStrings(token, entry.token);
+    for (expected, report.entries) |token, entry| try std.testing.expectEqualStrings(
+        token,
+        entry.token,
+    );
 }
 
 test "facts path regex finds valid suffixes without inventing truncated extensions" {
@@ -1001,9 +1069,15 @@ test "facts token limits and ranking use JavaScript UTF-16 units" {
     var report = try extract(std.testing.allocator, text.items);
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), report.entries.len);
-    try std.testing.expectEqualStrings(text.items[long_unicode_start..long_unicode_end], report.entries[0].token);
+    try std.testing.expectEqualStrings(
+        text.items[long_unicode_start..long_unicode_end],
+        report.entries[0].token,
+    );
     try std.testing.expectEqualStrings(text.items[ascii_start..ascii_end], report.entries[1].token);
-    try std.testing.expectEqualStrings(text.items[short_unicode_start..short_unicode_end], report.entries[2].token);
+    try std.testing.expectEqualStrings(
+        text.items[short_unicode_start..short_unicode_end],
+        report.entries[2].token,
+    );
 }
 
 test "facts pager models a split surrogate as one unit on each page" {
@@ -1030,7 +1104,11 @@ test "facts pager never emits a synthetic split-surrogate marker" {
 
     var assignment_text: std.ArrayList(u8) = .empty;
     defer assignment_text.deinit(std.testing.allocator);
-    try assignment_text.appendNTimes(std.testing.allocator, ' ', page_utf16_units - "FOO=bar".len - 1);
+    try assignment_text.appendNTimes(
+        std.testing.allocator,
+        ' ',
+        page_utf16_units - "FOO=bar".len - 1,
+    );
     try assignment_text.appendSlice(std.testing.allocator, "FOO=bar𐀀tail");
     var assignment_report = try extract(std.testing.allocator, assignment_text.items);
     defer assignment_report.deinit(std.testing.allocator);
@@ -1078,4 +1156,16 @@ test "facts follow ECMAScript whitespace and do not split on NEL" {
     const sheet = try report.textAlloc(std.testing.allocator);
     defer std.testing.allocator.free(sheet);
     try std.testing.expect(std.mem.indexOf(u8, sheet, "PROJ-1482") == null);
+}
+
+fn isUpperWord(c: u8) bool {
+    return std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_';
+}
+
+fn isTicketChar(c: u8) bool {
+    return std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '-';
+}
+
+test "facts reject truncated UTF-8 before paging" {
+    try std.testing.expectError(error.InvalidUtf8, extract(std.testing.allocator, "\xf0\x9f"));
 }

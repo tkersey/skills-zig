@@ -67,6 +67,23 @@ pub const Renderer = struct {
         const lines = try layout.wrap(allocator, wrapped_text, cols);
         errdefer allocator.free(lines);
 
+        const pages = try paginate(allocator, lines, cols, options);
+
+        return .{
+            .allocator = allocator,
+            .text = wrapped_text,
+            .lines = lines,
+            .pages = pages,
+            .cols = cols,
+        };
+    }
+
+    fn paginate(
+        allocator: std.mem.Allocator,
+        lines: []const layout.Line,
+        cols: usize,
+        options: RenderOptions,
+    ) ![]PageSpan {
         const hard_line_limit = @max(
             @as(usize, 1),
             (@as(usize, options.max_height) - 2 * pad_y) / font.cell_height,
@@ -109,13 +126,7 @@ pub const Renderer = struct {
             .line_count = line_count,
         });
 
-        return .{
-            .allocator = allocator,
-            .text = wrapped_text,
-            .lines = lines,
-            .pages = try pages.toOwnedSlice(allocator),
-            .cols = cols,
-        };
+        return pages.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -208,7 +219,11 @@ fn inflatePixels(allocator: std.mem.Allocator, page: Page) ![]u8 {
     defer allocator.free(history);
     var inflater: std.compress.flate.Decompress = .init(&input, .zlib, history);
     const row_width = @as(usize, page.width) + 1;
-    const scanline_count = std.math.mul(usize, row_width, page.height) catch return error.ImageTooLarge;
+    const scanline_count = std.math.mul(
+        usize,
+        row_width,
+        page.height,
+    ) catch return error.ImageTooLarge;
     const scanlines = try allocator.alloc(u8, scanline_count);
     defer allocator.free(scanlines);
     try inflater.reader.readSliceAll(scanlines);
@@ -355,7 +370,10 @@ test "page budget is inclusive and splits on the next scalar" {
     defer exact_page.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1568), exact_page.width);
     try std.testing.expectEqual(@as(u32, 728), exact_page.height);
-    try expectPixelHash(exact_page, "f66b25f05f71dcf7359b989532dfaf7ac3a0a37d5a4e2bc73699c1c12ede400a");
+    try expectPixelHash(
+        exact_page,
+        "f66b25f05f71dcf7359b989532dfaf7ac3a0a37d5a4e2bc73699c1c12ede400a",
+    );
 
     const text = try std.testing.allocator.alloc(u8, 27_992);
     defer std.testing.allocator.free(text);
@@ -378,12 +396,20 @@ test "page budget is inclusive and splits on the next scalar" {
 }
 
 test "PNG bytes are deterministic within the Zig implementation" {
-    var first_renderer = try Renderer.init(std.testing.allocator, "same input\nwith tabs\tand 東", .{});
+    var first_renderer = try Renderer.init(
+        std.testing.allocator,
+        "same input\nwith tabs\tand 東",
+        .{},
+    );
     defer first_renderer.deinit();
     var first = (try first_renderer.next()).?;
     defer first.deinit(std.testing.allocator);
 
-    var second_renderer = try Renderer.init(std.testing.allocator, "same input\nwith tabs\tand 東", .{});
+    var second_renderer = try Renderer.init(
+        std.testing.allocator,
+        "same input\nwith tabs\tand 東",
+        .{},
+    );
     defer second_renderer.deinit();
     var second = (try second_renderer.next()).?;
     defer second.deinit(std.testing.allocator);
