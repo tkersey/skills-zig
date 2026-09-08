@@ -567,3 +567,56 @@ test "canonical traversal releases all live frame keys on allocation failure" {
         .{parsed.value},
     );
 }
+
+fn fuzzCanonicalJson(_: void, smith: *std.testing.Smith) !void {
+    var storage: [4096]u8 = undefined;
+    const input = storage[0..smith.slice(&storage)];
+    const allocator = std.testing.allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{
+        .parse_numbers = false,
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = storage.len,
+    }) catch |err| switch (err) {
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.DuplicateField,
+        => return,
+        else => return err,
+    };
+    defer parsed.deinit();
+    const canonical = canonicalJsonAlloc(allocator, parsed.value) catch |err| switch (err) {
+        // Arbitrary valid JSON can exceed the canonicalizer's depth or exponent domain.
+        error.JsonNestingExceeded, error.InvalidNumber => return,
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, canonical, .{
+        .parse_numbers = false,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer reparsed.deinit();
+    const repeated = try canonicalJsonAlloc(allocator, reparsed.value);
+    defer allocator.free(repeated);
+    try std.testing.expectEqualStrings(canonical, repeated);
+}
+
+fn canonicalFuzzSeed(comptime json: []const u8) []const u8 {
+    // Smith.slice reads a little-endian length and clamps it to the remaining seed bytes.
+    return "\xff\xff\xff\xff" ++ json;
+}
+
+test "fuzz canonical JSON preserves parse and canonicalization closure" {
+    try std.testing.fuzz({}, fuzzCanonicalJson, .{ .corpus = &.{
+        canonicalFuzzSeed("null"),
+        canonicalFuzzSeed("[true,false,0,-0,\"\",[],{}]"),
+        canonicalFuzzSeed("{\"z\":1,\"a\":[{\"b\":2,\"a\":3}]}"),
+        canonicalFuzzSeed("{\"é\":\"\\u0000\\n\\t\\\"\\\\\",\"a\":\"\\ud83d\\ude00\"}"),
+        canonicalFuzzSeed("[9007199254740992.1,9007199254740992.2,1.2300e+2,-0.0000001]"),
+        canonicalFuzzSeed("[1e9223372036854775807,1e-9223372036854775808]"),
+        canonicalFuzzSeed("[" ** max_nesting_depth ++ "null" ++ "]" ** max_nesting_depth),
+        canonicalFuzzSeed("[" ** (max_nesting_depth + 1) ++ "0" ++ "]" ** (max_nesting_depth + 1)),
+        canonicalFuzzSeed("{\"duplicate\":0,\"duplicate\":1}"),
+        canonicalFuzzSeed("\xff[invalid"),
+    } });
+}
