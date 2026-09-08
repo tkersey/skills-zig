@@ -2668,7 +2668,10 @@ fn previewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 /// Uncapped parsing appends tools only, so owned call-ID bytes remain stable.
 /// Capped parsing keeps its existing bounded reverse scan across ordered removals.
 const ToolLookup = struct {
+    // Small scans avoid populating allocator size classes for a short-lived index.
+    const scan_tools_max: usize = 64;
     enabled: bool,
+    promoted: bool = false,
     by_call_id: std.StringHashMapUnmanaged(usize) = .empty,
 
     fn deinit(self: *ToolLookup, allocator: std.mem.Allocator) void {
@@ -2676,7 +2679,7 @@ const ToolLookup = struct {
     }
 
     fn find(self: *const ToolLookup, trace: *CanonicalSessionTrace, call_id: []const u8) ?usize {
-        if (!self.enabled) return findToolByCallId(trace, call_id);
+        if (!self.promoted) return findToolByCallId(trace, call_id);
         const index = self.by_call_id.get(call_id) orelse return null;
         std.debug.assert(index < trace.tools.items.len);
         std.debug.assert(std.mem.eql(u8, trace.tools.items[index].call_id.?, call_id));
@@ -2690,6 +2693,18 @@ const ToolLookup = struct {
     ) !void {
         if (!self.enabled) return;
         std.debug.assert(trace.tools.items.len > 0);
+        if (!self.promoted) {
+            if (trace.tools.items.len <= scan_tools_max) return;
+            const capacity = std.math.cast(u32, trace.tools.items.len) orelse
+                return error.OutOfMemory;
+            try self.by_call_id.ensureTotalCapacity(allocator, capacity);
+            for (trace.tools.items, 0..) |tool, index| {
+                const call_id = tool.call_id orelse continue;
+                self.by_call_id.putAssumeCapacity(call_id, index);
+            }
+            self.promoted = true;
+            return;
+        }
         const index = trace.tools.items.len - 1;
         const call_id = trace.tools.items[index].call_id orelse return;
         try self.by_call_id.put(allocator, call_id, index);
@@ -3563,7 +3578,7 @@ test "tool lookup borrows stable row keys across growth and keeps latest matchin
     defer lookup.deinit(allocator);
     var turn: ?usize = null;
     const turn_index = try startTurn(allocator, &trace, "trace.jsonl", &turn, "turn", null);
-    for (0..32) |index| {
+    for (0..96) |index| {
         var tool = try initToolRecord(allocator, &trace, turn_index, "same-call");
         var transferred = false;
         errdefer if (!transferred) tool.deinit(allocator);
@@ -3571,6 +3586,47 @@ test "tool lookup borrows stable row keys across growth and keeps latest matchin
         transferred = true;
         try lookup.remember(allocator, &trace);
         try std.testing.expectEqual(index, lookup.find(&trace, "same-call").?);
+        try std.testing.expectEqual(index >= ToolLookup.scan_tools_max, lookup.promoted);
     }
+    try std.testing.expectEqual(@as(?usize, null), lookup.find(&trace, "missing"));
+}
+
+test "tool lookup promotes without losing earlier rows or exposing partial state on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseToolLookupPromotion,
+        .{},
+    );
+}
+
+fn exerciseToolLookupPromotion(allocator: std.mem.Allocator) !void {
+    var trace = CanonicalSessionTrace{
+        .session = try SessionRecord.init(allocator, "trace.jsonl"),
+    };
+    defer trace.deinit(allocator);
+    var lookup = ToolLookup{ .enabled = true };
+    defer lookup.deinit(allocator);
+    var current: ?usize = null;
+    const turn = try startTurn(allocator, &trace, "trace.jsonl", &current, "turn", null);
+    for (0..ToolLookup.scan_tools_max + 1) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "call-{d}", .{index});
+        var tool = try initToolRecord(allocator, &trace, turn, name);
+        trace.tools.append(allocator, tool) catch |err| {
+            tool.deinit(allocator);
+            return err;
+        };
+        lookup.remember(allocator, &trace) catch |err| {
+            try std.testing.expect(!lookup.promoted);
+            try std.testing.expectEqual(@as(?usize, 0), lookup.find(&trace, "call-0"));
+            return err;
+        };
+        if (index < ToolLookup.scan_tools_max) {
+            try std.testing.expectEqual(@as(u32, 0), lookup.by_call_id.capacity());
+        }
+    }
+    try std.testing.expect(lookup.promoted);
+    try std.testing.expectEqual(@as(?usize, 0), lookup.find(&trace, "call-0"));
+    try std.testing.expectEqual(@as(?usize, 64), lookup.find(&trace, "call-64"));
     try std.testing.expectEqual(@as(?usize, null), lookup.find(&trace, "missing"));
 }
