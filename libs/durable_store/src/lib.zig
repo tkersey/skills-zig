@@ -8367,16 +8367,16 @@ fn detectAncestorCaseInsensitivity(
             else => return err,
         };
         if (alias_stat.kind != .directory) return false;
-        const alias_real = std.Io.Dir.cwd().realPathFileAlloc(
-            Io.io(),
-            alias,
-            allocator,
-        ) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer allocator.free(alias_real);
-        return std.mem.eql(u8, canonical, alias_real);
+        const original_identity = (try hostObjectIdentity(canonical)) orelse
+            return error.TransactionRecoveryRequired;
+        const alias_identity = (try hostObjectIdentity(alias)) orelse return false;
+        // Directory aliases are not regular-file hardlinks. Mount identity keeps
+        // separate Linux bind mounts from becoming a case-folding witness.
+        if (!caseWitnessObjectsEqual(original_identity, alias_identity)) return false;
+        if (!hostObjectIdentitiesEqual(original_identity, alias_identity)) {
+            return error.DirectoryIdentityChanged;
+        }
+        return true;
     }
     return false;
 }
@@ -8419,7 +8419,10 @@ fn targetNameCaseSensitivity(
             witness_name,
             variant,
             second,
-        );
+        ) catch |err| switch (err) {
+            error.FileNotFound => error.TransactionRecoveryRequired,
+            else => err,
+        };
     }
     return error.TransactionRecoveryRequired;
 }
@@ -8452,6 +8455,7 @@ fn targetNameStatEqual(
     const left_value = left orelse return right == null;
     const right_value = right orelse return false;
     return left_value.inode == right_value.inode and
+        left_value.nlink == right_value.nlink and
         left_value.kind == right_value.kind and
         left_value.mtime.nanoseconds == right_value.mtime.nanoseconds and
         left_value.ctime.nanoseconds == right_value.ctime.nanoseconds;
@@ -8476,12 +8480,7 @@ fn classifyTargetNameStats(
     } else {
         return false;
     }
-    return @as(?bool, try targetNamesResolveToSamePath(
-        allocator,
-        dir,
-        witness_name,
-        variant,
-    ));
+    return targetNamesShareDirectoryEntry(allocator, dir, witness_name, variant, stats);
 }
 
 fn targetNameStat(
@@ -8498,31 +8497,60 @@ fn targetNameStat(
     };
 }
 
-fn targetNamesResolveToSamePath(
+fn targetNamesShareDirectoryEntry(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
     original_name: []const u8,
     alias_name: []const u8,
-) !bool {
-    const original = dir.realPathFileAlloc(
-        Io.io(),
-        original_name,
-        allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.TransactionRecoveryRequired,
-        else => return err,
-    };
+    stats: TargetNameStats,
+) !?bool {
+    const original_stat = stats.original orelse return error.TransactionRecoveryRequired;
+    const alias_stat = stats.alias orelse return error.TransactionRecoveryRequired;
+    if (original_stat.inode != alias_stat.inode or original_stat.kind != alias_stat.kind) {
+        return false;
+    }
+    if (!targetNameStatEqual(original_stat, alias_stat)) return null;
+    const original = try dir.realPathFileAlloc(Io.io(), original_name, allocator);
     defer allocator.free(original);
-    const alias = dir.realPathFileAlloc(
-        Io.io(),
-        alias_name,
-        allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.TransactionRecoveryRequired,
-        else => return err,
-    };
+    const alias = try dir.realPathFileAlloc(Io.io(), alias_name, allocator);
     defer allocator.free(alias);
-    return std.mem.eql(u8, original, alias);
+    if (std.mem.eql(u8, original, alias)) return true;
+    if (@import("builtin").os.tag != .linux) {
+        return caseNamesAreOneDirectoryEntry(dir, original_name);
+    }
+    // Linux realpath preserves lookup spelling on case-folding mounts. A name
+    // mismatch is inconclusive; identity distinguishes objects, not hardlinks.
+    const original_identity = (try hostObjectIdentity(original)) orelse
+        return error.TransactionRecoveryRequired;
+    const alias_identity = (try hostObjectIdentity(alias)) orelse
+        return error.TransactionRecoveryRequired;
+    if (!caseWitnessObjectsEqual(original_identity, alias_identity)) return false;
+    if (!hostObjectIdentitiesEqual(original_identity, alias_identity)) return null;
+    if (original_identity.inode != original_stat.inode or
+        original_identity.ctime_ns != original_stat.ctime.nanoseconds or
+        original_identity.mtime_ns != original_stat.mtime.nanoseconds) return null;
+    if (original_stat.kind == .directory or original_stat.nlink == 1) return true;
+    return caseNamesAreOneDirectoryEntry(dir, original_name);
+}
+
+fn caseWitnessObjectsEqual(left: HostObjectIdentity, right: HostObjectIdentity) bool {
+    return left.device == right.device and left.mount_id == right.mount_id and
+        left.inode == right.inode and left.kind == right.kind;
+}
+
+fn caseNamesAreOneDirectoryEntry(dir: std.Io.Dir, name: []const u8) !?bool {
+    const entries_max: usize = 1024;
+    var listing = try dir.openDir(Io.io(), ".", .{ .iterate = true });
+    defer listing.close(Io.io());
+    var iter = listing.iterate();
+    var matches: usize = 0;
+    for (0..entries_max) |_| {
+        const entry = (try iter.next(Io.io())) orelse return if (matches == 1) true else null;
+        if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+        matches += 1;
+        if (matches > 1) return false;
+    }
+    return null;
 }
 
 fn childNameCaseSensitivity(
@@ -8558,52 +8586,21 @@ fn entryNameCaseSensitivity(
     dir: std.Io.Dir,
     entry_name: []const u8,
 ) !?bool {
-    const original_stat = dir.statFile(
-        Io.io(),
-        entry_name,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    if (original_stat.kind == .sym_link) return null;
-    const variant = (try caseVariantAlloc(
-        allocator,
-        entry_name,
-    )) orelse return null;
+    const variant = (try caseVariantAlloc(allocator, entry_name)) orelse return null;
     defer allocator.free(variant);
-    const alias_stat = dir.statFile(
-        Io.io(),
-        variant,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            return existingCaseWitness(dir, entry_name);
-        },
-        else => return err,
-    };
-    if (alias_stat.kind == .sym_link) return null;
-    const original = dir.realPathFileAlloc(
-        Io.io(),
+    const stats = try targetNameStats(dir, entry_name, variant);
+    if (stats.original == null) return null;
+    if (stats.alias == null) return existingCaseWitness(dir, entry_name);
+    return classifyTargetNameStats(
+        allocator,
+        dir,
         entry_name,
-        allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(original);
-    const alias = dir.realPathFileAlloc(
-        Io.io(),
         variant,
-        allocator,
+        stats,
     ) catch |err| switch (err) {
-        error.FileNotFound => {
-            return existingCaseWitness(dir, entry_name);
-        },
-        else => return err,
+        error.FileNotFound => existingCaseWitness(dir, entry_name),
+        else => err,
     };
-    defer allocator.free(alias);
-    return std.mem.eql(u8, original, alias);
 }
 
 fn existingCaseWitness(dir: std.Io.Dir, entry_name: []const u8) !?bool {
@@ -16444,16 +16441,10 @@ test "EventStore advisory paths preserve existing filesystem case identity" {
     defer std.testing.allocator.free(case_alias);
     try writeTextAtomic(std.testing.allocator, canonical_path, "{\"sequence\":1}\n");
 
-    const alias_real_path = std.Io.Dir.cwd().realPathFileAlloc(
-        Io.io(),
-        case_alias,
-        std.testing.allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer std.testing.allocator.free(alias_real_path);
-    try std.testing.expectEqualStrings(canonical_path, alias_real_path);
+    const canonical_stat = try tmp.dir.statFile(Io.io(), "Events.jsonl", .{});
+    const alias_stat = (try targetNameStat(tmp.dir, "events.jsonl")) orelse return;
+    try std.testing.expectEqual(canonical_stat.inode, alias_stat.inode);
+    try std.testing.expectEqual(@as(std.Io.File.NLink, 1), canonical_stat.nlink);
 
     const canonical_advisory = try eventStoreLockPathAlloc(std.testing.allocator, canonical_path);
     defer std.testing.allocator.free(canonical_advisory);
@@ -16523,6 +16514,80 @@ test "CAS read custody holds the existing member of a partial advisory pair" {
     try std.testing.expectError(
         error.LockBusy,
         acquireCasAdvisoryLock(std.testing.allocator, binding_path),
+    );
+}
+
+test "EventStore missing case aliases retain one custody owner" {
+    directory_case_cache = .{};
+    defer directory_case_cache = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(Io.io(), "CaseParent", .default_dir);
+    const original = try tmp.dir.statFile(Io.io(), "CaseParent", .{});
+    const alias_stat = (try targetNameStat(tmp.dir, "caseParent")) orelse return;
+    try std.testing.expectEqual(original.inode, alias_stat.inode);
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), "CaseParent", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const first = try std.fs.path.join(std.testing.allocator, &.{ root, "Events.jsonl" });
+    defer std.testing.allocator.free(first);
+    const alias = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
+    defer std.testing.allocator.free(alias);
+    var owner = JsonlEventStore.init(first);
+    var session = try owner.eventStore().acquireExclusive(std.testing.allocator);
+    defer session.release();
+    var contender = JsonlEventStore.init(alias);
+    if (contender.eventStore().snapshot(std.testing.allocator, 4096)) |snapshot| {
+        var unexpected = snapshot;
+        defer unexpected.deinit(std.testing.allocator);
+        std.debug.print("case-alias snapshot succeeded: exists={any}, records={d}\n", .{
+            unexpected.exists,
+            unexpected.records.len,
+        });
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.EventStoreBusy, err);
+    }
+}
+
+test "EventStore case probes distinguish folding from case-variant hardlinks" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(Io.io(), "Events", .{ .exclusive = true });
+    file.close(Io.io());
+    const folding = try targetNameStat(tmp.dir, "events") != null;
+    const destination = if (folding) "other-link" else "events";
+    try tmp.dir.hardLink("Events", tmp.dir, destination, Io.io(), .{});
+    const source_stat = try tmp.dir.statFile(Io.io(), "Events", .{});
+    try std.testing.expectEqual(@as(std.Io.File.NLink, 2), source_stat.nlink);
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expectEqual(
+        @as(?bool, folding),
+        try targetNameCaseSensitivity(std.testing.allocator, root, "Events"),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, folding),
+        try entryNameCaseSensitivity(std.testing.allocator, tmp.dir, "Events"),
+    );
+}
+
+test "EventStore changing case-witness metadata remains inconclusive" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(Io.io(), "Events", .{ .exclusive = true });
+    file.close(Io.io());
+    const original = try tmp.dir.statFile(Io.io(), "Events", .{});
+    var changed = original;
+    changed.ctime.nanoseconds += 1;
+    const stats: TargetNameStats = .{ .original = original, .alias = changed };
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        try classifyTargetNameStats(std.testing.allocator, tmp.dir, "Events", "events", stats),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        try caseNamesAreOneDirectoryEntry(tmp.dir, "Missing"),
     );
 }
 
