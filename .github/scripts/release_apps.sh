@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note img)
+apps=(seq lift cas ledger memory-note)
 
 resolve_ref() {
   local ref=$1
@@ -78,10 +78,11 @@ case "$mode" in
 
     is_retired_build_line() {
       local raw=$1
-      local app token
+      local app token constructor
       for app in "${retired_apps[@]}"; do
         token=${app//-/_}
-        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])" <<<"$raw"; then
+        constructor="build${token//_/}"
+        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])|(^|[^[:alnum:]_])${constructor}([^[:alnum:]_]|$)" <<<"$raw"; then
           return 0
         fi
       done
@@ -221,9 +222,6 @@ case "$mode" in
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
-        .github/workflows/release-img.yml)
-          mark_app img
-          ;;
         apps/*)
           matched=0
           for app in "${apps[@]}"; do
@@ -271,6 +269,9 @@ case "$mode" in
           fi
           if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
             retired_app_deletion=1
+            if classify_build_line "$raw"; then
+              changed_matched=1
+            fi
           elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then

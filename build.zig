@@ -19,7 +19,6 @@ pub fn build(b: *std.Build) void {
         cas.surface,
         ledger.surface,
         buildMemoryNote(ctx, shared),
-        buildImg(ctx),
     };
     for (surfaces) |surface| {
         _ = addGroupedStep(
@@ -316,34 +315,6 @@ fn buildMemoryNote(ctx: BuildContext, shared: SharedModules) AppSurface {
         .build_description = "Build memory-note binary",
         .build_deps = &.{&memory_note.install.step},
         .test_deps = &.{&run_memory_note_tests.step},
-    });
-}
-
-fn buildImg(ctx: BuildContext) AppSurface {
-    const b = ctx.b;
-    const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
-    const img_atlas = ctx.module("apps/img/assets/atlas.zig", &.{});
-    const img_root = ctx.module("apps/img/src/main.zig", &.{
-        .{ .name = "app_meta", .module = img_meta },
-        .{ .name = "img_atlas", .module = img_atlas },
-    });
-    const img_tests_root = ctx.module("apps/img/src/tests.zig", &.{
-        .{ .name = "img_atlas", .module = img_atlas },
-    });
-    const img = addInstalledExecutable(b, "img", img_root);
-    const run_img_tests = addTestStep(
-        b,
-        img_tests_root,
-        "test-img",
-        "Run img tests",
-    );
-    addRunStep(b, img.exe, "run-img", "Run img", &.{"--help"});
-    return appSurface(b, .{
-        .path = b.path("apps/img"),
-        .build_step_name = "build-img",
-        .build_description = "Build img binary",
-        .build_deps = &.{&img.install.step},
-        .test_deps = &.{&run_img_tests.step},
     });
 }
 

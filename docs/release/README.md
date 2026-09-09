@@ -7,7 +7,6 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
-- `img`: `.github/workflows/release-img.yml` on tag `img-v*`
 
 Codex automation is part of CAS 0.4 and is invoked through `cas automation`.
 It uses the CAS build, version, tag, release archives, and tap formula; there is
@@ -20,7 +19,6 @@ Per-app VERSION files:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/img/VERSION`
 
 Release contract:
 
@@ -46,9 +44,8 @@ Release tags must match file versions:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
 
-Each workflow publishes two release archives for its independently versioned CLI. CAS neither bundles nor executes Ledger; caller workflows validate inquiry carriers before handing them to CAS. The `img` archives carry `apps/img/LICENSES/**` beside the binary so the embedded-font and upstream notices survive distribution:
+Each workflow publishes two release archives for its independently versioned CLI. CAS neither bundles nor executes Ledger; caller workflows validate inquiry carriers before handing them to CAS.
 
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`
@@ -65,8 +62,6 @@ Examples:
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
-- `img-v0.1.0-linux-x86_64.tar.gz`
-- `img-v0.1.0-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 
@@ -91,7 +86,6 @@ Use explicit queue checks first:
 ```bash
 gh run list --workflow release-seq.yml --status queued --limit 20
 gh run list --workflow release-ledger.yml --status queued --limit 20
-gh run list --workflow release-img.yml --status queued --limit 20
 gh run view <run-id> --json status,jobs,headBranch,createdAt
 ```
 
