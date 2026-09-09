@@ -269,6 +269,9 @@ case "$mode" in
           fi
           if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
             retired_app_deletion=1
+            if classify_build_line "$raw"; then
+              changed_matched=1
+            fi
           elif classify_build_line "$raw"; then
             changed_matched=1
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
