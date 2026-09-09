@@ -108,6 +108,12 @@ The permission is narrow:
 - Arenas are preferred for request-lifetime graphs.
 - Long-lived stores retain only data required by their contract.
 
+Trace parsing preserves the supported unbounded aggregate JSONL input range.
+Its returned turns, occurrences, tools, and warnings may grow with the consumed
+source. This is an explicit compatibility exception to a fixed aggregate result
+budget, not a claim of constant memory. Record bytes and scratch retention remain
+bounded, result ownership remains explicit, and allocation failures are returned.
+
 `usize` is allowed for in-memory slice indexes and standard-library allocator
 interfaces. Persisted counts, protocol fields, timestamps, and externally
 visible limits use explicitly sized integer types.
@@ -147,13 +153,14 @@ performance, maintenance, and supply-chain justification.
 - No unresolved `TODO`, `FIXME`, or `HACK` comments.
 - No discarded errors through `catch {}` or `catch unreachable`.
 - No unmarked `while (true)` loops.
-- No direct recursion in fully audited files.
+- No direct recursion, including calls through a `self` receiver, in fully audited files.
 - No function or test block longer than 70 lines in fully audited files.
 
-Pull request CI fully audits new Zig files and audits every added line in
-modified Zig files. This is a ratchet: existing code remains changeable, but new
-violations cannot be introduced. When materially refactoring an existing file,
-run the full-file audit and leave the touched functions within the contract.
+Pull request CI audits every tracked Zig file, including tests and build tools.
+The separate repository-mapping check verifies CI and release ownership; it does
+not audit source. Mechanical checks cannot prove the absence of indirect or
+mutual recursion, or establish ownership and operating-error correctness; those
+obligations also require source review and behavioral tests.
 
 ```bash
 zig test tools/tiger_style/main.zig

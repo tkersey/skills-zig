@@ -312,12 +312,30 @@ test "physical relation schema contains only source-structural fields" {
 }
 
 test "lossless session and token fields are append-only ABI v1 extensions" {
-    try std.testing.expectEqual(@as(u16, 24), try Relation.sessions.fieldIndex("root_session_id"));
-    try std.testing.expectEqual(@as(u16, 25), try Relation.sessions.fieldIndex("parent_session_id"));
-    try std.testing.expectEqual(@as(u16, 10), try Relation.token_events.fieldIndex("total_input_tokens"));
-    try std.testing.expectEqual(@as(u16, 15), try Relation.token_events.fieldIndex("last_input_tokens"));
-    try std.testing.expectEqual(@as(u16, 23), try Relation.token_events.fieldIndex("line_number"));
-    try std.testing.expectEqual(@as(u16, 27), try Relation.token_events.fieldIndex("timestamp_ms"));
+    try std.testing.expectEqual(
+        @as(u16, 24),
+        try Relation.sessions.fieldIndex("root_session_id"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 25),
+        try Relation.sessions.fieldIndex("parent_session_id"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 10),
+        try Relation.token_events.fieldIndex("total_input_tokens"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 15),
+        try Relation.token_events.fieldIndex("last_input_tokens"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 23),
+        try Relation.token_events.fieldIndex("line_number"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 27),
+        try Relation.token_events.fieldIndex("timestamp_ms"),
+    );
     try std.testing.expectError(
         error.UnknownPhysicalField,
         Relation.tool_invocations.fieldIndex("total_input_tokens"),

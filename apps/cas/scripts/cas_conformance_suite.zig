@@ -48,7 +48,11 @@ const Scenario = enum {
     app_server_features,
 
     fn parse(raw: []const u8) ?Scenario {
-        if (std.mem.eql(u8, raw, "overload_backoff") or std.mem.eql(u8, raw, "overload-backoff")) return .overload_backoff;
+        if (std.mem.eql(
+            u8,
+            raw,
+            "overload_backoff",
+        ) or std.mem.eql(u8, raw, "overload-backoff")) return .overload_backoff;
         if (std.mem.eql(u8, raw, "app_server_features") or
             std.mem.eql(u8, raw, "app-server-features")) return .app_server_features;
         return null;
@@ -138,14 +142,20 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (parsed.show_version) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -170,6 +180,10 @@ pub fn main(init: std.process.Init) !void {
         .max_retries = parsed.max_retries,
     };
 
+    return runScenarios(allocator, parsed, ctx);
+}
+
+fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) !void {
     const smoke_preflight = if (parsed.skip_smoke_check)
         SmokePreflightResult{
             .status = "skipped",
@@ -185,20 +199,38 @@ pub fn main(init: std.process.Init) !void {
         try results.append(allocator, try executeScenario(allocator, ctx, scenario));
     }
 
-    var overall_ok = std.mem.eql(u8, smoke_preflight.status, "pass") or std.mem.eql(u8, smoke_preflight.status, "skipped");
+    var overall_ok = std.mem.eql(u8, smoke_preflight.status, "pass") or std.mem.eql(
+        u8,
+        smoke_preflight.status,
+        "skipped",
+    );
     for (results.items) |result| {
         if (!result.ok) overall_ok = false;
     }
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try writeScenarioReport(parsed.json, ctx.cwd, smoke_preflight, results.items, overall_ok);
+    std.process.exit(if (overall_ok) 0 else 1);
+}
+
+fn writeScenarioReport(
+    json: bool,
+    cwd: []const u8,
+    smoke_preflight: SmokePreflightResult,
+    results: []const ScenarioResult,
+    overall_ok: bool,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
-    if (parsed.json) {
+    if (json) {
         const payload = .{
             .check = "cas-conformance-suite",
             .cwd = cwd,
             .ok = overall_ok,
             .smoke_preflight = smoke_preflight,
-            .scenarios = results.items,
+            .scenarios = results,
         };
         try std.json.Stringify.value(payload, .{ .whitespace = .indent_2 }, stdout);
         try stdout.writeAll("\n");
@@ -210,45 +242,46 @@ pub fn main(init: std.process.Init) !void {
             "smoke preflight: {s} ({s})\n",
             .{ smoke_preflight.status, smoke_preflight.detail },
         );
-        for (results.items) |result| {
-            try stdout.print(
-                "- {s} [{s}]: {s} ({s})",
-                .{ result.name, result.mode, if (result.ok) "pass" else "fail", result.detail },
-            );
-            if (result.items_total > 0) {
-                try stdout.print(
-                    " items={d}/{d}",
-                    .{ result.items_ok, result.items_total },
-                );
-            }
-            if (result.in_progress > 0) {
-                try stdout.print(" in_progress={d}", .{result.in_progress});
-            }
-            if (result.missing_rows > 0) {
-                try stdout.print(" missing_rows={d}", .{result.missing_rows});
-            }
-            if (result.attempts > 0) {
-                try stdout.print(" attempts={d}", .{result.attempts});
-            }
-            if (result.retries > 0) {
-                try stdout.print(" retries={d}", .{result.retries});
-            }
-            if (result.delays_ms.len > 0) {
-                try stdout.print(" delays_ms={any}", .{result.delays_ms});
-            }
-            if (result.temp_root.len > 0) {
-                try stdout.print(" temp_root={s}", .{result.temp_root});
-            }
-            try stdout.writeByte('\n');
-        }
+        for (results) |result| try writeScenarioRow(stdout, result);
     }
+}
 
-    std.process.exit(if (overall_ok) 0 else 1);
+fn writeScenarioRow(stdout: *std.Io.Writer, result: ScenarioResult) !void {
+    try stdout.print(
+        "- {s} [{s}]: {s} ({s})",
+        .{ result.name, result.mode, if (result.ok) "pass" else "fail", result.detail },
+    );
+    if (result.items_total > 0) {
+        try stdout.print(
+            " items={d}/{d}",
+            .{ result.items_ok, result.items_total },
+        );
+    }
+    if (result.in_progress > 0) {
+        try stdout.print(" in_progress={d}", .{result.in_progress});
+    }
+    if (result.missing_rows > 0) {
+        try stdout.print(" missing_rows={d}", .{result.missing_rows});
+    }
+    if (result.attempts > 0) {
+        try stdout.print(" attempts={d}", .{result.attempts});
+    }
+    if (result.retries > 0) {
+        try stdout.print(" retries={d}", .{result.retries});
+    }
+    if (result.delays_ms.len > 0) {
+        try stdout.print(" delays_ms={any}", .{result.delays_ms});
+    }
+    if (result.temp_root.len > 0) {
+        try stdout.print(" temp_root={s}", .{result.temp_root});
+    }
+    try stdout.writeByte('\n');
 }
 
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var scenarios: std.ArrayList(Scenario) = .empty;
+    errdefer scenarios.deinit(allocator);
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -273,42 +306,12 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         if (i >= argv.len) return error.MissingValue;
         const value = argv[i];
 
-        if (std.mem.eql(u8, arg, "--cwd")) {
-            out.cwd = value;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--scenario")) {
             const scenario = Scenario.parse(value) orelse return error.UnknownScenario;
             try scenarios.append(allocator, scenario);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--smoke-binary")) {
-            out.smoke_binary = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--preflight-binary")) {
-            out.preflight_binary = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--codex-path")) {
-            out.codex_path = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--hooks")) {
-            out.hook_policy = cas_hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--backoff-base-ms")) {
-            const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidBackoffBase;
-            if (parsed == 0) return error.InvalidBackoffBase;
-            out.backoff_base_ms = parsed;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--max-retries")) {
-            out.max_retries = std.fmt.parseInt(u32, value, 10) catch return error.InvalidMaxRetries;
-            continue;
-        }
-        return error.UnknownArg;
+        try parseValueArg(&out, arg, value);
     }
 
     if (scenarios.items.len == 0) {
@@ -324,10 +327,17 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     return out;
 }
 
-fn resolveExecutable(allocator: std.mem.Allocator, explicit: ?[]const u8, fallback_name: []const u8) ![]const u8 {
+fn resolveExecutable(
+    allocator: std.mem.Allocator,
+    explicit: ?[]const u8,
+    fallback_name: []const u8,
+) ![]const u8 {
     if (explicit) |path| return allocator.dupe(u8, path);
 
-    const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
+    const exe_dir = std.process.executableDirPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    ) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
         const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, fallback_name });
@@ -340,14 +350,26 @@ fn resolveExecutable(allocator: std.mem.Allocator, explicit: ?[]const u8, fallba
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+            .{},
+        ) catch return false;
         return true;
     }
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().access(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{},
+    ) catch return false;
     return true;
 }
 
-fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
+fn runCommandCapture(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    argv: []const []const u8,
+) !CommandCapture {
     if (builtin.os.tag == .macos) return runCommandCapturePosixSpawn(allocator, cwd, argv);
 
     const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
@@ -368,13 +390,17 @@ fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []con
     };
 }
 
-fn runCommandCapturePosixSpawn(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
+fn runCommandCapturePosixSpawn(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    argv: []const []const u8,
+) !CommandCapture {
     if (argv.len == 0) return error.FileNotFound;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const temp_root = try makeTempRoot(allocator, "cas-capture");
     defer {
-        deleteTreeAbsolute(temp_root) catch {};
+        cleanupTempRoot(temp_root);
         allocator.free(temp_root);
     }
 
@@ -383,56 +409,28 @@ fn runCommandCapturePosixSpawn(allocator: std.mem.Allocator, cwd: ?[]const u8, a
     const stderr_path = try std.fs.path.join(allocator, &.{ temp_root, "stderr.txt" });
     defer allocator.free(stderr_path);
 
-    var stdout_file = try std.Io.Dir.createFileAbsolute(io, stdout_path, .{ .truncate = true, .read = true });
+    var stdout_file = try std.Io.Dir.createFileAbsolute(
+        io,
+        stdout_path,
+        .{ .truncate = true, .read = true },
+    );
     defer stdout_file.close(io);
-    var stderr_file = try std.Io.Dir.createFileAbsolute(io, stderr_path, .{ .truncate = true, .read = true });
+    var stderr_file = try std.Io.Dir.createFileAbsolute(
+        io,
+        stderr_path,
+        .{ .truncate = true, .read = true },
+    );
     defer stderr_file.close(io);
 
-    var actions: std.c.posix_spawn_file_actions_t = undefined;
-    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
-    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
-    if (std.c.posix_spawn_file_actions_adddup2(&actions, stdout_file.handle, std.posix.STDOUT_FILENO) != 0) return error.SpawnFileActionsFailed;
-    if (std.c.posix_spawn_file_actions_adddup2(&actions, stderr_file.handle, std.posix.STDERR_FILENO) != 0) return error.SpawnFileActionsFailed;
-
-    var cwd_storage: ?[:0]u8 = null;
-    defer if (cwd_storage) |path| allocator.free(path);
-    if (cwd) |path| {
-        cwd_storage = try allocator.dupeZ(u8, path);
-        if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.?.ptr) != 0) return error.SpawnFileActionsFailed;
-    }
-
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer allocator.free(argv_buf);
-    var arg_storage = try allocator.alloc([:0]u8, argv.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-    for (argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
-        arg_count += 1;
-        argv_buf[i] = arg_storage[i].ptr;
-    }
-
-    var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
-        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
-    else
-        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
-
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
-    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS => break,
-        .INTR => continue,
-        .CHILD => return error.NoChildProcess,
-        else => return error.WaitFailed,
-    };
-
+    const exit_code = try spawnCapturedCommand(
+        allocator,
+        cwd,
+        argv,
+        stdout_file.handle,
+        stderr_file.handle,
+    );
     return .{
-        .exit_code = statusToExitCode(@bitCast(status)),
+        .exit_code = exit_code,
         .stdout = try readFileAbsoluteAlloc(allocator, stdout_path, MaxCommandOutputBytes),
         .stderr = try readFileAbsoluteAlloc(allocator, stderr_path, MaxCommandOutputBytes / 2),
     };
@@ -466,22 +464,46 @@ fn statusToExitCode(status: u32) u8 {
 fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
     const base = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    var dir = try std.Io.Dir.openDirAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        parent,
+        .{},
+    );
     defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    return dir.readFileAlloc(std.Io.Threaded.global_single_threaded.io(), base, allocator, .limited(max_bytes));
+    return dir.readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        base,
+        allocator,
+        .limited(max_bytes),
+    );
 }
 
 fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflightResult {
-    const argv = [_][]const u8{ ctx.smoke_binary, "--cwd", ctx.cwd, "--hooks", ctx.hook_policy.asString(), "--json" };
+    const argv = [_][]const u8{
+        ctx.smoke_binary,
+        "--cwd",
+        ctx.cwd,
+        "--hooks",
+        ctx.hook_policy.asString(),
+        "--json",
+    };
     const capture = runCommandCapture(allocator, null, &argv) catch |err| {
         return .{
             .status = "fail",
             .ok = false,
             .exit_code = 1,
-            .detail = try std.fmt.allocPrint(allocator, "unable to start cas_smoke_check: {s}", .{@errorName(err)}),
+            .detail = try std.fmt.allocPrint(
+                allocator,
+                "unable to start cas_smoke_check: {s}",
+                .{@errorName(err)},
+            ),
         };
     };
 
+    return parseSmokeCapture(allocator, capture);
+}
+
+fn parseSmokeCapture(allocator: std.mem.Allocator, capture: CommandCapture) !SmokePreflightResult {
     const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
     const stderr_trimmed = std.mem.trim(u8, capture.stderr, " \t\r\n");
 
@@ -490,12 +512,23 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
     var thread_id: ?[]const u8 = null;
 
     if (stdout_trimmed.len > 0) {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout_trimmed, .{}) catch null;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            stdout_trimmed,
+            .{},
+        ) catch null;
         defer if (parsed) |*owned| owned.deinit();
         if (parsed) |report| {
             if (report.value == .object) {
-                if (boolField(report.value.object, "ok")) |parsed_ok| ok = parsed_ok and capture.exit_code == 0;
-                if (core_json.stringField(report.value.object, "threadId")) |value| thread_id = try allocator.dupe(u8, value);
+                if (boolField(
+                    report.value.object,
+                    "ok",
+                )) |parsed_ok| ok = parsed_ok and capture.exit_code == 0;
+                if (core_json.stringField(
+                    report.value.object,
+                    "threadId",
+                )) |value| thread_id = try allocator.dupe(u8, value);
                 const checks_len = if (report.value.object.get("checks")) |checks_val|
                     switch (checks_val) {
                         .array => |arr| arr.items.len,
@@ -509,7 +542,11 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
                     .{
                         if (ok) "pass" else "fail",
                         checks_len,
-                        if (thread_id) |id| try std.fmt.allocPrint(allocator, ", threadId={s}", .{id}) else "",
+                        if (thread_id) |id| try std.fmt.allocPrint(
+                            allocator,
+                            ", threadId={s}",
+                            .{id},
+                        ) else "",
                     },
                 );
             }
@@ -677,26 +714,7 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         "exhaust",
         tiny_policy,
     );
-    if (success.wire_attempts != 3 or
-        success.retries != 2 or
-        success.notifications != 2 or
-        success.observer_calls != 1)
-    {
-        return error.InvalidSuccessRetryProof;
-    }
-    if (nonoverload.wire_attempts != 1 or
-        nonoverload.retries != 0 or
-        nonoverload.observer_calls != 1)
-    {
-        return error.InvalidNonOverloadProof;
-    }
-    if (exhaustion.wire_attempts != tiny_policy.max_retries + 1 or
-        exhaustion.retries != tiny_policy.max_retries or
-        !exhaustion.exhausted or
-        exhaustion.observer_calls != 1)
-    {
-        return error.InvalidExhaustionProof;
-    }
+    try validateRetryProofs(success, nonoverload, exhaustion, tiny_policy.max_retries);
     const delays = try allocator.dupe(u32, success.delays_ms[0..success.delay_count]);
     return .{
         .name = Scenario.overload_backoff.asString(),
@@ -813,61 +831,13 @@ fn runProductionRetryCase(
         for (notifications.items) |line| allocator.free(line);
         notifications.deinit(allocator);
     }
-    if (std.mem.eql(u8, mode, "success")) {
-        const result = try client.requestJsonCaptureNotificationsWithSendObserver(
-            "conformance/retry",
-            "{\"value\":7}",
-            &notifications,
-            .{ .context = &observer, .before_send = ConformanceSendObserver.count },
-        );
-        defer allocator.free(result);
-        if (!std.mem.eql(u8, result, "{\"ok\":true}") or client.lastError() != null) {
-            return error.InvalidSuccessRetryProof;
-        }
-    } else {
-        const result = client.requestJsonWithSendObserver(
-            "conformance/retry",
-            "{\"value\":7}",
-            .{ .context = &observer, .before_send = ConformanceSendObserver.count },
-        );
-        if (result) |owned| {
-            allocator.free(owned);
-            return error.ExpectedRequestFailure;
-        } else |err| if (err != error.RequestFailed) return err;
-    }
+    try exerciseRetryRequest(allocator, &client, mode, &notifications, &observer);
     if (observer.calls != 1) return error.ObserverCallCountMismatch;
     for (telemetry.delays_ms[0..telemetry.delay_count]) |delay| {
         if (delay > policy.max_delay_ms) return error.RetryDelayOutOfBounds;
     }
 
-    const requests = try std.Io.Dir.readFileAlloc(
-        std.Io.Dir.cwd(),
-        io,
-        log_path,
-        allocator,
-        .limited(64 * 1024),
-    );
-    defer allocator.free(requests);
-    var lines = std.mem.tokenizeScalar(u8, requests, '\n');
-    var index: i64 = 1;
-    while (lines.next()) |line| : (index += 1) {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidRetryRequest,
-        };
-        if (core_json.intField(object, "id") != index) return error.NonFreshRetryRequestId;
-        if (!std.mem.eql(
-            u8,
-            core_json.stringField(object, "method") orelse return error.InvalidRetryRequest,
-            "conformance/retry",
-        )) return error.InvalidRetryRequest;
-        const params = core_json.objectField(object, "params") orelse
-            return error.InvalidRetryRequest;
-        if (core_json.intField(params, "value") != 7) return error.InvalidRetryRequest;
-    }
-    if (index - 1 != telemetry.wire_attempts) return error.RetryAttemptCountMismatch;
+    try verifyRetryWireLog(allocator, io, log_path, telemetry.wire_attempts);
     return .{
         .wire_attempts = telemetry.wire_attempts,
         .retries = telemetry.retries,
@@ -890,10 +860,18 @@ fn commandSummary(allocator: std.mem.Allocator, capture: CommandCapture) ![]cons
         );
     }
     if (stderr_trimmed.len > 0) {
-        return std.fmt.allocPrint(allocator, "exit={d} stderr={s}", .{ capture.exit_code, stderr_trimmed });
+        return std.fmt.allocPrint(
+            allocator,
+            "exit={d} stderr={s}",
+            .{ capture.exit_code, stderr_trimmed },
+        );
     }
     if (stdout_trimmed.len > 0) {
-        return std.fmt.allocPrint(allocator, "exit={d} stdout={s}", .{ capture.exit_code, stdout_trimmed });
+        return std.fmt.allocPrint(
+            allocator,
+            "exit={d} stdout={s}",
+            .{ capture.exit_code, stdout_trimmed },
+        );
     }
     return std.fmt.allocPrint(allocator, "exit={d}", .{capture.exit_code});
 }
@@ -913,7 +891,10 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
         const candidate = try std.fmt.allocPrint(
             allocator,
             "{s}/{s}-{d}-{d}",
-            .{ base, prefix, @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000), attempt },
+            .{ base, prefix, @divFloor(
+                std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+                1_000_000_000,
+            ), attempt },
         );
         std.Io.Dir.createDirAbsolute(
             std.Io.Threaded.global_single_threaded.io(),
@@ -934,7 +915,11 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
 fn deleteTreeAbsolute(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     const base = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    var dir = try std.Io.Dir.openDirAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        parent,
+        .{},
+    );
     defer dir.close(std.Io.Threaded.global_single_threaded.io());
     try dir.deleteTree(std.Io.Threaded.global_single_threaded.io(), base);
 }
@@ -1068,4 +1053,204 @@ test "overload scenario route drives production proxy retry integration" {
     try std.testing.expectEqual(@as(u32, 3), result.attempts);
     try std.testing.expectEqual(@as(u32, 2), result.retries);
     try std.testing.expectEqual(@as(usize, 2), result.delays_ms.len);
+}
+
+fn parseValueArg(out: *ParsedArgs, arg: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, arg, "--cwd")) {
+        out.cwd = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--smoke-binary")) {
+        out.smoke_binary = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--preflight-binary")) {
+        out.preflight_binary = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--codex-path")) {
+        out.codex_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--hooks")) {
+        out.hook_policy = cas_hooks.HookPolicy.parse(value) orelse
+            return error.InvalidHooksPolicy;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--backoff-base-ms")) {
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidBackoffBase;
+        if (parsed == 0) return error.InvalidBackoffBase;
+        out.backoff_base_ms = parsed;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--max-retries")) {
+        out.max_retries = std.fmt.parseInt(u32, value, 10) catch return error.InvalidMaxRetries;
+        return;
+    }
+    return error.UnknownArg;
+}
+
+fn spawnCapturedCommand(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    argv: []const []const u8,
+    stdout_handle: std.posix.fd_t,
+    stderr_handle: std.posix.fd_t,
+) !u8 {
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
+    defer {
+        const destroyed = std.c.posix_spawn_file_actions_destroy(&actions);
+        std.debug.assert(destroyed == 0);
+    }
+    if (std.c.posix_spawn_file_actions_adddup2(
+        &actions,
+        stdout_handle,
+        std.posix.STDOUT_FILENO,
+    ) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_adddup2(
+        &actions,
+        stderr_handle,
+        std.posix.STDERR_FILENO,
+    ) != 0) return error.SpawnFileActionsFailed;
+
+    var cwd_storage: ?[:0]u8 = null;
+    defer if (cwd_storage) |path| allocator.free(path);
+    if (cwd) |path| {
+        cwd_storage = try allocator.dupeZ(u8, path);
+        if (std.c.posix_spawn_file_actions_addchdir_np(
+            &actions,
+            cwd_storage.?.ptr,
+        ) != 0) return error.SpawnFileActionsFailed;
+    }
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_buf);
+    var arg_storage = try allocator.alloc([:0]u8, argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (argv, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
+        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
+    else
+        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    // The owned child determines termination; interruptions only retry the wait.
+    while (true) { // tiger: event-loop
+        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .CHILD => return error.NoChildProcess,
+            else => return error.WaitFailed,
+        }
+    }
+
+    return statusToExitCode(@bitCast(status));
+}
+
+fn validateRetryProofs(
+    success: RetryCaseProof,
+    nonoverload: RetryCaseProof,
+    exhaustion: RetryCaseProof,
+    max_retries: u32,
+) !void {
+    if (success.wire_attempts != 3 or
+        success.retries != 2 or
+        success.notifications != 2 or
+        success.observer_calls != 1)
+    {
+        return error.InvalidSuccessRetryProof;
+    }
+    if (nonoverload.wire_attempts != 1 or
+        nonoverload.retries != 0 or
+        nonoverload.observer_calls != 1)
+    {
+        return error.InvalidNonOverloadProof;
+    }
+    if (exhaustion.wire_attempts != max_retries + 1 or
+        exhaustion.retries != max_retries or
+        !exhaustion.exhausted or
+        exhaustion.observer_calls != 1)
+    {
+        return error.InvalidExhaustionProof;
+    }
+}
+
+fn exerciseRetryRequest(
+    allocator: std.mem.Allocator,
+    client: *cas_proxy_client.Client,
+    mode: []const u8,
+    notifications: *std.ArrayList([]u8),
+    observer: *ConformanceSendObserver,
+) !void {
+    if (std.mem.eql(u8, mode, "success")) {
+        const result = try client.requestJsonCaptureNotificationsWithSendObserver(
+            "conformance/retry",
+            "{\"value\":7}",
+            notifications,
+            .{ .context = observer, .before_send = ConformanceSendObserver.count },
+        );
+        defer allocator.free(result);
+        if (!std.mem.eql(u8, result, "{\"ok\":true}") or client.lastError() != null) {
+            return error.InvalidSuccessRetryProof;
+        }
+    } else {
+        const result = client.requestJsonWithSendObserver(
+            "conformance/retry",
+            "{\"value\":7}",
+            .{ .context = observer, .before_send = ConformanceSendObserver.count },
+        );
+        if (result) |owned| {
+            allocator.free(owned);
+            return error.ExpectedRequestFailure;
+        } else |err| if (err != error.RequestFailed) return err;
+    }
+}
+
+fn verifyRetryWireLog(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_path: []const u8,
+    wire_attempts: u32,
+) !void {
+    const requests = try std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        io,
+        log_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(requests);
+    var lines = std.mem.tokenizeScalar(u8, requests, '\n');
+    var index: i64 = 1;
+    while (lines.next()) |line| : (index += 1) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidRetryRequest,
+        };
+        if (core_json.intField(object, "id") != index) return error.NonFreshRetryRequestId;
+        if (!std.mem.eql(
+            u8,
+            core_json.stringField(object, "method") orelse return error.InvalidRetryRequest,
+            "conformance/retry",
+        )) return error.InvalidRetryRequest;
+        const params = core_json.objectField(object, "params") orelse
+            return error.InvalidRetryRequest;
+        if (core_json.intField(params, "value") != 7) return error.InvalidRetryRequest;
+    }
+    if (index - 1 != wire_attempts) return error.RetryAttemptCountMismatch;
 }

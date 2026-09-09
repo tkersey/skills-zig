@@ -228,6 +228,7 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build test-cas-session-inquiry
 bash apps/cas/scripts/perf/budget_governor_gate.sh
 
-# Linux-only bounded fuzz smoke (matches CI behavior).
-timeout 180 zig test --dep core_json --dep core_io -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -ffuzz --test-filter "fuzz governor"
+# Bounded native fuzz qualification (matches CI behavior).
+.github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor \
+  -Doptimize=ReleaseSafe --fuzz=100K --summary all
 ```

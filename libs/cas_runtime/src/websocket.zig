@@ -2,7 +2,7 @@ const std = @import("std");
 
 const builtin = @import("builtin");
 const launch = @import("transport.zig");
-const hooks = @import("cas_hook_policy");
+const hooks = @import("hook_policy.zig");
 const mem = std.mem;
 
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -18,6 +18,19 @@ pub const max_readyz_bytes: usize = 1024;
 pub const default_startup_timeout_ms = launch.default_startup_timeout_ms;
 
 pub const owner_watchdog_shutdown_grace_ms: u32 = 1_000;
+const transport_poll_quantum_ms: i64 = 1_000;
+
+pub fn retireProcessChild(
+    io: std.Io,
+    child: *std.process.Child,
+    process_group_id: ?u64,
+) void {
+    if (process_group_id) |group_id| forceKillProcessGroup(group_id);
+    child.kill(io);
+    if (process_group_id) |group_id| {
+        _ = waitForProcessGroupExit(group_id, owner_watchdog_shutdown_grace_ms);
+    }
+}
 
 pub const ManagedServer = struct {
     child: std.process.Child,
@@ -253,13 +266,21 @@ pub const Connection = struct {
     }
 
     pub fn sendTextTimeout(self: *Connection, payload: []const u8, timeout_ms: u32) !void {
-        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
-        if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
         const io = std.Io.Threaded.global_single_threaded.io();
         const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
             .clock = .awake,
         });
+        return self.sendTextDeadline(payload, deadline);
+    }
+
+    pub fn sendTextDeadline(
+        self: *Connection,
+        payload: []const u8,
+        deadline: std.Io.Clock.Timestamp,
+    ) !void {
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
+        if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
         writeClientFrame(self, 0x1, payload, deadline) catch |err| switch (err) {
             error.WebSocketWriteLockTimeout => return error.Timeout,
             else => {
@@ -275,7 +296,6 @@ pub const Connection = struct {
     }
 
     pub fn readTextAllocTimeout(self: *Connection, timeout_ms: u32) !?[]u8 {
-        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         const io = std.Io.Threaded.global_single_threaded.io();
         const duration = std.Io.Clock.Duration{
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
@@ -285,6 +305,11 @@ pub const Connection = struct {
             io,
             duration,
         );
+        return self.readTextAllocDeadline(deadline);
+    }
+
+    pub fn readTextAllocDeadline(self: *Connection, deadline: std.Io.Clock.Timestamp) !?[]u8 {
+        if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         return self.readTextAllocUntil(deadline) catch |err| switch (err) {
             error.WebSocketIdleTimeout => return error.Timeout,
             else => return err,
@@ -1589,8 +1614,8 @@ fn writeStreamAllUntil(
             .events = std.posix.POLL.OUT | std.posix.POLL.ERR,
             .revents = 0,
         }};
-        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
-        if (try std.posix.poll(&fds, poll_timeout) == 0) return error.Timeout;
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, transport_poll_quantum_ms));
+        if (try std.posix.poll(&fds, poll_timeout) == 0) continue;
         if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
             return error.ConnectionResetByPeer;
         }
@@ -1642,14 +1667,22 @@ fn readStreamExact(
     const io = std.Io.Threaded.global_single_threaded.io();
     var offset: usize = 0;
     while (offset < dest.len) {
-        const incoming = if (deadline) |value|
-            try stream.socket.receiveTimeout(
+        const incoming = if (deadline) |value| bounded: {
+            if (value.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
+            const quantum = std.Io.Clock.Timestamp.fromNow(io, .{
+                .raw = .fromMilliseconds(transport_poll_quantum_ms),
+                .clock = value.clock,
+            });
+            const poll_deadline = if (value.compare(.lt, quantum)) value else quantum;
+            break :bounded stream.socket.receiveTimeout(
                 io,
                 dest[offset..],
-                .{ .deadline = value },
-            )
-        else
-            try stream.socket.receive(io, dest[offset..]);
+                .{ .deadline = poll_deadline },
+            ) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        } else try stream.socket.receive(io, dest[offset..]);
         if (incoming.data.len == 0) return error.EndOfStream;
         offset += incoming.data.len;
     }

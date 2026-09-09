@@ -133,14 +133,20 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (delegate.isVersionRequested(argv)) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
@@ -168,26 +174,41 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(exit_code);
     }
 
+    return runSelectedTarget(allocator, init.io, argv);
+}
+
+fn runSelectedTarget(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     const target_name = resolveTarget(argv[1]) orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSubcommand", argv[1]);
     };
 
     const target_exec = blk: {
-        const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
-        if (exe_dir) |dir| break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target_name });
+        const exe_dir = std.process.executableDirPathAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            allocator,
+        ) catch null;
+        if (exe_dir) |dir| {
+            defer allocator.free(dir);
+            break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target_name });
+        }
         break :blk try allocator.dupe(u8, target_name);
     };
+    defer allocator.free(target_exec);
 
     var child_argv: std.ArrayList([]const u8) = .empty;
     defer child_argv.deinit(allocator);
     try child_argv.append(allocator, target_exec);
     try child_argv.appendSlice(allocator, argv[2..]);
 
-    const exit_code = runCommand(allocator, init.io, child_argv.items) catch |err| {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const exit_code = runCommand(allocator, io, child_argv.items) catch |err| {
+        var stderr_writer = std.Io.File.stderr().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "failed to launch {s}: {s}\ninstall or expose the compiled CAS binary set beside `cas` ({s})\n",
+            "failed to launch {s}: {s}\ninstall or expose the compiled CAS " ++
+                "binary set beside `cas` ({s})\n",
             .{ target_name, @errorName(err), InstalledBinarySet },
         );
         std.process.exit(1);
@@ -281,12 +302,15 @@ fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) 
     if (spawn_rc != 0) return posixSpawnError(spawn_rc);
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
-    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS => return statusToExitCode(@bitCast(status)),
-        .INTR => continue,
-        .CHILD => return error.NoChildProcess,
-        else => return error.WaitFailed,
-    };
+    // The owned child determines termination; interruptions only retry the wait.
+    while (true) { // tiger: event-loop
+        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => return statusToExitCode(@bitCast(status)),
+            .INTR => continue,
+            .CHILD => return error.NoChildProcess,
+            else => return error.WaitFailed,
+        }
+    }
 }
 
 fn posixSpawnError(rc: c_int) anyerror {
@@ -324,19 +348,31 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "app-server")) {
         return "cas_app_server_preflight";
     }
-    if (std.mem.eql(u8, subcommand, "conformance") or std.mem.eql(u8, subcommand, "conformance-suite") or std.mem.eql(u8, subcommand, "conformance_suite")) {
+    if (std.mem.eql(u8, subcommand, "conformance") or std.mem.eql(
+        u8,
+        subcommand,
+        "conformance-suite",
+    ) or std.mem.eql(u8, subcommand, "conformance_suite")) {
         return "cas_conformance_suite";
     }
     if (std.mem.eql(u8, subcommand, "goal")) {
         return "cas_goal";
     }
-    if (std.mem.eql(u8, subcommand, "instance_runner") or std.mem.eql(u8, subcommand, "instance-runner")) {
+    if (std.mem.eql(
+        u8,
+        subcommand,
+        "instance_runner",
+    ) or std.mem.eql(u8, subcommand, "instance-runner")) {
         return "cas_instance_runner";
     }
     if (std.mem.eql(u8, subcommand, "review")) {
         return "cas_review_session";
     }
-    if (std.mem.eql(u8, subcommand, "session_inquiry") or std.mem.eql(u8, subcommand, "session-inquiry")) {
+    if (std.mem.eql(
+        u8,
+        subcommand,
+        "session_inquiry",
+    ) or std.mem.eql(u8, subcommand, "session-inquiry")) {
         return "cas_session_inquiry";
     }
     if (std.mem.eql(u8, subcommand, "smoke_check") or std.mem.eql(u8, subcommand, "smoke-check")) {
@@ -351,7 +387,10 @@ fn printCapabilities(args: []const []const u8) !void {
         if (std.mem.eql(u8, arg, "--json")) {
             json = true;
         } else if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try stdout.writeAll(
                 \\cas capabilities
@@ -365,7 +404,10 @@ fn printCapabilities(args: []const []const u8) !void {
             core_cli.exitUsageFailure(HelpSurface, Version, "UnknownFlag", arg);
         }
     }
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     try writeCapabilities(stdout, json);
 }
@@ -381,7 +423,10 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_app_server_preflight", resolveTarget("app-server").?);
     try std.testing.expect(resolveTarget("cron") == null);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance").?);
-    try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance-suite").?);
+    try std.testing.expectEqualStrings(
+        "cas_conformance_suite",
+        resolveTarget("conformance-suite").?,
+    );
     try std.testing.expectEqualStrings("cas_goal", resolveTarget("goal").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance_runner").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
@@ -496,17 +541,27 @@ test "capabilities advertise only current review boundary features" {
         "cas_review_history_v2",
     ) == null);
     try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "dcp_v2=true") != null);
+}
 
+test "capabilities JSON advertises only current review boundary features" {
     var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer json_output.deinit();
     try writeCapabilities(&json_output.writer, true);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_opaque_request_binding_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_rer_opaque_request_binding_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),
         "\"cas_workflow_bound_owner_lived_review_v1\": true",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_review_scoped_instructions_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),
@@ -534,7 +589,18 @@ test "capabilities advertise only current review boundary features" {
         "cas_review_history_v2",
     ) == null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"dcp_v2\": true") != null);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_output.written(), .{});
+}
+
+test "capabilities JSON contains exact feature boolean entries" {
+    var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer json_output.deinit();
+    try writeCapabilities(&json_output.writer, true);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_output.written(),
+        .{},
+    );
     defer parsed.deinit();
     const features = parsed.value.object.get("cas_capabilities").?.object.get("features").?.object;
     try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);

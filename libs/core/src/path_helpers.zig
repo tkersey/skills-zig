@@ -19,7 +19,10 @@ pub fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }

@@ -1,0 +1,170 @@
+{
+  "schema": "ledger-artifact-definition/v1",
+  "id": "example/related-records",
+  "owner": "example",
+  "requires": {
+    "abi": "ledger-artifact-abi/v1",
+    "operators": [
+      "append-only-log",
+      "bind-existing",
+      "compare-and-append",
+      "event-kinds",
+      "exact-object",
+      "fold",
+      "reducer",
+      "replay",
+      "transition-table"
+    ]
+  },
+  "parameters": {},
+  "inputs": {
+    "event": {
+      "codec": "json",
+      "max_bytes": 4096
+    }
+  },
+  "canonicalization": {},
+  "shape": {
+    "documents": {
+      "event": {
+        "object": "exact",
+        "fields": {
+          "kind": {},
+          "id": {},
+          "record": {}
+        }
+      }
+    }
+  },
+  "constraints": {
+    "laws": [
+      [
+        "append-only-log",
+        {
+          "input": "event"
+        }
+      ],
+      [
+        "event-kinds",
+        {
+          "values": [
+            "component.created",
+            "component.resolved",
+            "relation.created"
+          ]
+        }
+      ],
+      [
+        "reducer",
+        {
+          "key": "/id",
+          "on": "/kind",
+          "event_kind": "/kind",
+          "retain_once": "/record",
+          "relation": {
+            "discriminator": "/type",
+            "vertex_tag": "component",
+            "edge_tag": "relation",
+            "source": "/from",
+            "target": "/to",
+            "active_states": [
+              "present"
+            ],
+            "max_vertices": 8,
+            "max_edges": 8,
+            "acyclic": true
+          }
+        }
+      ],
+      [
+        "transition-table",
+        {
+          "states": [
+            "pending",
+            "satisfied",
+            "present"
+          ],
+          "transitions": [
+            {
+              "from": null,
+              "on": "component.created",
+              "to": "pending"
+            },
+            {
+              "from": "pending",
+              "on": "component.resolved",
+              "to": "satisfied"
+            },
+            {
+              "from": null,
+              "on": "relation.created",
+              "to": "present"
+            }
+          ]
+        }
+      ]
+    ]
+  },
+  "identity": {},
+  "storage": {
+    "kind": "event-log",
+    "slots": {
+      "events": {
+        "path": "example/plain.jsonl",
+        "kind": "event-log",
+        "codec": "jsonl",
+        "max_bytes": 65536
+      }
+    }
+  },
+  "operations": {
+    "append": {
+      "effects": [
+        {
+          "op": "compare-and-append",
+          "slot": "events",
+          "input": "event"
+        }
+      ]
+    },
+    "bind-existing": {
+      "effects": [
+        {
+          "op": "bind-existing",
+          "slot": "events",
+          "input": "event"
+        }
+      ]
+    }
+  },
+  "projections": {
+    "current": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "fold",
+          "key_field": "id",
+          "state_field": "status",
+          "retained_field": "current",
+          "event_count_field": "event_count",
+          "relation": {
+            "select": "vertices",
+            "target_states": [
+              "satisfied"
+            ],
+            "match": "all",
+            "unmatched_field": "unmatched"
+          }
+        }
+      ]
+    }
+  },
+  "bounds": {
+    "max_input_bytes": 4096,
+    "max_store_bytes": 65536,
+    "max_records": 32,
+    "max_output_bytes": 4096,
+    "max_diagnostics": 8,
+    "max_reducer_states": 16
+  }
+}

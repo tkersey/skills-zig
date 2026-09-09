@@ -180,14 +180,14 @@ pub const Db = struct {
         var raw: ?*c.sqlite3 = null;
         const open_result = c.sqlite3_open_v2(path_z, &raw, flags, null);
         if (open_result != c.SQLITE_OK or raw == null) {
-            if (raw) |handle| _ = c.sqlite3_close(handle);
+            if (raw) |handle| reportSqliteCleanup(c.sqlite3_close(handle), "close failed open");
             return userErrorFmt("failed to open db: {s}", .{db_path});
         }
         return .{ .handle = raw.? };
     }
 
     pub fn close(self: *Db) void {
-        _ = c.sqlite3_close(self.handle);
+        reportSqliteCleanup(c.sqlite3_close(self.handle), "close database");
     }
 
     pub fn prepare(self: *Db, allocator: std.mem.Allocator, sql: []const u8) !Stmt {
@@ -229,8 +229,8 @@ pub const Db = struct {
     }
 
     pub fn rollback(self: *Db, allocator: std.mem.Allocator) void {
-        self.exec(allocator, "rollback", &.{}) catch |err| switch (err) {
-            else => {},
+        self.exec(allocator, "rollback", &.{}) catch |err| {
+            std.log.warn("CAS automation rollback failed: {s}", .{@errorName(err)});
         };
     }
 };
@@ -241,7 +241,7 @@ pub const Stmt = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Stmt) void {
-        _ = c.sqlite3_finalize(self.handle);
+        reportSqliteCleanup(c.sqlite3_finalize(self.handle), "finalize statement");
     }
 
     pub fn bindAll(self: *Stmt, params: []const SqlParam) !void {
@@ -551,7 +551,10 @@ pub fn parseUnixTimestampMs(raw: []const u8) !i64 {
     const parsed = std.fmt.parseInt(i64, raw, 10) catch {
         return userErrorFmt("timestamp must be an integer unix value", .{});
     };
-    if (parsed < 10_000_000_000) return parsed * 1000;
+    if (parsed < 10_000_000_000) {
+        return std.math.mul(i64, parsed, 1000) catch
+            userErrorFmt("timestamp seconds are outside the millisecond range", .{});
+    }
     return parsed;
 }
 
@@ -2202,4 +2205,29 @@ test "doctor rejects symlinked and non-file automation artifacts" {
     try std.testing.expectEqualStrings("unsafe-automation-file", diagnostics.rows.items[0].code);
     try std.testing.expectEqualStrings("unsafe-memory-file", diagnostics.rows.items[1].code);
     try std.testing.expect(diagnostics.hasError());
+}
+
+fn reportSqliteCleanup(result: c_int, operation: []const u8) void {
+    if (result != c.SQLITE_OK) {
+        std.log.warn("CAS automation could not {s}: SQLite status {d}", .{ operation, result });
+    }
+}
+
+test "timestamp admission preserves unit threshold and signed boundaries" {
+    const cases = .{
+        .{ "-9223372036854775", @as(i64, -9223372036854775000) },
+        .{ "-1", @as(i64, -1000) },
+        .{ "0", @as(i64, 0) },
+        .{ "9999999999", @as(i64, 9999999999000) },
+        .{ "10000000000", @as(i64, 10000000000) },
+        .{ "9223372036854775807", std.math.maxInt(i64) },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectEqual(case[1], try parseUnixTimestampMs(case[0]));
+    }
+    for ([_][]const u8{
+        "-9223372036854776", "-9223372036854775808", "9223372036854775808", "invalid",
+    }) |raw| {
+        try std.testing.expectError(error.UserInput, parseUnixTimestampMs(raw));
+    }
 }

@@ -194,7 +194,9 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz passive definition parsing (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test -Mroot=libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "
+        run: >-
+          .github/scripts/linux_fuzz_gate.sh -- zig build test-definition-core
+          -Doptimize=ReleaseSafe --fuzz=100K --summary all
 
   lift:
     needs: changes
@@ -221,7 +223,9 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz lift bench_stats (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_io --dep core_cli -Mroot=apps/lift/scripts/bench_stats.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz "
+        run: >-
+          .github/scripts/linux_fuzz_gate.sh -- zig build test-lift-bench-stats
+          -Doptimize=ReleaseSafe --fuzz=100K --summary all
 
   cas:
     needs: changes
@@ -440,7 +444,9 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz CAS budget governor (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
+        run: >-
+          .github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor
+          -Doptimize=ReleaseSafe --fuzz=100K --summary all
 
   perf-hub:
     needs: changes

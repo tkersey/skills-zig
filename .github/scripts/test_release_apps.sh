@@ -313,6 +313,19 @@ git commit -qm remove-retired-build-owner
 test -z "$(bash "$classifier" affected "$retired_build_base" HEAD)"
 test -z "$(bash "$classifier" version-changed "$retired_build_base" HEAD)"
 
+# A removed app constructor must not inherit the surrounding surviving owners.
+git reset --hard -q "$retired_build_base"
+printf 'pub fn build() void {\n    const surfaces = .{\n        cas.surface,\n        buildRetired(ctx),\n        ledger.surface,\n    };\n}\n' >build.zig
+git add build.zig
+git commit -qm retired-constructor
+retired_constructor_base=$(git rev-parse HEAD)
+sed '/buildRetired(ctx)/d' build.zig >build.next
+mv build.next build.zig
+rm apps/retired/VERSION
+git add build.zig apps/retired/VERSION
+git commit -qm remove-retired-constructor
+test -z "$(bash "$classifier" affected "$retired_constructor_base" HEAD)"
+
 auto_release_paths=()
 while IFS= read -r trigger_path; do
   auto_release_paths+=("$trigger_path")

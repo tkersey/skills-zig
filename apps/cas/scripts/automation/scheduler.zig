@@ -126,7 +126,7 @@ pub fn parsePlistProgramArguments(
         const start = start_tag + "<string>".len;
         const end_rel = std.mem.indexOf(u8, body[start..], "</string>") orelse break;
         if (result.items.len >= 32) return error.TooManyProgramArguments;
-        try result.append(allocator, try allocator.dupe(u8, body[start .. start + end_rel]));
+        try appendProgramArgument(allocator, result, body[start .. start + end_rel]);
         cursor = start + end_rel + "</string>".len;
     }
 }
@@ -137,8 +137,10 @@ fn parseSchedulerPlistJson(
     expected_label: []const u8,
     result: *std.ArrayList([]u8),
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidSchedulerPlist;
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSchedulerPlist;
     const label = parsed.value.object.get("Label") orelse return error.InvalidSchedulerPlist;
@@ -151,11 +153,7 @@ fn parseSchedulerPlistJson(
     }
     for (arguments.array.items) |argument| {
         if (argument != .string) return error.InvalidSchedulerPlist;
-        const owned = try allocator.dupe(u8, argument.string);
-        result.append(allocator, owned) catch |err| {
-            allocator.free(owned);
-            return err;
-        };
+        try appendProgramArgument(allocator, result, argument.string);
     }
 }
 
@@ -181,7 +179,7 @@ pub fn parseLaunchctlProgramArguments(
             trimmed[0] == '"' and
             trimmed[trimmed.len - 1] == '"';
         const value = if (quoted) trimmed[1 .. trimmed.len - 1] else trimmed;
-        try result.append(allocator, try allocator.dupe(u8, value));
+        try appendProgramArgument(allocator, result, value);
     }
     if (in_arguments) return error.UnterminatedProgramArguments;
 }
@@ -315,12 +313,18 @@ fn duplicateProgramArguments(
     target: *std.ArrayList([]u8),
 ) !void {
     for (source) |argument| {
-        const owned = try allocator.dupe(u8, argument);
-        target.append(allocator, owned) catch |err| {
-            allocator.free(owned);
-            return err;
-        };
+        try appendProgramArgument(allocator, target, argument);
     }
+}
+
+fn appendProgramArgument(
+    allocator: std.mem.Allocator,
+    target: *std.ArrayList([]u8),
+    argument: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, argument);
+    errdefer allocator.free(owned);
+    try target.append(allocator, owned);
 }
 
 fn programArgumentsEqual(left: []const []u8, right: []const []u8) bool {
@@ -1884,4 +1888,62 @@ test "scheduler plist inspection distinguishes absence from read failures" {
     @memset(oversized, 'x');
     try tmp.dir.writeFile(io, .{ .sub_path = "oversized.plist", .data = oversized });
     try expectSchedulerPlistReadFailure(allocator, oversized_path);
+}
+
+const ArgumentParserCase = enum { plist, launchctl, json };
+
+test "scheduler argument parsers preserve owned prefixes on allocation failure" {
+    inline for (.{ ArgumentParserCase.plist, .launchctl, .json }) |case| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            checkArgumentParserAllocations,
+            .{case},
+        );
+    }
+}
+
+fn checkArgumentParserAllocations(
+    allocator: std.mem.Allocator,
+    case: ArgumentParserCase,
+) !void {
+    var arguments: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStrings(allocator, arguments);
+    // Precisely one slot forces the first parsed row to allocate after cloning.
+    try arguments.ensureTotalCapacityPrecise(allocator, 1);
+    try appendProgramArgument(allocator, &arguments, "existing");
+    parseArgumentFixture(allocator, case, &arguments) catch |err| {
+        try std.testing.expectEqualStrings("existing", arguments.items[0]);
+        return err;
+    };
+    const expected = [_][]const u8{ "existing", "/opt/cas", "automation", "run-due" };
+    try std.testing.expectEqual(expected.len, arguments.items.len);
+    for (expected, arguments.items) |text, argument| {
+        try std.testing.expectEqualStrings(text, argument);
+    }
+}
+
+fn parseArgumentFixture(
+    allocator: std.mem.Allocator,
+    case: ArgumentParserCase,
+    arguments: *std.ArrayList([]u8),
+) !void {
+    switch (case) {
+        .plist => try parsePlistProgramArguments(
+            allocator,
+            "<key>ProgramArguments</key><array><string>/opt/cas</string>" ++
+                "<string>automation</string><string>run-due</string></array>",
+            arguments,
+        ),
+        .launchctl => try parseLaunchctlProgramArguments(
+            allocator,
+            "arguments = {\n  \"/opt/cas\"\n  automation\n  run-due\n}\n",
+            arguments,
+        ),
+        .json => try parseSchedulerPlistJson(
+            allocator,
+            "{\"Label\":\"test\",\"ProgramArguments\":[\"/opt/cas\",\"automation\",\"run-due\"]}",
+            "test",
+            arguments,
+        ),
+    }
 }

@@ -78,10 +78,11 @@ case "$mode" in
 
     is_retired_build_line() {
       local raw=$1
-      local app token
+      local app token constructor
       for app in "${retired_apps[@]}"; do
         token=${app//-/_}
-        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])" <<<"$raw"; then
+        constructor="build${token//_/}"
+        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])|(^|[^[:alnum:]_])${constructor}([^[:alnum:]_]|$)" <<<"$raw"; then
           return 0
         fi
       done

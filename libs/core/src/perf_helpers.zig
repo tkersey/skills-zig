@@ -14,7 +14,8 @@ pub const AllocStats = struct {
     }
 
     pub fn totalRequestedBytes(self: AllocStats) u64 {
-        return self.requested_alloc_bytes + self.requested_resize_bytes + self.requested_remap_bytes;
+        return self.requested_alloc_bytes +
+            self.requested_resize_bytes + self.requested_remap_bytes;
     }
 };
 
@@ -45,14 +46,26 @@ pub const CountingAllocator = struct {
         return self.child.rawAlloc(len, alignment, ret_addr);
     }
 
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.stats.resize_calls += 1;
         self.stats.requested_resize_bytes += @intCast(new_len);
         return self.child.rawResize(memory, alignment, new_len, ret_addr);
     }
 
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.stats.remap_calls += 1;
         self.stats.requested_remap_bytes += @intCast(new_len);
@@ -70,7 +83,7 @@ pub fn intFieldToUsize(value: std.json.Value) !usize {
     return switch (value) {
         .integer => |i| blk: {
             if (i <= 0) return error.InvalidConfig;
-            break :blk @intCast(i);
+            break :blk std.math.cast(usize, i) orelse return error.InvalidConfig;
         },
         else => error.InvalidConfig,
     };
@@ -101,7 +114,7 @@ pub fn valueToU64(value: std.json.Value) ?u64 {
             break :blk @intCast(v);
         },
         .float => |v| blk: {
-            if (v < 0) break :blk null;
+            if (!std.math.isFinite(v) or v < 0 or v >= 0x1p64) break :blk null;
             break :blk @intFromFloat(v);
         },
         else => null,
@@ -123,15 +136,18 @@ pub fn percentileU64(allocator: std.mem.Allocator, samples: []const u64, p: usiz
     std.mem.sort(u64, copy, {}, lessThanU64);
 
     if (p >= 100) return copy[copy.len - 1];
-    const idx = ((copy.len - 1) * p) / 100;
+    const last = copy.len - 1;
+    const idx = (last / 100) * p + ((last % 100) * p) / 100;
     return copy[idx];
 }
 
 pub fn allowedUpperBoundWithTolerance(base: u64, tolerance_pct: f64) u64 {
     if (base == 0) return 1;
-    const factor = 1.0 + @max(tolerance_pct, 0.0) / 100.0;
-    const allowed = @as(f64, @floatFromInt(base)) * factor;
-    return @as(u64, @intFromFloat(std.math.ceil(allowed)));
+    const tolerance = if (std.math.isNan(tolerance_pct)) 0.0 else @max(tolerance_pct, 0.0);
+    const factor = 1.0 + tolerance / 100.0;
+    const allowed = std.math.ceil(@as(f64, @floatFromInt(base)) * factor);
+    if (allowed >= 0x1p64) return std.math.maxInt(u64);
+    return @intFromFloat(allowed);
 }
 
 fn lessThanU64(_: void, a: u64, b: u64) bool {
@@ -164,4 +180,23 @@ test "float and numeric value helpers parse numbers" {
     try std.testing.expectEqual(@as(?u64, 5), valueToU64(.{ .integer = 5 }));
     try std.testing.expectEqual(@as(?u64, 7), valueToU64(.{ .float = 7.0 }));
     try std.testing.expectEqual(@as(?f64, 9.0), valueToF64(.{ .integer = 9 }));
+}
+
+test "numeric helpers reject unrepresentable unsigned floats" {
+    const invalid = [_]f64{ -1.0, 0x1p64, std.math.inf(f64), std.math.nan(f64) };
+    for (invalid) |value| {
+        try std.testing.expectEqual(@as(?u64, null), valueToU64(.{ .float = value }));
+    }
+    try std.testing.expectEqual(@as(?u64, 7), valueToU64(.{ .float = 7.9 }));
+}
+
+test "tolerance upper bounds saturate instead of trapping" {
+    const maximum = std.math.maxInt(u64);
+    try std.testing.expectEqual(maximum, allowedUpperBoundWithTolerance(maximum, 20));
+    try std.testing.expectEqual(maximum, allowedUpperBoundWithTolerance(1, std.math.inf(f64)));
+    try std.testing.expectEqual(@as(u64, 100), allowedUpperBoundWithTolerance(100, -20));
+    try std.testing.expectEqual(
+        @as(u64, 100),
+        allowedUpperBoundWithTolerance(100, std.math.nan(f64)),
+    );
 }

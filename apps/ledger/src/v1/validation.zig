@@ -247,35 +247,7 @@ const CompiledRule = struct {
     reference_targets: []CompiledReferenceTarget,
 
     fn deinit(self: *CompiledRule, allocator: std.mem.Allocator) void {
-        allocator.free(self.path_ids);
-        for (self.keys) |key| allocator.free(key);
-        allocator.free(self.keys);
-        for (self.optional_keys) |key| allocator.free(key);
-        allocator.free(self.optional_keys);
-        for (self.values) |*value| value.deinit(allocator);
-        allocator.free(self.values);
-        if (self.min_number) |*value| value.deinit(allocator);
-        if (self.max_number) |*value| value.deinit(allocator);
-        for (self.children) |*child| child.deinit(allocator);
-        allocator.free(self.children);
-        for (self.coverage_children) |*child| child.deinit(allocator);
-        allocator.free(self.coverage_children);
-        for (self.variants) |*variant| variant.deinit(allocator);
-        allocator.free(self.variants);
-        for (self.format_parts) |*part| part.deinit(allocator);
-        allocator.free(self.format_parts);
-        for (self.regex_patterns) |*pattern| pattern.deinit(allocator);
-        allocator.free(self.regex_patterns);
-        if (self.sha256_prefix) |prefix| allocator.free(prefix);
-        for (self.reference_sources) |*source| source.deinit(allocator);
-        allocator.free(self.reference_sources);
-        for (self.reference_targets) |*target| target.deinit(allocator);
-        allocator.free(self.reference_targets);
-        if (self.imported_plan) |plan| {
-            plan.deinit(allocator);
-            allocator.destroy(plan);
-        }
-        self.* = undefined;
+        deinitRuleTree(allocator, self);
     }
 };
 
@@ -300,6 +272,112 @@ pub const Plan = struct {
         self.* = undefined;
     }
 };
+
+// A definition has at most 33 import levels. Each plan has a root, at most
+// 16 conditional edges, and 17 item edges (item depths 0 through 16 inclusive).
+const max_compiled_rule_depth = 33 * (1 + 16 + 17);
+
+const RuleDeinitFrame = struct {
+    rule: *CompiledRule,
+    group: usize = 0,
+    index: usize = 0,
+
+    fn next(self: *RuleDeinitFrame) ?*CompiledRule {
+        while (ruleChildGroup(self.rule, self.group)) |rules| {
+            if (self.index < rules.len) {
+                const child = &rules[self.index];
+                self.index += 1;
+                return child;
+            }
+            self.group += 1;
+            self.index = 0;
+        }
+        return null;
+    }
+};
+
+fn ruleChildGroup(rule: *CompiledRule, group: usize) ?[]CompiledRule {
+    if (group == 0) return rule.children;
+    if (group == 1) return rule.coverage_children;
+    var index = group - 2;
+    if (index < rule.variants.len) return rule.variants[index].rules;
+    index -= rule.variants.len;
+    if (index < rule.reference_sources.len) return rule.reference_sources[index].rules;
+    index -= rule.reference_sources.len;
+    if (index < rule.reference_targets.len * 3) {
+        const target = &rule.reference_targets[index / 3];
+        return switch (index % 3) {
+            0 => target.rules,
+            1 => target.match_rules,
+            2 => target.coverage_rules,
+            else => unreachable,
+        };
+    }
+    index -= rule.reference_targets.len * 3;
+    if (index == 0) {
+        if (rule.imported_plan) |plan| return plan.rules;
+    }
+    return null;
+}
+
+fn deinitRuleTree(allocator: std.mem.Allocator, root: *CompiledRule) void {
+    var frames: [max_compiled_rule_depth]RuleDeinitFrame = undefined;
+    frames[0] = .{ .rule = root };
+    var count: usize = 1;
+    while (count != 0) {
+        const frame = &frames[count - 1];
+        if (frame.next()) |child| {
+            std.debug.assert(count < frames.len);
+            frames[count] = .{ .rule = child };
+            count += 1;
+        } else {
+            deinitRuleStorage(allocator, frame.rule);
+            count -= 1;
+        }
+    }
+}
+
+fn deinitRuleStorage(allocator: std.mem.Allocator, rule: *CompiledRule) void {
+    allocator.free(rule.path_ids);
+    deinitKeySlices(allocator, rule.keys);
+    deinitKeySlices(allocator, rule.optional_keys);
+    for (rule.values) |*value| value.deinit(allocator);
+    allocator.free(rule.values);
+    if (rule.min_number) |*value| value.deinit(allocator);
+    if (rule.max_number) |*value| value.deinit(allocator);
+    allocator.free(rule.children);
+    allocator.free(rule.coverage_children);
+    for (rule.variants) |*variant| {
+        if (variant.tag_value) |*value| value.deinit(allocator);
+        allocator.free(variant.rules);
+    }
+    allocator.free(rule.variants);
+    deinitFormatParts(allocator, rule.format_parts);
+    deinitRegexPatterns(allocator, rule.regex_patterns);
+    if (rule.sha256_prefix) |prefix| allocator.free(prefix);
+    for (rule.reference_sources) |source| {
+        allocator.free(source.rules);
+        deinitFormatParts(allocator, source.format_parts);
+    }
+    allocator.free(rule.reference_sources);
+    for (rule.reference_targets) |target| {
+        allocator.free(target.rules);
+        allocator.free(target.match_rules);
+        allocator.free(target.coverage_rules);
+        deinitFormatParts(allocator, target.format_parts);
+    }
+    allocator.free(rule.reference_targets);
+    if (rule.imported_plan) |plan| {
+        for (plan.inputs) |*input| input.deinit(allocator);
+        allocator.free(plan.inputs);
+        for (plan.pointers) |*pointer| pointer.deinit(allocator);
+        allocator.free(plan.pointers);
+        allocator.free(plan.rules);
+        allocator.free(plan.root_shared_prefixes);
+        allocator.destroy(plan);
+    }
+    rule.* = undefined;
+}
 
 const RootTraversal = struct {
     shared_prefixes: []u16,
@@ -362,40 +440,18 @@ const Builder = struct {
     pointers: std.ArrayList(Pointer) = .empty,
     rules: std.ArrayList(CompiledRule) = .empty,
     item_rule_count: usize = 0,
-    conditional_depth: usize = 0,
-    inherited_input_index: ?u8 = null,
 
     fn initRule(
-        self: *Builder,
+        _: *Builder,
         operator: definition.Operator,
         input_index: u8,
         pointer_id: ?u16,
-    ) !CompiledRule {
-        return .{
-            .operator = operator,
-            .input_index = input_index,
-            .pointer_id = pointer_id,
-            .path_ids = try self.allocator.alloc(u16, 0),
-            .keys = try self.allocator.alloc([]u8, 0),
-            .optional_keys = try self.allocator.alloc([]u8, 0),
-            .values = try self.allocator.alloc(EnumScalar, 0),
-            .children = try self.allocator.alloc(CompiledRule, 0),
-            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
-            .variants = try self.allocator.alloc(CompiledVariant, 0),
-            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
-            .regex_patterns = try self.allocator.alloc(
-                CompiledRegexPattern,
-                0,
-            ),
-            .reference_sources = try self.allocator.alloc(
-                CompiledReferenceSource,
-                0,
-            ),
-            .reference_targets = try self.allocator.alloc(
-                CompiledReferenceTarget,
-                0,
-            ),
-        };
+    ) CompiledRule {
+        var rule = emptyCompiledRule();
+        rule.operator = operator;
+        rule.input_index = input_index;
+        rule.pointer_id = pointer_id;
+        return rule;
     }
 
     fn deinit(self: *Builder) void {
@@ -428,136 +484,34 @@ const Builder = struct {
     }
 
     fn compileRawRule(self: *Builder, value: std.json.Value) anyerror!void {
-        const object = try definition_core.json.object(value);
-        const operator = try definition.Operator.parse(
-            try definition_core.json.requiredString(object, "op"),
-        );
-        if (!isValidationOperator(operator)) {
-            return error.UnsupportedValidationOperator;
-        }
-        if (!self.definition_plan.requires(operator)) {
-            return error.UndeclaredArtifactOperator;
-        }
-        const pointer_id = if (object.get("path")) |raw_path|
-            try self.internPointer(try definition_core.json.string(raw_path))
-        else
-            null;
-        const import_index = if (operator == .definition_ref)
-            try findImportedDefinition(
-                self.definition_plan,
-                try definition_core.json.requiredString(
-                    object,
-                    "definition",
-                ),
-            )
-        else
-            null;
-        const canonical_config =
-            try definition_core.canonical_json.canonicalJsonAlloc(
-                self.allocator,
-                value,
-            );
-        defer self.allocator.free(canonical_config);
-        try self.compileRule(.{
-            .operator = operator,
-            .pointer_id = pointer_id,
-            .import_index = import_index,
-            .canonical_config = canonical_config,
-        });
-    }
-
-    fn compileConditionalRules(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-    ) anyerror![]CompiledRule {
-        const values = try definition_core.json.array(raw);
-        if (values.items.len == 0 or values.items.len > 64 or
-            self.conditional_depth >= 16)
-        {
-            return error.InvalidConditionalRuleCount;
-        }
-        const start = self.rules.items.len;
-        errdefer {
-            for (self.rules.items[start..]) |*rule| {
-                rule.deinit(self.allocator);
-            }
-            self.rules.shrinkRetainingCapacity(start);
-        }
-        self.conditional_depth += 1;
-        defer self.conditional_depth -= 1;
-        const previous_input_index = self.inherited_input_index;
-        self.inherited_input_index = input_index;
-        defer self.inherited_input_index = previous_input_index;
-        for (values.items) |value| try self.compileRawRule(value);
-        const count = self.rules.items.len - start;
-        if (count != values.items.len) {
-            return error.UnsupportedConditionalRule;
-        }
-        const rules = try self.allocator.alloc(CompiledRule, count);
-        @memcpy(rules, self.rules.items[start..]);
-        self.rules.shrinkRetainingCapacity(start);
-        return rules;
+        var compiler = Compiler{ .allocator = self.allocator };
+        defer compiler.deinit();
+        var rule = self.initRule(.required_field, 0, null);
+        errdefer rule.deinit(self.allocator);
+        try compiler.rawRule(.{
+            .builder = self,
+            .rule = &rule,
+            .object = undefined,
+            .input_index = 0,
+        }, value, null);
+        try compiler.run();
+        try self.rules.append(self.allocator, rule);
     }
 
     fn compileRule(self: *Builder, source: definition.Rule) anyerror!void {
         if (!isValidationOperator(source.operator)) return;
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            self.allocator,
-            source.canonical_config,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-                .parse_numbers = false,
-            },
-        );
-        defer parsed.deinit();
-        const object = try definition_core.json.object(parsed.value);
-        const input_index = if (object.get("input")) |raw_input|
-            try self.inputIndex(try definition_core.json.string(raw_input))
-        else if (self.inherited_input_index) |inherited|
-            inherited
-        else if (self.inputs.len == 1)
-            0
-        else
-            return error.AmbiguousRuleInput;
-
-        var rule = try self.initRule(
-            source.operator,
-            input_index,
-            source.pointer_id,
-        );
+        var compiler = Compiler{ .allocator = self.allocator };
+        defer compiler.deinit();
+        var rule = self.initRule(.required_field, 0, null);
         errdefer rule.deinit(self.allocator);
-
-        try self.compileRootRuleOperator(source, object, input_index, &rule);
+        try compiler.source(.{
+            .builder = self,
+            .rule = &rule,
+            .object = undefined,
+            .input_index = 0,
+        }, source, null);
+        try compiler.run();
         try self.rules.append(self.allocator, rule);
-    }
-
-    fn compileRootRuleOperator(
-        self: *Builder,
-        source: definition.Rule,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        if (isPrimitiveRootOperator(source.operator)) {
-            return self.compilePrimitiveRootRule(object, rule);
-        }
-        if (isRelationalRootOperator(source.operator)) {
-            return self.compileRelationalRootRule(
-                source,
-                object,
-                input_index,
-                rule,
-            );
-        }
-        return self.compileNestedProtocolRootRule(
-            source,
-            object,
-            input_index,
-            rule,
-        );
     }
 
     fn compilePrimitiveRootRule(
@@ -579,7 +533,7 @@ const Builder = struct {
                 true,
                 rule,
             ),
-            .optional_field => try self.compileOptionalRootRule(object, rule),
+            .optional_field => unreachable,
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
             ),
@@ -613,12 +567,11 @@ const Builder = struct {
 
     fn compileRelationalRootRule(
         self: *Builder,
-        source: definition.Rule,
         object: std.json.ObjectMap,
         input_index: u8,
         rule: *CompiledRule,
     ) anyerror!void {
-        switch (source.operator) {
+        switch (rule.operator) {
             .set_equality,
             .subset,
             .superset,
@@ -632,39 +585,23 @@ const Builder = struct {
             => try self.compileComparisonRootRule(
                 object,
                 input_index,
-                source.pointer_id,
+                rule.pointer_id,
                 rule,
             ),
             .declared_field_values => try self.compileDeclaredValuesRootRule(
                 object,
-                source.pointer_id,
+                rule.pointer_id,
                 rule,
             ),
             .cross_input_equal => try self.compileCrossInputRootRule(
                 object,
                 rule,
             ),
-            .implies => try self.compileImplication(
-                object,
-                input_index,
-                0,
-                false,
-                rule,
-            ),
+            .implies => unreachable,
             .total_partition => try self.compilePartitionRootRule(object, rule),
             .total_mapping => try self.compileMappingRootRule(object, rule),
             .path_format => try self.compilePathFormat(object, rule),
-            .exactly_one, .at_least_one => try self.compileCountRootRule(
-                object,
-                input_index,
-                source.pointer_id,
-                rule,
-            ),
-            .keyed_join => try self.compileKeyedJoinRootRule(
-                object,
-                input_index,
-                rule,
-            ),
+            .exactly_one, .at_least_one, .keyed_join => unreachable,
             .predecessor_successor => try self.compileCorrespondenceRootRule(
                 object,
                 rule,
@@ -725,69 +662,6 @@ const Builder = struct {
         rule.path_ids[0] = try self.internPointer(
             try definition_core.json.requiredString(object, "value"),
         );
-    }
-
-    fn compileNestedProtocolRootRule(
-        self: *Builder,
-        source: definition.Rule,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        switch (source.operator) {
-            .one_of,
-            .all_rules,
-            .any_rules,
-            .no_rules,
-            .object_values,
-            => try self.compileNestedRootRule(object, input_index, rule),
-            .tagged_union => try self.compileTaggedUnion(
-                object,
-                input_index,
-                0,
-                true,
-                rule,
-            ),
-            .definition_ref => try self.compileDefinitionRef(
-                object,
-                true,
-                source.import_index,
-                rule,
-            ),
-            .keyed_unique => try self.compileKeyedUniqueRootRule(
-                object,
-                source.pointer_id,
-                rule,
-            ),
-            .reference_exists => try self.compileReferenceRootRule(
-                object,
-                input_index,
-                source.pointer_id,
-                rule,
-            ),
-            else => {},
-        }
-    }
-
-    fn compileOptionalRootRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "input", "path", "rules", "allow_null" },
-        );
-        try definition_core.json.requireFields(object, &.{ "op", "path" });
-        if (object.get("rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                rule.input_index,
-                0,
-            );
-        }
-        rule.allow_null =
-            try optionalBoolean(object, "allow_null") orelse false;
     }
 
     fn compileSortedRootRule(
@@ -944,73 +818,6 @@ const Builder = struct {
         }
     }
 
-    fn compileCountRootRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        source_pointer_id: ?u16,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "input", "path", "paths", "rules" },
-        );
-        const has_path = object.get("path") != null;
-        if (has_path == (object.get("paths") != null)) {
-            return error.ConflictingCountRuleTargets;
-        }
-        if (has_path) {
-            if (source_pointer_id == null) {
-                return error.CountRuleCollectionMissing;
-            }
-            rule.children = try self.compileItemRules(
-                try definition_core.json.field(object, "rules"),
-                input_index,
-                0,
-            );
-            return;
-        }
-        rule.path_ids = try self.parsePaths(
-            try definition_core.json.field(object, "paths"),
-        );
-        if (object.get("rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-    }
-
-    fn compileKeyedJoinRootRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try requireKeyedJoinKeys(object);
-        rule.pointer_id = try self.internPointer(
-            try definition_core.json.requiredString(object, "collection"),
-        );
-        rule.other_pointer_id = try self.internPointer(
-            try definition_core.json.requiredString(object, "equals"),
-        );
-        rule.path_ids = try self.allocator.alloc(u16, 3);
-        const names = [_][]const u8{ "key", "selector", "value" };
-        for (names, 0..) |name, index| {
-            rule.path_ids[index] = try self.internPointer(
-                try definition_core.json.requiredString(object, name),
-            );
-        }
-        if (object.get("rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-    }
-
     fn compileCorrespondenceRootRule(
         self: *Builder,
         object: std.json.ObjectMap,
@@ -1039,27 +846,6 @@ const Builder = struct {
                 try definition_core.json.requiredString(object, name),
             );
         }
-    }
-
-    fn compileNestedRootRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "input", "path", "rules" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "op", "path", "rules" },
-        );
-        rule.children = try self.compileItemRules(
-            try definition_core.json.field(object, "rules"),
-            input_index,
-            0,
-        );
     }
 
     fn compileKeyedUniqueRootRule(
@@ -1096,209 +882,6 @@ const Builder = struct {
         rule.reference_sources = try self.compileKeySources(
             try definition_core.json.field(object, "sources"),
         );
-    }
-
-    fn compileReferenceRootRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        source_pointer_id: ?u16,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try requireReferenceRootKeys(object);
-        rule.other_input_index = if (object.get("target_input")) |raw|
-            try self.inputIndex(try definition_core.json.string(raw))
-        else
-            input_index;
-        try self.compileReferenceRootSources(
-            object,
-            input_index,
-            source_pointer_id,
-            rule,
-        );
-        try self.compileReferenceRootTargets(object, rule);
-        try compileReferenceRootPolicies(object, rule);
-    }
-
-    fn compileReferenceRootSources(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        source_pointer_id: ?u16,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        if (object.get("sources")) |raw_sources| {
-            if (object.get("path") != null or
-                object.get("reference") != null)
-            {
-                return error.ConflictingReferenceSources;
-            }
-            rule.reference_sources = try self.compileReferenceSources(
-                raw_sources,
-                input_index,
-            );
-            return;
-        }
-        try definition_core.json.requireFields(
-            object,
-            &.{ "path", "reference" },
-        );
-        if (source_pointer_id == null) {
-            return error.ReferenceCollectionMissing;
-        }
-        rule.other_pointer_id = try self.internPointer(
-            try definition_core.json.string(
-                try definition_core.json.field(object, "reference"),
-            ),
-        );
-    }
-
-    fn compileReferenceRootTargets(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        if (object.get("targets")) |raw_targets| {
-            if (hasSingleReferenceTargetFields(object)) {
-                return error.ConflictingReferenceTargets;
-            }
-            rule.reference_targets = try self.compileReferenceTargets(
-                raw_targets,
-                rule.other_input_index.?,
-            );
-            return;
-        }
-        try definition_core.json.requireFields(
-            object,
-            &.{ "target", "key" },
-        );
-        const target_items = try self.optionalPointer(object, "target_items");
-        rule.path_ids = try self.allocator.alloc(
-            u16,
-            if (target_items == null) 2 else 3,
-        );
-        rule.path_ids[0] = try self.internPointer(
-            try definition_core.json.requiredString(object, "target"),
-        );
-        rule.path_ids[1] = try self.internPointer(
-            try definition_core.json.string(
-                try definition_core.json.field(object, "key"),
-            ),
-        );
-        if (target_items) |pointer_id| rule.path_ids[2] = pointer_id;
-        try self.compileReferenceRootTargetRules(object, rule);
-    }
-
-    fn compileReferenceRootTargetRules(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        if (object.get("target_rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                rule.other_input_index.?,
-                0,
-            );
-        }
-        if (object.get("coverage_rules")) |raw_rules| {
-            rule.coverage_children = try self.compileItemRules(
-                raw_rules,
-                rule.other_input_index.?,
-                0,
-            );
-        }
-    }
-
-    fn compileReferenceSources(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-    ) anyerror![]CompiledReferenceSource {
-        const items = try definition_core.json.array(raw);
-        if (items.items.len == 0 or items.items.len > 64) {
-            return error.ReferenceSourceCountInvalid;
-        }
-        const sources = try self.allocator.alloc(
-            CompiledReferenceSource,
-            items.items.len,
-        );
-        var initialized: usize = 0;
-        errdefer {
-            for (sources[0..initialized]) |*source| {
-                source.deinit(self.allocator);
-            }
-            self.allocator.free(sources);
-        }
-        for (items.items, 0..) |item, index| {
-            sources[index] = try self.compileReferenceSource(
-                item,
-                input_index,
-            );
-            initialized += 1;
-        }
-        return sources;
-    }
-
-    fn compileReferenceSource(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-    ) anyerror!CompiledReferenceSource {
-        const object = try definition_core.json.object(raw);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{
-                "path",
-                "items",
-                "reference",
-                "fragments",
-                "rules",
-                "optional",
-                "singleton",
-            },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "path", "reference" },
-        );
-        var source: CompiledReferenceSource = .{
-            .pointer_id = try self.internPointer(
-                try definition_core.json.string(
-                    try definition_core.json.field(object, "path"),
-                ),
-            ),
-            .items_pointer_id = try self.optionalPointer(object, "items"),
-            .reference_pointer_id = try self.internPointer(
-                try definition_core.json.string(
-                    try definition_core.json.field(object, "reference"),
-                ),
-            ),
-            .optional = try optionalBoolean(object, "optional") orelse false,
-            .rules = try self.allocator.alloc(CompiledRule, 0),
-            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
-        };
-        errdefer source.deinit(self.allocator);
-        if (object.get("rules")) |raw_rules| {
-            source.rules = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-        source.singleton =
-            try optionalBoolean(object, "singleton") orelse false;
-        if (source.singleton and source.items_pointer_id != null) {
-            return error.ReferenceSourceModeConflict;
-        }
-        if (object.get("fragments")) |raw_fragments| {
-            source.format_parts = try self.compileFormatParts(
-                raw_fragments,
-                true,
-                false,
-            );
-        }
-        return source;
     }
 
     fn compileKeySources(
@@ -1346,93 +929,6 @@ const Builder = struct {
             initialized += 1;
         }
         return sources;
-    }
-
-    fn compileReferenceTargets(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-    ) anyerror![]CompiledReferenceTarget {
-        const items = try definition_core.json.array(raw);
-        if (items.items.len == 0 or items.items.len > 64) {
-            return error.ReferenceTargetCountInvalid;
-        }
-        const targets = try self.allocator.alloc(
-            CompiledReferenceTarget,
-            items.items.len,
-        );
-        var initialized: usize = 0;
-        errdefer {
-            for (targets[0..initialized]) |*target| {
-                target.deinit(self.allocator);
-            }
-            self.allocator.free(targets);
-        }
-        for (items.items, 0..) |item, index| {
-            targets[index] = try self.compileReferenceTarget(
-                item,
-                input_index,
-            );
-            initialized += 1;
-        }
-        return targets;
-    }
-
-    fn compileReferenceTarget(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-    ) anyerror!CompiledReferenceTarget {
-        const object = try definition_core.json.object(raw);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{
-                "path",
-                "items",
-                "key",
-                "coverage_key",
-                "fragments",
-                "rules",
-                "match_rules",
-                "coverage_rules",
-                "optional",
-            },
-        );
-        try definition_core.json.requireFields(object, &.{"path"});
-        if ((object.get("key") == null) == (object.get("fragments") == null)) {
-            return error.ReferenceTargetKeyInvalid;
-        }
-        var target = try self.initReferenceTarget(object);
-        errdefer target.deinit(self.allocator);
-        if (object.get("rules")) |raw_rules| {
-            target.rules = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-        if (object.get("match_rules")) |raw_rules| {
-            target.match_rules = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-        if (object.get("coverage_rules")) |raw_rules| {
-            target.coverage_rules = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                0,
-            );
-        }
-        if (object.get("fragments")) |raw_fragments| {
-            target.format_parts = try self.compileFormatParts(
-                raw_fragments,
-                false,
-                false,
-            );
-        }
-        return target;
     }
 
     fn initReferenceTarget(
@@ -1596,36 +1092,6 @@ const Builder = struct {
         return error.PathFormatFragmentInvalid;
     }
 
-    fn compileImplication(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        item_mode: bool,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try requireImplicationKeys(object, item_mode);
-        try definition_core.json.requireFields(object, &.{ "op", "if" });
-        rule.pointer_id = try self.internPointer(
-            try definition_core.json.requiredString(object, "if"),
-        );
-        const conditional_rules = object.get("rules");
-        try self.compileImplicationConsequence(
-            object,
-            input_index,
-            depth,
-            item_mode,
-            conditional_rules,
-            rule,
-        );
-        try compileImplicationPredicates(
-            self.allocator,
-            object,
-            conditional_rules != null,
-            rule,
-        );
-    }
-
     fn requireImplicationKeys(
         object: std.json.ObjectMap,
         item_mode: bool,
@@ -1662,53 +1128,6 @@ const Builder = struct {
                     "rules",
                 },
             );
-        }
-    }
-
-    fn compileImplicationConsequence(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        item_mode: bool,
-        conditional_rules: ?std.json.Value,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        const consequent_path = object.get("then");
-        if ((consequent_path == null) == (conditional_rules == null)) {
-            return error.ImplicationConsequenceAmbiguous;
-        }
-        if (consequent_path) |raw_consequent| {
-            rule.other_pointer_id = try self.internPointer(
-                try definition_core.json.string(raw_consequent),
-            );
-            rule.other_input_index = if (!item_mode and
-                object.get("then_input") != null)
-                try self.inputIndex(
-                    try definition_core.json.string(
-                        object.get("then_input").?,
-                    ),
-                )
-            else
-                input_index;
-        } else {
-            if (object.get("then_input") != null or
-                object.get("then_equals") != null or
-                object.get("then_nonempty") != null)
-            {
-                return error.ConditionalRulesHaveScalarConsequence;
-            }
-            rule.children = if (item_mode)
-                try self.compileItemRules(
-                    conditional_rules.?,
-                    input_index,
-                    depth + 1,
-                )
-            else
-                try self.compileConditionalRules(
-                    conditional_rules.?,
-                    input_index,
-                );
         }
     }
 
@@ -1785,79 +1204,9 @@ const Builder = struct {
         return values;
     }
 
-    fn compileItemRules(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-        depth: usize,
-    ) anyerror![]CompiledRule {
-        if (depth > 16) return error.ItemRuleDepthExceeded;
-        const items = try definition_core.json.array(raw);
-        if (items.items.len == 0 or items.items.len > 64) {
-            return error.ItemRuleCountInvalid;
-        }
-        self.item_rule_count = std.math.add(
-            usize,
-            self.item_rule_count,
-            items.items.len,
-        ) catch return error.TooManyItemRules;
-        if (self.item_rule_count > 65_535) return error.TooManyItemRules;
-        const rules = try self.allocator.alloc(CompiledRule, items.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (rules[0..initialized]) |*rule| rule.deinit(self.allocator);
-            self.allocator.free(rules);
-        }
-        for (items.items, 0..) |item, index| {
-            rules[index] = try self.compileItemRule(
-                try definition_core.json.object(item),
-                input_index,
-                depth,
-            );
-            initialized += 1;
-        }
-        return rules;
-    }
-
-    fn compileItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-    ) anyerror!CompiledRule {
-        const operator = try definition.Operator.parse(
-            try definition_core.json.requiredString(object, "op"),
-        );
-        if (!self.definition_plan.requires(operator)) {
-            return error.UndeclaredArtifactOperator;
-        }
-        if (!isItemOperator(operator)) {
-            return error.UnsupportedItemOperator;
-        }
-        if (object.contains("input")) return error.ItemRuleInputForbidden;
-        const pointer_id = if (object.get("path")) |raw|
-            try self.internPointer(try definition_core.json.string(raw))
-        else
-            null;
-        var rule = try self.initRule(operator, input_index, pointer_id);
-        errdefer rule.deinit(self.allocator);
-        if (isPrimitiveItemOperator(operator)) {
-            try self.compilePrimitiveItemRule(object, depth, &rule);
-        } else {
-            try self.compileCompositeItemRule(
-                object,
-                input_index,
-                depth,
-                &rule,
-            );
-        }
-        return rule;
-    }
-
     fn compilePrimitiveItemRule(
         self: *Builder,
         object: std.json.ObjectMap,
-        depth: usize,
         rule: *CompiledRule,
     ) anyerror!void {
         switch (rule.operator) {
@@ -1867,11 +1216,7 @@ const Builder = struct {
                 false,
                 rule,
             ),
-            .optional_field => try self.compileOptionalItemRule(
-                object,
-                depth,
-                rule,
-            ),
+            .optional_field => unreachable,
             .required_field, .field_absent, .timestamp, .unique => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1917,87 +1262,6 @@ const Builder = struct {
         }
     }
 
-    fn compileCompositeItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        switch (rule.operator) {
-            .set_equality,
-            .subset,
-            .superset,
-            .disjoint,
-            .path_scope_subset,
-            .path_scope_disjoint,
-            .member_of,
-            .not_member_of,
-            .field_equal,
-            .field_not_equal,
-            => try self.compileComparisonItemRule(object, input_index, rule),
-            .exactly_one,
-            .at_least_one,
-            => try self.compileCountItemRule(object, input_index, depth, rule),
-            .keyed_unique => try self.compileKeyedUniqueItemRule(object, rule),
-            .reference_exists => try self.compileReferenceItemRule(
-                object,
-                input_index,
-                depth,
-                rule,
-            ),
-            .implies => try self.compileImplication(
-                object,
-                input_index,
-                depth,
-                true,
-                rule,
-            ),
-            .one_of,
-            .all_rules,
-            .any_rules,
-            .no_rules,
-            .object_values,
-            => try self.compileNestedItemRule(object, input_index, depth, rule),
-            .tagged_union => try self.compileTaggedUnion(
-                object,
-                input_index,
-                depth,
-                false,
-                rule,
-            ),
-            .definition_ref => try self.compileDefinitionRef(
-                object,
-                false,
-                null,
-                rule,
-            ),
-            else => unreachable,
-        }
-    }
-
-    fn compileOptionalItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "path", "rules", "allow_null" },
-        );
-        try definition_core.json.requireFields(object, &.{ "op", "path" });
-        if (object.get("rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                rule.input_index,
-                depth + 1,
-            );
-        }
-        rule.allow_null =
-            try optionalBoolean(object, "allow_null") orelse false;
-    }
-
     fn compileSortedItemRule(
         self: *Builder,
         object: std.json.ObjectMap,
@@ -2037,44 +1301,6 @@ const Builder = struct {
         );
     }
 
-    fn compileCountItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "path", "paths", "rules" },
-        );
-        const has_path = object.get("path") != null;
-        if (has_path == (object.get("paths") != null)) {
-            return error.ConflictingCountRuleTargets;
-        }
-        if (has_path) {
-            if (rule.pointer_id == null) {
-                return error.CountRuleCollectionMissing;
-            }
-            rule.children = try self.compileItemRules(
-                try definition_core.json.field(object, "rules"),
-                input_index,
-                depth + 1,
-            );
-            return;
-        }
-        rule.path_ids = try self.parsePaths(
-            try definition_core.json.field(object, "paths"),
-        );
-        if (object.get("rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                depth + 1,
-            );
-        }
-    }
-
     fn compileKeyedUniqueItemRule(
         self: *Builder,
         object: std.json.ObjectMap,
@@ -2092,98 +1318,13 @@ const Builder = struct {
         );
     }
 
-    fn compileReferenceItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try requireReferenceItemKeys(object);
-        if (rule.pointer_id == null) {
-            return error.ReferenceCollectionMissing;
-        }
-        rule.other_input_index = input_index;
-        rule.other_pointer_id = try self.internPointer(
-            try definition_core.json.string(
-                try definition_core.json.field(object, "reference"),
-            ),
-        );
-        try self.compileReferenceItemTarget(
-            object,
-            input_index,
-            depth,
-            rule,
-        );
-        try compileReferencePolicies(object, rule.pointer_id.?, rule);
-    }
-
-    fn compileReferenceItemTarget(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        const target_items = try self.optionalPointer(object, "target_items");
-        rule.path_ids = try self.allocator.alloc(
-            u16,
-            if (target_items == null) 2 else 3,
-        );
-        rule.path_ids[0] = try self.internPointer(
-            try definition_core.json.requiredString(object, "target"),
-        );
-        rule.path_ids[1] = try self.internPointer(
-            try definition_core.json.string(
-                try definition_core.json.field(object, "key"),
-            ),
-        );
-        if (target_items) |pointer_id| rule.path_ids[2] = pointer_id;
-        if (object.get("target_rules")) |raw_rules| {
-            rule.children = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                depth + 1,
-            );
-        }
-        if (object.get("coverage_rules")) |raw_rules| {
-            rule.coverage_children = try self.compileItemRules(
-                raw_rules,
-                input_index,
-                depth + 1,
-            );
-        }
-    }
-
-    fn compileNestedItemRule(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "op", "path", "rules" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "op", "path", "rules" },
-        );
-        rule.children = try self.compileItemRules(
-            try definition_core.json.field(object, "rules"),
-            input_index,
-            depth + 1,
-        );
-    }
-
     fn compileDefinitionRef(
         self: *Builder,
         object: std.json.ObjectMap,
         allow_input: bool,
         expected_import_index: ?u16,
         rule: *CompiledRule,
-    ) anyerror!void {
+    ) anyerror!*const definition.Plan {
         if (allow_input) {
             try definition_core.json.requireExactKeys(
                 object,
@@ -2233,8 +1374,8 @@ const Builder = struct {
         );
         self.allocator.free(rule.path_ids);
         rule.path_ids = bindings;
-        rule.imported_plan = try self.compileImportedPlan(imported_definition);
         rule.import_index = import_index;
+        return imported_definition;
     }
 
     fn compileImportedInputBindings(
@@ -2276,31 +1417,6 @@ const Builder = struct {
             return error.ImportedDefinitionSelfBindingInvalid;
         }
         return bindings;
-    }
-
-    fn compileImportedPlan(
-        self: *Builder,
-        imported_definition: *const definition.Plan,
-    ) !*Plan {
-        const imported_plan = try self.allocator.create(Plan);
-        var imported_plan_initialized = false;
-        errdefer {
-            if (imported_plan_initialized) {
-                imported_plan.deinit(self.allocator);
-            }
-            self.allocator.destroy(imported_plan);
-        }
-        imported_plan.* = try compile(
-            self.allocator,
-            imported_definition,
-        );
-        imported_plan_initialized = true;
-        for (imported_plan.rules) |imported_rule| {
-            if (!isValidationOperator(imported_rule.operator)) {
-                return error.UnsupportedImportedDefinitionRule;
-            }
-        }
-        return imported_plan;
     }
 
     fn compileSha256Rule(
@@ -2508,117 +1624,6 @@ const Builder = struct {
         );
     }
 
-    fn compileTaggedUnion(
-        self: *Builder,
-        object: std.json.ObjectMap,
-        input_index: u8,
-        depth: usize,
-        allow_input: bool,
-        rule: *CompiledRule,
-    ) anyerror!void {
-        if (allow_input) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "input", "path", "tag", "variants" },
-            );
-        } else {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "path", "tag", "variants" },
-            );
-        }
-        try definition_core.json.requireFields(
-            object,
-            &.{ "op", "path", "variants" },
-        );
-        if (object.get("tag")) |raw_tag| {
-            rule.other_pointer_id = try self.internPointer(
-                try definition_core.json.string(raw_tag),
-            );
-        }
-        const raw_variants = try definition_core.json.array(
-            try definition_core.json.field(object, "variants"),
-        );
-        if (raw_variants.items.len == 0 or raw_variants.items.len > 64) {
-            return error.TaggedUnionVariantCountInvalid;
-        }
-        const variants = try self.allocator.alloc(
-            CompiledVariant,
-            raw_variants.items.len,
-        );
-        var initialized: usize = 0;
-        errdefer {
-            for (variants[0..initialized]) |*variant| {
-                variant.deinit(self.allocator);
-            }
-            self.allocator.free(variants);
-        }
-        for (raw_variants.items, 0..) |raw_variant, index| {
-            var variant = try self.compileVariant(
-                raw_variant,
-                input_index,
-                depth,
-                rule.other_pointer_id != null,
-            );
-            errdefer variant.deinit(self.allocator);
-            if (variantDuplicates(variant, variants[0..initialized])) {
-                return error.DuplicateTaggedUnionVariant;
-            }
-            variants[index] = variant;
-            initialized += 1;
-        }
-        rule.variants = variants;
-    }
-
-    fn compileVariant(
-        self: *Builder,
-        raw: std.json.Value,
-        input_index: u8,
-        depth: usize,
-        tagged: bool,
-    ) anyerror!CompiledVariant {
-        const object = try definition_core.json.object(raw);
-        if (tagged) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "value", "rules" },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "value", "rules" },
-            );
-        } else {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "kind", "rules" },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "kind", "rules" },
-            );
-        }
-        return .{
-            .kind = if (!tagged)
-                try JsonKind.parse(
-                    try definition_core.json.requiredString(object, "kind"),
-                )
-            else
-                null,
-            .tag_value = if (tagged)
-                try parseEnumScalar(
-                    self.allocator,
-                    try definition_core.json.field(object, "value"),
-                )
-            else
-                null,
-            .rules = try self.compileVariantRules(
-                try definition_core.json.field(object, "rules"),
-                input_index,
-                depth + 1,
-            ),
-        };
-    }
-
     fn variantDuplicates(
         variant: CompiledVariant,
         prior_variants: []const CompiledVariant,
@@ -2634,18 +1639,828 @@ const Builder = struct {
         return false;
     }
 
-    fn compileVariantRules(
-        self: *Builder,
-        raw: std.json.Value,
+    const RuleWork = struct {
+        builder: *Builder,
+        rule: *CompiledRule,
+        object: std.json.ObjectMap,
         input_index: u8,
+        depth: usize = 0,
+        conditional_depth: usize = 0,
+        import_depth: usize = 0,
+        item_mode: bool = false,
+    };
+
+    const RuleGroup = struct {
+        work: RuleWork,
+        raw: std.json.Value,
+        output: *[]CompiledRule,
+        allow_empty: bool = false,
+    };
+
+    const RuleSequence = struct {
+        work: RuleWork,
+        raw: []const std.json.Value,
+        output: []CompiledRule,
+        index: usize = 0,
+    };
+
+    const VariantSequence = struct {
+        work: RuleWork,
+        raw: []const std.json.Value,
+        index: usize = 0,
+    };
+
+    const ReferenceSequence = struct {
+        work: RuleWork,
+        raw: []const std.json.Value,
+        index: usize = 0,
+    };
+
+    const ReferenceFinish = struct {
+        work: RuleWork,
+        object: std.json.ObjectMap,
+        index: usize,
+    };
+
+    const ImportWork = struct {
+        builder: *Builder,
+        destination: *CompiledRule,
         depth: usize,
-    ) anyerror![]CompiledRule {
-        const items = try definition_core.json.array(raw);
-        if (items.items.len == 0) {
-            return self.allocator.alloc(CompiledRule, 0);
+        index: usize = 0,
+    };
+
+    const CompilerTask = union(enum) {
+        root: RuleWork,
+        item: RuleWork,
+        release_parsed: std.json.Parsed(std.json.Value),
+        group: RuleGroup,
+        sequence: RuleSequence,
+        optional_finish: RuleWork,
+        implication_finish: RuleWork,
+        variant: VariantSequence,
+        variant_check: VariantSequence,
+        reference_targets: RuleWork,
+        reference_policies: RuleWork,
+        reference_source: ReferenceSequence,
+        reference_source_finish: ReferenceFinish,
+        reference_target: ReferenceSequence,
+        reference_target_finish: ReferenceFinish,
+        import_next: ImportWork,
+        import_finish: ImportWork,
+    };
+
+    const Compiler = struct {
+        allocator: std.mem.Allocator,
+        tasks: std.ArrayList(CompilerTask) = .empty,
+
+        // At most 33 import levels, each with 17 conditional and 17 item
+        // levels. Each level retains at most six continuations; siblings
+        // occupy one sequence frame regardless of their admitted count.
+        const max_tasks = 33 * (17 + 17) * 6;
+
+        fn deinit(self: *Compiler) void {
+            while (self.tasks.pop()) |task| switch (task) {
+                .release_parsed => |parsed| parsed.deinit(),
+                .import_finish => |work| self.destroyImport(work),
+                else => {},
+            };
+            self.tasks.deinit(self.allocator);
         }
-        return self.compileItemRules(raw, input_index, depth);
-    }
+
+        fn destroyImport(self: *Compiler, work: ImportWork) void {
+            work.builder.deinit();
+            self.allocator.destroy(work.builder);
+        }
+
+        fn reserve(self: *Compiler, count: usize) !void {
+            std.debug.assert(self.tasks.items.len <= max_tasks);
+            if (count > max_tasks - self.tasks.items.len) {
+                return error.ValidationCompilerDepthExceeded;
+            }
+            try self.tasks.ensureUnusedCapacity(self.allocator, count);
+        }
+
+        fn push(self: *Compiler, task: CompilerTask) !void {
+            try self.reserve(1);
+            self.tasks.appendAssumeCapacity(task);
+            std.debug.assert(self.tasks.items.len <= max_tasks);
+        }
+
+        fn run(self: *Compiler) anyerror!void {
+            while (self.tasks.pop()) |task| try self.step(task);
+        }
+
+        fn step(self: *Compiler, task: CompilerTask) anyerror!void {
+            switch (task) {
+                .root => |work| try self.root(work),
+                .item => |work| try self.item(work),
+                .release_parsed => |parsed| parsed.deinit(),
+                .group => |group| try self.ruleGroup(group),
+                .sequence => |value| try self.sequence(value),
+                .optional_finish => |work| {
+                    work.rule.allow_null = try optionalBoolean(
+                        work.object,
+                        "allow_null",
+                    ) orelse false;
+                },
+                .implication_finish => |work| try compileImplicationPredicates(
+                    self.allocator,
+                    work.object,
+                    work.object.get("rules") != null,
+                    work.rule,
+                ),
+                .variant => |value| try self.variant(value),
+                .variant_check => |value| try checkVariant(value),
+                .reference_targets => |work| try self.referenceTargets(work),
+                .reference_policies => |work| try referencePolicies(work),
+                .reference_source => |value| try self.referenceSource(value),
+                .reference_source_finish => |value| try self.sourceFinish(value),
+                .reference_target => |value| try self.referenceTarget(value),
+                .reference_target_finish => |value| try self.targetFinish(value),
+                .import_next => |work| try self.importNext(work),
+                .import_finish => |work| try self.importFinish(work),
+            }
+        }
+
+        fn source(
+            self: *Compiler,
+            work: RuleWork,
+            source_rule: definition.Rule,
+            inherited_input: ?u8,
+        ) !void {
+            try self.reserve(2);
+            const parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                self.allocator,
+                source_rule.canonical_config,
+                .{
+                    .allocate = .alloc_always,
+                    .duplicate_field_behavior = .@"error",
+                    .parse_numbers = false,
+                },
+            );
+            errdefer parsed.deinit();
+            const object = try definition_core.json.object(parsed.value);
+            const input_index = if (object.get("input")) |raw|
+                try work.builder.inputIndex(try definition_core.json.string(raw))
+            else if (inherited_input) |index|
+                index
+            else if (work.builder.inputs.len == 1)
+                0
+            else
+                return error.AmbiguousRuleInput;
+            work.rule.* = work.builder.initRule(
+                source_rule.operator,
+                input_index,
+                source_rule.pointer_id,
+            );
+            work.rule.import_index = source_rule.import_index;
+            var next = work;
+            next.object = object;
+            next.input_index = input_index;
+            next.item_mode = false;
+            self.tasks.appendAssumeCapacity(.{ .release_parsed = parsed });
+            self.tasks.appendAssumeCapacity(.{ .root = next });
+        }
+
+        fn rawRule(
+            self: *Compiler,
+            work: RuleWork,
+            value: std.json.Value,
+            inherited_input: ?u8,
+        ) !void {
+            const object = try definition_core.json.object(value);
+            const operator = try definition.Operator.parse(
+                try definition_core.json.requiredString(object, "op"),
+            );
+            if (!isValidationOperator(operator)) return error.UnsupportedValidationOperator;
+            if (!work.builder.definition_plan.requires(operator)) {
+                return error.UndeclaredArtifactOperator;
+            }
+            const pointer_id = if (object.get("path")) |path|
+                try work.builder.internPointer(try definition_core.json.string(path))
+            else
+                null;
+            const import_index = if (operator == .definition_ref)
+                try findImportedDefinition(
+                    work.builder.definition_plan,
+                    try definition_core.json.requiredString(object, "definition"),
+                )
+            else
+                null;
+            const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+                self.allocator,
+                value,
+            );
+            defer self.allocator.free(canonical);
+            try self.source(work, .{
+                .operator = operator,
+                .pointer_id = pointer_id,
+                .import_index = import_index,
+                .canonical_config = canonical,
+            }, inherited_input);
+        }
+
+        fn root(self: *Compiler, work: RuleWork) !void {
+            switch (work.rule.operator) {
+                .optional_field => try self.optional(work),
+                .implies => try self.implication(work),
+                .exactly_one, .at_least_one => try self.countRule(work),
+                .keyed_join => try self.keyedJoin(work),
+                .one_of, .all_rules, .any_rules, .no_rules, .object_values => try self.nested(work),
+                .tagged_union => try self.taggedUnion(work),
+                .definition_ref => try self.imported(work),
+                .reference_exists => try self.referenceRoot(work),
+                .keyed_unique => try work.builder.compileKeyedUniqueRootRule(
+                    work.object,
+                    work.rule.pointer_id,
+                    work.rule,
+                ),
+                else => try self.plainRoot(work),
+            }
+        }
+
+        fn plainRoot(self: *Compiler, work: RuleWork) !void {
+            _ = self;
+            if (isPrimitiveRootOperator(work.rule.operator)) {
+                try work.builder.compilePrimitiveRootRule(work.object, work.rule);
+            } else if (isRelationalRootOperator(work.rule.operator)) {
+                try work.builder.compileRelationalRootRule(
+                    work.object,
+                    work.input_index,
+                    work.rule,
+                );
+            }
+        }
+
+        fn item(self: *Compiler, work: RuleWork) !void {
+            const operator = try definition.Operator.parse(
+                try definition_core.json.requiredString(work.object, "op"),
+            );
+            if (!work.builder.definition_plan.requires(operator)) {
+                return error.UndeclaredArtifactOperator;
+            }
+            if (!isItemOperator(operator)) return error.UnsupportedItemOperator;
+            if (work.object.contains("input")) return error.ItemRuleInputForbidden;
+            const pointer_id = if (work.object.get("path")) |raw_path|
+                try work.builder.internPointer(try definition_core.json.string(raw_path))
+            else
+                null;
+            work.rule.* = work.builder.initRule(operator, work.input_index, pointer_id);
+            switch (operator) {
+                .optional_field => try self.optional(work),
+                .implies => try self.implication(work),
+                .exactly_one, .at_least_one => try self.countRule(work),
+                .one_of, .all_rules, .any_rules, .no_rules, .object_values => try self.nested(work),
+                .tagged_union => try self.taggedUnion(work),
+                .definition_ref => try self.imported(work),
+                .reference_exists => try self.referenceItem(work),
+                .keyed_unique => try work.builder.compileKeyedUniqueItemRule(
+                    work.object,
+                    work.rule,
+                ),
+                else => {
+                    if (isPrimitiveItemOperator(operator)) {
+                        try work.builder.compilePrimitiveItemRule(
+                            work.object,
+                            work.rule,
+                        );
+                    } else {
+                        try work.builder.compileComparisonItemRule(
+                            work.object,
+                            work.input_index,
+                            work.rule,
+                        );
+                    }
+                },
+            }
+        }
+
+        fn childWork(work: RuleWork) RuleWork {
+            var child = work;
+            child.depth = if (work.item_mode) work.depth + 1 else 0;
+            child.item_mode = true;
+            return child;
+        }
+
+        fn children(
+            self: *Compiler,
+            work: RuleWork,
+            raw_rules: std.json.Value,
+            output: *[]CompiledRule,
+        ) !void {
+            try self.push(.{ .group = .{
+                .work = childWork(work),
+                .raw = raw_rules,
+                .output = output,
+            } });
+        }
+
+        fn optionalChildren(
+            self: *Compiler,
+            work: RuleWork,
+            name: []const u8,
+            output: *[]CompiledRule,
+        ) !void {
+            if (work.object.get(name)) |raw_rules| {
+                try self.children(work, raw_rules, output);
+            }
+        }
+
+        fn ruleGroup(self: *Compiler, value: RuleGroup) !void {
+            if (value.allow_empty) {
+                const items = try definition_core.json.array(value.raw);
+                if (items.items.len == 0) return;
+            }
+            if (value.work.item_mode and value.work.depth > 16) {
+                return error.ItemRuleDepthExceeded;
+            }
+            const items = try definition_core.json.array(value.raw);
+            if (value.work.item_mode) {
+                try admitItemGroup(value.work.builder, items.items.len);
+            } else if (items.items.len == 0 or items.items.len > 64 or
+                value.work.conditional_depth > 16)
+            {
+                return error.InvalidConditionalRuleCount;
+            }
+            const rules = try self.allocator.alloc(CompiledRule, items.items.len);
+            for (rules) |*rule| rule.* = value.work.builder.initRule(.required_field, 0, null);
+            self.allocator.free(value.output.*);
+            value.output.* = rules;
+            try self.push(.{ .sequence = .{
+                .work = value.work,
+                .raw = items.items,
+                .output = rules,
+            } });
+        }
+
+        fn admitItemGroup(builder: *Builder, count: usize) !void {
+            if (count == 0 or count > 64) return error.ItemRuleCountInvalid;
+            builder.item_rule_count = std.math.add(
+                usize,
+                builder.item_rule_count,
+                count,
+            ) catch return error.TooManyItemRules;
+            if (builder.item_rule_count > 65_535) return error.TooManyItemRules;
+        }
+
+        fn sequence(self: *Compiler, value: RuleSequence) !void {
+            if (value.index == value.raw.len) return;
+            var next = value;
+            next.index += 1;
+            try self.push(.{ .sequence = next });
+            var work = value.work;
+            work.rule = &value.output[value.index];
+            if (work.item_mode) {
+                work.object = try definition_core.json.object(value.raw[value.index]);
+                try self.push(.{ .item = work });
+            } else {
+                try self.rawRule(work, value.raw[value.index], work.input_index);
+            }
+        }
+
+        fn optional(self: *Compiler, work: RuleWork) !void {
+            const keys: []const []const u8 = if (work.item_mode)
+                &.{ "op", "path", "rules", "allow_null" }
+            else
+                &.{ "op", "input", "path", "rules", "allow_null" };
+            try definition_core.json.requireExactKeys(work.object, keys);
+            try definition_core.json.requireFields(work.object, &.{ "op", "path" });
+            try self.push(.{ .optional_finish = work });
+            try self.optionalChildren(work, "rules", &work.rule.children);
+        }
+
+        fn nested(self: *Compiler, work: RuleWork) !void {
+            const keys: []const []const u8 = if (work.item_mode)
+                &.{ "op", "path", "rules" }
+            else
+                &.{ "op", "input", "path", "rules" };
+            try definition_core.json.requireExactKeys(work.object, keys);
+            try definition_core.json.requireFields(work.object, &.{ "op", "path", "rules" });
+            try self.children(
+                work,
+                try definition_core.json.field(work.object, "rules"),
+                &work.rule.children,
+            );
+        }
+
+        fn countRule(self: *Compiler, work: RuleWork) !void {
+            const keys: []const []const u8 = if (work.item_mode)
+                &.{ "op", "path", "paths", "rules" }
+            else
+                &.{ "op", "input", "path", "paths", "rules" };
+            try definition_core.json.requireExactKeys(work.object, keys);
+            const has_path = work.object.get("path") != null;
+            if (has_path == (work.object.get("paths") != null)) {
+                return error.ConflictingCountRuleTargets;
+            }
+            if (has_path) {
+                if (work.rule.pointer_id == null) return error.CountRuleCollectionMissing;
+                try self.children(
+                    work,
+                    try definition_core.json.field(work.object, "rules"),
+                    &work.rule.children,
+                );
+            } else {
+                work.rule.path_ids = try work.builder.parsePaths(
+                    try definition_core.json.field(work.object, "paths"),
+                );
+                try self.optionalChildren(work, "rules", &work.rule.children);
+            }
+        }
+
+        fn keyedJoin(self: *Compiler, work: RuleWork) !void {
+            try requireKeyedJoinKeys(work.object);
+            work.rule.pointer_id = try work.builder.internPointer(
+                try definition_core.json.requiredString(work.object, "collection"),
+            );
+            work.rule.other_pointer_id = try work.builder.internPointer(
+                try definition_core.json.requiredString(work.object, "equals"),
+            );
+            work.rule.path_ids = try self.allocator.alloc(u16, 3);
+            for ([_][]const u8{ "key", "selector", "value" }, 0..) |name, index| {
+                work.rule.path_ids[index] = try work.builder.internPointer(
+                    try definition_core.json.requiredString(work.object, name),
+                );
+            }
+            try self.optionalChildren(work, "rules", &work.rule.children);
+        }
+
+        fn implication(self: *Compiler, work: RuleWork) !void {
+            try requireImplicationKeys(work.object, work.item_mode);
+            try definition_core.json.requireFields(work.object, &.{ "op", "if" });
+            work.rule.pointer_id = try work.builder.internPointer(
+                try definition_core.json.requiredString(work.object, "if"),
+            );
+            const consequence = work.object.get("then");
+            const raw_rules = work.object.get("rules");
+            if ((consequence == null) == (raw_rules == null)) {
+                return error.ImplicationConsequenceAmbiguous;
+            }
+            if (consequence) |raw_consequence| {
+                work.rule.other_pointer_id = try work.builder.internPointer(
+                    try definition_core.json.string(raw_consequence),
+                );
+                work.rule.other_input_index = if (!work.item_mode and
+                    work.object.get("then_input") != null)
+                    try work.builder.inputIndex(try definition_core.json.string(
+                        work.object.get("then_input").?,
+                    ))
+                else
+                    work.input_index;
+            } else {
+                if (work.object.get("then_input") != null or
+                    work.object.get("then_equals") != null or
+                    work.object.get("then_nonempty") != null)
+                {
+                    return error.ConditionalRulesHaveScalarConsequence;
+                }
+            }
+            try self.push(.{ .implication_finish = work });
+            if (raw_rules) |rules| {
+                if (work.item_mode) {
+                    try self.children(work, rules, &work.rule.children);
+                } else {
+                    var child = work;
+                    child.conditional_depth += 1;
+                    try self.push(.{ .group = .{
+                        .work = child,
+                        .raw = rules,
+                        .output = &work.rule.children,
+                    } });
+                }
+            }
+        }
+
+        fn taggedUnion(self: *Compiler, work: RuleWork) !void {
+            const keys: []const []const u8 = if (work.item_mode)
+                &.{ "op", "path", "tag", "variants" }
+            else
+                &.{ "op", "input", "path", "tag", "variants" };
+            try definition_core.json.requireExactKeys(work.object, keys);
+            try definition_core.json.requireFields(work.object, &.{ "op", "path", "variants" });
+            if (work.object.get("tag")) |tag| {
+                work.rule.other_pointer_id = try work.builder.internPointer(
+                    try definition_core.json.string(tag),
+                );
+            }
+            const variants = try definition_core.json.array(
+                try definition_core.json.field(work.object, "variants"),
+            );
+            if (variants.items.len == 0 or variants.items.len > 64) {
+                return error.TaggedUnionVariantCountInvalid;
+            }
+            work.rule.variants = try self.allocator.alloc(CompiledVariant, variants.items.len);
+            for (work.rule.variants) |*value| value.* = .{ .rules = &.{} };
+            try self.push(.{ .variant = .{ .work = work, .raw = variants.items } });
+        }
+
+        fn variant(self: *Compiler, value: VariantSequence) !void {
+            if (value.index == value.raw.len) return;
+            const object = try definition_core.json.object(value.raw[value.index]);
+            const tagged = value.work.rule.other_pointer_id != null;
+            const keys: []const []const u8 = if (tagged)
+                &.{ "value", "rules" }
+            else
+                &.{ "kind", "rules" };
+            try definition_core.json.requireExactKeys(object, keys);
+            try definition_core.json.requireFields(object, keys);
+            const output = &value.work.rule.variants[value.index];
+            if (tagged) {
+                output.tag_value = try parseEnumScalar(
+                    self.allocator,
+                    try definition_core.json.field(object, "value"),
+                );
+            } else {
+                output.kind = try JsonKind.parse(
+                    try definition_core.json.requiredString(object, "kind"),
+                );
+            }
+            var next = value;
+            next.index += 1;
+            try self.push(.{ .variant = next });
+            try self.push(.{ .variant_check = value });
+            var work = value.work;
+            work.item_mode = true;
+            work.depth += 1;
+            try self.push(.{ .group = .{
+                .work = work,
+                .raw = try definition_core.json.field(object, "rules"),
+                .output = &output.rules,
+                .allow_empty = true,
+            } });
+        }
+
+        fn checkVariant(value: VariantSequence) !void {
+            const variants = value.work.rule.variants;
+            if (variantDuplicates(variants[value.index], variants[0..value.index])) {
+                return error.DuplicateTaggedUnionVariant;
+            }
+        }
+
+        fn referenceRoot(self: *Compiler, work: RuleWork) !void {
+            try requireReferenceRootKeys(work.object);
+            work.rule.other_input_index = if (work.object.get("target_input")) |raw_input|
+                try work.builder.inputIndex(try definition_core.json.string(raw_input))
+            else
+                work.input_index;
+            try self.push(.{ .reference_targets = work });
+            if (work.object.get("sources")) |raw_sources| {
+                if (work.object.get("path") != null or work.object.get("reference") != null) {
+                    return error.ConflictingReferenceSources;
+                }
+                const sources = try definition_core.json.array(raw_sources);
+                if (sources.items.len == 0 or sources.items.len > 64) {
+                    return error.ReferenceSourceCountInvalid;
+                }
+                work.rule.reference_sources = try self.allocator.alloc(
+                    CompiledReferenceSource,
+                    sources.items.len,
+                );
+                for (work.rule.reference_sources) |*source_value| source_value.* = .{
+                    .pointer_id = 0,
+                    .reference_pointer_id = 0,
+                    .rules = &.{},
+                    .format_parts = &.{},
+                };
+                try self.push(.{ .reference_source = .{ .work = work, .raw = sources.items } });
+            } else {
+                try definition_core.json.requireFields(work.object, &.{ "path", "reference" });
+                if (work.rule.pointer_id == null) return error.ReferenceCollectionMissing;
+                work.rule.other_pointer_id = try work.builder.internPointer(
+                    try definition_core.json.string(
+                        try definition_core.json.field(work.object, "reference"),
+                    ),
+                );
+            }
+        }
+
+        fn referenceSource(self: *Compiler, value: ReferenceSequence) !void {
+            if (value.index == value.raw.len) return;
+            const object = try definition_core.json.object(value.raw[value.index]);
+            try definition_core.json.requireExactKeys(object, &.{
+                "path",
+                "items",
+                "reference",
+                "fragments",
+                "rules",
+                "optional",
+                "singleton",
+            });
+            try definition_core.json.requireFields(object, &.{ "path", "reference" });
+            const builder = value.work.builder;
+            const output = &value.work.rule.reference_sources[value.index];
+            output.pointer_id = try builder.internPointer(
+                try definition_core.json.string(try definition_core.json.field(object, "path")),
+            );
+            output.items_pointer_id = try builder.optionalPointer(object, "items");
+            output.reference_pointer_id = try builder.internPointer(
+                try definition_core.json.string(
+                    try definition_core.json.field(object, "reference"),
+                ),
+            );
+            output.optional = try optionalBoolean(object, "optional") orelse false;
+            var next = value;
+            next.index += 1;
+            try self.push(.{ .reference_source = next });
+            try self.push(.{ .reference_source_finish = .{
+                .work = value.work,
+                .object = object,
+                .index = value.index,
+            } });
+            var work = value.work;
+            work.object = object;
+            try self.optionalChildren(work, "rules", &output.rules);
+        }
+
+        fn sourceFinish(self: *Compiler, value: ReferenceFinish) !void {
+            _ = self;
+            const source_value = &value.work.rule.reference_sources[value.index];
+            source_value.singleton = try optionalBoolean(value.object, "singleton") orelse false;
+            if (source_value.singleton and source_value.items_pointer_id != null) {
+                return error.ReferenceSourceModeConflict;
+            }
+            if (value.object.get("fragments")) |fragments| {
+                source_value.format_parts = try value.work.builder.compileFormatParts(
+                    fragments,
+                    true,
+                    false,
+                );
+            }
+        }
+
+        fn referenceTargets(self: *Compiler, work: RuleWork) !void {
+            try self.push(.{ .reference_policies = work });
+            if (work.object.get("targets")) |raw_targets| {
+                if (hasSingleReferenceTargetFields(work.object)) {
+                    return error.ConflictingReferenceTargets;
+                }
+                const targets = try definition_core.json.array(raw_targets);
+                if (targets.items.len == 0 or targets.items.len > 64) {
+                    return error.ReferenceTargetCountInvalid;
+                }
+                work.rule.reference_targets = try self.allocator.alloc(
+                    CompiledReferenceTarget,
+                    targets.items.len,
+                );
+                for (work.rule.reference_targets) |*target| target.* = .{
+                    .pointer_id = 0,
+                    .rules = &.{},
+                    .match_rules = &.{},
+                    .coverage_rules = &.{},
+                    .format_parts = &.{},
+                };
+                var next = work;
+                next.input_index = work.rule.other_input_index.?;
+                try self.push(.{ .reference_target = .{ .work = next, .raw = targets.items } });
+            } else {
+                try definition_core.json.requireFields(work.object, &.{ "target", "key" });
+                try self.singleReferenceTarget(work);
+            }
+        }
+
+        fn singleReferenceTarget(self: *Compiler, work: RuleWork) !void {
+            const target_items = try work.builder.optionalPointer(work.object, "target_items");
+            work.rule.path_ids = try self.allocator.alloc(u16, if (target_items == null) 2 else 3);
+            work.rule.path_ids[0] = try work.builder.internPointer(
+                try definition_core.json.requiredString(work.object, "target"),
+            );
+            work.rule.path_ids[1] = try work.builder.internPointer(
+                try definition_core.json.string(try definition_core.json.field(work.object, "key")),
+            );
+            if (target_items) |pointer_id| work.rule.path_ids[2] = pointer_id;
+            var next = work;
+            next.input_index = work.rule.other_input_index.?;
+            try self.optionalChildren(next, "coverage_rules", &work.rule.coverage_children);
+            try self.optionalChildren(next, "target_rules", &work.rule.children);
+        }
+
+        fn referenceTarget(self: *Compiler, value: ReferenceSequence) !void {
+            if (value.index == value.raw.len) return;
+            const object = try definition_core.json.object(value.raw[value.index]);
+            try definition_core.json.requireExactKeys(object, &.{
+                "path",
+                "items",
+                "key",
+                "coverage_key",
+                "fragments",
+                "rules",
+                "match_rules",
+                "coverage_rules",
+                "optional",
+            });
+            try definition_core.json.requireFields(object, &.{"path"});
+            if ((object.get("key") == null) == (object.get("fragments") == null)) {
+                return error.ReferenceTargetKeyInvalid;
+            }
+            const target = &value.work.rule.reference_targets[value.index];
+            target.* = try value.work.builder.initReferenceTarget(object);
+            var next = value;
+            next.index += 1;
+            try self.push(.{ .reference_target = next });
+            try self.push(.{ .reference_target_finish = .{
+                .work = value.work,
+                .object = object,
+                .index = value.index,
+            } });
+            var work = value.work;
+            work.object = object;
+            try self.optionalChildren(work, "coverage_rules", &target.coverage_rules);
+            try self.optionalChildren(work, "match_rules", &target.match_rules);
+            try self.optionalChildren(work, "rules", &target.rules);
+        }
+
+        fn targetFinish(self: *Compiler, value: ReferenceFinish) !void {
+            _ = self;
+            if (value.object.get("fragments")) |fragments| {
+                const target = &value.work.rule.reference_targets[value.index];
+                target.format_parts = try value.work.builder.compileFormatParts(
+                    fragments,
+                    false,
+                    false,
+                );
+            }
+        }
+
+        fn referencePolicies(work: RuleWork) !void {
+            if (work.item_mode) {
+                try compileReferencePolicies(work.object, work.rule.pointer_id.?, work.rule);
+            } else {
+                try compileReferenceRootPolicies(work.object, work.rule);
+            }
+        }
+
+        fn referenceItem(self: *Compiler, work: RuleWork) !void {
+            try requireReferenceItemKeys(work.object);
+            if (work.rule.pointer_id == null) return error.ReferenceCollectionMissing;
+            work.rule.other_input_index = work.input_index;
+            work.rule.other_pointer_id = try work.builder.internPointer(
+                try definition_core.json.string(
+                    try definition_core.json.field(work.object, "reference"),
+                ),
+            );
+            try self.push(.{ .reference_policies = work });
+            try self.singleReferenceTarget(work);
+        }
+
+        fn imported(self: *Compiler, work: RuleWork) !void {
+            const imported_definition = try work.builder.compileDefinitionRef(
+                work.object,
+                !work.item_mode,
+                work.rule.import_index,
+                work.rule,
+            );
+            if (work.import_depth == 32) return error.ImportDepthExceeded;
+            const builder = try self.allocator.create(Builder);
+            builder.* = .{
+                .allocator = self.allocator,
+                .definition_plan = imported_definition,
+                .inputs = imported_definition.inputs,
+            };
+            const next: ImportWork = .{
+                .builder = builder,
+                .destination = work.rule,
+                .depth = work.import_depth + 1,
+            };
+            errdefer self.destroyImport(next);
+            try self.reserve(2);
+            try builder.rules.ensureTotalCapacity(self.allocator, imported_definition.rules.len);
+            for (imported_definition.pointers) |pointer| _ = try builder.internPointer(pointer);
+            self.tasks.appendAssumeCapacity(.{ .import_finish = next });
+            self.tasks.appendAssumeCapacity(.{ .import_next = next });
+        }
+
+        fn importNext(self: *Compiler, value: ImportWork) !void {
+            if (value.index == value.builder.definition_plan.rules.len) return;
+            var next = value;
+            next.index += 1;
+            try self.push(.{ .import_next = next });
+            const source_rule = value.builder.definition_plan.rules[value.index];
+            if (!isValidationOperator(source_rule.operator)) return;
+            const rule = value.builder.initRule(.required_field, 0, null);
+            value.builder.rules.appendAssumeCapacity(rule);
+            const destination = &value.builder.rules.items[value.builder.rules.items.len - 1];
+            try self.source(.{
+                .builder = value.builder,
+                .rule = destination,
+                .object = undefined,
+                .input_index = 0,
+                .import_depth = value.depth,
+            }, source_rule, null);
+        }
+
+        fn importFinish(self: *Compiler, value: ImportWork) !void {
+            defer self.destroyImport(value);
+            const plan = try self.allocator.create(Plan);
+            errdefer self.allocator.destroy(plan);
+            plan.* = try value.builder.finish(
+                value.builder.definition_plan.bounds.max_input_bytes,
+                value.builder.definition_plan.bounds.max_records,
+                value.builder.definition_plan.bounds.max_diagnostics,
+            );
+            value.destination.imported_plan = plan;
+        }
+    };
 
     fn parsePaths(self: *Builder, raw: std.json.Value) ![]u16 {
         const items = try definition_core.json.array(raw);
@@ -2658,6 +2473,46 @@ const Builder = struct {
             out[index] = try self.internPointer(try definition_core.json.string(item));
         }
         return out;
+    }
+
+    fn finish(
+        self: *Builder,
+        max_input_bytes: usize,
+        max_records: usize,
+        max_diagnostics: usize,
+    ) !Plan {
+        const allocator = self.allocator;
+        const inputs = try cloneInputs(allocator, self.inputs);
+        errdefer {
+            for (inputs) |*input| input.deinit(allocator);
+            allocator.free(inputs);
+        }
+        const pointers = try self.pointers.toOwnedSlice(allocator);
+        errdefer {
+            for (pointers) |*pointer| pointer.deinit(allocator);
+            allocator.free(pointers);
+        }
+        const rules = try self.rules.toOwnedSlice(allocator);
+        errdefer {
+            for (rules) |*rule| rule.deinit(allocator);
+            allocator.free(rules);
+        }
+        const root_traversal = try compileRootTraversal(
+            allocator,
+            pointers,
+            rules,
+        );
+        errdefer root_traversal.deinit(allocator);
+        return .{
+            .inputs = inputs,
+            .pointers = pointers,
+            .rules = rules,
+            .root_shared_prefixes = root_traversal.shared_prefixes,
+            .max_root_pointer_depth = root_traversal.max_depth,
+            .max_input_bytes = max_input_bytes,
+            .max_records = max_records,
+            .max_diagnostics = max_diagnostics,
+        };
     }
 };
 
@@ -2673,37 +2528,11 @@ pub fn compile(
     errdefer builder.deinit();
     for (definition_plan.pointers) |pointer| _ = try builder.internPointer(pointer);
     for (definition_plan.rules) |rule| try builder.compileRule(rule);
-    const inputs = try cloneInputs(allocator, definition_plan.inputs);
-    errdefer {
-        for (inputs) |*input| input.deinit(allocator);
-        allocator.free(inputs);
-    }
-    const pointers = try builder.pointers.toOwnedSlice(allocator);
-    errdefer {
-        for (pointers) |*pointer| pointer.deinit(allocator);
-        allocator.free(pointers);
-    }
-    const rules = try builder.rules.toOwnedSlice(allocator);
-    errdefer {
-        for (rules) |*rule| rule.deinit(allocator);
-        allocator.free(rules);
-    }
-    const root_traversal = try compileRootTraversal(
-        allocator,
-        pointers,
-        rules,
+    return builder.finish(
+        definition_plan.bounds.max_input_bytes,
+        definition_plan.bounds.max_records,
+        definition_plan.bounds.max_diagnostics,
     );
-    errdefer root_traversal.deinit(allocator);
-    return .{
-        .inputs = inputs,
-        .pointers = pointers,
-        .rules = rules,
-        .root_shared_prefixes = root_traversal.shared_prefixes,
-        .max_root_pointer_depth = root_traversal.max_depth,
-        .max_input_bytes = definition_plan.bounds.max_input_bytes,
-        .max_records = definition_plan.bounds.max_records,
-        .max_diagnostics = definition_plan.bounds.max_diagnostics,
-    };
 }
 
 pub fn compileEmbedded(
@@ -2735,37 +2564,7 @@ pub fn compileEmbedded(
         return error.InvalidEmbeddedRuleCount;
     }
     for (rules.items) |rule| try builder.compileRawRule(rule);
-    const owned_inputs = try cloneInputs(allocator, inputs);
-    errdefer {
-        for (owned_inputs) |*input| input.deinit(allocator);
-        allocator.free(owned_inputs);
-    }
-    const pointers = try builder.pointers.toOwnedSlice(allocator);
-    errdefer {
-        for (pointers) |*pointer| pointer.deinit(allocator);
-        allocator.free(pointers);
-    }
-    const compiled_rules = try builder.rules.toOwnedSlice(allocator);
-    errdefer {
-        for (compiled_rules) |*rule| rule.deinit(allocator);
-        allocator.free(compiled_rules);
-    }
-    const root_traversal = try compileRootTraversal(
-        allocator,
-        pointers,
-        compiled_rules,
-    );
-    errdefer root_traversal.deinit(allocator);
-    return .{
-        .inputs = owned_inputs,
-        .pointers = pointers,
-        .rules = compiled_rules,
-        .root_shared_prefixes = root_traversal.shared_prefixes,
-        .max_root_pointer_depth = root_traversal.max_depth,
-        .max_input_bytes = max_input_bytes,
-        .max_records = max_records,
-        .max_diagnostics = max_diagnostics,
-    };
+    return builder.finish(max_input_bytes, max_records, max_diagnostics);
 }
 
 fn findImportedDefinition(
@@ -3215,77 +3014,44 @@ pub fn decodeCache(
     if (try decoder.readU16() != 33) {
         return error.LedgerValidationCacheVersionMismatch;
     }
-    var imported_plan_count: usize = 0;
-    return decodeCachePlan(
-        allocator,
-        decoder,
-        0,
-        &imported_plan_count,
-    );
+    var plan = emptyDecodedPlan();
+    errdefer plan.deinit(allocator);
+    var machine = CacheDecodeMachine{ .allocator = allocator, .decoder = decoder };
+    defer machine.frames.deinit(allocator);
+    try machine.push(.{ .plan = .{ .plan = &plan } });
+    while (machine.frames.pop()) |frame| try machine.step(frame);
+    return plan;
 }
 
-fn decodeCachePlan(
-    allocator: std.mem.Allocator,
-    decoder: *definition_core.cache.Decoder,
-    depth: usize,
-    imported_plan_count: *usize,
-) anyerror!Plan {
-    if (depth > 32) return error.CacheImportDepthExceeded;
-    imported_plan_count.* = std.math.add(
-        usize,
-        imported_plan_count.*,
-        1,
-    ) catch return error.CacheImportCountExceeded;
-    if (imported_plan_count.* > 128) return error.CacheImportCountExceeded;
-    const inputs = try decodeCacheInputs(allocator, decoder);
-    errdefer {
-        for (inputs) |*input| input.deinit(allocator);
-        allocator.free(inputs);
-    }
-    const pointers = try decodeCachePointers(allocator, decoder);
-    errdefer {
-        for (pointers) |*pointer| pointer.deinit(allocator);
-        allocator.free(pointers);
-    }
-    var total_rule_count: usize = 0;
-    const rules = try decodeCacheRules(
-        allocator,
-        decoder,
-        inputs.len,
-        pointers.len,
-        0,
-        &total_rule_count,
-        depth,
-        imported_plan_count,
-    );
-    errdefer {
-        for (rules) |*rule| rule.deinit(allocator);
-        allocator.free(rules);
-    }
-    const root_traversal = try compileRootTraversal(
-        allocator,
-        pointers,
-        rules,
-    );
-    errdefer root_traversal.deinit(allocator);
-    const max_input_bytes = try decoder.readUsize();
-    const max_records = try decoder.readUsize();
-    const max_diagnostics = try decoder.readUsize();
-    if (max_input_bytes == 0 or max_input_bytes > 256 * 1024 * 1024 or
-        max_records == 0 or max_records > 10_000_000 or
-        max_diagnostics == 0 or max_diagnostics > 1024)
-    {
-        return error.CacheValidationBoundsInvalid;
-    }
+fn emptyDecodedPlan() Plan {
     return .{
-        .inputs = inputs,
-        .pointers = pointers,
-        .rules = rules,
-        .root_shared_prefixes = root_traversal.shared_prefixes,
-        .max_root_pointer_depth = root_traversal.max_depth,
-        .max_input_bytes = max_input_bytes,
-        .max_records = max_records,
-        .max_diagnostics = max_diagnostics,
+        .inputs = &.{},
+        .pointers = &.{},
+        .rules = &.{},
+        .root_shared_prefixes = &.{},
+        .max_root_pointer_depth = 0,
+        .max_input_bytes = 0,
+        .max_records = 0,
+        .max_diagnostics = 0,
+    };
+}
+
+fn emptyCompiledRule() CompiledRule {
+    return .{
+        .operator = .required_field,
+        .input_index = 0,
+        .pointer_id = null,
+        .path_ids = &.{},
+        .keys = &.{},
+        .optional_keys = &.{},
+        .values = &.{},
+        .children = &.{},
+        .coverage_children = &.{},
+        .variants = &.{},
+        .format_parts = &.{},
+        .regex_patterns = &.{},
+        .reference_sources = &.{},
+        .reference_targets = &.{},
     };
 }
 
@@ -3357,7 +3123,9 @@ fn validateRuleGraph(
     root_rules: []const CompiledRule,
     definition_plan: *const definition.Plan,
 ) !void {
-    const allocator = std.heap.page_allocator;
+    const scratch_bytes = 4 * 1024;
+    var scratch = std.heap.stackFallback(scratch_bytes, std.heap.page_allocator);
+    const allocator = scratch.get();
     var tasks: std.ArrayList(CacheRuleTask) = .empty;
     defer tasks.deinit(allocator);
     try appendCacheRuleTasks(&tasks, allocator, root_rules, definition_plan);
@@ -3611,48 +3379,6 @@ fn encodeCompiledFormatParts(
     }
 }
 
-fn decodeCacheRules(
-    allocator: std.mem.Allocator,
-    decoder: *definition_core.cache.Decoder,
-    input_count: usize,
-    pointer_count: usize,
-    depth: usize,
-    total_rule_count: *usize,
-    plan_depth: usize,
-    imported_plan_count: *usize,
-) anyerror![]CompiledRule {
-    const count = try decoder.readCount(65_535);
-    if (depth > 16 and count != 0) {
-        return error.CacheItemRuleDepthExceeded;
-    }
-    total_rule_count.* = std.math.add(
-        usize,
-        total_rule_count.*,
-        count,
-    ) catch return error.CacheRuleCountExceeded;
-    if (total_rule_count.* > 65_535) return error.CacheRuleCountExceeded;
-    const rules = try allocator.alloc(CompiledRule, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (rules[0..initialized]) |*rule| rule.deinit(allocator);
-        allocator.free(rules);
-    }
-    for (rules) |*destination| {
-        destination.* = try decodeCacheRule(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        initialized += 1;
-    }
-    return rules;
-}
-
 const CacheRuleDecodeContext = struct {
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
@@ -3661,19 +3387,321 @@ const CacheRuleDecodeContext = struct {
     depth: usize,
     total_rule_count: *usize,
     plan_depth: usize,
-    imported_plan_count: *usize,
+};
 
-    fn decodeRules(self: CacheRuleDecodeContext) anyerror![]CompiledRule {
-        return decodeCacheRules(
-            self.allocator,
-            self.decoder,
-            self.input_count,
-            self.pointer_count,
-            self.depth + 1,
-            self.total_rule_count,
-            self.plan_depth,
-            self.imported_plan_count,
-        );
+const CacheDecodeFrame = union(enum) {
+    plan: struct {
+        plan: *Plan,
+        depth: usize = 0,
+        finish: bool = false,
+    },
+    rules: struct {
+        rules: []CompiledRule,
+        index: usize = 0,
+        context: CacheRuleDecodeContext,
+    },
+    rule: struct {
+        rule: *CompiledRule,
+        context: CacheRuleDecodeContext,
+        stage: enum {
+            header,
+            children,
+            coverage,
+            variants,
+            format,
+            sources,
+            targets,
+            imported,
+            validate,
+        } = .header,
+    },
+    variants: struct {
+        variants: []CompiledVariant,
+        index: usize = 0,
+        context: CacheRuleDecodeContext,
+    },
+    sources: struct {
+        sources: []CompiledReferenceSource,
+        index: usize = 0,
+        context: CacheRuleDecodeContext,
+        finish: bool = false,
+    },
+    targets: struct {
+        targets: []CompiledReferenceTarget,
+        index: usize = 0,
+        context: CacheRuleDecodeContext,
+        stage: enum { header, rules, match, coverage, format } = .header,
+    },
+};
+
+const CacheDecodeMachine = struct {
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    frames: std.ArrayList(CacheDecodeFrame) = .empty,
+    rule_counts: [33]usize = @splat(0),
+    plan_count: usize = 0,
+
+    fn push(self: *CacheDecodeMachine, frame: CacheDecodeFrame) !void {
+        // Each admitted import contributes at most 17 rule levels, four
+        // suspended continuations per level, and its plan/group continuation.
+        std.debug.assert(self.frames.items.len < 33 * (17 * 4 + 3));
+        try self.frames.append(self.allocator, frame);
+    }
+
+    fn step(self: *CacheDecodeMachine, frame: CacheDecodeFrame) !void {
+        switch (frame) {
+            .plan => |value| try self.plan(value),
+            .rules => |value| try self.rules(value),
+            .rule => |value| try self.rule(value),
+            .variants => |value| try self.variants(value),
+            .sources => |value| try self.sources(value),
+            .targets => |value| try self.targets(value),
+        }
+    }
+
+    fn plan(self: *CacheDecodeMachine, frame: @FieldType(CacheDecodeFrame, "plan")) !void {
+        if (frame.finish) return self.finishPlan(frame.plan);
+        if (frame.depth > 32) return error.CacheImportDepthExceeded;
+        self.plan_count += 1;
+        if (self.plan_count > 128) return error.CacheImportCountExceeded;
+        const output = frame.plan;
+        output.inputs = try decodeCacheInputs(self.allocator, self.decoder);
+        output.pointers = try decodeCachePointers(self.allocator, self.decoder);
+        self.rule_counts[frame.depth] = 0;
+        const context: CacheRuleDecodeContext = .{
+            .allocator = self.allocator,
+            .decoder = self.decoder,
+            .input_count = output.inputs.len,
+            .pointer_count = output.pointers.len,
+            .depth = 0,
+            .total_rule_count = &self.rule_counts[frame.depth],
+            .plan_depth = frame.depth,
+        };
+        try self.push(.{ .plan = .{
+            .plan = output,
+            .depth = frame.depth,
+            .finish = true,
+        } });
+        try self.readRules(context, &output.rules);
+    }
+
+    fn finishPlan(self: *CacheDecodeMachine, output: *Plan) !void {
+        const traversal = try compileRootTraversal(self.allocator, output.pointers, output.rules);
+        output.root_shared_prefixes = traversal.shared_prefixes;
+        output.max_root_pointer_depth = traversal.max_depth;
+        output.max_input_bytes = try self.decoder.readUsize();
+        output.max_records = try self.decoder.readUsize();
+        output.max_diagnostics = try self.decoder.readUsize();
+        if (output.max_input_bytes == 0 or output.max_input_bytes > 256 * 1024 * 1024 or
+            output.max_records == 0 or output.max_records > 10_000_000 or
+            output.max_diagnostics == 0 or output.max_diagnostics > 1024)
+        {
+            return error.CacheValidationBoundsInvalid;
+        }
+    }
+
+    fn readRules(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *[]CompiledRule,
+    ) !void {
+        const count = try self.decoder.readCount(65_535);
+        if (context.depth > 16 and count != 0) return error.CacheItemRuleDepthExceeded;
+        context.total_rule_count.* = std.math.add(usize, context.total_rule_count.*, count) catch
+            return error.CacheRuleCountExceeded;
+        if (context.total_rule_count.* > 65_535) return error.CacheRuleCountExceeded;
+        const allocated = try self.allocator.alloc(CompiledRule, count);
+        @memset(allocated, emptyCompiledRule());
+        output.* = allocated;
+        try self.push(.{ .rules = .{ .rules = allocated, .context = context } });
+    }
+
+    fn readChildRules(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *[]CompiledRule,
+    ) !void {
+        var child_context = context;
+        child_context.depth += 1;
+        try self.readRules(child_context, output);
+    }
+
+    fn rules(self: *CacheDecodeMachine, frame: @FieldType(CacheDecodeFrame, "rules")) !void {
+        if (frame.index == frame.rules.len) return;
+        var next = frame;
+        next.index += 1;
+        try self.push(.{ .rules = next });
+        try self.push(.{ .rule = .{
+            .rule = &frame.rules[frame.index],
+            .context = frame.context,
+        } });
+    }
+
+    fn rule(self: *CacheDecodeMachine, frame: @FieldType(CacheDecodeFrame, "rule")) !void {
+        if (frame.stage == .validate) {
+            return validateCachedRule(
+                frame.rule.*,
+                frame.context.input_count,
+                frame.context.pointer_count,
+            );
+        }
+        var next = frame;
+        next.stage = @enumFromInt(@intFromEnum(frame.stage) + 1);
+        try self.push(.{ .rule = next });
+        switch (frame.stage) {
+            .header => frame.rule.* = decodedRuleFromHeader(
+                try decodeCacheRuleHeader(frame.context),
+            ),
+            .children => try self.readChildRules(frame.context, &frame.rule.children),
+            .coverage => try self.readChildRules(frame.context, &frame.rule.coverage_children),
+            .variants => try self.readVariants(frame.context, &frame.rule.variants),
+            .format => try self.readRuleFormat(frame.rule),
+            .sources => try self.readSources(frame.context, &frame.rule.reference_sources),
+            .targets => try self.readTargets(frame.context, &frame.rule.reference_targets),
+            .imported => try self.readImportedPlan(frame.context, frame.rule),
+            .validate => unreachable,
+        }
+    }
+
+    fn readRuleFormat(self: *CacheDecodeMachine, output: *CompiledRule) !void {
+        output.format_parts = try decodeCompiledFormatParts(self.allocator, self.decoder);
+        output.regex_patterns = try decodeCompiledRegexPatterns(self.allocator, self.decoder);
+        output.sha256_mode = if (try self.decoder.readBool())
+            try self.decoder.readEnum(Sha256Mode)
+        else
+            null;
+        output.sha256_prefix = try self.decoder.readOptionalBytesAlloc(self.allocator, 4096);
+    }
+
+    fn readVariants(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *[]CompiledVariant,
+    ) !void {
+        const count = try self.decoder.readCount(64);
+        const allocated = try self.allocator.alloc(CompiledVariant, count);
+        @memset(allocated, .{ .rules = &.{} });
+        output.* = allocated;
+        try self.push(.{ .variants = .{ .variants = allocated, .context = context } });
+    }
+
+    fn variants(
+        self: *CacheDecodeMachine,
+        frame: @FieldType(CacheDecodeFrame, "variants"),
+    ) !void {
+        if (frame.index == frame.variants.len) return;
+        const output = &frame.variants[frame.index];
+        switch (try self.decoder.readByte()) {
+            0 => output.kind = try self.decoder.readEnum(JsonKind),
+            1 => output.tag_value = try decodeEnumScalar(self.allocator, self.decoder),
+            else => return error.CacheTaggedUnionVariantInvalid,
+        }
+        var next = frame;
+        next.index += 1;
+        try self.push(.{ .variants = next });
+        try self.readChildRules(frame.context, &output.rules);
+    }
+
+    fn readSources(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *[]CompiledReferenceSource,
+    ) !void {
+        const count = try self.decoder.readCount(64);
+        const allocated = try self.allocator.alloc(CompiledReferenceSource, count);
+        @memset(allocated, .{
+            .pointer_id = 0,
+            .reference_pointer_id = 0,
+            .rules = &.{},
+            .format_parts = &.{},
+        });
+        output.* = allocated;
+        try self.push(.{ .sources = .{ .sources = allocated, .context = context } });
+    }
+
+    fn sources(
+        self: *CacheDecodeMachine,
+        frame: @FieldType(CacheDecodeFrame, "sources"),
+    ) !void {
+        if (frame.index == frame.sources.len) return;
+        const output = &frame.sources[frame.index];
+        var next = frame;
+        if (frame.finish) {
+            output.format_parts = try decodeCompiledFormatParts(self.allocator, self.decoder);
+            next.index += 1;
+            next.finish = false;
+            return self.push(.{ .sources = next });
+        }
+        output.pointer_id = try self.decoder.readU16();
+        output.items_pointer_id = try readOptionalU16(self.decoder);
+        output.reference_pointer_id = try self.decoder.readU16();
+        output.optional = try self.decoder.readBool();
+        output.singleton = try self.decoder.readBool();
+        next.finish = true;
+        try self.push(.{ .sources = next });
+        try self.readChildRules(frame.context, &output.rules);
+    }
+
+    fn readTargets(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *[]CompiledReferenceTarget,
+    ) !void {
+        const count = try self.decoder.readCount(64);
+        const allocated = try self.allocator.alloc(CompiledReferenceTarget, count);
+        @memset(allocated, .{
+            .pointer_id = 0,
+            .rules = &.{},
+            .match_rules = &.{},
+            .coverage_rules = &.{},
+            .format_parts = &.{},
+        });
+        output.* = allocated;
+        try self.push(.{ .targets = .{ .targets = allocated, .context = context } });
+    }
+
+    fn targets(
+        self: *CacheDecodeMachine,
+        frame: @FieldType(CacheDecodeFrame, "targets"),
+    ) !void {
+        if (frame.index == frame.targets.len) return;
+        const output = &frame.targets[frame.index];
+        var next = frame;
+        if (frame.stage == .format) {
+            output.format_parts = try decodeCompiledFormatParts(self.allocator, self.decoder);
+            next.stage = .header;
+            next.index += 1;
+            return self.push(.{ .targets = next });
+        }
+        next.stage = @enumFromInt(@intFromEnum(frame.stage) + 1);
+        try self.push(.{ .targets = next });
+        switch (frame.stage) {
+            .header => try self.readTargetHeader(output),
+            .rules => try self.readChildRules(frame.context, &output.rules),
+            .match => try self.readChildRules(frame.context, &output.match_rules),
+            .coverage => try self.readChildRules(frame.context, &output.coverage_rules),
+            .format => unreachable,
+        }
+    }
+
+    fn readTargetHeader(self: *CacheDecodeMachine, output: *CompiledReferenceTarget) !void {
+        output.pointer_id = try self.decoder.readU16();
+        output.optional = try self.decoder.readBool();
+        output.items_pointer_id = try readOptionalU16(self.decoder);
+        output.key_pointer_id = try readOptionalU16(self.decoder);
+        output.coverage_key_pointer_id = try readOptionalU16(self.decoder);
+    }
+
+    fn readImportedPlan(
+        self: *CacheDecodeMachine,
+        context: CacheRuleDecodeContext,
+        output: *CompiledRule,
+    ) !void {
+        if (!try self.decoder.readBool()) return;
+        const imported = try self.allocator.create(Plan);
+        imported.* = emptyDecodedPlan();
+        output.imported_plan = imported;
+        try self.push(.{ .plan = .{ .plan = imported, .depth = context.plan_depth + 1 } });
     }
 };
 
@@ -3704,101 +3732,15 @@ const DecodedCacheRuleHeader = struct {
     reject_self_reference: bool,
     ignore_null_references: bool,
     then_nonempty: bool,
-
-    fn deinit(
-        self: *DecodedCacheRuleHeader,
-        allocator: std.mem.Allocator,
-    ) void {
-        allocator.free(self.path_ids);
-        deinitKeySlices(allocator, self.keys);
-        deinitKeySlices(allocator, self.optional_keys);
-        for (self.values) |*value| value.deinit(allocator);
-        allocator.free(self.values);
-        if (self.min_number) |*value| value.deinit(allocator);
-        if (self.max_number) |*value| value.deinit(allocator);
-        self.* = undefined;
-    }
 };
 
-const DecodedCacheRuleNested = struct {
-    children: []CompiledRule,
-    coverage_children: []CompiledRule,
-    variants: []CompiledVariant,
-
-    fn deinit(
-        self: *DecodedCacheRuleNested,
-        allocator: std.mem.Allocator,
-    ) void {
-        deinitRuleSlice(allocator, self.children);
-        deinitRuleSlice(allocator, self.coverage_children);
-        for (self.variants) |*variant| variant.deinit(allocator);
-        allocator.free(self.variants);
-        self.* = undefined;
-    }
-};
-
-const DecodedCacheRuleTail = struct {
-    format_parts: []CompiledFormatPart,
-    regex_patterns: []CompiledRegexPattern,
-    sha256_mode: ?Sha256Mode,
-    sha256_prefix: ?[]u8,
-    reference_sources: []CompiledReferenceSource,
-    reference_targets: []CompiledReferenceTarget,
-    imported_plan: ?*Plan,
-
-    fn deinit(
-        self: *DecodedCacheRuleTail,
-        allocator: std.mem.Allocator,
-    ) void {
-        for (self.format_parts) |*part| part.deinit(allocator);
-        allocator.free(self.format_parts);
-        for (self.regex_patterns) |*pattern| pattern.deinit(allocator);
-        allocator.free(self.regex_patterns);
-        if (self.sha256_prefix) |prefix| allocator.free(prefix);
-        for (self.reference_sources) |*source| source.deinit(allocator);
-        allocator.free(self.reference_sources);
-        for (self.reference_targets) |*target| target.deinit(allocator);
-        allocator.free(self.reference_targets);
-        if (self.imported_plan) |plan| {
-            plan.deinit(allocator);
-            allocator.destroy(plan);
-        }
-        self.* = undefined;
-    }
-};
-
-fn decodeCacheRule(
-    allocator: std.mem.Allocator,
-    decoder: *definition_core.cache.Decoder,
-    input_count: usize,
-    pointer_count: usize,
-    depth: usize,
-    total_rule_count: *usize,
-    plan_depth: usize,
-    imported_plan_count: *usize,
-) anyerror!CompiledRule {
-    const context: CacheRuleDecodeContext = .{
-        .allocator = allocator,
-        .decoder = decoder,
-        .input_count = input_count,
-        .pointer_count = pointer_count,
-        .depth = depth,
-        .total_rule_count = total_rule_count,
-        .plan_depth = plan_depth,
-        .imported_plan_count = imported_plan_count,
-    };
-    var header = try decodeCacheRuleHeader(context);
-    errdefer header.deinit(allocator);
-    var nested = try decodeCacheRuleNested(context);
-    errdefer nested.deinit(allocator);
-    var tail = try decodeCacheRuleTail(context);
-    errdefer tail.deinit(allocator);
-    const rule: CompiledRule = .{
+fn decodedRuleFromHeader(header: DecodedCacheRuleHeader) CompiledRule {
+    return .{
         .operator = header.operator,
         .input_index = header.input_index,
         .pointer_id = header.pointer_id,
         .import_index = header.import_index,
-        .imported_plan = tail.imported_plan,
+        .imported_plan = null,
         .other_input_index = header.other_input_index,
         .other_pointer_id = header.other_pointer_id,
         .path_ids = header.path_ids,
@@ -3821,18 +3763,16 @@ fn decodeCacheRule(
         .reject_self_reference = header.reject_self_reference,
         .ignore_null_references = header.ignore_null_references,
         .then_nonempty = header.then_nonempty,
-        .children = nested.children,
-        .coverage_children = nested.coverage_children,
-        .variants = nested.variants,
-        .format_parts = tail.format_parts,
-        .regex_patterns = tail.regex_patterns,
-        .sha256_mode = tail.sha256_mode,
-        .sha256_prefix = tail.sha256_prefix,
-        .reference_sources = tail.reference_sources,
-        .reference_targets = tail.reference_targets,
+        .children = &.{},
+        .coverage_children = &.{},
+        .variants = &.{},
+        .format_parts = &.{},
+        .regex_patterns = &.{},
+        .sha256_mode = null,
+        .sha256_prefix = null,
+        .reference_sources = &.{},
+        .reference_targets = &.{},
     };
-    try validateCachedRule(rule, input_count, pointer_count);
-    return rule;
 }
 
 fn decodeCacheRuleHeader(
@@ -3902,232 +3842,12 @@ fn decodeCacheRuleHeader(
     };
 }
 
-fn decodeCacheRuleNested(
-    context: CacheRuleDecodeContext,
-) anyerror!DecodedCacheRuleNested {
-    const children = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, children);
-    const coverage_children = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, coverage_children);
-    const variants = try decodeCacheVariants(context);
-    errdefer {
-        for (variants) |*variant| variant.deinit(context.allocator);
-        context.allocator.free(variants);
-    }
-    return .{
-        .children = children,
-        .coverage_children = coverage_children,
-        .variants = variants,
-    };
-}
-
-fn decodeCacheVariants(
-    context: CacheRuleDecodeContext,
-) anyerror![]CompiledVariant {
-    const count = try context.decoder.readCount(64);
-    const variants = try context.allocator.alloc(CompiledVariant, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (variants[0..initialized]) |*variant| {
-            variant.deinit(context.allocator);
-        }
-        context.allocator.free(variants);
-    }
-    for (variants) |*variant| {
-        variant.* = try decodeCacheVariant(context);
-        initialized += 1;
-    }
-    return variants;
-}
-
-fn decodeCacheVariant(
-    context: CacheRuleDecodeContext,
-) anyerror!CompiledVariant {
-    var tag_value: ?EnumScalar = null;
-    errdefer if (tag_value) |*value| value.deinit(context.allocator);
-    const kind: ?JsonKind = switch (try context.decoder.readByte()) {
-        0 => try context.decoder.readEnum(JsonKind),
-        1 => tag: {
-            tag_value = try decodeEnumScalar(
-                context.allocator,
-                context.decoder,
-            );
-            break :tag null;
-        },
-        else => return error.CacheTaggedUnionVariantInvalid,
-    };
-    return .{
-        .kind = kind,
-        .tag_value = tag_value,
-        .rules = try context.decodeRules(),
-    };
-}
-
-fn decodeCacheRuleTail(
-    context: CacheRuleDecodeContext,
-) anyerror!DecodedCacheRuleTail {
-    const format_parts = try decodeCompiledFormatParts(
-        context.allocator,
-        context.decoder,
-    );
-    errdefer deinitFormatParts(context.allocator, format_parts);
-    const regex_patterns = try decodeCompiledRegexPatterns(
-        context.allocator,
-        context.decoder,
-    );
-    errdefer deinitRegexPatterns(context.allocator, regex_patterns);
-    const sha256_mode = if (try context.decoder.readBool())
-        try context.decoder.readEnum(Sha256Mode)
-    else
-        null;
-    const sha256_prefix = try context.decoder.readOptionalBytesAlloc(
-        context.allocator,
-        4096,
-    );
-    errdefer if (sha256_prefix) |prefix| context.allocator.free(prefix);
-    const reference_sources = try decodeCacheReferenceSources(context);
-    errdefer deinitReferenceSources(context.allocator, reference_sources);
-    const reference_targets = try decodeCacheReferenceTargets(context);
-    errdefer deinitReferenceTargets(context.allocator, reference_targets);
-    const imported_plan = try decodeCacheImportedPlan(context);
-    errdefer if (imported_plan) |plan| {
-        plan.deinit(context.allocator);
-        context.allocator.destroy(plan);
-    };
-    return .{
-        .format_parts = format_parts,
-        .regex_patterns = regex_patterns,
-        .sha256_mode = sha256_mode,
-        .sha256_prefix = sha256_prefix,
-        .reference_sources = reference_sources,
-        .reference_targets = reference_targets,
-        .imported_plan = imported_plan,
-    };
-}
-
-fn decodeCacheReferenceSources(
-    context: CacheRuleDecodeContext,
-) anyerror![]CompiledReferenceSource {
-    const count = try context.decoder.readCount(64);
-    const sources = try context.allocator.alloc(CompiledReferenceSource, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (sources[0..initialized]) |*source| {
-            source.deinit(context.allocator);
-        }
-        context.allocator.free(sources);
-    }
-    for (sources) |*source| {
-        source.* = try decodeCacheReferenceSource(context);
-        initialized += 1;
-    }
-    return sources;
-}
-
-fn decodeCacheReferenceSource(
-    context: CacheRuleDecodeContext,
-) anyerror!CompiledReferenceSource {
-    const pointer_id = try context.decoder.readU16();
-    const items_pointer_id = try readOptionalU16(context.decoder);
-    const reference_pointer_id = try context.decoder.readU16();
-    const optional = try context.decoder.readBool();
-    const singleton = try context.decoder.readBool();
-    const rules = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, rules);
-    return .{
-        .pointer_id = pointer_id,
-        .items_pointer_id = items_pointer_id,
-        .reference_pointer_id = reference_pointer_id,
-        .optional = optional,
-        .singleton = singleton,
-        .rules = rules,
-        .format_parts = try decodeCompiledFormatParts(
-            context.allocator,
-            context.decoder,
-        ),
-    };
-}
-
-fn decodeCacheReferenceTargets(
-    context: CacheRuleDecodeContext,
-) anyerror![]CompiledReferenceTarget {
-    const count = try context.decoder.readCount(64);
-    const targets = try context.allocator.alloc(CompiledReferenceTarget, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (targets[0..initialized]) |*target| {
-            target.deinit(context.allocator);
-        }
-        context.allocator.free(targets);
-    }
-    for (targets) |*target| {
-        target.* = try decodeCacheReferenceTarget(context);
-        initialized += 1;
-    }
-    return targets;
-}
-
-fn decodeCacheReferenceTarget(
-    context: CacheRuleDecodeContext,
-) anyerror!CompiledReferenceTarget {
-    const pointer_id = try context.decoder.readU16();
-    const optional = try context.decoder.readBool();
-    const items_pointer_id = try readOptionalU16(context.decoder);
-    const key_pointer_id = try readOptionalU16(context.decoder);
-    const coverage_key_pointer_id = try readOptionalU16(context.decoder);
-    const rules = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, rules);
-    const match_rules = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, match_rules);
-    const coverage_rules = try context.decodeRules();
-    errdefer deinitRuleSlice(context.allocator, coverage_rules);
-    const format_parts = try decodeCompiledFormatParts(
-        context.allocator,
-        context.decoder,
-    );
-    errdefer deinitFormatParts(context.allocator, format_parts);
-    return .{
-        .pointer_id = pointer_id,
-        .optional = optional,
-        .items_pointer_id = items_pointer_id,
-        .key_pointer_id = key_pointer_id,
-        .coverage_key_pointer_id = coverage_key_pointer_id,
-        .rules = rules,
-        .match_rules = match_rules,
-        .coverage_rules = coverage_rules,
-        .format_parts = format_parts,
-    };
-}
-
-fn decodeCacheImportedPlan(
-    context: CacheRuleDecodeContext,
-) anyerror!?*Plan {
-    if (!try context.decoder.readBool()) return null;
-    const plan = try context.allocator.create(Plan);
-    errdefer context.allocator.destroy(plan);
-    plan.* = try decodeCachePlan(
-        context.allocator,
-        context.decoder,
-        context.plan_depth + 1,
-        context.imported_plan_count,
-    );
-    return plan;
-}
-
 fn deinitKeySlices(
     allocator: std.mem.Allocator,
     keys: [][]u8,
 ) void {
     for (keys) |key| allocator.free(key);
     allocator.free(keys);
-}
-
-fn deinitRuleSlice(
-    allocator: std.mem.Allocator,
-    rules: []CompiledRule,
-) void {
-    for (rules) |*rule| rule.deinit(allocator);
-    allocator.free(rules);
 }
 
 fn deinitFormatParts(
@@ -4146,21 +3866,6 @@ fn deinitRegexPatterns(
     allocator.free(patterns);
 }
 
-fn deinitReferenceSources(
-    allocator: std.mem.Allocator,
-    sources: []CompiledReferenceSource,
-) void {
-    for (sources) |*source| source.deinit(allocator);
-    allocator.free(sources);
-}
-
-fn deinitReferenceTargets(
-    allocator: std.mem.Allocator,
-    targets: []CompiledReferenceTarget,
-) void {
-    for (targets) |*target| target.deinit(allocator);
-    allocator.free(targets);
-}
 fn decodeCompiledFormatParts(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
@@ -5782,13 +5487,868 @@ const RuleEvaluationContext = struct {
     rule: *const CompiledRule,
     root: std.json.Value,
     target: ?std.json.Value,
+    item: bool = false,
 };
 
-inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
+fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
+    return switch (context.rule.operator) {
+        .optional_field,
+        .one_of,
+        .all_rules,
+        .any_rules,
+        .no_rules,
+        .object_values,
+        .exactly_one,
+        .at_least_one,
+        .tagged_union,
+        .definition_ref,
+        .reference_exists,
+        .keyed_join,
+        .implies,
+        => evaluateNestedRule(context),
+        else => evaluateLeafRule(context),
+    };
+}
+
+fn evaluateNestedRule(context: RuleEvaluationContext) anyerror!?bool {
+    var initial: EvaluationFrame = .{ .rule = context };
+    switch (try initial.advance(null)) {
+        .done => |result| return result,
+        .again => {},
+        .child => unreachable,
+    }
+    var evaluation: RuleEvaluator = .{ .allocator = context.allocator };
+    defer evaluation.deinit();
+    evaluation.push(initial) catch |err| {
+        initial.deinit(context.allocator);
+        return err;
+    };
+    return evaluation.run();
+}
+
+// Every descent follows a compiled rule edge. A rule-list frame adds one
+// continuation per edge; imports obey the same compiled depth bound.
+const max_evaluation_frames = 2 * max_compiled_rule_depth + 4;
+
+const EvaluationStep = union(enum) {
+    done: ?bool,
+    again,
+    child: EvaluationFrame,
+};
+
+const EvaluationFrame = union(enum) {
+    rule: RuleEvaluationContext,
+    rules: ItemRulesEvaluation,
+    sequence: SequenceEvaluation,
+    imported: ImportedEvaluation,
+    reference: ReferenceEvaluation,
+    keyed_join: KeyedJoinEvaluation,
+
+    fn deinit(self: *EvaluationFrame, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .imported => |*frame| frame.deinit(allocator),
+            .reference => |*frame| frame.deinit(allocator),
+            else => {},
+        }
+    }
+
+    fn advance(self: *EvaluationFrame, result: ?bool) !EvaluationStep {
+        return switch (self.*) {
+            .rule => |context| startEvaluation(self, context),
+            .rules => |*frame| frame.advance(result),
+            .sequence => |*frame| frame.advance(result),
+            .imported => |*frame| frame.advance(result),
+            .reference => |*frame| frame.advance(result),
+            .keyed_join => |*frame| frame.advance(result),
+        };
+    }
+};
+
+const RuleEvaluator = struct {
+    allocator: std.mem.Allocator,
+    frames: std.ArrayList(EvaluationFrame) = .empty,
+
+    fn deinit(self: *RuleEvaluator) void {
+        for (self.frames.items) |*frame| frame.deinit(self.allocator);
+        self.frames.deinit(self.allocator);
+    }
+
+    fn push(self: *RuleEvaluator, frame: EvaluationFrame) !void {
+        if (self.frames.items.len == max_evaluation_frames) {
+            return error.ItemRuleDepthExceeded;
+        }
+        try self.frames.append(self.allocator, frame);
+    }
+
+    fn run(self: *RuleEvaluator) !?bool {
+        var result: ?bool = null;
+        while (self.frames.items.len != 0) {
+            const frame = &self.frames.items[self.frames.items.len - 1];
+            switch (try frame.advance(result)) {
+                .done => |value| {
+                    var completed = self.frames.pop().?;
+                    completed.deinit(self.allocator);
+                    result = value;
+                },
+                .again => {},
+                .child => |child| try self.push(child),
+            }
+        }
+        return result;
+    }
+};
+
+const ItemRulesEvaluation = struct {
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rules: []const CompiledRule,
+    root: std.json.Value,
+    next: usize = 0,
+
+    fn advance(self: *ItemRulesEvaluation, result: ?bool) EvaluationStep {
+        if (self.next != 0 and !result.?) return .{ .done = false };
+        if (self.next == self.rules.len) return .{ .done = true };
+        const rule = &self.rules[self.next];
+        self.next += 1;
+        return .{ .child = .{ .rule = .{
+            .allocator = self.allocator,
+            .plan = self.plan,
+            .loaded = &.{},
+            .rule = rule,
+            .root = self.root,
+            .target = if (rule.pointer_id) |pointer_id|
+                resolve(self.root, self.plan.pointers[pointer_id])
+            else
+                self.root,
+            .item = true,
+        } } };
+    }
+};
+
+fn evaluationChildren(
+    context: RuleEvaluationContext,
+    rules: []const CompiledRule,
+    value: std.json.Value,
+) EvaluationFrame {
+    return .{ .rules = .{
+        .allocator = context.allocator,
+        .plan = context.plan,
+        .rules = rules,
+        .root = value,
+    } };
+}
+
+fn startEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) !EvaluationStep {
+    return switch (context.rule.operator) {
+        .optional_field => startOptionalEvaluation(frame, context),
+        .one_of,
+        .all_rules,
+        .any_rules,
+        .no_rules,
+        .object_values,
+        .exactly_one,
+        .at_least_one,
+        => startSequenceEvaluation(frame, context),
+        .tagged_union => startTaggedEvaluation(frame, context),
+        .definition_ref => startImportedEvaluation(frame, context),
+        .reference_exists => startReferenceEvaluation(frame, context),
+        .keyed_join => startKeyedJoinEvaluation(frame, context),
+        .implies => startImplicationEvaluation(frame, context),
+        else => .{ .done = try evaluateLeafRule(context) },
+    };
+}
+
+fn startOptionalEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) EvaluationStep {
+    const value = context.target orelse return .{ .done = true };
+    const rule = context.rule;
+    if ((rule.allow_null and value == .null) or rule.children.len == 0) {
+        return .{ .done = true };
+    }
+    frame.* = evaluationChildren(context, rule.children, value);
+    return .again;
+}
+
+fn startTaggedEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) EvaluationStep {
+    const value = context.target orelse return .{ .done = false };
+    const rule = context.rule;
+    const tag = if (rule.other_pointer_id) |pointer_id|
+        resolve(value, context.plan.pointers[pointer_id]) orelse
+            return .{ .done = false }
+    else
+        null;
+    for (rule.variants) |variant| {
+        const matches = if (tag) |selected|
+            enumEqual(variant.tag_value.?, selected)
+        else
+            valueHasKind(value, variant.kind.?);
+        if (matches) {
+            frame.* = evaluationChildren(context, variant.rules, value);
+            return .again;
+        }
+    }
+    return .{ .done = false };
+}
+
+fn startImplicationEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) EvaluationStep {
+    const rule = context.rule;
+    if (context.item and rule.children.len != 0) {
+        if (!implicationPredicateHolds(context.plan, context.root, rule)) {
+            return .{ .done = true };
+        }
+        frame.* = evaluationChildren(context, rule.children, context.root);
+        return .again;
+    }
+    const other = if (context.item)
+        context.root
+    else
+        context.loaded[rule.other_input_index.?].json() orelse
+            return .{ .done = null };
+    return .{ .done = implicationHolds(context.plan, context.root, other, rule) };
+}
+
+const SequenceEvaluation = struct {
+    context: RuleEvaluationContext,
+    selection: enum { items, fields, branches },
+    quantifier: enum { all, any, none, one },
+    items: []const std.json.Value = &.{},
+    next: usize = 0,
+    matches: usize = 0,
+    waiting: bool = false,
+
+    fn advance(self: *SequenceEvaluation, result: ?bool) EvaluationStep {
+        if (self.waiting) {
+            self.waiting = false;
+            if (result.?) self.matches += 1;
+            switch (self.quantifier) {
+                .all => if (!result.?) return .{ .done = false },
+                .any => if (result.?) return .{ .done = true },
+                .none => if (result.?) return .{ .done = false },
+                .one => if (self.matches > 1) return .{ .done = false },
+            }
+        }
+        const value = self.nextValue() orelse return .{ .done = switch (self.quantifier) {
+            .all, .none => true,
+            .any => false,
+            .one => self.matches == 1,
+        } };
+        self.waiting = true;
+        const rules = if (self.selection == .branches)
+            self.context.rule.children[self.next - 1 .. self.next]
+        else
+            self.context.rule.children;
+        return .{ .child = evaluationChildren(self.context, rules, value) };
+    }
+
+    fn nextValue(self: *SequenceEvaluation) ?std.json.Value {
+        const rule = self.context.rule;
+        switch (self.selection) {
+            .items => {
+                if (self.next == self.items.len) return null;
+                const value = self.items[self.next];
+                self.next += 1;
+                return value;
+            },
+            .branches => {
+                if (self.next == rule.children.len) return null;
+                self.next += 1;
+                return self.context.target.?;
+            },
+            .fields => while (self.next != rule.path_ids.len) {
+                const pointer_id = rule.path_ids[self.next];
+                self.next += 1;
+                if (resolve(self.context.root, self.context.plan.pointers[pointer_id])) |value| {
+                    return value;
+                }
+            },
+        }
+        return null;
+    }
+};
+
+fn startSequenceEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) EvaluationStep {
+    const rule = context.rule;
+    const counted = rule.operator == .exactly_one or rule.operator == .at_least_one;
+    const quantifier: @FieldType(SequenceEvaluation, "quantifier") = switch (rule.operator) {
+        .all_rules, .object_values => .all,
+        .any_rules, .at_least_one => .any,
+        .no_rules => .none,
+        .one_of, .exactly_one => .one,
+        else => unreachable,
+    };
+    if (counted and rule.path_ids.len != 0) {
+        if (rule.children.len == 0) {
+            return .{ .done = countPresent(context.plan, context.root, rule) };
+        }
+        frame.* = .{ .sequence = .{
+            .context = context,
+            .selection = .fields,
+            .quantifier = quantifier,
+        } };
+        return .again;
+    }
+    const value = context.target orelse return .{ .done = false };
+    if (rule.operator == .one_of) {
+        frame.* = .{ .sequence = .{
+            .context = context,
+            .selection = .branches,
+            .quantifier = .one,
+        } };
+        return .again;
+    }
+    const items = if (rule.operator == .object_values)
+        switch (value) {
+            .object => |object| object.values(),
+            else => return .{ .done = false },
+        }
+    else switch (value) {
+        .array => |array| array.items,
+        else => return .{ .done = false },
+    };
+    if (items.len > context.plan.max_records) return .{ .done = false };
+    frame.* = .{ .sequence = .{
+        .context = context,
+        .selection = .items,
+        .quantifier = quantifier,
+        .items = items,
+    } };
+    return .again;
+}
+
+const ImportedRuleCursor = struct {
+    rules: []const CompiledRule,
+    next: usize = 0,
+};
+
+const ImportedEvaluation = struct {
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []LoadedInput,
+    diagnostics: definition_core.diagnostics.Collector,
+    cursors: [17]ImportedRuleCursor = undefined,
+    cursor_count: usize = 1,
+    waiting: ?*const CompiledRule = null,
+
+    fn deinit(self: *ImportedEvaluation, allocator: std.mem.Allocator) void {
+        self.diagnostics.deinit();
+        allocator.free(self.loaded);
+    }
+
+    fn advance(self: *ImportedEvaluation, result: ?bool) !EvaluationStep {
+        if (self.waiting) |rule| {
+            self.waiting = null;
+            if (result != null and !result.?) {
+                const path = if (rule.pointer_id) |id| self.plan.pointers[id].raw else "";
+                try self.diagnostics.add(
+                    rule.operator.id(),
+                    path,
+                    "artifact does not satisfy the compiled structural rule",
+                );
+            }
+        }
+        while (self.cursor_count != 0) {
+            const cursor = &self.cursors[self.cursor_count - 1];
+            if (cursor.next == cursor.rules.len) {
+                self.cursor_count -= 1;
+                continue;
+            }
+            const rule = &cursor.rules[cursor.next];
+            cursor.next += 1;
+            const root = self.loaded[rule.input_index].json() orelse continue;
+            if (rule.operator == .implies and rule.children.len != 0) {
+                if (!implicationPredicateHolds(self.plan, root, rule)) continue;
+                if (self.cursor_count == self.cursors.len) {
+                    return error.ConditionalRuleDepthExceeded;
+                }
+                self.cursors[self.cursor_count] = .{ .rules = rule.children };
+                self.cursor_count += 1;
+                continue;
+            }
+            if (self.cursor_count == 1) {
+                if (rule.pointer_id) |id| {
+                    if (self.plan.pointers[id].segments.len >= 1025) {
+                        return error.JsonPointerTooDeep;
+                    }
+                }
+            }
+            self.waiting = rule;
+            return .{ .child = .{ .rule = .{
+                .allocator = self.allocator,
+                .plan = self.plan,
+                .loaded = self.loaded,
+                .rule = rule,
+                .root = root,
+                .target = if (rule.pointer_id) |id|
+                    resolve(root, self.plan.pointers[id])
+                else
+                    root,
+            } } };
+        }
+        return .{ .done = self.diagnostics.items.items.len == 0 };
+    }
+};
+
+fn startImportedEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) !EvaluationStep {
+    const target = context.target orelse return .{ .done = false };
+    const plan = context.rule.imported_plan.?;
+    const bindings = context.rule.path_ids;
+    if (bindings.len != plan.inputs.len) {
+        return error.ImportedDefinitionInputBindingsMismatch;
+    }
+    const loaded = try context.allocator.alloc(LoadedInput, plan.inputs.len);
+    var transferred = false;
+    defer if (!transferred) context.allocator.free(loaded);
+    @memset(loaded, .{});
+    for (bindings, loaded) |binding, *input| {
+        input.borrowed_json = if (binding == imported_self_input)
+            target
+        else if (binding < context.loaded.len)
+            context.loaded[binding].json() orelse return .{ .done = false }
+        else
+            return error.ImportedDefinitionInputBindingInvalid;
+    }
+    if (plan.max_root_pointer_depth >= 1025) return error.JsonPointerTooDeep;
+    frame.* = .{ .imported = .{
+        .allocator = context.allocator,
+        .plan = plan,
+        .loaded = loaded,
+        .diagnostics = definition_core.diagnostics.Collector.init(context.allocator, .{
+            .max_count = plan.max_diagnostics,
+            .max_total_bytes = 64 * 1024,
+            .max_message_bytes = 2048,
+        }),
+    } };
+    frame.imported.cursors[0] = .{ .rules = plan.rules };
+    transferred = true;
+    return .again;
+}
+
+const KeyedJoinSelection = struct {
+    selected: std.json.Value,
+    expected: std.json.Value,
+};
+
+const KeyedJoinEvaluation = struct {
+    context: RuleEvaluationContext,
+    selection: KeyedJoinSelection,
+    waiting: bool = false,
+
+    fn advance(self: *KeyedJoinEvaluation, result: ?bool) EvaluationStep {
+        const rule = self.context.rule;
+        if (self.waiting) {
+            if (!result.?) return .{ .done = false };
+        } else if (rule.children.len != 0) {
+            self.waiting = true;
+            return .{ .child = evaluationChildren(
+                self.context,
+                rule.children,
+                self.selection.selected,
+            ) };
+        }
+        const actual = resolve(
+            self.selection.selected,
+            self.context.plan.pointers[rule.path_ids[2]],
+        ) orelse return .{ .done = false };
+        return .{ .done = valuesEqual(actual, self.selection.expected) };
+    }
+};
+
+fn startKeyedJoinEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) !EvaluationStep {
+    const selection = try selectKeyedJoin(
+        context.allocator,
+        context.plan,
+        context.root,
+        context.rule,
+    ) orelse return .{ .done = false };
+    frame.* = .{ .keyed_join = .{ .context = context, .selection = selection } };
+    return .again;
+}
+
+const ReferenceValues = struct {
+    array: []const std.json.Value = &.{},
+    singleton: ?std.json.Value = null,
+
+    fn len(self: ReferenceValues) usize {
+        return if (self.singleton != null) 1 else self.array.len;
+    }
+
+    fn get(self: ReferenceValues, index: usize) std.json.Value {
+        if (self.singleton) |value| {
+            std.debug.assert(index == 0);
+            return value;
+        }
+        return self.array[index];
+    }
+};
+
+const ReferenceGroup = struct {
+    pointer_id: ?u16,
+    nested_pointer_id: ?u16 = null,
+    optional: bool = false,
+    singleton: bool = false,
+};
+
+const ReferenceRow = struct {
+    group: usize,
+    parent: std.json.Value,
+    item: std.json.Value,
+};
+
+const ReferenceCursor = struct {
+    side: enum { target, source } = .target,
+    group_index: usize = 0,
+    active: bool = false,
+    parents: ReferenceValues = .{},
+    parent_index: usize = 0,
+    parent: std.json.Value = .null,
+    children: []const std.json.Value = &.{},
+    child_index: usize = 0,
+    count: usize = 0,
+
+    fn groupCount(self: *const ReferenceCursor, rule: *const CompiledRule) usize {
+        return switch (self.side) {
+            .target => @max(1, rule.reference_targets.len),
+            .source => @max(1, rule.reference_sources.len),
+        };
+    }
+
+    fn group(self: *const ReferenceCursor, rule: *const CompiledRule) ReferenceGroup {
+        if (self.side == .source) {
+            if (rule.reference_sources.len == 0) return .{ .pointer_id = null };
+            const source = rule.reference_sources[self.group_index];
+            return .{
+                .pointer_id = source.pointer_id,
+                .nested_pointer_id = source.items_pointer_id,
+                .optional = source.optional,
+                .singleton = source.singleton,
+            };
+        }
+        if (rule.reference_targets.len == 0) return .{
+            .pointer_id = rule.path_ids[0],
+            .nested_pointer_id = if (rule.path_ids.len == 3) rule.path_ids[2] else null,
+        };
+        const target = rule.reference_targets[self.group_index];
+        return .{
+            .pointer_id = target.pointer_id,
+            .nested_pointer_id = target.items_pointer_id,
+            .optional = target.optional,
+        };
+    }
+
+    fn addCount(self: *ReferenceCursor, amount: usize, limit: usize) !void {
+        self.count = std.math.add(usize, self.count, amount) catch
+            return error.InvalidReferenceTraversal;
+        if (self.count > limit) return error.InvalidReferenceTraversal;
+    }
+
+    fn openGroup(
+        self: *ReferenceCursor,
+        context: RuleEvaluationContext,
+        root: std.json.Value,
+        group_spec: ReferenceGroup,
+    ) !bool {
+        const value = if (group_spec.pointer_id) |pointer_id|
+            resolve(root, context.plan.pointers[pointer_id]) orelse {
+                if (group_spec.optional) return false;
+                return error.InvalidReferenceTraversal;
+            }
+        else
+            context.target.?;
+        self.parents = switch (value) {
+            .array => |array| .{ .array = array.items },
+            else => if (group_spec.singleton)
+                .{ .singleton = value }
+            else
+                return error.InvalidReferenceTraversal,
+        };
+        if (self.side == .target and context.rule.reference_targets.len == 0 and
+            self.parents.len() > context.plan.max_records)
+        {
+            return error.InvalidReferenceTraversal;
+        }
+        if (self.side == .source and group_spec.nested_pointer_id == null) {
+            try self.addCount(self.parents.len(), context.plan.max_records);
+        }
+        self.parent_index = 0;
+        self.children = &.{};
+        self.child_index = 0;
+        self.active = true;
+        return true;
+    }
+
+    fn next(
+        self: *ReferenceCursor,
+        context: RuleEvaluationContext,
+        root: std.json.Value,
+    ) !?ReferenceRow {
+        while (self.group_index < self.groupCount(context.rule)) {
+            const group_spec = self.group(context.rule);
+            if (!self.active and !try self.openGroup(context, root, group_spec)) {
+                self.group_index += 1;
+                continue;
+            }
+            if (self.child_index < self.children.len) {
+                const item = self.children[self.child_index];
+                self.child_index += 1;
+                return .{ .group = self.group_index, .parent = self.parent, .item = item };
+            }
+            if (self.parent_index == self.parents.len()) {
+                self.active = false;
+                self.group_index += 1;
+                continue;
+            }
+            const parent = self.parents.get(self.parent_index);
+            self.parent_index += 1;
+            if (group_spec.nested_pointer_id) |pointer_id| {
+                const nested = resolve(parent, context.plan.pointers[pointer_id]) orelse
+                    return error.InvalidReferenceTraversal;
+                self.children = switch (nested) {
+                    .array => |array| array.items,
+                    else => return error.InvalidReferenceTraversal,
+                };
+                try self.addCount(self.children.len, context.plan.max_records);
+                self.parent = parent;
+                self.child_index = 0;
+                continue;
+            }
+            if (self.side == .target) try self.addCount(1, context.plan.max_records);
+            return .{ .group = self.group_index, .parent = parent, .item = parent };
+        }
+        return null;
+    }
+};
+
+const ReferenceEvaluation = struct {
+    context: RuleEvaluationContext,
+    target_root: std.json.Value,
+    index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty,
+    aliases: std.ArrayList(ReferenceCoverageAlias) = .empty,
+    cursor: ReferenceCursor = .{},
+    stage: enum {
+        target_next,
+        target_filter,
+        target_coverage,
+        target_match,
+        source_next,
+        source_filter,
+    } = .target_next,
+    row: ReferenceRow = undefined,
+    key: ReferenceKey = undefined,
+    required: bool = false,
+    coverage_group: ?std.json.Value = null,
+    waiting: bool = false,
+    reference_count: usize = 0,
+
+    fn deinit(self: *ReferenceEvaluation, allocator: std.mem.Allocator) void {
+        self.index.deinit(allocator);
+        self.aliases.deinit(allocator);
+    }
+
+    fn advance(self: *ReferenceEvaluation, result: ?bool) !EvaluationStep {
+        return switch (self.stage) {
+            .target_next => self.nextTarget(),
+            .target_filter => self.filterTarget(result),
+            .target_coverage => self.coverTarget(result),
+            .target_match => self.matchTarget(result),
+            .source_next => self.nextSource(),
+            .source_filter => self.filterSource(result),
+        };
+    }
+
+    fn predicate(
+        self: *ReferenceEvaluation,
+        rules: []const CompiledRule,
+    ) EvaluationStep {
+        self.waiting = rules.len != 0;
+        if (!self.waiting) return .again;
+        return .{ .child = evaluationChildren(self.context, rules, self.row.item) };
+    }
+
+    fn targetSpec(self: *const ReferenceEvaluation) ?CompiledReferenceTarget {
+        if (self.context.rule.reference_targets.len == 0) return null;
+        return self.context.rule.reference_targets[self.row.group];
+    }
+
+    fn nextTarget(self: *ReferenceEvaluation) !EvaluationStep {
+        self.row = (self.cursor.next(self.context, self.target_root) catch |err| switch (err) {
+            error.InvalidReferenceTraversal => return .{ .done = false },
+        }) orelse {
+            self.stage = .source_next;
+            self.cursor = .{ .side = .source };
+            return .again;
+        };
+        self.stage = .target_filter;
+        return self.predicate(if (self.targetSpec()) |target|
+            target.rules
+        else
+            self.context.rule.children);
+    }
+
+    fn filterTarget(self: *ReferenceEvaluation, result: ?bool) EvaluationStep {
+        if (self.waiting and !result.?) {
+            self.stage = .target_next;
+            return .again;
+        }
+        const plan = self.context.plan;
+        self.key = if (self.targetSpec()) |target|
+            if (target.key_pointer_id) |pointer_id|
+                .{ .scalar = resolve(self.row.item, plan.pointers[pointer_id]) orelse
+                    return .{ .done = false } }
+            else
+                .{ .formatted = .{
+                    .parent = self.row.parent,
+                    .item = self.row.item,
+                    .value = self.row.item,
+                    .parts = target.format_parts,
+                } }
+        else
+            .{ .scalar = resolve(self.row.item, plan.pointers[self.context.rule.path_ids[1]]) orelse
+                return .{ .done = false } };
+        self.stage = .target_coverage;
+        return self.predicate(if (self.targetSpec()) |target|
+            target.coverage_rules
+        else
+            self.context.rule.coverage_children);
+    }
+
+    fn coverTarget(self: *ReferenceEvaluation, result: ?bool) EvaluationStep {
+        self.required = !self.waiting or result.?;
+        self.coverage_group = null;
+        if (self.required) {
+            if (self.targetSpec()) |target| {
+                if (target.coverage_key_pointer_id) |pointer_id| {
+                    self.coverage_group = resolve(
+                        self.row.item,
+                        self.context.plan.pointers[pointer_id],
+                    ) orelse return .{ .done = false };
+                }
+            }
+        }
+        self.stage = .target_match;
+        return self.predicate(if (self.targetSpec()) |target| target.match_rules else &.{});
+    }
+
+    fn matchTarget(self: *ReferenceEvaluation, result: ?bool) !EvaluationStep {
+        if (!try indexReferenceKey(
+            self.context.allocator,
+            self.context.plan,
+            self.key,
+            self.required,
+            self.coverage_group,
+            !self.waiting or result.?,
+            &self.index,
+            &self.aliases,
+        )) return .{ .done = false };
+        self.stage = .target_next;
+        return .again;
+    }
+
+    fn nextSource(self: *ReferenceEvaluation) !EvaluationStep {
+        self.row = (self.cursor.next(self.context, self.context.root) catch |err| switch (err) {
+            error.InvalidReferenceTraversal => return .{ .done = false },
+        }) orelse return .{ .done = !self.context.rule.total_coverage or
+            try referenceCoverageComplete(
+                self.context.allocator,
+                &self.index,
+                self.aliases.items,
+            ) };
+        self.stage = .source_filter;
+        return self.predicate(if (self.context.rule.reference_sources.len == 0)
+            &.{}
+        else
+            self.context.rule.reference_sources[self.row.group].rules);
+    }
+
+    fn filterSource(self: *ReferenceEvaluation, result: ?bool) !EvaluationStep {
+        self.stage = .source_next;
+        if (self.waiting and !result.?) return .again;
+        const rule = self.context.rule;
+        const source = if (rule.reference_sources.len == 0)
+            null
+        else
+            rule.reference_sources[self.row.group];
+        if (!try markReferenceItem(
+            self.context.plan,
+            rule,
+            self.row.item,
+            if (source) |value| value.reference_pointer_id else rule.other_pointer_id.?,
+            if (source) |value| value.format_parts else &.{},
+            &self.index,
+            &self.reference_count,
+        )) return .{ .done = false };
+        return .again;
+    }
+};
+
+fn startReferenceEvaluation(
+    frame: *EvaluationFrame,
+    context: RuleEvaluationContext,
+) EvaluationStep {
+    if (context.target == null) return .{ .done = false };
+    const target_root = if (context.item)
+        context.root
+    else
+        context.loaded[context.rule.other_input_index.?].json() orelse
+            return .{ .done = null };
+    frame.* = .{ .reference = .{ .context = context, .target_root = target_root } };
+    return .again;
+}
+
+fn markReferenceItem(
+    plan: *const Plan,
+    rule: *const CompiledRule,
+    item: std.json.Value,
+    pointer_id: u16,
+    format_parts: []const CompiledFormatPart,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    reference_count: *usize,
+) !bool {
+    const source_key = if (rule.reject_self_reference)
+        resolve(item, plan.pointers[rule.path_ids[1]]) orelse return false
+    else
+        null;
+    const references = resolve(item, plan.pointers[pointer_id]) orelse return true;
+    const values: ReferenceValues = switch (references) {
+        .array => |array| .{ .array = array.items },
+        else => .{ .singleton = references },
+    };
+    for (0..values.len()) |position| {
+        const reference = values.get(position);
+        if (rule.ignore_null_references and reference == .null) continue;
+        reference_count.* = std.math.add(usize, reference_count.*, 1) catch return false;
+        if (reference_count.* > plan.max_records or
+            !try markSourceReference(plan, index, item, reference, source_key, format_parts))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn evaluateLeafRule(context: RuleEvaluationContext) anyerror!?bool {
     return switch (context.rule.operator) {
         .required_field,
         .field_absent,
-        .optional_field,
         .exact_object,
         .scalar_type,
         .bounded_string,
@@ -5807,10 +6367,7 @@ inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
         .sorted,
         => try evaluatePrimitiveRule(context),
         .keyed_unique,
-        .keyed_join,
         .declared_field_values,
-        .reference_exists,
-        .implies,
         => try evaluateIndexedRule(context),
         .total_partition,
         .total_mapping,
@@ -5819,7 +6376,13 @@ inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
         .array_count_equal,
         .array_integer_sum_lte,
         => try evaluateProtocolRule(context),
-        else => try evaluateCompositeRule(context),
+        else => if (isComparisonExecutionOperator(context.rule.operator))
+            if (context.item)
+                compareRuleRoots(context.plan, context.rule, context.root, context.root)
+            else
+                compareRule(context.plan, context.loaded, context.rule)
+        else
+            true,
     };
 }
 
@@ -5844,17 +6407,6 @@ inline fn evaluateScalarPrimitiveRule(context: RuleEvaluationContext) anyerror!b
     return switch (rule.operator) {
         .required_field => target != null,
         .field_absent => target == null,
-        .optional_field => if (target) |value|
-            (rule.allow_null and value == .null) or
-                rule.children.len == 0 or
-                try itemRulesHold(
-                    context.allocator,
-                    context.plan,
-                    rule.children,
-                    value,
-                )
-        else
-            true,
         .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value|
             valueHasKind(value, rule.scalar_kind.?)
@@ -5939,12 +6491,6 @@ inline fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
                 context.root,
                 rule,
             ),
-        .keyed_join => try selectedKeyedJoin(
-            context.allocator,
-            context.plan,
-            context.root,
-            rule,
-        ),
         .declared_field_values => if (context.target) |value|
             try declaredFieldValuesHold(
                 context.allocator,
@@ -5955,25 +6501,6 @@ inline fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
             )
         else
             false,
-        .reference_exists => if (context.target) |value|
-            try referencesExist(
-                context.allocator,
-                context.plan,
-                rule,
-                value,
-                context.root,
-                context.loaded[rule.other_input_index.?].json() orelse
-                    return null,
-            )
-        else
-            false,
-        .implies => implicationHolds(
-            context.plan,
-            context.root,
-            context.loaded[rule.other_input_index.?].json() orelse
-                return null,
-            rule,
-        ),
         else => unreachable,
     };
 }
@@ -6063,138 +6590,6 @@ fn arrayIntegerSumLte(
         plan.pointers[rule.other_pointer_id.?],
     ) orelse return false) catch return false;
     return sum <= limit;
-}
-
-inline fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
-    const rule = context.rule;
-    return switch (rule.operator) {
-        .one_of => if (context.target) |value|
-            try oneOfRulesHold(context.allocator, context.plan, rule, value)
-        else
-            false,
-        .tagged_union => if (context.target) |value|
-            try taggedUnionHolds(context.allocator, context.plan, rule, value)
-        else
-            false,
-        .definition_ref => if (context.target) |value|
-            try importedPlanHolds(
-                context.allocator,
-                rule.imported_plan.?,
-                rule.path_ids,
-                context.loaded,
-                value,
-            )
-        else
-            false,
-        .all_rules, .any_rules, .no_rules => if (context.target) |value|
-            try collectionRuleHolds(
-                context.allocator,
-                context.plan,
-                rule,
-                value,
-            )
-        else
-            false,
-        .object_values => if (context.target) |value|
-            try objectValuesHold(context.allocator, context.plan, rule, value)
-        else
-            false,
-        .set_equality,
-        .subset,
-        .superset,
-        .disjoint,
-        .path_scope_subset,
-        .path_scope_disjoint,
-        .member_of,
-        .not_member_of,
-        .field_equal,
-        .field_not_equal,
-        .cross_input_equal,
-        => compareRule(context.plan, context.loaded, rule),
-        .exactly_one, .at_least_one => if (rule.path_ids.len != 0)
-            if (rule.children.len == 0)
-                countPresent(context.plan, context.root, rule)
-            else
-                try countMatchingFields(
-                    context.allocator,
-                    context.plan,
-                    context.root,
-                    rule,
-                )
-        else
-            try countMatching(
-                context.allocator,
-                context.plan,
-                context.root,
-                rule,
-            ),
-        else => true,
-    };
-}
-
-fn collectionRuleHolds(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    value: std.json.Value,
-) anyerror!bool {
-    const items = switch (value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (items.len > plan.max_records) return false;
-    return switch (rule.operator) {
-        .all_rules => {
-            for (items) |item| {
-                if (!try itemRulesHold(allocator, plan, rule.children, item)) {
-                    return false;
-                }
-            }
-            return true;
-        },
-        .any_rules => {
-            for (items) |item| {
-                if (try itemRulesHold(allocator, plan, rule.children, item)) {
-                    return true;
-                }
-            }
-            return false;
-        },
-        .no_rules => {
-            for (items) |item| {
-                if (try itemRulesHold(allocator, plan, rule.children, item)) {
-                    return false;
-                }
-            }
-            return true;
-        },
-        else => unreachable,
-    };
-}
-
-fn objectValuesHold(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    value: std.json.Value,
-) anyerror!bool {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return false,
-    };
-    if (object.count() > plan.max_records) return false;
-    var iterator = object.iterator();
-    while (iterator.next()) |entry| {
-        if (!try itemRulesHold(
-            allocator,
-            plan,
-            rule.children,
-            entry.value_ptr.*,
-        )) {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn forbiddenObjectKeysHold(
@@ -6297,22 +6692,6 @@ fn forbiddenKeyMatches(key: []const u8, rule: *const CompiledRule) bool {
     return false;
 }
 
-fn oneOfRulesHold(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    value: std.json.Value,
-) anyerror!bool {
-    var matches: usize = 0;
-    for (rule.children) |*child| {
-        if (try itemRuleHolds(allocator, plan, child, value)) {
-            matches += 1;
-            if (matches > 1) return false;
-        }
-    }
-    return matches == 1;
-}
-
 fn formattedFieldsHold(
     plan: *const Plan,
     rule: *const CompiledRule,
@@ -6412,219 +6791,6 @@ fn formattedFieldFragment(
     };
 }
 
-fn taggedUnionHolds(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    value: std.json.Value,
-) anyerror!bool {
-    if (rule.other_pointer_id) |tag_pointer_id| {
-        const tag = resolve(
-            value,
-            plan.pointers[tag_pointer_id],
-        ) orelse return false;
-        for (rule.variants) |variant| {
-            if (enumEqual(variant.tag_value.?, tag)) {
-                return itemRulesHold(
-                    allocator,
-                    plan,
-                    variant.rules,
-                    value,
-                );
-            }
-        }
-        return false;
-    }
-    for (rule.variants) |variant| {
-        if (valueHasKind(value, variant.kind.?)) {
-            return itemRulesHold(
-                allocator,
-                plan,
-                variant.rules,
-                value,
-            );
-        }
-    }
-    return false;
-}
-
-fn itemRulesHold(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rules: []const CompiledRule,
-    root: std.json.Value,
-) anyerror!bool {
-    for (rules) |*rule| {
-        if (!try itemRuleHolds(allocator, plan, rule, root)) return false;
-    }
-    return true;
-}
-
-fn itemRuleHolds(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    root: std.json.Value,
-) anyerror!bool {
-    const target = if (rule.pointer_id) |pointer_id|
-        resolve(root, plan.pointers[pointer_id])
-    else
-        root;
-    const context: RuleEvaluationContext = .{
-        .allocator = allocator,
-        .plan = plan,
-        .loaded = &.{},
-        .rule = rule,
-        .root = root,
-        .target = target,
-    };
-    if (isPrimitiveExecutionOperator(rule.operator)) {
-        return evaluatePrimitiveRule(context);
-    }
-    if (isIndexedExecutionOperator(rule.operator)) {
-        return evaluateIndexedItemRule(context);
-    }
-    if (isProtocolExecutionOperator(rule.operator)) {
-        return evaluateProtocolRule(context);
-    }
-    return evaluateCompositeItemRule(context);
-}
-
-fn evaluateIndexedItemRule(
-    context: RuleEvaluationContext,
-) anyerror!bool {
-    const rule = context.rule;
-    return switch (rule.operator) {
-        .keyed_unique => if (rule.reference_sources.len == 0)
-            if (context.target) |value|
-                try keyedUnique(
-                    context.allocator,
-                    value,
-                    context.plan.pointers[rule.other_pointer_id.?],
-                    context.plan.max_records,
-                )
-            else
-                false
-        else
-            try keyedUniqueSources(
-                context.allocator,
-                context.plan,
-                context.root,
-                rule,
-            ),
-        .keyed_join => try selectedKeyedJoin(
-            context.allocator,
-            context.plan,
-            context.root,
-            rule,
-        ),
-        .declared_field_values => if (context.target) |value|
-            try declaredFieldValuesHold(
-                context.allocator,
-                context.plan,
-                context.root,
-                rule,
-                value,
-            )
-        else
-            false,
-        .reference_exists => if (context.target) |value|
-            try referencesExist(
-                context.allocator,
-                context.plan,
-                rule,
-                value,
-                context.root,
-                context.root,
-            )
-        else
-            false,
-        .implies => if (rule.children.len != 0)
-            if (implicationPredicateHolds(context.plan, context.root, rule))
-                itemRulesHold(
-                    context.allocator,
-                    context.plan,
-                    rule.children,
-                    context.root,
-                )
-            else
-                true
-        else
-            implicationHolds(
-                context.plan,
-                context.root,
-                context.root,
-                rule,
-            ),
-        else => unreachable,
-    };
-}
-
-fn evaluateCompositeItemRule(
-    context: RuleEvaluationContext,
-) anyerror!bool {
-    if (isComparisonExecutionOperator(context.rule.operator)) {
-        return compareRuleRoots(
-            context.plan,
-            context.rule,
-            context.root,
-            context.root,
-        );
-    }
-    return evaluateCompositeRule(context);
-}
-
-fn isPrimitiveExecutionOperator(operator: definition.Operator) bool {
-    return switch (operator) {
-        .required_field,
-        .field_absent,
-        .optional_field,
-        .exact_object,
-        .scalar_type,
-        .bounded_string,
-        .regex,
-        .sha256,
-        .bounded_number,
-        .bounded_array,
-        .bounded_object,
-        .enum_value,
-        .digest,
-        .timestamp,
-        .safe_identifier,
-        .safe_relative_path,
-        .forbidden_object_keys,
-        .unique,
-        .sorted,
-        => true,
-        else => false,
-    };
-}
-
-fn isIndexedExecutionOperator(operator: definition.Operator) bool {
-    return switch (operator) {
-        .keyed_unique,
-        .keyed_join,
-        .declared_field_values,
-        .reference_exists,
-        .implies,
-        => true,
-        else => false,
-    };
-}
-
-fn isProtocolExecutionOperator(operator: definition.Operator) bool {
-    return switch (operator) {
-        .total_partition,
-        .total_mapping,
-        .predecessor_successor,
-        .path_format,
-        .array_count_equal,
-        .array_integer_sum_lte,
-        => true,
-        else => false,
-    };
-}
-
 fn isComparisonExecutionOperator(operator: definition.Operator) bool {
     return switch (operator) {
         .set_equality,
@@ -6642,34 +6808,6 @@ fn isComparisonExecutionOperator(operator: definition.Operator) bool {
         else => false,
     };
 }
-fn importedPlanHolds(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    bindings: []const u16,
-    outer_loaded: []const LoadedInput,
-    target: std.json.Value,
-) anyerror!bool {
-    if (bindings.len != plan.inputs.len) {
-        return error.ImportedDefinitionInputBindingsMismatch;
-    }
-    const values = try allocator.alloc(InputValue, plan.inputs.len);
-    defer allocator.free(values);
-    for (plan.inputs, bindings, values) |input, binding, *value| {
-        value.* = .{
-            .name = input.name,
-            .value = if (binding == imported_self_input)
-                target
-            else if (binding < outer_loaded.len)
-                outer_loaded[binding].json() orelse return false
-            else
-                return error.ImportedDefinitionInputBindingInvalid,
-        };
-    }
-    var execution = try executeValues(allocator, plan, values);
-    defer execution.deinit();
-    return execution.isValid();
-}
-
 fn compareRule(
     plan: *const Plan,
     loaded: []const LoadedInput,
@@ -6759,49 +6897,6 @@ fn countPresent(plan: *const Plan, root: std.json.Value, rule: *const CompiledRu
         if (resolve(root, plan.pointers[pointer_id]) != null) count += 1;
     }
     return if (rule.operator == .exactly_one) count == 1 else count >= 1;
-}
-
-fn countMatchingFields(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    root: std.json.Value,
-    rule: *const CompiledRule,
-) !bool {
-    var count: usize = 0;
-    for (rule.path_ids) |pointer_id| {
-        const value = resolve(root, plan.pointers[pointer_id]) orelse continue;
-        if (try itemRulesHold(allocator, plan, rule.children, value)) {
-            count += 1;
-            if (rule.operator == .exactly_one and count > 1) return false;
-            if (rule.operator == .at_least_one) return true;
-        }
-    }
-    return count == 1;
-}
-
-fn countMatching(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    root: std.json.Value,
-    rule: *const CompiledRule,
-) !bool {
-    const items = switch (resolve(
-        root,
-        plan.pointers[rule.pointer_id.?],
-    ) orelse return false) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (items.len > plan.max_records) return false;
-    var count: usize = 0;
-    for (items) |item| {
-        if (try itemRulesHold(allocator, plan, rule.children, item)) {
-            count += 1;
-            if (rule.operator == .exactly_one and count > 1) return false;
-            if (rule.operator == .at_least_one) return true;
-        }
-    }
-    return count == 1;
 }
 
 fn implicationHolds(
@@ -7843,29 +7938,29 @@ fn keyedUniqueSources(
     return true;
 }
 
-fn selectedKeyedJoin(
+fn selectKeyedJoin(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
     rule: *const CompiledRule,
-) !bool {
+) !?KeyedJoinSelection {
     const collection = switch (resolve(
         root,
         plan.pointers[rule.pointer_id.?],
-    ) orelse return false) {
+    ) orelse return null) {
         .array => |array| array.items,
-        else => return false,
+        else => return null,
     };
-    if (collection.len > plan.max_records) return false;
+    if (collection.len > plan.max_records) return null;
     const selector = resolve(
         root,
         plan.pointers[rule.path_ids[1]],
-    ) orelse return false;
-    const selector_digest = scalarKeyDigest(selector) orelse return false;
+    ) orelse return null;
+    const selector_digest = scalarKeyDigest(selector) orelse return null;
     const expected = resolve(
         root,
         plan.pointers[rule.other_pointer_id.?],
-    ) orelse return false;
+    ) orelse return null;
 
     var index: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
     defer index.deinit(allocator);
@@ -7873,37 +7968,28 @@ fn selectedKeyedJoin(
         const key = resolve(
             item,
             plan.pointers[rule.path_ids[0]],
-        ) orelse return false;
-        const digest = scalarKeyDigest(key) orelse return false;
+        ) orelse return null;
+        const digest = scalarKeyDigest(key) orelse return null;
         const result = try index.getOrPut(allocator, digest);
         if (result.found_existing) {
             const prior_key = resolve(
                 result.value_ptr.*,
                 plan.pointers[rule.path_ids[0]],
-            ) orelse return false;
-            if (valuesEqual(prior_key, key)) return false;
+            ) orelse return null;
+            if (valuesEqual(prior_key, key)) return null;
             return error.KeyedJoinDigestCollision;
         }
         result.value_ptr.* = item;
     }
-    const selected = index.get(selector_digest) orelse return false;
+    const selected = index.get(selector_digest) orelse return null;
     const selected_key = resolve(
         selected,
         plan.pointers[rule.path_ids[0]],
-    ) orelse return false;
+    ) orelse return null;
     if (!valuesEqual(selected_key, selector)) {
         return error.KeyedJoinDigestCollision;
     }
-    if (rule.children.len != 0 and
-        !try itemRulesHold(allocator, plan, rule.children, selected))
-    {
-        return false;
-    }
-    const actual = resolve(
-        selected,
-        plan.pointers[rule.path_ids[2]],
-    ) orelse return false;
-    return valuesEqual(actual, expected);
+    return .{ .selected = selected, .expected = expected };
 }
 
 const CorrespondenceEntry = struct {
@@ -8203,280 +8289,6 @@ const ReferenceCoverageAlias = struct {
     group: std.json.Value,
 };
 
-fn referencesExist(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source_value: std.json.Value,
-    source_root: std.json.Value,
-    target_root: std.json.Value,
-) !bool {
-    var index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty;
-    defer index.deinit(allocator);
-    var coverage_aliases: std.ArrayList(ReferenceCoverageAlias) = .empty;
-    defer coverage_aliases.deinit(allocator);
-    if (rule.reference_targets.len == 0) {
-        if (!try indexSingleReferenceTargetSet(
-            allocator,
-            plan,
-            rule,
-            target_root,
-            &index,
-            &coverage_aliases,
-        )) return false;
-    } else if (!try indexReferenceTargetUnion(
-        allocator,
-        plan,
-        rule,
-        target_root,
-        &index,
-        &coverage_aliases,
-    )) return false;
-
-    var source_count: usize = 0;
-    var reference_count: usize = 0;
-    if (rule.reference_sources.len == 0) {
-        if (!try markSingleReferenceSource(
-            allocator,
-            plan,
-            rule,
-            source_value,
-            &index,
-            &source_count,
-            &reference_count,
-        )) return false;
-    } else if (!try markDeclaredReferenceSources(
-        allocator,
-        plan,
-        rule,
-        source_root,
-        &index,
-        &source_count,
-        &reference_count,
-    )) {
-        return false;
-    }
-    if (rule.total_coverage and
-        !try referenceCoverageComplete(
-            allocator,
-            &index,
-            coverage_aliases.items,
-        ))
-    {
-        return false;
-    }
-    return true;
-}
-
-fn markSingleReferenceSource(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source_value: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    source_count: *usize,
-    reference_count: *usize,
-) !bool {
-    const source_items = switch (source_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    source_count.* = source_items.len;
-    if (source_count.* > plan.max_records) return false;
-    return markReferencesFromItems(
-        allocator,
-        plan,
-        rule,
-        source_items,
-        rule.other_pointer_id.?,
-        &.{},
-        &.{},
-        index,
-        reference_count,
-    );
-}
-
-fn markDeclaredReferenceSources(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source_root: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    source_count: *usize,
-    reference_count: *usize,
-) !bool {
-    for (rule.reference_sources) |source| {
-        const items_value = resolve(
-            source_root,
-            plan.pointers[source.pointer_id],
-        ) orelse {
-            if (source.optional) continue;
-            return false;
-        };
-        const singleton_items = [1]std.json.Value{items_value};
-        const items = switch (items_value) {
-            .array => |array| array.items,
-            else => if (source.singleton)
-                singleton_items[0..]
-            else
-                return false,
-        };
-        if (!try markDeclaredReferenceSource(
-            allocator,
-            plan,
-            rule,
-            source,
-            items,
-            index,
-            source_count,
-            reference_count,
-        )) return false;
-    }
-    return true;
-}
-
-fn markDeclaredReferenceSource(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source: CompiledReferenceSource,
-    items: []const std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    source_count: *usize,
-    reference_count: *usize,
-) !bool {
-    if (source.items_pointer_id) |items_pointer_id| {
-        for (items) |parent| {
-            const nested_value = resolve(
-                parent,
-                plan.pointers[items_pointer_id],
-            ) orelse return false;
-            const nested_items = switch (nested_value) {
-                .array => |array| array.items,
-                else => return false,
-            };
-            if (!try addReferenceSourceItems(
-                allocator,
-                plan,
-                rule,
-                source,
-                nested_items,
-                index,
-                source_count,
-                reference_count,
-            )) return false;
-        }
-        return true;
-    }
-    return addReferenceSourceItems(
-        allocator,
-        plan,
-        rule,
-        source,
-        items,
-        index,
-        source_count,
-        reference_count,
-    );
-}
-
-fn addReferenceSourceItems(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source: CompiledReferenceSource,
-    items: []const std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    source_count: *usize,
-    reference_count: *usize,
-) !bool {
-    source_count.* = std.math.add(
-        usize,
-        source_count.*,
-        items.len,
-    ) catch return false;
-    if (source_count.* > plan.max_records) return false;
-    return markReferencesFromItems(
-        allocator,
-        plan,
-        rule,
-        items,
-        source.reference_pointer_id,
-        source.rules,
-        source.format_parts,
-        index,
-        reference_count,
-    );
-}
-
-fn markReferencesFromItems(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    source_items: []const std.json.Value,
-    reference_pointer_id: u16,
-    source_rules: []const CompiledRule,
-    format_parts: []const CompiledFormatPart,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    reference_count: *usize,
-) !bool {
-    for (source_items) |item| {
-        if (source_rules.len != 0 and
-            !try itemRulesHold(allocator, plan, source_rules, item))
-        {
-            continue;
-        }
-        const source_key = if (rule.reject_self_reference)
-            resolve(item, plan.pointers[rule.path_ids[1]]) orelse
-                return false
-        else
-            null;
-        const references = resolve(
-            item,
-            plan.pointers[reference_pointer_id],
-        ) orelse continue;
-        switch (references) {
-            .array => |array| for (array.items) |reference| {
-                if (rule.ignore_null_references and reference == .null) {
-                    continue;
-                }
-                reference_count.* += 1;
-                if (reference_count.* > plan.max_records or
-                    !try markSourceReference(
-                        plan,
-                        index,
-                        item,
-                        reference,
-                        source_key,
-                        format_parts,
-                    ))
-                {
-                    return false;
-                }
-            },
-            else => {
-                if (rule.ignore_null_references and references == .null) {
-                    continue;
-                }
-                reference_count.* += 1;
-                if (reference_count.* > plan.max_records or
-                    !try markSourceReference(
-                        plan,
-                        index,
-                        item,
-                        references,
-                        source_key,
-                        format_parts,
-                    ))
-                {
-                    return false;
-                }
-            },
-        }
-    }
-    return true;
-}
-
 fn markSourceReference(
     plan: *const Plan,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
@@ -8503,231 +8315,6 @@ fn markSourceReference(
             .value = reference,
             .parts = format_parts,
         } },
-    );
-}
-
-fn indexSingleReferenceTargetSet(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    target_root: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
-) !bool {
-    const target_value = resolve(
-        target_root,
-        plan.pointers[rule.path_ids[0]],
-    ) orelse return false;
-    const target_parents = switch (target_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (target_parents.len > plan.max_records) return false;
-    var target_count: usize = 0;
-    for (target_parents) |parent| {
-        if (rule.path_ids.len == 3) {
-            const nested_value = resolve(
-                parent,
-                plan.pointers[rule.path_ids[2]],
-            ) orelse return false;
-            const nested_items = switch (nested_value) {
-                .array => |array| array.items,
-                else => return false,
-            };
-            target_count = std.math.add(
-                usize,
-                target_count,
-                nested_items.len,
-            ) catch return false;
-            if (target_count > plan.max_records) return false;
-            for (nested_items) |item| {
-                if (!try indexReferenceTarget(
-                    allocator,
-                    plan,
-                    rule,
-                    item,
-                    index,
-                    coverage_aliases,
-                )) return false;
-            }
-        } else {
-            target_count += 1;
-            if (target_count > plan.max_records or
-                !try indexReferenceTarget(
-                    allocator,
-                    plan,
-                    rule,
-                    parent,
-                    index,
-                    coverage_aliases,
-                ))
-            {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-fn indexReferenceTargetUnion(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    target_root: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
-) !bool {
-    var target_count: usize = 0;
-    for (rule.reference_targets) |target| {
-        const parents_value = resolve(
-            target_root,
-            plan.pointers[target.pointer_id],
-        ) orelse {
-            if (target.optional) continue;
-            return false;
-        };
-        const parents = switch (parents_value) {
-            .array => |array| array.items,
-            else => return false,
-        };
-        for (parents) |parent| {
-            if (target.items_pointer_id) |items_pointer_id| {
-                const items_value = resolve(
-                    parent,
-                    plan.pointers[items_pointer_id],
-                ) orelse return false;
-                const items = switch (items_value) {
-                    .array => |array| array.items,
-                    else => return false,
-                };
-                target_count = std.math.add(
-                    usize,
-                    target_count,
-                    items.len,
-                ) catch return false;
-                if (target_count > plan.max_records) return false;
-                for (items) |item| {
-                    if (!try indexReferenceTargetSpec(
-                        allocator,
-                        plan,
-                        target,
-                        parent,
-                        item,
-                        index,
-                        coverage_aliases,
-                    )) return false;
-                }
-            } else {
-                target_count += 1;
-                if (target_count > plan.max_records or
-                    !try indexReferenceTargetSpec(
-                        allocator,
-                        plan,
-                        target,
-                        parent,
-                        parent,
-                        index,
-                        coverage_aliases,
-                    ))
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
-}
-
-fn indexReferenceTargetSpec(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    target: CompiledReferenceTarget,
-    parent: std.json.Value,
-    item: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
-) !bool {
-    if (target.rules.len != 0 and
-        !try itemRulesHold(allocator, plan, target.rules, item))
-    {
-        return true;
-    }
-    const key: ReferenceKey = if (target.key_pointer_id) |pointer_id|
-        .{ .scalar = resolve(item, plan.pointers[pointer_id]) orelse
-            return false }
-    else
-        .{ .formatted = .{
-            .parent = parent,
-            .item = item,
-            .value = item,
-            .parts = target.format_parts,
-        } };
-    const required = target.coverage_rules.len == 0 or
-        try itemRulesHold(
-            allocator,
-            plan,
-            target.coverage_rules,
-            item,
-        );
-    const coverage_group = if (required)
-        if (target.coverage_key_pointer_id) |pointer_id|
-            resolve(item, plan.pointers[pointer_id]) orelse return false
-        else
-            null
-    else
-        null;
-    const match_allowed = target.match_rules.len == 0 or
-        try itemRulesHold(
-            allocator,
-            plan,
-            target.match_rules,
-            item,
-        );
-    return indexReferenceKey(
-        allocator,
-        plan,
-        key,
-        required,
-        coverage_group,
-        match_allowed,
-        index,
-        coverage_aliases,
-    );
-}
-
-fn indexReferenceTarget(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    rule: *const CompiledRule,
-    item: std.json.Value,
-    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
-    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
-) !bool {
-    if (rule.children.len != 0 and
-        !try itemRulesHold(allocator, plan, rule.children, item))
-    {
-        return true;
-    }
-    const key = resolve(
-        item,
-        plan.pointers[rule.path_ids[1]],
-    ) orelse return false;
-    const required = rule.coverage_children.len == 0 or
-        try itemRulesHold(
-            allocator,
-            plan,
-            rule.coverage_children,
-            item,
-        );
-    return indexReferenceKey(
-        allocator,
-        plan,
-        .{ .scalar = key },
-        required,
-        null,
-        true,
-        index,
-        coverage_aliases,
     );
 }
 
@@ -12643,4 +12230,639 @@ test "tagged union item implications compile conditional native rules" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.valid, result.valid);
     }
+}
+
+fn cacheTraversalTestFrame(allocator: std.mem.Allocator) !Plan {
+    var output = emptyDecodedPlan();
+    errdefer output.deinit(allocator);
+    output.inputs = try allocator.alloc(definition.Input, 1);
+    output.inputs[0] = .{
+        .name = &.{},
+        .codec = .json,
+        .required = true,
+        .max_bytes = 4096,
+    };
+    output.inputs[0].name = try allocator.dupe(u8, "record");
+    output.pointers = pointers: {
+        var pointer = try definition_core.json_pointer.compile(allocator, "");
+        errdefer pointer.deinit(allocator);
+        const allocated = try allocator.alloc(Pointer, 1);
+        allocated[0] = pointer;
+        break :pointers allocated;
+    };
+    output.rules = try allocator.alloc(CompiledRule, 1);
+    output.rules[0] = emptyCompiledRule();
+    output.max_input_bytes = 4096;
+    output.max_records = 64;
+    output.max_diagnostics = 8;
+    return output;
+}
+
+fn cacheTraversalTestPlan(
+    allocator: std.mem.Allocator,
+    item_depth: usize,
+    import_depth: usize,
+) !Plan {
+    std.debug.assert(item_depth <= 17 and import_depth <= 32);
+    var root = try cacheTraversalTestFrame(allocator);
+    errdefer root.deinit(allocator);
+    var plan = &root;
+    for (0..import_depth + 1) |level| {
+        var rule = &plan.rules[0];
+        for (0..item_depth) |_| {
+            rule.operator = .optional_field;
+            rule.pointer_id = 0;
+            const children = try allocator.alloc(CompiledRule, 1);
+            children[0] = emptyCompiledRule();
+            rule.children = children;
+            rule = &children[0];
+        }
+        rule.pointer_id = 0;
+        if (level == import_depth) {
+            rule.operator = .scalar_type;
+            rule.scalar_kind = .string;
+        } else {
+            rule.operator = .definition_ref;
+            rule.import_index = 0;
+            rule.path_ids = try allocator.alloc(u16, 1);
+            rule.path_ids[0] = imported_self_input;
+            const imported = try allocator.create(Plan);
+            imported.* = emptyDecodedPlan();
+            rule.imported_plan = imported;
+            imported.* = try cacheTraversalTestFrame(allocator);
+            plan = imported;
+        }
+    }
+    return root;
+}
+
+fn cacheTraversalTestBytes(
+    allocator: std.mem.Allocator,
+    item_depth: usize,
+    import_depth: usize,
+) ![]u8 {
+    var plan = try cacheTraversalTestPlan(allocator, item_depth, import_depth);
+    defer plan.deinit(allocator);
+    var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    return encoder.toOwnedSlice();
+}
+
+test "iterative validation cache preserves deepest admitted rule and import trees" {
+    const allocator = std.testing.allocator;
+    const bytes = try cacheTraversalTestBytes(allocator, 16, 32);
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var decoded = try decodeCache(allocator, &decoder);
+    defer decoded.deinit(allocator);
+    try decoder.finish();
+    var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+    defer encoder.deinit();
+    try encodeCache(&decoded, &encoder);
+    try std.testing.expectEqualSlices(u8, bytes, encoder.written());
+}
+
+test "iterative validation cache reports child depth before parent configuration" {
+    const allocator = std.testing.allocator;
+    var plan = try cacheTraversalTestPlan(allocator, 17, 1);
+    defer plan.deinit(allocator);
+    plan.rules[0].input_index = 63;
+    var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    var decoder = definition_core.cache.Decoder.init(encoder.written());
+    try std.testing.expectError(error.CacheItemRuleDepthExceeded, decodeCache(allocator, &decoder));
+}
+
+test "iterative validation cache frees partial nested owners at every allocation failure" {
+    const allocator = std.testing.allocator;
+    const bytes = try cacheTraversalTestBytes(allocator, 2, 2);
+    defer allocator.free(bytes);
+    try std.testing.checkAllAllocationFailures(allocator, decodeForAllocationFailure, .{bytes});
+    for (0..bytes.len) |length| {
+        var decoder = definition_core.cache.Decoder.init(bytes[0..length]);
+        try std.testing.expectError(error.CachePayloadTruncated, decodeCache(allocator, &decoder));
+    }
+}
+
+fn cacheTraversalWideImportPlan(allocator: std.mem.Allocator, count: usize) !Plan {
+    std.debug.assert(count <= 128);
+    var plan = try cacheTraversalTestFrame(allocator);
+    errdefer plan.deinit(allocator);
+    const rules = try allocator.alloc(CompiledRule, count);
+    @memset(rules, emptyCompiledRule());
+    plan.rules[0].deinit(allocator);
+    allocator.free(plan.rules);
+    plan.rules = rules;
+    for (rules) |*rule| {
+        rule.operator = .definition_ref;
+        rule.pointer_id = 0;
+        rule.import_index = 0;
+        rule.path_ids = try allocator.alloc(u16, 1);
+        rule.path_ids[0] = imported_self_input;
+        const imported = try allocator.create(Plan);
+        imported.* = emptyDecodedPlan();
+        rule.imported_plan = imported;
+        imported.* = try cacheTraversalTestPlan(allocator, 0, 0);
+    }
+    return plan;
+}
+
+test "iterative validation cache preserves total import admission at 128 plans" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 127, 128 }) |imports| {
+        var plan = try cacheTraversalWideImportPlan(allocator, imports);
+        defer plan.deinit(allocator);
+        var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+        defer encoder.deinit();
+        try encodeCache(&plan, &encoder);
+        var decoder = definition_core.cache.Decoder.init(encoder.written());
+        if (imports == 127) {
+            var decoded = try decodeCache(allocator, &decoder);
+            defer decoded.deinit(allocator);
+            try decoder.finish();
+            try std.testing.expectEqual(@as(usize, 127), decoded.rules.len);
+        } else {
+            try std.testing.expectError(
+                error.CacheImportCountExceeded,
+                decodeCache(allocator, &decoder),
+            );
+        }
+    }
+}
+
+fn iterativeCompilerDefinition(inputs: []definition.Input) definition.Plan {
+    return .{
+        .id = @constCast("test"),
+        .owner = &.{},
+        .closure_digest = @splat(0),
+        .operator_mask = std.math.maxInt(u128),
+        .parameter_declarations = .{ .items = &.{}, .shape_digest = @splat(0) },
+        .inputs = inputs,
+        .storage_kind = .pure,
+        .imports = &.{},
+        .pointers = &.{},
+        .rules = &.{},
+        .operations = &.{},
+        .projections = &.{},
+        .bounds = .{
+            .max_input_bytes = 4096,
+            .max_store_bytes = 4096,
+            .max_records = 64,
+            .max_output_bytes = 4096,
+            .max_diagnostics = 8,
+            .max_reducer_states = 64,
+        },
+        .canonicalization_json = &.{},
+        .identity_json = &.{},
+        .storage_json = &.{},
+    };
+}
+
+fn iterativeCompilerEmbedded(allocator: std.mem.Allocator, raw: []const u8) !Plan {
+    var inputs = [_]definition.Input{.{
+        .name = @constCast("record"),
+        .codec = .json,
+        .required = true,
+        .max_bytes = 4096,
+    }};
+    const definition_plan = iterativeCompilerDefinition(&inputs);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    return compileEmbedded(allocator, &definition_plan, &inputs, parsed.value, 4096, 64, 8);
+}
+
+test "iterative validation compiler preserves child before parent tail errors" {
+    const cases = [_][]const u8{
+        \\[{"op":"optional-field","path":"/root","allow_null":"bad",
+        \\"rules":[{"op":"scalar-type","path":"/child","type":"bad"}]}]
+        ,
+        \\[{"op":"implies","if":"/gate","equals":1,"empty":true,
+        \\"rules":[{"op":"scalar-type","path":"/child","type":"bad"}]}]
+        ,
+        \\[{"op":"tagged-union","path":"/root","tag":"/tag","variants":[
+        \\{"value":"same","rules":[]},{"value":"same","rules":[
+        \\{"op":"scalar-type","path":"/child","type":"bad"}]}]}]
+        ,
+        \\[{"op":"reference-exists","sources":[{"path":"/sources",
+        \\"reference":"/ref","items":"/items","singleton":true,
+        \\"rules":[{"op":"scalar-type","path":"/child","type":"bad"}]}],
+        \\"target":3,"key":"/key","coverage":"bad"}]
+        ,
+        \\[{"op":"reference-exists","path":"/source","reference":"/ref",
+        \\"targets":[{"path":"/target","fragments":[],"rules":[
+        \\{"op":"scalar-type","path":"/child","type":"bad"}]}]}]
+        ,
+    };
+    for (cases) |raw| {
+        try std.testing.expectError(
+            error.UnsupportedJsonKind,
+            iterativeCompilerEmbedded(std.testing.allocator, raw),
+        );
+    }
+}
+
+fn iterativeCompilerNestedRules(item_depth: usize, conditional_depth: usize) ![]u8 {
+    const allocator = std.testing.allocator;
+    var raw = try allocator.dupe(
+        u8,
+        "[{\"op\":\"scalar-type\",\"path\":\"/leaf\",\"type\":\"string\"}]",
+    );
+    errdefer allocator.free(raw);
+    for (0..item_depth + conditional_depth) |index| {
+        const prefix = if (index < item_depth)
+            "[{\"op\":\"optional-field\",\"path\":\"/branch\",\"rules\":"
+        else
+            "[{\"op\":\"implies\",\"if\":\"/gate\",\"rules\":";
+        const next = try std.fmt.allocPrint(allocator, "{s}{s}}}]", .{ prefix, raw });
+        allocator.free(raw);
+        raw = next;
+    }
+    return raw;
+}
+
+test "iterative validation compiler retains independent item and conditional depth bounds" {
+    const cases = [_]struct { items: usize, conditions: usize, failure: ?anyerror }{
+        .{ .items = 17, .conditions = 16, .failure = null },
+        .{ .items = 18, .conditions = 0, .failure = error.ItemRuleDepthExceeded },
+        .{ .items = 0, .conditions = 17, .failure = error.InvalidConditionalRuleCount },
+    };
+    for (cases) |case| {
+        const raw = try iterativeCompilerNestedRules(case.items, case.conditions);
+        defer std.testing.allocator.free(raw);
+        if (case.failure) |expected| {
+            try std.testing.expectError(
+                expected,
+                iterativeCompilerEmbedded(std.testing.allocator, raw),
+            );
+        } else {
+            var plan = try iterativeCompilerEmbedded(std.testing.allocator, raw);
+            defer plan.deinit(std.testing.allocator);
+            var rule = &plan.rules[0];
+            for (0..case.items + case.conditions) |_| {
+                try std.testing.expectEqual(@as(usize, 1), rule.children.len);
+                rule = &rule.children[0];
+            }
+            try std.testing.expectEqual(definition.Operator.scalar_type, rule.operator);
+        }
+    }
+}
+
+const iterative_compiler_reference_fixture =
+    \\[{"op":"reference-exists","sources":[{"path":"/source","items":"/items",
+    \\"reference":"/ref","rules":[{"op":"optional-field","path":"/optional",
+    \\"rules":[{"op":"scalar-type","path":"/leaf","type":"string"}]}],
+    \\"fragments":[{"parent":"/prefix"},{"value":true}]}],
+    \\"targets":[{"path":"/target","key":"/key","rules":[
+    \\{"op":"tagged-union","path":"/union","tag":"/tag","variants":[
+    \\{"value":"first","rules":[{"op":"scalar-type","path":"/value","type":"string"}]},
+    \\{"value":"second","rules":[]}]}],
+    \\"coverage_rules":[{"op":"scalar-type","path":"/coverage","type":"string"}]}]}]
+;
+
+fn iterativeCompilerAllocationFailure(allocator: std.mem.Allocator) !void {
+    var plan = iterativeCompilerEmbedded(
+        allocator,
+        iterative_compiler_reference_fixture,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+}
+
+test "iterative validation compiler preserves pointer order and partial ownership" {
+    const allocator = std.testing.allocator;
+    var plan = try iterativeCompilerEmbedded(allocator, iterative_compiler_reference_fixture);
+    defer plan.deinit(allocator);
+    const expected = [_][]const u8{
+        "/source", "/items",  "/ref",    "/optional",
+        "/leaf",   "/prefix", "/target", "/key",
+        "/union",  "/tag",    "/value",  "/coverage",
+    };
+    try std.testing.expectEqual(expected.len, plan.pointers.len);
+    for (expected, plan.pointers) |raw, pointer| {
+        try std.testing.expectEqualStrings(raw, pointer.raw);
+    }
+    try std.testing.checkAllAllocationFailures(allocator, iterativeCompilerAllocationFailure, .{});
+}
+
+test "iterative validation compiler accepts the full import depth without recursion" {
+    var inputs = [_]definition.Input{.{
+        .name = @constCast("record"),
+        .codec = .json,
+        .required = true,
+        .max_bytes = 4096,
+    }};
+    var pointers = [_][]u8{@constCast("")};
+    var rules = [_]definition.Rule{.{
+        .operator = .definition_ref,
+        .pointer_id = 0,
+        .import_index = 0,
+        .canonical_config = @constCast(
+            "{\"op\":\"definition-ref\",\"path\":\"\",\"definition\":\"test\"}",
+        ),
+    }};
+    var definitions: [33]definition.Plan = undefined;
+    for (&definitions, 0..) |*owner, index| {
+        owner.* = iterativeCompilerDefinition(&inputs);
+        owner.pointers = &pointers;
+        if (index + 1 < definitions.len) {
+            owner.imports = definitions[index + 1 .. index + 2];
+            owner.rules = &rules;
+        }
+    }
+    var plan = try compile(std.testing.allocator, &definitions[0]);
+    defer plan.deinit(std.testing.allocator);
+    var current = &plan;
+    for (0..32) |_| current = current.rules[0].imported_plan.?;
+    try std.testing.expectEqual(@as(usize, 0), current.rules.len);
+}
+
+fn iterativeEvaluatorTestContext(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: *const CompiledRule,
+    root: std.json.Value,
+) RuleEvaluationContext {
+    return .{
+        .allocator = allocator,
+        .plan = plan,
+        .loaded = &.{},
+        .rule = rule,
+        .root = root,
+        .target = if (rule.pointer_id) |id| resolve(root, plan.pointers[id]) else root,
+        .item = true,
+    };
+}
+
+fn iterativeEvaluatorTestPlan(allocator: std.mem.Allocator) !Plan {
+    var plan = emptyDecodedPlan();
+    plan.max_records = 64;
+    plan.max_diagnostics = 8;
+    const paths = [_][]const u8{ "/targets", "/sources", "/id", "/refs" };
+    const pointers = try allocator.alloc(Pointer, paths.len);
+    errdefer allocator.free(pointers);
+    var initialized: usize = 0;
+    errdefer for (pointers[0..initialized]) |*pointer| pointer.deinit(allocator);
+    for (paths, pointers) |path, *pointer| {
+        pointer.* = try definition_core.json_pointer.compile(allocator, path);
+        initialized += 1;
+    }
+    plan.pointers = pointers;
+    return plan;
+}
+
+fn iterativeEvaluatorAllocationFailure(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: *const CompiledRule,
+    value: std.json.Value,
+) !void {
+    const valid = try evaluateRule(iterativeEvaluatorTestContext(allocator, plan, rule, value));
+    try std.testing.expectEqual(true, valid.?);
+}
+
+fn iterativeImportedAllocationFailure(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+) !void {
+    var execution = try executeValues(allocator, plan, &.{.{
+        .name = "record",
+        .value = .{ .string = "accepted" },
+    }});
+    defer execution.deinit();
+    try std.testing.expect(execution.isValid());
+}
+
+test "iterative validation evaluator handles deepest admitted imported item rules" {
+    const allocator = std.testing.allocator;
+    const bytes = try cacheTraversalTestBytes(allocator, 16, 32);
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var plan = try decodeCache(allocator, &decoder);
+    defer plan.deinit(allocator);
+    for ([_]std.json.Value{ .{ .string = "accepted" }, .{ .integer = 7 } }, 0..) |value, index| {
+        var execution = try executeValues(allocator, &plan, &.{.{
+            .name = "record",
+            .value = value,
+        }});
+        defer execution.deinit();
+        try std.testing.expectEqual(index == 0, execution.isValid());
+        try std.testing.expectEqual(index, execution.diagnostics.?.items.items.len);
+    }
+}
+
+test "iterative validation evaluator frees all imported continuations on allocation failure" {
+    const allocator = std.testing.allocator;
+    const bytes = try cacheTraversalTestBytes(allocator, 2, 2);
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var plan = try decodeCache(allocator, &decoder);
+    defer plan.deinit(allocator);
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        iterativeImportedAllocationFailure,
+        .{&plan},
+    );
+}
+
+test "iterative validation evaluator preserves composite short circuit before later errors" {
+    const allocator = std.testing.allocator;
+    var plan = emptyDecodedPlan();
+    plan.max_records = 4;
+    var bindings = [_]u16{imported_self_input};
+    var poison = emptyCompiledRule();
+    poison.operator = .definition_ref;
+    poison.imported_plan = &plan;
+    poison.path_ids = &bindings;
+    var children = [_]CompiledRule{ emptyCompiledRule(), emptyCompiledRule(), poison };
+    var rule = emptyCompiledRule();
+    rule.operator = .one_of;
+    rule.children = &children;
+    const context = iterativeEvaluatorTestContext(allocator, &plan, &rule, .null);
+    try std.testing.expectEqual(false, (try evaluateRule(context)).?);
+    children[1].operator = .field_absent;
+    try std.testing.expectError(
+        error.ImportedDefinitionInputBindingsMismatch,
+        evaluateRule(context),
+    );
+    rule.operator = .optional_field;
+    rule.children = children[2..];
+    rule.allow_null = true;
+    try std.testing.expectEqual(true, (try evaluateRule(context)).?);
+    rule.allow_null = false;
+    try std.testing.expectError(
+        error.ImportedDefinitionInputBindingsMismatch,
+        evaluateRule(context),
+    );
+}
+
+test "iterative validation evaluator keeps imported diagnostic and later error order" {
+    const allocator = std.testing.allocator;
+    var empty = emptyDecodedPlan();
+    var bindings = [_]u16{imported_self_input};
+    var scalar = emptyCompiledRule();
+    scalar.operator = .scalar_type;
+    scalar.scalar_kind = .string;
+    var poison = emptyCompiledRule();
+    poison.operator = .definition_ref;
+    poison.imported_plan = &empty;
+    poison.path_ids = &bindings;
+    var rules = [_]CompiledRule{ scalar, poison };
+    var inputs = [_]definition.Input{.{
+        .name = @constCast("record"),
+        .codec = .json,
+        .required = true,
+        .max_bytes = 4096,
+    }};
+    var imported = emptyDecodedPlan();
+    imported.inputs = &inputs;
+    imported.rules = &rules;
+    imported.max_diagnostics = 8;
+    var outer = poison;
+    outer.imported_plan = &imported;
+    const context = iterativeEvaluatorTestContext(allocator, &empty, &outer, .{ .integer = 7 });
+    try std.testing.expectError(
+        error.ImportedDefinitionInputBindingsMismatch,
+        evaluateRule(context),
+    );
+    rules[1] = emptyCompiledRule();
+    try std.testing.expectEqual(false, (try evaluateRule(context)).?);
+}
+
+test "iterative validation evaluator resumes nested reference predicates and frees indexes" {
+    const allocator = std.testing.allocator;
+    var plan = try iterativeEvaluatorTestPlan(allocator);
+    defer plan.deinit(allocator);
+    var paths = [_]u16{ 0, 2 };
+    var inner = emptyCompiledRule();
+    inner.operator = .reference_exists;
+    inner.pointer_id = 1;
+    inner.other_pointer_id = 3;
+    inner.path_ids = &paths;
+    var predicates = [_]CompiledRule{inner};
+    var targets = [_]CompiledReferenceTarget{.{
+        .pointer_id = 0,
+        .key_pointer_id = 2,
+        .rules = &predicates,
+        .coverage_rules = &predicates,
+        .match_rules = &predicates,
+        .format_parts = &.{},
+    }};
+    var sources = [_]CompiledReferenceSource{.{
+        .pointer_id = 1,
+        .reference_pointer_id = 3,
+        .rules = &predicates,
+        .format_parts = &.{},
+    }};
+    var outer = inner;
+    outer.reference_targets = &targets;
+    outer.reference_sources = &sources;
+    outer.total_coverage = true;
+    const bytes =
+        \\{"targets":[{"id":"a","targets":[{"id":"x"}],"sources":[{"refs":["x"]}]},{"id":"b","targets":[{"id":"x"}],"sources":[{"refs":["missing"]}]}],"sources":[{"refs":["a"],"targets":[{"id":"x"}],"sources":[{"refs":["x"]}]},{"refs":["missing"],"targets":[{"id":"x"}],"sources":[{"refs":["missing"]}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    try iterativeEvaluatorAllocationFailure(allocator, &plan, &outer, parsed.value);
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        iterativeEvaluatorAllocationFailure,
+        .{ &plan, &outer, parsed.value },
+    );
+    outer.ignore_null_references = true;
+    plan.max_records = 1;
+    const context = iterativeEvaluatorTestContext(allocator, &plan, &outer, parsed.value);
+    try std.testing.expectEqual(false, (try evaluateRule(context)).?);
+}
+
+test "iterative validation evaluator filters targets before keys and coverage predicates" {
+    const allocator = std.testing.allocator;
+    var plan = try iterativeEvaluatorTestPlan(allocator);
+    defer plan.deinit(allocator);
+    var empty = emptyDecodedPlan();
+    var bindings = [_]u16{imported_self_input};
+    var filter = [_]CompiledRule{emptyCompiledRule()};
+    filter[0].operator = .scalar_type;
+    filter[0].scalar_kind = .string;
+    var poison = [_]CompiledRule{emptyCompiledRule()};
+    poison[0].operator = .definition_ref;
+    poison[0].imported_plan = &empty;
+    poison[0].path_ids = &bindings;
+    var targets = [_]CompiledReferenceTarget{.{
+        .pointer_id = 0,
+        .key_pointer_id = 2,
+        .rules = &filter,
+        .coverage_rules = &poison,
+        .match_rules = &poison,
+        .format_parts = &.{},
+    }};
+    var rule = emptyCompiledRule();
+    rule.operator = .reference_exists;
+    rule.pointer_id = 1;
+    rule.other_pointer_id = 3;
+    rule.reference_targets = &targets;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"targets\":[{}],\"sources\":[]}",
+        .{},
+    );
+    defer parsed.deinit();
+    const context = iterativeEvaluatorTestContext(allocator, &plan, &rule, parsed.value);
+    try std.testing.expectEqual(true, (try evaluateRule(context)).?);
+    filter[0].scalar_kind = .object;
+    try std.testing.expectEqual(false, (try evaluateRule(context)).?);
+    const item = &parsed.value.object.getPtr("targets").?.array.items[0];
+    try item.object.put(parsed.arena.allocator(), "id", .{ .string = "a" });
+    try std.testing.expectError(
+        error.ImportedDefinitionInputBindingsMismatch,
+        evaluateRule(context),
+    );
+}
+
+test "iterative validation evaluator keeps primitive rules allocation free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var plan = emptyDecodedPlan();
+    var rule = emptyCompiledRule();
+    rule.operator = .scalar_type;
+    rule.scalar_kind = .string;
+    const context = iterativeEvaluatorTestContext(
+        failing.allocator(),
+        &plan,
+        &rule,
+        .{ .string = "accepted" },
+    );
+    try std.testing.expectEqual(true, (try evaluateRule(context)).?);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+fn maximumRuleCleanupTestPlan(allocator: std.mem.Allocator) !Plan {
+    var output = try cacheTraversalTestPlan(allocator, 17, 32);
+    errdefer output.deinit(allocator);
+    var current: ?*Plan = &output;
+    while (current) |plan| {
+        var leaf = &plan.rules[0];
+        while (leaf.children.len != 0) leaf = &leaf.children[0];
+        current = leaf.imported_plan;
+        for (0..16) |_| {
+            const children = try allocator.alloc(CompiledRule, 1);
+            children[0] = plan.rules[0];
+            plan.rules[0] = emptyCompiledRule();
+            plan.rules[0].operator = .implies;
+            plan.rules[0].pointer_id = 0;
+            plan.rules[0].children = children;
+        }
+    }
+    return output;
+}
+
+test "iterative validation cache cleanup handles maximum construction depth without allocating" {
+    var plan = try maximumRuleCleanupTestPlan(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    plan.deinit(failing.allocator());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }

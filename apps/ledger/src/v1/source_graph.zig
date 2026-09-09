@@ -1836,6 +1836,510 @@ fn lowerConfiguredFields(
     return lowered;
 }
 
+const LawContext = struct {
+    input: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    terms: ?std.json.ObjectMap = null,
+    allow_terms: bool = false,
+
+    fn nested(self: LawContext) LawContext {
+        return .{ .terms = self.terms, .allow_terms = self.allow_terms };
+    }
+};
+
+const LawExpression = struct {
+    raw: std.json.Value,
+    output: *std.json.Value,
+    context: LawContext,
+};
+
+const LawList = struct {
+    raw: std.json.Array,
+    output: *std.json.Array,
+    context: LawContext,
+    mode: enum { expressions, mixed_rules, values },
+    index: usize = 0,
+};
+
+const LawObjectEntries = struct {
+    raw: std.json.ObjectMap,
+    output: *std.json.ObjectMap,
+    context: LawContext,
+    index: usize = 0,
+    admission: enum { unrestricted, non_overriding, relation_options },
+    single: ?*bool = null,
+};
+
+const LawObjectResult = struct {
+    object: *std.json.ObjectMap,
+    output: *std.json.Value,
+    inherited: LawContext = .{},
+};
+
+const LawRelation = struct {
+    expression: std.json.Array,
+    output: *std.json.Value,
+    context: LawContext,
+    raw_sources: std.json.Array,
+    raw_targets: std.json.Array,
+    sources: std.json.Array,
+    targets: std.json.Array,
+    source_input: ?[]const u8 = null,
+    target_input: ?[]const u8 = null,
+    result: std.json.ObjectMap = .empty,
+    endpoint: CompactEndpoint = undefined,
+    target_phase: bool = false,
+    index: usize = 0,
+    single: bool = false,
+};
+
+const LawTask = union(enum) {
+    expression: LawExpression,
+    nested: struct { key: []const u8, expression: LawExpression },
+    list: LawList,
+    append: struct {
+        output: *std.json.Array,
+        value: *std.json.Value,
+        charge: bool,
+    },
+    finish_array: struct { output: *std.json.Value, array: *std.json.Array },
+    object_entries: LawObjectEntries,
+    put: struct {
+        object: *std.json.ObjectMap,
+        key: []const u8,
+        value: *std.json.Value,
+        admission: @FieldType(LawObjectEntries, "admission"),
+    },
+    finish_object: LawObjectResult,
+    relation_endpoint: *LawRelation,
+    finish_endpoint: *LawRelation,
+    relation_options: *LawRelation,
+    finish_relation: *LawRelation,
+};
+
+const LawLowering = struct {
+    allocator: std.mem.Allocator,
+    budget: *ExpansionBudget,
+    tasks: std.ArrayList(LawTask) = .empty,
+
+    fn run(self: *LawLowering, first: LawTask) !void {
+        defer self.tasks.deinit(self.allocator);
+        try self.tasks.append(self.allocator, first);
+        while (self.tasks.pop()) |task| {
+            try self.execute(task);
+            if (self.tasks.items.len > ExpansionBudget.max_emitted) {
+                return error.SourceGraphExpansionLimitExceeded;
+            }
+        }
+    }
+
+    fn execute(self: *LawLowering, task: LawTask) !void {
+        switch (task) {
+            .expression => |work| try self.expression(work),
+            .nested => |work| try self.nestedValue(work.key, work.expression),
+            .list => |work| try self.list(work),
+            .append => |work| {
+                if (work.charge) try self.budget.reserve(1);
+                try work.output.append(work.value.*);
+            },
+            .finish_array => |work| work.output.* = .{ .array = work.array.* },
+            .object_entries => |work| try self.objectEntries(work),
+            .put => |work| try self.putEntry(work),
+            .finish_object => |work| try self.finishObject(work),
+            .relation_endpoint => |work| try self.relationEndpoint(work),
+            .finish_endpoint => |work| try self.finishEndpoint(work),
+            .relation_options => |work| try self.relationOptions(work),
+            .finish_relation => |work| try self.finishRelation(work),
+        }
+    }
+
+    fn list(self: *LawLowering, work: LawList) !void {
+        if (work.index == work.raw.items.len) return;
+        const value = try self.allocator.create(std.json.Value);
+        var next = work;
+        next.index += 1;
+        try self.tasks.append(self.allocator, .{ .list = next });
+        try self.tasks.append(self.allocator, .{ .append = .{
+            .output = work.output,
+            .value = value,
+            .charge = work.mode != .values,
+        } });
+        const expression_work: LawExpression = .{
+            .raw = work.raw.items[work.index],
+            .output = value,
+            .context = work.context,
+        };
+        const is_expression = work.mode == .expressions or
+            (work.mode == .mixed_rules and expression_work.raw == .array);
+        try self.tasks.append(self.allocator, if (is_expression)
+            .{ .expression = expression_work }
+        else
+            .{ .nested = .{ .key = "", .expression = expression_work } });
+    }
+
+    fn scheduleList(
+        self: *LawLowering,
+        raw: std.json.Array,
+        output: *std.json.Value,
+        context: LawContext,
+        mode: @FieldType(LawList, "mode"),
+    ) !void {
+        const array = try self.allocator.create(std.json.Array);
+        array.* = .init(self.allocator);
+        try self.tasks.append(self.allocator, .{ .finish_array = .{
+            .output = output,
+            .array = array,
+        } });
+        try self.tasks.append(self.allocator, .{ .list = .{
+            .raw = raw,
+            .output = array,
+            .context = context,
+            .mode = mode,
+        } });
+    }
+
+    fn objectEntries(self: *LawLowering, work: LawObjectEntries) !void {
+        if (work.index == work.raw.count()) return;
+        const key = work.raw.keys()[work.index];
+        const raw = work.raw.values()[work.index];
+        var next = work;
+        next.index += 1;
+        try self.tasks.append(self.allocator, .{ .object_entries = next });
+        if (work.admission == .relation_options and std.mem.eql(u8, key, "single")) {
+            work.single.?.* = try definition_core.json.boolean(raw);
+            return;
+        }
+        const value = try self.allocator.create(std.json.Value);
+        try self.tasks.append(self.allocator, .{ .put = .{
+            .object = work.output,
+            .key = key,
+            .value = value,
+            .admission = work.admission,
+        } });
+        try self.tasks.append(self.allocator, .{ .nested = .{
+            .key = key,
+            .expression = .{
+                .raw = raw,
+                .output = value,
+                .context = work.context.nested(),
+            },
+        } });
+    }
+
+    fn putEntry(self: *LawLowering, work: @FieldType(LawTask, "put")) !void {
+        switch (work.admission) {
+            .unrestricted => try work.object.put(self.allocator, work.key, work.value.*),
+            .non_overriding => try putNonOverriding(
+                self.allocator,
+                work.object,
+                work.key,
+                work.value.*,
+            ),
+            .relation_options => try putNonOverridingReserved(
+                self.allocator,
+                work.object,
+                work.key,
+                work.value.*,
+                &.{ "path", "reference", "target", "target_input", "key", "sources", "targets" },
+            ),
+        }
+    }
+
+    fn finishObject(self: *LawLowering, work: LawObjectResult) !void {
+        if (work.inherited.input) |input| if (!work.object.contains("input")) {
+            try work.object.put(self.allocator, "input", .{ .string = input });
+        };
+        if (work.inherited.path) |path| if (path.len != 0 and !work.object.contains("path")) {
+            try work.object.put(self.allocator, "path", .{ .string = path });
+        };
+        work.output.* = .{ .object = work.object.* };
+    }
+
+    fn nestedValue(self: *LawLowering, key: []const u8, work: LawExpression) !void {
+        if (isRuleListKey(key)) {
+            try self.scheduleList(
+                try definition_core.json.array(work.raw),
+                work.output,
+                work.context.nested(),
+                .mixed_rules,
+            );
+            return;
+        }
+        switch (work.raw) {
+            .array => |array| try self.scheduleList(array, work.output, work.context, .values),
+            .object => |object| {
+                const output = try self.allocator.create(std.json.ObjectMap);
+                output.* = .empty;
+                try self.tasks.append(self.allocator, .{ .finish_object = .{
+                    .object = output,
+                    .output = work.output,
+                } });
+                try self.tasks.append(self.allocator, .{ .object_entries = .{
+                    .raw = object,
+                    .output = output,
+                    .context = work.context,
+                    .admission = .unrestricted,
+                } });
+            },
+            else => work.output.* = work.raw,
+        }
+    }
+
+    fn expression(self: *LawLowering, source: LawExpression) !void {
+        var work = source;
+        for (0..2) |_| {
+            const candidate = try definition_core.json.array(work.raw);
+            if (candidate.items.len == 0) return error.InvalidLawExpression;
+            const op = try definition_core.json.string(candidate.items[0]);
+            if (!std.mem.eql(u8, op, "use")) break;
+            if (!work.context.allow_terms or candidate.items.len != 2) return error.InvalidLawTerm;
+            const name = try definition_core.json.string(candidate.items[1]);
+            const terms = work.context.terms orelse return error.UnknownLawTerm;
+            work.raw = terms.get(name) orelse return error.UnknownLawTerm;
+            work.context.allow_terms = false;
+        }
+        const raw = try definition_core.json.array(work.raw);
+        if (raw.items.len == 0) return error.InvalidLawExpression;
+        const op = try definition_core.json.string(raw.items[0]);
+        if (raw.items.len <= 2) return self.objectExpression(work, raw, op);
+        if (isSimplePositionalOperator(op)) {
+            work.output.* = try lowerSimplePositionalExpression(
+                self.allocator,
+                raw,
+                op,
+                work.context.input,
+                work.context.path,
+            );
+        } else if (std.mem.eql(u8, op, "all") or std.mem.eql(u8, op, "any") or
+            std.mem.eql(u8, op, "none"))
+        {
+            try self.quantified(work, raw, op);
+        } else if (std.mem.eql(u8, op, "implies")) {
+            try self.implication(work, raw);
+        } else if (std.mem.eql(u8, op, "reference-exists")) {
+            try self.relation(work, raw);
+        } else return error.UnsupportedPositionalLaw;
+    }
+
+    fn objectExpression(
+        self: *LawLowering,
+        work: LawExpression,
+        raw: std.json.Array,
+        op: []const u8,
+    ) !void {
+        const result = try self.allocator.create(std.json.ObjectMap);
+        result.* = .empty;
+        try result.put(self.allocator, "op", .{ .string = op });
+        try self.tasks.append(self.allocator, .{ .finish_object = .{
+            .object = result,
+            .output = work.output,
+            .inherited = work.context,
+        } });
+        if (raw.items.len == 2) {
+            try self.tasks.append(self.allocator, .{ .object_entries = .{
+                .raw = try definition_core.json.object(raw.items[1]),
+                .output = result,
+                .context = work.context,
+                .admission = .non_overriding,
+            } });
+        }
+    }
+
+    fn scheduleRulesField(
+        self: *LawLowering,
+        object: *std.json.ObjectMap,
+        raw: std.json.Array,
+        context: LawContext,
+    ) !void {
+        const value = try self.allocator.create(std.json.Value);
+        try self.tasks.append(self.allocator, .{ .put = .{
+            .object = object,
+            .key = "rules",
+            .value = value,
+            .admission = .unrestricted,
+        } });
+        try self.scheduleList(raw, value, context.nested(), .expressions);
+    }
+
+    fn quantified(
+        self: *LawLowering,
+        work: LawExpression,
+        raw: std.json.Array,
+        op: []const u8,
+    ) !void {
+        if (raw.items.len != 3) return error.InvalidLawExpression;
+        const subject = try compactReference(raw.items[1]);
+        const result = try self.allocator.create(std.json.ObjectMap);
+        result.* = .empty;
+        try result.put(self.allocator, "op", .{ .string = op });
+        try putIfPresent(
+            self.allocator,
+            result,
+            "input",
+            resolvedInput(subject, work.context.input),
+        );
+        try result.put(self.allocator, "path", .{
+            .string = try resolvedPath(self.allocator, subject, work.context.path),
+        });
+        try self.tasks.append(self.allocator, .{ .finish_object = .{
+            .object = result,
+            .output = work.output,
+        } });
+        try self.scheduleRulesField(
+            result,
+            try definition_core.json.array(raw.items[2]),
+            work.context,
+        );
+    }
+
+    fn implication(self: *LawLowering, work: LawExpression, raw: std.json.Array) !void {
+        if (raw.items.len != 4) return error.InvalidLawExpression;
+        const condition = try compactReference(raw.items[1]);
+        const predicate = try definition_core.json.object(raw.items[2]);
+        try definition_core.json.requireExactKeys(
+            predicate,
+            &.{ "equals", "not_equals", "empty", "nonempty" },
+        );
+        const input = resolvedInput(condition, work.context.input) orelse
+            return error.InvalidCompactReference;
+        const result = try self.allocator.create(std.json.ObjectMap);
+        result.* = .empty;
+        try result.put(self.allocator, "op", .{ .string = "implies" });
+        try result.put(self.allocator, "input", .{ .string = input });
+        try result.put(self.allocator, "if", .{
+            .string = try resolvedPath(self.allocator, condition, work.context.path),
+        });
+        var iterator = predicate.iterator();
+        while (iterator.next()) |entry| {
+            try result.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try self.tasks.append(self.allocator, .{ .finish_object = .{
+            .object = result,
+            .output = work.output,
+        } });
+        switch (raw.items[3]) {
+            .array => |rules| try self.scheduleRulesField(result, rules, work.context),
+            .object => |consequence| try putCompactObjectConsequence(
+                self.allocator,
+                result,
+                consequence,
+                work.context.input,
+                work.context.path,
+            ),
+            else => return error.InvalidLawExpression,
+        }
+    }
+
+    fn relation(self: *LawLowering, work: LawExpression, raw: std.json.Array) !void {
+        if (raw.items.len < 3 or raw.items.len > 4) return error.InvalidLawExpression;
+        const sources = try definition_core.json.array(raw.items[1]);
+        const targets = try definition_core.json.array(raw.items[2]);
+        if (sources.items.len == 0 or targets.items.len == 0) return error.InvalidCompactRelation;
+        const state = try self.allocator.create(LawRelation);
+        state.* = .{
+            .expression = raw,
+            .output = work.output,
+            .context = work.context,
+            .raw_sources = sources,
+            .raw_targets = targets,
+            .sources = .init(self.allocator),
+            .targets = .init(self.allocator),
+        };
+        try state.result.put(self.allocator, "op", .{ .string = "reference-exists" });
+        try self.tasks.append(self.allocator, .{ .relation_endpoint = state });
+    }
+
+    fn relationEndpoint(self: *LawLowering, state: *LawRelation) !void {
+        const raw = if (state.target_phase) state.raw_targets else state.raw_sources;
+        if (state.index == raw.items.len) {
+            if (!state.target_phase) {
+                state.target_phase = true;
+                state.index = 0;
+                try self.tasks.append(self.allocator, .{ .relation_endpoint = state });
+            } else try self.tasks.append(self.allocator, .{ .relation_options = state });
+            return;
+        }
+        const endpoint = try definition_core.json.array(raw.items[state.index]);
+        if (endpoint.items.len < 2 or endpoint.items.len > 3) {
+            return error.InvalidCompactRelationEndpoint;
+        }
+        state.endpoint = .{
+            .reference = try compactReference(endpoint.items[0]),
+            .object = .empty,
+        };
+        try state.endpoint.object.put(self.allocator, "path", .{
+            .string = try resolvedPath(
+                self.allocator,
+                state.endpoint.reference,
+                state.context.path,
+            ),
+        });
+        if (endpoint.items[1] != .null) {
+            try state.endpoint.object.put(
+                self.allocator,
+                if (state.target_phase) "key" else "reference",
+                endpoint.items[1],
+            );
+        }
+        try self.tasks.append(self.allocator, .{ .finish_endpoint = state });
+        if (endpoint.items.len == 3) {
+            try self.tasks.append(self.allocator, .{ .object_entries = .{
+                .raw = try definition_core.json.object(endpoint.items[2]),
+                .output = &state.endpoint.object,
+                .context = state.context,
+                .admission = .non_overriding,
+            } });
+        }
+    }
+
+    fn finishEndpoint(self: *LawLowering, state: *LawRelation) !void {
+        const input = resolvedInput(state.endpoint.reference, state.context.input) orelse
+            return error.InvalidCompactReference;
+        const common = if (state.target_phase) &state.target_input else &state.source_input;
+        if (common.*) |expected| {
+            if (!std.mem.eql(u8, expected, input)) {
+                return if (state.target_phase)
+                    error.MixedRelationTargetInputs
+                else
+                    error.MixedRelationSourceInputs;
+            }
+        } else common.* = input;
+        const values = if (state.target_phase) &state.targets else &state.sources;
+        try values.append(.{ .object = state.endpoint.object });
+        state.index += 1;
+        try self.tasks.append(self.allocator, .{ .relation_endpoint = state });
+    }
+
+    fn relationOptions(self: *LawLowering, state: *LawRelation) !void {
+        try state.result.put(self.allocator, "input", .{ .string = state.source_input.? });
+        if (!std.mem.eql(u8, state.source_input.?, state.target_input.?)) {
+            try state.result.put(self.allocator, "target_input", .{
+                .string = state.target_input.?,
+            });
+        }
+        try self.tasks.append(self.allocator, .{ .finish_relation = state });
+        if (state.expression.items.len == 4) {
+            try self.tasks.append(self.allocator, .{ .object_entries = .{
+                .raw = try definition_core.json.object(state.expression.items[3]),
+                .output = &state.result,
+                .context = state.context,
+                .admission = .relation_options,
+                .single = &state.single,
+            } });
+        }
+    }
+
+    fn finishRelation(self: *LawLowering, state: *LawRelation) !void {
+        if (state.single) {
+            try flattenCompactRelation(self.allocator, &state.result, state.sources, state.targets);
+        } else {
+            try state.result.put(self.allocator, "sources", .{ .array = state.sources });
+            try state.result.put(self.allocator, "targets", .{ .array = state.targets });
+        }
+        state.output.* = .{ .object = state.result };
+    }
+};
+
 fn lowerExpressions(
     allocator: std.mem.Allocator,
     raw: std.json.Array,
@@ -1844,344 +2348,38 @@ fn lowerExpressions(
     terms: ?std.json.ObjectMap,
     allow_terms: bool,
     budget: *ExpansionBudget,
-) anyerror!std.json.Array {
-    var lowered = std.json.Array.init(allocator);
-    for (raw.items) |expression| {
-        try appendRule(
-            budget,
-            &lowered,
-            try lowerExpression(
-                allocator,
-                expression,
-                inherited_input,
-                inherited_path,
-                terms,
-                allow_terms,
-                budget,
-            ),
-        );
-    }
-    return lowered;
-}
-
-fn lowerExpression(
-    allocator: std.mem.Allocator,
-    raw: std.json.Value,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    var selected = raw;
-    var terms_allowed = allow_terms;
-    for (0..2) |_| {
-        const candidate = try definition_core.json.array(selected);
-        if (candidate.items.len == 0) return error.InvalidLawExpression;
-        const candidate_operator = try definition_core.json.string(
-            candidate.items[0],
-        );
-        if (!std.mem.eql(u8, candidate_operator, "use")) break;
-        if (!terms_allowed or candidate.items.len != 2) {
-            return error.InvalidLawTerm;
-        }
-        const name = try definition_core.json.string(candidate.items[1]);
-        const term_map = terms orelse return error.UnknownLawTerm;
-        selected = term_map.get(name) orelse return error.UnknownLawTerm;
-        terms_allowed = false;
-    }
-    const expression = try definition_core.json.array(selected);
-    if (expression.items.len == 0) return error.InvalidLawExpression;
-    const operator = try definition_core.json.string(expression.items[0]);
-    if (expression.items.len > 2) {
-        return lowerPositionalExpression(
-            allocator,
-            expression,
-            inherited_input,
-            inherited_path,
-            terms,
-            terms_allowed,
-            budget,
-        );
-    }
-    return lowerObjectExpression(
-        allocator,
-        expression,
-        operator,
-        inherited_input,
-        inherited_path,
-        terms,
-        terms_allowed,
-        budget,
-    );
-}
-
-fn lowerObjectExpression(
-    allocator: std.mem.Allocator,
-    expression: std.json.Array,
-    operator: []const u8,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    var result = std.json.ObjectMap.empty;
-    try result.put(allocator, "op", .{ .string = operator });
-    if (expression.items.len == 2) {
-        const config = try definition_core.json.object(expression.items[1]);
-        var iterator = config.iterator();
-        while (iterator.next()) |entry| {
-            try putNonOverriding(
-                allocator,
-                &result,
-                entry.key_ptr.*,
-                try lowerNestedExpressions(
-                    allocator,
-                    entry.key_ptr.*,
-                    entry.value_ptr.*,
-                    terms,
-                    allow_terms,
-                    budget,
-                ),
-            );
-        }
-    }
-    if (inherited_input) |input| {
-        if (!result.contains("input")) {
-            try result.put(allocator, "input", .{ .string = input });
-        }
-    }
-    if (inherited_path) |path| {
-        if (path.len != 0 and !result.contains("path")) {
-            try result.put(allocator, "path", .{ .string = path });
-        }
-    }
-    return .{ .object = result };
-}
-
-fn lowerNestedExpressions(
-    allocator: std.mem.Allocator,
-    key: []const u8,
-    raw: std.json.Value,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    const root = try allocator.create(std.json.Value);
-    var stack: std.ArrayList(NestedTask) = .empty;
-    defer stack.deinit(allocator);
-    try stack.append(allocator, .{ .transform = .{
-        .key = key,
+) !std.json.Array {
+    var result = std.json.Array.init(allocator);
+    var lowering: LawLowering = .{ .allocator = allocator, .budget = budget };
+    try lowering.run(.{ .list = .{
         .raw = raw,
-        .output = root,
+        .output = &result,
+        .mode = .expressions,
+        .context = .{
+            .input = inherited_input,
+            .path = inherited_path,
+            .terms = terms,
+            .allow_terms = allow_terms,
+        },
     } });
-    while (stack.pop()) |task| {
-        try runNestedTask(
-            allocator,
-            task,
-            terms,
-            allow_terms,
-            budget,
-            &stack,
-        );
-        if (stack.items.len > ExpansionBudget.max_emitted) {
-            return error.SourceGraphExpansionLimitExceeded;
-        }
-    }
-    return root.*;
+    return result;
 }
 
-const NestedTransform = struct {
-    key: []const u8,
-    raw: std.json.Value,
-    output: *std.json.Value,
-};
-
-const NestedObjectEntry = struct {
-    key: []const u8,
-    value: *std.json.Value,
-};
-
-const NestedTask = union(enum) {
-    transform: NestedTransform,
-    finish_object: struct {
-        output: *std.json.Value,
-        object: *std.json.ObjectMap,
-    },
-    put_object: struct {
-        object: *std.json.ObjectMap,
-        entry: NestedObjectEntry,
-    },
-    finish_array: struct {
-        output: *std.json.Value,
-        array: *std.json.Array,
-    },
-    append_array: struct {
-        array: *std.json.Array,
-        value: *std.json.Value,
-    },
-};
-
-fn runNestedTask(
+fn putCompactObjectConsequence(
     allocator: std.mem.Allocator,
-    task: NestedTask,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-    stack: *std.ArrayList(NestedTask),
+    result: *std.json.ObjectMap,
+    consequence: std.json.ObjectMap,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
 ) !void {
-    switch (task) {
-        .transform => |work| try transformNestedValue(
-            allocator,
-            work,
-            terms,
-            allow_terms,
-            budget,
-            stack,
-        ),
-        .finish_object => |work| work.output.* = .{ .object = work.object.* },
-        .put_object => |work| try work.object.put(
-            allocator,
-            work.entry.key,
-            work.entry.value.*,
-        ),
-        .finish_array => |work| work.output.* = .{ .array = work.array.* },
-        .append_array => |work| try work.array.append(work.value.*),
-    }
-}
-
-fn transformNestedValue(
-    allocator: std.mem.Allocator,
-    work: NestedTransform,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-    stack: *std.ArrayList(NestedTask),
-) !void {
-    if (isRuleListKey(work.key)) {
-        work.output.* = .{ .array = try lowerNestedRuleList(
-            allocator,
-            try definition_core.json.array(work.raw),
-            terms,
-            allow_terms,
-            budget,
-        ) };
-        return;
-    }
-    switch (work.raw) {
-        .object => |object| try scheduleNestedObject(
-            allocator,
-            work.output,
-            object,
-            stack,
-        ),
-        .array => |array| try scheduleNestedArray(
-            allocator,
-            work.output,
-            array,
-            stack,
-        ),
-        else => work.output.* = work.raw,
-    }
-}
-
-fn scheduleNestedObject(
-    allocator: std.mem.Allocator,
-    output: *std.json.Value,
-    source: std.json.ObjectMap,
-    stack: *std.ArrayList(NestedTask),
-) !void {
-    const object = try allocator.create(std.json.ObjectMap);
-    object.* = .empty;
-    try stack.append(allocator, .{ .finish_object = .{
-        .output = output,
-        .object = object,
-    } });
-    var entries: std.ArrayList(NestedTransform) = .empty;
-    defer entries.deinit(allocator);
-    var iterator = source.iterator();
-    while (iterator.next()) |entry| {
-        try entries.append(allocator, .{
-            .key = entry.key_ptr.*,
-            .raw = entry.value_ptr.*,
-            .output = try allocator.create(std.json.Value),
-        });
-    }
-    var index = entries.items.len;
-    while (index > 0) {
-        index -= 1;
-        const entry = entries.items[index];
-        try stack.append(allocator, .{ .put_object = .{
-            .object = object,
-            .entry = .{ .key = entry.key, .value = entry.output },
-        } });
-        try stack.append(allocator, .{ .transform = entry });
-    }
-}
-
-fn scheduleNestedArray(
-    allocator: std.mem.Allocator,
-    output: *std.json.Value,
-    source: std.json.Array,
-    stack: *std.ArrayList(NestedTask),
-) !void {
-    const array = try allocator.create(std.json.Array);
-    array.* = std.json.Array.init(allocator);
-    try stack.append(allocator, .{ .finish_array = .{
-        .output = output,
-        .array = array,
-    } });
-    var index = source.items.len;
-    while (index > 0) {
-        index -= 1;
-        const value = try allocator.create(std.json.Value);
-        try stack.append(allocator, .{ .append_array = .{
-            .array = array,
-            .value = value,
-        } });
-        try stack.append(allocator, .{ .transform = .{
-            .key = "",
-            .raw = source.items[index],
-            .output = value,
-        } });
-    }
-}
-
-fn lowerNestedRuleList(
-    allocator: std.mem.Allocator,
-    raw: std.json.Array,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Array {
-    var lowered = std.json.Array.init(allocator);
-    for (raw.items) |rule| {
-        try appendRule(
-            budget,
-            &lowered,
-            if (rule == .array)
-                try lowerExpression(
-                    allocator,
-                    rule,
-                    null,
-                    null,
-                    terms,
-                    allow_terms,
-                    budget,
-                )
-            else
-                try lowerNestedExpressions(
-                    allocator,
-                    "",
-                    rule,
-                    terms,
-                    allow_terms,
-                    budget,
-                ),
-        );
-    }
-    return lowered;
+    try definition_core.json.requireExactKeys(consequence, &.{ "then", "equals", "nonempty" });
+    const then = try compactReference(try definition_core.json.field(consequence, "then"));
+    try putIfPresent(allocator, result, "then_input", resolvedInput(then, inherited_input));
+    try result.put(allocator, "then", .{
+        .string = try resolvedPath(allocator, then, inherited_path),
+    });
+    if (consequence.get("equals")) |value| try result.put(allocator, "then_equals", value);
+    if (consequence.get("nonempty")) |value| try result.put(allocator, "then_nonempty", value);
 }
 
 const CompactReference = struct {
@@ -2240,65 +2438,6 @@ fn putIfPresent(
     if (value) |text| {
         try object.put(allocator, name, .{ .string = text });
     }
-}
-
-fn lowerPositionalExpression(
-    allocator: std.mem.Allocator,
-    expression: std.json.Array,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    const operator = try definition_core.json.string(expression.items[0]);
-    if (isSimplePositionalOperator(operator)) {
-        return lowerSimplePositionalExpression(
-            allocator,
-            expression,
-            operator,
-            inherited_input,
-            inherited_path,
-        );
-    }
-    if (std.mem.eql(u8, operator, "all") or
-        std.mem.eql(u8, operator, "any") or
-        std.mem.eql(u8, operator, "none"))
-    {
-        return lowerQuantifiedExpression(
-            allocator,
-            expression,
-            operator,
-            inherited_input,
-            inherited_path,
-            terms,
-            allow_terms,
-            budget,
-        );
-    }
-    if (std.mem.eql(u8, operator, "implies")) {
-        return lowerCompactImplication(
-            allocator,
-            expression,
-            inherited_input,
-            inherited_path,
-            terms,
-            allow_terms,
-            budget,
-        );
-    }
-    if (std.mem.eql(u8, operator, "reference-exists")) {
-        return lowerCompactRelation(
-            allocator,
-            expression,
-            inherited_input,
-            inherited_path,
-            terms,
-            allow_terms,
-            budget,
-        );
-    }
-    return error.UnsupportedPositionalLaw;
 }
 
 fn isSimplePositionalOperator(operator: []const u8) bool {
@@ -2459,43 +2598,6 @@ fn lowerEnumExpression(
     return .{ .object = result };
 }
 
-fn lowerQuantifiedExpression(
-    allocator: std.mem.Allocator,
-    expression: std.json.Array,
-    operator: []const u8,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) !std.json.Value {
-    if (expression.items.len != 3) return error.InvalidLawExpression;
-    const subject = try compactReference(expression.items[1]);
-    var result = std.json.ObjectMap.empty;
-    try result.put(allocator, "op", .{ .string = operator });
-    try putIfPresent(
-        allocator,
-        &result,
-        "input",
-        resolvedInput(subject, inherited_input),
-    );
-    try result.put(allocator, "path", .{
-        .string = try resolvedPath(allocator, subject, inherited_path),
-    });
-    try result.put(allocator, "rules", .{
-        .array = try lowerExpressions(
-            allocator,
-            try definition_core.json.array(expression.items[2]),
-            null,
-            null,
-            terms,
-            allow_terms,
-            budget,
-        ),
-    });
-    return .{ .object = result };
-}
-
 fn isBinaryReferenceOperator(operator: []const u8) bool {
     inline for (.{
         "field-equal",
@@ -2511,282 +2613,6 @@ fn isBinaryReferenceOperator(operator: []const u8) bool {
         if (std.mem.eql(u8, operator, candidate)) return true;
     }
     return false;
-}
-
-fn lowerCompactImplication(
-    allocator: std.mem.Allocator,
-    expression: std.json.Array,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    if (expression.items.len != 4) return error.InvalidLawExpression;
-    const condition = try compactReference(expression.items[1]);
-    const predicate = try definition_core.json.object(expression.items[2]);
-    try definition_core.json.requireExactKeys(predicate, &.{
-        "equals",
-        "not_equals",
-        "empty",
-        "nonempty",
-    });
-    const condition_input = resolvedInput(condition, inherited_input) orelse
-        return error.InvalidCompactReference;
-    var result = std.json.ObjectMap.empty;
-    try result.put(allocator, "op", .{ .string = "implies" });
-    try result.put(allocator, "input", .{ .string = condition_input });
-    try result.put(allocator, "if", .{
-        .string = try resolvedPath(
-            allocator,
-            condition,
-            inherited_path,
-        ),
-    });
-    var predicate_iterator = predicate.iterator();
-    while (predicate_iterator.next()) |entry| {
-        try result.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
-    }
-    try putCompactConsequence(
-        allocator,
-        &result,
-        expression.items[3],
-        inherited_input,
-        inherited_path,
-        terms,
-        allow_terms,
-        budget,
-    );
-    return .{ .object = result };
-}
-
-fn putCompactConsequence(
-    allocator: std.mem.Allocator,
-    result: *std.json.ObjectMap,
-    raw: std.json.Value,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) !void {
-    switch (raw) {
-        .array => |rules| try result.put(allocator, "rules", .{
-            .array = try lowerExpressions(
-                allocator,
-                rules,
-                null,
-                null,
-                terms,
-                allow_terms,
-                budget,
-            ),
-        }),
-        .object => |consequence| {
-            try definition_core.json.requireExactKeys(
-                consequence,
-                &.{ "then", "equals", "nonempty" },
-            );
-            const then = try compactReference(
-                try definition_core.json.field(consequence, "then"),
-            );
-            try putIfPresent(
-                allocator,
-                result,
-                "then_input",
-                resolvedInput(then, inherited_input),
-            );
-            try result.put(allocator, "then", .{
-                .string = try resolvedPath(allocator, then, inherited_path),
-            });
-            if (consequence.get("equals")) |value| {
-                try result.put(allocator, "then_equals", value);
-            }
-            if (consequence.get("nonempty")) |value| {
-                try result.put(allocator, "then_nonempty", value);
-            }
-        },
-        else => return error.InvalidLawExpression,
-    }
-}
-
-fn lowerCompactRelation(
-    allocator: std.mem.Allocator,
-    expression: std.json.Array,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    if (expression.items.len < 3 or expression.items.len > 4) {
-        return error.InvalidLawExpression;
-    }
-    const raw_sources = try definition_core.json.array(expression.items[1]);
-    const raw_targets = try definition_core.json.array(expression.items[2]);
-    if (raw_sources.items.len == 0 or raw_targets.items.len == 0) {
-        return error.InvalidCompactRelation;
-    }
-    var result = std.json.ObjectMap.empty;
-    try result.put(allocator, "op", .{ .string = "reference-exists" });
-    const sources = try lowerCompactSources(
-        allocator,
-        raw_sources,
-        inherited_input,
-        inherited_path,
-        terms,
-        allow_terms,
-        budget,
-    );
-    const targets = try lowerCompactTargets(
-        allocator,
-        raw_targets,
-        inherited_input,
-        inherited_path,
-        terms,
-        allow_terms,
-        budget,
-    );
-    try result.put(allocator, "input", .{ .string = sources.input });
-    if (!std.mem.eql(u8, sources.input, targets.input)) {
-        try result.put(allocator, "target_input", .{ .string = targets.input });
-    }
-    const single = if (expression.items.len == 4)
-        try applyCompactRelationOptions(
-            allocator,
-            &result,
-            expression.items[3],
-            terms,
-            allow_terms,
-            budget,
-        )
-    else
-        false;
-    if (single) {
-        try flattenCompactRelation(
-            allocator,
-            &result,
-            sources.values,
-            targets.values,
-        );
-    } else {
-        try result.put(allocator, "sources", .{ .array = sources.values });
-        try result.put(allocator, "targets", .{ .array = targets.values });
-    }
-    return .{ .object = result };
-}
-
-const CompactEndpoints = struct {
-    values: std.json.Array,
-    input: []const u8,
-};
-
-fn lowerCompactSources(
-    allocator: std.mem.Allocator,
-    raw: std.json.Array,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) !CompactEndpoints {
-    var values = std.json.Array.init(allocator);
-    var common_input: ?[]const u8 = null;
-    for (raw.items) |raw_endpoint| {
-        const endpoint = try lowerCompactEndpoint(
-            allocator,
-            raw_endpoint,
-            "reference",
-            inherited_path,
-            terms,
-            allow_terms,
-            budget,
-        );
-        const input = resolvedInput(endpoint.reference, inherited_input) orelse
-            return error.InvalidCompactReference;
-        if (common_input) |expected| {
-            if (!std.mem.eql(u8, expected, input)) {
-                return error.MixedRelationSourceInputs;
-            }
-        } else common_input = input;
-        try values.append(.{ .object = endpoint.object });
-    }
-    return .{ .values = values, .input = common_input.? };
-}
-
-fn lowerCompactTargets(
-    allocator: std.mem.Allocator,
-    raw: std.json.Array,
-    inherited_input: ?[]const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) !CompactEndpoints {
-    var values = std.json.Array.init(allocator);
-    var common_input: ?[]const u8 = null;
-    for (raw.items) |raw_endpoint| {
-        const endpoint = try lowerCompactEndpoint(
-            allocator,
-            raw_endpoint,
-            "key",
-            inherited_path,
-            terms,
-            allow_terms,
-            budget,
-        );
-        const input = resolvedInput(endpoint.reference, inherited_input) orelse
-            return error.InvalidCompactReference;
-        if (common_input) |expected| {
-            if (!std.mem.eql(u8, expected, input)) {
-                return error.MixedRelationTargetInputs;
-            }
-        } else common_input = input;
-        try values.append(.{ .object = endpoint.object });
-    }
-    return .{ .values = values, .input = common_input.? };
-}
-
-fn applyCompactRelationOptions(
-    allocator: std.mem.Allocator,
-    result: *std.json.ObjectMap,
-    raw: std.json.Value,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) !bool {
-    var single = false;
-    const options = try definition_core.json.object(raw);
-    var iterator = options.iterator();
-    while (iterator.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "single")) {
-            single = try definition_core.json.boolean(entry.value_ptr.*);
-            continue;
-        }
-        try putNonOverridingReserved(
-            allocator,
-            result,
-            entry.key_ptr.*,
-            try lowerNestedExpressions(
-                allocator,
-                entry.key_ptr.*,
-                entry.value_ptr.*,
-                terms,
-                allow_terms,
-                budget,
-            ),
-            &.{
-                "path",
-                "reference",
-                "target",
-                "target_input",
-                "key",
-                "sources",
-                "targets",
-            },
-        );
-    }
-    return single;
 }
 
 fn flattenCompactRelation(
@@ -2843,53 +2669,6 @@ const CompactEndpoint = struct {
     reference: CompactReference,
     object: std.json.ObjectMap,
 };
-
-fn lowerCompactEndpoint(
-    allocator: std.mem.Allocator,
-    raw: std.json.Value,
-    selector_key: []const u8,
-    inherited_path: ?[]const u8,
-    terms: ?std.json.ObjectMap,
-    allow_terms: bool,
-    budget: *ExpansionBudget,
-) anyerror!CompactEndpoint {
-    const endpoint = try definition_core.json.array(raw);
-    if (endpoint.items.len < 2 or endpoint.items.len > 3) {
-        return error.InvalidCompactRelationEndpoint;
-    }
-    const reference = try compactReference(endpoint.items[0]);
-    var object = std.json.ObjectMap.empty;
-    try object.put(allocator, "path", .{
-        .string = try resolvedPath(
-            allocator,
-            reference,
-            inherited_path,
-        ),
-    });
-    if (endpoint.items[1] != .null) {
-        try object.put(allocator, selector_key, endpoint.items[1]);
-    }
-    if (endpoint.items.len == 3) {
-        const options = try definition_core.json.object(endpoint.items[2]);
-        var iterator = options.iterator();
-        while (iterator.next()) |entry| {
-            try putNonOverriding(
-                allocator,
-                &object,
-                entry.key_ptr.*,
-                try lowerNestedExpressions(
-                    allocator,
-                    entry.key_ptr.*,
-                    entry.value_ptr.*,
-                    terms,
-                    allow_terms,
-                    budget,
-                ),
-            );
-        }
-    }
-    return .{ .reference = reference, .object = object };
-}
 
 fn makeRule(
     allocator: std.mem.Allocator,
@@ -3691,4 +3470,189 @@ test "shared event template lowers passive operation plans" {
         "created",
         try definition_core.json.requiredString(kind, "literal"),
     );
+}
+
+fn nestedLawSource(allocator: std.mem.Allocator, depth: usize, object_form: bool) ![]u8 {
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator, "{\"laws\":[");
+    const prefix = if (object_form)
+        "[\"all\",{\"input\":\"record\",\"path\":\"/items\",\"rules\":["
+    else
+        "[\"all\",\"record#/items\",[";
+    const suffix = if (object_form) "]}]" else "]]";
+    for (0..depth) |_| try source.appendSlice(allocator, prefix);
+    try source.appendSlice(allocator, "[\"enum\",\"#/kind\",[\"ok\"]]");
+    for (0..depth) |_| try source.appendSlice(allocator, suffix);
+    try source.appendSlice(allocator, "]}");
+    return source.toOwnedSlice(allocator);
+}
+
+fn expectNestedLawChain(value: std.json.Value, depth: usize) !void {
+    var rules = try definition_core.json.array(value);
+    for (0..depth) |_| {
+        try std.testing.expectEqual(1, rules.items.len);
+        const rule = try definition_core.json.object(rules.items[0]);
+        try std.testing.expectEqualStrings(
+            "all",
+            try definition_core.json.requiredString(rule, "op"),
+        );
+        rules = try definition_core.json.array(try definition_core.json.field(rule, "rules"));
+    }
+    try std.testing.expectEqual(1, rules.items.len);
+    const leaf = try definition_core.json.object(rules.items[0]);
+    try std.testing.expectEqualStrings("enum", try definition_core.json.requiredString(leaf, "op"));
+    try std.testing.expectEqualStrings(
+        "/kind",
+        try definition_core.json.requiredString(leaf, "path"),
+    );
+}
+
+test "compact and object laws lower deep source trees without recursive calls" {
+    for ([_]bool{ false, true }) |object_form| {
+        const source = try nestedLawSource(std.testing.allocator, 4096, object_form);
+        defer std.testing.allocator.free(source);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            source,
+            .{},
+        );
+        defer parsed.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var budget: ExpansionBudget = .{};
+        const lowered = try lowerConstraints(
+            arena.allocator(),
+            parsed.value,
+            &.{"record"},
+            &budget,
+        );
+        try expectNestedLawChain(lowered, 4096);
+        try std.testing.expectEqual(4097, budget.emitted);
+    }
+}
+
+test "wide law lists preserve order and the emitted-rule boundary" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "{\"laws\":[");
+    for (0..4096) |index| {
+        if (index != 0) try source.appendSlice(std.testing.allocator, ",");
+        try source.appendSlice(std.testing.allocator, "[\"enum\",\"record#/n\",[0]]");
+    }
+    try source.appendSlice(std.testing.allocator, "]}");
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source.items,
+        .{},
+    );
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var budget: ExpansionBudget = .{ .emitted = ExpansionBudget.max_emitted - 4096 };
+    const lowered = try lowerConstraints(arena.allocator(), parsed.value, &.{"record"}, &budget);
+    try std.testing.expectEqual(4096, lowered.array.items.len);
+    try std.testing.expectEqual(ExpansionBudget.max_emitted, budget.emitted);
+    try std.testing.expectError(
+        error.SourceGraphExpansionLimitExceeded,
+        lowerConstraints(arena.allocator(), parsed.value, &.{"record"}, &budget),
+    );
+}
+
+const lowering_parity_source =
+    \\{"laws":[["all","record#/items",[["enum","#/kind",["ok"]]]],["implies","record#/enabled",{"equals":true},[["bounded-number","record#/n",0,9]]],["reference-exists",[["record#/links","/id"]],[["record#/nodes","/id",{"rules":[["enum",{"path":"/kind","values":["ok"]}]]}]],{"single":true}]]}
+;
+
+const lowering_parity_expected =
+    \\[{"input":"record","op":"all","path":"/items","rules":[{"op":"enum","path":"/kind","values":["ok"]}]},{"equals":true,"if":"/enabled","input":"record","op":"implies","rules":[{"input":"record","max":9,"min":0,"op":"bounded-number","path":"/n"}]},{"input":"record","key":"/id","op":"reference-exists","path":"/links","reference":"/id","target":"/nodes","target_rules":[{"op":"enum","path":"/kind","values":["ok"]}]}]
+;
+
+fn exerciseLawLoweringAllocationFailures(allocator: std.mem.Allocator) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        lowering_parity_source,
+        .{},
+    );
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var budget: ExpansionBudget = .{};
+    const lowered = try lowerConstraints(arena.allocator(), parsed.value, &.{"record"}, &budget);
+    // The independent byte oracle is outside the injected lowering allocator.
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        std.testing.allocator,
+        lowered,
+    );
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(lowering_parity_expected, canonical);
+    try std.testing.expectEqual(6, budget.emitted);
+}
+
+test "law continuations preserve canonical quantifier implication and relation bytes under OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseLawLoweringAllocationFailures,
+        .{},
+    );
+}
+
+test "nested law errors precede later collisions and exhausted parent budgets" {
+    const cases = [_]struct { source: []const u8, expected: anyerror }{
+        .{ .source =
+        \\{"laws":[["all",{"rules":[[]],"op":"collision"}]]}
+        , .expected = error.InvalidLawExpression },
+        .{ .source =
+        \\{"laws":[["all",{"op":"collision","rules":[[]]}]]}
+        , .expected = error.SourceGraphFieldCollision },
+        .{ .source =
+        \\{"laws":[["all","record#/items",[[]]]]}
+        , .expected = error.InvalidLawExpression },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.source,
+            .{},
+        );
+        defer parsed.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var budget: ExpansionBudget = .{ .emitted = ExpansionBudget.max_emitted };
+        try std.testing.expectError(
+            case.expected,
+            lowerConstraints(arena.allocator(), parsed.value, &.{"record"}, &budget),
+        );
+    }
+}
+
+test "native object rules remain on the same bounded continuation stack" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "{\"laws\":[[\"all\",{\"rules\":[");
+    for (0..4096) |_| {
+        try source.appendSlice(std.testing.allocator, "{\"op\":\"all\",\"rules\":[");
+    }
+    try source.appendSlice(
+        std.testing.allocator,
+        "{\"op\":\"enum\",\"path\":\"/kind\",\"values\":[\"ok\"]}",
+    );
+    for (0..4096) |_| try source.appendSlice(std.testing.allocator, "]}");
+    try source.appendSlice(std.testing.allocator, "]}]]}");
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source.items,
+        .{},
+    );
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var budget: ExpansionBudget = .{};
+    const lowered = try lowerConstraints(arena.allocator(), parsed.value, &.{"record"}, &budget);
+    try expectNestedLawChain(lowered, 4097);
+    try std.testing.expectEqual(4098, budget.emitted);
 }

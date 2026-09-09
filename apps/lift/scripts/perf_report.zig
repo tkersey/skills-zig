@@ -1,3 +1,4 @@
+const core_calendar = @import("core_calendar");
 const std = @import("std");
 const core_io = @import("core_io");
 const core_cli = @import("core_cli");
@@ -34,6 +35,76 @@ const Config = struct {
     output: []const u8 = "perf-report.md",
 };
 
+const ReportBody =
+    \\## 1. Performance Contract
+    \\
+    \\- Metric:
+    \\- Target:
+    \\- Percentile:
+    \\- Workload command:
+    \\- Dataset:
+    \\- Environment:
+    \\- Constraints:
+    \\
+    \\## 2. Baseline
+    \\
+    \\- Measurement method:
+    \\- Sample size:
+    \\- Results (p50/p95/p99):
+    \\- Notes:
+    \\
+    \\## 3. Bottleneck Evidence
+    \\
+    \\- Profile or trace summary:
+    \\- Hot paths:
+    \\- Bound classification (CPU/memory/I/O/lock/tail):
+    \\
+    \\## 4. Hypothesis
+    \\
+    \\- Cause:
+    \\- Expected impact:
+    \\- Risks:
+    \\
+    \\## 5. Experiment Plan
+    \\
+    \\- Change description:
+    \\- Control variables:
+    \\- Success criteria:
+    \\
+    \\## 6. Results
+    \\
+    \\- Variant measurements:
+    \\- Delta vs baseline:
+    \\- Confidence:
+    \\
+    \\## 7. Trade-offs
+    \\
+    \\- Correctness:
+    \\- Maintainability:
+    \\- Cost or resource impact:
+    \\
+    \\## 8. Regression Guard
+    \\
+    \\- Benchmark or budget:
+    \\- Alert or threshold:
+    \\
+    \\## 9. Validation
+    \\
+    \\- Correctness command(s) -> pass/fail:
+    \\- Performance command(s) -> numbers:
+    \\
+    \\## 10. Lift Compliance
+    \\
+    \\- mode (measured|unmeasured):
+    \\- proof artifacts (bench + profile paths):
+    \\
+    \\## 11. Next Steps
+    \\
+    \\- Follow-up experiments:
+    \\- Rollout plan:
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -46,12 +117,20 @@ pub fn main(init: std.process.Init) !void {
     const report_date = try currentDateIso(allocator);
     defer allocator.free(report_date);
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
-    const w = &writer_alloc.writer;
+    const output = try renderReportAlloc(allocator, cfg, report_date);
+    defer allocator.free(output);
 
-    try w.print(
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = cfg.output,
+        .data = output,
+    });
+    const success_message = try std.fmt.allocPrint(allocator, "Wrote {s}\n", .{cfg.output});
+    defer allocator.free(success_message);
+    try writeToStreamAllowBrokenPipe(std.Io.File.stdout(), success_message);
+}
+
+fn renderReportAlloc(allocator: std.mem.Allocator, cfg: Config, report_date: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
         \\# Performance Report: {s}
         \\
         \\Date: {s}
@@ -59,85 +138,7 @@ pub fn main(init: std.process.Init) !void {
         \\System: {s}
         \\
         \\
-    , .{ cfg.title, report_date, cfg.owner, cfg.system });
-
-    try w.writeAll(
-        \\## 1. Performance Contract
-        \\
-        \\- Metric:
-        \\- Target:
-        \\- Percentile:
-        \\- Workload command:
-        \\- Dataset:
-        \\- Environment:
-        \\- Constraints:
-        \\
-        \\## 2. Baseline
-        \\
-        \\- Measurement method:
-        \\- Sample size:
-        \\- Results (p50/p95/p99):
-        \\- Notes:
-        \\
-        \\## 3. Bottleneck Evidence
-        \\
-        \\- Profile or trace summary:
-        \\- Hot paths:
-        \\- Bound classification (CPU/memory/I/O/lock/tail):
-        \\
-        \\## 4. Hypothesis
-        \\
-        \\- Cause:
-        \\- Expected impact:
-        \\- Risks:
-        \\
-        \\## 5. Experiment Plan
-        \\
-        \\- Change description:
-        \\- Control variables:
-        \\- Success criteria:
-        \\
-        \\## 6. Results
-        \\
-        \\- Variant measurements:
-        \\- Delta vs baseline:
-        \\- Confidence:
-        \\
-        \\## 7. Trade-offs
-        \\
-        \\- Correctness:
-        \\- Maintainability:
-        \\- Cost or resource impact:
-        \\
-        \\## 8. Regression Guard
-        \\
-        \\- Benchmark or budget:
-        \\- Alert or threshold:
-        \\
-        \\## 9. Validation
-        \\
-        \\- Correctness command(s) -> pass/fail:
-        \\- Performance command(s) -> numbers:
-        \\
-        \\## 10. Lift Compliance
-        \\
-        \\- mode (measured|unmeasured):
-        \\- proof artifacts (bench + profile paths):
-        \\
-        \\## 11. Next Steps
-        \\
-        \\- Follow-up experiments:
-        \\- Rollout plan:
-        \\
-    );
-
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
-        .sub_path = cfg.output,
-        .data = out.items,
-    });
-    const success_message = try std.fmt.allocPrint(allocator, "Wrote {s}\n", .{cfg.output});
-    defer allocator.free(success_message);
-    try writeToStreamAllowBrokenPipe(std.Io.File.stdout(), success_message);
+    ++ ReportBody, .{ cfg.title, report_date, cfg.owner, cfg.system });
 }
 
 fn parseArgs(argv: []const []const u8) !Config {
@@ -147,13 +148,19 @@ fn parseArgs(argv: []const []const u8) !Config {
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
@@ -188,7 +195,10 @@ fn parseArgs(argv: []const []const u8) !Config {
 }
 
 fn currentDateIso(allocator: std.mem.Allocator) ![]u8 {
-    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(core_io.defaultIo()).nanoseconds, 1_000_000_000));
+    const now_sec: i64 = @intCast(@divFloor(
+        std.Io.Clock.real.now(core_io.defaultIo()).nanoseconds,
+        1_000_000_000,
+    ));
     const days: i64 = @divFloor(now_sec, 86_400);
     const date = civilFromDays(days);
     const year_u: u64 = @intCast(@max(date.year, 0));
@@ -204,22 +214,11 @@ const Date = struct {
 };
 
 fn civilFromDays(days_since_unix_epoch: i64) Date {
-    // Howard Hinnant's civil-from-days algorithm.
-    const z = days_since_unix_epoch + 719_468;
-    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
-    const doe = z - era * 146_097; // [0, 146096]
-    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365); // [0, 399]
-    var y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0,365]
-    const mp = @divFloor(5 * doy + 2, 153); // [0,11]
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1; // [1,31]
-    var m = mp + 3;
-    if (m > 12) m -= 12;
-    if (m <= 2) y += 1;
+    const date = core_calendar.civilFromDays(days_since_unix_epoch, .legacy_negative_era);
     return .{
-        .year = y,
-        .month = m,
-        .day = d,
+        .year = @intCast(date.year),
+        .month = @intCast(date.month),
+        .day = @intCast(date.day),
     };
 }
 
@@ -232,4 +231,28 @@ test "civil date conversion stable around epoch" {
     try std.testing.expectEqual(@as(i64, 1970), epoch.year);
     try std.testing.expectEqual(@as(i64, 1), epoch.month);
     try std.testing.expectEqual(@as(i64, 1), epoch.day);
+}
+
+fn renderReportWithAllocator(allocator: std.mem.Allocator) !void {
+    const output = try renderReportAlloc(
+        allocator,
+        .{ .title = "Example", .owner = "Team", .system = "CLI" },
+        "2026-09-07",
+    );
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        output,
+        "# Performance Report: Example\n\nDate: 2026-09-07\nOwner: Team\nSystem: CLI\n",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, output, "## 1. Performance Contract\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "- Rollout plan:\n"));
+}
+
+test "CLI report renderer retains its complete header and body under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        renderReportWithAllocator,
+        .{},
+    );
 }

@@ -12,7 +12,7 @@ const UsageText =
     \\Compute normalized budget governor state from account/rateLimits/read JSON.
     \\
     \\Usage:
-    \\  zig run codex/skills/cas/scripts/budget_governor.zig -- [options] < input.json
+    \\  budget_governor [options] < input.json
     \\
     \\Options:
     \\  --now-sec N   Override "now" (unix epoch seconds)
@@ -106,59 +106,85 @@ pub fn main(init: std.process.Init) !void {
 
     const parsed = try parseArgs(argv);
     if (parsed.show_version) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
     if (parsed.show_help) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpWithVersion(stdout, UsageText, Version);
         return;
     }
 
-    const input = try std.Io.File.stdin().readToEndAlloc(allocator, 16 * 1024 * 1024);
+    var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &.{});
+    // allocRemaining rejects at its limit; the extra byte preserves an inclusive 16 MiB ceiling.
+    const input = try stdin_reader.interface.allocRemaining(
+        allocator,
+        .limited(16 * 1024 * 1024 + 1),
+    );
     defer allocator.free(input);
 
-    const out = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);
+    var owned = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);
+    defer owned.deinit();
+    const out = owned.value;
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     if (parsed.pretty) {
         std.json.Stringify.value(out, .{ .whitespace = .indent_2 }, stdout) catch |err| {
-            if (core_io.isClosedPipeError(err)) return;
+            if (isClosedOutput(err, stdout_writer.err)) return;
             return err;
         };
     } else {
         std.json.Stringify.value(out, .{}, stdout) catch |err| {
-            if (core_io.isClosedPipeError(err)) return;
+            if (isClosedOutput(err, stdout_writer.err)) return;
             return err;
         };
     }
     stdout.writeAll("\n") catch |err| {
-        if (core_io.isClosedPipeError(err)) return;
+        if (isClosedOutput(err, stdout_writer.err)) return;
         return err;
     };
 }
 
+pub const OwnedGovernor = struct {
+    value: GovernorOut,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *OwnedGovernor) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+// The returned owner retains an input-bounded parsed tree. CLI input is capped
+// at 16 MiB; every string is owned even when the original input is overwritten.
 pub fn computeBudgetGovernorFromSlice(
     allocator: std.mem.Allocator,
     input: []const u8,
     now_sec_opt: ?i64,
-) !GovernorOut {
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-
-    var parsed_json = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), input, .{});
-    defer parsed_json.deinit();
-
-    const root = switch (parsed_json.value) {
+) !OwnedGovernor {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{
+        .allocate = .alloc_always,
+    });
+    const root = switch (parsed) {
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-
-    return computeBudgetGovernor(root, now_sec_opt);
+    return .{ .value = computeBudgetGovernor(root, now_sec_opt), .arena = arena };
 }
 
 const ParsedArgs = struct {
@@ -301,7 +327,12 @@ fn clampFloat(v: f64, lo: f64, hi: f64) f64 {
     return v;
 }
 
-fn computeLinearPacing(used_percent: ?i64, resets_at: ?i64, window_mins: ?i64, now_sec: i64) Pacing {
+fn computeLinearPacing(
+    used_percent: ?i64,
+    resets_at: ?i64,
+    window_mins: ?i64,
+    now_sec: i64,
+) Pacing {
     if (used_percent == null or resets_at == null or window_mins == null or window_mins.? <= 0) {
         return .{
             .ok = false,
@@ -313,11 +344,18 @@ fn computeLinearPacing(used_percent: ?i64, resets_at: ?i64, window_mins: ?i64, n
         };
     }
 
-    const window_sec = window_mins.? * 60;
-    const start_at = resets_at.? - window_sec;
-    const elapsed_sec = now_sec - start_at;
-    const elapsed_percent = clampFloat((@as(f64, @floatFromInt(elapsed_sec)) / @as(f64, @floatFromInt(window_sec))) * 100.0, 0.0, 100.0);
-    const remaining_mins = @max(@as(i64, 0), @divFloor(resets_at.? - now_sec + 59, 60));
+    // Inputs are signed 64-bit timestamps and minute counts. Widen before
+    // multiplication/subtraction so the full accepted numeric domain is safe.
+    const window_sec = @as(i128, window_mins.?) * 60;
+    const start_at = @as(i128, resets_at.?) - window_sec;
+    const elapsed_sec = @as(i128, now_sec) - start_at;
+    const elapsed_percent = clampFloat(
+        (@as(f64, @floatFromInt(elapsed_sec)) / @as(f64, @floatFromInt(window_sec))) * 100.0,
+        0.0,
+        100.0,
+    );
+    const remaining_wide = @divFloor(@as(i128, resets_at.?) - now_sec + 59, 60);
+    const remaining_mins: i64 = @intCast(@max(@as(i128, 0), remaining_wide));
     const delta_percent = @as(f64, @floatFromInt(used_percent.?)) - elapsed_percent;
 
     return .{
@@ -333,7 +371,8 @@ fn computeLinearPacing(used_percent: ?i64, resets_at: ?i64, window_mins: ?i64, n
 fn tierFromDelta(used_percent: ?i64, elapsed_percent: ?f64, delta_percent: ?f64) TierInfo {
     if (used_percent == null) return .{ .tier = "unknown", .tierReason = "used_unknown" };
     if (used_percent.? >= 95) return .{ .tier = "critical", .tierReason = "used_ge_95" };
-    if (elapsed_percent == null or delta_percent == null) return .{ .tier = "unknown", .tierReason = "pacing_unknown" };
+    if (elapsed_percent == null or delta_percent == null)
+        return .{ .tier = "unknown", .tierReason = "pacing_unknown" };
     if (delta_percent.? <= -25.0) return .{ .tier = "surplus", .tierReason = "delta_le_-25" };
     if (delta_percent.? <= -10.0) return .{ .tier = "ahead", .tierReason = "delta_le_-10" };
     if (delta_percent.? < 10.0) return .{ .tier = "on_track", .tierReason = "delta_lt_10" };
@@ -381,7 +420,11 @@ fn evaluateWindow(window: ObjectMap, kind: []const u8, now_sec: i64) WindowEval 
     };
 }
 
-fn pickStricterWindow(primary: ?WindowEval, secondary: ?WindowEval, preferred_kind: ?[]const u8) ?WindowEval {
+fn pickStricterWindow(
+    primary: ?WindowEval,
+    secondary: ?WindowEval,
+    preferred_kind: ?[]const u8,
+) ?WindowEval {
     if (primary == null and secondary == null) return null;
     if (primary != null and secondary == null) return primary.?;
     if (primary == null and secondary != null) return secondary.?;
@@ -396,8 +439,15 @@ fn pickStricterWindow(primary: ?WindowEval, secondary: ?WindowEval, preferred_ki
     return primary.?;
 }
 
+// Returned strings borrow root's backing owner; callers keep that owner alive.
 pub fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
-    const now_sec = now_sec_opt orelse @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
+    const now_sec = now_sec_opt orelse @as(
+        i64,
+        @intCast(@divFloor(
+            std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+            1_000_000_000,
+        )),
+    );
     const picked = pickBucket(root);
     if (picked.bucket == null) {
         return .{
@@ -429,32 +479,8 @@ pub fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
         .pacingOk = if (selected) |s| s.pacingOk else false,
         .pacingReason = if (selected) |s| s.pacingReason else "window_missing",
         .effectiveTier = if (selected) |s| s.effectiveTier else "on_track",
-        .primary = if (primary_eval) |p| WindowOut{
-            .usedPercent = p.usedPercent,
-            .resetsAt = p.resetsAt,
-            .windowDurationMins = p.windowDurationMins,
-            .remainingMins = p.remainingMins,
-            .elapsedPercent = p.elapsedPercent,
-            .deltaPercent = p.deltaPercent,
-            .tier = p.tier,
-            .tierReason = p.tierReason,
-            .pacingOk = p.pacingOk,
-            .pacingReason = p.pacingReason,
-            .effectiveTier = p.effectiveTier,
-        } else null,
-        .secondary = if (secondary_eval) |s| WindowOut{
-            .usedPercent = s.usedPercent,
-            .resetsAt = s.resetsAt,
-            .windowDurationMins = s.windowDurationMins,
-            .remainingMins = s.remainingMins,
-            .elapsedPercent = s.elapsedPercent,
-            .deltaPercent = s.deltaPercent,
-            .tier = s.tier,
-            .tierReason = s.tierReason,
-            .pacingOk = s.pacingOk,
-            .pacingReason = s.pacingReason,
-            .effectiveTier = s.effectiveTier,
-        } else null,
+        .primary = if (primary_eval) |value| windowOut(value) else null,
+        .secondary = if (secondary_eval) |value| windowOut(value) else null,
     };
 
     if (selected) |s| {
@@ -494,7 +520,8 @@ test "governor chooses stricter secondary window" {
 }
 
 fn parseAndComputeWithAlloc(alloc: std.mem.Allocator, json: []const u8) !void {
-    _ = try computeBudgetGovernorFromSlice(alloc, json, 1700000000);
+    var owned = try computeBudgetGovernorFromSlice(alloc, json, 1700000000);
+    defer owned.deinit();
 }
 
 test "allocation failures parse governor json" {
@@ -507,7 +534,11 @@ test "allocation failures parse governor json" {
         \\  }
         \\}
     ;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAndComputeWithAlloc, .{json});
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseAndComputeWithAlloc,
+        .{json},
+    );
 }
 
 fn fuzzGovernorTarget(_: void, smith: *std.testing.Smith) !void {
@@ -518,7 +549,12 @@ fn fuzzGovernorTarget(_: void, smith: *std.testing.Smith) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), input, .{}) catch return;
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        input,
+        .{},
+    ) catch return;
     defer parsed.deinit();
 
     const root = switch (parsed.value) {
@@ -530,4 +566,70 @@ fn fuzzGovernorTarget(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz governor json input" {
     try std.testing.fuzz({}, fuzzGovernorTarget, .{});
+}
+
+fn windowOut(value: WindowEval) WindowOut {
+    return .{
+        .usedPercent = value.usedPercent,
+        .resetsAt = value.resetsAt,
+        .windowDurationMins = value.windowDurationMins,
+        .remainingMins = value.remainingMins,
+        .elapsedPercent = value.elapsedPercent,
+        .deltaPercent = value.deltaPercent,
+        .tier = value.tier,
+        .tierReason = value.tierReason,
+        .pacingOk = value.pacingOk,
+        .pacingReason = value.pacingReason,
+        .effectiveTier = value.effectiveTier,
+    };
+}
+
+fn isClosedOutput(err: anyerror, underlying: ?anyerror) bool {
+    if (core_io.isClosedPipeError(err)) return true;
+    const cause = underlying orelse return false;
+    return err == error.WriteFailed and core_io.isClosedPipeError(cause);
+}
+
+test "output failure succeeds only for a closed reader" {
+    try std.testing.expect(isClosedOutput(error.BrokenPipe, null));
+    try std.testing.expect(isClosedOutput(error.WriteFailed, error.BrokenPipe));
+    try std.testing.expect(!isClosedOutput(error.WriteFailed, error.InputOutput));
+    try std.testing.expect(!isClosedOutput(error.WriteFailed, null));
+}
+
+test "pacing arithmetic accepts the full timestamp and duration domain" {
+    const maximum = std.math.maxInt(i64);
+    const minimum = std.math.minInt(i64);
+    const future = computeLinearPacing(50, maximum, maximum, minimum);
+    try std.testing.expect(future.ok);
+    try std.testing.expect(future.remainingMins.? > 0);
+    try std.testing.expect(std.math.isFinite(future.elapsedPercent.?));
+    const past = computeLinearPacing(50, minimum, maximum, maximum);
+    try std.testing.expect(past.ok);
+    try std.testing.expectEqual(@as(?i64, 0), past.remainingMins);
+    try std.testing.expectEqual(@as(?f64, 100), past.elapsedPercent);
+}
+
+test "owned governor preserves escaped fields after freeing its input" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOwnedGovernor, .{});
+}
+
+fn checkOwnedGovernor(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"rateLimitsByLimitId":{"team\u002dlimit":{"limitId":"id\u002d1",
+        \\"limitName":"team\u0020quota","planType":"pro\u0020plan",
+        \\"primary":{"usedPercent":50,"resetsAt":200,"windowDurationMins":100}}}}
+    ;
+    var owned = blk: {
+        const input = try allocator.dupe(u8, json);
+        defer allocator.free(input);
+        const result = try computeBudgetGovernorFromSlice(allocator, input, 100);
+        @memset(input, '?');
+        break :blk result;
+    };
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("team-limit", owned.value.bucketKey.?);
+    try std.testing.expectEqualStrings("id-1", owned.value.limitId.?);
+    try std.testing.expectEqualStrings("team quota", owned.value.limitName.?);
+    try std.testing.expectEqualStrings("pro plan", owned.value.planType.?);
 }

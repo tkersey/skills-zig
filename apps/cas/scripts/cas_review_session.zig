@@ -425,7 +425,8 @@ const FailureInfo = struct {
     hint: []const u8,
 };
 
-const account_resource_exhausted_hint = "detached review stopped because the account or runtime resource budget was exhausted before emitting a structured reviewResult";
+const account_resource_exhausted_hint = "detached review stopped because the account or runtime " ++
+    "resource budget was exhausted before emitting a structured reviewResult";
 
 fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) OutputReceipt {
     var out = receipt;
@@ -609,6 +610,7 @@ const LiveReviewNotificationState = struct {
     review_turn_id: []const u8,
     review_text: ?[]u8 = null,
     observed_terminal_status: ?[]const u8 = null,
+    observed_terminal_status_owned: ?[]u8 = null,
     observed_turn_error_message: ?[]u8 = null,
     saw_entered_review_mode: bool = false,
     saw_exited_review_mode: bool = false,
@@ -616,8 +618,11 @@ const LiveReviewNotificationState = struct {
     fn deinit(self: *LiveReviewNotificationState, allocator: std.mem.Allocator) void {
         if (self.review_text) |text| allocator.free(text);
         if (self.observed_turn_error_message) |text| allocator.free(text);
+        if (self.observed_terminal_status_owned) |text| allocator.free(text);
         self.review_text = null;
         self.observed_turn_error_message = null;
+        self.observed_terminal_status_owned = null;
+        self.observed_terminal_status = null;
     }
 };
 
@@ -627,24 +632,30 @@ pub fn main(init: std.process.Init) !void {
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), usageDetailForParseError(err));
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            @errorName(err),
+            usageDetailForParseError(err),
+        );
     };
     defer parsed.deinit(allocator);
-    configured_store_root_override = parsed.store_root orelse init.environ_map.get("CAS_STORE_ROOT");
+    const environment_store_root = init.environ_map.get("CAS_STORE_ROOT");
+    configured_store_root_override = parsed.store_root orelse environment_store_root;
     configured_store_cwd = parsed.cwd;
     configured_codex_thread_id = parsed.codex_thread_id orelse
         init.environ_map.get("CODEX_THREAD_ID") orelse
         init.environ_map.get("CODEX_SESSION_ID");
 
     if (parsed.show_version) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help or parsed.action == null) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -661,7 +672,10 @@ fn defaultTimeoutMsForAction(parsed: ParsedArgs) u32 {
     const action = parsed.action orelse return default_control_timeout_ms;
     return switch (action) {
         .run, .wait => default_review_timeout_ms,
-        .start => if (parsed.wait_after_start) default_review_timeout_ms else default_control_timeout_ms,
+        .start => if (parsed.wait_after_start)
+            default_review_timeout_ms
+        else
+            default_control_timeout_ms,
     };
 }
 
@@ -674,197 +688,206 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         if (out.receipt_paths.len != 0) allocator.free(out.receipt_paths);
     }
     if (argv.len > 0) out.executable_path = argv[0];
-    if (argv.len <= 1) return out;
-
-    var i: usize = 1;
-    const first = argv[i];
-    if (core_cli.isHelpArg(first)) {
-        out.show_help = true;
-        return out;
-    }
-    if (core_cli.isVersionArg(first) or core_cli.isVersionSubcommand(first)) {
-        out.show_version = true;
-        return out;
-    }
-
-    out.action = Action.parse(first) orelse return error.UnknownAction;
-    i += 1;
-
+    if (argv.len <= 1 or parseReviewIntrospection(&out, argv[1])) return out;
+    out.action = Action.parse(argv[1]) orelse return error.UnknownAction;
+    var i: usize = 2;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (core_cli.isHelpArg(arg)) {
-            out.show_help = true;
-            continue;
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            out.show_version = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--json")) {
-            out.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--read-only")) {
-            out.read_only = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--latest")) {
-            out.latest_review_session = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--wait")) {
-            out.wait_after_start = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--uncommitted")) {
-            try setTarget(&out, .{ .kind = .uncommitted });
-            continue;
-        }
-
+        if (try parseReviewFlag(&out, arg)) continue;
         i += 1;
         if (i >= argv.len) return error.MissingValue;
         const value = argv[i];
-
-        if (std.mem.eql(u8, arg, "--cwd")) {
-            out.cwd = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--codex-path")) {
-            if (value.len == 0) return error.InvalidCodexPath;
-            out.codex_path = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--code-mode-host")) {
-            if (value.len == 0) return error.InvalidCodeModeHost;
-            out.code_mode_host = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--parent-thread-id")) {
-            out.parent_thread_id = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--parent-mode")) {
-            out.parent_mode = ParentMode.parse(value) orelse return error.InvalidParentMode;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--multi-agent-mode")) {
-            out.multi_agent_mode = cas.MultiAgentMode.parse(value) orelse return error.InvalidMultiAgentMode;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--review-thread-id")) {
-            try validateReviewThreadIdSelector(value);
-            out.review_thread_id = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--base")) {
-            try setTarget(&out, .{ .kind = .base_branch, .branch = value });
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--commit")) {
-            try setTarget(&out, .{ .kind = .commit, .sha = value });
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--title")) {
-            if (out.target == null or out.target.?.kind != .commit) return error.TitleRequiresCommit;
-            out.target.?.title = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--custom-instructions")) {
-            if (out.custom_instructions_arg != null) return error.DuplicateCustomInstructions;
-            const instructions = try loadCustomInstructionsAlloc(allocator, value);
-            if (!workflowBindingStringValid(instructions)) {
-                allocator.free(instructions);
-                return error.InvalidCustomInstructions;
-            }
-            out.custom_instructions_arg = value;
-            out.custom_instructions = instructions;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--workflow-binding-json")) {
-            if (out.workflow_binding_arg != null) return error.DuplicateWorkflowBinding;
-            if (value.len == 0 or std.mem.eql(u8, value, "-")) return error.InvalidWorkflowBinding;
-            out.workflow_binding_arg = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--timeout-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidTimeout;
-            out.timeout_ms = @intCast(parsed);
-            out.timeout_ms_explicit = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--poll-interval-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidPollInterval;
-            out.poll_interval_ms = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--exec-approval")) {
-            out.exec_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--file-approval")) {
-            out.file_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--permissions-approval")) {
-            out.permissions_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--request-user-input-response-json")) {
-            out.request_user_input_response_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--elicitation-action")) {
-            out.elicitation_action = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--elicitation-content-json")) {
-            out.elicitation_content_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--dynamic-tool-response-json")) {
-            out.dynamic_tool_response_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--hooks")) {
-            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse
-                return error.InvalidHooksPolicy;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--review-lock-override")) {
-            if (value.len == 0) return error.InvalidReviewLockOverrideReason;
-            out.review_lock_override_reason = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--fresh-attempt")) {
-            if (value.len == 0) return error.InvalidFreshAttemptReason;
-            out.fresh_attempt_reason = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--store-root")) {
-            if (value.len == 0) return error.InvalidStoreRoot;
-            out.store_root = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--codex-thread-id")) {
-            if (value.len == 0) return error.InvalidCodexThreadId;
-            out.codex_thread_id = value;
-            continue;
-        }
+        if (try parseReviewLocationOption(&out, arg, value)) continue;
+        if (try parseReviewTargetOption(&out, arg, value)) continue;
+        if (try parseReviewInputOption(allocator, &out, arg, value)) continue;
+        if (try parseReviewTimingOption(&out, arg, value)) continue;
+        if (parseReviewApprovalOption(&out, arg, value)) continue;
+        if (try parseReviewStoreOption(&out, arg, value)) continue;
         if (std.mem.eql(u8, arg, "--path")) {
             try receipt_paths.append(allocator, value);
             continue;
         }
         return error.UnknownArg;
     }
-
     out.receipt_paths = try receipt_paths.toOwnedSlice(allocator);
-
-    // Action-local help and version are introspection surfaces, not operations.
-    // They must remain reachable without satisfying operation operands.
+    // Introspection remains reachable without satisfying operation operands.
     if (out.show_help or out.show_version) return out;
+    try validateReviewArgs(out);
+    if (!out.timeout_ms_explicit) out.timeout_ms = defaultTimeoutMsForAction(out);
+    return out;
+}
 
+fn parseReviewIntrospection(out: *ParsedArgs, arg: []const u8) bool {
+    if (core_cli.isHelpArg(arg)) {
+        out.show_help = true;
+        return true;
+    }
+    if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+        out.show_version = true;
+        return true;
+    }
+    return false;
+}
+
+fn parseReviewFlag(out: *ParsedArgs, arg: []const u8) !bool {
+    if (parseReviewIntrospection(out, arg)) return true;
+    const flags = .{
+        .{ "--json", "json" },
+        .{ "--read-only", "read_only" },
+        .{ "--latest", "latest_review_session" },
+        .{ "--wait", "wait_after_start" },
+    };
+    inline for (flags) |flag| {
+        if (std.mem.eql(u8, arg, flag[0])) {
+            @field(out, flag[1]) = true;
+            return true;
+        }
+    }
+    if (std.mem.eql(u8, arg, "--uncommitted")) {
+        try setTarget(out, .{ .kind = .uncommitted });
+        return true;
+    }
+    return false;
+}
+
+fn parseReviewLocationOption(out: *ParsedArgs, arg: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, arg, "--cwd")) {
+        out.cwd = value;
+    } else if (std.mem.eql(u8, arg, "--codex-path")) {
+        if (value.len == 0) return error.InvalidCodexPath;
+        out.codex_path = value;
+    } else if (std.mem.eql(u8, arg, "--code-mode-host")) {
+        if (value.len == 0) return error.InvalidCodeModeHost;
+        out.code_mode_host = value;
+    } else if (std.mem.eql(u8, arg, "--parent-thread-id")) {
+        out.parent_thread_id = value;
+    } else if (std.mem.eql(u8, arg, "--parent-mode")) {
+        out.parent_mode = ParentMode.parse(value) orelse return error.InvalidParentMode;
+    } else if (std.mem.eql(u8, arg, "--multi-agent-mode")) {
+        out.multi_agent_mode = cas.MultiAgentMode.parse(value) orelse
+            return error.InvalidMultiAgentMode;
+    } else if (std.mem.eql(u8, arg, "--review-thread-id")) {
+        try validateReviewThreadIdSelector(value);
+        out.review_thread_id = value;
+    } else return false;
+    return true;
+}
+
+fn parseReviewTargetOption(out: *ParsedArgs, arg: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, arg, "--base")) {
+        try setTarget(out, .{ .kind = .base_branch, .branch = value });
+    } else if (std.mem.eql(u8, arg, "--commit")) {
+        try setTarget(out, .{ .kind = .commit, .sha = value });
+    } else if (std.mem.eql(u8, arg, "--title")) {
+        if (out.target == null or out.target.?.kind != .commit) return error.TitleRequiresCommit;
+        out.target.?.title = value;
+    } else return false;
+    return true;
+}
+
+fn parseReviewInputOption(
+    allocator: std.mem.Allocator,
+    out: *ParsedArgs,
+    arg: []const u8,
+    value: []const u8,
+) !bool {
+    if (std.mem.eql(u8, arg, "--custom-instructions")) {
+        if (out.custom_instructions_arg != null) return error.DuplicateCustomInstructions;
+        const instructions = try loadCustomInstructionsAlloc(allocator, value);
+        if (!workflowBindingStringValid(instructions)) {
+            allocator.free(instructions);
+            return error.InvalidCustomInstructions;
+        }
+        out.custom_instructions_arg = value;
+        out.custom_instructions = instructions;
+    } else if (std.mem.eql(u8, arg, "--workflow-binding-json")) {
+        if (out.workflow_binding_arg != null) return error.DuplicateWorkflowBinding;
+        if (value.len == 0 or std.mem.eql(u8, value, "-")) return error.InvalidWorkflowBinding;
+        out.workflow_binding_arg = value;
+    } else return false;
+    return true;
+}
+
+fn parseReviewTimingOption(out: *ParsedArgs, arg: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, arg, "--timeout-ms")) {
+        const duration = try std.fmt.parseInt(i64, value, 10);
+        if (duration <= 0 or duration > std.math.maxInt(u32)) return error.InvalidTimeout;
+        out.timeout_ms = @intCast(duration);
+        out.timeout_ms_explicit = true;
+    } else if (std.mem.eql(u8, arg, "--poll-interval-ms")) {
+        const duration = try std.fmt.parseInt(i64, value, 10);
+        if (duration <= 0 or duration > std.math.maxInt(u32)) return error.InvalidPollInterval;
+        out.poll_interval_ms = @intCast(duration);
+    } else return false;
+    return true;
+}
+
+fn parseReviewApprovalOption(out: *ParsedArgs, arg: []const u8, value: []const u8) bool {
+    const options = .{
+        .{ "--exec-approval", "exec_approval" },
+        .{ "--file-approval", "file_approval" },
+        .{ "--permissions-approval", "permissions_approval" },
+        .{ "--request-user-input-response-json", "request_user_input_response_json" },
+        .{ "--elicitation-action", "elicitation_action" },
+        .{ "--elicitation-content-json", "elicitation_content_json" },
+        .{ "--dynamic-tool-response-json", "dynamic_tool_response_json" },
+    };
+    inline for (options) |option| {
+        if (std.mem.eql(u8, arg, option[0])) {
+            @field(out, option[1]) = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+test "review duration options reject values outside their stored range" {
+    for ([_][]const u8{ "--timeout-ms", "--poll-interval-ms" }) |flag| {
+        const expected = if (std.mem.eql(u8, flag, "--timeout-ms"))
+            error.InvalidTimeout
+        else
+            error.InvalidPollInterval;
+        for ([_][]const u8{ "-1", "0", "4294967296" }) |invalid| {
+            const argv = [_][]const u8{
+                "cas_review_session", "run", "--cwd", "/tmp", "--uncommitted", flag, invalid,
+            };
+            try std.testing.expectError(expected, parseArgs(std.testing.allocator, &argv));
+        }
+        for ([_][]const u8{ "1", "4294967295" }) |valid| {
+            const argv = [_][]const u8{
+                "cas_review_session", "run", "--cwd", "/tmp", "--uncommitted", flag, valid,
+            };
+            const parsed = try parseArgs(std.testing.allocator, &argv);
+            defer parsed.deinit(std.testing.allocator);
+            const observed = if (std.mem.eql(u8, flag, "--timeout-ms"))
+                parsed.timeout_ms
+            else
+                parsed.poll_interval_ms;
+            try std.testing.expectEqual(try std.fmt.parseInt(u32, valid, 10), observed);
+        }
+    }
+}
+
+fn parseReviewStoreOption(out: *ParsedArgs, arg: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, arg, "--hooks")) {
+        out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
+    } else if (std.mem.eql(u8, arg, "--review-lock-override")) {
+        if (value.len == 0) return error.InvalidReviewLockOverrideReason;
+        out.review_lock_override_reason = value;
+    } else if (std.mem.eql(u8, arg, "--fresh-attempt")) {
+        if (value.len == 0) return error.InvalidFreshAttemptReason;
+        out.fresh_attempt_reason = value;
+    } else if (std.mem.eql(u8, arg, "--store-root")) {
+        if (value.len == 0) return error.InvalidStoreRoot;
+        out.store_root = value;
+    } else if (std.mem.eql(u8, arg, "--codex-thread-id")) {
+        if (value.len == 0) return error.InvalidCodexThreadId;
+        out.codex_thread_id = value;
+    } else return false;
+    return true;
+}
+
+fn validateReviewArgs(out: ParsedArgs) !void {
     if (out.multi_agent_mode != null) return error.MultiAgentModeRemoved;
     if (out.action == .wait and out.review_lock_override_reason != null) {
         return error.ReviewLockOverrideUnsupportedAction;
@@ -876,49 +899,47 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         return error.WorkflowBindingUnsupportedAction;
     }
     switch (out.action.?) {
-        .run, .start => {
-            if (out.cwd == null) return error.MissingCwd;
-            if (out.target == null) return error.MissingTarget;
-            if (out.review_thread_id != null or out.latest_review_session) {
-                return error.ReviewSessionSelectorUnsupportedAction;
-            }
-            if (out.parent_mode == .fresh and out.parent_thread_id != null) {
-                return error.FreshParentModeDisallowsParentThreadId;
-            }
-            if (out.parent_mode == .reuse and out.parent_thread_id == null) {
-                return error.ReuseParentModeRequiresParentThreadId;
-            }
-            if (out.custom_instructions != null and out.parent_thread_id != null) {
-                return error.CustomInstructionsRequireFreshParent;
-            }
-            if (out.receipt_paths.len != 0) return error.SessionPathUnsupportedAction;
-        },
-        .wait => {
-            if (out.codex_path != null) return error.CodexPathUnsupportedAction;
-            if (out.code_mode_host != null) return error.CodeModeHostUnsupportedAction;
-            if (out.target != null) return error.TargetUnsupportedAction;
-            if (out.custom_instructions != null) return error.CustomInstructionsUnsupportedAction;
-            if (out.wait_after_start) return error.WaitFlagUnsupportedAction;
-            if (out.review_thread_id != null and out.latest_review_session) {
-                return error.AmbiguousReviewSessionSelector;
-            }
-            if (out.receipt_paths.len > 1 or
-                (out.receipt_paths.len == 1 and
-                    (out.review_thread_id != null or out.latest_review_session)))
-            {
-                return error.AmbiguousReviewSessionSelector;
-            }
-            if (out.review_thread_id == null and
-                !out.latest_review_session and
-                out.receipt_paths.len == 0)
-            {
-                return error.MissingReviewThreadId;
-            }
-        },
+        .run, .start => try validateReviewStartArgs(out),
+        .wait => try validateReviewWaitArgs(out),
     }
+}
 
-    if (!out.timeout_ms_explicit) out.timeout_ms = defaultTimeoutMsForAction(out);
-    return out;
+fn validateReviewStartArgs(out: ParsedArgs) !void {
+    if (out.cwd == null) return error.MissingCwd;
+    if (out.target == null) return error.MissingTarget;
+    if (out.review_thread_id != null or out.latest_review_session) {
+        return error.ReviewSessionSelectorUnsupportedAction;
+    }
+    if (out.parent_mode == .fresh and out.parent_thread_id != null) {
+        return error.FreshParentModeDisallowsParentThreadId;
+    }
+    if (out.parent_mode == .reuse and out.parent_thread_id == null) {
+        return error.ReuseParentModeRequiresParentThreadId;
+    }
+    if (out.custom_instructions != null and out.parent_thread_id != null) {
+        return error.CustomInstructionsRequireFreshParent;
+    }
+    if (out.receipt_paths.len != 0) return error.SessionPathUnsupportedAction;
+}
+
+fn validateReviewWaitArgs(out: ParsedArgs) !void {
+    if (out.codex_path != null) return error.CodexPathUnsupportedAction;
+    if (out.code_mode_host != null) return error.CodeModeHostUnsupportedAction;
+    if (out.target != null) return error.TargetUnsupportedAction;
+    if (out.custom_instructions != null) return error.CustomInstructionsUnsupportedAction;
+    if (out.wait_after_start) return error.WaitFlagUnsupportedAction;
+    if (out.review_thread_id != null and out.latest_review_session) {
+        return error.AmbiguousReviewSessionSelector;
+    }
+    if (out.receipt_paths.len > 1 or (out.receipt_paths.len == 1 and
+        (out.review_thread_id != null or out.latest_review_session)))
+    {
+        return error.AmbiguousReviewSessionSelector;
+    }
+    const has_selector = out.review_thread_id != null or out.latest_review_session;
+    if (!has_selector and out.receipt_paths.len == 0) {
+        return error.MissingReviewThreadId;
+    }
 }
 
 const ReviewThreadIdSelectorHint =
@@ -962,7 +983,12 @@ fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![
         return reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     }
     if (std.mem.startsWith(u8, raw, "@")) {
-        return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), raw[1..], allocator, .limited(1024 * 1024));
+        return std.Io.Dir.cwd().readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            raw[1..],
+            allocator,
+            .limited(1024 * 1024),
+        );
     }
     return allocator.dupe(u8, raw);
 }
@@ -979,15 +1005,31 @@ fn validateWorkflowBinding(binding: WorkflowBinding) !void {
     }
 }
 
-fn loadWorkflowBindingAlloc(allocator: std.mem.Allocator, raw_arg: ?[]const u8) !?std.json.Parsed(WorkflowBinding) {
+fn loadWorkflowBindingAlloc(
+    allocator: std.mem.Allocator,
+    raw_arg: ?[]const u8,
+) !?std.json.Parsed(WorkflowBinding) {
     const arg = raw_arg orelse return null;
     const raw = if (std.mem.startsWith(u8, arg, "@")) blk: {
         if (arg.len == 1) return error.InvalidWorkflowBinding;
-        break :blk try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), arg[1..], allocator, .limited(1024 * 1024));
+        break :blk try std.Io.Dir.cwd().readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            arg[1..],
+            allocator,
+            .limited(1024 * 1024),
+        );
     } else try allocator.dupe(u8, arg);
     defer allocator.free(raw);
 
-    var parsed = std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{ .allocate = .alloc_always }) catch return error.InvalidWorkflowBinding;
+    var parsed = std.json.parseFromSlice(
+        WorkflowBinding,
+        allocator,
+        raw,
+        .{ .allocate = .alloc_always },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidWorkflowBinding,
+    };
     errdefer parsed.deinit();
     try validateWorkflowBinding(parsed.value);
     return parsed;
@@ -1106,11 +1148,37 @@ fn parseReviewRuntimeGateAlloc(
     {
         return error.InvalidReviewPreflightReceipt;
     }
+    return copyReviewRuntimeGateAlloc(
+        allocator,
+        path,
+        banner,
+        binary_digest,
+        stable_digest,
+        experimental_digest,
+    );
+}
+
+fn copyReviewRuntimeGateAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    banner: []const u8,
+    binary_digest: []const u8,
+    stable_digest: []const u8,
+    experimental_digest: []const u8,
+) !ReviewRuntimeGate {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const owned_banner = try allocator.dupe(u8, banner);
+    errdefer allocator.free(owned_banner);
+    const owned_binary = try allocator.dupe(u8, binary_digest);
+    errdefer allocator.free(owned_binary);
+    const owned_stable = try allocator.dupe(u8, stable_digest);
+    errdefer allocator.free(owned_stable);
     return .{
-        .resolved_path = try allocator.dupe(u8, path),
-        .version = try allocator.dupe(u8, banner),
-        .binary_digest = try allocator.dupe(u8, binary_digest),
-        .stable_schema_digest = try allocator.dupe(u8, stable_digest),
+        .resolved_path = owned_path,
+        .version = owned_banner,
+        .binary_digest = owned_binary,
+        .stable_schema_digest = owned_stable,
         .experimental_schema_digest = try allocator.dupe(u8, experimental_digest),
     };
 }
@@ -1154,6 +1222,28 @@ fn reviewBehavioralProbesPassed(value: std.json.Value) bool {
     }
     return initialize_passed and transport_passed and server_requests_passed and
         overload_passed and structured_review_passed;
+}
+
+fn checkReviewRuntimeGateAllocation(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var gate = try parseReviewRuntimeGateAlloc(allocator, raw);
+    defer gate.deinit(allocator);
+}
+
+fn checkWorkflowBindingAllocation(allocator: std.mem.Allocator) !void {
+    var binding = (try loadWorkflowBindingAlloc(
+        allocator,
+        "{\"requestId\":\"request\",\"requestFingerprint\":\"fingerprint\"}",
+    )).?;
+    defer binding.deinit();
+    try std.testing.expectEqualStrings("request", binding.value.requestId);
+}
+
+test "workflow binding reports allocation failure and releases partial input" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkWorkflowBindingAllocation,
+        .{},
+    );
 }
 
 fn runReviewRuntimeGate(
@@ -1201,14 +1291,55 @@ fn runReviewRuntimeGate(
 }
 
 fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
-    const action_name = if (parsed.action != null and parsed.action.? == .run) "run" else "start";
-    var loaded_workflow_binding = try loadWorkflowBindingAlloc(
-        allocator,
-        parsed.workflow_binding_arg,
-    );
-    defer if (loaded_workflow_binding) |*binding| binding.deinit();
-    const workflow_binding = if (loaded_workflow_binding) |binding| binding.value else null;
-    const cwd = repoRealpathAlloc(allocator, parsed.cwd.?) catch |err| {
+    var binding = try loadWorkflowBindingAlloc(allocator, parsed.workflow_binding_arg);
+    defer if (binding) |*value| value.deinit();
+    const workflow_binding = if (binding) |value| value.value else null;
+    const cwd = try startReviewCwdAlloc(allocator, parsed, workflow_binding);
+    defer allocator.free(cwd);
+    if (workflowBoundStartAdmissionFailure(parsed, workflow_binding)) |failure| {
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "review/start",
+            failure.hint,
+            cwd,
+            .{ .workflow_binding = workflow_binding },
+            failure,
+        );
+    }
+    var gate = try startReviewRuntimeGate(allocator, io, parsed, cwd);
+    defer gate.deinit(allocator);
+    var host = try startReviewCodeModeHost(allocator, parsed, cwd, gate);
+    defer if (host) |*value| value.deinit();
+    var start = ReviewStart{
+        .allocator = allocator,
+        .io = io,
+        .parsed = parsed,
+        .cwd = cwd,
+        .gate = &gate,
+        .workflow_binding = workflow_binding,
+        .code_mode_host = if (host) |*value| value else null,
+    };
+    defer start.deinit();
+    try start.prepareReceipt();
+    try start.connect();
+    try start.bindTarget();
+    try start.acquireTuple();
+    try start.createParent();
+    try start.sendReview();
+    try start.bindAttempt();
+    try start.prepareRecord();
+    try start.persistStarted();
+    if (parsed.wait_after_start) return start.waitAndFinish();
+    try start.printResult(null, false, false, null);
+}
+
+fn startReviewCwdAlloc(
+    allocator: std.mem.Allocator,
+    parsed: ParsedArgs,
+    workflow_binding: ?WorkflowBinding,
+) ![]const u8 {
+    return repoRealpathAlloc(allocator, parsed.cwd.?) catch |err| {
         if (workflow_binding != null) {
             try renderErrorAndExit(
                 parsed.json,
@@ -1226,19 +1357,15 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         }
         return err;
     };
-    defer allocator.free(cwd);
-    if (workflowBoundStartAdmissionFailure(parsed, workflow_binding)) |failure| {
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            failure.hint,
-            cwd,
-            .{ .workflow_binding = workflow_binding },
-            failure,
-        );
-    }
-    var runtime_gate = runReviewRuntimeGate(
+}
+
+fn startReviewRuntimeGate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+) !ReviewRuntimeGate {
+    return runReviewRuntimeGate(
         allocator,
         io,
         cwd,
@@ -1262,1160 +1389,836 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
         );
     };
-    defer runtime_gate.deinit(allocator);
-    const resolved_codex_path = runtime_gate.resolved_path;
-    const codex_version = runtime_gate.version;
-    var code_mode_host: ?cas.app_server_launch.CodeModeHost = if (parsed.code_mode_host) |raw|
-        cas.app_server_launch.CodeModeHost.init(allocator, raw) catch |err| {
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "app-server/launch",
-                @errorName(err),
-                cwd,
+}
+
+fn startReviewCodeModeHost(
+    allocator: std.mem.Allocator,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+    gate: ReviewRuntimeGate,
+) !?cas.app_server_launch.CodeModeHost {
+    const raw = parsed.code_mode_host orelse return null;
+    return cas.app_server_launch.CodeModeHost.init(allocator, raw) catch |err| {
+        try renderErrorAndExit(parsed.json, "start", "app-server/launch", @errorName(err), cwd, .{
+            .resolved_codex_path = gate.resolved_path,
+            .resolved_codex_version = gate.version,
+            .codex_binary_digest = gate.binary_digest,
+            .app_server_contract_id = app_server_contract_id,
+            .structured_review_capability = structured_review_capability,
+            .compatibility_verdict = "compatible",
+            .selected_transport = "websocket",
+        }, .{
+            .code = "invalid_code_mode_host",
+            .hint = "use ws:// only for a loopback Code Mode host and wss:// for every " ++
+                "non-loopback host",
+        });
+    };
+}
+
+// The command owns every stage until it returns. Optional resources are installed
+// immediately after acquisition, so partial initialization has one cleanup path.
+const ReviewStart = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+    gate: *const ReviewRuntimeGate,
+    workflow_binding: ?WorkflowBinding,
+    code_mode_host: ?*cas.app_server_launch.CodeModeHost,
+    digest_buffer: [64]u8 = undefined,
+    receipt: OutputReceipt = .{},
+    workflow_deadline_ms: ?i64 = null,
+    previous_request_deadline: ?i64 = null,
+    managed_server: ?cas_websocket.ManagedServer = null,
+    client: ?cas.Client = null,
+    session_dir: ?[]const u8 = null,
+    canonical_target: ?CanonicalTarget = null,
+    identity: ?TargetIdentity = null,
+    tuple: ?ReviewTupleIdentity = null,
+    lock_bundle: ?ReviewTupleStartLockBundle = null,
+    parent_thread_id: ?[]const u8 = null,
+    parent_event_log_path: ?[]const u8 = null,
+    review_params_json: ?[]const u8 = null,
+    review_result_json: ?[]const u8 = null,
+    review_thread_id: ?[]const u8 = null,
+    review_turn_id: ?[]const u8 = null,
+    event_log_path: ?[]const u8 = null,
+    record_path: ?[]const u8 = null,
+    store_root: ?[]const u8 = null,
+    repo_root: ?[]const u8 = null,
+    record: ?SessionRecord = null,
+    terminal_status_from_grace: bool = false,
+
+    fn deinit(self: *ReviewStart) void {
+        const strings = .{
+            self.repo_root,
+            self.store_root,
+            self.record_path,
+            self.event_log_path,
+            self.review_turn_id,
+            self.review_thread_id,
+            self.review_result_json,
+            self.review_params_json,
+            self.parent_event_log_path,
+            self.parent_thread_id,
+        };
+        inline for (strings) |value| if (value) |bytes| self.allocator.free(bytes);
+        if (self.lock_bundle) |*value| value.deinit(self.allocator);
+        if (self.tuple) |value| value.deinit(self.allocator);
+        if (self.identity) |value| value.deinit(self.allocator);
+        if (self.canonical_target) |value| value.deinit(self.allocator);
+        if (self.session_dir) |value| self.allocator.free(value);
+        if (self.client) |*client| {
+            if (self.workflow_deadline_ms != null) {
+                _ = client.swapRequestDeadlineMs(self.previous_request_deadline);
+            }
+            client.close();
+            client.deinit();
+        }
+        if (self.managed_server) |*server| {
+            if (self.workflow_binding != null) server.kill();
+            server.deinit(self.allocator);
+        }
+    }
+
+    fn prepareReceipt(self: *ReviewStart) !void {
+        self.receipt = .{
+            .surface_action = if (self.parsed.action == .run) "run" else "start",
+            .resolved_codex_path = self.gate.resolved_path,
+            .resolved_codex_version = self.gate.version,
+            .codex_binary_digest = self.gate.binary_digest,
+            .app_server_contract_id = app_server_contract_id,
+            .structured_review_capability = structured_review_capability,
+            .compatibility_verdict = "compatible",
+            .selected_transport = "websocket",
+            .selection_reason = "detached_review_requires_cross_process_truth",
+            .code_mode_host_redacted = if (self.code_mode_host) |host|
+                host.redacted_origin
+            else
+                null,
+            .code_mode_host_digest = if (self.code_mode_host) |host|
+                host.digestHex(&self.digest_buffer)
+            else
+                null,
+            .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+            .hook_policy = self.parsed.hook_policy,
+            .fresh_attempt_required = self.parsed.fresh_attempt_reason != null,
+            .workflow_binding = self.workflow_binding,
+            .developer_instructions = self.parsed.custom_instructions,
+        };
+        if (self.parsed.parent_thread_id != null) {
+            try self.renderFailure(
+                "review/start",
+                "Structured review attempts require a fresh CAS-owned thread",
                 .{
-                    .resolved_codex_path = resolved_codex_path,
-                    .resolved_codex_version = codex_version,
-                    .codex_binary_digest = runtime_gate.binary_digest,
-                    .app_server_contract_id = app_server_contract_id,
-                    .structured_review_capability = structured_review_capability,
-                    .compatibility_verdict = "compatible",
-                    .selected_transport = "websocket",
-                },
-                .{
-                    .code = "invalid_code_mode_host",
-                    .hint = "use ws:// only for a loopback Code Mode host and wss:// for every " ++
-                        "non-loopback host",
+                    .code = "inline_review_parent_reuse_unsupported",
+                    .hint = "omit --parent-thread-id and let CAS create one unique isolated " ++
+                        "thread for this attempt",
                 },
             );
         }
-    else
-        null;
-    defer if (code_mode_host) |*host| host.deinit();
-    var code_mode_digest_buffer: [64]u8 = undefined;
-    const code_mode_host_redacted = if (code_mode_host) |*host| host.redacted_origin else null;
-    const code_mode_host_digest = if (code_mode_host) |*host|
-        host.digestHex(&code_mode_digest_buffer)
-    else
-        null;
-    var output_receipt = OutputReceipt{
-        .surface_action = action_name,
-        .resolved_codex_path = resolved_codex_path,
-        .resolved_codex_version = codex_version,
-        .codex_binary_digest = runtime_gate.binary_digest,
-        .app_server_contract_id = app_server_contract_id,
-        .structured_review_capability = structured_review_capability,
-        .compatibility_verdict = "compatible",
-        .selected_transport = "websocket",
-        .selection_reason = "detached_review_requires_cross_process_truth",
-        .code_mode_host_redacted = code_mode_host_redacted,
-        .code_mode_host_digest = code_mode_host_digest,
-        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-        .hook_policy = parsed.hook_policy,
-        .fresh_attempt_required = parsed.fresh_attempt_reason != null,
-        .workflow_binding = workflow_binding,
-        .developer_instructions = parsed.custom_instructions,
-    };
-    if (parsed.parent_thread_id != null) {
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            "Structured review attempts require a fresh CAS-owned thread",
-            cwd,
-            output_receipt,
-            .{
-                .code = "inline_review_parent_reuse_unsupported",
-                .hint = "omit --parent-thread-id and let CAS create one unique isolated thread for this attempt",
-            },
-        );
+        if (self.workflow_binding != null) {
+            self.workflow_deadline_ms = monotonicMilliseconds(self.io) +
+                @as(i64, self.parsed.timeout_ms);
+        }
     }
 
-    const workflow_deadline_ms: ?i64 = if (workflow_binding != null)
-        monotonicMilliseconds() + @as(i64, parsed.timeout_ms)
-    else
-        null;
-
-    var managed_server = startManagedWebsocketServer(
-        allocator,
-        cwd,
-        resolved_codex_path,
-        parsed.hook_policy,
-        workflow_binding != null,
-        if (code_mode_host) |*host| host else null,
-        io,
-    ) catch |err| {
-        try renderErrorAndExit(
-            parsed.json,
+    fn renderFailure(
+        self: *const ReviewStart,
+        method: []const u8,
+        message: []const u8,
+        failure: FailureInfo,
+    ) !noreturn {
+        return renderErrorAndExit(
+            self.parsed.json,
             "start",
-            "review/start",
-            @errorName(err),
-            cwd,
-            output_receipt,
-            .{
-                .code = "websocket_bootstrap_failed",
-                .hint = "CAS could not start the managed websocket app-server for detached review",
-            },
-        );
-    };
-    defer managed_server.deinit(allocator);
-    defer if (workflow_binding != null) managed_server.kill();
-    const managed_server_pid = managed_server.processId();
-    const managed_server_listen_url = managed_server.listen_url;
-    output_receipt.managed_server_pid = managed_server_pid;
-    output_receipt.managed_server_listen_url = managed_server_listen_url;
-
-    var client = connectReviewClient(
-        allocator,
-        cwd,
-        resolved_codex_path,
-        codex_version,
-        "websocket",
-        managed_server_listen_url,
-        io,
-        parsed,
-        workflow_deadline_ms,
-    ) catch |err| {
-        managed_server.kill();
-        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-            .code = "websocket_bootstrap_failed",
-            .hint = "CAS started the managed websocket app-server but could not " ++
-                "complete the websocket client handshake",
-        };
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            @errorName(err),
-            cwd,
-            output_receipt,
+            method,
+            message,
+            self.cwd,
+            self.receipt,
             failure,
         );
-    };
-    defer {
-        client.close();
-        client.deinit();
     }
-    const post_initialize_version = readCodexVersionAlloc(
-        allocator,
-        io,
-        cwd,
-        resolved_codex_path,
-    ) catch |err| {
-        managed_server.kill();
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "initialize",
-            @errorName(err),
-            cwd,
-            output_receipt,
-            .{
+
+    fn connect(self: *ReviewStart) !void {
+        self.managed_server = startManagedWebsocketServer(
+            self.allocator,
+            self.cwd,
+            self.gate.resolved_path,
+            self.parsed.hook_policy,
+            self.workflow_binding != null,
+            self.code_mode_host,
+            self.io,
+        ) catch |err| {
+            try self.renderFailure("review/start", @errorName(err), .{
+                .code = "websocket_bootstrap_failed",
+                .hint = "CAS could not start the managed websocket app-server for detached review",
+            });
+        };
+        self.receipt.managed_server_pid = self.managed_server.?.processId();
+        self.receipt.managed_server_listen_url = self.managed_server.?.listen_url;
+        self.client = self.connectClient(self.workflow_deadline_ms) catch |err| {
+            self.managed_server.?.kill();
+            try self.renderFailure(
+                "review/start",
+                @errorName(err),
+                serverRequestProviderFailure(err) orelse .{
+                    .code = "websocket_bootstrap_failed",
+                    .hint = "CAS started the managed websocket app-server but could not " ++
+                        "complete the websocket client handshake",
+                },
+            );
+        };
+        try self.revalidateRuntime();
+        if (self.workflow_deadline_ms) |deadline| {
+            self.previous_request_deadline = self.client.?.swapRequestDeadlineMs(deadline);
+        }
+    }
+
+    fn connectClient(self: *ReviewStart, deadline: ?i64) !cas.Client {
+        return connectReviewClient(
+            self.allocator,
+            self.cwd,
+            self.gate.resolved_path,
+            self.gate.version,
+            "websocket",
+            self.managed_server.?.listen_url,
+            self.io,
+            self.parsed,
+            deadline,
+        );
+    }
+
+    fn revalidateRuntime(self: *ReviewStart) !void {
+        const version = readCodexVersionAlloc(
+            self.allocator,
+            self.io,
+            self.cwd,
+            self.gate.resolved_path,
+        ) catch |err| {
+            self.managed_server.?.kill();
+            try self.renderFailure("initialize", @errorName(err), .{
                 .code = "incompatible_codex_review_runtime",
                 .hint = "the exact Codex runtime could not be revalidated after app-server " ++
                     "initialization",
-            },
-        );
-    };
-    defer allocator.free(post_initialize_version);
-    if (!std.mem.eql(u8, post_initialize_version, codex_version)) {
-        managed_server.kill();
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "initialize",
-            "Codex runtime changed after review preflight",
-            cwd,
-            output_receipt,
-            .{
+            });
+        };
+        defer self.allocator.free(version);
+        if (!std.mem.eql(u8, version, self.gate.version)) {
+            self.managed_server.?.kill();
+            try self.renderFailure("initialize", "Codex runtime changed after review preflight", .{
                 .code = "incompatible_codex_review_runtime",
                 .hint = "retry after the exact resolved Codex executable is stable across " ++
                     "preflight and initialization",
-            },
+            });
+        }
+    }
+
+    fn bindTarget(self: *ReviewStart) !void {
+        self.session_dir = try sessionDirAlloc(self.allocator);
+        self.canonical_target = canonicalTargetAlloc(
+            self.allocator,
+            self.io,
+            self.cwd,
+            self.parsed.target.?,
+        ) catch |err| {
+            try self.targetFailure(err, "CAS could not canonicalize the workflow-bound " ++
+                "review target; no review attempt was created");
+            return err;
+        };
+        self.identity = computeTargetIdentityAlloc(
+            self.allocator,
+            self.io,
+            self.cwd,
+            self.canonical_target.?.value,
+            self.parsed.custom_instructions,
+        ) catch |err| {
+            try self.targetFailure(err, "CAS could not bind the workflow-bound target " ++
+                "identity; no review attempt was created");
+            return err;
+        };
+    }
+
+    fn markPreStart(self: *ReviewStart) void {
+        self.receipt.error_review_attempt_phase = "pre_review_start";
+        self.receipt.error_review_attempt_exists = false;
+    }
+
+    fn targetFailure(self: *ReviewStart, err: anyerror, hint: []const u8) !void {
+        if (self.workflow_binding == null) return;
+        self.managed_server.?.kill();
+        self.markPreStart();
+        try self.renderFailure("review/start", @errorName(err), .{
+            .code = "review_target_resolution_failed",
+            .hint = hint,
+        });
+    }
+
+    fn acquireTuple(self: *ReviewStart) !void {
+        self.tuple = reviewTupleIdentityAlloc(
+            self.allocator,
+            self.cwd,
+            self.identity.?,
+            self.gate.resolved_path,
+            self.gate.version,
+            &self.client.?,
+            self.workflow_binding,
+        ) catch |err| {
+            self.managed_server.?.kill();
+            self.markPreStart();
+            try self.renderFailure(
+                "review/start",
+                @errorName(err),
+                serverRequestProviderFailure(err) orelse .{
+                    .code = "pre_review_start_failed",
+                    .hint = "CAS could not bind the owner-lived review tuple before " ++
+                        "review/start; no review attempt was created",
+                },
+            );
+        };
+        self.tuple.?.codex_binary_digest = self.gate.binary_digest;
+        self.tuple.?.app_server_contract_id = app_server_contract_id;
+        self.tuple.?.transport_kind = "websocket";
+        self.tuple.?.code_mode_host_digest = self.receipt.code_mode_host_digest;
+        self.receipt.account_fingerprint = self.tuple.?.account_fingerprint;
+        self.receipt.account_fingerprint_reduced_protection =
+            self.tuple.?.account_fingerprint_reduced_protection;
+        self.receipt.codex_thread_id = self.tuple.?.codex_thread_id;
+        self.lock_bundle = try acquireReviewTupleStartLockOrExit(
+            self.allocator,
+            self.parsed.json,
+            self.receipt.surface_action,
+            targetToRecord(self.canonical_target.?.value),
+            self.identity.?,
+            self.tuple.?,
+            self.parsed.review_lock_override_reason,
+            self.parsed.fresh_attempt_reason,
+            &self.managed_server.?,
         );
     }
-    const previous_request_deadline = if (workflow_deadline_ms) |deadline_ms|
-        client.swapRequestDeadlineMs(deadline_ms)
-    else
-        null;
-    defer if (workflow_deadline_ms != null) {
-        _ = client.swapRequestDeadlineMs(previous_request_deadline);
-    };
 
-    const session_dir = try sessionDirAlloc(allocator);
-    defer allocator.free(session_dir);
-    const canonical_target = canonicalTargetAlloc(allocator, io, cwd, parsed.target.?) catch |err| {
-        if (workflow_binding != null) {
-            managed_server.kill();
-            output_receipt.error_review_attempt_phase = "pre_review_start";
-            output_receipt.error_review_attempt_exists = false;
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                @errorName(err),
-                cwd,
-                output_receipt,
-                .{
-                    .code = "review_target_resolution_failed",
-                    .hint = "CAS could not canonicalize the workflow-bound " ++
-                        "review target; no review attempt was created",
-                },
-            );
-        }
-        return err;
-    };
-    defer canonical_target.deinit(allocator);
-    const target = canonical_target.value;
-    const target_record = targetToRecord(target);
-    var identity = computeTargetIdentityAlloc(
-        allocator,
-        io,
-        cwd,
-        target,
-        parsed.custom_instructions,
-    ) catch |err| {
-        if (workflow_binding != null) {
-            managed_server.kill();
-            output_receipt.error_review_attempt_phase = "pre_review_start";
-            output_receipt.error_review_attempt_exists = false;
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                @errorName(err),
-                cwd,
-                output_receipt,
-                .{
-                    .code = "review_target_resolution_failed",
-                    .hint = "CAS could not bind the workflow-bound target " ++
-                        "identity; no review attempt was created",
-                },
-            );
-        }
-        return err;
-    };
-    defer identity.deinit(allocator);
-    var review_tuple = reviewTupleIdentityAlloc(
-        allocator,
-        cwd,
-        identity,
-        resolved_codex_path,
-        codex_version,
-        &client,
-        workflow_binding,
-    ) catch |err| {
-        managed_server.kill();
-        output_receipt.error_review_attempt_phase = "pre_review_start";
-        output_receipt.error_review_attempt_exists = false;
-        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-            .code = "pre_review_start_failed",
-            .hint = "CAS could not bind the owner-lived review tuple before " ++
-                "review/start; no review attempt was created",
+    fn createParent(self: *ReviewStart) !void {
+        self.parent_thread_id = startParentThreadAlloc(
+            self.allocator,
+            &self.client.?,
+            self.cwd,
+            self.session_dir.?,
+            self.parsed.custom_instructions,
+        ) catch |err| {
+            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
+                .code = "pre_review_start_failed",
+                .hint = "the owner-lived review failed before review/start; the exact " ++
+                    "request may start one fresh attempt",
+            };
+            self.updateLock("pre_review_start_failed", failure.code);
+            if (self.workflow_binding != null) {
+                self.managed_server.?.kill();
+                self.markPreStart();
+                try self.renderFailure("review/start", @errorName(err), failure);
+            }
+            return err;
         };
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            @errorName(err),
-            cwd,
-            output_receipt,
-            failure,
+        self.parent_event_log_path = try parentEventLogPathAlloc(
+            self.allocator,
+            self.session_dir.?,
+            self.parent_thread_id.?,
         );
-    };
-    defer review_tuple.deinit(allocator);
-    review_tuple.codex_binary_digest = runtime_gate.binary_digest;
-    review_tuple.app_server_contract_id = app_server_contract_id;
-    review_tuple.transport_kind = "websocket";
-    review_tuple.code_mode_host_digest = code_mode_host_digest;
-    output_receipt.account_fingerprint = review_tuple.account_fingerprint;
-    output_receipt.account_fingerprint_reduced_protection = review_tuple.account_fingerprint_reduced_protection;
-    output_receipt.codex_thread_id = review_tuple.codex_thread_id;
-    var tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
-        allocator,
-        parsed.json,
-        action_name,
-        target_record,
-        identity,
-        review_tuple,
-        parsed.review_lock_override_reason,
-        parsed.fresh_attempt_reason,
-        &managed_server,
-    );
-    defer tuple_lock_bundle.deinit(allocator);
-    const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
-        const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
-        defer allocator.free(existing_parent_event_log_path);
-        resumeParentThread(
-            allocator,
-            &client,
-            existing,
-            existing_parent_event_log_path,
-        ) catch |err| {
-            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-                .code = "pre_review_start_failed",
-                .hint = "the owner-lived review could not resume its selected " ++
-                    "parent before review/start; no review attempt was created",
-            };
-            updateReviewTupleLockBestEffort(
-                allocator,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                "pre_review_start_failed",
-                failure.code,
-                null,
-                null,
-                null,
-                existing_parent_event_log_path,
-            );
-            if (workflow_binding != null) {
-                managed_server.kill();
-                output_receipt.error_review_attempt_phase = "pre_review_start";
-                output_receipt.error_review_attempt_exists = false;
-                try renderErrorAndExit(
-                    parsed.json,
-                    "start",
-                    "review/start",
-                    @errorName(err),
-                    cwd,
-                    output_receipt,
-                    failure,
-                );
-            }
-            return err;
+        self.review_params_json = try buildReviewStartParamsJson(
+            self.allocator,
+            self.parent_thread_id.?,
+            self.canonical_target.?.value,
+        );
+        self.appendLog(
+            self.parent_event_log_path.?,
+            "thread/start",
+            "response",
+            self.parent_thread_id.?,
+        );
+    }
+
+    fn appendLog(
+        self: *const ReviewStart,
+        path: []const u8,
+        method: []const u8,
+        direction: []const u8,
+        payload: []const u8,
+    ) void {
+        // Logging failure must not replace an already-created review attempt.
+        appendLogRecord(self.allocator, path, method, direction, payload) catch |err| {
+            std.log.warn("review event log {s}: {s}", .{ path, @errorName(err) });
         };
-        var parent_status = fetchReviewStatus(
-            allocator,
-            &client,
-            existing,
-            null,
-            existing_parent_event_log_path,
-            null,
-            .all,
-        ) catch |err| {
-            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-                .code = "pre_review_start_failed",
-                .hint = "the owner-lived review could not validate its selected " ++
-                    "parent before review/start; no review attempt was created",
-            };
-            updateReviewTupleLockBestEffort(
-                allocator,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                "pre_review_start_failed",
-                failure.code,
-                null,
-                null,
-                null,
-                existing_parent_event_log_path,
-            );
-            if (workflow_binding != null) {
-                managed_server.kill();
-                output_receipt.error_review_attempt_phase = "pre_review_start";
-                output_receipt.error_review_attempt_exists = false;
-                try renderErrorAndExit(
-                    parsed.json,
-                    "start",
-                    "review/start",
-                    @errorName(err),
-                    cwd,
-                    output_receipt,
-                    failure,
-                );
-            }
-            return err;
-        };
-        defer parent_status.deinit(allocator);
-        if (failureInfoForParentReuse(&parent_status)) |failure| {
-            updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", failure.code, null, null, null, existing_parent_event_log_path);
-            if (workflow_binding != null) managed_server.kill();
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                failure.hint,
-                cwd,
-                output_receipt,
-                failure,
-            );
-        }
-        break :blk try allocator.dupe(u8, existing);
-    } else startParentThreadAlloc(
-        allocator,
-        &client,
-        cwd,
-        session_dir,
-        parsed.custom_instructions,
-    ) catch |err| {
-        const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-            .code = "pre_review_start_failed",
-            .hint = "the owner-lived review failed before review/start; the exact " ++
-                "request may start one fresh attempt",
-        };
+    }
+
+    fn updateLock(self: *const ReviewStart, state: []const u8, failure: ?[]const u8) void {
         updateReviewTupleLockBestEffort(
-            allocator,
-            tuple_lock_bundle.path,
-            tuple_lock_bundle.lock,
-            "pre_review_start_failed",
-            failure.code,
-            null,
-            null,
-            null,
-            null,
+            self.allocator,
+            self.lock_bundle.?.path,
+            self.lock_bundle.?.lock,
+            state,
+            failure,
+            self.review_thread_id,
+            self.review_turn_id,
+            self.record_path,
+            self.event_log_path orelse self.parent_event_log_path,
         );
-        if (workflow_binding != null) {
-            managed_server.kill();
-            output_receipt.error_review_attempt_phase = "pre_review_start";
-            output_receipt.error_review_attempt_exists = false;
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                @errorName(err),
-                cwd,
-                output_receipt,
-                failure,
-            );
-        }
-        return err;
-    };
-    defer allocator.free(parent_thread_id);
-    const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
-    defer allocator.free(parent_event_log_path);
-    const review_params_json = try buildReviewStartParamsJson(
-        allocator,
-        parent_thread_id,
-        target,
-    );
-    defer allocator.free(review_params_json);
-    appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
+    }
 
-    var review_result_json: []u8 = undefined;
-    var review_start_send_boundary = ReviewStartSendBoundary{
-        .allocator = allocator,
-        .lock_path = tuple_lock_bundle.path,
-        .lock = &tuple_lock_bundle.lock,
-    };
-    const review_start_send_observer: ?cas.RequestSendObserver = if (workflow_binding != null)
-        .{
-            .context = &review_start_send_boundary,
-            .before_send = persistReviewStartSendBoundary,
-        }
-    else
-        null;
-    review_result_json = requestReviewStart(
-        &client,
-        review_params_json,
-        review_start_send_observer,
-    ) catch |err| {
-        const request_send_started = client.lastRequestSendStarted();
-        const raw_message = client.lastError() orelse @errorName(err);
-        const failure = failureInfoForReviewStart(err, raw_message);
-        if (workflow_binding != null and request_send_started and
-            failure != null and
+    fn sendReview(self: *ReviewStart) !void {
+        var boundary = ReviewStartSendBoundary{
+            .allocator = self.allocator,
+            .lock_path = self.lock_bundle.?.path,
+            .lock = &self.lock_bundle.?.lock,
+        };
+        const observer: ?cas.RequestSendObserver = if (self.workflow_binding != null)
+            .{ .context = &boundary, .before_send = persistReviewStartSendBoundary }
+        else
+            null;
+        self.review_result_json = requestReviewStart(
+            &self.client.?,
+            self.review_params_json.?,
+            observer,
+        ) catch |err| return try self.reviewSendFailure(err);
+    }
+
+    fn reviewSendFailure(self: *ReviewStart, err: anyerror) !noreturn {
+        const sent = self.client.?.lastRequestSendStarted();
+        const raw = self.client.?.lastError() orelse @errorName(err);
+        const failure = failureInfoForReviewStart(err, raw);
+        if (self.workflow_binding != null and sent and failure != null and
             std.mem.eql(u8, failure.?.code, "account_resource_exhausted"))
         {
-            output_receipt.error_review_attempt_phase = "review_terminal";
-            output_receipt.error_review_attempt_exists = true;
-            terminalizeOwnedReviewAttempt(
-                allocator,
-                &managed_server,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                .{ .event_log_path = parent_event_log_path },
-                failure.?,
-            );
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                failure.?.hint,
-                cwd,
-                output_receipt,
-                failure.?,
-            );
+            try self.terminalStartFailure(failure.?, true);
         }
-        if (reviewStartFailureOwnsAttempt(workflow_binding != null, request_send_started, err)) {
-            output_receipt.error_review_attempt_phase = if (request_send_started)
-                "review_terminal"
-            else
-                "pre_review_start";
-            output_receipt.error_review_attempt_exists = request_send_started;
-            const timeout_failure = workflowOwnedPostStartFailure(err);
-            terminalizeOwnedReviewAttempt(
-                allocator,
-                &managed_server,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                .{ .event_log_path = parent_event_log_path },
-                timeout_failure,
-            );
-            try renderErrorAndExit(
-                parsed.json,
-                "start",
-                "review/start",
-                timeout_failure.hint,
-                cwd,
-                output_receipt,
-                timeout_failure,
-            );
+        if (reviewStartFailureOwnsAttempt(self.workflow_binding != null, sent, err)) {
+            try self.terminalStartFailure(workflowOwnedPostStartFailure(err), sent);
         }
-        const message = if (failure) |value| value.hint else raw_message;
         const failure_for_lock: FailureInfo = failure orelse .{
             .code = "pre_review_start_failed",
             .hint = "detached review startup failed after app-server launch",
         };
-        updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, if (std.mem.eql(u8, failure_for_lock.code, "account_resource_exhausted")) "account_resource_exhausted" else "pre_review_start_failed", failure_for_lock.code, null, null, null, parent_event_log_path);
-        if (workflow_binding != null) managed_server.kill();
-        try renderErrorAndExit(
-            parsed.json,
+        const state = if (std.mem.eql(u8, failure_for_lock.code, "account_resource_exhausted"))
+            "account_resource_exhausted"
+        else
+            "pre_review_start_failed";
+        self.updateLock(state, failure_for_lock.code);
+        if (self.workflow_binding != null) self.managed_server.?.kill();
+        return renderErrorAndExit(
+            self.parsed.json,
             "start",
             "review/start",
-            message,
-            cwd,
+            if (failure) |value| value.hint else raw,
+            self.cwd,
             .{
-                .resolved_codex_path = resolved_codex_path,
-                .resolved_codex_version = codex_version,
+                .resolved_codex_path = self.gate.resolved_path,
+                .resolved_codex_version = self.gate.version,
                 .compatibility_verdict = if (failure != null) "incompatible" else "not_checked",
             },
             failure_for_lock,
         );
-    };
-    defer allocator.free(review_result_json);
+    }
 
-    const review_thread_id = extractReviewThreadIdAlloc(allocator, review_result_json) catch |err| {
-        output_receipt.error_review_attempt_phase = "review_terminal";
-        output_receipt.error_review_attempt_exists = true;
-        const failure = workflowOwnedPostStartFailure(err);
+    fn terminalize(self: *ReviewStart, failure: FailureInfo) void {
         terminalizeOwnedReviewAttempt(
-            allocator,
-            &managed_server,
-            tuple_lock_bundle.path,
-            tuple_lock_bundle.lock,
-            .{ .event_log_path = parent_event_log_path },
-            failure,
-        );
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            failure.hint,
-            cwd,
-            output_receipt,
-            failure,
-        );
-    };
-    defer allocator.free(review_thread_id);
-    const review_turn_id = extractReviewTurnIdAlloc(allocator, review_result_json) catch |err| {
-        output_receipt.error_review_attempt_phase = "review_terminal";
-        output_receipt.error_review_attempt_exists = true;
-        output_receipt.error_review_thread_id = review_thread_id;
-        const failure = workflowOwnedPostStartFailure(err);
-        terminalizeOwnedReviewAttempt(
-            allocator,
-            &managed_server,
-            tuple_lock_bundle.path,
-            tuple_lock_bundle.lock,
+            self.allocator,
+            &self.managed_server.?,
+            self.lock_bundle.?.path,
+            self.lock_bundle.?.lock,
             .{
-                .review_thread_id = review_thread_id,
-                .event_log_path = parent_event_log_path,
+                .record_path = self.record_path,
+                .record = if (self.record) |*value| value else null,
+                .review_thread_id = self.review_thread_id,
+                .review_turn_id = self.review_turn_id,
+                .event_log_path = self.event_log_path orelse self.parent_event_log_path,
             },
             failure,
         );
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            failure.hint,
-            cwd,
-            output_receipt,
-            failure,
+    }
+
+    fn terminalStartFailure(self: *ReviewStart, failure: FailureInfo, sent: bool) !noreturn {
+        self.receipt.error_review_attempt_phase = if (sent)
+            "review_terminal"
+        else
+            "pre_review_start";
+        self.receipt.error_review_attempt_exists = sent;
+        self.receipt.error_review_thread_id = self.review_thread_id;
+        self.terminalize(failure);
+        return self.renderFailure("review/start", failure.hint, failure);
+    }
+
+    fn bindAttempt(self: *ReviewStart) !void {
+        self.review_thread_id = extractReviewThreadIdAlloc(
+            self.allocator,
+            self.review_result_json.?,
+        ) catch |err| {
+            return try self.terminalStartFailure(workflowOwnedPostStartFailure(err), true);
+        };
+        self.review_turn_id = extractReviewTurnIdAlloc(
+            self.allocator,
+            self.review_result_json.?,
+        ) catch |err| {
+            return try self.terminalStartFailure(workflowOwnedPostStartFailure(err), true);
+        };
+        self.event_log_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}.events.ndjson",
+            .{ self.session_dir.?, self.review_thread_id.? },
         );
-    };
-    defer allocator.free(review_turn_id);
-    const event_log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.events.ndjson", .{ session_dir, review_thread_id });
-    defer allocator.free(event_log_path);
-    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
-    defer allocator.free(record_path);
+        self.record_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}.json",
+            .{ self.session_dir.?, self.review_thread_id.? },
+        );
+        self.appendLog(self.event_log_path.?, "review/start", "request", self.review_params_json.?);
+        self.appendLog(
+            self.event_log_path.?,
+            "review/start",
+            "response",
+            self.review_result_json.?,
+        );
+    }
 
-    appendLogRecord(
-        allocator,
-        event_log_path,
-        "review/start",
-        "request",
-        review_params_json,
-    ) catch |err| switch (err) {
-        else => {},
-    };
-    appendLogRecord(
-        allocator,
-        event_log_path,
-        "review/start",
-        "response",
-        review_result_json,
-    ) catch |err| switch (err) {
-        else => {},
-    };
-    const store_root = try casStoreRootAlloc(allocator);
-    defer allocator.free(store_root);
-    const repo_root = try repoRootForCwdAlloc(allocator, cwd);
-    defer if (repo_root) |root| allocator.free(root);
-
-    var record = SessionRecord{
-        .cwd = cwd,
-        .store_root = store_root,
-        .store_scope = "repo-local",
-        .repo_root = repo_root,
-        .codex_thread_id = review_tuple.codex_thread_id,
-        .parent_thread_id = parent_thread_id,
-        .review_thread_id = review_thread_id,
-        .review_turn_id = review_turn_id,
-        .delivery = "detached",
-        .target = target_record,
-        .developer_instructions = parsed.custom_instructions,
-        .event_log_path = event_log_path,
-        .created_at_unix_s = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))),
-        .last_observed_status = "inProgress",
-        .codex_version = codex_version,
-        .resolved_codex_path = resolved_codex_path,
-        .codex_binary_digest = runtime_gate.binary_digest,
-        .app_server_contract_id = app_server_contract_id,
-        .compatibility_verdict = "compatible",
-        .transport_kind = "websocket",
-        .transport_selection_reason = "detached_review_requires_cross_process_truth",
-        .code_mode_host_redacted = code_mode_host_redacted,
-        .code_mode_host_digest = code_mode_host_digest,
-        .managed_server_pid = managed_server_pid,
-        .managed_server_listen_url = managed_server_listen_url,
-        .managed_server_stderr_log_path = null,
-        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-        .hook_policy = parsed.hook_policy.asString(),
-        .hook_log_path = event_log_path,
-        .requested_multi_agent_mode = if (output_receipt.requested_multi_agent_mode) |mode| mode.configValue() else null,
-        .effective_multi_agent_mode = if (output_receipt.effective_multi_agent_mode) |mode| mode.configValue() else null,
-        .multi_agent_mode_support = output_receipt.multi_agent_mode_support.asString(),
-        .multi_agent_mode_metric_eligible = output_receipt.multi_agent_mode_metric_eligible,
-        .base_sha = identity.base_sha,
-        .head_sha = identity.head_sha,
-        .target_fingerprint = identity.fingerprint,
-        .accountFingerprint = review_tuple.account_fingerprint,
-        .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
-        .workflowBinding = workflow_binding,
-    };
-    if (std.mem.eql(u8, action_name, "run")) {
-        const auto_replaced = std.mem.eql(u8, tuple_lock_bundle.lock.overrideReason orelse "", "auto-replaced-dead-transport");
-        output_receipt.review_broker_decision = .{
-            .action = if (auto_replaced) "auto_replaced_dead_transport" else "created_new",
-            .reason = if (auto_replaced)
-                "existing same-tuple review transport was marked lost and both recorded owner and managed server were dead"
+    fn prepareRecord(self: *ReviewStart) !void {
+        self.store_root = try casStoreRootAlloc(self.allocator);
+        self.repo_root = try repoRootForCwdAlloc(self.allocator, self.cwd);
+        const reduced_protection = self.tuple.?.account_fingerprint_reduced_protection;
+        self.record = .{
+            .cwd = self.cwd,
+            .store_root = self.store_root,
+            .store_scope = "repo-local",
+            .repo_root = self.repo_root,
+            .codex_thread_id = self.tuple.?.codex_thread_id,
+            .parent_thread_id = self.parent_thread_id.?,
+            .review_thread_id = self.review_thread_id.?,
+            .review_turn_id = self.review_turn_id.?,
+            .delivery = "detached",
+            .target = targetToRecord(self.canonical_target.?.value),
+            .developer_instructions = self.parsed.custom_instructions,
+            .event_log_path = self.event_log_path.?,
+            .created_at_unix_s = @intCast(@divFloor(
+                std.Io.Clock.real.now(self.io).nanoseconds,
+                1_000_000_000,
+            )),
+            .last_observed_status = "inProgress",
+            .codex_version = self.gate.version,
+            .resolved_codex_path = self.gate.resolved_path,
+            .codex_binary_digest = self.gate.binary_digest,
+            .app_server_contract_id = app_server_contract_id,
+            .compatibility_verdict = "compatible",
+            .transport_kind = "websocket",
+            .transport_selection_reason = "detached_review_requires_cross_process_truth",
+            .code_mode_host_redacted = self.receipt.code_mode_host_redacted,
+            .code_mode_host_digest = self.receipt.code_mode_host_digest,
+            .managed_server_pid = self.receipt.managed_server_pid,
+            .managed_server_listen_url = self.receipt.managed_server_listen_url,
+            .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+            .hook_policy = self.parsed.hook_policy.asString(),
+            .hook_log_path = self.event_log_path,
+            .requested_multi_agent_mode = if (self.receipt.requested_multi_agent_mode) |mode|
+                mode.configValue()
             else
-                "no reusable terminal receipt or provably live active attempt satisfied the requested tuple before starting a new review",
-            .reviewThreadId = review_thread_id,
-            .recordPath = record_path,
-            .eventLogPath = event_log_path,
+                null,
+            .effective_multi_agent_mode = if (self.receipt.effective_multi_agent_mode) |mode|
+                mode.configValue()
+            else
+                null,
+            .multi_agent_mode_support = self.receipt.multi_agent_mode_support.asString(),
+            .multi_agent_mode_metric_eligible = self.receipt.multi_agent_mode_metric_eligible,
+            .base_sha = self.identity.?.base_sha,
+            .head_sha = self.identity.?.head_sha,
+            .target_fingerprint = self.identity.?.fingerprint,
+            .accountFingerprint = self.tuple.?.account_fingerprint,
+            .accountFingerprintReducedProtection = reduced_protection,
+            .workflowBinding = self.workflow_binding,
+        };
+        self.setBrokerDecision();
+    }
+
+    fn setBrokerDecision(self: *ReviewStart) void {
+        if (!std.mem.eql(u8, self.receipt.surface_action, "run")) return;
+        const replaced = std.mem.eql(
+            u8,
+            self.lock_bundle.?.lock.overrideReason orelse "",
+            "auto-replaced-dead-transport",
+        );
+        self.receipt.review_broker_decision = .{
+            .action = if (replaced) "auto_replaced_dead_transport" else "created_new",
+            .reason = if (replaced)
+                "existing same-tuple review transport was marked lost and both recorded " ++
+                    "owner and managed server were dead"
+            else
+                "no reusable terminal receipt or provably live active attempt satisfied " ++
+                    "the requested tuple before starting a new review",
+            .reviewThreadId = self.review_thread_id,
+            .recordPath = self.record_path,
+            .eventLogPath = self.event_log_path,
         };
     }
-    writeSessionRecord(allocator, record_path, record) catch |err| {
-        if (workflow_binding != null) {
-            const failure = workflowOwnedPostStartFailure(err);
-            terminalizeOwnedReviewAttempt(
-                allocator,
-                &managed_server,
-                tuple_lock_bundle.path,
-                tuple_lock_bundle.lock,
-                .{
-                    .record_path = record_path,
-                    .record = &record,
-                    .review_thread_id = review_thread_id,
-                    .review_turn_id = review_turn_id,
-                    .event_log_path = event_log_path,
-                },
-                failure,
-            );
-            var disconnected_status = try makeDisconnectedReviewStatus(allocator);
-            defer disconnected_status.deinit(allocator);
-            try printStartJson(
-                allocator,
-                cwd,
-                parent_thread_id,
-                review_thread_id,
-                review_turn_id,
-                target_record,
-                identity,
-                record_path,
-                event_log_path,
-                output_receipt,
-                disconnected_status,
-                false,
-                true,
-                failure,
-            );
-            std.process.exit(1);
-        }
-        return err;
-    };
-    updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
 
-    if (parsed.wait_after_start) {
-        const wait_deadline_ms = workflow_deadline_ms orelse
-            (monotonicMilliseconds() + @as(i64, parsed.timeout_ms));
-        const previous_wait_deadline = if (workflow_deadline_ms == null)
-            client.swapRequestDeadlineMs(wait_deadline_ms)
+    fn persistStarted(self: *ReviewStart) !void {
+        writeSessionRecord(self.allocator, self.record_path.?, self.record.?) catch |err| {
+            if (self.workflow_binding == null) return err;
+            const failure = workflowOwnedPostStartFailure(err);
+            self.terminalize(failure);
+            var status = try makeDisconnectedReviewStatus(self.allocator);
+            defer status.deinit(self.allocator);
+            try self.printJsonResult(status, false, true, failure);
+            std.process.exit(1);
+        };
+        self.updateLock("review_started", null);
+    }
+
+    fn printJsonResult(
+        self: *const ReviewStart,
+        status: ?ReviewStatus,
+        timed_out: bool,
+        waited: bool,
+        failure: ?FailureInfo,
+    ) !void {
+        try printStartJson(
+            self.allocator,
+            self.cwd,
+            self.parent_thread_id.?,
+            self.review_thread_id.?,
+            self.review_turn_id.?,
+            targetToRecord(self.canonical_target.?.value),
+            self.identity.?,
+            self.record_path.?,
+            self.event_log_path.?,
+            self.receipt,
+            status,
+            timed_out,
+            waited,
+            failure,
+        );
+    }
+
+    fn printResult(
+        self: *const ReviewStart,
+        status: ?ReviewStatus,
+        timed_out: bool,
+        waited: bool,
+        failure: ?FailureInfo,
+    ) !void {
+        if (self.parsed.json) return self.printJsonResult(status, timed_out, waited, failure);
+        var output = std.Io.File.stdout().writer(self.io, &.{});
+        const writer = &output.interface;
+        if (timed_out) return writer.print("cas review start timed out after {d}ms\n" ++
+            "review thread: {s}\n", .{ self.parsed.timeout_ms, self.review_thread_id.? });
+        if (status) |latest| {
+            if (!latest.review_result_available) {
+                return writer.print("cas review start reached terminal status without " ++
+                    "a reviewResult\nreview thread: {s}\n", .{self.review_thread_id.?});
+            }
+            return writer.print("cas review start\ncwd: {s}\nparent thread: {s}\n" ++
+                "review thread: {s}\nreview turn: {s}\nfinal turn status: {s}\n" ++
+                "record: {s}\nevent log: {s}\n", .{
+                self.cwd,
+                self.parent_thread_id.?,
+                self.review_thread_id.?,
+                self.review_turn_id.?,
+                latest.turn_status,
+                self.record_path.?,
+                self.event_log_path.?,
+            });
+        }
+        try writer.print("cas review start\ncwd: {s}\nparent thread: {s}\n" ++
+            "review thread: {s}\nreview turn: {s}\nrecord: {s}\nevent log: {s}\n", .{
+            self.cwd,
+            self.parent_thread_id.?,
+            self.review_thread_id.?,
+            self.review_turn_id.?,
+            self.record_path.?,
+            self.event_log_path.?,
+        });
+    }
+
+    fn waitAndFinish(self: *ReviewStart) !void {
+        const deadline = self.workflow_deadline_ms orelse
+            (monotonicMilliseconds(self.io) + @as(i64, self.parsed.timeout_ms));
+        const previous = if (self.workflow_deadline_ms == null)
+            self.client.?.swapRequestDeadlineMs(deadline)
         else
             null;
-        defer if (workflow_deadline_ms == null) {
-            _ = client.swapRequestDeadlineMs(previous_wait_deadline);
+        defer if (self.workflow_deadline_ms == null) {
+            _ = self.client.?.swapRequestDeadlineMs(previous);
         };
-        updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "waiting", null, review_thread_id, review_turn_id, record_path, event_log_path);
-        var terminal_status_from_grace = false;
+        self.updateLock("waiting", null);
         const latest = waitForReviewCompletion(
-            allocator,
-            &client,
-            record.review_thread_id,
-            record.review_turn_id,
-            record.event_log_path,
-            parsed.timeout_ms,
-            parsed.poll_interval_ms,
-            wait_deadline_ms,
-        ) catch |err| switch (err) {
-            error.WaitTimedOut => timeout: {
-                var timeout_status = fetch_timeout_status: {
-                    var grace_client = connectReviewClient(
-                        allocator,
-                        cwd,
-                        resolved_codex_path,
-                        codex_version,
-                        "websocket",
-                        managed_server_listen_url,
-                        io,
-                        parsed,
-                        monotonicMilliseconds() + @as(
-                            i64,
-                            finalReviewStatusGraceMs(parsed.poll_interval_ms),
-                        ),
-                    ) catch {
-                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
-                    };
-                    defer {
-                        grace_client.close();
-                        grace_client.deinit();
-                    }
-                    break :fetch_timeout_status fetchReviewStatusAfterWaitTimeout(
-                        allocator,
-                        &grace_client,
-                        record.review_thread_id,
-                        record.review_turn_id,
-                        record.event_log_path,
-                        parsed.poll_interval_ms,
-                    ) catch {
-                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
-                    };
-                };
-                if (reviewStatusCompletesWait(&timeout_status)) {
-                    terminal_status_from_grace = true;
-                    break :timeout timeout_status;
-                }
-                defer timeout_status.deinit(allocator);
-                if (workflow_binding != null) {
-                    const failure = reviewWaitTimeoutDisposition(true).failure;
-                    terminalizeOwnedReviewAttempt(
-                        allocator,
-                        &managed_server,
-                        tuple_lock_bundle.path,
-                        tuple_lock_bundle.lock,
-                        .{
-                            .record_path = record_path,
-                            .record = &record,
-                            .review_thread_id = review_thread_id,
-                            .review_turn_id = review_turn_id,
-                            .event_log_path = event_log_path,
-                        },
-                        failure,
-                    );
-                    try printStartJson(
-                        allocator,
-                        cwd,
-                        parent_thread_id,
-                        review_thread_id,
-                        review_turn_id,
-                        target_record,
-                        identity,
-                        record_path,
-                        event_log_path,
-                        output_receipt,
-                        timeout_status,
-                        true,
-                        true,
-                        failure,
-                    );
-                    std.process.exit(1);
-                }
-                const timeout_disposition = reviewWaitTimeoutDisposition(workflow_binding != null);
-                record.last_observed_status = timeoutStatusString(&timeout_status);
-                try writeSessionRecord(allocator, record_path, record);
-                updateReviewTupleLockBestEffort(
-                    allocator,
-                    tuple_lock_bundle.path,
-                    tuple_lock_bundle.lock,
-                    timeout_disposition.lock_state,
-                    timeout_disposition.failure.code,
-                    review_thread_id,
-                    review_turn_id,
-                    record_path,
-                    event_log_path,
-                );
-                if (parsed.json) {
-                    try printStartJson(
-                        allocator,
-                        cwd,
-                        parent_thread_id,
-                        review_thread_id,
-                        review_turn_id,
-                        target_record,
-                        identity,
-                        record_path,
-                        event_log_path,
-                        output_receipt,
-                        timeout_status,
-                        true,
-                        true,
-                        timeout_disposition.failure,
-                    );
-                } else {
-                    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                    const stdout = &stdout_writer.interface;
-                    try stdout.print(
-                        "cas review start timed out after {d}ms\n" ++
-                            "review thread: {s}\n",
-                        .{
-                            parsed.timeout_ms,
-                            review_thread_id,
-                        },
-                    );
-                }
-                std.process.exit(1);
-            },
-            else => {
-                if (workflow_binding != null or isTransportLossError(err)) {
-                    const failure = workflowOwnedPostStartFailure(err);
-                    terminalizeOwnedReviewAttempt(
-                        allocator,
-                        &managed_server,
-                        tuple_lock_bundle.path,
-                        tuple_lock_bundle.lock,
-                        .{
-                            .record_path = record_path,
-                            .record = &record,
-                            .review_thread_id = review_thread_id,
-                            .review_turn_id = review_turn_id,
-                            .event_log_path = event_log_path,
-                        },
-                        failure,
-                    );
-                    var disconnected_status = try makeDisconnectedReviewStatus(allocator);
-                    defer disconnected_status.deinit(allocator);
-                    if (parsed.json) {
-                        try printStartJson(
-                            allocator,
-                            cwd,
-                            parent_thread_id,
-                            review_thread_id,
-                            review_turn_id,
-                            target_record,
-                            identity,
-                            record_path,
-                            event_log_path,
-                            output_receipt,
-                            disconnected_status,
-                            err == error.ConnectionTimedOut,
-                            true,
-                            failure,
-                        );
-                    } else {
-                        var stderr_writer = std.Io.File.stderr().writer(
-                            std.Io.Threaded.global_single_threaded.io(),
-                            &.{},
-                        );
-                        try stderr_writer.interface.print(
-                            "cas review start: {s} ({s})\nrecord: {s}\n",
-                            .{ failure.hint, failure.code, record_path },
-                        );
-                    }
-                    std.process.exit(1);
-                }
-                return err;
-            },
-        };
-        defer latest.deinit(allocator);
-        record.last_observed_status = latest.turn_status;
-        persistTerminalReviewResult(&record, latest);
-        if (!latest.review_result_available) {
-            if (failureInfoForStatus(&latest)) |failure| {
-                if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
-                    record.compatibility_verdict = "incompatible";
-                    output_receipt.compatibility_verdict = "incompatible";
-                }
-            }
-            writeSessionRecord(allocator, record_path, record) catch |err| {
-                if (workflow_binding != null) {
-                    managed_server.kill();
-                    const persistence_failure = terminalReviewOwnerFailure("review_owner_failed").?;
-                    updateReviewTupleLockBestEffort(
-                        allocator,
-                        tuple_lock_bundle.path,
-                        tuple_lock_bundle.lock,
-                        "terminal",
-                        persistence_failure.code,
-                        review_thread_id,
-                        review_turn_id,
-                        record_path,
-                        event_log_path,
-                    );
-                    output_receipt.error_review_attempt_phase = "review_terminal";
-                    output_receipt.error_review_attempt_exists = true;
-                    if (parsed.json) {
-                        try printStartJson(
-                            allocator,
-                            cwd,
-                            parent_thread_id,
-                            review_thread_id,
-                            review_turn_id,
-                            target_record,
-                            identity,
-                            record_path,
-                            event_log_path,
-                            output_receipt,
-                            latest,
-                            false,
-                            true,
-                            persistence_failure,
-                        );
-                    }
-                    std.process.exit(1);
-                }
-                return err;
+            self.allocator,
+            &self.client.?,
+            self.review_thread_id.?,
+            self.review_turn_id.?,
+            self.event_log_path.?,
+            self.parsed.timeout_ms,
+            self.parsed.poll_interval_ms,
+            deadline,
+        ) catch |err|
+            switch (err) {
+                error.WaitTimedOut => try self.waitTimeout(),
+                else => return try self.waitFailure(err),
             };
-            if (failureInfoForStatus(&latest)) |failure| {
-                updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, if (std.mem.eql(u8, failure.code, "account_resource_exhausted")) "account_resource_exhausted" else "terminal", failure.code, review_thread_id, review_turn_id, record_path, event_log_path);
-            } else {
-                updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "terminal", "review_output_missing", review_thread_id, review_turn_id, record_path, event_log_path);
-            }
-            if (workflow_binding != null) managed_server.kill();
-            if (parsed.json) {
-                try printStartJson(
-                    allocator,
-                    cwd,
-                    parent_thread_id,
-                    review_thread_id,
-                    review_turn_id,
-                    target_record,
-                    identity,
-                    record_path,
-                    event_log_path,
-                    output_receipt,
-                    latest,
-                    false,
-                    true,
-                    failureInfoForStatus(&latest) orelse .{
-                        .code = "review_output_missing",
-                        .hint = "detached review reached terminal status without a materialized reviewResult",
-                    },
-                );
-            } else {
-                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                const stdout = &stdout_writer.interface;
-                try stdout.print(
-                    "cas review start reached terminal status without a reviewResult\n" ++
-                        "review thread: {s}\n",
-                    .{review_thread_id},
-                );
-            }
+        defer latest.deinit(self.allocator);
+        self.record.?.last_observed_status = latest.turn_status;
+        persistTerminalReviewResult(&self.record.?, latest);
+        if (!latest.review_result_available) return try self.finishMissingResult(latest);
+        try self.persistTerminal(latest);
+        try self.finishResult(latest);
+    }
+
+    fn graceStatus(self: *ReviewStart) !ReviewStatus {
+        const deadline = monotonicMilliseconds(self.io) +
+            @as(i64, finalReviewStatusGraceMs(self.parsed.poll_interval_ms));
+        var client = self.connectClient(deadline) catch {
+            return makeDisconnectedReviewStatus(self.allocator);
+        };
+        defer {
+            client.close();
+            client.deinit();
+        }
+        return fetchReviewStatusAfterWaitTimeout(
+            self.allocator,
+            &client,
+            self.review_thread_id.?,
+            self.review_turn_id.?,
+            self.event_log_path.?,
+            self.parsed.poll_interval_ms,
+        ) catch {
+            return makeDisconnectedReviewStatus(self.allocator);
+        };
+    }
+
+    fn waitTimeout(self: *ReviewStart) !ReviewStatus {
+        var status = try self.graceStatus();
+        if (reviewStatusCompletesWait(&status)) {
+            self.terminal_status_from_grace = true;
+            return status;
+        }
+        defer status.deinit(self.allocator);
+        const disposition = reviewWaitTimeoutDisposition(self.workflow_binding != null);
+        if (self.workflow_binding != null) {
+            self.terminalize(disposition.failure);
+            try self.printJsonResult(status, true, true, disposition.failure);
             std.process.exit(1);
         }
-        writeSessionRecord(allocator, record_path, record) catch |err| {
-            if (workflow_binding != null) {
-                managed_server.kill();
-                const persistence_failure = terminalReviewOwnerFailure("review_owner_failed").?;
-                updateReviewTupleLockBestEffort(
-                    allocator,
-                    tuple_lock_bundle.path,
-                    tuple_lock_bundle.lock,
-                    "terminal",
-                    persistence_failure.code,
-                    review_thread_id,
-                    review_turn_id,
-                    record_path,
-                    event_log_path,
-                );
-                output_receipt.error_review_attempt_phase = "review_terminal";
-                output_receipt.error_review_attempt_exists = true;
-                if (parsed.json) {
-                    try printStartJson(
-                        allocator,
-                        cwd,
-                        parent_thread_id,
-                        review_thread_id,
-                        review_turn_id,
-                        target_record,
-                        identity,
-                        record_path,
-                        event_log_path,
-                        output_receipt,
-                        latest,
-                        false,
-                        true,
-                        persistence_failure,
-                    );
-                }
-                std.process.exit(1);
-            }
-            return err;
+        self.record.?.last_observed_status = timeoutStatusString(&status);
+        try writeSessionRecord(self.allocator, self.record_path.?, self.record.?);
+        self.updateLock(disposition.lock_state, disposition.failure.code);
+        try self.printResult(status, true, true, disposition.failure);
+        std.process.exit(1);
+    }
+
+    fn waitFailure(self: *ReviewStart, err: anyerror) !noreturn {
+        if (self.workflow_binding == null and !isTransportLossError(err)) return err;
+        const failure = workflowOwnedPostStartFailure(err);
+        self.terminalize(failure);
+        var status = try makeDisconnectedReviewStatus(self.allocator);
+        defer status.deinit(self.allocator);
+        if (self.parsed.json) {
+            try self.printJsonResult(status, err == error.ConnectionTimedOut, true, failure);
+        } else {
+            var output = std.Io.File.stderr().writer(self.io, &.{});
+            try output.interface.print(
+                "cas review start: {s} ({s})\nrecord: {s}\n",
+                .{ failure.hint, failure.code, self.record_path.? },
+            );
+        }
+        std.process.exit(1);
+    }
+
+    fn persistTerminal(self: *ReviewStart, latest: ReviewStatus) !void {
+        writeSessionRecord(self.allocator, self.record_path.?, self.record.?) catch |err| {
+            if (self.workflow_binding == null) return err;
+            self.managed_server.?.kill();
+            const failure = terminalReviewOwnerFailure("review_owner_failed").?;
+            self.updateLock("terminal", failure.code);
+            self.receipt.error_review_attempt_phase = "review_terminal";
+            self.receipt.error_review_attempt_exists = true;
+            if (self.parsed.json) try self.printJsonResult(latest, false, true, failure);
+            std.process.exit(1);
         };
-        var terminal_context_client: ?cas.Client = if (terminal_status_from_grace)
-            connectReviewClient(
-                allocator,
-                cwd,
-                resolved_codex_path,
-                codex_version,
-                "websocket",
-                managed_server_listen_url,
-                io,
-                parsed,
-                monotonicMilliseconds() + 1_000,
-            ) catch null
+    }
+
+    fn finishMissingResult(self: *ReviewStart, latest: ReviewStatus) !noreturn {
+        const observed_failure = failureInfoForStatus(&latest);
+        if (observed_failure) |failure| {
+            if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
+                self.record.?.compatibility_verdict = "incompatible";
+                self.receipt.compatibility_verdict = "incompatible";
+            }
+        }
+        try self.persistTerminal(latest);
+        const failure = observed_failure orelse FailureInfo{
+            .code = "review_output_missing",
+            .hint = "detached review reached terminal status without a materialized reviewResult",
+        };
+        const state = if (std.mem.eql(u8, failure.code, "account_resource_exhausted"))
+            "account_resource_exhausted"
+        else
+            "terminal";
+        self.updateLock(state, failure.code);
+        if (self.workflow_binding != null) self.managed_server.?.kill();
+        try self.printResult(latest, false, true, failure);
+        std.process.exit(1);
+    }
+
+    fn finishResult(self: *ReviewStart, latest: ReviewStatus) !void {
+        var fresh: ?cas.Client = if (self.terminal_status_from_grace)
+            self.connectClient(monotonicMilliseconds(self.io) + 1_000) catch null
         else
             null;
-        defer if (terminal_context_client) |*fresh_client| {
-            fresh_client.close();
-            fresh_client.deinit();
+        defer if (fresh) |*client| {
+            client.close();
+            client.deinit();
         };
-        const terminal_context_client_ptr = if (terminal_context_client) |*fresh_client|
-            fresh_client
-        else
-            &client;
-        const terminal_context = captureTerminalReviewContext(
-            allocator,
-            io,
-            cwd,
-            target,
-            parsed.custom_instructions,
-            terminal_context_client_ptr,
-            workflow_binding,
-            terminal_status_from_grace,
-            resolved_codex_path,
-            codex_version,
-            runtime_gate.binary_digest,
+        const client = if (fresh) |*value| value else &self.client.?;
+        const context = captureTerminalReviewContext(
+            self.allocator,
+            self.io,
+            self.cwd,
+            self.canonical_target.?.value,
+            self.parsed.custom_instructions,
+            client,
+            self.workflow_binding,
+            self.terminal_status_from_grace,
+            self.gate.resolved_path,
+            self.gate.version,
+            self.gate.binary_digest,
             app_server_contract_id,
             "websocket",
-            code_mode_host_digest,
+            self.receipt.code_mode_host_digest,
         );
-        defer terminal_context.deinit(allocator);
-        const terminal_binding_failure = try terminalReviewFailureAlloc(
-            allocator,
+        defer context.deinit(self.allocator);
+        const failure = try terminalReviewFailureAlloc(
+            self.allocator,
             latest,
-            identity,
-            terminal_context.identity,
-            review_tuple,
-            terminal_context.tuple,
+            self.identity.?,
+            context.identity,
+            self.tuple.?,
+            context.tuple,
         );
         applyObservedReviewContext(
-            &output_receipt,
-            terminal_context.tuple,
-            terminal_context.codex_path,
-            terminal_context.codex_version,
+            &self.receipt,
+            context.tuple,
+            context.codex_path,
+            context.codex_version,
         );
         try updateReviewTupleLock(
-            allocator,
-            tuple_lock_bundle.path,
-            tuple_lock_bundle.lock,
-            if (terminal_binding_failure == null) "normalized" else "terminal",
-            if (terminal_binding_failure) |failure| failure.code else null,
-            review_thread_id,
-            review_turn_id,
-            record_path,
-            event_log_path,
+            self.allocator,
+            self.lock_bundle.?.path,
+            self.lock_bundle.?.lock,
+            if (failure == null) "normalized" else "terminal",
+            if (failure) |value| value.code else null,
+            self.review_thread_id,
+            self.review_turn_id,
+            self.record_path,
+            self.event_log_path,
         );
-
-        // Terminal renderers may exit (for example `run` with findings), so
-        // owner cleanup must happen before control crosses the renderer.
-        if (workflow_binding != null) managed_server.kill();
-        if (parsed.json) {
-            try printStartJson(
-                allocator,
-                cwd,
-                parent_thread_id,
-                review_thread_id,
-                review_turn_id,
-                target_record,
-                identity,
-                record_path,
-                event_log_path,
-                output_receipt,
-                latest,
-                false,
-                true,
-                terminal_binding_failure,
-            );
-        } else {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            const stdout = &stdout_writer.interface;
-            try stdout.print(
-                "cas review start\ncwd: {s}\nparent thread: {s}\n" ++
-                    "review thread: {s}\nreview turn: {s}\n" ++
-                    "final turn status: {s}\nrecord: {s}\nevent log: {s}\n",
-                .{
-                    cwd,
-                    parent_thread_id,
-                    review_thread_id,
-                    review_turn_id,
-                    latest.turn_status,
-                    record_path,
-                    event_log_path,
-                },
-            );
-        }
-        if (terminal_binding_failure != null) {
-            std.process.exit(1);
-        }
-        return;
+        // Renderers may exit, so owner cleanup precedes the terminal render.
+        if (self.workflow_binding != null) self.managed_server.?.kill();
+        try self.printResult(latest, false, true, failure);
+        if (failure != null) std.process.exit(1);
     }
-
-    if (parsed.json) {
-        try printStartJson(
-            allocator,
-            cwd,
-            parent_thread_id,
-            review_thread_id,
-            review_turn_id,
-            target_record,
-            identity,
-            record_path,
-            event_log_path,
-            output_receipt,
-            null,
-            false,
-            false,
-            null,
-        );
-    } else {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const stdout = &stdout_writer.interface;
-        try stdout.print(
-            "cas review start\ncwd: {s}\nparent thread: {s}\n" ++
-                "review thread: {s}\nreview turn: {s}\n" ++
-                "record: {s}\nevent log: {s}\n",
-            .{
-                cwd,
-                parent_thread_id,
-                review_thread_id,
-                review_turn_id,
-                record_path,
-                event_log_path,
-            },
-        );
-    }
-}
-
+};
 fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var loaded = try loadSelectedSessionRecord(allocator, parsed);
     defer loaded.deinit(allocator);
@@ -2423,14 +2226,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const selected_target = try targetConfigFromRecord(record.target);
     const stored_identity = try targetIdentityForRecordAlloc(allocator, record);
     defer stored_identity.deinit(allocator);
-    const stored_identity_opt: ?TargetIdentity = stored_identity;
-    const wait_deadline_ms = monotonicMilliseconds() + @as(i64, parsed.timeout_ms);
-
-    if (try recordHasTerminalFailureReplayCandidate(
-        allocator,
-        record,
-        loaded.record_path,
-    )) {
+    const deadline_ms = monotonicMilliseconds(io) + @as(i64, parsed.timeout_ms);
+    if (try recordHasTerminalFailureReplayCandidate(allocator, record, loaded.record_path)) {
         try replayTerminalRecordAndExit(
             allocator,
             parsed.json,
@@ -2439,8 +2236,66 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             stored_identity,
         );
     }
+    var runtime_gate = try waitRuntimeGate(allocator, io, parsed, record);
+    defer runtime_gate.deinit(allocator);
+    var current_identity = try computeTargetIdentityAlloc(
+        allocator,
+        io,
+        record.cwd,
+        selected_target,
+        record.developer_instructions,
+    );
+    defer current_identity.deinit(allocator);
+    const context = HistoricalWaitContext{
+        .allocator = allocator,
+        .io = io,
+        .parsed = parsed,
+        .record = &record,
+        .record_path = loaded.record_path,
+        .selected_target = selected_target,
+        .stored_identity = stored_identity,
+        .current_identity = current_identity,
+        .runtime_gate = &runtime_gate,
+        .deadline_ms = deadline_ms,
+    };
+    try context.replayNormalizedVerdict();
+    var recovery_owner_lease: ?ReviewOwnerLease = null;
+    defer if (recovery_owner_lease) |*lease| lease.deinit(allocator);
+    try context.checkOwner(&recovery_owner_lease);
+    // A newly committed exact verdict outranks any historical reconnect.
+    try context.replay();
+    var stored_tuple = try storedReviewTupleIdentityAlloc(allocator, record);
+    defer stored_tuple.deinit(allocator);
+    var client = context.connect(deadline_ms) catch |err|
+        return context.connectionFailure(err, stored_tuple);
+    defer {
+        client.close();
+        client.deinit();
+    }
+    const previous_deadline = client.swapRequestDeadlineMs(deadline_ms);
+    defer _ = client.swapRequestDeadlineMs(previous_deadline);
+    var current_tuple = context.captureTuple(&client) catch |err| {
+        try context.providerFailure(err);
+        return err;
+    };
+    defer current_tuple.deinit(allocator);
+    var terminal_status_from_grace = false;
+    const latest = try context.wait(&client, current_tuple, &terminal_status_from_grace);
+    defer latest.deinit(allocator);
+    record.last_observed_status = latest.turn_status;
+    persistTerminalReviewResult(&record, latest);
+    if (!latest.review_result_available) try context.missingResult(latest, current_tuple);
+    try writeSessionRecord(allocator, loaded.record_path, record);
+    try context.finish(&client, stored_tuple, latest, terminal_status_from_grace);
+}
 
-    var runtime_gate = runReviewRuntimeGate(
+fn waitRuntimeGate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    record: SessionRecord,
+) !ReviewRuntimeGate {
+    var gate = runReviewRuntimeGate(
         allocator,
         io,
         record.cwd,
@@ -2472,10 +2327,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             },
         );
     };
-    defer runtime_gate.deinit(allocator);
-    const current_codex_path = runtime_gate.resolved_path;
-    const current_codex_version = runtime_gate.version;
-    if (!std.mem.eql(u8, record.codex_binary_digest orelse "", runtime_gate.binary_digest) or
+    errdefer gate.deinit(allocator);
+    if (!std.mem.eql(u8, record.codex_binary_digest orelse "", gate.binary_digest) or
         !reviewRecordContractSupported(record.app_server_contract_id))
     {
         try renderErrorAndExit(
@@ -2486,9 +2339,9 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             record.cwd,
             withRecordMultiAgentMode(.{
                 .surface_action = "wait",
-                .resolved_codex_path = current_codex_path,
-                .resolved_codex_version = current_codex_version,
-                .codex_binary_digest = runtime_gate.binary_digest,
+                .resolved_codex_path = gate.resolved_path,
+                .resolved_codex_version = gate.version,
+                .codex_binary_digest = gate.binary_digest,
                 .app_server_contract_id = app_server_contract_id,
                 .structured_review_capability = structured_review_capability,
                 .compatibility_verdict = "incompatible",
@@ -2503,620 +2356,489 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             },
         );
     }
-    var current_identity = try computeTargetIdentityAlloc(
-        allocator,
-        io,
-        record.cwd,
-        selected_target,
-        record.developer_instructions,
-    );
-    defer current_identity.deinit(allocator);
-    const current_identity_opt: ?TargetIdentity = current_identity;
+    return gate;
+}
 
-    if (try recordIsNormalizedVerdictReplayCandidate(
-        allocator,
-        record,
-        loaded.record_path,
-    )) {
-        const replay_currentness_failure: ?FailureInfo = validation: {
-            var validation_server = try startManagedWebsocketServer(
-                allocator,
-                record.cwd,
-                current_codex_path,
-                parsed.hook_policy,
-                true,
-                null,
-                io,
-            );
-            defer validation_server.deinit(allocator);
-            defer validation_server.kill();
-            var validation_client = try connectReviewClient(
-                allocator,
-                record.cwd,
-                current_codex_path,
-                current_codex_version,
-                "websocket",
-                validation_server.listen_url,
-                io,
-                parsed,
-                wait_deadline_ms,
-            );
-            defer {
-                validation_client.close();
-                validation_client.deinit();
-            }
-            var stored_tuple_for_replay = try storedReviewTupleIdentityAlloc(
-                allocator,
-                record,
-            );
-            defer stored_tuple_for_replay.deinit(allocator);
-            var current_tuple_for_replay = try reviewTupleIdentityAlloc(
-                allocator,
-                record.cwd,
-                current_identity,
-                current_codex_path,
-                current_codex_version,
-                &validation_client,
-                record.workflowBinding,
-            );
-            defer current_tuple_for_replay.deinit(allocator);
-            current_tuple_for_replay.codex_binary_digest = runtime_gate.binary_digest;
-            current_tuple_for_replay.app_server_contract_id =
-                record.app_server_contract_id orelse app_server_contract_id;
-            current_tuple_for_replay.transport_kind = record.transport_kind orelse "websocket";
-            current_tuple_for_replay.code_mode_host_digest = record.code_mode_host_digest;
-            break :validation try reviewTupleCurrentnessFailureAlloc(
-                allocator,
-                stored_tuple_for_replay,
-                current_tuple_for_replay,
-            );
-        };
-        if (replay_currentness_failure) |failure| {
-            if (parsed.json) {
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    current_identity,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-            return error.ReviewTupleMismatch;
-        }
-        try replayTerminalRecordAndExit(
-            allocator,
-            parsed.json,
-            record,
-            loaded.record_path,
-            current_identity,
-        );
-    }
-    var recovery_owner_lease: ?ReviewOwnerLease = null;
-    defer if (recovery_owner_lease) |*lease| lease.deinit(allocator);
-    switch (try workflowBoundRecordOwnerState(
-        allocator,
-        record,
-        loaded.record_path,
-        &recovery_owner_lease,
-    )) {
-        .live => {
-            const failure = workflowOwnerActiveFailureInfo();
-            if (parsed.json) {
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    stored_identity,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-            return error.WorkflowBoundReviewOwnerActive;
-        },
-        .dead => {
-            const failure = terminalReviewTransportFailure("review_transport_lost").?;
-            try terminalizeDeadWorkflowBoundOwner(
-                allocator,
-                loaded.record_path,
-                &record,
-                failure,
-            );
-            if (parsed.json) {
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    stored_identity,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-            return error.ReviewTransportTerminal;
-        },
-        .not_applicable => {},
-    }
-    // The owner may have committed a normalized verdict or terminal failure
-    // between the first replay probe and the lease-state observation. Replay
-    // that newer exact state before any historical reconnect is attempted.
-    try replayTerminalRecordAndExit(
-        allocator,
-        parsed.json,
-        record,
-        loaded.record_path,
-        current_identity,
-    );
-    var stored_tuple = try storedReviewTupleIdentityAlloc(allocator, record);
-    defer stored_tuple.deinit(allocator);
-    var client = connectReviewClient(
-        allocator,
-        record.cwd,
-        record.resolved_codex_path orelse "codex",
-        record.codex_version,
-        record.transport_kind,
-        record.managed_server_listen_url,
-        io,
-        parsed,
-        wait_deadline_ms,
-    ) catch |err| {
-        if (err == error.ConnectionTimedOut) {
-            try emitHistoricalWaitTimeoutAndExit(
-                allocator,
-                parsed,
-                loaded.record_path,
-                &record,
-                stored_identity_opt,
-                stored_tuple,
-                record.resolved_codex_path orelse "codex",
-                record.codex_version,
-            );
-        }
-        // A concurrent owner can terminalize while this observer is inside
-        // connect/upgrade. The persisted exact state outranks the observer's
-        // socket error and must never be overwritten by it.
-        try replayTerminalRecordAndExit(
-            allocator,
-            parsed.json,
-            record,
-            loaded.record_path,
-            current_identity,
-        );
-        if (serverRequestProviderFailure(err)) |failure| {
-            if (!try transitionActiveReviewTupleLockForRecord(
-                allocator,
-                record,
-                loaded.record_path,
-                "terminal",
-                failure.code,
-            )) {
-                try replayTerminalRecordAndExit(
-                    allocator,
-                    parsed.json,
-                    record,
-                    loaded.record_path,
-                    current_identity,
-                );
-                return error.InvalidReviewTupleLockBinding;
-            }
-            if (parsed.json) {
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    stored_identity_opt,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-            return err;
-        }
-        if (isTransportLossError(err)) {
-            var exact_lock = try loadExactReviewTupleLockForRecord(
-                allocator,
-                record,
-                loaded.record_path,
-            );
-            defer exact_lock.deinit(allocator);
-            if (!reviewTupleLockDeadTransportProven(allocator, exact_lock.record)) {
-                try emitHistoricalWaitTimeoutAndExit(
-                    allocator,
-                    parsed,
-                    loaded.record_path,
-                    &record,
-                    stored_identity_opt,
-                    stored_tuple,
-                    record.resolved_codex_path orelse "codex",
-                    record.codex_version,
-                );
-            }
-            if (!try transitionActiveReviewTupleLockForRecord(
-                allocator,
-                record,
-                loaded.record_path,
-                "terminal",
-                "review_transport_lost",
-            )) {
-                try replayTerminalRecordAndExit(
-                    allocator,
-                    parsed.json,
-                    record,
-                    loaded.record_path,
-                    current_identity,
-                );
-                return error.InvalidReviewTupleLockBinding;
-            }
-            if (parsed.json) {
-                const failure = terminalReviewTransportFailure("review_transport_lost").?;
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    stored_identity_opt,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-        }
-        return err;
-    };
-    defer {
-        client.close();
-        client.deinit();
-    }
-    const previous_wait_deadline = client.swapRequestDeadlineMs(wait_deadline_ms);
-    defer _ = client.swapRequestDeadlineMs(previous_wait_deadline);
-    var current_tuple = reviewTupleIdentityAlloc(
-        allocator,
-        record.cwd,
-        current_identity,
-        current_codex_path,
-        current_codex_version,
-        &client,
-        record.workflowBinding,
-    ) catch |err| {
-        if (serverRequestProviderFailure(err)) |failure| {
-            try transitionReviewTupleLockForRecordOrReplay(
-                allocator,
-                parsed.json,
-                record,
-                loaded.record_path,
-                "terminal",
-                failure.code,
-                current_identity,
-            );
-            if (parsed.json) {
-                try printRecordedReviewFailureJson(
-                    allocator,
-                    .wait,
-                    record,
-                    loaded.record_path,
-                    stored_identity_opt,
-                    null,
-                    failure,
-                );
-                std.process.exit(1);
-            }
-        }
-        return err;
-    };
-    defer current_tuple.deinit(allocator);
-    current_tuple.codex_binary_digest = runtime_gate.binary_digest;
-    current_tuple.app_server_contract_id =
-        record.app_server_contract_id orelse app_server_contract_id;
-    current_tuple.transport_kind = record.transport_kind orelse "websocket";
-    current_tuple.code_mode_host_digest = record.code_mode_host_digest;
-    var terminal_status_from_grace = false;
-    const latest = waitForReviewCompletion(
-        allocator,
-        &client,
-        record.review_thread_id,
-        record.review_turn_id,
-        record.event_log_path,
-        parsed.timeout_ms,
-        parsed.poll_interval_ms,
-        wait_deadline_ms,
-    ) catch |err| switch (err) {
-        error.WaitTimedOut => timeout: {
-            var timeout_status = grace: {
-                var grace_client = connectReviewClient(
-                    allocator,
-                    record.cwd,
-                    record.resolved_codex_path orelse "codex",
-                    record.codex_version,
-                    record.transport_kind,
-                    record.managed_server_listen_url,
-                    io,
-                    parsed,
-                    monotonicMilliseconds() + @as(
-                        i64,
-                        finalReviewStatusGraceMs(parsed.poll_interval_ms),
-                    ),
-                ) catch break :grace try makeDisconnectedReviewStatus(allocator);
-                defer {
-                    grace_client.close();
-                    grace_client.deinit();
-                }
-                break :grace fetchReviewStatusAfterWaitTimeout(
-                    allocator,
-                    &grace_client,
-                    record.review_thread_id,
-                    record.review_turn_id,
-                    record.event_log_path,
-                    parsed.poll_interval_ms,
-                ) catch try makeDisconnectedReviewStatus(allocator);
-            };
-            try applyRecordedStatusOverlay(allocator, record, &timeout_status);
-            // A semantic result observed inside the bounded final grace window
-            // is terminal evidence, not a timeout diagnostic. Feed it through
-            // the ordinary persistence and normalization path below.
-            if (reviewStatusCompletesWait(&timeout_status)) {
-                terminal_status_from_grace = true;
-                break :timeout timeout_status;
-            }
-            record.last_observed_status = timeoutStatusString(&timeout_status);
-            try transitionReviewTupleLockForRecordOrReplay(
-                allocator,
-                parsed.json,
-                record,
-                loaded.record_path,
-                "waiting",
-                "wait_timed_out",
-                current_identity,
-            );
-            if (parsed.json) {
-                try printStatusJson(
-                    allocator,
-                    .wait,
-                    record.cwd,
-                    record.parent_thread_id,
-                    record.review_thread_id,
-                    record.review_turn_id,
-                    timeout_status,
-                    loaded.record_path,
-                    record.event_log_path,
-                    record.target,
-                    stored_identity_opt,
-                    waitOutputReceipt(
-                        record,
-                        current_tuple,
-                        current_codex_path,
-                        current_codex_version,
-                    ),
-                    parsed.timeout_ms,
-                    true,
-                    .{
-                        .code = "wait_timed_out",
-                        .hint = "retry cas review wait on the same review thread " ++
-                            "or increase --timeout-ms",
-                    },
-                );
-            } else {
-                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                const stdout = &stdout_writer.interface;
-                try stdout.print("cas review wait timed out after {d}ms\nreview thread: {s}\n", .{
-                    parsed.timeout_ms,
-                    record.review_thread_id,
-                });
-            }
-            std.process.exit(1);
-        },
-        else => {
-            if (serverRequestProviderFailure(err)) |failure| {
-                try transitionReviewTupleLockForRecordOrReplay(
-                    allocator,
-                    parsed.json,
-                    record,
-                    loaded.record_path,
-                    "terminal",
-                    failure.code,
-                    current_identity,
-                );
-                if (parsed.json) {
-                    try printRecordedReviewFailureJson(
-                        allocator,
-                        .wait,
-                        record,
-                        loaded.record_path,
-                        stored_identity_opt,
-                        null,
-                        failure,
-                    );
-                    std.process.exit(1);
-                }
-                return err;
-            }
-            if (isTransportLossError(err)) {
-                try transitionReviewTupleLockForRecordOrReplay(
-                    allocator,
-                    parsed.json,
-                    record,
-                    loaded.record_path,
-                    "terminal",
-                    "review_transport_lost",
-                    current_identity,
-                );
-                if (parsed.json) {
-                    const failure = terminalReviewTransportFailure("review_transport_lost").?;
-                    try printRecordedReviewFailureJson(
-                        allocator,
-                        .wait,
-                        record,
-                        loaded.record_path,
-                        stored_identity_opt,
-                        null,
-                        failure,
-                    );
-                    std.process.exit(1);
-                }
-            }
-            return err;
-        },
-    };
-    defer latest.deinit(allocator);
+const HistoricalWaitContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    record: *SessionRecord,
+    record_path: []const u8,
+    selected_target: TargetConfig,
+    stored_identity: TargetIdentity,
+    current_identity: TargetIdentity,
+    runtime_gate: *const ReviewRuntimeGate,
+    deadline_ms: i64,
 
-    record.last_observed_status = latest.turn_status;
-    persistTerminalReviewResult(&record, latest);
-    if (!latest.review_result_available) {
-        const failure_for_lock: FailureInfo = failureInfoForStatus(&latest) orelse .{
-            .code = "review_output_missing",
-            .hint = "detached review reached terminal status without a materialized reviewResult",
-        };
-        if (failureInfoForStatus(&latest)) |failure| {
-            if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
-                record.compatibility_verdict = "incompatible";
-            }
-        }
-        try writeSessionRecord(allocator, loaded.record_path, record);
-        try transitionReviewTupleLockForRecordOrReplay(
-            allocator,
-            parsed.json,
-            record,
-            loaded.record_path,
-            if (std.mem.eql(u8, failure_for_lock.code, "account_resource_exhausted")) "account_resource_exhausted" else "terminal",
-            failure_for_lock.code,
-            current_identity,
+    fn replay(self: HistoricalWaitContext) !void {
+        try replayTerminalRecordAndExit(
+            self.allocator,
+            self.parsed.json,
+            self.record.*,
+            self.record_path,
+            self.current_identity,
         );
-        if (parsed.json) {
-            try printStatusJson(
-                allocator,
-                .wait,
-                record.cwd,
-                record.parent_thread_id,
-                record.review_thread_id,
-                record.review_turn_id,
-                latest,
-                loaded.record_path,
-                record.event_log_path,
-                record.target,
-                current_identity_opt,
-                waitOutputReceipt(
-                    record,
-                    current_tuple,
-                    current_codex_path,
-                    current_codex_version,
-                ),
-                null,
-                false,
-                failure_for_lock,
-            );
-        } else {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            const stdout = &stdout_writer.interface;
-            try stdout.print(
-                "cas review wait reached terminal status without a reviewResult\n" ++
-                    "review thread: {s}\n",
-                .{record.review_thread_id},
-            );
-        }
+    }
+
+    fn printFailure(
+        self: HistoricalWaitContext,
+        identity: TargetIdentity,
+        failure: FailureInfo,
+    ) !void {
+        if (!self.parsed.json) return;
+        try printRecordedReviewFailureJson(
+            self.allocator,
+            .wait,
+            self.record.*,
+            self.record_path,
+            identity,
+            null,
+            failure,
+        );
         std.process.exit(1);
     }
-    try writeSessionRecord(allocator, loaded.record_path, record);
-    var terminal_context_client: ?cas.Client = if (terminal_status_from_grace)
-        connectReviewClient(
-            allocator,
+
+    fn connect(self: HistoricalWaitContext, deadline_ms: i64) !cas.Client {
+        const record = self.record.*;
+        return connectReviewClient(
+            self.allocator,
             record.cwd,
             record.resolved_codex_path orelse "codex",
             record.codex_version,
             record.transport_kind,
             record.managed_server_listen_url,
-            io,
-            parsed,
-            monotonicMilliseconds() + 1_000,
-        ) catch null
-    else
-        null;
-    defer if (terminal_context_client) |*fresh_client| {
-        fresh_client.close();
-        fresh_client.deinit();
-    };
-    const terminal_context_client_ptr = if (terminal_context_client) |*fresh_client|
-        fresh_client
-    else
-        &client;
-    const terminal_context = captureTerminalReviewContext(
-        allocator,
-        io,
-        record.cwd,
-        selected_target,
-        record.developer_instructions,
-        terminal_context_client_ptr,
-        record.workflowBinding,
-        terminal_status_from_grace,
-        current_codex_path,
-        current_codex_version,
-        runtime_gate.binary_digest,
-        record.app_server_contract_id orelse app_server_contract_id,
-        record.transport_kind orelse "websocket",
-        record.code_mode_host_digest,
-    );
-    defer terminal_context.deinit(allocator);
-    const terminal_lock_failure = try terminalReviewFailureAlloc(
-        allocator,
-        latest,
-        current_identity,
-        terminal_context.identity,
-        stored_tuple,
-        terminal_context.tuple,
-    );
-    try transitionReviewTupleLockForRecordOrReplay(
-        allocator,
-        parsed.json,
-        record,
-        loaded.record_path,
-        if (terminal_lock_failure == null) "normalized" else "terminal",
-        if (terminal_lock_failure) |failure| failure.code else null,
-        current_identity,
-    );
+            self.io,
+            self.parsed,
+            deadline_ms,
+        );
+    }
 
-    if (parsed.json) {
+    fn captureTuple(self: HistoricalWaitContext, client: *cas.Client) !ReviewTupleIdentity {
+        const record = self.record.*;
+        var tuple = try reviewTupleIdentityAlloc(
+            self.allocator,
+            record.cwd,
+            self.current_identity,
+            self.runtime_gate.resolved_path,
+            self.runtime_gate.version,
+            client,
+            record.workflowBinding,
+        );
+        tuple.codex_binary_digest = self.runtime_gate.binary_digest;
+        tuple.app_server_contract_id = record.app_server_contract_id orelse app_server_contract_id;
+        tuple.transport_kind = record.transport_kind orelse "websocket";
+        tuple.code_mode_host_digest = record.code_mode_host_digest;
+        return tuple;
+    }
+
+    fn replayNormalizedVerdict(self: HistoricalWaitContext) !void {
+        if (!try recordIsNormalizedVerdictReplayCandidate(
+            self.allocator,
+            self.record.*,
+            self.record_path,
+        )) return;
+        const failure = try self.replayCurrentnessFailure();
+        if (failure) |value| {
+            try self.printFailure(self.current_identity, value);
+            return error.ReviewTupleMismatch;
+        }
+        try self.replay();
+    }
+
+    fn replayCurrentnessFailure(self: HistoricalWaitContext) !?FailureInfo {
+        var server = try startManagedWebsocketServer(
+            self.allocator,
+            self.record.cwd,
+            self.runtime_gate.resolved_path,
+            self.parsed.hook_policy,
+            true,
+            null,
+            self.io,
+        );
+        defer server.deinit(self.allocator);
+        defer server.kill();
+        var client = try connectReviewClient(
+            self.allocator,
+            self.record.cwd,
+            self.runtime_gate.resolved_path,
+            self.runtime_gate.version,
+            "websocket",
+            server.listen_url,
+            self.io,
+            self.parsed,
+            self.deadline_ms,
+        );
+        defer {
+            client.close();
+            client.deinit();
+        }
+        var stored_tuple = try storedReviewTupleIdentityAlloc(self.allocator, self.record.*);
+        defer stored_tuple.deinit(self.allocator);
+        var current_tuple = try self.captureTuple(&client);
+        defer current_tuple.deinit(self.allocator);
+        return reviewTupleCurrentnessFailureAlloc(self.allocator, stored_tuple, current_tuple);
+    }
+
+    fn checkOwner(self: HistoricalWaitContext, lease: *?ReviewOwnerLease) !void {
+        switch (try workflowBoundRecordOwnerState(
+            self.allocator,
+            self.record.*,
+            self.record_path,
+            lease,
+        )) {
+            .live => {
+                try self.printFailure(self.stored_identity, workflowOwnerActiveFailureInfo());
+                return error.WorkflowBoundReviewOwnerActive;
+            },
+            .dead => {
+                const failure = terminalReviewTransportFailure("review_transport_lost").?;
+                try terminalizeDeadWorkflowBoundOwner(
+                    self.allocator,
+                    self.record_path,
+                    self.record,
+                    failure,
+                );
+                try self.printFailure(self.stored_identity, failure);
+                return error.ReviewTransportTerminal;
+            },
+            .not_applicable => {},
+        }
+    }
+
+    fn historicalTimeout(self: HistoricalWaitContext, tuple: ReviewTupleIdentity) !void {
+        try emitHistoricalWaitTimeoutAndExit(
+            self.allocator,
+            self.parsed,
+            self.record_path,
+            self.record,
+            self.stored_identity,
+            tuple,
+            self.record.resolved_codex_path orelse "codex",
+            self.record.codex_version,
+        );
+    }
+
+    fn transitionActive(self: HistoricalWaitContext, failure: FailureInfo) !void {
+        if (!try transitionActiveReviewTupleLockForRecord(
+            self.allocator,
+            self.record.*,
+            self.record_path,
+            "terminal",
+            failure.code,
+        )) {
+            try self.replay();
+            return error.InvalidReviewTupleLockBinding;
+        }
+        try self.printFailure(self.stored_identity, failure);
+    }
+
+    fn connectionFailure(
+        self: HistoricalWaitContext,
+        err: anyerror,
+        stored_tuple: ReviewTupleIdentity,
+    ) !void {
+        if (err == error.ConnectionTimedOut) try self.historicalTimeout(stored_tuple);
+        // Exact persisted state outranks an observer's concurrent socket failure.
+        try self.replay();
+        if (serverRequestProviderFailure(err)) |failure| {
+            try self.transitionActive(failure);
+            return err;
+        }
+        if (isTransportLossError(err)) {
+            var exact_lock = try loadExactReviewTupleLockForRecord(
+                self.allocator,
+                self.record.*,
+                self.record_path,
+            );
+            defer exact_lock.deinit(self.allocator);
+            if (!reviewTupleLockDeadTransportProven(self.allocator, exact_lock.record)) {
+                try self.historicalTimeout(stored_tuple);
+            }
+            try self.transitionActive(terminalReviewTransportFailure("review_transport_lost").?);
+        }
+        return err;
+    }
+
+    fn transition(
+        self: HistoricalWaitContext,
+        state: []const u8,
+        code: ?[]const u8,
+    ) !void {
+        try transitionReviewTupleLockForRecordOrReplay(
+            self.allocator,
+            self.parsed.json,
+            self.record.*,
+            self.record_path,
+            state,
+            code,
+            self.current_identity,
+        );
+    }
+
+    fn providerFailure(self: HistoricalWaitContext, err: anyerror) !void {
+        if (serverRequestProviderFailure(err)) |failure| {
+            try self.transition("terminal", failure.code);
+            try self.printFailure(self.stored_identity, failure);
+        }
+    }
+
+    fn waitFailure(self: HistoricalWaitContext, err: anyerror) !void {
+        if (serverRequestProviderFailure(err) != null) {
+            try self.providerFailure(err);
+            return err;
+        }
+        if (isTransportLossError(err)) {
+            const failure = terminalReviewTransportFailure("review_transport_lost").?;
+            try self.transition("terminal", failure.code);
+            try self.printFailure(self.stored_identity, failure);
+        }
+        return err;
+    }
+
+    fn graceStatus(self: HistoricalWaitContext) !ReviewStatus {
+        const deadline = monotonicMilliseconds(self.io) + @as(
+            i64,
+            finalReviewStatusGraceMs(self.parsed.poll_interval_ms),
+        );
+        var client = self.connect(deadline) catch
+            return makeDisconnectedReviewStatus(self.allocator);
+        defer {
+            client.close();
+            client.deinit();
+        }
+        return fetchReviewStatusAfterWaitTimeout(
+            self.allocator,
+            &client,
+            self.record.review_thread_id,
+            self.record.review_turn_id,
+            self.record.event_log_path,
+            self.parsed.poll_interval_ms,
+        ) catch try makeDisconnectedReviewStatus(self.allocator);
+    }
+
+    fn wait(
+        self: HistoricalWaitContext,
+        client: *cas.Client,
+        current_tuple: ReviewTupleIdentity,
+        terminal_status_from_grace: *bool,
+    ) !ReviewStatus {
+        return waitForReviewCompletion(
+            self.allocator,
+            client,
+            self.record.review_thread_id,
+            self.record.review_turn_id,
+            self.record.event_log_path,
+            self.parsed.timeout_ms,
+            self.parsed.poll_interval_ms,
+            self.deadline_ms,
+        ) catch |err| switch (err) {
+            error.WaitTimedOut => {
+                var status = try self.graceStatus();
+                errdefer status.deinit(self.allocator);
+                try applyRecordedStatusOverlay(self.allocator, self.record.*, &status);
+                if (reviewStatusCompletesWait(&status)) {
+                    terminal_status_from_grace.* = true;
+                    return status;
+                }
+                try self.timeout(status, current_tuple);
+                return error.WaitTimedOut;
+            },
+            else => {
+                try self.waitFailure(err);
+                return err;
+            },
+        };
+    }
+
+    fn timeout(
+        self: HistoricalWaitContext,
+        status: ReviewStatus,
+        tuple: ReviewTupleIdentity,
+    ) !void {
+        self.record.last_observed_status = timeoutStatusString(&status);
+        try self.transition("waiting", "wait_timed_out");
+        if (self.parsed.json) {
+            const record = self.record.*;
+            try printStatusJson(
+                self.allocator,
+                .wait,
+                record.cwd,
+                record.parent_thread_id,
+                record.review_thread_id,
+                record.review_turn_id,
+                status,
+                self.record_path,
+                record.event_log_path,
+                record.target,
+                self.stored_identity,
+                waitOutputReceipt(
+                    record,
+                    tuple,
+                    self.runtime_gate.resolved_path,
+                    self.runtime_gate.version,
+                ),
+                self.parsed.timeout_ms,
+                true,
+                .{
+                    .code = "wait_timed_out",
+                    .hint = "retry cas review wait on the same review thread " ++
+                        "or increase --timeout-ms",
+                },
+            );
+        } else {
+            var writer = std.Io.File.stdout().writer(self.io, &.{});
+            try writer.interface.print(
+                "cas review wait timed out after {d}ms\nreview thread: {s}\n",
+                .{ self.parsed.timeout_ms, self.record.review_thread_id },
+            );
+        }
+        std.process.exit(1);
+    }
+
+    fn missingResult(
+        self: HistoricalWaitContext,
+        latest: ReviewStatus,
+        tuple: ReviewTupleIdentity,
+    ) !void {
+        const failure: FailureInfo = failureInfoForStatus(&latest) orelse .{
+            .code = "review_output_missing",
+            .hint = "detached review reached terminal status without a materialized reviewResult",
+        };
+        if (failureInfoForStatus(&latest)) |observed| {
+            if (std.mem.eql(u8, observed.code, "incompatible_codex_review_runtime")) {
+                self.record.compatibility_verdict = "incompatible";
+            }
+        }
+        try writeSessionRecord(self.allocator, self.record_path, self.record.*);
+        const state = if (std.mem.eql(u8, failure.code, "account_resource_exhausted"))
+            "account_resource_exhausted"
+        else
+            "terminal";
+        try self.transition(state, failure.code);
+        if (self.parsed.json) {
+            try self.printStatus(
+                latest,
+                tuple,
+                self.runtime_gate.resolved_path,
+                self.runtime_gate.version,
+                failure,
+            );
+        } else {
+            var writer = std.Io.File.stdout().writer(self.io, &.{});
+            try writer.interface.print(
+                "cas review wait reached terminal status without a reviewResult\n" ++
+                    "review thread: {s}\n",
+                .{self.record.review_thread_id},
+            );
+        }
+        std.process.exit(1);
+    }
+
+    fn printStatus(
+        self: HistoricalWaitContext,
+        latest: ReviewStatus,
+        tuple: ?ReviewTupleIdentity,
+        codex_path: ?[]const u8,
+        codex_version: ?[]const u8,
+        failure: ?FailureInfo,
+    ) !void {
+        const record = self.record.*;
         try printStatusJson(
-            allocator,
+            self.allocator,
             .wait,
             record.cwd,
             record.parent_thread_id,
             record.review_thread_id,
             record.review_turn_id,
             latest,
-            loaded.record_path,
+            self.record_path,
             record.event_log_path,
             record.target,
-            current_identity_opt,
-            waitOutputReceipt(
-                record,
+            self.current_identity,
+            waitOutputReceipt(record, tuple, codex_path, codex_version),
+            null,
+            false,
+            failure,
+        );
+    }
+
+    fn terminalContext(
+        self: HistoricalWaitContext,
+        client: *cas.Client,
+        terminal_status_from_grace: bool,
+    ) TerminalReviewContext {
+        const record = self.record.*;
+        return captureTerminalReviewContext(
+            self.allocator,
+            self.io,
+            record.cwd,
+            self.selected_target,
+            record.developer_instructions,
+            client,
+            record.workflowBinding,
+            terminal_status_from_grace,
+            self.runtime_gate.resolved_path,
+            self.runtime_gate.version,
+            self.runtime_gate.binary_digest,
+            record.app_server_contract_id orelse app_server_contract_id,
+            record.transport_kind orelse "websocket",
+            record.code_mode_host_digest,
+        );
+    }
+
+    fn finish(
+        self: HistoricalWaitContext,
+        client: *cas.Client,
+        stored_tuple: ReviewTupleIdentity,
+        latest: ReviewStatus,
+        terminal_status_from_grace: bool,
+    ) !void {
+        var fresh_client: ?cas.Client = if (terminal_status_from_grace)
+            self.connect(monotonicMilliseconds(self.io) + 1_000) catch null
+        else
+            null;
+        defer if (fresh_client) |*value| {
+            value.close();
+            value.deinit();
+        };
+        const context_client = if (fresh_client) |*value| value else client;
+        const terminal_context = self.terminalContext(context_client, terminal_status_from_grace);
+        defer terminal_context.deinit(self.allocator);
+        const failure = try terminalReviewFailureAlloc(
+            self.allocator,
+            latest,
+            self.current_identity,
+            terminal_context.identity,
+            stored_tuple,
+            terminal_context.tuple,
+        );
+        try self.transition(
+            if (failure == null) "normalized" else "terminal",
+            if (failure) |value| value.code else null,
+        );
+        if (self.parsed.json) {
+            try self.printStatus(
+                latest,
                 terminal_context.tuple,
                 terminal_context.codex_path,
                 terminal_context.codex_version,
-            ),
-            null,
-            false,
-            terminal_lock_failure,
-        );
-    } else {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const stdout = &stdout_writer.interface;
-        try stdout.print(
-            "cas review wait\nreview thread: {s}\nreview turn: {s}\n" ++
-                "final turn status: {s}\nrecord: {s}\n",
-            .{
-                record.review_thread_id,
-                record.review_turn_id,
-                latest.turn_status,
-                loaded.record_path,
-            },
-        );
+                failure,
+            );
+        } else {
+            var writer = std.Io.File.stdout().writer(self.io, &.{});
+            try writer.interface.print(
+                "cas review wait\nreview thread: {s}\nreview turn: {s}\n" ++
+                    "final turn status: {s}\nrecord: {s}\n",
+                .{
+                    self.record.review_thread_id, self.record.review_turn_id,
+                    latest.turn_status,           self.record_path,
+                },
+            );
+        }
+        if (failure != null) std.process.exit(1);
     }
-    if (terminal_lock_failure != null) std.process.exit(1);
-}
+};
 
 const NormalizedReceipt = struct {
     source_path: []const u8,
@@ -3241,7 +2963,37 @@ fn validateCasRerRecordObjectAlloc(
         for (errors.items) |err| allocator.free(err);
         errors.deinit(allocator);
     }
+    try validateCasRerHeader(allocator, &errors, data);
+    const command = try requiredCasRerObjectField(allocator, data, "command", &errors);
+    const tuple = try requiredCasRerObjectField(allocator, data, "tuple", &errors);
+    const attempt = try requiredCasRerObjectField(allocator, data, "attempt", &errors);
+    const verdict = try requiredCasRerObjectField(allocator, data, "verdict", &errors);
+    const failure = try requiredCasRerObjectField(allocator, data, "failure", &errors);
+    const principal = try requiredCasRerObjectField(allocator, data, "principal", &errors);
+    try validateCasRerCommand(allocator, &errors, command);
+    try validateCasRerTarget(allocator, &errors, tuple);
+    try validateCasRerTimestamps(allocator, &errors, data);
+    try validateCasRerBinding(allocator, &errors, data);
+    try validateCasRerAttempt(allocator, &errors, attempt);
+    if (verdict) |object| {
+        const status = jsonStringField(object, "status");
+        try validateCasRerVerdictStatus(allocator, &errors, object);
+        try validateCasRerFindings(allocator, &errors, object, status);
+        try validateCasRerTerminalFailure(allocator, &errors, failure, status);
+        const claim = CasRerTupleClaim{ .tuple = tuple, .attempt = attempt, .status = status };
+        try validateCasRerTupleVerdict(allocator, &errors, object, claim);
+    }
+    try validateCasRerPrincipal(allocator, &errors, principal);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    return .{ .path = owned_path, .errors = try errors.toOwnedSlice(allocator) };
+}
 
+fn validateCasRerHeader(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    data: std.json.ObjectMap,
+) !void {
     if (!std.mem.eql(
         u8,
         jsonStringField(data, "schema") orelse "",
@@ -3249,45 +3001,44 @@ fn validateCasRerRecordObjectAlloc(
     )) {
         try appendGateError(
             allocator,
-            &errors,
+            errors,
             "schema must be {s}",
             .{cas_review_evidence_schema},
         );
     }
     const record_id = nonEmptyOptional(jsonStringField(data, "recordId"));
     if (record_id == null) {
-        try appendGateError(allocator, &errors, "recordId must be non-empty", .{});
+        try appendGateError(allocator, errors, "recordId must be non-empty", .{});
     } else {
         if (!std.mem.startsWith(u8, record_id.?, "rer_")) {
-            try appendGateError(allocator, &errors, "recordId must start with rer_", .{});
+            try appendGateError(allocator, errors, "recordId must start with rer_", .{});
         }
         if (std.mem.indexOfScalar(u8, record_id.?, '/') != null or
             std.mem.indexOfScalar(u8, record_id.?, '\\') != null)
         {
             try appendGateError(
                 allocator,
-                &errors,
+                errors,
                 "recordId must not contain path separators",
                 .{},
             );
         }
     }
+}
 
-    const command = try requiredCasRerObjectField(allocator, data, "command", &errors);
-    const tuple = try requiredCasRerObjectField(allocator, data, "tuple", &errors);
-    const attempt = try requiredCasRerObjectField(allocator, data, "attempt", &errors);
-    const verdict = try requiredCasRerObjectField(allocator, data, "verdict", &errors);
-    const failure = try requiredCasRerObjectField(allocator, data, "failure", &errors);
-    const principal = try requiredCasRerObjectField(allocator, data, "principal", &errors);
-
+fn validateCasRerCommand(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    command: ?std.json.ObjectMap,
+) !void {
     if (command) |command_obj| {
         if (nonEmptyOptional(jsonStringField(command_obj, "surface")) == null) {
-            try appendGateError(allocator, &errors, "command.surface must be non-empty", .{});
+            try appendGateError(allocator, errors, "command.surface must be non-empty", .{});
         }
         if (nonEmptyOptional(jsonStringField(command_obj, "backendSelected")) == null) {
             try appendGateError(
                 allocator,
-                &errors,
+                errors,
                 "command.backendSelected must be non-empty",
                 .{},
             );
@@ -3296,7 +3047,7 @@ fn validateCasRerRecordObjectAlloc(
             if (nonEmptyOptional(jsonStringField(broker, "action")) == null) {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "command.brokerDecision.action must be non-empty",
                     .{},
                 );
@@ -3304,7 +3055,7 @@ fn validateCasRerRecordObjectAlloc(
             if (nonEmptyOptional(jsonStringField(broker, "reason")) == null) {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "command.brokerDecision.reason must be non-empty",
                     .{},
                 );
@@ -3312,16 +3063,22 @@ fn validateCasRerRecordObjectAlloc(
             if (jsonBoolField(broker, "freshAttemptRequired") == null) {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "command.brokerDecision.freshAttemptRequired must be boolean",
                     .{},
                 );
             }
         } else {
-            try appendGateError(allocator, &errors, "missing command.brokerDecision", .{});
+            try appendGateError(allocator, errors, "missing command.brokerDecision", .{});
         }
     }
+}
 
+fn validateCasRerTarget(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    tuple: ?std.json.ObjectMap,
+) !void {
     if (tuple) |tuple_obj| {
         if (tuple_obj.get("target")) |target_value| {
             const canonical_target: ?[]u8 = canonicalTargetRecordJsonFromValueAlloc(
@@ -3336,21 +3093,27 @@ fn validateCasRerRecordObjectAlloc(
             } else {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "tuple.target must be a complete schema-4 target object",
                     .{},
                 );
             }
         } else {
-            try appendGateError(allocator, &errors, "missing tuple.target", .{});
+            try appendGateError(allocator, errors, "missing tuple.target", .{});
         }
     }
+}
 
+fn validateCasRerTimestamps(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    data: std.json.ObjectMap,
+) !void {
     const created_at = jsonStringField(data, "createdAt");
     if (created_at == null or parseCasRerCreatedAtNs(created_at.?) == null) {
         try appendGateError(
             allocator,
-            &errors,
+            errors,
             "createdAt must be a parseable CAS-RER timestamp",
             .{},
         );
@@ -3359,25 +3122,34 @@ fn validateCasRerRecordObjectAlloc(
     if (updated_at == null or parseCasRerCreatedAtNs(updated_at.?) == null) {
         try appendGateError(
             allocator,
-            &errors,
+            errors,
             "updatedAt must be a parseable CAS-RER timestamp",
             .{},
         );
     }
+}
 
+fn validateCasRerBinding(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    data: std.json.ObjectMap,
+) !void {
     if (data.get("workflowBinding")) |binding_value| {
         switch (binding_value) {
             .object => {
                 const canonical = canonicalWorkflowBindingJsonFromValueAlloc(
                     allocator,
                     binding_value,
-                ) catch null;
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => null,
+                };
                 if (canonical) |value| {
                     allocator.free(value);
                 } else {
                     try appendGateError(
                         allocator,
-                        &errors,
+                        errors,
                         "workflowBinding must be a complete canonical request binding",
                         .{},
                     );
@@ -3385,19 +3157,23 @@ fn validateCasRerRecordObjectAlloc(
             },
             else => try appendGateError(
                 allocator,
-                &errors,
+                errors,
                 "workflowBinding must be an object when present",
                 .{},
             ),
         }
     }
+}
 
-    var attempt_exists_value: ?bool = null;
+fn validateCasRerAttempt(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    attempt: ?std.json.ObjectMap,
+) !void {
     if (attempt) |attempt_obj| {
         const attempt_exists = jsonBoolField(attempt_obj, "exists");
-        attempt_exists_value = attempt_exists;
         if (attempt_exists == null) {
-            try appendGateError(allocator, &errors, "attempt.exists must be boolean", .{});
+            try appendGateError(allocator, errors, "attempt.exists must be boolean", .{});
         }
         const review_thread_id_present = nonEmptyOptional(
             jsonStringField(attempt_obj, "reviewThreadId"),
@@ -3406,7 +3182,7 @@ fn validateCasRerRecordObjectAlloc(
             if (value != review_thread_id_present) {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "attempt.exists must equal attempt.reviewThreadId non-empty",
                     .{},
                 );
@@ -3416,327 +3192,407 @@ fn validateCasRerRecordObjectAlloc(
             if (!reviewPhaseAllowed(phase)) {
                 try appendGateError(
                     allocator,
-                    &errors,
+                    errors,
                     "invalid attempt.phase: {s}",
                     .{phase},
                 );
             }
         } else {
-            try appendGateError(allocator, &errors, "missing attempt.phase", .{});
+            try appendGateError(allocator, errors, "missing attempt.phase", .{});
         }
     }
+}
 
-    if (verdict) |verdict_obj| {
-        const status = jsonStringField(verdict_obj, "status");
-        if (status == null or !casRerStatusAllowed(status.?)) {
+fn validateCasRerVerdictStatus(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    verdict_obj: std.json.ObjectMap,
+) !void {
+    const status = jsonStringField(verdict_obj, "status");
+    if (status == null or !casRerStatusAllowed(status.?)) {
+        try appendGateError(
+            allocator,
+            errors,
+            "invalid verdict.status: {s}",
+            .{status orelse "null"},
+        );
+    }
+    const clean = jsonBoolField(verdict_obj, "clean");
+    if (clean == null) {
+        try appendGateError(allocator, errors, "verdict.clean must be boolean", .{});
+    } else if (std.mem.eql(u8, status orelse "", "clean")) {
+        if (clean.? != true) {
             try appendGateError(
                 allocator,
-                &errors,
-                "invalid verdict.status: {s}",
-                .{status orelse "null"},
-            );
-        }
-        const clean = jsonBoolField(verdict_obj, "clean");
-        if (clean == null) {
-            try appendGateError(allocator, &errors, "verdict.clean must be boolean", .{});
-        } else if (std.mem.eql(u8, status orelse "", "clean")) {
-            if (clean.? != true) {
-                try appendGateError(
-                    allocator,
-                    &errors,
-                    "verdict.status=clean requires verdict.clean=true",
-                    .{},
-                );
-            }
-        } else if (clean.? != false) {
-            try appendGateError(
-                allocator,
-                &errors,
-                "verdict.status!=clean requires verdict.clean=false",
+                errors,
+                "verdict.status=clean requires verdict.clean=true",
                 .{},
             );
         }
-        const finding_count = jsonUsizeField(verdict_obj, "findingCount");
-        if (finding_count == null) {
+    } else if (clean.? != false) {
+        try appendGateError(
+            allocator,
+            errors,
+            "verdict.status!=clean requires verdict.clean=false",
+            .{},
+        );
+    }
+}
+
+const CasRerFindings = struct { count: ?usize, length: ?usize };
+
+fn casRerFindingsCounts(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    verdict_obj: std.json.ObjectMap,
+) !CasRerFindings {
+    const finding_count = jsonUsizeField(verdict_obj, "findingCount");
+    if (finding_count == null) {
+        try appendGateError(
+            allocator,
+            errors,
+            "verdict.findingCount must be a non-negative integer",
+            .{},
+        );
+    }
+    const findings_len = try casRerFindingsLength(allocator, errors, verdict_obj);
+    return .{ .count = finding_count, .length = findings_len };
+}
+
+fn casRerFindingsLength(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    verdict_obj: std.json.ObjectMap,
+) !?usize {
+    if (verdict_obj.get("findings")) |value| {
+        if (value == .array) return value.array.items.len;
+    }
+    try appendGateError(allocator, errors, "verdict.findings must be an array", .{});
+    return null;
+}
+
+fn validateCasRerFindings(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    verdict_obj: std.json.ObjectMap,
+    status: ?[]const u8,
+) !void {
+    const values = try casRerFindingsCounts(allocator, errors, verdict_obj);
+    const finding_count = values.count;
+    const findings_len = values.length;
+    if (std.mem.eql(u8, status orelse "", "findings") and
+        (finding_count orelse 0) == 0)
+    {
+        try appendGateError(
+            allocator,
+            errors,
+            "verdict.status=findings requires findingCount > 0",
+            .{},
+        );
+    }
+    if (std.mem.eql(u8, status orelse "", "findings") and
+        findings_len != null and
+        finding_count != null and
+        findings_len.? != finding_count.?)
+    {
+        try appendGateError(
+            allocator,
+            errors,
+            "findings length must match findingCount",
+            .{},
+        );
+    }
+    if (std.mem.eql(u8, status orelse "", "clean")) {
+        if ((finding_count orelse 1) != 0) {
             try appendGateError(
                 allocator,
-                &errors,
-                "verdict.findingCount must be a non-negative integer",
+                errors,
+                "verdict.status=clean requires findingCount = 0",
                 .{},
             );
         }
-        const findings_len: ?usize = blk: {
-            const findings_value = verdict_obj.get("findings") orelse {
-                try appendGateError(allocator, &errors, "verdict.findings must be an array", .{});
-                break :blk null;
-            };
-            switch (findings_value) {
-                .array => |array| break :blk array.items.len,
-                else => {
-                    try appendGateError(
-                        allocator,
-                        &errors,
-                        "verdict.findings must be an array",
-                        .{},
-                    );
-                    break :blk null;
-                },
-            }
-        };
-        if (std.mem.eql(u8, status orelse "", "findings") and
-            (finding_count orelse 0) == 0)
-        {
+        if ((findings_len orelse 1) != 0) {
             try appendGateError(
                 allocator,
-                &errors,
-                "verdict.status=findings requires findingCount > 0",
-                .{},
-            );
-        }
-        if (std.mem.eql(u8, status orelse "", "findings") and
-            findings_len != null and
-            finding_count != null and
-            findings_len.? != finding_count.?)
-        {
-            try appendGateError(
-                allocator,
-                &errors,
-                "findings length must match findingCount",
-                .{},
-            );
-        }
-        if (std.mem.eql(u8, status orelse "", "clean")) {
-            if ((finding_count orelse 1) != 0) {
-                try appendGateError(
-                    allocator,
-                    &errors,
-                    "verdict.status=clean requires findingCount = 0",
-                    .{},
-                );
-            }
-            if ((findings_len orelse 1) != 0) {
-                try appendGateError(
-                    allocator,
-                    &errors,
-                    "verdict.status=clean requires findings length = 0",
-                    .{},
-                );
-            }
-        }
-        if (std.mem.eql(u8, status orelse "", "clean") or
-            std.mem.eql(u8, status orelse "", "findings"))
-        {
-            if (failure) |failure_obj| {
-                if (fieldPresentNonNull(failure_obj, "failureCode")) {
-                    try appendGateError(
-                        allocator,
-                        &errors,
-                        "terminal tuple verdict requires failure.failureCode=null",
-                        .{},
-                    );
-                }
-                if (fieldPresentNonNull(failure_obj, "failureClass")) {
-                    try appendGateError(
-                        allocator,
-                        &errors,
-                        "terminal tuple verdict requires failure.failureClass=null",
-                        .{},
-                    );
-                }
-                if (fieldPresentNonNull(failure_obj, "retryableSameTupleNow")) {
-                    try appendGateError(
-                        allocator,
-                        &errors,
-                        "terminal tuple verdict requires failure.retryableSameTupleNow=null",
-                        .{},
-                    );
-                }
-            }
-        }
-        if (jsonBoolField(verdict_obj, "tupleVerdictExists")) |tuple_verdict_exists| {
-            if (tuple_verdict_exists) {
-                if (!(std.mem.eql(u8, status orelse "", "clean") or
-                    std.mem.eql(u8, status orelse "", "findings")))
-                {
-                    try appendGateError(
-                        allocator,
-                        &errors,
-                        "tupleVerdictExists requires terminal clean or findings",
-                        .{},
-                    );
-                }
-                if (tuple) |tuple_obj| {
-                    if (nonEmptyOptional(jsonStringField(tuple_obj, "repoRealpath")) == null) {
-                        try appendGateError(
-                            allocator,
-                            &errors,
-                            "tupleVerdictExists requires tuple.repoRealpath",
-                            .{},
-                        );
-                    }
-                    if (nonEmptyOptional(jsonStringField(tuple_obj, "baseSha")) == null) {
-                        try appendGateError(
-                            allocator,
-                            &errors,
-                            "tupleVerdictExists requires tuple.baseSha",
-                            .{},
-                        );
-                    }
-                    if (nonEmptyOptional(jsonStringField(tuple_obj, "headSha")) == null) {
-                        try appendGateError(
-                            allocator,
-                            &errors,
-                            "tupleVerdictExists requires tuple.headSha",
-                            .{},
-                        );
-                    }
-                    if (nonEmptyOptional(jsonStringField(tuple_obj, "targetFingerprint")) == null) {
-                        try appendGateError(
-                            allocator,
-                            &errors,
-                            "tupleVerdictExists requires tuple.targetFingerprint",
-                            .{},
-                        );
-                    }
-                }
-                if (std.mem.eql(u8, status orelse "", "clean") or
-                    std.mem.eql(u8, status orelse "", "findings"))
-                {
-                    if (attempt_exists_value != true) {
-                        try appendGateError(
-                            allocator,
-                            &errors,
-                            "terminal tuple verdict requires attempt.exists=true",
-                            .{},
-                        );
-                    }
-                    if (attempt) |attempt_obj| {
-                        if (nonEmptyOptional(jsonStringField(
-                            attempt_obj,
-                            "reviewThreadId",
-                        )) == null) {
-                            try appendGateError(
-                                allocator,
-                                &errors,
-                                "terminal tuple verdict requires attempt.reviewThreadId",
-                                .{},
-                            );
-                        }
-                        if (nonEmptyOptional(jsonStringField(
-                            attempt_obj,
-                            "reviewTurnId",
-                        )) == null) {
-                            try appendGateError(
-                                allocator,
-                                &errors,
-                                "terminal tuple verdict requires attempt.reviewTurnId",
-                                .{},
-                            );
-                        }
-                        const phase = jsonStringField(attempt_obj, "phase") orelse "";
-                        if (!(std.mem.eql(u8, phase, "review_terminal") or
-                            std.mem.eql(u8, phase, "normalized_verdict")))
-                        {
-                            try appendGateError(
-                                allocator,
-                                &errors,
-                                "terminal tuple verdict requires terminal attempt.phase",
-                                .{},
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            try appendGateError(
-                allocator,
-                &errors,
-                "verdict.tupleVerdictExists must be boolean",
+                errors,
+                "verdict.status=clean requires findings length = 0",
                 .{},
             );
         }
     }
+}
 
-    if (principal) |principal_obj| {
-        const kind = jsonStringField(principal_obj, "kind");
-        if (kind == null or
-            !(std.mem.eql(u8, kind.?, "strong") or
-                std.mem.eql(u8, kind.?, "reduced") or
-                std.mem.eql(u8, kind.?, "unknown")))
-        {
-            try appendGateError(
-                allocator,
-                &errors,
-                "principal.kind must be strong, reduced, or unknown",
-                .{},
-            );
-        }
-        const proof_usable = jsonBoolField(principal_obj, "proofUsable");
-        if (proof_usable == null) {
-            try appendGateError(allocator, &errors, "principal.proofUsable must be boolean", .{});
-        }
-        const reduced = jsonBoolField(principal_obj, "reduced");
-        if (reduced == null) {
-            try appendGateError(allocator, &errors, "principal.reduced must be boolean", .{});
-        }
-        const fallback_used = jsonBoolField(principal_obj, "fallbackUsed");
-        if (fallback_used == null) {
-            try appendGateError(allocator, &errors, "principal.fallbackUsed must be boolean", .{});
-        } else if (fallback_used != false) {
-            try appendGateError(allocator, &errors, "principal.fallbackUsed must be false", .{});
-        }
-        if (std.mem.eql(u8, kind orelse "", "reduced")) {
-            if (proof_usable != false) {
+fn validateCasRerTerminalFailure(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    failure: ?std.json.ObjectMap,
+    status: ?[]const u8,
+) !void {
+    if (std.mem.eql(u8, status orelse "", "clean") or
+        std.mem.eql(u8, status orelse "", "findings"))
+    {
+        if (failure) |failure_obj| {
+            if (fieldPresentNonNull(failure_obj, "failureCode")) {
                 try appendGateError(
                     allocator,
-                    &errors,
-                    "principal.kind=reduced requires proofUsable=false",
+                    errors,
+                    "terminal tuple verdict requires failure.failureCode=null",
                     .{},
                 );
             }
-            if (reduced != true) {
+            if (fieldPresentNonNull(failure_obj, "failureClass")) {
                 try appendGateError(
                     allocator,
-                    &errors,
-                    "principal.kind=reduced requires reduced=true",
+                    errors,
+                    "terminal tuple verdict requires failure.failureClass=null",
                     .{},
                 );
             }
-        }
-        if (proof_usable == true) {
-            if (!std.mem.eql(u8, kind orelse "", "strong")) {
+            if (fieldPresentNonNull(failure_obj, "retryableSameTupleNow")) {
                 try appendGateError(
                     allocator,
-                    &errors,
-                    "proofUsable=true requires principal.kind=strong",
-                    .{},
-                );
-            }
-            if (reduced != false) {
-                try appendGateError(
-                    allocator,
-                    &errors,
-                    "proofUsable=true requires principal.reduced=false",
-                    .{},
-                );
-            }
-            if (!casRerPrincipalFingerprintUsable(
-                jsonStringField(principal_obj, "accountFingerprint"),
-            )) {
-                try appendGateError(
-                    allocator,
-                    &errors,
-                    "proofUsable=true requires principal.accountFingerprint",
+                    errors,
+                    "terminal tuple verdict requires failure.retryableSameTupleNow=null",
                     .{},
                 );
             }
         }
     }
+}
 
-    return .{
-        .path = try allocator.dupe(u8, path),
-        .errors = try errors.toOwnedSlice(allocator),
-    };
+const CasRerTupleClaim = struct {
+    tuple: ?std.json.ObjectMap,
+    attempt: ?std.json.ObjectMap,
+    status: ?[]const u8,
+};
+
+fn validateCasRerTupleVerdict(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    verdict_obj: std.json.ObjectMap,
+    claim: CasRerTupleClaim,
+) !void {
+    const status = claim.status;
+    if (jsonBoolField(verdict_obj, "tupleVerdictExists")) |tuple_verdict_exists| {
+        if (tuple_verdict_exists) {
+            if (!(std.mem.eql(u8, status orelse "", "clean") or
+                std.mem.eql(u8, status orelse "", "findings")))
+            {
+                try appendGateError(
+                    allocator,
+                    errors,
+                    "tupleVerdictExists requires terminal clean or findings",
+                    .{},
+                );
+            }
+            try validateCasRerTupleIdentity(allocator, errors, claim.tuple);
+            try validateCasRerTerminalAttempt(allocator, errors, claim);
+        }
+    } else {
+        try appendGateError(
+            allocator,
+            errors,
+            "verdict.tupleVerdictExists must be boolean",
+            .{},
+        );
+    }
+}
+
+fn validateCasRerTupleIdentity(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    tuple: ?std.json.ObjectMap,
+) !void {
+    if (tuple) |tuple_obj| {
+        if (nonEmptyOptional(jsonStringField(tuple_obj, "repoRealpath")) == null) {
+            try appendGateError(
+                allocator,
+                errors,
+                "tupleVerdictExists requires tuple.repoRealpath",
+                .{},
+            );
+        }
+        if (nonEmptyOptional(jsonStringField(tuple_obj, "baseSha")) == null) {
+            try appendGateError(
+                allocator,
+                errors,
+                "tupleVerdictExists requires tuple.baseSha",
+                .{},
+            );
+        }
+        if (nonEmptyOptional(jsonStringField(tuple_obj, "headSha")) == null) {
+            try appendGateError(
+                allocator,
+                errors,
+                "tupleVerdictExists requires tuple.headSha",
+                .{},
+            );
+        }
+        if (nonEmptyOptional(jsonStringField(tuple_obj, "targetFingerprint")) == null) {
+            try appendGateError(
+                allocator,
+                errors,
+                "tupleVerdictExists requires tuple.targetFingerprint",
+                .{},
+            );
+        }
+    }
+}
+
+fn validateCasRerTerminalAttempt(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    claim: CasRerTupleClaim,
+) !void {
+    const status = claim.status;
+    const attempt = claim.attempt;
+    const attempt_exists_value = if (attempt) |value| jsonBoolField(value, "exists") else null;
+    if (std.mem.eql(u8, status orelse "", "clean") or
+        std.mem.eql(u8, status orelse "", "findings"))
+    {
+        if (attempt_exists_value != true) {
+            try appendGateError(
+                allocator,
+                errors,
+                "terminal tuple verdict requires attempt.exists=true",
+                .{},
+            );
+        }
+        if (attempt) |attempt_obj| {
+            if (nonEmptyOptional(jsonStringField(
+                attempt_obj,
+                "reviewThreadId",
+            )) == null) {
+                try appendGateError(
+                    allocator,
+                    errors,
+                    "terminal tuple verdict requires attempt.reviewThreadId",
+                    .{},
+                );
+            }
+            if (nonEmptyOptional(jsonStringField(
+                attempt_obj,
+                "reviewTurnId",
+            )) == null) {
+                try appendGateError(
+                    allocator,
+                    errors,
+                    "terminal tuple verdict requires attempt.reviewTurnId",
+                    .{},
+                );
+            }
+            const phase = jsonStringField(attempt_obj, "phase") orelse "";
+            if (!(std.mem.eql(u8, phase, "review_terminal") or
+                std.mem.eql(u8, phase, "normalized_verdict")))
+            {
+                try appendGateError(
+                    allocator,
+                    errors,
+                    "terminal tuple verdict requires terminal attempt.phase",
+                    .{},
+                );
+            }
+        }
+    }
+}
+
+fn validateCasRerPrincipal(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    principal: ?std.json.ObjectMap,
+) !void {
+    const principal_obj = principal orelse return;
+    const kind = jsonStringField(principal_obj, "kind");
+    if (kind == null or
+        !(std.mem.eql(u8, kind.?, "strong") or
+            std.mem.eql(u8, kind.?, "reduced") or
+            std.mem.eql(u8, kind.?, "unknown")))
+    {
+        try appendGateError(
+            allocator,
+            errors,
+            "principal.kind must be strong, reduced, or unknown",
+            .{},
+        );
+    }
+    const proof_usable = jsonBoolField(principal_obj, "proofUsable");
+    if (proof_usable == null) {
+        try appendGateError(allocator, errors, "principal.proofUsable must be boolean", .{});
+    }
+    const reduced = jsonBoolField(principal_obj, "reduced");
+    if (reduced == null) {
+        try appendGateError(allocator, errors, "principal.reduced must be boolean", .{});
+    }
+    const fallback_used = jsonBoolField(principal_obj, "fallbackUsed");
+    if (fallback_used == null) {
+        try appendGateError(allocator, errors, "principal.fallbackUsed must be boolean", .{});
+    } else if (fallback_used != false) {
+        try appendGateError(allocator, errors, "principal.fallbackUsed must be false", .{});
+    }
+    try validateCasRerPrincipalClaims(
+        allocator,
+        errors,
+        principal_obj,
+        kind,
+        proof_usable,
+        reduced,
+    );
+}
+
+fn validateCasRerPrincipalClaims(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    principal_obj: std.json.ObjectMap,
+    kind: ?[]const u8,
+    proof_usable: ?bool,
+    reduced: ?bool,
+) !void {
+    if (std.mem.eql(u8, kind orelse "", "reduced")) {
+        if (proof_usable != false) {
+            try appendGateError(
+                allocator,
+                errors,
+                "principal.kind=reduced requires proofUsable=false",
+                .{},
+            );
+        }
+        if (reduced != true) {
+            try appendGateError(
+                allocator,
+                errors,
+                "principal.kind=reduced requires reduced=true",
+                .{},
+            );
+        }
+    }
+    if (proof_usable == true) {
+        if (!std.mem.eql(u8, kind orelse "", "strong")) {
+            try appendGateError(
+                allocator,
+                errors,
+                "proofUsable=true requires principal.kind=strong",
+                .{},
+            );
+        }
+        if (reduced != false) {
+            try appendGateError(
+                allocator,
+                errors,
+                "proofUsable=true requires principal.reduced=false",
+                .{},
+            );
+        }
+        if (!casRerPrincipalFingerprintUsable(
+            jsonStringField(principal_obj, "accountFingerprint"),
+        )) {
+            try appendGateError(
+                allocator,
+                errors,
+                "proofUsable=true requires principal.accountFingerprint",
+                .{},
+            );
+        }
+    }
 }
 
 fn gateErrorsContain(gate: GateResult, needle: []const u8) bool {
@@ -3870,7 +3726,7 @@ fn captureTerminalReviewContext(
         if (context.codex_path) |path| {
             if (context.codex_version) |version| {
                 const previous_deadline = if (refresh_request_deadline)
-                    client.swapRequestDeadlineMs(monotonicMilliseconds() + 1_000)
+                    client.swapRequestDeadlineMs(monotonicMilliseconds(io) + 1_000)
                 else
                     null;
                 defer if (refresh_request_deadline) {
@@ -3943,184 +3799,223 @@ fn fetchReviewStatus(
             thread_read_persistence,
         );
     }
-    const params_json = try stringifyAnyAlloc(allocator, .{
-        .threadId = review_thread_id,
+    const context = ReviewStatusFetch{
+        .allocator = allocator,
+        .client = client,
+        .thread_id = review_thread_id,
+        .turn_id = null,
+        .event_log_path = event_log_path,
+        .live_notifications = null,
+        .persistence = thread_read_persistence,
+    };
+    return fetchUnpagedReviewStatus(context);
+}
+
+fn logReviewRequestError(
+    allocator: std.mem.Allocator,
+    event_log_path: []const u8,
+    method: []const u8,
+    detail: []const u8,
+) void {
+    appendLogRecord(allocator, event_log_path, method, "error", detail) catch |err| {
+        // Preserve the request failure while reporting loss of its diagnostic log.
+        std.log.warn("could not append {s} review error log: {s}", .{ method, @errorName(err) });
+    };
+}
+
+fn fetchUnpagedReviewStatus(context: ReviewStatusFetch) !ReviewStatus {
+    const allocator = context.allocator;
+    const params = try stringifyAnyAlloc(allocator, .{
+        .threadId = context.thread_id,
         .includeTurns = true,
     });
-    defer allocator.free(params_json);
-
-    var captured_notifications: std.ArrayList([]u8) = .empty;
-    defer {
-        for (captured_notifications.items) |line| allocator.free(line);
-        captured_notifications.deinit(allocator);
-    }
-
-    const response_json = (if (live_notifications != null)
-        client.requestJsonCaptureNotifications("thread/read", params_json, &captured_notifications)
-    else
-        client.requestJson("thread/read", params_json)) catch |err| {
-        const detail = client.lastError() orelse @errorName(err);
-        appendLogRecord(allocator, event_log_path, "thread/read", "error", detail) catch {};
-        if (reviewHistoryIsNotMaterialized(detail)) {
-            const without_turns_params = try stringifyAnyAlloc(allocator, .{
-                .threadId = review_thread_id,
-                .includeTurns = false,
-            });
-            defer allocator.free(without_turns_params);
-            const without_turns_json = (if (live_notifications != null)
-                client.requestJsonCaptureNotifications(
-                    "thread/read",
-                    without_turns_params,
-                    &captured_notifications,
-                )
-            else
-                client.requestJson("thread/read", without_turns_params)) catch |fallback_err| {
-                const fallback_detail = client.lastError() orelse @errorName(fallback_err);
-                appendLogRecord(allocator, event_log_path, "thread/read", "error", fallback_detail) catch {};
-                if (!reviewHistoryIsNotMaterialized(fallback_detail)) return fallback_err;
-                if (live_notifications) |state| {
-                    try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
-                }
-                var pending = try unmaterializedReviewStatusAlloc(allocator, fallback_detail);
-                errdefer pending.deinit(allocator);
-                try populateReviewEvidenceFromLiveNotifications(allocator, &pending, live_notifications);
-                return pending;
-            };
-            defer allocator.free(without_turns_json);
-            if (live_notifications) |state| {
-                try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
-            }
-            var status = try parseReviewStatusAlloc(
-                allocator,
-                without_turns_json,
-                false,
-                review_thread_id,
-                review_turn_id,
-            );
-            try populateReviewResult(allocator, &status, review_turn_id);
-            try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
-            try persistThreadReadResponse(
-                allocator,
-                event_log_path,
-                without_turns_json,
-                thread_read_persistence,
-                &status,
-            );
-            if (try maybeResumeMaterializedThread(
-                allocator,
-                client,
-                review_thread_id,
-                event_log_path,
-                &status,
-            )) {
-                status.deinit(allocator);
-                for (captured_notifications.items) |line| allocator.free(line);
-                captured_notifications.clearRetainingCapacity();
-                const resumed_json = if (live_notifications != null)
-                    try client.requestJsonCaptureNotifications(
-                        "thread/read",
-                        without_turns_params,
-                        &captured_notifications,
-                    )
-                else
-                    try client.requestJson("thread/read", without_turns_params);
-                defer allocator.free(resumed_json);
-                if (live_notifications) |state| {
-                    try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
-                }
-                var resumed_status = try parseReviewStatusAlloc(
-                    allocator,
-                    resumed_json,
-                    false,
-                    review_thread_id,
-                    review_turn_id,
-                );
-                try populateReviewResult(allocator, &resumed_status, review_turn_id);
-                try populateReviewEvidenceFromLiveNotifications(
-                    allocator,
-                    &resumed_status,
-                    live_notifications,
-                );
-                try persistThreadReadResponse(
-                    allocator,
-                    event_log_path,
-                    resumed_json,
-                    thread_read_persistence,
-                    &resumed_status,
-                );
-                return resumed_status;
-            }
-            return status;
-        }
-        return err;
+    defer allocator.free(params);
+    const response = context.client.requestJson("thread/read", params) catch |err| {
+        const detail = context.client.lastError() orelse @errorName(err);
+        logReviewRequestError(allocator, context.event_log_path, "thread/read", detail);
+        if (!reviewHistoryIsNotMaterialized(detail)) return err;
+        return fetchUnmaterializedReviewStatus(context);
     };
-    defer allocator.free(response_json);
-    if (live_notifications) |state| {
-        try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
-    }
+    defer allocator.free(response);
+    return finishUnpagedReviewStatus(context, response, params, true);
+}
+
+fn fetchUnmaterializedReviewStatus(context: ReviewStatusFetch) !ReviewStatus {
+    const allocator = context.allocator;
+    const params = try stringifyAnyAlloc(allocator, .{
+        .threadId = context.thread_id,
+        .includeTurns = false,
+    });
+    defer allocator.free(params);
+    const response = context.client.requestJson("thread/read", params) catch |err| {
+        const detail = context.client.lastError() orelse @errorName(err);
+        logReviewRequestError(allocator, context.event_log_path, "thread/read", detail);
+        if (!reviewHistoryIsNotMaterialized(detail)) return err;
+        return unmaterializedReviewStatusAlloc(allocator, detail);
+    };
+    defer allocator.free(response);
+    return finishUnpagedReviewStatus(context, response, params, false);
+}
+
+fn finishUnpagedReviewStatus(
+    context: ReviewStatusFetch,
+    response: []const u8,
+    params: []const u8,
+    materialized: bool,
+) !ReviewStatus {
+    var status = try parseUnpagedReviewStatus(context, response, materialized);
+    var owns_status = true;
+    errdefer if (owns_status) status.deinit(context.allocator);
+    if (!try maybeResumeMaterializedThread(
+        context.allocator,
+        context.client,
+        context.thread_id,
+        context.event_log_path,
+        &status,
+    )) return status;
+    status.deinit(context.allocator);
+    owns_status = false;
+    const resumed = try context.client.requestJson("thread/read", params);
+    defer context.allocator.free(resumed);
+    return parseUnpagedReviewStatus(context, resumed, materialized);
+}
+
+fn parseUnpagedReviewStatus(
+    context: ReviewStatusFetch,
+    response: []const u8,
+    materialized: bool,
+) !ReviewStatus {
     var status = try parseReviewStatusAlloc(
-        allocator,
-        response_json,
-        true,
-        review_thread_id,
-        review_turn_id,
+        context.allocator,
+        response,
+        materialized,
+        context.thread_id,
+        null,
     );
-    try populateReviewResult(allocator, &status, review_turn_id);
-    try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
+    errdefer status.deinit(context.allocator);
+    try populateReviewResult(context.allocator, &status, null);
     try persistThreadReadResponse(
-        allocator,
-        event_log_path,
-        response_json,
-        thread_read_persistence,
+        context.allocator,
+        context.event_log_path,
+        response,
+        context.persistence,
         &status,
     );
-    if (try maybeResumeMaterializedThread(
-        allocator,
-        client,
-        review_thread_id,
-        event_log_path,
-        &status,
-    )) {
-        status.deinit(allocator);
-        const params_after_resume = try stringifyAnyAlloc(allocator, .{
-            .threadId = review_thread_id,
-            .includeTurns = true,
-        });
-        defer allocator.free(params_after_resume);
-        for (captured_notifications.items) |line| allocator.free(line);
-        captured_notifications.clearRetainingCapacity();
-        const resumed_json = if (live_notifications != null)
-            try client.requestJsonCaptureNotifications("thread/read", params_after_resume, &captured_notifications)
-        else
-            try client.requestJson("thread/read", params_after_resume);
-        defer allocator.free(resumed_json);
-        if (live_notifications) |state| {
-            try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
-        }
-        var resumed_status = try parseReviewStatusAlloc(
-            allocator,
-            resumed_json,
-            true,
-            review_thread_id,
-            review_turn_id,
-        );
-        try populateReviewResult(allocator, &resumed_status, review_turn_id);
-        try populateReviewEvidenceFromLiveNotifications(
-            allocator,
-            &resumed_status,
-            live_notifications,
-        );
-        try persistThreadReadResponse(
-            allocator,
-            event_log_path,
-            resumed_json,
-            thread_read_persistence,
-            &resumed_status,
-        );
-        return resumed_status;
-    }
     return status;
 }
+
+const ReviewStatusFetch = struct {
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    thread_id: []const u8,
+    turn_id: ?[]const u8,
+    event_log_path: []const u8,
+    live_notifications: ?*LiveReviewNotificationState,
+    persistence: ThreadReadPersistence,
+
+    fn absorb(self: ReviewStatusFetch, captured: *const std.ArrayList([]u8)) !void {
+        if (self.live_notifications) |state| {
+            try absorbLiveReviewNotifications(
+                self.allocator,
+                captured,
+                self.event_log_path,
+                state,
+            );
+        }
+    }
+
+    fn populate(self: ReviewStatusFetch, status: *ReviewStatus) !void {
+        try populateReviewEvidenceFromLiveNotifications(
+            self.allocator,
+            status,
+            self.live_notifications,
+        );
+    }
+
+    fn requestThread(
+        self: ReviewStatusFetch,
+        params: []const u8,
+        captured: *std.ArrayList([]u8),
+    ) ![]u8 {
+        if (self.live_notifications != null) {
+            return self.client.requestJsonCaptureNotifications("thread/read", params, captured);
+        }
+        return self.client.requestJson("thread/read", params);
+    }
+
+    fn pending(
+        self: ReviewStatusFetch,
+        err: anyerror,
+        captured: *const std.ArrayList([]u8),
+    ) !ReviewStatus {
+        const detail = self.client.lastError() orelse @errorName(err);
+        logReviewRequestError(self.allocator, self.event_log_path, "thread/read", detail);
+        try self.absorb(captured);
+        if (err != error.RequestFailed or !reviewHistoryIsNotMaterialized(detail)) return err;
+        var status = try unmaterializedReviewStatusAlloc(self.allocator, detail);
+        errdefer status.deinit(self.allocator);
+        try self.populate(&status);
+        return status;
+    }
+
+    fn persist(
+        self: ReviewStatusFetch,
+        status: *const ReviewStatus,
+        thread_json: []const u8,
+        turns_json: ?[]const u8,
+    ) !void {
+        try persistPaginatedReviewStatus(
+            self.allocator,
+            self.event_log_path,
+            thread_json,
+            turns_json,
+            self.persistence,
+            status,
+        );
+    }
+
+    fn turns(
+        self: ReviewStatusFetch,
+        status: *ReviewStatus,
+        thread_json: []const u8,
+        captured: *std.ArrayList([]u8),
+        resume_attempted: *bool,
+    ) !void {
+        const params = try stringifyAnyAlloc(self.allocator, .{
+            .threadId = self.thread_id,
+            .limit = @as(u32, 10),
+            .sortDirection = "desc",
+            .itemsView = "full",
+        });
+        defer self.allocator.free(params);
+        for (captured.items) |line| self.allocator.free(line);
+        captured.clearRetainingCapacity();
+        const response = requestPaginatedReviewTurns(
+            self.allocator,
+            self.client,
+            self.thread_id,
+            self.event_log_path,
+            params,
+            self.live_notifications,
+            captured,
+            resume_attempted,
+        ) catch |err| {
+            const detail = self.client.lastError() orelse @errorName(err);
+            logReviewRequestError(self.allocator, self.event_log_path, "thread/turns/list", detail);
+            try self.absorb(captured);
+            try self.populate(status);
+            if (err != error.RequestFailed) return err;
+            try populateReviewResult(self.allocator, status, self.turn_id);
+            return self.persist(status, thread_json, null);
+        };
+        defer self.allocator.free(response);
+        try self.absorb(captured);
+        try populatePaginatedReviewTurn(self.allocator, response, self.turn_id, status);
+        try self.populate(status);
+        try populateReviewResult(self.allocator, status, self.turn_id);
+        try self.persist(status, thread_json, response);
+    }
+};
 
 fn fetchPaginatedReviewStatus(
     allocator: std.mem.Allocator,
@@ -4131,63 +4026,29 @@ fn fetchPaginatedReviewStatus(
     live_notifications: ?*LiveReviewNotificationState,
     persistence: ThreadReadPersistence,
 ) !ReviewStatus {
-    const thread_params = try stringifyAnyAlloc(allocator, .{
+    const context = ReviewStatusFetch{
+        .allocator = allocator,
+        .client = client,
+        .thread_id = review_thread_id,
+        .turn_id = review_turn_id,
+        .event_log_path = event_log_path,
+        .live_notifications = live_notifications,
+        .persistence = persistence,
+    };
+    const params = try stringifyAnyAlloc(allocator, .{
         .threadId = review_thread_id,
         .includeTurns = false,
     });
-    defer allocator.free(thread_params);
-    var captured_notifications: std.ArrayList([]u8) = .empty;
+    defer allocator.free(params);
+    var captured: std.ArrayList([]u8) = .empty;
     defer {
-        for (captured_notifications.items) |line| allocator.free(line);
-        captured_notifications.deinit(allocator);
+        for (captured.items) |line| allocator.free(line);
+        captured.deinit(allocator);
     }
-    const thread_json = (if (live_notifications != null)
-        client.requestJsonCaptureNotifications(
-            "thread/read",
-            thread_params,
-            &captured_notifications,
-        )
-    else
-        client.requestJson("thread/read", thread_params)) catch |err| {
-        const detail = client.lastError() orelse @errorName(err);
-        appendLogRecord(
-            allocator,
-            event_log_path,
-            "thread/read",
-            "error",
-            detail,
-        ) catch |append_err| switch (append_err) {
-            else => {},
-        };
-        if (live_notifications) |notifications| {
-            try absorbLiveReviewNotifications(
-                allocator,
-                &captured_notifications,
-                event_log_path,
-                notifications,
-            );
-        }
-        if (err != error.RequestFailed or !reviewHistoryIsNotMaterialized(detail)) {
-            return err;
-        }
-        var pending = try unmaterializedReviewStatusAlloc(allocator, detail);
-        errdefer pending.deinit(allocator);
-        try populateReviewEvidenceFromLiveNotifications(
-            allocator,
-            &pending,
-            live_notifications,
-        );
-        return pending;
-    };
+    const thread_json = context.requestThread(params, &captured) catch |err|
+        return context.pending(err, &captured);
     defer allocator.free(thread_json);
-    if (live_notifications) |notifications| {
-        try absorbLiveReviewNotifications(
-            allocator,
-            &captured_notifications,
-            event_log_path,
-            notifications,
-        );
-    }
+    try context.absorb(&captured);
     var status = try parseReviewStatusAlloc(
         allocator,
         thread_json,
@@ -4196,11 +4057,7 @@ fn fetchPaginatedReviewStatus(
         review_turn_id,
     );
     errdefer status.deinit(allocator);
-    try populateReviewEvidenceFromLiveNotifications(
-        allocator,
-        &status,
-        live_notifications,
-    );
+    try context.populate(&status);
     var resume_attempted = try maybeResumeMaterializedThread(
         allocator,
         client,
@@ -4208,90 +4065,7 @@ fn fetchPaginatedReviewStatus(
         event_log_path,
         &status,
     );
-
-    const turns_params = try stringifyAnyAlloc(allocator, .{
-        .threadId = review_thread_id,
-        .limit = @as(u32, 10),
-        .sortDirection = "desc",
-        .itemsView = "full",
-    });
-    defer allocator.free(turns_params);
-    for (captured_notifications.items) |line| allocator.free(line);
-    captured_notifications.clearRetainingCapacity();
-    const turns_json = requestPaginatedReviewTurns(
-        allocator,
-        client,
-        review_thread_id,
-        event_log_path,
-        turns_params,
-        live_notifications,
-        &captured_notifications,
-        &resume_attempted,
-    ) catch |err| {
-        const detail = client.lastError() orelse @errorName(err);
-        appendLogRecord(
-            allocator,
-            event_log_path,
-            "thread/turns/list",
-            "error",
-            detail,
-        ) catch |append_err| switch (append_err) {
-            else => {},
-        };
-        if (live_notifications) |notifications| {
-            try absorbLiveReviewNotifications(
-                allocator,
-                &captured_notifications,
-                event_log_path,
-                notifications,
-            );
-        }
-        try populateReviewEvidenceFromLiveNotifications(
-            allocator,
-            &status,
-            live_notifications,
-        );
-        if (err != error.RequestFailed) return err;
-        try populateReviewResult(allocator, &status, review_turn_id);
-        try persistPaginatedReviewStatus(
-            allocator,
-            event_log_path,
-            thread_json,
-            null,
-            persistence,
-            &status,
-        );
-        return status;
-    };
-    defer allocator.free(turns_json);
-    if (live_notifications) |notifications| {
-        try absorbLiveReviewNotifications(
-            allocator,
-            &captured_notifications,
-            event_log_path,
-            notifications,
-        );
-    }
-    try populatePaginatedReviewTurn(
-        allocator,
-        turns_json,
-        review_turn_id,
-        &status,
-    );
-    try populateReviewEvidenceFromLiveNotifications(
-        allocator,
-        &status,
-        live_notifications,
-    );
-    try populateReviewResult(allocator, &status, review_turn_id);
-    try persistPaginatedReviewStatus(
-        allocator,
-        event_log_path,
-        thread_json,
-        turns_json,
-        persistence,
-        &status,
-    );
+    try context.turns(&status, thread_json, &captured, &resume_attempted);
     return status;
 }
 
@@ -4454,7 +4228,7 @@ fn fetchReviewStatusAfterWaitTimeout(
     // The final status observation has one small independent grace window.
     const grace_ms = finalReviewStatusGraceMs(poll_interval_ms);
     const previous_deadline = client.swapRequestDeadlineMs(
-        monotonicMilliseconds() + @as(i64, grace_ms),
+        monotonicMilliseconds(client.io) + @as(i64, grace_ms),
     );
     defer _ = client.swapRequestDeadlineMs(previous_deadline);
     return fetchReviewStatus(
@@ -4545,100 +4319,120 @@ fn parseReviewStatusAlloc(
 ) !ReviewStatus {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
-    const root_obj = parsed.value.object;
+    const root_obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidResponse,
+    };
     const thread_obj = core_json.objectField(root_obj, "thread") orelse return error.MissingThread;
     if (expected_thread_id) |expected| {
         const observed = core_json.stringField(thread_obj, "id") orelse
             return error.MissingThreadId;
         if (!std.mem.eql(u8, observed, expected)) return error.ReviewThreadMismatch;
     }
-    const thread_preview = if (core_json.stringField(thread_obj, "preview")) |preview|
-        try allocator.dupe(u8, preview)
-    else
-        try allocator.dupe(u8, "");
-    errdefer allocator.free(thread_preview);
-    const thread_status = blk: {
-        if (core_json.stringField(thread_obj, "status")) |status| break :blk status;
-        if (core_json.objectField(thread_obj, "status")) |status_obj| {
-            if (core_json.stringField(status_obj, "type")) |status| break :blk status;
+    var status = try initialThreadReviewStatus(allocator, thread_obj, raw_json, materialized);
+    errdefer status.deinit(allocator);
+    const selected_turn = try selectThreadReviewTurn(
+        thread_obj,
+        expected_turn_id,
+        &status.turn_count,
+    );
+    if (selected_turn) |turn| {
+        if (core_json.stringField(turn, "status")) |value| {
+            const owned_status = try allocator.dupe(u8, value);
+            allocator.free(status.turn_status);
+            status.turn_status = owned_status;
         }
-        break :blk "unknown";
-    };
-    var turn_status: []const u8 = if (materialized) "pending" else "materializing";
-    var turn_count: usize = 0;
-    var turn_error_message: ?[]const u8 = null;
-    errdefer if (turn_error_message) |message| allocator.free(message);
-    var last_turn_has_entered_review_mode = false;
-    var last_turn_has_exited_review_mode = false;
-    const rollout_path = if (core_json.stringField(thread_obj, "path")) |path|
-        try allocator.dupe(u8, path)
-    else
-        null;
-    errdefer if (rollout_path) |path| allocator.free(path);
-    var selected_turn: ?std.json.ObjectMap = null;
-    if (thread_obj.get("turns")) |turns_val| switch (turns_val) {
-        .array => |arr| {
-            turn_count = arr.items.len;
-            if (expected_turn_id) |expected| {
-                for (arr.items) |turn| {
-                    if (turn != .object) continue;
-                    const observed = core_json.stringField(turn.object, "id") orelse continue;
-                    if (!std.mem.eql(u8, observed, expected)) continue;
-                    if (selected_turn != null) return error.DuplicateReviewTurn;
-                    selected_turn = turn.object;
-                }
-            } else if (arr.items.len > 0 and arr.items[arr.items.len - 1] == .object) {
-                selected_turn = arr.items[arr.items.len - 1].object;
-            }
-            if (selected_turn) |turn| {
-                if (core_json.stringField(turn, "status")) |status| turn_status = status;
-                if (turn.get("error")) |error_val| {
-                    turn_error_message = try extractErrorMessageAlloc(allocator, error_val);
-                }
-                if (turn.get("items")) |items_val| switch (items_val) {
-                    .array => |items| {
-                        for (items.items) |item| {
-                            if (item != .object) continue;
-                            const item_type = core_json.stringField(
-                                item.object,
-                                "type",
-                            ) orelse continue;
-                            if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
-                                last_turn_has_entered_review_mode = true;
-                            }
-                            if (std.mem.eql(u8, item_type, "exitedReviewMode")) {
-                                last_turn_has_exited_review_mode = true;
-                            }
-                        }
-                    },
-                    else => {},
-                };
-            }
-        },
-        else => {},
-    };
-    // An inline review may own the thread before Codex materializes its rollout.
-    // Preserve turn identity once turns are observable, while allowing callers
-    // to retain the structured non-terminal state during that interval.
+        if (turn.get("error")) |value| {
+            status.turn_error_message = try extractErrorMessageAlloc(allocator, value);
+        }
+        populateReviewModeFlags(turn, &status);
+    }
+    // Inline reviews may own the thread before their rollout materializes.
     if (materialized and expected_turn_id != null and selected_turn == null) {
         return error.MissingReviewTurn;
     }
+    return status;
+}
+
+fn initialThreadReviewStatus(
+    allocator: std.mem.Allocator,
+    thread: std.json.ObjectMap,
+    raw_json: []const u8,
+    materialized: bool,
+) !ReviewStatus {
+    const preview = try allocator.dupe(u8, core_json.stringField(thread, "preview") orelse "");
+    errdefer allocator.free(preview);
+    const borrowed_status = blk: {
+        if (core_json.stringField(thread, "status")) |status| break :blk status;
+        if (core_json.objectField(thread, "status")) |object| {
+            if (core_json.stringField(object, "type")) |status| break :blk status;
+        }
+        break :blk "unknown";
+    };
+    const path = if (core_json.stringField(thread, "path")) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (path) |value| allocator.free(value);
+    const thread_status = try allocator.dupe(u8, borrowed_status);
+    errdefer allocator.free(thread_status);
+    const turn_status = try allocator.dupe(u8, if (materialized) "pending" else "materializing");
+    errdefer allocator.free(turn_status);
     return .{
-        .thread_status = try allocator.dupe(u8, thread_status),
-        .turn_status = try allocator.dupe(u8, turn_status),
-        .turn_count = turn_count,
+        .thread_status = thread_status,
+        .turn_status = turn_status,
+        .turn_count = 0,
         .materialized = materialized,
-        .thread_preview = thread_preview,
-        .rollout_path = rollout_path,
-        .turn_error_message = turn_error_message,
-        .last_turn_has_entered_review_mode = last_turn_has_entered_review_mode,
-        .last_turn_has_exited_review_mode = last_turn_has_exited_review_mode,
+        .thread_preview = preview,
+        .rollout_path = path,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
         .review_result_available = false,
         .review_result_source = null,
         .review_result_json = null,
         .review_text = null,
         .raw_response_json = try allocator.dupe(u8, raw_json),
     };
+}
+
+fn selectThreadReviewTurn(
+    thread: std.json.ObjectMap,
+    expected_turn_id: ?[]const u8,
+    turn_count: *usize,
+) !?std.json.ObjectMap {
+    const turns = thread.get("turns") orelse return null;
+    if (turns != .array) return null;
+    const items = turns.array.items;
+    turn_count.* = items.len;
+    if (expected_turn_id) |expected| {
+        var selected: ?std.json.ObjectMap = null;
+        for (items) |turn| {
+            if (turn != .object) continue;
+            const observed = core_json.stringField(turn.object, "id") orelse continue;
+            if (!std.mem.eql(u8, observed, expected)) continue;
+            if (selected != null) return error.DuplicateReviewTurn;
+            selected = turn.object;
+        }
+        return selected;
+    }
+    if (items.len > 0 and items[items.len - 1] == .object) return items[items.len - 1].object;
+    return null;
+}
+
+fn populateReviewModeFlags(turn: std.json.ObjectMap, status: *ReviewStatus) void {
+    const items = turn.get("items") orelse return;
+    if (items != .array) return;
+    for (items.array.items) |item| {
+        if (item != .object) continue;
+        const item_type = core_json.stringField(item.object, "type") orelse continue;
+        if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
+            status.last_turn_has_entered_review_mode = true;
+        }
+        if (std.mem.eql(u8, item_type, "exitedReviewMode")) {
+            status.last_turn_has_exited_review_mode = true;
+        }
+    }
 }
 
 fn extractErrorMessageAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
@@ -4682,59 +4476,105 @@ fn absorbLiveReviewNotifications(
     live_notifications: *LiveReviewNotificationState,
 ) !void {
     for (captured_notifications.items) |line| {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
         defer parsed.deinit();
-        const root_obj = switch (parsed.value) {
-            .object => |obj| obj,
+        const root = switch (parsed.value) {
+            .object => |object| object,
             else => continue,
         };
-        const method = core_json.stringField(root_obj, "method") orelse continue;
+        const method = core_json.stringField(root, "method") orelse continue;
         try appendLogRecord(allocator, event_log_path, method, "notification", line);
-        if (std.mem.eql(u8, method, "turn/aborted")) {
-            const params_obj = core_json.objectField(root_obj, "params") orelse continue;
-            const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
-            const turn_id = core_json.stringField(params_obj, "turnId") orelse continue;
-            if (std.mem.eql(u8, thread_id, live_notifications.review_thread_id) and
-                std.mem.eql(u8, turn_id, live_notifications.review_turn_id))
-            {
-                live_notifications.observed_terminal_status = "interrupted";
-            }
-            continue;
-        }
+        const params = core_json.objectField(root, "params") orelse continue;
         if (std.mem.eql(u8, method, "turn/completed")) {
-            const params_obj = core_json.objectField(root_obj, "params") orelse continue;
-            const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
-            if (!std.mem.eql(u8, thread_id, live_notifications.review_thread_id)) continue;
-            const turn_obj = core_json.objectField(params_obj, "turn") orelse continue;
-            const turn_id = core_json.stringField(turn_obj, "id") orelse continue;
-            if (!std.mem.eql(u8, turn_id, live_notifications.review_turn_id)) continue;
-            const turn_status = core_json.stringField(turn_obj, "status") orelse continue;
-            live_notifications.observed_terminal_status =
-                if (std.mem.eql(u8, turn_status, "completed")) "completed" else if (std.mem.eql(u8, turn_status, "failed")) "failed" else if (std.mem.eql(u8, turn_status, "errored")) "errored" else if (std.mem.eql(u8, turn_status, "interrupted")) "interrupted" else turn_status;
-            if (turn_obj.get("error")) |error_val| {
-                if (live_notifications.observed_turn_error_message) |existing| allocator.free(existing);
-                live_notifications.observed_turn_error_message = try extractErrorMessageAlloc(allocator, error_val);
-            }
+            try absorbCompletedReviewTurn(allocator, params, live_notifications);
             continue;
         }
-        if (!std.mem.eql(u8, method, "item/started") and !std.mem.eql(u8, method, "item/completed")) continue;
-        const params_obj = core_json.objectField(root_obj, "params") orelse continue;
-        const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
-        const turn_id = core_json.stringField(params_obj, "turnId") orelse continue;
-        if (!std.mem.eql(u8, thread_id, live_notifications.review_thread_id)) continue;
-        if (!std.mem.eql(u8, turn_id, live_notifications.review_turn_id)) continue;
-        const item_obj = core_json.objectField(params_obj, "item") orelse continue;
-        const item_type = core_json.stringField(item_obj, "type") orelse continue;
-        if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
-            live_notifications.saw_entered_review_mode = true;
-            continue;
+        if (!notificationMatchesReviewTurn(params, live_notifications)) continue;
+        if (std.mem.eql(u8, method, "turn/aborted")) {
+            try storeLiveReviewTurnStatus(allocator, live_notifications, "interrupted");
+        } else if (std.mem.eql(u8, method, "item/started") or
+            std.mem.eql(u8, method, "item/completed"))
+        {
+            try absorbLiveReviewItem(allocator, params, live_notifications);
         }
-        if (!std.mem.eql(u8, item_type, "exitedReviewMode")) continue;
-        live_notifications.saw_exited_review_mode = true;
-        const review_text = core_json.stringField(item_obj, "review") orelse continue;
-        if (live_notifications.review_text) |existing| allocator.free(existing);
-        live_notifications.review_text = try allocator.dupe(u8, review_text);
     }
+}
+
+fn notificationMatchesReviewTurn(
+    params: std.json.ObjectMap,
+    state: *const LiveReviewNotificationState,
+) bool {
+    const thread_id = core_json.stringField(params, "threadId") orelse return false;
+    const turn_id = core_json.stringField(params, "turnId") orelse return false;
+    return std.mem.eql(u8, thread_id, state.review_thread_id) and
+        std.mem.eql(u8, turn_id, state.review_turn_id);
+}
+
+fn absorbCompletedReviewTurn(
+    allocator: std.mem.Allocator,
+    params: std.json.ObjectMap,
+    state: *LiveReviewNotificationState,
+) !void {
+    const thread_id = core_json.stringField(params, "threadId") orelse return;
+    if (!std.mem.eql(u8, thread_id, state.review_thread_id)) return;
+    const turn = core_json.objectField(params, "turn") orelse return;
+    const turn_id = core_json.stringField(turn, "id") orelse return;
+    if (!std.mem.eql(u8, turn_id, state.review_turn_id)) return;
+    const status = core_json.stringField(turn, "status") orelse return;
+    const error_value = turn.get("error");
+    const message = if (error_value) |value|
+        try extractErrorMessageAlloc(allocator, value)
+    else
+        null;
+    errdefer if (message) |owned| allocator.free(owned);
+    try storeLiveReviewTurnStatus(allocator, state, status);
+    if (error_value != null) {
+        if (state.observed_turn_error_message) |existing| allocator.free(existing);
+        state.observed_turn_error_message = message;
+    }
+}
+
+fn storeLiveReviewTurnStatus(
+    allocator: std.mem.Allocator,
+    state: *LiveReviewNotificationState,
+    status: []const u8,
+) !void {
+    const known: []const []const u8 = &.{ "completed", "failed", "errored", "interrupted" };
+    for (known) |value| {
+        if (!std.mem.eql(u8, status, value)) continue;
+        if (state.observed_terminal_status_owned) |existing| allocator.free(existing);
+        state.observed_terminal_status_owned = null;
+        state.observed_terminal_status = value;
+        return;
+    }
+    const owned = try allocator.dupe(u8, status);
+    if (state.observed_terminal_status_owned) |existing| allocator.free(existing);
+    state.observed_terminal_status_owned = owned;
+    state.observed_terminal_status = owned;
+}
+
+fn absorbLiveReviewItem(
+    allocator: std.mem.Allocator,
+    params: std.json.ObjectMap,
+    state: *LiveReviewNotificationState,
+) !void {
+    const item = core_json.objectField(params, "item") orelse return;
+    const item_type = core_json.stringField(item, "type") orelse return;
+    if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
+        state.saw_entered_review_mode = true;
+        return;
+    }
+    if (!std.mem.eql(u8, item_type, "exitedReviewMode")) return;
+    if (core_json.stringField(item, "review")) |review_text| {
+        const owned = try allocator.dupe(u8, review_text);
+        if (state.review_text) |existing| allocator.free(existing);
+        state.review_text = owned;
+    }
+    state.saw_exited_review_mode = true;
 }
 
 fn populateReviewEvidenceFromLiveNotifications(
@@ -4809,13 +4649,15 @@ fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
     if (!status.materialized or status.rollout_path == null or status.turn_count == 0) {
         return .{
             .code = "parent_thread_not_materialized",
-            .hint = "supplied parent thread is not safely materialized for detached review reuse; pass a materialized thread or use --parent-mode fresh",
+            .hint = "supplied parent thread is not safely materialized for detached review " ++
+                "reuse; pass a materialized thread or use --parent-mode fresh",
         };
     }
     if (std.mem.eql(u8, status.turn_status, "inProgress")) {
         return .{
             .code = "unsafe_parent_thread_state",
-            .hint = "supplied parent thread still has an active turn; wait for it to finish or choose another parent thread",
+            .hint = "supplied parent thread still has an active turn; wait for it to finish or " ++
+                "choose another parent thread",
         };
     }
     if (std.mem.eql(u8, status.turn_status, "interrupted") or
@@ -4824,13 +4666,15 @@ fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
     {
         return .{
             .code = "unsafe_parent_thread_state",
-            .hint = "supplied parent thread ended in an interrupted or failed state; reuse a clean materialized parent thread instead",
+            .hint = "supplied parent thread ended in an interrupted or failed state; reuse a " ++
+                "clean materialized parent thread instead",
         };
     }
     if (status.last_turn_has_entered_review_mode and !status.last_turn_has_exited_review_mode) {
         return .{
             .code = "unsafe_parent_thread_state",
-            .hint = "supplied parent thread still carries unfinished review-mode state; reuse a clean materialized parent thread instead",
+            .hint = "supplied parent thread still carries unfinished review-mode state; reuse " ++
+                "a clean materialized parent thread instead",
         };
     }
     return null;
@@ -4898,7 +4742,97 @@ fn gitOutputRawAllocLimited(
     if (!ok) return error.GitCommandFailed;
     return allocator.dupe(u8, result.stdout);
 }
+fn exerciseReviewStatusAllocation(allocator: std.mem.Allocator) !void {
+    const raw =
+        \\{"thread":{"id":"thread","status":{"type":"running"},"path":"rollout","preview":"text","turns":[{"id":"turn","status":"failed","error":{"message":"failure"},"items":[{"type":"enteredReviewMode"},{"type":"exitedReviewMode"}]}]}}
+    ;
+    const status = try parseReviewStatusAlloc(allocator, raw, true, "thread", "turn");
+    defer status.deinit(allocator);
+    try std.testing.expectEqualStrings("failed", status.turn_status);
+    try std.testing.expectEqualStrings("failure", status.turn_error_message.?);
+    try std.testing.expect(status.last_turn_has_entered_review_mode);
+    try std.testing.expect(status.last_turn_has_exited_review_mode);
+}
 
+test "review status parsing cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseReviewStatusAllocation,
+        .{},
+    );
+}
+
+test "review status parser rejects a non-object response" {
+    try std.testing.expectError(error.InvalidResponse, parseReviewStatusAlloc(
+        std.testing.allocator,
+        "[]",
+        true,
+        "thread",
+        "turn",
+    ));
+}
+
+fn exerciseCasRerGateAllocation(allocator: std.mem.Allocator) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(
+        allocator,
+        "invalid.json",
+        parsed.value.object,
+    );
+    defer gate.deinit(allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gateErrorsContain(gate, "missing tuple"));
+}
+
+test "CAS-RER gate cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCasRerGateAllocation,
+        .{},
+    );
+}
+
+test "live review status retains unknown protocol status across source release" {
+    const allocator = std.testing.allocator;
+    var state = LiveReviewNotificationState{
+        .review_thread_id = "thread",
+        .review_turn_id = "turn",
+    };
+    defer state.deinit(allocator);
+    {
+        const source = try allocator.dupe(u8, "future-status");
+        defer allocator.free(source);
+        try storeLiveReviewTurnStatus(allocator, &state, source);
+        @memset(source, 'x');
+    }
+    try std.testing.expectEqualStrings("future-status", state.observed_terminal_status.?);
+    try storeLiveReviewTurnStatus(allocator, &state, "completed");
+    try std.testing.expectEqualStrings("completed", state.observed_terminal_status.?);
+    try std.testing.expect(state.observed_terminal_status_owned == null);
+}
+
+fn exerciseLiveReviewStatusAllocation(allocator: std.mem.Allocator) !void {
+    var state = LiveReviewNotificationState{
+        .review_thread_id = "thread",
+        .review_turn_id = "turn",
+    };
+    defer state.deinit(allocator);
+    try storeLiveReviewTurnStatus(allocator, &state, "future-status");
+    storeLiveReviewTurnStatus(allocator, &state, "next-status") catch |err| {
+        try std.testing.expectEqualStrings("future-status", state.observed_terminal_status.?);
+        return err;
+    };
+    try std.testing.expectEqualStrings("next-status", state.observed_terminal_status.?);
+}
+
+test "live review status replacement preserves ownership on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseLiveReviewStatusAllocation,
+        .{},
+    );
+}
 fn dirtyStateDigestAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5091,13 +5025,32 @@ fn computeTargetIdentityAlloc(
         .uncommitted => try allocator.dupe(u8, current_head_sha),
     };
     errdefer allocator.free(base_sha);
+    const fingerprint = try targetFingerprintAlloc(
+        allocator,
+        target,
+        developer_instructions,
+        head_sha,
+        base_sha,
+        dirty_digest,
+    );
+    return .{ .head_sha = head_sha, .base_sha = base_sha, .fingerprint = fingerprint };
+}
+
+fn targetFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    target: TargetConfig,
+    developer_instructions: ?[]const u8,
+    head_sha: []const u8,
+    base_sha: []const u8,
+    dirty_digest: ?[]const u8,
+) ![]const u8 {
     const target_record = targetToRecord(target);
     const target_json = try stringifyAnyAlloc(allocator, .{
         .target = target_record,
         .developerInstructions = developer_instructions,
     });
     defer allocator.free(target_json);
-    const fingerprint = if (dirty_digest) |digest|
+    return if (dirty_digest) |digest|
         try std.fmt.allocPrint(allocator, "target={s};head={s};base={s};dirty={s}", .{
             target_json,
             head_sha,
@@ -5110,11 +5063,6 @@ fn computeTargetIdentityAlloc(
             head_sha,
             base_sha,
         });
-    return .{
-        .head_sha = head_sha,
-        .base_sha = base_sha,
-        .fingerprint = fingerprint,
-    };
 }
 
 fn targetIdentityForRecordAlloc(
@@ -5265,9 +5213,9 @@ fn reviewStartFailureOwnsAttempt(
     return if (workflow_bound) request_send_started else isTransportLossError(err);
 }
 
-fn monotonicMilliseconds() i64 {
+fn monotonicMilliseconds(io: std.Io) i64 {
     return @intCast(@divFloor(
-        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     ));
 }
@@ -5283,7 +5231,7 @@ fn waitForReviewCompletion(
     absolute_deadline_ms: ?i64,
 ) !ReviewStatus {
     const deadline_ms = absolute_deadline_ms orelse
-        (monotonicMilliseconds() + @as(i64, timeout_ms));
+        (monotonicMilliseconds(client.io) + @as(i64, timeout_ms));
     const previous_request_deadline = client.swapRequestDeadlineMs(deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_request_deadline);
     var live_notifications = LiveReviewNotificationState{
@@ -5292,7 +5240,9 @@ fn waitForReviewCompletion(
     };
     defer live_notifications.deinit(allocator);
     var completed_without_result_since_ms: ?i64 = null;
-    while (true) {
+    var first_poll = true;
+    while (first_poll or monotonicMilliseconds(client.io) < deadline_ms) {
+        first_poll = false;
         // The bound review thread is the sole authority for both liveness and
         // completion. Poll it directly so an unrelated app-server method can
         // neither fail nor consume recovery for this review attempt.
@@ -5308,7 +5258,7 @@ fn waitForReviewCompletion(
             error.ConnectionTimedOut => return error.WaitTimedOut,
             else => return err,
         };
-        const now_ms = monotonicMilliseconds();
+        const now_ms = monotonicMilliseconds(client.io);
         if (reviewStatusCompletesWait(&latest)) return latest;
         if (reviewStatusAwaitsStructuredCompletion(&latest)) {
             if (completed_without_result_since_ms == null) {
@@ -5324,14 +5274,13 @@ fn waitForReviewCompletion(
         latest.deinit(allocator);
         if (now_ms >= deadline_ms) return error.WaitTimedOut;
         const remaining_ms: u32 = @intCast(deadline_ms - now_ms);
-        std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+        try std.Io.sleep(
+            client.io,
             .fromMilliseconds(@min(poll_interval_ms, remaining_ms)),
             .awake,
-        ) catch |err| switch (err) {
-            else => {},
-        };
+        );
     }
+    return error.WaitTimedOut;
 }
 
 const ReviewWaitTimeoutDisposition = struct {
@@ -5489,8 +5438,8 @@ fn terminalizeOwnedReviewAttempt(
         context.record_path,
         context.event_log_path,
     );
-    writeReviewTupleLock(allocator, lock_path, terminal_lock) catch |err| switch (err) {
-        else => {},
+    writeReviewTupleLock(allocator, lock_path, terminal_lock) catch |err| {
+        std.log.warn("terminal review lock persistence failed: {s}", .{@errorName(err)});
     };
 
     if (context.record) |record| {
@@ -5499,8 +5448,8 @@ fn terminalizeOwnedReviewAttempt(
         record.terminal_failure_hint = durable_failure.hint;
         record.terminal_failure_at_unix_s = unixSeconds();
         if (context.record_path) |record_path| {
-            writeSessionRecord(allocator, record_path, record.*) catch |err| switch (err) {
-                else => {},
+            writeSessionRecord(allocator, record_path, record.*) catch |err| {
+                std.log.warn("terminal review record persistence failed: {s}", .{@errorName(err)});
             };
         }
     }
@@ -5522,7 +5471,11 @@ fn startParentThreadAlloc(
     const result_json = try client.requestJson("thread/start", params_json);
     defer allocator.free(result_json);
     const parent_thread_id = try extractStartedThreadIdAlloc(allocator, result_json);
-    const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
+    const parent_event_log_path = try parentEventLogPathAlloc(
+        allocator,
+        session_dir,
+        parent_thread_id,
+    );
     defer allocator.free(parent_event_log_path);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "request", params_json);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", result_json);
@@ -5548,23 +5501,6 @@ fn buildThreadResumeParamsJson(
     return stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
 }
 
-fn resumeParentThread(
-    allocator: std.mem.Allocator,
-    client: *cas.Client,
-    parent_thread_id: []const u8,
-    parent_event_log_path: []const u8,
-) !void {
-    const params_json = try buildThreadResumeParamsJson(
-        allocator,
-        parent_thread_id,
-    );
-    defer allocator.free(params_json);
-    const result_json = try client.requestJson("thread/resume", params_json);
-    defer allocator.free(result_json);
-    try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "request", params_json);
-    try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "response", result_json);
-}
-
 fn extractStartedThreadIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
@@ -5578,7 +5514,10 @@ fn extractReviewThreadIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
     const root_obj = parsed.value.object;
-    const review_thread_id = core_json.stringField(root_obj, "reviewThreadId") orelse return error.MissingReviewThreadId;
+    const review_thread_id = core_json.stringField(
+        root_obj,
+        "reviewThreadId",
+    ) orelse return error.MissingReviewThreadId;
     return allocator.dupe(u8, review_thread_id);
 }
 
@@ -5610,8 +5549,14 @@ fn buildReviewStartParamsJson(
 fn buildTargetJson(allocator: std.mem.Allocator, target: TargetConfig) ![]u8 {
     return switch (target.kind) {
         .uncommitted => stringifyAnyAlloc(allocator, .{ .type = "uncommittedChanges" }),
-        .base_branch => stringifyAnyAlloc(allocator, .{ .type = "baseBranch", .branch = target.branch.? }),
-        .commit => stringifyAnyAlloc(allocator, .{ .type = "commit", .sha = target.sha.?, .title = target.title }),
+        .base_branch => stringifyAnyAlloc(
+            allocator,
+            .{ .type = "baseBranch", .branch = target.branch.? },
+        ),
+        .commit => stringifyAnyAlloc(
+            allocator,
+            .{ .type = "commit", .sha = target.sha.?, .title = target.title },
+        ),
     };
 }
 
@@ -5633,7 +5578,11 @@ fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
     else
         try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(start_input);
-    const start = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), start_input, allocator);
+    const start = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        start_input,
+        allocator,
+    );
     defer allocator.free(start);
     const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
         error.GitCommandFailed => return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{start}),
@@ -5647,7 +5596,10 @@ fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8
     const expanded = try core_path.expandHomePath(allocator, root);
     errdefer allocator.free(expanded);
     if (std.fs.path.isAbsolute(expanded)) return expanded;
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
     allocator.free(expanded);
@@ -5715,86 +5667,101 @@ fn casRerStableCompareIgnoredField(key: []const u8) bool {
         std.mem.eql(u8, key, "rawReceipt");
 }
 
-fn jsonValueStableEqual(
+const StableJsonFrame = struct {
     left: std.json.Value,
     right: std.json.Value,
-    ignore_cas_rer_provenance: bool,
-) bool {
+    next_index: usize = 0,
+};
+
+fn stableJsonScalarEqual(left: std.json.Value, right: std.json.Value) ?bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
     return switch (left) {
-        .null => right == .null,
-        .bool => |left_bool| switch (right) {
-            .bool => |right_bool| left_bool == right_bool,
-            else => false,
-        },
-        .integer => |left_integer| switch (right) {
-            .integer => |right_integer| left_integer == right_integer,
-            else => false,
-        },
-        .float => |left_float| switch (right) {
-            .float => |right_float| left_float == right_float,
-            else => false,
-        },
-        .number_string => |left_number| switch (right) {
-            .number_string => |right_number| std.mem.eql(u8, left_number, right_number),
-            else => false,
-        },
-        .string => |left_string| switch (right) {
-            .string => |right_string| std.mem.eql(u8, left_string, right_string),
-            else => false,
-        },
-        .array => |left_array| switch (right) {
-            .array => |right_array| blk: {
-                if (left_array.items.len != right_array.items.len) break :blk false;
-                for (left_array.items, right_array.items) |left_item, right_item| {
-                    if (!jsonValueStableEqual(
-                        left_item,
-                        right_item,
-                        ignore_cas_rer_provenance,
-                    )) break :blk false;
-                }
-                break :blk true;
-            },
-            else => false,
-        },
-        .object => |left_object| switch (right) {
-            .object => |right_object| jsonObjectStableEqual(
-                left_object,
-                right_object,
-                ignore_cas_rer_provenance,
-            ),
-            else => false,
-        },
+        .null => true,
+        .bool => |value| value == right.bool,
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .number_string => |value| std.mem.eql(u8, value, right.number_string),
+        .string => |value| std.mem.eql(u8, value, right.string),
+        .array, .object => null,
     };
 }
 
-fn jsonObjectStableEqual(
-    left: std.json.ObjectMap,
-    right: std.json.ObjectMap,
-    ignore_cas_rer_provenance: bool,
-) bool {
-    var left_count: usize = 0;
-    var left_it = left.iterator();
-    while (left_it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (ignore_cas_rer_provenance and casRerStableCompareIgnoredField(key)) continue;
-        left_count += 1;
-        const right_value = right.get(key) orelse return false;
-        if (!jsonValueStableEqual(
-            entry.value_ptr.*,
-            right_value,
-            ignore_cas_rer_provenance,
-        )) return false;
+fn stableJsonObjectFieldCount(object: std.json.ObjectMap, ignore_provenance: bool) usize {
+    var count: usize = 0;
+    for (object.keys()) |key| {
+        if (ignore_provenance and casRerStableCompareIgnoredField(key)) continue;
+        count += 1;
     }
+    return count;
+}
 
-    var right_count: usize = 0;
-    var right_it = right.iterator();
-    while (right_it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (ignore_cas_rer_provenance and casRerStableCompareIgnoredField(key)) continue;
-        right_count += 1;
+fn stableJsonContainerSizesEqual(frame: StableJsonFrame, ignore_provenance: bool) bool {
+    return switch (frame.left) {
+        .array => |value| value.items.len == frame.right.array.items.len,
+        .object => |value| stableJsonObjectFieldCount(value, ignore_provenance) ==
+            stableJsonObjectFieldCount(frame.right.object, ignore_provenance),
+        else => unreachable,
+    };
+}
+
+fn nextStableJsonChild(frame: *StableJsonFrame, ignore_provenance: bool) !?StableJsonFrame {
+    switch (frame.left) {
+        .array => |value| {
+            if (frame.next_index == value.items.len) return null;
+            const index = frame.next_index;
+            frame.next_index += 1;
+            return .{ .left = value.items[index], .right = frame.right.array.items[index] };
+        },
+        .object => |value| {
+            while (frame.next_index < value.count()) {
+                const index = frame.next_index;
+                frame.next_index += 1;
+                const key = value.keys()[index];
+                if (ignore_provenance and casRerStableCompareIgnoredField(key)) continue;
+                return .{
+                    .left = value.values()[index],
+                    .right = frame.right.object.get(key) orelse return error.JsonValuesDiffer,
+                };
+            }
+            return null;
+        },
+        else => unreachable,
     }
+}
 
-    return left_count == right_count;
+fn jsonValueStableEqualAlloc(
+    allocator: std.mem.Allocator,
+    left: std.json.Value,
+    right: std.json.Value,
+    ignore_provenance: bool,
+    frames_max: usize,
+) !bool {
+    std.debug.assert(frames_max > 0);
+    var frames: std.ArrayList(StableJsonFrame) = .empty;
+    defer frames.deinit(allocator);
+    try frames.append(allocator, .{ .left = left, .right = right });
+    while (frames.items.len > 0) {
+        const frame = &frames.items[frames.items.len - 1];
+        if (frame.next_index == 0) {
+            if (stableJsonScalarEqual(frame.left, frame.right)) |equal| {
+                if (!equal) return false;
+                _ = frames.pop();
+                continue;
+            }
+            if (!stableJsonContainerSizesEqual(frame.*, ignore_provenance)) return false;
+        }
+        const child = nextStableJsonChild(frame, ignore_provenance) catch |err| switch (err) {
+            error.JsonValuesDiffer => return false,
+        };
+        if (child) |value| {
+            // Each nesting level consumes at least one byte in both parsed sources.
+            if (frames.items.len == frames_max) return error.InvalidJsonTraversalBound;
+            try frames.append(allocator, value);
+        } else {
+            _ = frames.pop();
+        }
+    }
+    return true;
 }
 
 fn casRerStableContentMatchesAlloc(
@@ -5807,14 +5774,20 @@ fn casRerStableContentMatchesAlloc(
         allocator,
         std.mem.trim(u8, raw, " \t\r\n"),
         .{},
-    ) catch return false;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer existing_parsed.deinit();
     var incoming_parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
         std.mem.trim(u8, json, " \t\r\n"),
         .{},
-    ) catch return false;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer incoming_parsed.deinit();
     const existing = switch (existing_parsed.value) {
         .object => |obj| obj,
@@ -5838,7 +5811,119 @@ fn casRerStableContentMatchesAlloc(
         jsonStringField(existing, "recordId"),
         jsonStringField(incoming, "recordId"),
     )) return false;
-    return jsonObjectStableEqual(existing, incoming, true);
+    return jsonValueStableEqualAlloc(
+        allocator,
+        .{ .object = existing },
+        .{ .object = incoming },
+        true,
+        @min(raw.len, json.len),
+    );
+}
+
+fn checkStableReviewJsonAllocation(allocator: std.mem.Allocator, raw: []const u8) !void {
+    try std.testing.expect(try casRerStableContentMatchesAlloc(allocator, raw, raw));
+}
+
+test "stable review JSON comparison propagates allocation failures" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer","nested":[{"value":1,"createdAt":"a"}]}
+    ;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkStableReviewJsonAllocation,
+        .{raw},
+    );
+}
+
+test "stable review JSON traversal bounds depth without recursive calls" {
+    const allocator = std.testing.allocator;
+    const depth = 4096;
+    const raw = try allocator.alloc(u8, depth * 2 + 1);
+    defer allocator.free(raw);
+    @memset(raw[0..depth], '[');
+    raw[depth] = '0';
+    @memset(raw[depth + 1 ..], ']');
+    var left = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer right.deinit();
+    try std.testing.expect(try jsonValueStableEqualAlloc(
+        allocator,
+        left.value,
+        right.value,
+        false,
+        depth + 1,
+    ));
+    try std.testing.expectError(error.InvalidJsonTraversalBound, jsonValueStableEqualAlloc(
+        allocator,
+        left.value,
+        right.value,
+        false,
+        depth,
+    ));
+    var leaf = &right.value;
+    for (0..depth) |_| leaf = &leaf.array.items[0];
+    leaf.* = .{ .integer = 1 };
+    try std.testing.expect(!try jsonValueStableEqualAlloc(
+        allocator,
+        left.value,
+        right.value,
+        false,
+        depth + 1,
+    ));
+}
+
+test "stable review JSON traversal retains only the active wide-array path" {
+    const allocator = std.testing.allocator;
+    const entries = 4096;
+    const raw = try allocator.alloc(u8, entries * 2 + 1);
+    defer allocator.free(raw);
+    raw[0] = '[';
+    for (0..entries) |index| {
+        raw[index * 2 + 1] = '0';
+        raw[index * 2 + 2] = if (index == entries - 1) ']' else ',';
+    }
+    var left = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer right.deinit();
+    try std.testing.expect(try jsonValueStableEqualAlloc(
+        allocator,
+        left.value,
+        right.value,
+        false,
+        2,
+    ));
+    right.value.array.items[entries - 1] = .{ .integer = 1 };
+    try std.testing.expect(!try jsonValueStableEqualAlloc(
+        allocator,
+        left.value,
+        right.value,
+        false,
+        2,
+    ));
+}
+
+test "stable review JSON retains scalar kinds and nested provenance policy" {
+    const allocator = std.testing.allocator;
+    const prefix = "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer\",\"nested\":";
+    const left = prefix ++ "{\"value\":1,\"createdAt\":\"old\"}}";
+    const cases = [_]struct { raw: []const u8, equal: bool }{
+        .{ .raw = prefix ++ "{\"createdAt\":\"new\",\"value\":1}}", .equal = true },
+        .{ .raw = prefix ++ "{\"value\":1}}", .equal = true },
+        .{ .raw = prefix ++ "{\"value\":2}}", .equal = false },
+        .{ .raw = prefix ++ "{\"value\":1.0}}", .equal = false },
+        .{ .raw = prefix ++ "{\"other\":1}}", .equal = false },
+        .{ .raw = prefix ++ "{\"value\":1,\"extra\":0}}", .equal = false },
+        .{ .raw = prefix ++ "[1]}", .equal = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.equal, try casRerStableContentMatchesAlloc(
+            allocator,
+            left,
+            case.raw,
+        ));
+    }
 }
 
 fn writeRawJsonFileExclusiveOrIdenticalAlloc(
@@ -5889,7 +5974,10 @@ fn parseCasRerCreatedAtNs(text: []const u8) ?i128 {
 }
 
 fn unixSeconds() i64 {
-    return @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
+    return @intCast(@divFloor(
+        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        1_000_000_000,
+    ));
 }
 
 fn parentEventLogPathAlloc(
@@ -5897,7 +5985,11 @@ fn parentEventLogPathAlloc(
     session_dir: []const u8,
     parent_thread_id: []const u8,
 ) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}.parent.events.ndjson", .{ session_dir, parent_thread_id });
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.parent.events.ndjson",
+        .{ session_dir, parent_thread_id },
+    );
 }
 
 fn startManagedWebsocketServer(
@@ -5976,7 +6068,7 @@ fn connectReviewClient(
 ) !cas.Client {
     _ = codex_version;
     const websocket_connect_timeout_ms: u32 = if (request_deadline_ms) |deadline_ms| blk: {
-        const remaining_ms = deadline_ms - monotonicMilliseconds();
+        const remaining_ms = deadline_ms - monotonicMilliseconds(io);
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
         break :blk @intCast(@min(remaining_ms, 10_000));
     } else 10_000;
@@ -5996,7 +6088,11 @@ fn connectReviewClient(
         .dynamic_tool_response_json = parsed.dynamic_tool_response_json,
         .read_only = parsed.read_only,
         .hook_policy = parsed.hook_policy,
-        .websocket_url = if (transport_kind != null and std.mem.eql(u8, transport_kind.?, "websocket")) websocket_url else null,
+        .websocket_url = if (transport_kind != null and std.mem.eql(
+            u8,
+            transport_kind.?,
+            "websocket",
+        )) websocket_url else null,
         .websocket_connect_timeout_ms = websocket_connect_timeout_ms,
         .request_deadline_ms = request_deadline_ms,
     });
@@ -6139,7 +6235,11 @@ fn persistTerminalReviewResult(record: *SessionRecord, status: ReviewStatus) voi
     record.terminal_review_result_json = status.review_result_json;
 }
 
-fn applyRecordedStatusOverlay(allocator: std.mem.Allocator, record: SessionRecord, status: *ReviewStatus) !void {
+fn applyRecordedStatusOverlay(
+    allocator: std.mem.Allocator,
+    record: SessionRecord,
+    status: *ReviewStatus,
+) !void {
     if (std.mem.eql(u8, record.last_observed_status, "interruptRequested") and
         std.mem.eql(u8, status.turn_status, "inProgress"))
     {
@@ -6166,14 +6266,24 @@ const LoadedSessionRecord = struct {
     }
 };
 
-fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8) !LoadedSessionRecord {
+fn loadSessionRecord(
+    allocator: std.mem.Allocator,
+    review_thread_id: []const u8,
+) !LoadedSessionRecord {
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
-    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
+    const record_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.json",
+        .{ session_dir, review_thread_id },
+    );
     return loadOwnedSessionRecordPath(allocator, record_path);
 }
 
-fn loadSelectedSessionRecord(allocator: std.mem.Allocator, parsed: ParsedArgs) !LoadedSessionRecord {
+fn loadSelectedSessionRecord(
+    allocator: std.mem.Allocator,
+    parsed: ParsedArgs,
+) !LoadedSessionRecord {
     if (parsed.receipt_paths.len == 1) {
         const record_path = try absoluteInputPathAlloc(allocator, parsed.receipt_paths[0]);
         return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
@@ -6193,14 +6303,20 @@ fn absoluteInputPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]con
     const expanded = try core_path.expandHomePath(allocator, path);
     errdefer allocator.free(expanded);
     if (std.fs.path.isAbsolute(expanded)) return expanded;
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
     allocator.free(expanded);
     return absolute;
 }
 
-fn loadOwnedSessionRecordPath(allocator: std.mem.Allocator, record_path: []const u8) !LoadedSessionRecord {
+fn loadOwnedSessionRecordPath(
+    allocator: std.mem.Allocator,
+    record_path: []const u8,
+) !LoadedSessionRecord {
     errdefer allocator.free(record_path);
     const raw = try durable_store.readRegularFileNoSymlink(allocator, record_path, 1024 * 1024);
     errdefer allocator.free(raw);
@@ -6229,86 +6345,74 @@ fn loadOwnedSessionRecordPath(allocator: std.mem.Allocator, record_path: []const
     };
 }
 
+fn validateSessionTerminalFailure(record: SessionRecord) !void {
+    const present = record.terminal_failure_code != null or
+        record.terminal_failure_hint != null or record.terminal_failure_at_unix_s != null;
+    if (!present) return;
+    const code = nonEmptyOptional(record.terminal_failure_code) orelse
+        return error.InvalidSessionRecord;
+    const hint = nonEmptyOptional(record.terminal_failure_hint) orelse
+        return error.InvalidSessionRecord;
+    const terminalized_at = record.terminal_failure_at_unix_s orelse
+        return error.InvalidSessionRecord;
+    _ = terminalReviewOwnerFailure(code) orelse return error.InvalidSessionRecord;
+    // Failure codes carry identity; diagnostic hint copy may change across releases.
+    if (hint.len == 0 or terminalized_at <= 0) return error.InvalidSessionRecord;
+}
+
+fn validateSessionRequiredStrings(record: SessionRecord) !void {
+    const required = [_]?[]const u8{
+        record.store_root,            record.repo_root,          record.codex_thread_id,
+        record.resolved_codex_path,   record.transport_kind,     record.transport_selection_reason,
+        record.parent_thread_id,      record.review_thread_id,   record.review_turn_id,
+        record.event_log_path,        record.codex_version,      record.codex_binary_digest,
+        record.compatibility_verdict, record.base_sha,           record.head_sha,
+        record.target_fingerprint,    record.accountFingerprint, record.managed_server_listen_url,
+    };
+    for (required) |value| {
+        if (nonEmptyOptional(value) == null) return error.InvalidSessionRecord;
+    }
+}
+
+fn validateSessionRecordFields(record: SessionRecord) !void {
+    try validateSessionRequiredStrings(record);
+    try validateSessionTerminalFailure(record);
+    const code_mode_complete = (record.code_mode_host_redacted == null and
+        record.code_mode_host_digest == null) or
+        (nonEmptyOptional(record.code_mode_host_redacted) != null and
+            nonEmptyOptional(record.code_mode_host_digest) != null);
+    if (record.schema_version != 4 or
+        !std.fs.path.isAbsolute(record.store_root.?) or
+        !std.fs.path.isAbsolute(record.repo_root.?) or
+        !std.fs.path.isAbsolute(record.cwd) or
+        !std.mem.eql(u8, record.store_scope orelse "", "repo-local") or
+        !std.mem.eql(u8, record.cwd, record.repo_root.?) or
+        !std.mem.eql(u8, record.delivery, "detached") or
+        !std.mem.eql(u8, record.transport_kind.?, "websocket") or
+        !std.mem.eql(
+            u8,
+            record.transport_selection_reason.?,
+            "detached_review_requires_cross_process_truth",
+        ) or
+        !reviewRecordContractSupported(record.app_server_contract_id) or
+        !code_mode_complete or
+        record.managed_server_pid == null or record.managed_server_pid.? == 0 or
+        record.orphan_ttl_seconds == null or record.orphan_ttl_seconds.? == 0)
+    {
+        return error.InvalidSessionRecord;
+    }
+}
+
 fn validateCurrentSessionRecordAlloc(
     allocator: std.mem.Allocator,
     record_path: []const u8,
     record: SessionRecord,
 ) !void {
-    const store_root = nonEmptyOptional(record.store_root) orelse
-        return error.InvalidSessionRecord;
-    const repo_root = nonEmptyOptional(record.repo_root) orelse
-        return error.InvalidSessionRecord;
-    const codex_thread_id = nonEmptyOptional(record.codex_thread_id) orelse
-        return error.InvalidSessionRecord;
-    const resolved_codex_path = nonEmptyOptional(record.resolved_codex_path) orelse
-        return error.InvalidSessionRecord;
-    const transport_kind = nonEmptyOptional(record.transport_kind) orelse
-        return error.InvalidSessionRecord;
-    const transport_reason = nonEmptyOptional(record.transport_selection_reason) orelse
-        return error.InvalidSessionRecord;
-    const terminal_failure_fields_present = record.terminal_failure_code != null or
-        record.terminal_failure_hint != null or record.terminal_failure_at_unix_s != null;
-    const code_mode_identity_complete = (record.code_mode_host_redacted == null and
-        record.code_mode_host_digest == null) or
-        (nonEmptyOptional(record.code_mode_host_redacted) != null and
-            nonEmptyOptional(record.code_mode_host_digest) != null);
-    if (terminal_failure_fields_present) {
-        const code = nonEmptyOptional(record.terminal_failure_code) orelse
-            return error.InvalidSessionRecord;
-        const hint = nonEmptyOptional(record.terminal_failure_hint) orelse
-            return error.InvalidSessionRecord;
-        const terminalized_at = record.terminal_failure_at_unix_s orelse
-            return error.InvalidSessionRecord;
-        _ = terminalReviewOwnerFailure(code) orelse
-            return error.InvalidSessionRecord;
-        // The stable failure code is semantic identity. Hint text is durable
-        // diagnostic copy and may differ across compatible releases.
-        if (hint.len == 0 or terminalized_at <= 0) {
-            return error.InvalidSessionRecord;
-        }
-    }
-    _ = codex_thread_id;
-    _ = resolved_codex_path;
-
-    if (record.schema_version != 4 or
-        !std.fs.path.isAbsolute(store_root) or
-        !std.fs.path.isAbsolute(repo_root) or
-        !std.fs.path.isAbsolute(record.cwd) or
-        !std.mem.eql(u8, record.store_scope orelse "", "repo-local") or
-        !std.mem.eql(u8, record.cwd, repo_root) or
-        !std.mem.eql(u8, record.delivery, "detached") or
-        !std.mem.eql(u8, transport_kind, "websocket") or
-        !std.mem.eql(
-            u8,
-            transport_reason,
-            "detached_review_requires_cross_process_truth",
-        ) or
-        nonEmptyOptional(record.parent_thread_id) == null or
-        nonEmptyOptional(record.review_thread_id) == null or
-        nonEmptyOptional(record.review_turn_id) == null or
-        nonEmptyOptional(record.event_log_path) == null or
-        nonEmptyOptional(record.codex_version) == null or
-        nonEmptyOptional(record.codex_binary_digest) == null or
-        !reviewRecordContractSupported(record.app_server_contract_id) or
-        !code_mode_identity_complete or
-        nonEmptyOptional(record.compatibility_verdict) == null or
-        nonEmptyOptional(record.base_sha) == null or
-        nonEmptyOptional(record.head_sha) == null or
-        nonEmptyOptional(record.target_fingerprint) == null or
-        nonEmptyOptional(record.accountFingerprint) == null or
-        nonEmptyOptional(record.managed_server_listen_url) == null or
-        record.managed_server_pid == null or
-        record.managed_server_pid.? == 0 or
-        record.orphan_ttl_seconds == null or
-        record.orphan_ttl_seconds.? == 0)
-    {
-        return error.InvalidSessionRecord;
-    }
-
+    try validateSessionRecordFields(record);
     const session_dir = try std.fmt.allocPrint(
         allocator,
         "{s}/review_sessions",
-        .{store_root},
+        .{record.store_root.?},
     );
     defer allocator.free(session_dir);
     const expected_record_path = try std.fmt.allocPrint(
@@ -6342,8 +6446,15 @@ fn latestSessionRecordPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return latestSessionRecordPathInDirAlloc(allocator, session_dir);
 }
 
-fn latestSessionRecordPathInDirAlloc(allocator: std.mem.Allocator, session_dir: []const u8) ![]const u8 {
-    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), session_dir, .{ .iterate = true });
+fn latestSessionRecordPathInDirAlloc(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+) ![]const u8 {
+    var dir = try std.Io.Dir.openDirAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        session_dir,
+        .{ .iterate = true },
+    );
     defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var best_name: ?[]u8 = null;
@@ -6352,11 +6463,22 @@ fn latestSessionRecordPathInDirAlloc(allocator: std.mem.Allocator, session_dir: 
     var it = dir.iterate();
     while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (!isReviewSessionRecordName(entry.name, entry.kind)) continue;
-        const stat = dir.statFile(std.Io.Threaded.global_single_threaded.io(), entry.name, .{ .follow_symlinks = false }) catch continue;
+        const stat = dir.statFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            entry.name,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
         if (stat.kind != .file) continue;
         const replace = if (best_mtime) |mtime|
             stat.mtime.nanoseconds > mtime.nanoseconds or
-                (stat.mtime.nanoseconds == mtime.nanoseconds and std.mem.order(u8, entry.name, best_name.?) == .gt)
+                (stat.mtime.nanoseconds == mtime.nanoseconds and std.mem.order(
+                    u8,
+                    entry.name,
+                    best_name.?,
+                ) == .gt)
         else
             true;
         if (!replace) continue;
@@ -6423,7 +6545,11 @@ fn repoRootForCwdAlloc(allocator: std.mem.Allocator, cwd: []const u8) !?[]const 
     return repo_root;
 }
 
-fn hashedAccountFingerprintAlloc(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) ![]const u8 {
+fn hashedAccountFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    value: []const u8,
+) ![]const u8 {
     const tagged = try std.fmt.allocPrint(allocator, "account.{s}:{s}", .{ tag, value });
     defer allocator.free(tagged);
     const digest = try sha256HexBareAlloc(allocator, tagged);
@@ -6431,7 +6557,10 @@ fn hashedAccountFingerprintAlloc(allocator: std.mem.Allocator, tag: []const u8, 
     return std.fmt.allocPrint(allocator, "acct:{s}", .{digest});
 }
 
-fn accountPrincipalFromJsonAlloc(allocator: std.mem.Allocator, account_json: []const u8) !AccountPrincipalEvidence {
+fn accountPrincipalFromJsonAlloc(
+    allocator: std.mem.Allocator,
+    account_json: []const u8,
+) !AccountPrincipalEvidence {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, account_json, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -6460,10 +6589,18 @@ fn accountPrincipalFromJsonAlloc(allocator: std.mem.Allocator, account_json: []c
         }
         if (jsonStringField(account_obj, "type")) |account_type| {
             if (jsonStringField(account_obj, "planType")) |plan_type| {
-                const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ account_type, plan_type });
+                const combined = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}:{s}",
+                    .{ account_type, plan_type },
+                );
                 defer allocator.free(combined);
                 return .{
-                    .fingerprint = try hashedAccountFingerprintAlloc(allocator, "type-plan", combined),
+                    .fingerprint = try hashedAccountFingerprintAlloc(
+                        allocator,
+                        "type-plan",
+                        combined,
+                    ),
                     .reduced_protection = true,
                 };
             }
@@ -6475,12 +6612,18 @@ fn accountPrincipalFromJsonAlloc(allocator: std.mem.Allocator, account_json: []c
     };
 }
 
-fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: []const u8) ![]const u8 {
+fn accountFingerprintFromJsonAlloc(
+    allocator: std.mem.Allocator,
+    account_json: []const u8,
+) ![]const u8 {
     const principal = try accountPrincipalFromJsonAlloc(allocator, account_json);
     return principal.fingerprint;
 }
 
-fn readAccountPrincipalAlloc(allocator: std.mem.Allocator, client: *cas.Client) !AccountPrincipalEvidence {
+fn readAccountPrincipalAlloc(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+) !AccountPrincipalEvidence {
     const account_json = client.requestJson(
         "account/read",
         "{\"refreshToken\":false}",
@@ -6538,7 +6681,10 @@ fn currentCodexThreadIdAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return allocator.dupe(u8, "reduced-unspecified");
 }
 
-fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity) ![]const u8 {
+fn canonicalReviewTuplePayloadAlloc(
+    allocator: std.mem.Allocator,
+    tuple: ReviewTupleIdentity,
+) ![]const u8 {
     const base_payload = try std.fmt.allocPrint(
         allocator,
         "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\n" ++
@@ -6726,6 +6872,48 @@ fn recordTerminalOwnerFailure(
     return terminalReviewOwnerFailure(lock_code);
 }
 
+fn replayNormalizedRecordAndExit(
+    allocator: std.mem.Allocator,
+    json_mode: bool,
+    record: SessionRecord,
+    record_path: []const u8,
+    identity: TargetIdentity,
+) !void {
+    const normalized = try normalizeReceiptFromPathAlloc(
+        allocator,
+        record_path,
+        true,
+        .{
+            .requested_identity = identity,
+            .requested_identity_required = true,
+        },
+    );
+    defer normalized.deinit(allocator);
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    const stdout = &stdout_writer.interface;
+    if (json_mode) {
+        try writeReceiptObject(stdout, normalized);
+        try stdout.writeAll("\n");
+    } else {
+        try stdout.print(
+            "cas review wait\nreview thread: {s}\nstatus: {s}\nfindings: {d}\nrecord: {s}\n",
+            .{
+                record.review_thread_id,
+                normalized.status,
+                normalized.finding_count,
+                record_path,
+            },
+        );
+    }
+    // A completed review is a successful wait operation even when its
+    // semantic verdict contains findings. Review credit is adjudicated by
+    // the caller; replay must preserve the live wait command's exit law.
+    std.process.exit(0);
+}
+
 fn replayTerminalRecordAndExit(
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -6740,39 +6928,7 @@ fn replayTerminalRecordAndExit(
     );
     defer loaded.deinit(allocator);
     if (std.mem.eql(u8, loaded.record.state, "normalized")) {
-        const normalized = try normalizeReceiptFromPathAlloc(
-            allocator,
-            record_path,
-            true,
-            .{
-                .requested_identity = identity,
-                .requested_identity_required = true,
-            },
-        );
-        defer normalized.deinit(allocator);
-        var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
-            &.{},
-        );
-        const stdout = &stdout_writer.interface;
-        if (json_mode) {
-            try writeReceiptObject(stdout, normalized);
-            try stdout.writeAll("\n");
-        } else {
-            try stdout.print(
-                "cas review wait\nreview thread: {s}\nstatus: {s}\nfindings: {d}\nrecord: {s}\n",
-                .{
-                    record.review_thread_id,
-                    normalized.status,
-                    normalized.finding_count,
-                    record_path,
-                },
-            );
-        }
-        // A completed review is a successful wait operation even when its
-        // semantic verdict contains findings. Review credit is adjudicated by
-        // the caller; replay must preserve the live wait command's exit law.
-        std.process.exit(0);
+        try replayNormalizedRecordAndExit(allocator, json_mode, record, record_path, identity);
     }
 
     const terminal = std.mem.eql(u8, loaded.record.state, "terminal") or
@@ -6920,65 +7076,72 @@ fn terminalizeDeadWorkflowBoundOwner(
     try writeReviewTupleLock(allocator, loaded.path, terminal_lock);
 }
 
+fn persistRecordlessDeadOwnerRecovery(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+    lock: ReviewTupleLock,
+) ![]const u8 {
+    const failure = workflowDeadOwnerFailureInfo(lock);
+    const terminal_state = if (workflowDeadOwnerAttemptExists(lock))
+        "terminal"
+    else
+        "pre_review_start_failed";
+    const terminal = withReviewTupleLockState(
+        lock,
+        terminal_state,
+        unixSeconds(),
+        failure.code,
+        lock.reviewThreadId,
+        lock.reviewTurnId,
+        null,
+        lock.eventLogPath,
+    );
+    const terminal_json = try stringifyAnyAlloc(allocator, terminal);
+    defer allocator.free(terminal_json);
+    const terminal_digest = try sha256HexAlloc(allocator, terminal_json);
+    defer allocator.free(terminal_digest);
+    const predecessor_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.predecessor-{s}",
+        .{ lock_path, terminal_digest["sha256:".len..] },
+    );
+    errdefer allocator.free(predecessor_path);
+    writeReviewTupleLockExclusive(
+        allocator,
+        predecessor_path,
+        terminal,
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            var existing = (try loadReviewTupleLockArtifact(
+                allocator,
+                predecessor_path,
+                false,
+            )) orelse return error.InvalidReviewTupleLockBinding;
+            defer existing.deinit(allocator);
+            if (!std.mem.eql(u8, existing.record.tupleHash, terminal.tupleHash) or
+                existing.record.ownerPid != terminal.ownerPid or
+                existing.record.createdAtUnixS != terminal.createdAtUnixS or
+                !std.mem.eql(u8, existing.record.state, terminal.state) or
+                !std.mem.eql(
+                    u8,
+                    existing.record.lastFailureCode orelse "",
+                    terminal.lastFailureCode orelse "",
+                )) return error.InvalidReviewTupleLockBinding;
+        },
+        else => return err,
+    };
+    try writeReviewTupleLock(allocator, lock_path, terminal);
+    return predecessor_path;
+}
+
 fn persistDeadOwnerRecoveryEvidence(
     allocator: std.mem.Allocator,
     lock_path: []const u8,
     lock: ReviewTupleLock,
     target_identity: TargetIdentity,
 ) !?[]const u8 {
-    const record_path = lock.recordPath orelse {
-        const failure = workflowDeadOwnerFailureInfo(lock);
-        const terminal_state = if (workflowDeadOwnerAttemptExists(lock))
-            "terminal"
-        else
-            "pre_review_start_failed";
-        const terminal = withReviewTupleLockState(
-            lock,
-            terminal_state,
-            unixSeconds(),
-            failure.code,
-            lock.reviewThreadId,
-            lock.reviewTurnId,
-            null,
-            lock.eventLogPath,
-        );
-        const terminal_json = try stringifyAnyAlloc(allocator, terminal);
-        defer allocator.free(terminal_json);
-        const terminal_digest = try sha256HexAlloc(allocator, terminal_json);
-        defer allocator.free(terminal_digest);
-        const predecessor_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}.predecessor-{s}",
-            .{ lock_path, terminal_digest["sha256:".len..] },
-        );
-        errdefer allocator.free(predecessor_path);
-        writeReviewTupleLockExclusive(
-            allocator,
-            predecessor_path,
-            terminal,
-        ) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                var existing = (try loadReviewTupleLockArtifact(
-                    allocator,
-                    predecessor_path,
-                    false,
-                )) orelse return error.InvalidReviewTupleLockBinding;
-                defer existing.deinit(allocator);
-                if (!std.mem.eql(u8, existing.record.tupleHash, terminal.tupleHash) or
-                    existing.record.ownerPid != terminal.ownerPid or
-                    existing.record.createdAtUnixS != terminal.createdAtUnixS or
-                    !std.mem.eql(u8, existing.record.state, terminal.state) or
-                    !std.mem.eql(
-                        u8,
-                        existing.record.lastFailureCode orelse "",
-                        terminal.lastFailureCode orelse "",
-                    )) return error.InvalidReviewTupleLockBinding;
-            },
-            else => return err,
-        };
-        try writeReviewTupleLock(allocator, lock_path, terminal);
-        return predecessor_path;
-    };
+    const record_path = lock.recordPath orelse
+        return try persistRecordlessDeadOwnerRecovery(allocator, lock_path, lock);
     var loaded_record = try loadOwnedSessionRecordPath(
         allocator,
         try allocator.dupe(u8, record_path),
@@ -7039,7 +7202,11 @@ fn reviewTupleLocksDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
 fn reviewTupleLockPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8) ![]const u8 {
     const locks_dir = try reviewTupleLocksDirAlloc(allocator);
     defer allocator.free(locks_dir);
-    const bare_hash = if (std.mem.startsWith(u8, tuple_hash, "sha256:")) tuple_hash["sha256:".len..] else tuple_hash;
+    const bare_hash = if (std.mem.startsWith(
+        u8,
+        tuple_hash,
+        "sha256:",
+    )) tuple_hash["sha256:".len..] else tuple_hash;
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ locks_dir, bare_hash });
 }
 
@@ -7061,14 +7228,21 @@ fn reviewTupleLockLegacyRewriteClaimExpired(
     allocator: std.mem.Allocator,
     claim_path: []const u8,
     now_s: i64,
-) bool {
+) !bool {
     const raw = durable_store.readRegularFileNoSymlink(
         allocator,
         claim_path,
         4096,
-    ) catch return true;
+    ) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
     defer allocator.free(raw);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |value| value,
@@ -7108,7 +7282,10 @@ const ReviewTupleRewriteLease = struct {
                 std.Io.Threaded.global_single_threaded.io(),
                 claim_path,
             ) catch |err| switch (err) {
-                else => {},
+                error.FileNotFound => {},
+                else => std.log.warn("review legacy claim cleanup failed for {s}: {s}", .{
+                    claim_path, @errorName(err),
+                }),
             };
             allocator.free(claim_path);
         }
@@ -7116,6 +7293,30 @@ const ReviewTupleRewriteLease = struct {
         allocator.free(self.path);
     }
 };
+
+const review_lease_race_attempts_max: u32 = 64;
+const review_lease_retry_ms: u32 = 10;
+
+fn openReviewLeaseFile(io: std.Io, path: []const u8) !?std.Io.File {
+    return std.Io.Dir.openFileAbsolute(io, path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .follow_symlinks = false,
+    }) catch |open_err| switch (open_err) {
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(io, path, .{
+            .read = true,
+            .truncate = false,
+            .exclusive = true,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |create_err| switch (create_err) {
+            error.PathAlreadyExists => null,
+            else => return create_err,
+        },
+        else => return open_err,
+    };
+}
 
 fn tryAcquireReviewOwnerLeaseAlloc(
     allocator: std.mem.Allocator,
@@ -7125,38 +7326,23 @@ fn tryAcquireReviewOwnerLeaseAlloc(
     errdefer allocator.free(lease_path);
     try ensureParentPath(lease_path);
     const io = std.Io.Threaded.global_single_threaded.io();
-    while (true) { // tiger: event-loop
-        const file = std.Io.Dir.openFileAbsolute(io, lease_path, .{
-            .mode = .read_write,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
-            .follow_symlinks = false,
-        }) catch |open_err| switch (open_err) {
-            error.FileNotFound => std.Io.Dir.createFileAbsolute(io, lease_path, .{
-                .read = true,
-                .truncate = false,
-                .exclusive = true,
-                .lock = .exclusive,
-                .lock_nonblocking = true,
-            }) catch |create_err| switch (create_err) {
-                error.PathAlreadyExists => continue,
-                error.WouldBlock => {
-                    allocator.free(lease_path);
-                    return null;
-                },
-                else => return create_err,
-            },
+    for (0..review_lease_race_attempts_max) |_| {
+        const file = openReviewLeaseFile(io, lease_path) catch |err| switch (err) {
             error.WouldBlock => {
                 allocator.free(lease_path);
                 return null;
             },
-            else => return open_err,
+            else => return err,
         };
-        return .{ .file = file, .path = lease_path };
+        if (file) |opened| return .{ .file = opened, .path = lease_path };
     }
+    return error.PathAlreadyExists;
 }
 
-fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: ReviewTupleLock) !bool {
+fn reviewTupleLockWorkflowBindingValidAlloc(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+) !bool {
     const codex_thread_id = lock.codexThreadId orelse return false;
     const current_lock = std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version);
     const previous_lock = std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version);
@@ -7198,6 +7384,14 @@ fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: 
         // authority-bearing field.
         return false;
     }
+    return reviewTupleLockHashValidAlloc(allocator, lock, codex_thread_id);
+}
+
+fn reviewTupleLockHashValidAlloc(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+    codex_thread_id: []const u8,
+) !bool {
     const workflow_binding_digest = if (lock.workflowBinding) |binding| blk: {
         try validateWorkflowBinding(binding);
         const canonical = try stringifyAnyAlloc(allocator, binding);
@@ -7241,12 +7435,21 @@ fn loadReviewTupleLockArtifact(
     path: []const u8,
     require_canonical_path: bool,
 ) !?LoadedReviewTupleLock {
-    const raw = durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024) catch |err| switch (err) {
+    const raw = durable_store.readRegularFileNoSymlink(
+        allocator,
+        path,
+        1024 * 1024,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     errdefer allocator.free(raw);
-    const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(
+        ReviewTupleLock,
+        allocator,
+        raw,
+        .{ .ignore_unknown_fields = true },
+    );
     errdefer parsed.deinit();
     if (!try reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value) or
         (require_canonical_path and
@@ -7392,7 +7595,11 @@ fn requestReviewStart(
     return client.requestJson("review/start", params_json);
 }
 
-fn writeReviewTupleLock(allocator: std.mem.Allocator, path: []const u8, lock: ReviewTupleLock) !void {
+fn writeReviewTupleLock(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    lock: ReviewTupleLock,
+) !void {
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
     const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
@@ -7400,12 +7607,62 @@ fn writeReviewTupleLock(allocator: std.mem.Allocator, path: []const u8, lock: Re
     try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
-fn writeReviewTupleLockExclusive(allocator: std.mem.Allocator, path: []const u8, lock: ReviewTupleLock) !void {
+fn writeReviewTupleLockExclusive(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    lock: ReviewTupleLock,
+) !void {
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
     const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
     defer allocator.free(payload);
     try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
+}
+
+fn waitReviewLeaseRetry(io: std.Io, started_ms: i64, wait_ms: u32) !void {
+    const elapsed_ms = monotonicMilliseconds(io) - started_ms;
+    if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
+    try std.Io.sleep(
+        io,
+        .fromMilliseconds(@min(@as(i64, review_lease_retry_ms), @as(i64, wait_ms) - elapsed_ms)),
+        .awake,
+    );
+}
+
+fn tryAcquireLegacyReviewClaim(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    claim_path: []const u8,
+    stale_claim_removed: *bool,
+) !enum { acquired, reclaimed, occupied } {
+    const claim = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n",
+        .{ currentProcessId(), unixSeconds() },
+    );
+    defer allocator.free(claim);
+    durable_store.writeTextCreateNew(
+        allocator,
+        claim_path,
+        claim,
+        .{ .reject_symlinks = true },
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            if (stale_claim_removed.* or
+                !try reviewTupleLockLegacyRewriteClaimExpired(allocator, claim_path, unixSeconds()))
+            {
+                return .occupied;
+            }
+            std.Io.Dir.deleteFileAbsolute(io, claim_path) catch |delete_err| switch (delete_err) {
+                error.FileNotFound => {},
+                else => return delete_err,
+            };
+            stale_claim_removed.* = true;
+            return .reclaimed;
+        },
+        else => return err,
+    };
+    return .acquired;
 }
 
 fn acquireReviewTupleLockRewriteLeaseWithin(
@@ -7422,115 +7679,70 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
         null;
     errdefer if (legacy_claim_path) |path| allocator.free(path);
     try ensureParentPath(lease_path);
-
-    const started_ms = monotonicMilliseconds();
-    var stale_legacy_claim_removed = false;
-    while (true) {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const file = std.Io.Dir.openFileAbsolute(io, lease_path, .{
-            .mode = .read_write,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
-            .follow_symlinks = false,
-        }) catch |open_err| switch (open_err) {
-            error.FileNotFound => std.Io.Dir.createFileAbsolute(io, lease_path, .{
-                .read = true,
-                .truncate = false,
-                .exclusive = true,
-                .lock = .exclusive,
-                .lock_nonblocking = true,
-            }) catch |create_err| switch (create_err) {
-                error.PathAlreadyExists => continue,
-                error.WouldBlock => {
-                    const elapsed_ms = monotonicMilliseconds() - started_ms;
-                    if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
-                    std.Io.sleep(
-                        io,
-                        .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
-                        .awake,
-                    ) catch |sleep_err| switch (sleep_err) {
-                        else => {},
-                    };
-                    continue;
-                },
-                else => return create_err,
-            },
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const started_ms = monotonicMilliseconds(io);
+    var stale_claim_removed = false;
+    // Deadline polling also has a count bound for repeated create/remove races.
+    const attempts_max = review_lease_race_attempts_max + wait_ms / review_lease_retry_ms;
+    for (0..attempts_max) |_| {
+        const file = (openReviewLeaseFile(io, lease_path) catch |err| switch (err) {
             error.WouldBlock => {
-                const elapsed_ms = monotonicMilliseconds() - started_ms;
-                if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
-                std.Io.sleep(
-                    io,
-                    .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
-                    .awake,
-                ) catch |sleep_err| switch (sleep_err) {
-                    else => {},
-                };
+                try waitReviewLeaseRetry(io, started_ms, wait_ms);
                 continue;
             },
-            else => return open_err,
-        };
+            else => return err,
+        }) orelse continue;
+        var file_owned = true;
+        defer if (file_owned) file.close(io);
         if (legacy_claim_path) |claim_path| {
-            const legacy_claim = try std.fmt.allocPrint(
+            const claim = try tryAcquireLegacyReviewClaim(
                 allocator,
-                "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n",
-                .{ currentProcessId(), unixSeconds() },
-            );
-            defer allocator.free(legacy_claim);
-            durable_store.writeTextCreateNew(
-                allocator,
+                io,
                 claim_path,
-                legacy_claim,
-                .{ .reject_symlinks = true },
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    file.close(io);
-                    if (!stale_legacy_claim_removed and
-                        reviewTupleLockLegacyRewriteClaimExpired(
-                            allocator,
-                            claim_path,
-                            unixSeconds(),
-                        ))
-                    {
-                        std.Io.Dir.deleteFileAbsolute(
-                            io,
-                            claim_path,
-                        ) catch |delete_err| switch (delete_err) {
-                            error.FileNotFound => {},
-                            else => return delete_err,
-                        };
-                        stale_legacy_claim_removed = true;
-                        continue;
-                    }
-                    const elapsed_ms = monotonicMilliseconds() - started_ms;
-                    if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
-                    std.Io.sleep(
-                        io,
-                        .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
-                        .awake,
-                    ) catch |sleep_err| switch (sleep_err) {
-                        else => {},
-                    };
-                    continue;
-                },
-                else => {
-                    file.close(io);
-                    return err;
-                },
-            };
+                &stale_claim_removed,
+            );
+            if (claim != .acquired) {
+                file.close(io);
+                file_owned = false;
+                if (claim == .occupied) try waitReviewLeaseRetry(io, started_ms, wait_ms);
+                continue;
+            }
         }
+        file_owned = false;
         return .{
             .file = file,
             .path = lease_path,
             .legacy_claim_path = legacy_claim_path,
         };
     }
+    return error.PathAlreadyExists;
 }
 
-fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8) ReviewTupleLockAction {
-    return reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, false);
+fn reviewTupleLockAction(
+    action_name: []const u8,
+    existing: ?ReviewTupleLock,
+    now_s: i64,
+    override_reason: ?[]const u8,
+    fresh_attempt_reason: ?[]const u8,
+) ReviewTupleLockAction {
+    return reviewTupleLockActionWithProbe(
+        action_name,
+        existing,
+        now_s,
+        override_reason,
+        fresh_attempt_reason,
+        false,
+    );
 }
 
-fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8, dead_transport_proven: bool) ReviewTupleLockAction {
+fn reviewTupleLockActionWithProbe(
+    action_name: []const u8,
+    existing: ?ReviewTupleLock,
+    now_s: i64,
+    override_reason: ?[]const u8,
+    fresh_attempt_reason: ?[]const u8,
+    dead_transport_proven: bool,
+) ReviewTupleLockAction {
     const lock = existing orelse return .create;
     const current_lock = std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version);
     const previous_lock = std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version);
@@ -7560,17 +7772,29 @@ fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupl
         return if (override_reason != null) .takeover_with_override else .block_stale;
     }
     if (std.mem.eql(u8, lock.state, "review_started") or std.mem.eql(u8, lock.state, "waiting")) {
-        if (std.mem.eql(u8, action_name, "run") and dead_transport_proven and reviewTupleLockReplaceableDeadFailure(lock)) return .auto_replace_dead_transport;
+        if (std.mem.eql(u8, action_name, "run") and dead_transport_proven and
+            reviewTupleLockReplaceableDeadFailure(lock))
+        {
+            return .auto_replace_dead_transport;
+        }
         return if (lock.reviewThreadId != null) .return_existing else .block_active;
     }
-    if (std.mem.eql(u8, lock.state, "pre_review_start_failed")) return .retry_after_pre_review_failure;
+    if (std.mem.eql(
+        u8,
+        lock.state,
+        "pre_review_start_failed",
+    )) return .retry_after_pre_review_failure;
     if (std.mem.eql(u8, lock.state, "starting_review")) return .block_active;
     return .block_invalid;
 }
 
 fn normalizedReceiptReusableTerminal(receipt: NormalizedReceipt) bool {
     if (!receipt.tuple_verdict_exists) return false;
-    if (!(std.mem.eql(u8, receipt.status, "clean") or std.mem.eql(u8, receipt.status, "findings"))) return false;
+    if (!(std.mem.eql(
+        u8,
+        receipt.status,
+        "clean",
+    ) or std.mem.eql(u8, receipt.status, "findings"))) return false;
     return casRerPrincipalProofUsable(receipt);
 }
 
@@ -7582,7 +7806,11 @@ fn terminalLockNeedsFreshAttempt(
 ) bool {
     if (!(std.mem.eql(u8, action_name, "run") or
         std.mem.eql(u8, action_name, "start"))) return false;
-    if (!(std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized"))) return false;
+    if (!(std.mem.eql(
+        u8,
+        lock.state,
+        "terminal",
+    ) or std.mem.eql(u8, lock.state, "normalized"))) return false;
     const record_path = lock.recordPath orelse return true;
     const normalized = normalizeReceiptFromPathAlloc(allocator, record_path, true, .{
         .requested_identity = target_identity,
@@ -7637,103 +7865,95 @@ fn ensureReviewTuplePredecessorExited(
     );
 }
 
+fn reviewShutdownReceiptPresent(
+    allocator: std.mem.Allocator,
+    receipt_path: []const u8,
+    receipt_token: []const u8,
+) !bool {
+    const raw = durable_store.readRegularFileNoSymlink(
+        allocator,
+        receipt_path,
+        4096,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidReviewTupleLockBinding,
+    };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidReviewTupleLockBinding,
+    };
+    if (!std.mem.eql(u8, jsonStringField(object, "schema") orelse "", "CAS-WDR-v1") or
+        !std.mem.eql(u8, jsonStringField(object, "token") orelse "", receipt_token))
+    {
+        return error.InvalidReviewTupleLockBinding;
+    }
+    return true;
+}
+
+fn waitReviewTuplePredecessorExit(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+    timeout_ms: u32,
+    incarnation_status: ?bool,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const receipt_token = if (lock.managedServerShutdownReceiptPath != null)
+        lock.managedServerShutdownReceiptToken orelse return error.InvalidReviewTupleLockBinding
+    else
+        null;
+    const started_ms = monotonicMilliseconds(io);
+    // Each incomplete poll sleeps ten milliseconds; permit the first and final observations.
+    const polls_max = timeout_ms / 10 + 2;
+    for (0..polls_max) |_| {
+        if (lock.managedServerShutdownReceiptPath) |path| {
+            if (try reviewShutdownReceiptPresent(allocator, path, receipt_token.?)) {
+                if (incarnation_status == false) return error.ReviewPredecessorStillAlive;
+                return;
+            }
+        }
+        if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) return;
+        if (monotonicMilliseconds(io) - started_ms >= timeout_ms) {
+            return error.ReviewPredecessorStillAlive;
+        }
+        try std.Io.sleep(
+            io,
+            .fromMilliseconds(10),
+            .awake,
+        );
+    }
+    return error.ReviewPredecessorStillAlive;
+}
+
 fn ensureReviewTuplePredecessorExitedWithin(
     allocator: std.mem.Allocator,
     lock: ReviewTupleLock,
     timeout_ms: u32,
 ) !void {
-    const incarnation_status = try reviewTuplePredecessorIncarnationExitedAlloc(
-        allocator,
-        lock,
-    );
+    const incarnation_status = try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock);
     if (incarnation_status == true) return;
-    if (lock.managedServerShutdownReceiptPath) |receipt_path| {
-        const receipt_token = lock.managedServerShutdownReceiptToken orelse
-            return error.InvalidReviewTupleLockBinding;
-        const started_ms = monotonicMilliseconds();
-        while (true) { // tiger: event-loop
-            const raw = durable_store.readRegularFileNoSymlink(
-                allocator,
-                receipt_path,
-                4096,
-            ) catch null;
-            if (raw) |payload| {
-                defer allocator.free(payload);
-                var parsed = std.json.parseFromSlice(
-                    std.json.Value,
-                    allocator,
-                    payload,
-                    .{},
-                ) catch return error.InvalidReviewTupleLockBinding;
-                defer parsed.deinit();
-                const object = switch (parsed.value) {
-                    .object => |value| value,
-                    else => return error.InvalidReviewTupleLockBinding,
-                };
-                if (!std.mem.eql(
-                    u8,
-                    jsonStringField(object, "schema") orelse "",
-                    "CAS-WDR-v1",
-                ) or !std.mem.eql(
-                    u8,
-                    jsonStringField(object, "token") orelse "",
-                    receipt_token,
-                )) return error.InvalidReviewTupleLockBinding;
-                if (incarnation_status == false) {
-                    return error.ReviewPredecessorStillAlive;
-                }
-                return;
-            }
-            if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
-                return;
-            }
-            if (monotonicMilliseconds() - started_ms >= timeout_ms) {
-                return error.ReviewPredecessorStillAlive;
-            }
-            std.Io.sleep(
-                std.Io.Threaded.global_single_threaded.io(),
-                .fromMilliseconds(10),
-                .awake,
-            ) catch |err| switch (err) {
-                else => {},
-            };
-        }
+    if (lock.managedServerShutdownReceiptPath != null or incarnation_status != null) {
+        return waitReviewTuplePredecessorExit(allocator, lock, timeout_ms, incarnation_status);
     }
-
-    if (incarnation_status != null) {
-        const started_ms = monotonicMilliseconds();
-        while (true) { // tiger: event-loop
-            if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
-                return;
-            }
-            if (monotonicMilliseconds() - started_ms >= timeout_ms) {
-                return error.ReviewPredecessorStillAlive;
-            }
-            std.Io.sleep(
-                std.Io.Threaded.global_single_threaded.io(),
-                .fromMilliseconds(10),
-                .awake,
-            ) catch |err| switch (err) {
-                else => {},
-            };
-        }
-    }
-
-    // Existing CAS-RTL-v2 locks predate the stable shutdown receipt. Their
-    // acquired owner lease proves the owner is gone, and the released
-    // watchdog contract has a bounded child-retirement grace. Numeric PID is
-    // diagnostic only and cannot gate authority across PID reuse.
+    // Legacy locks predate stable shutdown receipts. Owner leases prove the owner is gone;
+    // the watchdog has a bounded child-retirement grace, independent of recyclable PIDs.
     const compatibility_wait_ms = cas_websocket.owner_watchdog_shutdown_grace_ms + 100;
-    if (timeout_ms < compatibility_wait_ms) {
-        return error.ReviewPredecessorStillAlive;
-    }
-    std.Io.sleep(
+    if (timeout_ms < compatibility_wait_ms) return error.ReviewPredecessorStillAlive;
+    try std.Io.sleep(
         std.Io.Threaded.global_single_threaded.io(),
         .fromMilliseconds(compatibility_wait_ms),
         .awake,
-    ) catch |err| switch (err) {
-        else => {},
-    };
+    );
 }
 
 fn reviewTuplePredecessorIncarnationExitedAlloc(
@@ -7821,6 +8041,205 @@ fn reviewTupleLockActionMutates(action: ReviewTupleLockAction) bool {
     };
 }
 
+const ReviewTupleDiagnosticVerdict = struct {
+    status: []const u8,
+    reviewAttemptPhase: []const u8,
+    reviewAttemptExists: bool,
+    tupleVerdictExists: bool = false,
+    backendClass: []const u8 = "cas-receipt-normalized",
+    clean: bool = false,
+    findingCount: usize = 0,
+    failureCode: ?[]const u8,
+    failureHint: []const u8,
+    baseSha: ?[]const u8,
+    headSha: ?[]const u8,
+    targetFingerprint: []const u8,
+    reviewThreadId: ?[]const u8,
+    reviewTurnId: ?[]const u8,
+    recordPath: ?[]const u8,
+    eventLogPath: ?[]const u8,
+    findings: [0]std.json.Value = .{},
+};
+
+fn reviewTupleDiagnosticVerdict(
+    tuple: ReviewTupleIdentity,
+    lock: ?ReviewTupleLock,
+    status: []const u8,
+    phase: []const u8,
+    attempt_exists: bool,
+    failure_code: ?[]const u8,
+    hint: []const u8,
+) ReviewTupleDiagnosticVerdict {
+    return .{
+        .status = status,
+        .reviewAttemptPhase = phase,
+        .reviewAttemptExists = attempt_exists,
+        .failureCode = failure_code,
+        .failureHint = hint,
+        .baseSha = tuple.base_sha,
+        .headSha = tuple.head_sha,
+        .targetFingerprint = tuple.target_fingerprint,
+        .reviewThreadId = if (lock) |value| value.reviewThreadId else null,
+        .reviewTurnId = if (lock) |value| value.reviewTurnId else null,
+        .recordPath = if (lock) |value| value.recordPath else null,
+        .eventLogPath = if (lock) |value| value.eventLogPath else null,
+    };
+}
+
+const ExistingReviewTupleOutput = struct {
+    action_name: []const u8,
+    target: TargetRecord,
+    target_identity: TargetIdentity,
+    tuple: ReviewTupleIdentity,
+    lock_path: []const u8,
+    lock: ReviewTupleLock,
+    decision: ReviewTupleLockAction,
+};
+
+const ExistingReviewTupleStatus = struct {
+    phase: []const u8,
+    failure_code: ?[]const u8,
+    hint: []const u8,
+    broker: ?ReviewBrokerDecision,
+};
+
+fn existingReviewTupleStatus(output: ExistingReviewTupleOutput) ExistingReviewTupleStatus {
+    const lock = output.lock;
+    const terminal = std.mem.eql(u8, lock.state, "terminal") or
+        std.mem.eql(u8, lock.state, "normalized");
+    const active_failure: ?FailureInfo = if (output.tuple.workflow_binding != null and !terminal)
+        workflowOwnerActiveFailureInfo()
+    else
+        null;
+    return .{
+        .phase = if (terminal) "review_terminal" else "review_waiting",
+        .failure_code = if (active_failure) |failure| failure.code else null,
+        .hint = if (active_failure) |failure|
+            failure.hint
+        else if (output.decision == .normalize_existing)
+            "tuple lock points to an existing terminal receipt; " ++
+                "normalize that record instead of starting a duplicate review"
+        else
+            "tuple lock points to an existing active review attempt",
+        .broker = if (std.mem.eql(u8, output.action_name, "run")) .{
+            .action = "blocked_live_attempt",
+            .reason = if (output.decision == .normalize_existing)
+                "tuple lock points to an existing terminal receipt, but the receipt could " ++
+                    "not be normalized into a terminal verdict"
+            else
+                "tuple lock points to an existing active review attempt whose liveness " ++
+                    "was not disproven",
+            .reviewThreadId = lock.reviewThreadId,
+            .recordPath = lock.recordPath,
+            .eventLogPath = lock.eventLogPath,
+        } else null,
+    };
+}
+
+fn existingReviewTuplePayloadAlloc(
+    allocator: std.mem.Allocator,
+    output: ExistingReviewTupleOutput,
+    status: ExistingReviewTupleStatus,
+) ![]const u8 {
+    const lock = output.lock;
+    const tuple = output.tuple;
+    return stringifyAnyAlloc(allocator, .{
+        .demo = "cas-review-session",
+        .action = output.action_name,
+        .reviewBrokerDecision = status.broker,
+        .cwd = tuple.repo_realpath,
+        .reviewAttemptPhase = status.phase,
+        .reviewAttemptExists = lock.reviewThreadId != null,
+        .tupleVerdictExists = false,
+        .reviewThreadId = lock.reviewThreadId,
+        .reviewTurnId = lock.reviewTurnId,
+        .target = output.target,
+        .baseSha = tuple.base_sha,
+        .headSha = tuple.head_sha,
+        .targetFingerprint = tuple.target_fingerprint,
+        .resolvedCodexPath = tuple.resolved_codex_path,
+        .resolvedCodexVersion = tuple.resolved_codex_version,
+        .reviewTupleLockVersion = review_tuple_lock_version,
+        .reviewTupleHash = lock.tupleHash,
+        .reviewTupleLockPath = output.lock_path,
+        .reviewTupleLockState = lock.state,
+        .reviewTupleLockAction = output.decision.asString(),
+        .accountFingerprint = tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
+        .workflowBinding = tuple.workflow_binding,
+        .failureCode = status.failure_code,
+        .failureClass = failureClassForCode(status.failure_code),
+        .retryableSameTupleNow = retryableSameTupleNowForCode(status.failure_code),
+        .failureHint = status.hint,
+        .recordPath = lock.recordPath,
+        .eventLogPath = lock.eventLogPath,
+        .lastFailureCode = lock.lastFailureCode,
+        .reviewVerdict = reviewTupleDiagnosticVerdict(
+            tuple,
+            lock,
+            tupleLockDiagnosticVerdictStatus(lock),
+            status.phase,
+            lock.reviewThreadId != null,
+            status.failure_code,
+            status.hint,
+        ),
+    });
+}
+
+fn replayExistingReviewTuple(
+    allocator: std.mem.Allocator,
+    output: ExistingReviewTupleOutput,
+) !void {
+    if (output.decision != .normalize_existing) return;
+    const path = output.lock.recordPath orelse return;
+    const normalized = normalizeReceiptFromPathAlloc(allocator, path, true, .{
+        .requested_identity = output.target_identity,
+        .requested_identity_required = true,
+    }) catch |err| {
+        std.log.warn("existing review receipt could not be normalized: {s}", .{@errorName(err)});
+        return;
+    };
+    defer normalized.deinit(allocator);
+    var writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &writer.interface;
+    if (std.mem.eql(u8, output.action_name, "run")) {
+        try writeRunNormalizedReceiptObject(allocator, stdout, normalized, output.lock);
+    } else {
+        try writeReceiptObject(stdout, normalized);
+    }
+    try stdout.writeAll("\n");
+    std.process.exit(if (normalizedReceiptCommandSucceeded(normalized)) 0 else 1);
+}
+
+fn writeReviewTupleShadowBestEffort(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    payload_json: []const u8,
+    context: NormalizeContext,
+    action: []const u8,
+    reason: []const u8,
+) !void {
+    const timestamp = try casRerTimestampAlloc(allocator);
+    defer allocator.free(timestamp);
+    const path = writeCasRerShadowRecordFromJsonAlloc(
+        allocator,
+        source_path,
+        payload_json,
+        context,
+        .{
+            .command_surface = "run",
+            .backend_selected = "cas-run",
+            .broker_action = action,
+            .broker_reason = reason,
+            .timestamp = timestamp,
+        },
+    ) catch |err| {
+        std.log.warn("review shadow evidence persistence failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(path);
+}
+
 fn printReviewTupleLockExistingAndExit(
     allocator: std.mem.Allocator,
     action_name: []const u8,
@@ -7831,137 +8250,31 @@ fn printReviewTupleLockExistingAndExit(
     lock: ReviewTupleLock,
     decision: ReviewTupleLockAction,
 ) !noreturn {
-    if (decision == .normalize_existing) {
-        if (lock.recordPath) |record_path| {
-            const normalized_opt: ?NormalizedReceipt = normalizeReceiptFromPathAlloc(
-                allocator,
-                record_path,
-                true,
-                .{
-                    .requested_identity = target_identity,
-                    .requested_identity_required = true,
-                },
-            ) catch null;
-            if (normalized_opt) |normalized| {
-                defer normalized.deinit(allocator);
-                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                const stdout = &stdout_writer.interface;
-                if (std.mem.eql(u8, action_name, "run")) {
-                    try writeRunNormalizedReceiptObject(allocator, stdout, normalized, lock);
-                    try stdout.writeAll("\n");
-                } else {
-                    try writeReceiptObject(stdout, normalized);
-                    try stdout.writeAll("\n");
-                }
-                std.process.exit(if (normalizedReceiptCommandSucceeded(normalized)) 0 else 1);
-            }
-        }
-    }
-
-    const review_thread_id = lock.reviewThreadId;
-    const review_turn_id = lock.reviewTurnId;
-    const lock_points_to_terminal = std.mem.eql(u8, lock.state, "terminal") or
-        std.mem.eql(u8, lock.state, "normalized");
-    const workflow_owner_active = tuple.workflow_binding != null and !lock_points_to_terminal;
-    const active_failure: ?FailureInfo = if (workflow_owner_active)
-        workflowOwnerActiveFailureInfo()
-    else
-        null;
-    const active_failure_code: ?[]const u8 = if (active_failure) |failure| failure.code else null;
-    const active_failure_hint: []const u8 = if (active_failure) |failure|
-        failure.hint
-    else if (decision == .normalize_existing)
-        "tuple lock points to an existing terminal receipt; " ++
-            "normalize that record instead of starting a duplicate review"
-    else
-        "tuple lock points to an existing active review attempt";
-    const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
-        .action = "blocked_live_attempt",
-        .reason = if (decision == .normalize_existing)
-            "tuple lock points to an existing terminal receipt, but the receipt could not be normalized into a terminal verdict"
-        else
-            "tuple lock points to an existing active review attempt whose liveness was not disproven",
-        .reviewThreadId = review_thread_id,
-        .recordPath = lock.recordPath,
-        .eventLogPath = lock.eventLogPath,
-    } else null;
-    const payload = .{
-        .demo = "cas-review-session",
-        .action = action_name,
-        .reviewBrokerDecision = broker_decision,
-        .cwd = tuple.repo_realpath,
-        .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
-        .reviewAttemptExists = review_thread_id != null,
-        .tupleVerdictExists = false,
-        .reviewThreadId = review_thread_id,
-        .reviewTurnId = review_turn_id,
+    const output = ExistingReviewTupleOutput{
+        .action_name = action_name,
         .target = target,
-        .baseSha = tuple.base_sha,
-        .headSha = tuple.head_sha,
-        .targetFingerprint = tuple.target_fingerprint,
-        .resolvedCodexPath = tuple.resolved_codex_path,
-        .resolvedCodexVersion = tuple.resolved_codex_version,
-        .reviewTupleLockVersion = review_tuple_lock_version,
-        .reviewTupleHash = lock.tupleHash,
-        .reviewTupleLockPath = lock_path,
-        .reviewTupleLockState = lock.state,
-        .reviewTupleLockAction = decision.asString(),
-        .accountFingerprint = tuple.account_fingerprint,
-        .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
-        .workflowBinding = tuple.workflow_binding,
-        .failureCode = active_failure_code,
-        .failureClass = failureClassForCode(active_failure_code),
-        .retryableSameTupleNow = retryableSameTupleNowForCode(active_failure_code),
-        .failureHint = active_failure_hint,
-        .recordPath = lock.recordPath,
-        .eventLogPath = lock.eventLogPath,
-        .lastFailureCode = lock.lastFailureCode,
-        .reviewVerdict = .{
-            .status = tupleLockDiagnosticVerdictStatus(lock),
-            .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
-            .reviewAttemptExists = review_thread_id != null,
-            .tupleVerdictExists = false,
-            .backendClass = "cas-receipt-normalized",
-            .clean = false,
-            .findingCount = 0,
-            .failureCode = active_failure_code,
-            .failureHint = active_failure_hint,
-            .baseSha = tuple.base_sha,
-            .headSha = tuple.head_sha,
-            .targetFingerprint = tuple.target_fingerprint,
-            .reviewThreadId = review_thread_id,
-            .reviewTurnId = review_turn_id,
-            .recordPath = lock.recordPath,
-            .eventLogPath = lock.eventLogPath,
-            .findings = [_]std.json.Value{},
-        },
+        .target_identity = target_identity,
+        .tuple = tuple,
+        .lock_path = lock_path,
+        .lock = lock,
+        .decision = decision,
     };
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    const payload_json = try stringifyAnyAlloc(allocator, payload);
+    try replayExistingReviewTuple(allocator, output);
+    const status = existingReviewTupleStatus(output);
+    const payload_json = try existingReviewTuplePayloadAlloc(allocator, output, status);
     defer allocator.free(payload_json);
     if (std.mem.eql(u8, action_name, "run")) {
-        const timestamp = try casRerTimestampAlloc(allocator);
-        defer allocator.free(timestamp);
-        const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(
+        try writeReviewTupleShadowBestEffort(
             allocator,
             lock.recordPath orelse lock_path,
             payload_json,
-            .{
-                .requested_identity = target_identity,
-                .requested_identity_required = true,
-            },
-            .{
-                .command_surface = "run",
-                .backend_selected = "cas-run",
-                .broker_action = "blocked_live",
-                .broker_reason = broker_decision.?.reason,
-                .timestamp = timestamp,
-            },
-        ) catch null;
-        defer if (shadow_record_path) |path| allocator.free(path);
+            .{ .requested_identity = target_identity, .requested_identity_required = true },
+            "blocked_live",
+            status.broker.?.reason,
+        );
     }
-    try stdout.print("{s}\n", .{payload_json});
+    var writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try writer.interface.print("{s}\n", .{payload_json});
     std.process.exit(1);
 }
 
@@ -8000,6 +8313,200 @@ fn tupleLockDiagnosticVerdictStatus(lock: ReviewTupleLock) []const u8 {
     return "incomplete";
 }
 
+const BlockedReviewTupleOutput = struct {
+    action_name: []const u8,
+    target: TargetRecord,
+    tuple: ReviewTupleIdentity,
+    lock_path: []const u8,
+    lock: ?ReviewTupleLock,
+    decision: ReviewTupleLockAction,
+    override_reason: ?[]const u8,
+};
+
+const BlockedReviewTupleStatus = struct {
+    workflow_owner_dead: bool,
+    attempt_exists: bool,
+    phase: []const u8,
+    failure: FailureInfo,
+    broker: ?ReviewBrokerDecision,
+};
+
+fn blockedReviewTupleFailure(output: BlockedReviewTupleOutput) !FailureInfo {
+    if (output.tuple.workflow_binding != null) {
+        if (output.decision == .block_dead_owner) {
+            const lock = output.lock orelse return error.InvalidReviewTupleLockBinding;
+            return workflowDeadOwnerFailureInfo(lock);
+        }
+        if (output.decision == .block_active) return workflowOwnerActiveFailureInfo();
+    }
+    return switch (output.decision) {
+        .block_account_resource => .{
+            .code = "review_tuple_lock_account_resource_exhausted",
+            .hint = "same-account review retry is blocked until " ++
+                "the limit resets, the account changes, or --review-lock-override is supplied",
+        },
+        .block_stale => .{
+            .code = "review_tuple_lock_stale",
+            .hint = "tuple lock is stale; supply --review-lock-override " ++
+                "with a takeover reason before starting a new review",
+        },
+        .block_invalid => .{
+            .code = "review_tuple_lock_invalid",
+            .hint = "tuple lock file is invalid for CAS-RTL-v3, CAS-RTL-v2, " ++
+                "or historical CAS-RTL-v1; inspect or remove it before starting a new review",
+        },
+        else => .{
+            .code = "review_tuple_lock_active",
+            .hint = "an active review attempt already owns this repo/base/head/account tuple",
+        },
+    };
+}
+
+fn blockedReviewTupleStatus(output: BlockedReviewTupleOutput) !BlockedReviewTupleStatus {
+    const owner_dead = output.tuple.workflow_binding != null and
+        output.decision == .block_dead_owner;
+    const thread_id = if (output.lock) |lock| lock.reviewThreadId else null;
+    const exists = if (owner_dead)
+        if (output.lock) |lock| workflowDeadOwnerAttemptExists(lock) else false
+    else
+        thread_id != null;
+    const failure = try blockedReviewTupleFailure(output);
+    return .{
+        .workflow_owner_dead = owner_dead,
+        .attempt_exists = exists,
+        .phase = if (owner_dead and exists)
+            "review_terminal"
+        else if (exists)
+            "review_waiting"
+        else
+            "pre_review_start",
+        .failure = failure,
+        .broker = if (std.mem.eql(u8, output.action_name, "run")) .{
+            .action = reviewBrokerActionForBlockedLock(output.decision),
+            .reason = failure.hint,
+            .reviewThreadId = thread_id,
+            .recordPath = if (output.lock) |lock| lock.recordPath else null,
+            .eventLogPath = if (output.lock) |lock| lock.eventLogPath else null,
+        } else null,
+    };
+}
+
+fn terminalizeBlockedReviewTuple(
+    allocator: std.mem.Allocator,
+    output: BlockedReviewTupleOutput,
+    status: BlockedReviewTupleStatus,
+) !void {
+    if (!status.workflow_owner_dead) return;
+    const lock = output.lock orelse return error.InvalidReviewTupleLockBinding;
+    // Retry authority follows the durable transition, before any retryable receipt is emitted.
+    if (lock.recordPath) |record_path| {
+        var loaded = try loadOwnedSessionRecordPath(
+            allocator,
+            try allocator.dupe(u8, record_path),
+        );
+        defer loaded.deinit(allocator);
+        try terminalizeDeadWorkflowBoundOwner(
+            allocator,
+            record_path,
+            &loaded.record,
+            status.failure,
+        );
+    } else {
+        const terminal = withReviewTupleLockState(
+            lock,
+            "terminal",
+            unixSeconds(),
+            status.failure.code,
+            lock.reviewThreadId,
+            lock.reviewTurnId,
+            lock.recordPath,
+            lock.eventLogPath,
+        );
+        try writeReviewTupleLock(allocator, output.lock_path, terminal);
+    }
+}
+
+fn blockedReviewTuplePayloadAlloc(
+    allocator: std.mem.Allocator,
+    output: BlockedReviewTupleOutput,
+    status: BlockedReviewTupleStatus,
+) ![]const u8 {
+    const tuple = output.tuple;
+    const lock = output.lock;
+    return stringifyAnyAlloc(allocator, .{
+        .demo = "cas-review-session",
+        .action = output.action_name,
+        .reviewBrokerDecision = status.broker,
+        .cwd = tuple.repo_realpath,
+        .reviewAttemptPhase = status.phase,
+        .reviewAttemptExists = status.attempt_exists,
+        .tupleVerdictExists = false,
+        .reviewThreadId = if (lock) |value| value.reviewThreadId else null,
+        .reviewTurnId = if (lock) |value| value.reviewTurnId else null,
+        .target = output.target,
+        .baseSha = tuple.base_sha,
+        .headSha = tuple.head_sha,
+        .targetFingerprint = tuple.target_fingerprint,
+        .resolvedCodexPath = tuple.resolved_codex_path,
+        .resolvedCodexVersion = tuple.resolved_codex_version,
+        .failureCode = status.failure.code,
+        .failureClass = if (status.workflow_owner_dead and status.attempt_exists)
+            "transport_review_attempt"
+        else
+            "coordination",
+        .retryableSameTupleNow = status.workflow_owner_dead,
+        .failureHint = status.failure.hint,
+        .reviewTupleLockVersion = review_tuple_lock_version,
+        .reviewTupleHash = if (lock) |value| value.tupleHash else null,
+        .reviewTupleLockPath = output.lock_path,
+        .reviewTupleLockState = if (status.workflow_owner_dead)
+            "terminal"
+        else if (lock) |value| value.state else null,
+        .reviewTupleLockAction = output.decision.asString(),
+        .accountFingerprint = tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
+        .workflowBinding = tuple.workflow_binding,
+        .overrideReason = output.override_reason,
+        .recordPath = if (lock) |value| value.recordPath else null,
+        .eventLogPath = if (lock) |value| value.eventLogPath else null,
+        .lastFailureCode = if (lock) |value| value.lastFailureCode else null,
+        .reviewVerdict = reviewTupleDiagnosticVerdict(
+            tuple,
+            lock,
+            "incomplete",
+            status.phase,
+            status.attempt_exists,
+            status.failure.code,
+            status.failure.hint,
+        ),
+    });
+}
+
+fn printBlockedReviewTupleJson(
+    allocator: std.mem.Allocator,
+    output: BlockedReviewTupleOutput,
+    status: BlockedReviewTupleStatus,
+) !void {
+    const payload = try blockedReviewTuplePayloadAlloc(allocator, output, status);
+    defer allocator.free(payload);
+    if (std.mem.eql(u8, output.action_name, "run")) {
+        const source_path = if (output.lock) |lock|
+            lock.recordPath orelse output.lock_path
+        else
+            output.lock_path;
+        try writeReviewTupleShadowBestEffort(
+            allocator,
+            source_path,
+            payload,
+            normalizeContextFromReviewTuple(output.tuple),
+            publicReviewBrokerAction(reviewBrokerActionForBlockedLock(output.decision)),
+            status.failure.hint,
+        );
+    }
+    var writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try writer.interface.print("{s}\n", .{payload});
+}
+
 fn emitReviewTupleLockBlockedAndExit(
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -8011,176 +8518,25 @@ fn emitReviewTupleLockBlockedAndExit(
     decision: ReviewTupleLockAction,
     override_reason: ?[]const u8,
 ) !noreturn {
-    const workflow_owner_active = tuple.workflow_binding != null and decision == .block_active;
-    const workflow_owner_dead = tuple.workflow_binding != null and decision == .block_dead_owner;
-    const dead_attempt_exists = if (lock) |value|
-        workflowDeadOwnerAttemptExists(value)
-    else
-        false;
-    const owner_active_failure: ?FailureInfo = if (workflow_owner_active)
-        workflowOwnerActiveFailureInfo()
-    else
-        null;
-    const dead_owner_failure: ?FailureInfo = if (workflow_owner_dead) blk: {
-        const value = lock orelse return error.InvalidReviewTupleLockBinding;
-        break :blk workflowDeadOwnerFailureInfo(value);
-    } else null;
-    const failure_code: []const u8 = if (dead_owner_failure) |failure|
-        failure.code
-    else if (owner_active_failure) |failure|
-        failure.code
-    else switch (decision) {
-        .block_account_resource => "review_tuple_lock_account_resource_exhausted",
-        .block_stale => "review_tuple_lock_stale",
-        .block_invalid => "review_tuple_lock_invalid",
-        else => "review_tuple_lock_active",
+    const output = BlockedReviewTupleOutput{
+        .action_name = action_name,
+        .target = target,
+        .tuple = tuple,
+        .lock_path = lock_path,
+        .lock = lock,
+        .decision = decision,
+        .override_reason = override_reason,
     };
-    const hint: []const u8 = if (dead_owner_failure) |failure|
-        failure.hint
-    else if (owner_active_failure) |failure|
-        failure.hint
-    else switch (decision) {
-        .block_account_resource => "same-account review retry is blocked until " ++
-            "the limit resets, the account changes, or " ++
-            "--review-lock-override is supplied",
-        .block_stale => "tuple lock is stale; supply --review-lock-override " ++
-            "with a takeover reason before starting a new review",
-        .block_invalid => "tuple lock file is invalid for CAS-RTL-v3, CAS-RTL-v2, " ++
-            "or historical CAS-RTL-v1; " ++
-            "inspect or remove it before starting a new review",
-        else => "an active review attempt already owns this repo/base/head/account tuple",
-    };
-    if (workflow_owner_dead) {
-        const value = lock orelse return error.InvalidReviewTupleLockBinding;
-        // Retry authority follows the durable terminal transition. Never emit a
-        // retryable recovery receipt for a lease that remained active on disk.
-        if (value.recordPath) |record_path| {
-            var loaded_record = try loadOwnedSessionRecordPath(
-                allocator,
-                try allocator.dupe(u8, record_path),
-            );
-            defer loaded_record.deinit(allocator);
-            try terminalizeDeadWorkflowBoundOwner(
-                allocator,
-                record_path,
-                &loaded_record.record,
-                .{ .code = failure_code, .hint = hint },
-            );
-        } else {
-            const terminal = withReviewTupleLockState(
-                value,
-                "terminal",
-                unixSeconds(),
-                failure_code,
-                value.reviewThreadId,
-                value.reviewTurnId,
-                value.recordPath,
-                value.eventLogPath,
-            );
-            try writeReviewTupleLock(allocator, lock_path, terminal);
-        }
-    }
+    const status = try blockedReviewTupleStatus(output);
+    try terminalizeBlockedReviewTuple(allocator, output, status);
     if (json_mode) {
-        const blocked_review_thread_id = if (lock) |value| value.reviewThreadId else null;
-        const blocked_review_turn_id = if (lock) |value| value.reviewTurnId else null;
-        const blocked_attempt_exists = if (workflow_owner_dead)
-            dead_attempt_exists
-        else
-            blocked_review_thread_id != null;
-        const blocked_phase: []const u8 = if (workflow_owner_dead and blocked_attempt_exists)
-            "review_terminal"
-        else if (blocked_attempt_exists)
-            "review_waiting"
-        else
-            "pre_review_start";
-        const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
-            .action = reviewBrokerActionForBlockedLock(decision),
-            .reason = hint,
-            .reviewThreadId = if (lock) |value| value.reviewThreadId else null,
-            .recordPath = if (lock) |value| value.recordPath else null,
-            .eventLogPath = if (lock) |value| value.eventLogPath else null,
-        } else null;
-        const payload = .{
-            .demo = "cas-review-session",
-            .action = action_name,
-            .reviewBrokerDecision = broker_decision,
-            .cwd = tuple.repo_realpath,
-            .reviewAttemptPhase = blocked_phase,
-            .reviewAttemptExists = blocked_attempt_exists,
-            .tupleVerdictExists = false,
-            .reviewThreadId = blocked_review_thread_id,
-            .reviewTurnId = blocked_review_turn_id,
-            .target = target,
-            .baseSha = tuple.base_sha,
-            .headSha = tuple.head_sha,
-            .targetFingerprint = tuple.target_fingerprint,
-            .resolvedCodexPath = tuple.resolved_codex_path,
-            .resolvedCodexVersion = tuple.resolved_codex_version,
-            .failureCode = failure_code,
-            .failureClass = if (workflow_owner_dead and blocked_attempt_exists)
-                "transport_review_attempt"
-            else
-                "coordination",
-            .retryableSameTupleNow = workflow_owner_dead,
-            .failureHint = hint,
-            .reviewTupleLockVersion = review_tuple_lock_version,
-            .reviewTupleHash = if (lock) |value| value.tupleHash else null,
-            .reviewTupleLockPath = lock_path,
-            .reviewTupleLockState = if (workflow_owner_dead)
-                "terminal"
-            else if (lock) |value|
-                value.state
-            else
-                null,
-            .reviewTupleLockAction = decision.asString(),
-            .accountFingerprint = tuple.account_fingerprint,
-            .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
-            .workflowBinding = tuple.workflow_binding,
-            .overrideReason = override_reason,
-            .recordPath = if (lock) |value| value.recordPath else null,
-            .eventLogPath = if (lock) |value| value.eventLogPath else null,
-            .lastFailureCode = if (lock) |value| value.lastFailureCode else null,
-            .reviewVerdict = .{
-                .status = "incomplete",
-                .reviewAttemptPhase = blocked_phase,
-                .reviewAttemptExists = blocked_attempt_exists,
-                .tupleVerdictExists = false,
-                .backendClass = "cas-receipt-normalized",
-                .clean = false,
-                .findingCount = 0,
-                .failureCode = failure_code,
-                .failureHint = hint,
-                .baseSha = tuple.base_sha,
-                .headSha = tuple.head_sha,
-                .targetFingerprint = tuple.target_fingerprint,
-                .reviewThreadId = blocked_review_thread_id,
-                .reviewTurnId = blocked_review_turn_id,
-                .recordPath = if (lock) |value| value.recordPath else null,
-                .eventLogPath = if (lock) |value| value.eventLogPath else null,
-                .findings = [_]std.json.Value{},
-            },
-        };
-        const payload_json = try stringifyAnyAlloc(allocator, payload);
-        defer allocator.free(payload_json);
-        if (std.mem.eql(u8, action_name, "run")) {
-            const timestamp = try casRerTimestampAlloc(allocator);
-            defer allocator.free(timestamp);
-            const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, normalizeContextFromReviewTuple(tuple), .{
-                .command_surface = "run",
-                .backend_selected = "cas-run",
-                .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(decision)),
-                .broker_reason = hint,
-                .timestamp = timestamp,
-            }) catch null;
-            defer if (shadow_record_path) |path| allocator.free(path);
-        }
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const stdout = &stdout_writer.interface;
-        try stdout.print("{s}\n", .{payload_json});
+        try printBlockedReviewTupleJson(allocator, output, status);
     } else {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("review tuple lock blocked {s}: {s}\n", .{ decision.asString(), hint });
+        var writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        try writer.interface.print(
+            "review tuple lock blocked {s}: {s}\n",
+            .{ decision.asString(), status.failure.hint },
+        );
     }
     std.process.exit(1);
 }
@@ -8200,6 +8556,180 @@ const ReviewTupleStartLockBundle = struct {
     }
 };
 
+const ReviewTupleLockAcquisition = struct {
+    allocator: std.mem.Allocator,
+    json_mode: bool,
+    action_name: []const u8,
+    target: TargetRecord,
+    target_identity: TargetIdentity,
+    tuple: ReviewTupleIdentity,
+    override_reason: ?[]const u8,
+    fresh_attempt_reason: ?[]const u8,
+    managed_server: ?*cas_websocket.ManagedServer,
+    tuple_hash: []const u8,
+    lock_path: []const u8,
+    owner_lease_held_elsewhere: ?bool,
+    now_s: i64,
+
+    fn block(
+        self: ReviewTupleLockAcquisition,
+        lock: ?ReviewTupleLock,
+        decision: ReviewTupleLockAction,
+    ) !noreturn {
+        killManagedServerBeforeTupleLockExit(self.managed_server);
+        return emitReviewTupleLockBlockedAndExit(
+            self.allocator,
+            self.json_mode,
+            self.action_name,
+            self.target,
+            self.tuple,
+            self.lock_path,
+            lock,
+            decision,
+            self.override_reason,
+        );
+    }
+
+    fn load(self: ReviewTupleLockAcquisition) !?LoadedReviewTupleLock {
+        return loadReviewTupleLock(self.allocator, self.lock_path) catch
+            return try self.block(null, .block_invalid);
+    }
+
+    fn decide(
+        self: ReviewTupleLockAcquisition,
+        lock: ?ReviewTupleLock,
+        now_s: i64,
+    ) ReviewTupleLockAction {
+        return reviewTupleLockActionForAcquire(
+            self.allocator,
+            self.action_name,
+            lock,
+            now_s,
+            self.override_reason,
+            self.fresh_attempt_reason,
+            self.target_identity,
+            self.owner_lease_held_elsewhere,
+        );
+    }
+
+    fn finishExisting(
+        self: ReviewTupleLockAcquisition,
+        lock: ?ReviewTupleLock,
+        decision: ReviewTupleLockAction,
+    ) !void {
+        switch (decision) {
+            .return_existing, .normalize_existing => {
+                killManagedServerBeforeTupleLockExit(self.managed_server);
+                try printReviewTupleLockExistingAndExit(
+                    self.allocator,
+                    self.action_name,
+                    self.target,
+                    self.target_identity,
+                    self.tuple,
+                    self.lock_path,
+                    lock.?,
+                    decision,
+                );
+            },
+            .block_active,
+            .block_dead_owner,
+            .block_stale,
+            .block_account_resource,
+            .block_invalid,
+            => try self.block(lock, decision),
+            .create,
+            .retry_after_pre_review_failure,
+            .auto_replace_dead_transport,
+            .recover_dead_owner,
+            .takeover_with_override,
+            .fresh_after_terminal,
+            => {},
+        }
+    }
+
+    fn makeLock(self: ReviewTupleLockAcquisition, override_reason: ?[]const u8) ReviewTupleLock {
+        var lock = makeReviewTupleLock(
+            self.tuple_hash,
+            self.tuple,
+            "starting_review",
+            self.now_s,
+            override_reason,
+            self.fresh_attempt_reason,
+        );
+        if (self.managed_server) |server| {
+            lock.managedServerPid = server.processId();
+            lock.managedServerShutdownReceiptPath = server.shutdownReceiptPath();
+            lock.managedServerShutdownReceiptToken = server.shutdownReceiptToken();
+            lock.managedServerProcessGroupId = server.processGroupId();
+            lock.managedServerBootId = server.bootId();
+        }
+        return lock;
+    }
+
+    fn create(self: ReviewTupleLockAcquisition) !ReviewTupleLock {
+        const lock = self.makeLock(self.override_reason);
+        writeReviewTupleLockExclusive(
+            self.allocator,
+            self.lock_path,
+            lock,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                var raced = (try self.load()) orelse return err;
+                defer raced.deinit(self.allocator);
+                try self.finishExisting(raced.record, self.decide(raced.record, self.now_s));
+                return err;
+            },
+            else => return err,
+        };
+        return lock;
+    }
+
+    fn replace(
+        self: ReviewTupleLockAcquisition,
+        previous: ?ReviewTupleLock,
+    ) !ReviewTupleLock {
+        const bridge = if (previous) |lock|
+            std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version)
+        else
+            false;
+        var rewrite_lease = acquireReviewTupleLockRewriteLeaseWithin(
+            self.allocator,
+            self.lock_path,
+            0,
+            bridge,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => return try self.block(previous, .block_active),
+            else => return err,
+        };
+        defer rewrite_lease.deinit(self.allocator);
+        var latest = (try self.load()) orelse return try self.block(null, .block_invalid);
+        defer latest.deinit(self.allocator);
+        const decision = self.decide(latest.record, unixSeconds());
+        try self.finishExisting(latest.record, decision);
+        if (decision == .create) return try self.block(latest.record, .block_invalid);
+        const replacement_reason = switch (decision) {
+            .auto_replace_dead_transport => "auto-replaced-dead-transport",
+            .recover_dead_owner => "recovered-dead-owner",
+            else => self.override_reason,
+        };
+        if (decision == .recover_dead_owner or decision == .auto_replace_dead_transport) {
+            try ensureReviewTuplePredecessorExited(self.allocator, latest.record);
+        }
+        if (decision == .recover_dead_owner) {
+            const predecessor_path = try persistDeadOwnerRecoveryEvidence(
+                self.allocator,
+                self.lock_path,
+                latest.record,
+                self.target_identity,
+            );
+            if (predecessor_path) |path| self.allocator.free(path);
+        }
+        const lock = self.makeLock(replacement_reason);
+        try writeReviewTupleLock(self.allocator, self.lock_path, lock);
+        return lock;
+    }
+};
+
 fn acquireReviewTupleStartLockOrExit(
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -8212,359 +8742,42 @@ fn acquireReviewTupleStartLockOrExit(
     managed_server_to_kill_on_exit: ?*cas_websocket.ManagedServer,
 ) !ReviewTupleStartLockBundle {
     const tuple_hash = try reviewTupleHashAlloc(allocator, tuple);
+    errdefer allocator.free(tuple_hash);
     const lock_path = try reviewTupleLockPathAlloc(allocator, tuple_hash);
+    errdefer allocator.free(lock_path);
     var owner_lease = if (tuple.workflow_binding != null)
         try tryAcquireReviewOwnerLeaseAlloc(allocator, lock_path)
     else
         null;
     errdefer if (owner_lease) |*lease| lease.deinit(allocator);
-    const owner_lease_held_elsewhere: ?bool = if (tuple.workflow_binding != null)
-        owner_lease == null
-    else
-        null;
-    var loaded_opt = loadReviewTupleLock(allocator, lock_path) catch {
-        killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-        try emitReviewTupleLockBlockedAndExit(
-            allocator,
-            json_mode,
-            action_name,
-            target,
-            tuple,
-            lock_path,
+    const acquisition = ReviewTupleLockAcquisition{
+        .allocator = allocator,
+        .json_mode = json_mode,
+        .action_name = action_name,
+        .target = target,
+        .target_identity = target_identity,
+        .tuple = tuple,
+        .override_reason = override_reason,
+        .fresh_attempt_reason = fresh_attempt_reason,
+        .managed_server = managed_server_to_kill_on_exit,
+        .tuple_hash = tuple_hash,
+        .lock_path = lock_path,
+        .owner_lease_held_elsewhere = if (tuple.workflow_binding != null)
+            owner_lease == null
+        else
             null,
-            .block_invalid,
-            override_reason,
-        );
+        .now_s = unixSeconds(),
     };
-    defer if (loaded_opt) |*loaded| loaded.deinit(allocator);
-    const now_s = unixSeconds();
-    const decision = reviewTupleLockActionForAcquire(
-        allocator,
-        action_name,
-        if (loaded_opt) |loaded| loaded.record else null,
-        now_s,
-        override_reason,
-        fresh_attempt_reason,
-        target_identity,
-        owner_lease_held_elsewhere,
-    );
-    switch (decision) {
-        .create => {
-            var lock = makeReviewTupleLock(
-                tuple_hash,
-                tuple,
-                "starting_review",
-                now_s,
-                override_reason,
-                fresh_attempt_reason,
-            );
-            lock.managedServerPid = if (managed_server_to_kill_on_exit) |server|
-                server.processId()
-            else
-                null;
-            lock.managedServerShutdownReceiptPath = if (managed_server_to_kill_on_exit) |server|
-                server.shutdownReceiptPath()
-            else
-                null;
-            lock.managedServerShutdownReceiptToken = if (managed_server_to_kill_on_exit) |server|
-                server.shutdownReceiptToken()
-            else
-                null;
-            lock.managedServerProcessGroupId = if (managed_server_to_kill_on_exit) |server|
-                server.processGroupId()
-            else
-                null;
-            lock.managedServerBootId = if (managed_server_to_kill_on_exit) |server|
-                server.bootId()
-            else
-                null;
-            writeReviewTupleLockExclusive(allocator, lock_path, lock) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    var raced = (loadReviewTupleLock(allocator, lock_path) catch {
-                        killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                        try emitReviewTupleLockBlockedAndExit(
-                            allocator,
-                            json_mode,
-                            action_name,
-                            target,
-                            tuple,
-                            lock_path,
-                            null,
-                            .block_invalid,
-                            override_reason,
-                        );
-                    }) orelse return err;
-                    defer raced.deinit(allocator);
-                    const raced_decision = reviewTupleLockActionForAcquire(
-                        allocator,
-                        action_name,
-                        raced.record,
-                        now_s,
-                        override_reason,
-                        fresh_attempt_reason,
-                        target_identity,
-                        owner_lease_held_elsewhere,
-                    );
-                    switch (raced_decision) {
-                        .return_existing, .normalize_existing => {
-                            killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                            try printReviewTupleLockExistingAndExit(
-                                allocator,
-                                action_name,
-                                target,
-                                target_identity,
-                                tuple,
-                                lock_path,
-                                raced.record,
-                                raced_decision,
-                            );
-                        },
-                        .block_active,
-                        .block_dead_owner,
-                        .block_stale,
-                        .block_account_resource,
-                        .block_invalid,
-                        => {
-                            killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                            try emitReviewTupleLockBlockedAndExit(
-                                allocator,
-                                json_mode,
-                                action_name,
-                                target,
-                                tuple,
-                                lock_path,
-                                raced.record,
-                                raced_decision,
-                                override_reason,
-                            );
-                        },
-                        .create,
-                        .retry_after_pre_review_failure,
-                        .auto_replace_dead_transport,
-                        .recover_dead_owner,
-                        .takeover_with_override,
-                        .fresh_after_terminal,
-                        => return err,
-                    }
-                },
-                else => return err,
-            };
-            return .{
-                .path = lock_path,
-                .lock = lock,
-                .owner_lease = owner_lease,
-            };
-        },
-        .retry_after_pre_review_failure,
-        .auto_replace_dead_transport,
-        .recover_dead_owner,
-        .takeover_with_override,
-        .fresh_after_terminal,
-        => {
-            var rewrite_lease = acquireReviewTupleLockRewriteLeaseWithin(
-                allocator,
-                lock_path,
-                0,
-                if (loaded_opt) |loaded|
-                    std.mem.eql(u8, loaded.record.lockVersion, previous_review_tuple_lock_version)
-                else
-                    false,
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                    try emitReviewTupleLockBlockedAndExit(
-                        allocator,
-                        json_mode,
-                        action_name,
-                        target,
-                        tuple,
-                        lock_path,
-                        if (loaded_opt) |loaded| loaded.record else null,
-                        .block_active,
-                        override_reason,
-                    );
-                },
-                else => return err,
-            };
-            defer rewrite_lease.deinit(allocator);
-
-            var latest = (loadReviewTupleLock(allocator, lock_path) catch {
-                killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                try emitReviewTupleLockBlockedAndExit(
-                    allocator,
-                    json_mode,
-                    action_name,
-                    target,
-                    tuple,
-                    lock_path,
-                    null,
-                    .block_invalid,
-                    override_reason,
-                );
-            }) orelse {
-                killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                try emitReviewTupleLockBlockedAndExit(
-                    allocator,
-                    json_mode,
-                    action_name,
-                    target,
-                    tuple,
-                    lock_path,
-                    null,
-                    .block_invalid,
-                    override_reason,
-                );
-            };
-            defer latest.deinit(allocator);
-            const latest_decision = reviewTupleLockActionForAcquire(
-                allocator,
-                action_name,
-                latest.record,
-                unixSeconds(),
-                override_reason,
-                fresh_attempt_reason,
-                target_identity,
-                owner_lease_held_elsewhere,
-            );
-            switch (latest_decision) {
-                .retry_after_pre_review_failure,
-                .auto_replace_dead_transport,
-                .recover_dead_owner,
-                .takeover_with_override,
-                .fresh_after_terminal,
-                => {},
-                .return_existing, .normalize_existing => {
-                    killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                    try printReviewTupleLockExistingAndExit(
-                        allocator,
-                        action_name,
-                        target,
-                        target_identity,
-                        tuple,
-                        lock_path,
-                        latest.record,
-                        latest_decision,
-                    );
-                },
-                .block_active,
-                .block_dead_owner,
-                .block_stale,
-                .block_account_resource,
-                .block_invalid,
-                => {
-                    killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                    try emitReviewTupleLockBlockedAndExit(
-                        allocator,
-                        json_mode,
-                        action_name,
-                        target,
-                        tuple,
-                        lock_path,
-                        latest.record,
-                        latest_decision,
-                        override_reason,
-                    );
-                },
-                .create => {
-                    killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-                    try emitReviewTupleLockBlockedAndExit(
-                        allocator,
-                        json_mode,
-                        action_name,
-                        target,
-                        tuple,
-                        lock_path,
-                        latest.record,
-                        .block_invalid,
-                        override_reason,
-                    );
-                },
-            }
-            const replacement_override_reason =
-                if (latest_decision == .auto_replace_dead_transport)
-                    "auto-replaced-dead-transport"
-                else if (latest_decision == .recover_dead_owner)
-                    "recovered-dead-owner"
-                else
-                    override_reason;
-            if (latest_decision == .recover_dead_owner or
-                latest_decision == .auto_replace_dead_transport)
-            {
-                try ensureReviewTuplePredecessorExited(allocator, latest.record);
-            }
-            if (latest_decision == .recover_dead_owner) {
-                const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
-                    allocator,
-                    lock_path,
-                    latest.record,
-                    target_identity,
-                );
-                if (predecessor_rer_path) |path| allocator.free(path);
-            }
-            var lock = makeReviewTupleLock(
-                tuple_hash,
-                tuple,
-                "starting_review",
-                now_s,
-                replacement_override_reason,
-                fresh_attempt_reason,
-            );
-            lock.managedServerPid = if (managed_server_to_kill_on_exit) |server|
-                server.processId()
-            else
-                null;
-            lock.managedServerShutdownReceiptPath = if (managed_server_to_kill_on_exit) |server|
-                server.shutdownReceiptPath()
-            else
-                null;
-            lock.managedServerShutdownReceiptToken = if (managed_server_to_kill_on_exit) |server|
-                server.shutdownReceiptToken()
-            else
-                null;
-            lock.managedServerProcessGroupId = if (managed_server_to_kill_on_exit) |server|
-                server.processGroupId()
-            else
-                null;
-            lock.managedServerBootId = if (managed_server_to_kill_on_exit) |server|
-                server.bootId()
-            else
-                null;
-            try writeReviewTupleLock(allocator, lock_path, lock);
-            return .{
-                .path = lock_path,
-                .lock = lock,
-                .owner_lease = owner_lease,
-            };
-        },
-        .return_existing, .normalize_existing => {
-            const lock = loaded_opt.?.record;
-            killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-            try printReviewTupleLockExistingAndExit(
-                allocator,
-                action_name,
-                target,
-                target_identity,
-                tuple,
-                lock_path,
-                lock,
-                decision,
-            );
-        },
-        .block_active, .block_dead_owner, .block_stale, .block_account_resource, .block_invalid => {
-            killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
-            try emitReviewTupleLockBlockedAndExit(
-                allocator,
-                json_mode,
-                action_name,
-                target,
-                tuple,
-                lock_path,
-                if (loaded_opt) |loaded| loaded.record else null,
-                decision,
-                override_reason,
-            );
-        },
-    }
+    var loaded = try acquisition.load();
+    defer if (loaded) |*value| value.deinit(allocator);
+    const previous = if (loaded) |value| value.record else null;
+    const decision = acquisition.decide(previous, acquisition.now_s);
+    try acquisition.finishExisting(previous, decision);
+    const lock = if (decision == .create)
+        try acquisition.create()
+    else
+        try acquisition.replace(previous);
+    return .{ .path = lock_path, .lock = lock, .owner_lease = owner_lease };
 }
 
 fn killManagedServerBeforeTupleLockExit(managed_server: ?*cas_websocket.ManagedServer) void {
@@ -8592,8 +8805,8 @@ fn updateReviewTupleLockBestEffort(
         review_turn_id,
         record_path,
         event_log_path,
-    ) catch |err| switch (err) {
-        else => {},
+    ) catch |err| {
+        std.log.warn("review lock update failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -8709,7 +8922,10 @@ fn appendLogRecord(
         allocator,
         "{{\"recordedAtUnixS\":{d},\"method\":{s},\"direction\":{s},\"payload\":{s}}}",
         .{
-            @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000),
+            @divFloor(
+                std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+                1_000_000_000,
+            ),
             method_json,
             direction_json,
             payload_json_string,
@@ -8739,6 +8955,23 @@ fn ensureParentPath(path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
 }
 
+const ErrorReviewVerdict = struct {
+    status: []const u8 = "incomplete",
+    backendClass: []const u8 = "cas-receipt-normalized",
+    clean: bool = false,
+    findingCount: usize = 0,
+    failureCode: []const u8,
+    failureHint: []const u8,
+    baseSha: ?[]const u8 = @as(?[]const u8, null),
+    headSha: ?[]const u8 = @as(?[]const u8, null),
+    targetFingerprint: ?[]const u8 = @as(?[]const u8, null),
+    reviewThreadId: ?[]const u8,
+    reviewTurnId: ?[]const u8,
+    recordPath: ?[]const u8 = @as(?[]const u8, null),
+    eventLogPath: ?[]const u8 = @as(?[]const u8, null),
+    workflowBinding: ?WorkflowBinding,
+    findings: []const std.json.Value = &.{},
+};
 fn renderErrorAndExit(
     json_mode: bool,
     action: []const u8,
@@ -8749,82 +8982,91 @@ fn renderErrorAndExit(
     failure: FailureInfo,
 ) !noreturn {
     if (json_mode) {
-        const failure_class = failureClassForCode(failure.code);
-        const retryable_same_tuple_now = retryableSameTupleNowForCode(failure.code);
-        const review_attempt_phase = receipt.error_review_attempt_phase orelse
-            errorReviewAttemptPhase(action, method);
-        const payload = .{
-            .demo = "cas-review-session",
-            .action = action,
-            .method = method,
-            .reviewAttemptPhase = review_attempt_phase,
-            .reviewAttemptExists = receipt.error_review_attempt_exists,
-            .tupleVerdictExists = false,
-            .reviewThreadId = receipt.error_review_thread_id,
-            .reviewTurnId = receipt.error_review_turn_id,
-            .baseSha = @as(?[]const u8, null),
-            .headSha = @as(?[]const u8, null),
-            .targetFingerprint = @as(?[]const u8, null),
-            .cwd = cwd,
-            .resolvedCodexPath = receipt.resolved_codex_path,
-            .resolvedCodexVersion = receipt.resolved_codex_version,
-            .codexBinaryDigest = receipt.codex_binary_digest,
-            .appServerContractId = receipt.app_server_contract_id,
-            .structuredReviewCapability = receipt.structured_review_capability,
-            .compatibilityVerdict = receipt.compatibility_verdict,
-            .selectedTransport = receipt.selected_transport,
-            .codeModeHost = if (receipt.code_mode_host_redacted != null or
-                receipt.code_mode_host_digest != null)
-                .{
-                    .origin = receipt.code_mode_host_redacted,
-                    .sha256 = receipt.code_mode_host_digest,
-                }
-            else
-                null,
-            .requestedMultiAgentMode = if (receipt.requested_multi_agent_mode) |mode|
-                mode.configValue()
-            else
-                null,
-            .effectiveMultiAgentMode = if (receipt.effective_multi_agent_mode) |mode|
-                mode.configValue()
-            else
-                null,
-            .multiAgentModeSupport = receipt.multi_agent_mode_support.asString(),
-            .multiAgentModeMetricEligible = receipt.multi_agent_mode_metric_eligible,
-            .workflowBinding = receipt.workflow_binding,
-            .failureCode = failure.code,
-            .failureClass = failure_class,
-            .retryableSameTupleNow = retryable_same_tuple_now,
-            .failureHint = failure.hint,
-            .@"error" = message,
-            .reviewVerdict = .{
-                .status = "incomplete",
-                .backendClass = "cas-receipt-normalized",
-                .clean = false,
-                .findingCount = 0,
-                .failureCode = failure.code,
-                .failureHint = failure.hint,
-                .baseSha = @as(?[]const u8, null),
-                .headSha = @as(?[]const u8, null),
-                .targetFingerprint = @as(?[]const u8, null),
-                .reviewThreadId = receipt.error_review_thread_id,
-                .reviewTurnId = receipt.error_review_turn_id,
-                .recordPath = @as(?[]const u8, null),
-                .eventLogPath = @as(?[]const u8, null),
-                .workflowBinding = receipt.workflow_binding,
-                .findings = [_]std.json.Value{},
-            },
-        };
-        try printJson(payload);
+        try renderErrorReceipt(action, method, message, cwd, receipt, failure);
     } else {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stderr_writer = std.Io.File.stderr().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stderr = &stderr_writer.interface;
         try stderr.print("{s}: {s} ({s})\n", .{ method, message, failure.code });
     }
     std.process.exit(1);
 }
 
-fn readCodexVersionAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, codex_path: []const u8) ![]const u8 {
+fn renderErrorReceipt(
+    action: []const u8,
+    method: []const u8,
+    message: []const u8,
+    cwd: ?[]const u8,
+    receipt: OutputReceipt,
+    failure: FailureInfo,
+) !void {
+    const failure_class = failureClassForCode(failure.code);
+    const retryable_same_tuple_now = retryableSameTupleNowForCode(failure.code);
+    const review_attempt_phase = receipt.error_review_attempt_phase orelse
+        errorReviewAttemptPhase(action, method);
+    const payload = .{
+        .demo = "cas-review-session",
+        .action = action,
+        .method = method,
+        .reviewAttemptPhase = review_attempt_phase,
+        .reviewAttemptExists = receipt.error_review_attempt_exists,
+        .tupleVerdictExists = false,
+        .reviewThreadId = receipt.error_review_thread_id,
+        .reviewTurnId = receipt.error_review_turn_id,
+        .baseSha = @as(?[]const u8, null),
+        .headSha = @as(?[]const u8, null),
+        .targetFingerprint = @as(?[]const u8, null),
+        .cwd = cwd,
+        .resolvedCodexPath = receipt.resolved_codex_path,
+        .resolvedCodexVersion = receipt.resolved_codex_version,
+        .codexBinaryDigest = receipt.codex_binary_digest,
+        .appServerContractId = receipt.app_server_contract_id,
+        .structuredReviewCapability = receipt.structured_review_capability,
+        .compatibilityVerdict = receipt.compatibility_verdict,
+        .selectedTransport = receipt.selected_transport,
+        .codeModeHost = if (receipt.code_mode_host_redacted != null or
+            receipt.code_mode_host_digest != null)
+            .{
+                .origin = receipt.code_mode_host_redacted,
+                .sha256 = receipt.code_mode_host_digest,
+            }
+        else
+            null,
+        .requestedMultiAgentMode = if (receipt.requested_multi_agent_mode) |mode|
+            mode.configValue()
+        else
+            null,
+        .effectiveMultiAgentMode = if (receipt.effective_multi_agent_mode) |mode|
+            mode.configValue()
+        else
+            null,
+        .multiAgentModeSupport = receipt.multi_agent_mode_support.asString(),
+        .multiAgentModeMetricEligible = receipt.multi_agent_mode_metric_eligible,
+        .workflowBinding = receipt.workflow_binding,
+        .failureCode = failure.code,
+        .failureClass = failure_class,
+        .retryableSameTupleNow = retryable_same_tuple_now,
+        .failureHint = failure.hint,
+        .@"error" = message,
+        .reviewVerdict = ErrorReviewVerdict{
+            .failureCode = failure.code,
+            .failureHint = failure.hint,
+            .reviewThreadId = receipt.error_review_thread_id,
+            .reviewTurnId = receipt.error_review_turn_id,
+            .workflowBinding = receipt.workflow_binding,
+        },
+    };
+    try printJson(payload);
+}
+
+fn readCodexVersionAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    codex_path: []const u8,
+) ![]const u8 {
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ codex_path, "--version" },
         .cwd = .{ .path = cwd },
@@ -8839,28 +9081,22 @@ fn readCodexVersionAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const 
 fn quoteJsonStringAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try std.json.Stringify.value(text, .{}, &out.writer);
+    std.json.Stringify.value(text, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
 fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn optionalModeJsonAlloc(allocator: std.mem.Allocator, mode: ?cas.MultiAgentMode) ![]const u8 {
-    if (mode) |value| return quoteJsonStringAlloc(allocator, value.configValue());
-    return "null";
-}
-
-fn modeSupportJsonAlloc(allocator: std.mem.Allocator, support: cas.MultiAgentModeSupport) ![]u8 {
-    return quoteJsonStringAlloc(allocator, support.asString());
-}
-
 fn printJson(value: anytype) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, stdout);
     try stdout.writeAll("\n");
@@ -8868,6 +9104,26 @@ fn printJson(value: anytype) !void {
 
 const StatusAction = enum {
     wait,
+};
+
+const StatusReceiptOutput = struct {
+    allocator: std.mem.Allocator,
+    action: StatusAction,
+    cwd: ?[]const u8,
+    parent_thread_id: ?[]const u8,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    status: ReviewStatus,
+    record_path: ?[]const u8,
+    event_log_path: []const u8,
+    target: ?TargetRecord,
+    identity: ?TargetIdentity,
+    receipt: OutputReceipt,
+    timeout_ms: ?u32,
+    timed_out: ?bool,
+    failure: ?FailureInfo,
+
+    const print = printStatusReceiptOutput;
 };
 
 fn printStatusJson(
@@ -8889,282 +9145,24 @@ fn printStatusJson(
 ) !void {
     var scratch_arena = std.heap.ArenaAllocator.init(backing_allocator);
     defer scratch_arena.deinit();
-    const allocator = scratch_arena.allocator();
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    const effective_failure = failure;
-    const review_verdict_json_opt = if (identity) |target_identity|
-        try startWaitReviewVerdictJsonAlloc(
-            allocator,
-            target_identity,
-            review_thread_id,
-            review_turn_id,
-            record_path orelse "",
-            event_log_path,
-            receipt,
-            status,
-            timed_out orelse false,
-            true,
-            effective_failure,
-        )
-    else
-        null;
-    defer if (review_verdict_json_opt) |value| allocator.free(value);
-    const wait_tuple_verdict_exists = if (identity) |target_identity|
-        startReceiptTupleVerdictExists(
-            allocator,
-            review_verdict_json_opt,
-            review_thread_id,
-            target_identity,
-            status,
-            timed_out orelse false,
-        )
-    else
-        false;
-    const attempt_fields = identityReviewAttemptFields(
-        if (wait_tuple_verdict_exists)
-            "normalized_verdict"
-        else
-            startReceiptReviewAttemptPhase(
-                status,
-                timed_out orelse false,
-                effective_failure,
-                review_thread_id,
-            ),
-        wait_tuple_verdict_exists,
-        review_thread_id,
-        review_turn_id,
-        identity,
-    );
-
-    const cwd_json = if (cwd) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const parent_thread_json = if (parent_thread_id) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const rollout_path_json = if (status.rollout_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const record_path_json = if (record_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const target_json = if (target) |value| try stringifyAnyAlloc(allocator, value) else "null";
-    const target_fingerprint_json = if (identity) |value| try quoteJsonStringAlloc(allocator, value.fingerprint) else "null";
-    const head_sha_json = if (identity) |value|
-        if (value.head_sha) |sha| try quoteJsonStringAlloc(allocator, sha) else "null"
-    else
-        "null";
-    const base_sha_json = if (identity) |value|
-        if (value.base_sha) |sha| try quoteJsonStringAlloc(allocator, sha) else "null"
-    else
-        "null";
-    const review_result_source_json = if (status.review_result_source) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const review_result_json = status.review_result_json orelse "null";
-    const review_text_json = if (status.review_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
-    const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
-        receipt.code_mode_host_digest != null)
-        try stringifyAnyAlloc(allocator, .{
-            .origin = receipt.code_mode_host_redacted,
-            .sha256 = receipt.code_mode_host_digest,
-        })
-    else
-        "null";
-    const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
-    const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
-    const managed_server_pid_json = if (receipt.managed_server_pid) |value|
-        try std.fmt.allocPrint(allocator, "{d}", .{value})
-    else
-        "null";
-    const managed_server_listen_url_json = if (receipt.managed_server_listen_url) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const managed_server_stderr_log_path_json = if (receipt.managed_server_stderr_log_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const orphan_ttl_seconds_json = if (receipt.orphan_ttl_seconds) |value|
-        try std.fmt.allocPrint(allocator, "{d}", .{value})
-    else
-        "null";
-    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.requested_multi_agent_mode);
-    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.effective_multi_agent_mode);
-    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, receipt.multi_agent_mode_support);
-    const failure_code_json = if (effective_failure) |value|
-        try quoteJsonStringAlloc(allocator, value.code)
-    else
-        "null";
-    const failure_hint_json = if (effective_failure) |value|
-        try quoteJsonStringAlloc(allocator, value.hint)
-    else
-        "null";
-    const failure_control_suffix = try failureControlJsonSuffixAlloc(allocator, effective_failure);
-    defer allocator.free(failure_control_suffix);
-    const timeout_json = if (timeout_ms) |value|
-        try std.fmt.allocPrint(allocator, "{d}", .{value})
-    else
-        "null";
-    const timed_out_json = if (timed_out) |value|
-        if (value) "true" else "false"
-    else
-        "null";
-    const hook_summary = try hookSummaryFromEventLog(
-        allocator,
-        receipt.hook_policy,
-        receipt.hook_log_path orelse event_log_path,
-    );
-    const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
-    const structured_finding_count = if (status.review_result_available and
-        reviewStatusHasTrustedResult(status))
-        reviewFindingCount(allocator, status.review_result_json) catch null
-    else
-        null;
-    const structured_finding_count_json = if (structured_finding_count) |count|
-        try std.fmt.allocPrint(allocator, "{d}", .{count})
-    else
-        "null";
-    const clean_json = if (structured_finding_count) |count|
-        if (effective_failure == null and count == 0)
-            "true"
-        else
-            "false"
-    else
-        "null";
-
-    if (action == .wait) {
-        if (identity) |target_identity| {
-            const target_record = target orelse return error.MissingSessionTarget;
-            if (review_verdict_json_opt) |review_verdict_json| {
-                const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
-                    allocator,
-                    cwd orelse "",
-                    target_identity,
-                    target_record,
-                    parent_thread_id orelse "",
-                    review_thread_id,
-                    review_turn_id,
-                    record_path orelse "",
-                    event_log_path,
-                    receipt,
-                    review_verdict_json,
-                );
-                defer allocator.free(synthetic_receipt_json);
-                const normalized = try normalizeReceiptFromJsonAlloc(
-                    allocator,
-                    record_path orelse event_log_path,
-                    synthetic_receipt_json,
-                    true,
-                    .{
-                        .requested_identity = target_identity,
-                        .requested_identity_required = true,
-                    },
-                );
-                defer normalized.deinit(allocator);
-                const timestamp = try casRerTimestampAlloc(allocator);
-                defer allocator.free(timestamp);
-                const shadow_record_path = writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
-                    .command_surface = "start_wait",
-                    .backend_selected = "cas-start-wait",
-                    .broker_action = "created_new",
-                    .broker_reason = "low-level wait output shadowed into CAS-RER-v1",
-                    .timestamp = timestamp,
-                }) catch null;
-                defer if (shadow_record_path) |path| allocator.free(path);
-            }
-        }
-    }
-    const review_verdict_suffix = if (review_verdict_json_opt) |value|
-        try std.fmt.allocPrint(allocator, ",\"reviewVerdict\":{s}", .{value})
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(review_verdict_suffix);
-
-    try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\"",
-        .{@tagName(action)},
-    );
-    try writeReviewAttemptStateFields(stdout, attempt_fields);
-    try stdout.print(
-        ",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s}," ++
-            "\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s}," ++
-            "\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s}," ++
-            "\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s}," ++
-            "\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s}," ++
-            "\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s}," ++
-            "\"codexBinaryDigest\":{s},\"appServerContractId\":{s}," ++
-            "\"structuredReviewCapability\":{s},\"codeModeHost\":{s}," ++
-            "\"compatibilityVerdict\":{s},\"selectedTransport\":{s}," ++
-            "\"selectionReason\":{s},\"managedServerPid\":{s}," ++
-            "\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s}," ++
-            "\"orphanTtlSeconds\":{s},\"requestedMultiAgentMode\":{s}," ++
-            "\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s}," ++
-            "\"multiAgentModeMetricEligible\":{s}",
-        .{
-            cwd_json,
-            parent_thread_json,
-            try quoteJsonStringAlloc(allocator, review_thread_id),
-            try quoteJsonStringAlloc(allocator, review_turn_id),
-            try quoteJsonStringAlloc(allocator, status.thread_status),
-            try quoteJsonStringAlloc(allocator, status.turn_status),
-            status.turn_count,
-            if (status.materialized) "true" else "false",
-            rollout_path_json,
-            record_path_json,
-            try quoteJsonStringAlloc(allocator, event_log_path),
-            target_json,
-            target_fingerprint_json,
-            head_sha_json,
-            base_sha_json,
-            resolved_codex_path_json,
-            resolved_codex_version_json,
-            codex_binary_digest_json,
-            app_server_contract_id_json,
-            structured_review_capability_json,
-            code_mode_host_json,
-            try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
-            selected_transport_json,
-            selection_reason_json,
-            managed_server_pid_json,
-            managed_server_listen_url_json,
-            managed_server_stderr_log_path_json,
-            orphan_ttl_seconds_json,
-            requested_multi_agent_mode_json,
-            effective_multi_agent_mode_json,
-            multi_agent_mode_support_json,
-            if (receipt.multi_agent_mode_metric_eligible) "true" else "false",
-        },
-    );
-    if (receipt.workflow_binding) |binding| {
-        try stdout.writeAll(",\"workflowBinding\":");
-        try std.json.Stringify.value(binding, .{}, stdout);
-    }
-    if (receipt.developer_instructions) |instructions| {
-        try stdout.writeAll(",\"developerInstructions\":");
-        try writeJsonString(stdout, instructions);
-    }
-    try stdout.print(
-        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s}," ++
-            "\"failureHint\":{s}{s},\"hookSummary\":{s}," ++
-            "\"reviewResultAvailable\":{s},\"reviewResultSource\":{s}," ++
-            "\"reviewResult\":{s},\"rawReviewText\":{s}," ++
-            "\"structuredFindingCount\":{s},\"clean\":{s}{s}}}\n",
-        .{
-            timeout_json,
-            timed_out_json,
-            failure_code_json,
-            failure_hint_json,
-            failure_control_suffix,
-            hook_summary_json,
-            if (status.review_result_available) "true" else "false",
-            review_result_source_json,
-            review_result_json,
-            review_text_json,
-            structured_finding_count_json,
-            clean_json,
-            review_verdict_suffix,
-        },
-    );
+    const output = StatusReceiptOutput{
+        .allocator = scratch_arena.allocator(),
+        .action = action,
+        .cwd = cwd,
+        .parent_thread_id = parent_thread_id,
+        .review_thread_id = review_thread_id,
+        .review_turn_id = review_turn_id,
+        .status = status,
+        .record_path = record_path,
+        .event_log_path = event_log_path,
+        .target = target,
+        .identity = identity,
+        .receipt = receipt,
+        .timeout_ms = timeout_ms,
+        .timed_out = timed_out,
+        .failure = failure,
+    };
+    try output.print();
 }
 
 fn startWaitReviewVerdictJsonAlloc(
@@ -9198,7 +9196,9 @@ fn startWaitReviewVerdictJsonAlloc(
         review_result_json = value.review_result_json;
         if (value.review_result_available) {
             if (!reviewStatusHasTrustedResult(value)) {
-                if (effective_failure == null) effective_failure = reviewUntrustedSourceFailureInfo();
+                if (effective_failure == null) {
+                    effective_failure = reviewUntrustedSourceFailureInfo();
+                }
             } else {
                 if (reviewFindingCount(allocator, value.review_result_json)) |count| {
                     finding_count = count;
@@ -9255,110 +9255,50 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writer.writeAll(":\"cas-review-session\",");
     try writeJsonString(writer, "action");
     try writer.writeAll(":\"run\",");
-    try writeJsonString(writer, "cwd");
-    try writer.writeByte(':');
-    try writeJsonString(writer, cwd);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "target");
-    try writer.writeByte(':');
-    try std.json.Stringify.value(target, .{}, writer);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "baseSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, identity.base_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "headSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, identity.head_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "targetFingerprint");
-    try writer.writeByte(':');
-    try writeJsonString(writer, identity.fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "parentThreadId");
-    try writer.writeByte(':');
-    try writeJsonString(writer, parent_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, review_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewTurnId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, review_turn_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "recordPath");
-    try writer.writeByte(':');
-    try writeJsonString(writer, record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "eventLogPath");
-    try writer.writeByte(':');
-    try writeJsonString(writer, event_log_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "resolvedCodexPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "resolvedCodexVersion");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_version);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "codexBinaryDigest");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_binary_digest);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "appServerContractId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.app_server_contract_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "selectedTransport");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.selected_transport);
+    try writeReceiptField(writer, "cwd", cwd);
+    try writeReceiptNextField(writer, "target", target);
+    try writeReceiptNextField(writer, "baseSha", identity.base_sha);
+    try writeReceiptNextField(writer, "headSha", identity.head_sha);
+    try writeReceiptNextField(writer, "targetFingerprint", identity.fingerprint);
+    try writeReceiptNextField(writer, "parentThreadId", parent_thread_id);
+    try writeReceiptNextField(writer, "reviewThreadId", review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", review_turn_id);
+    try writeReceiptNextField(writer, "recordPath", record_path);
+    try writeReceiptNextField(writer, "eventLogPath", event_log_path);
+    try writeReceiptNextField(writer, "resolvedCodexPath", receipt.resolved_codex_path);
+    try writeReceiptNextField(writer, "resolvedCodexVersion", receipt.resolved_codex_version);
+    try writeReceiptNextField(writer, "codexBinaryDigest", receipt.codex_binary_digest);
+    try writeReceiptNextField(writer, "appServerContractId", receipt.app_server_contract_id);
+    try writeReceiptNextField(writer, "selectedTransport", receipt.selected_transport);
     try writer.writeByte(',');
     try writeJsonString(writer, "codeModeHost");
     try writer.writeAll(":{");
-    try writeJsonString(writer, "origin");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.code_mode_host_redacted);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "sha256");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.code_mode_host_digest);
+    try writeReceiptField(writer, "origin", receipt.code_mode_host_redacted);
+    try writeReceiptNextField(writer, "sha256", receipt.code_mode_host_digest);
     try writer.writeAll("},");
-    try writeJsonString(writer, "accountFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.account_fingerprint);
+    try writeReceiptField(writer, "accountFingerprint", receipt.account_fingerprint);
+    try writeReceiptNextField(
+        writer,
+        "accountFingerprintReducedProtection",
+        receipt.account_fingerprint_reduced_protection,
+    );
+    try writeReceiptNextField(writer, "codexThreadId", receipt.codex_thread_id);
     try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprintReducedProtection");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "codexThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "workflowBinding");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "workflowBinding");
     if (receipt.workflow_binding) |binding| {
         try std.json.Stringify.value(binding, .{}, writer);
     } else {
         try writer.writeAll("null");
     }
+    try writeReceiptNextField(writer, "developerInstructions", receipt.developer_instructions);
+    try writeReceiptNextField(
+        writer,
+        "principalStrength",
+        receiptPrincipalStrengthForOutput(receipt),
+    );
+    try writeReceiptNextField(writer, "createdAtUnixS", unixSeconds());
     try writer.writeByte(',');
-    try writeJsonString(writer, "developerInstructions");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.developer_instructions);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalStrength");
-    try writer.writeByte(':');
-    try writeJsonString(writer, if (receipt.account_fingerprint_reduced_protection) principal_strength_reduced else principal_strength_strong);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "createdAtUnixS");
-    try writer.writeByte(':');
-    try writer.print("{d}", .{unixSeconds()});
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewVerdict");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "reviewVerdict");
     try writer.writeAll(review_verdict_json);
     try writer.writeByte('}');
     return out.toOwnedSlice();
@@ -9411,6 +9351,25 @@ fn startShadowReceiptPayloadJsonAlloc(
     return stringifyAnyAlloc(allocator, payload);
 }
 
+const StartReceiptOutput = struct {
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    parent_thread_id: []const u8,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    target_record: TargetRecord,
+    identity: TargetIdentity,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    receipt: OutputReceipt,
+    status: ?ReviewStatus,
+    timed_out: bool,
+    waited: bool,
+    failure: ?FailureInfo,
+
+    const print = printStartReceiptOutput;
+};
+
 fn printStartJson(
     backing_allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -9429,302 +9388,482 @@ fn printStartJson(
 ) !void {
     var scratch_arena = std.heap.ArenaAllocator.init(backing_allocator);
     defer scratch_arena.deinit();
-    const allocator = scratch_arena.allocator();
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
+    const output = StartReceiptOutput{
+        .allocator = scratch_arena.allocator(),
+        .cwd = cwd,
+        .parent_thread_id = parent_thread_id,
+        .review_thread_id = review_thread_id,
+        .review_turn_id = review_turn_id,
+        .target_record = target_record,
+        .identity = identity,
+        .record_path = record_path,
+        .event_log_path = event_log_path,
+        .receipt = receipt,
+        .status = status,
+        .timed_out = timed_out,
+        .waited = waited,
+        .failure = failure,
+    };
+    try output.print();
+}
 
-    const effective_failure = failure;
-    const target_json = try stringifyAnyAlloc(allocator, target_record);
-    const attempt_phase = startReceiptReviewAttemptPhase(status, timed_out, effective_failure, review_thread_id);
-    const timed_out_json = if (timed_out) "true" else "false";
-    const waited_json = if (waited) "true" else "false";
-    const thread_status_json = if (status) |value| try quoteJsonStringAlloc(allocator, value.thread_status) else "null";
-    const turn_status_json = if (status) |value| try quoteJsonStringAlloc(allocator, value.turn_status) else "null";
-    const turn_count = if (status) |value| value.turn_count else 0;
-    const materialized_json = if (status) |value|
-        if (value.materialized) "true" else "false"
-    else
-        "null";
-    const rollout_path_json = if (status) |value|
-        if (value.rollout_path) |path| try quoteJsonStringAlloc(allocator, path) else "null"
-    else
-        "null";
-    const review_result_available_json = if (status) |value|
-        if (value.review_result_available) "true" else "false"
-    else
-        "null";
-    const review_result_source_json = if (status) |value|
-        if (value.review_result_source) |source| try quoteJsonStringAlloc(allocator, source) else "null"
-    else
-        "null";
-    const review_result_json = if (status) |value| value.review_result_json orelse "null" else "null";
-    const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const codex_binary_digest_json = if (receipt.codex_binary_digest) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const app_server_contract_id_json = if (receipt.app_server_contract_id) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const structured_review_capability_json = if (receipt.structured_review_capability) |value|
-        try quoteJsonStringAlloc(allocator, value)
-    else
-        "null";
-    const code_mode_host_json = if (receipt.code_mode_host_redacted != null or
-        receipt.code_mode_host_digest != null)
-        try stringifyAnyAlloc(allocator, .{
-            .origin = receipt.code_mode_host_redacted,
-            .sha256 = receipt.code_mode_host_digest,
-        })
-    else
-        "null";
-    const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
-    const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
-    const managed_server_pid_json = if (receipt.managed_server_pid) |value|
-        try std.fmt.allocPrint(allocator, "{d}", .{value})
-    else
-        "null";
-    const managed_server_listen_url_json = if (receipt.managed_server_listen_url) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const managed_server_stderr_log_path_json = if (receipt.managed_server_stderr_log_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
-    const orphan_ttl_seconds_json = if (receipt.orphan_ttl_seconds) |value|
-        try std.fmt.allocPrint(allocator, "{d}", .{value})
-    else
-        "null";
-    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.requested_multi_agent_mode);
-    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.effective_multi_agent_mode);
-    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, receipt.multi_agent_mode_support);
-    const failure_code_json = if (effective_failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
-    const failure_hint_json = if (effective_failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
-    const failure_control_suffix = try failureControlJsonSuffixAlloc(allocator, effective_failure);
-    defer allocator.free(failure_control_suffix);
-    const surface_action_json = try quoteJsonStringAlloc(allocator, receipt.surface_action);
-    const broker_decision_json = if (receipt.review_broker_decision) |value| try stringifyAnyAlloc(allocator, value) else try allocator.dupe(u8, "null");
-    defer allocator.free(broker_decision_json);
-    const hook_summary = try hookSummaryFromEventLog(allocator, receipt.hook_policy, receipt.hook_log_path orelse event_log_path);
-    const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
-    const review_verdict_json_opt = try startWaitReviewVerdictJsonAlloc(
+fn receiptOutputVerdict(allocator: std.mem.Allocator, output: StatusReceiptOutput) !?[]u8 {
+    const identity = output.identity orelse return null;
+    return startWaitReviewVerdictJsonAlloc(
         allocator,
         identity,
-        review_thread_id,
-        review_turn_id,
-        record_path,
-        event_log_path,
-        receipt,
-        status,
-        timed_out,
-        waited,
-        effective_failure,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.record_path orelse "",
+        output.event_log_path,
+        output.receipt,
+        output.status,
+        output.timed_out orelse false,
+        true,
+        output.failure,
     );
-    defer if (review_verdict_json_opt) |value| allocator.free(value);
-    const start_tuple_verdict_exists = startReceiptTupleVerdictExists(allocator, review_verdict_json_opt, review_thread_id, identity, status, timed_out);
-    const attempt_fields = identityReviewAttemptFields(
-        if (start_tuple_verdict_exists) "normalized_verdict" else attempt_phase,
-        start_tuple_verdict_exists,
-        review_thread_id,
-        review_turn_id,
-        identity,
-    );
-    const review_verdict_suffix = if (review_verdict_json_opt) |value|
-        try std.fmt.allocPrint(allocator, ",\"reviewVerdict\":{s}", .{value})
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(review_verdict_suffix);
+}
 
-    if (std.mem.eql(u8, receipt.surface_action, "start") and !waited and review_thread_id != null) {
-        const payload_json = try startShadowReceiptPayloadJsonAlloc(
+fn printStatusReceiptOutput(output: StatusReceiptOutput) !void {
+    const allocator = output.allocator;
+    const verdict = try receiptOutputVerdict(allocator, output);
+    defer if (verdict) |value| allocator.free(value);
+    const tuple_exists = if (output.identity) |identity|
+        startReceiptTupleVerdictExists(
             allocator,
-            cwd,
-            parent_thread_id,
-            review_thread_id,
-            review_turn_id,
-            record_path,
-            event_log_path,
+            verdict,
+            output.review_thread_id,
             identity,
-            target_record,
-            receipt,
-            attempt_phase,
-        );
-        defer allocator.free(payload_json);
-        const timestamp = try casRerTimestampAlloc(allocator);
-        defer allocator.free(timestamp);
-        const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(allocator, record_path, payload_json, .{
-            .requested_identity = identity,
-            .requested_identity_required = true,
-        }, .{
-            .command_surface = "start",
-            .backend_selected = "cas-start",
-            .broker_action = "created_new",
-            .broker_reason = "low-level start output shadowed into CAS-RER-v1",
-            .timestamp = timestamp,
-        }) catch null;
-        defer if (shadow_record_path) |path| allocator.free(path);
-    }
-
-    if (std.mem.eql(u8, receipt.surface_action, "run")) {
-        if (review_verdict_json_opt) |review_verdict_json| {
-            const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
-                allocator,
-                cwd,
-                identity,
-                target_record,
-                parent_thread_id,
-                review_thread_id,
-                review_turn_id,
-                record_path,
-                event_log_path,
-                receipt,
-                review_verdict_json,
-            );
-            defer allocator.free(synthetic_receipt_json);
-            const normalized = try normalizeReceiptFromJsonAlloc(
-                allocator,
-                record_path,
-                synthetic_receipt_json,
-                true,
-                .{
-                    .requested_identity = identity,
-                    .requested_identity_required = true,
-                },
-            );
-            defer normalized.deinit(allocator);
-            const broker = receipt.review_broker_decision orelse ReviewBrokerDecision{
-                .action = "created_new",
-                .reason = "run completed without an explicit broker decision",
-                .reviewThreadId = review_thread_id,
-                .recordPath = record_path,
-                .eventLogPath = event_log_path,
-            };
-            try writeCasRunEnvelopeFromReceipt(
-                allocator,
-                stdout,
-                normalized,
-                broker,
-                receipt.fresh_attempt_required,
-            );
-            try stdout.writeByte('\n');
-            if (!normalizedReceiptCommandSucceeded(normalized)) std.process.exit(1);
-            return;
-        }
-    } else if (std.mem.eql(u8, receipt.surface_action, "start") and waited) {
-        if (review_verdict_json_opt) |review_verdict_json| {
-            const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
-                allocator,
-                cwd,
-                identity,
-                target_record,
-                parent_thread_id,
-                review_thread_id,
-                review_turn_id,
-                record_path,
-                event_log_path,
-                receipt,
-                review_verdict_json,
-            );
-            defer allocator.free(synthetic_receipt_json);
-            const normalized = try normalizeReceiptFromJsonAlloc(
-                allocator,
-                record_path,
-                synthetic_receipt_json,
-                true,
-                .{
-                    .requested_identity = identity,
-                    .requested_identity_required = true,
-                },
-            );
-            defer normalized.deinit(allocator);
-            const timestamp = try casRerTimestampAlloc(allocator);
-            defer allocator.free(timestamp);
-            const shadow_record_path = writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
-                .command_surface = "start_wait",
-                .backend_selected = "cas-start-wait",
-                .broker_action = "created_new",
-                .broker_reason = "low-level start --wait output shadowed into CAS-RER-v1",
-                .timestamp = timestamp,
-            }) catch null;
-            defer if (shadow_record_path) |path| allocator.free(path);
-        }
-    }
-
-    try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":{s}," ++
-            "\"reviewBrokerDecision\":{s},\"cwd\":{s},\"parentThreadId\":{s}",
-        .{
-            surface_action_json,
-            broker_decision_json,
-            try quoteJsonStringAlloc(allocator, cwd),
-            try quoteJsonStringAlloc(allocator, parent_thread_id),
-        },
+            output.status,
+            output.timed_out orelse false,
+        )
+    else
+        false;
+    const phase = if (tuple_exists) "normalized_verdict" else startReceiptReviewAttemptPhase(
+        output.status,
+        output.timed_out orelse false,
+        output.failure,
+        output.review_thread_id,
     );
-    try writeReviewAttemptFields(stdout, attempt_fields);
-    try stdout.print(
-        ",\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s}," ++
-            "\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s}," ++
-            "\"resolvedCodexVersion\":{s},\"codexBinaryDigest\":{s}," ++
-            "\"appServerContractId\":{s},\"structuredReviewCapability\":{s}," ++
-            "\"codeModeHost\":{s},\"compatibilityVerdict\":{s}," ++
-            "\"selectedTransport\":{s},\"selectionReason\":{s}," ++
-            "\"managedServerPid\":{s},\"managedServerListenUrl\":{s}," ++
-            "\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}," ++
-            "\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s}," ++
-            "\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s}," ++
-            "\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s}",
-        .{
-            target_json,
-            try quoteJsonStringAlloc(allocator, record_path),
-            try quoteJsonStringAlloc(allocator, event_log_path),
-            try quoteJsonStringAlloc(allocator, receipt.resolved_codex_version orelse ""),
-            resolved_codex_path_json,
-            resolved_codex_version_json,
-            codex_binary_digest_json,
-            app_server_contract_id_json,
-            structured_review_capability_json,
-            code_mode_host_json,
-            try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
-            selected_transport_json,
-            selection_reason_json,
-            managed_server_pid_json,
-            managed_server_listen_url_json,
-            managed_server_stderr_log_path_json,
-            orphan_ttl_seconds_json,
-            requested_multi_agent_mode_json,
-            effective_multi_agent_mode_json,
-            multi_agent_mode_support_json,
-            if (receipt.multi_agent_mode_metric_eligible) "true" else "false",
-            waited_json,
-            timed_out_json,
-            thread_status_json,
-            turn_status_json,
-        },
+    const fields = identityReviewAttemptFields(
+        phase,
+        tuple_exists,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.identity,
     );
+    const hook_summary = try hookSummaryFromEventLog(
+        allocator,
+        output.receipt.hook_policy,
+        output.receipt.hook_log_path orelse output.event_log_path,
+    );
+    const finding_count = if (output.status.review_result_available and
+        reviewStatusHasTrustedResult(output.status))
+        reviewFindingCount(allocator, output.status.review_result_json) catch null
+    else
+        null;
+    try writeStatusShadow(output, verdict);
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    const writer = &stdout_writer.interface;
+    try writer.writeAll("{\"demo\":\"cas-review-session\"");
+    try writeReceiptNextField(writer, "action", @tagName(output.action));
+    try writeReviewAttemptStateFields(writer, fields);
+    try writeStatusReceiptIdentity(writer, output);
+    try writeReceiptTransportFields(writer, output.receipt);
+    try writeReceiptOptionalContext(writer, output.receipt);
+    try writeReceiptNextField(writer, "timeoutMs", output.timeout_ms);
+    try writeReceiptNextField(writer, "timedOut", output.timed_out);
+    try writeReceiptFailureFields(writer, output.failure);
+    try writeReceiptNextField(writer, "hookSummary", hook_summary);
+    try writeStatusReviewResultFields(writer, output.status);
+    try writeReceiptNextField(writer, "rawReviewText", output.status.review_text);
+    try writeReceiptNextField(writer, "structuredFindingCount", finding_count);
+    const clean: ?bool = if (finding_count) |count| output.failure == null and count == 0 else null;
+    try writeReceiptNextField(writer, "clean", clean);
+    if (verdict) |value| try writeReceiptNextRawField(writer, "reviewVerdict", value);
+    try writer.writeAll("}\n");
+}
+
+fn writeStatusReceiptIdentity(writer: *std.Io.Writer, output: StatusReceiptOutput) !void {
+    try writeReceiptNextField(writer, "cwd", output.cwd);
+    try writeReceiptNextField(writer, "parentThreadId", output.parent_thread_id);
+    try writeReceiptNextField(writer, "reviewThreadId", output.review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", output.review_turn_id);
+    try writeReceiptNextField(writer, "threadStatus", output.status.thread_status);
+    try writeReceiptNextField(writer, "turnStatus", output.status.turn_status);
+    try writeReceiptNextField(writer, "turnCount", output.status.turn_count);
+    try writeReceiptNextField(writer, "materialized", output.status.materialized);
+    try writeReceiptNextField(writer, "rolloutPath", output.status.rollout_path);
+    try writeReceiptNextField(writer, "recordPath", output.record_path);
+    try writeReceiptNextField(writer, "eventLogPath", output.event_log_path);
+    try writeReceiptNextField(writer, "target", output.target);
+    const identity = output.identity;
+    try writeReceiptNextField(
+        writer,
+        "targetFingerprint",
+        if (identity) |value| value.fingerprint else null,
+    );
+    try writeReceiptNextField(writer, "headSha", if (identity) |value| value.head_sha else null);
+    try writeReceiptNextField(writer, "baseSha", if (identity) |value| value.base_sha else null);
+}
+
+fn writeReceiptTransportFields(writer: *std.Io.Writer, receipt: OutputReceipt) !void {
+    try writeReceiptNextField(writer, "resolvedCodexPath", receipt.resolved_codex_path);
+    try writeReceiptNextField(writer, "resolvedCodexVersion", receipt.resolved_codex_version);
+    try writeReceiptNextField(writer, "codexBinaryDigest", receipt.codex_binary_digest);
+    try writeReceiptNextField(writer, "appServerContractId", receipt.app_server_contract_id);
+    try writeReceiptNextField(
+        writer,
+        "structuredReviewCapability",
+        receipt.structured_review_capability,
+    );
+    try writer.writeAll(",\"codeModeHost\":");
+    if (receipt.code_mode_host_redacted != null or receipt.code_mode_host_digest != null) {
+        try std.json.Stringify.value(.{
+            .origin = receipt.code_mode_host_redacted,
+            .sha256 = receipt.code_mode_host_digest,
+        }, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writeReceiptNextField(writer, "compatibilityVerdict", receipt.compatibility_verdict);
+    try writeReceiptNextField(writer, "selectedTransport", receipt.selected_transport);
+    try writeReceiptNextField(writer, "selectionReason", receipt.selection_reason);
+    try writeReceiptNextField(writer, "managedServerPid", receipt.managed_server_pid);
+    try writeReceiptNextField(writer, "managedServerListenUrl", receipt.managed_server_listen_url);
+    try writeReceiptNextField(
+        writer,
+        "managedServerStderrLogPath",
+        receipt.managed_server_stderr_log_path,
+    );
+    try writeReceiptNextField(writer, "orphanTtlSeconds", receipt.orphan_ttl_seconds);
+    try writeReceiptNextField(
+        writer,
+        "requestedMultiAgentMode",
+        if (receipt.requested_multi_agent_mode) |mode| mode.configValue() else null,
+    );
+    try writeReceiptNextField(
+        writer,
+        "effectiveMultiAgentMode",
+        if (receipt.effective_multi_agent_mode) |mode| mode.configValue() else null,
+    );
+    try writeReceiptNextField(
+        writer,
+        "multiAgentModeSupport",
+        receipt.multi_agent_mode_support.asString(),
+    );
+    try writeReceiptNextField(
+        writer,
+        "multiAgentModeMetricEligible",
+        receipt.multi_agent_mode_metric_eligible,
+    );
+}
+
+fn writeReceiptOptionalContext(writer: *std.Io.Writer, receipt: OutputReceipt) !void {
     if (receipt.workflow_binding) |binding| {
-        try stdout.writeAll(",\"workflowBinding\":");
-        try std.json.Stringify.value(binding, .{}, stdout);
+        try writeReceiptNextField(writer, "workflowBinding", binding);
     }
     if (receipt.developer_instructions) |instructions| {
-        try stdout.writeAll(",\"developerInstructions\":");
-        try writeJsonString(stdout, instructions);
+        try writeReceiptNextField(writer, "developerInstructions", instructions);
     }
-    try stdout.print(
-        ",\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s}," ++
-            "\"failureCode\":{s},\"failureHint\":{s}{s},\"hookSummary\":{s}," ++
-            "\"reviewResultAvailable\":{s},\"reviewResultSource\":{s}," ++
-            "\"reviewResult\":{s}{s}}}\n",
+}
+
+fn writeReceiptFailureFields(
+    writer: *std.Io.Writer,
+    failure: ?FailureInfo,
+) !void {
+    try writeReceiptNextField(writer, "failureCode", if (failure) |value| value.code else null);
+    try writeReceiptNextField(writer, "failureHint", if (failure) |value| value.hint else null);
+    const value = failure orelse return;
+    const failure_class = failureClassForCode(value.code) orelse return;
+    try writeReceiptNextField(writer, "failureClass", failure_class);
+    if (retryableSameTupleNowForCode(value.code)) |retryable| {
+        try writeReceiptNextField(writer, "retryableSameTupleNow", retryable);
+    }
+}
+
+fn writeStatusReviewResultFields(writer: *std.Io.Writer, status: ReviewStatus) !void {
+    try writeReceiptNextField(writer, "reviewResultAvailable", status.review_result_available);
+    try writeReceiptNextField(writer, "reviewResultSource", status.review_result_source);
+    try writeReceiptNextRawField(writer, "reviewResult", status.review_result_json orelse "null");
+}
+
+fn writeReceiptNextRawField(writer: *std.Io.Writer, name: []const u8, raw: []const u8) !void {
+    try writer.writeByte(',');
+    try writeReceiptFieldName(writer, name);
+    try writer.writeAll(raw);
+}
+
+fn writeStatusShadow(output: StatusReceiptOutput, verdict: ?[]const u8) !void {
+    if (output.action != .wait) return;
+    const identity = output.identity orelse return;
+    const target = output.target orelse return error.MissingSessionTarget;
+    const review_verdict = verdict orelse return;
+    const allocator = output.allocator;
+    const raw = try casRunSyntheticReceiptJsonAlloc(
+        allocator,
+        output.cwd orelse "",
+        identity,
+        target,
+        output.parent_thread_id orelse "",
+        output.review_thread_id,
+        output.review_turn_id,
+        output.record_path orelse "",
+        output.event_log_path,
+        output.receipt,
+        review_verdict,
+    );
+    defer allocator.free(raw);
+    const normalized = try normalizeReceiptFromJsonAlloc(allocator, output.record_path orelse
+        output.event_log_path, raw, true, .{
+        .requested_identity = identity,
+        .requested_identity_required = true,
+    });
+    defer normalized.deinit(allocator);
+    try writeReceiptShadow(allocator, normalized, "low-level wait output shadowed into CAS-RER-v1");
+}
+
+fn writeReceiptShadow(
+    allocator: std.mem.Allocator,
+    receipt: NormalizedReceipt,
+    reason: []const u8,
+) !void {
+    const timestamp = try casRerTimestampAlloc(allocator);
+    defer allocator.free(timestamp);
+    const path = writeCasRerShadowRecordFromReceipt(allocator, receipt, .{
+        .command_surface = "start_wait",
+        .backend_selected = "cas-start-wait",
+        .broker_action = "created_new",
+        .broker_reason = reason,
+        .timestamp = timestamp,
+    }) catch |err| {
+        std.log.warn("review shadow evidence persistence failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(path);
+}
+
+fn printStartReceiptOutput(output: StartReceiptOutput) !void {
+    const allocator = output.allocator;
+    const receipt = output.receipt;
+    const phase = startReceiptReviewAttemptPhase(
+        output.status,
+        output.timed_out,
+        output.failure,
+        output.review_thread_id,
+    );
+    const hook_summary = try hookSummaryFromEventLog(
+        allocator,
+        receipt.hook_policy,
+        receipt.hook_log_path orelse output.event_log_path,
+    );
+    const verdict = try startWaitReviewVerdictJsonAlloc(
+        allocator,
+        output.identity,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.record_path,
+        output.event_log_path,
+        receipt,
+        output.status,
+        output.timed_out,
+        output.waited,
+        output.failure,
+    );
+    defer if (verdict) |value| allocator.free(value);
+    const tuple_exists = startReceiptTupleVerdictExists(
+        allocator,
+        verdict,
+        output.review_thread_id,
+        output.identity,
+        output.status,
+        output.timed_out,
+    );
+    const fields = identityReviewAttemptFields(
+        if (tuple_exists) "normalized_verdict" else phase,
+        tuple_exists,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.identity,
+    );
+    try writeStartAttemptShadow(output, phase);
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    const writer = &stdout_writer.interface;
+    if (try writeStartNormalizedReceipt(writer, output, verdict)) return;
+    try writeStartReceiptFields(writer, output, fields, hook_summary, verdict);
+}
+
+fn writeStartReceiptFields(
+    writer: *std.Io.Writer,
+    output: StartReceiptOutput,
+    fields: ReviewAttemptFields,
+    hook_summary: cas.hooks.HookSummary,
+    verdict: ?[]const u8,
+) !void {
+    const receipt = output.receipt;
+    try writer.writeAll("{\"demo\":\"cas-review-session\"");
+    try writeReceiptNextField(writer, "action", receipt.surface_action);
+    try writeReceiptNextField(writer, "reviewBrokerDecision", receipt.review_broker_decision);
+    try writeReceiptNextField(writer, "cwd", output.cwd);
+    try writeReceiptNextField(writer, "parentThreadId", output.parent_thread_id);
+    try writeReviewAttemptFields(writer, fields);
+    try writeReceiptNextField(writer, "delivery", "detached");
+    try writeReceiptNextField(writer, "target", output.target_record);
+    try writeReceiptNextField(writer, "recordPath", output.record_path);
+    try writeReceiptNextField(writer, "eventLogPath", output.event_log_path);
+    try writeReceiptNextField(writer, "codexVersion", receipt.resolved_codex_version orelse "");
+    try writeReceiptTransportFields(writer, receipt);
+    try writeReceiptNextField(writer, "waited", output.waited);
+    try writeReceiptNextField(writer, "timedOut", output.timed_out);
+    try writeReceiptNextField(
+        writer,
+        "threadStatus",
+        if (output.status) |value| value.thread_status else null,
+    );
+    try writeReceiptNextField(
+        writer,
+        "turnStatus",
+        if (output.status) |value| value.turn_status else null,
+    );
+    try writeReceiptOptionalContext(writer, receipt);
+    try writeStartResultFields(writer, output, hook_summary, verdict);
+    try writer.writeAll("}\n");
+}
+
+fn writeStartResultFields(
+    writer: *std.Io.Writer,
+    output: StartReceiptOutput,
+    hook_summary: cas.hooks.HookSummary,
+    verdict: ?[]const u8,
+) !void {
+    const status = output.status;
+    try writeReceiptNextField(writer, "turnCount", if (status) |value| value.turn_count else 0);
+    const materialized: ?bool = if (status) |value| value.materialized else null;
+    try writeReceiptNextField(writer, "materialized", materialized);
+    try writeReceiptNextField(
+        writer,
+        "rolloutPath",
+        if (status) |value| value.rollout_path else null,
+    );
+    try writeReceiptFailureFields(writer, output.failure);
+    try writeReceiptNextField(writer, "hookSummary", hook_summary);
+    const result_available: ?bool = if (status) |value| value.review_result_available else null;
+    try writeReceiptNextField(writer, "reviewResultAvailable", result_available);
+    try writeReceiptNextField(
+        writer,
+        "reviewResultSource",
+        if (status) |value| value.review_result_source else null,
+    );
+    try writeReceiptNextRawField(
+        writer,
+        "reviewResult",
+        if (status) |value| value.review_result_json orelse "null" else "null",
+    );
+    if (verdict) |value| try writeReceiptNextRawField(writer, "reviewVerdict", value);
+}
+
+fn writeStartAttemptShadow(output: StartReceiptOutput, phase: []const u8) !void {
+    if (!std.mem.eql(u8, output.receipt.surface_action, "start") or output.waited or
+        output.review_thread_id == null) return;
+    const allocator = output.allocator;
+    const payload = try startShadowReceiptPayloadJsonAlloc(
+        allocator,
+        output.cwd,
+        output.parent_thread_id,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.record_path,
+        output.event_log_path,
+        output.identity,
+        output.target_record,
+        output.receipt,
+        phase,
+    );
+    defer allocator.free(payload);
+    const timestamp = try casRerTimestampAlloc(allocator);
+    defer allocator.free(timestamp);
+    const path = writeCasRerShadowRecordFromJsonAlloc(allocator, output.record_path, payload, .{
+        .requested_identity = output.identity,
+        .requested_identity_required = true,
+    }, .{
+        .command_surface = "start",
+        .backend_selected = "cas-start",
+        .broker_action = "created_new",
+        .broker_reason = "low-level start output shadowed into CAS-RER-v1",
+        .timestamp = timestamp,
+    }) catch |err| {
+        std.log.warn("review shadow evidence persistence failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(path);
+}
+
+fn writeStartNormalizedReceipt(
+    writer: *std.Io.Writer,
+    output: StartReceiptOutput,
+    verdict: ?[]const u8,
+) !bool {
+    const run = std.mem.eql(u8, output.receipt.surface_action, "run");
+    const start_wait = std.mem.eql(u8, output.receipt.surface_action, "start") and output.waited;
+    if (!run and !start_wait) return false;
+    const review_verdict = verdict orelse return false;
+    const allocator = output.allocator;
+    const raw = try casRunSyntheticReceiptJsonAlloc(
+        allocator,
+        output.cwd,
+        output.identity,
+        output.target_record,
+        output.parent_thread_id,
+        output.review_thread_id,
+        output.review_turn_id,
+        output.record_path,
+        output.event_log_path,
+        output.receipt,
+        review_verdict,
+    );
+    defer allocator.free(raw);
+    const normalized = try normalizeReceiptFromJsonAlloc(
+        allocator,
+        output.record_path,
+        raw,
+        true,
         .{
-            turn_count,
-            materialized_json,
-            rollout_path_json,
-            failure_code_json,
-            failure_hint_json,
-            failure_control_suffix,
-            hook_summary_json,
-            review_result_available_json,
-            review_result_source_json,
-            review_result_json,
-            review_verdict_suffix,
+            .requested_identity = output.identity,
+            .requested_identity_required = true,
         },
     );
+    defer normalized.deinit(allocator);
+    if (!run) {
+        try writeReceiptShadow(
+            allocator,
+            normalized,
+            "low-level start --wait output shadowed into CAS-RER-v1",
+        );
+        return false;
+    }
+    const broker = output.receipt.review_broker_decision orelse ReviewBrokerDecision{
+        .action = "created_new",
+        .reason = "run completed without an explicit broker decision",
+        .reviewThreadId = output.review_thread_id,
+        .recordPath = output.record_path,
+        .eventLogPath = output.event_log_path,
+    };
+    try writeCasRunEnvelopeFromReceipt(
+        allocator,
+        writer,
+        normalized,
+        broker,
+        output.receipt.fresh_attempt_required,
+    );
+    try writer.writeByte('\n');
+    if (!normalizedReceiptCommandSucceeded(normalized)) std.process.exit(1);
+    return true;
 }
 
 fn hookSummaryFromEventLog(
@@ -9733,7 +9872,11 @@ fn hookSummaryFromEventLog(
     event_log_path: []const u8,
 ) !cas.hooks.HookSummary {
     var accumulator = cas.hooks.HookAccumulator.init(policy, null);
-    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), event_log_path, .{}) catch {
+    const file = std.Io.Dir.openFileAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        event_log_path,
+        .{},
+    ) catch {
         var summary = accumulator.summary();
         summary.hookLogPath = event_log_path;
         return summary;
@@ -9752,7 +9895,12 @@ fn hookSummaryFromEventLog(
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            trimmed,
+            .{},
+        ) catch continue;
         defer parsed.deinit();
         const root = switch (parsed.value) {
             .object => |obj| obj,
@@ -9789,7 +9937,8 @@ fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
         if (std.mem.eql(u8, status.turn_status, "interrupted")) {
             return .{
                 .code = "review_interrupted",
-                .hint = "detached review was interrupted before a materialized reviewResult was written",
+                .hint = "detached review was interrupted before a materialized " ++
+                    "reviewResult was written",
             };
         }
         if (status.turn_error_message) |message| {
@@ -9799,14 +9948,20 @@ fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
             {
                 return .{
                     .code = "approval_denied",
-                    .hint = "detached review stopped on an approval or permissions denial before emitting a structured reviewResult",
+                    .hint = "detached review stopped on an approval or permissions " ++
+                        "denial before emitting a structured reviewResult",
                 };
             }
         }
-        if (std.mem.eql(u8, status.turn_status, "failed") or std.mem.eql(u8, status.turn_status, "errored")) {
+        if (std.mem.eql(
+            u8,
+            status.turn_status,
+            "failed",
+        ) or std.mem.eql(u8, status.turn_status, "errored")) {
             return .{
                 .code = "review_failed",
-                .hint = "detached review ended in a failed or errored state before emitting a structured reviewResult",
+                .hint = "detached review ended in a failed or errored state before " ++
+                    "emitting a structured reviewResult",
             };
         }
         return .{
@@ -9855,10 +10010,8 @@ fn readReviewResultJsonFromRolloutAlloc(
     const bytes = try reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(bytes);
 
-    var latest_json: ?[]u8 = null;
-    errdefer if (latest_json) |json| allocator.free(json);
-    var active_turn_matches = false;
-    var saw_review_turn = false;
+    var scan = ReviewRolloutScan{};
+    errdefer if (scan.latest_json) |json| allocator.free(json);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -9876,52 +10029,67 @@ fn readReviewResultJsonFromRolloutAlloc(
             .object => |obj| obj,
             else => return error.InvalidRolloutRecord,
         };
-        const line_type = core_json.stringField(root_obj, "type") orelse continue;
-        if (std.mem.eql(u8, line_type, "turn_context")) {
-            const payload_obj = core_json.objectField(root_obj, "payload") orelse
-                return error.InvalidReviewTurnBoundary;
-            const observed_turn_id = core_json.stringField(payload_obj, "turn_id") orelse
-                return error.InvalidReviewTurnBoundary;
-            if (observed_turn_id.len == 0) return error.InvalidReviewTurnBoundary;
-            active_turn_matches = std.mem.eql(u8, observed_turn_id, review_turn_id);
-            saw_review_turn = saw_review_turn or active_turn_matches;
-            continue;
-        }
-        if (!std.mem.eql(u8, line_type, "event_msg")) continue;
-        const payload_obj = core_json.objectField(root_obj, "payload") orelse continue;
-        const event_turn_matches = if (payload_obj.get("turn_id")) |turn_value| blk: {
-            const observed_turn_id = switch (turn_value) {
-                .string => |value| value,
-                else => return error.InvalidReviewTurnBoundary,
-            };
-            if (observed_turn_id.len == 0) return error.InvalidReviewTurnBoundary;
-            const matches = std.mem.eql(u8, observed_turn_id, review_turn_id);
-            saw_review_turn = saw_review_turn or matches;
-            break :blk matches;
-        } else active_turn_matches;
-        if (!event_turn_matches) continue;
-
-        const payload_type = core_json.stringField(payload_obj, "type") orelse continue;
-        const review_output = if (std.mem.eql(u8, payload_type, "exited_review_mode"))
-            payload_obj.get("review_output") orelse return error.InvalidReviewOutput
-        else if (std.mem.eql(u8, payload_type, "item_completed")) new_item: {
-            const item_obj = core_json.objectField(payload_obj, "item") orelse continue;
-            const item_type = core_json.stringField(item_obj, "type") orelse continue;
-            if (!std.mem.eql(u8, item_type, "ExitedReviewMode")) continue;
-            break :new_item item_obj.get("review_output") orelse
-                return error.InvalidReviewOutput;
-        } else continue;
-        const review_output_obj = switch (review_output) {
-            .object => |obj| obj,
-            else => return error.InvalidReviewOutput,
-        };
-        if (latest_json != null) return error.InvalidReviewOutput;
-        const next_json = try buildReviewResultJsonAlloc(allocator, review_output_obj);
-        latest_json = next_json;
+        try scanReviewRolloutRecord(allocator, &scan, root_obj, review_turn_id);
     }
 
-    if (!saw_review_turn) return error.MissingReviewTurnBoundary;
-    return latest_json;
+    if (!scan.saw_review_turn) return error.MissingReviewTurnBoundary;
+    return scan.latest_json;
+}
+
+const ReviewRolloutScan = struct {
+    latest_json: ?[]u8 = null,
+    active_turn_matches: bool = false,
+    saw_review_turn: bool = false,
+};
+
+fn scanReviewRolloutRecord(
+    allocator: std.mem.Allocator,
+    scan: *ReviewRolloutScan,
+    root_obj: std.json.ObjectMap,
+    review_turn_id: []const u8,
+) !void {
+    const line_type = core_json.stringField(root_obj, "type") orelse return;
+    if (std.mem.eql(u8, line_type, "turn_context")) {
+        const payload_obj = core_json.objectField(root_obj, "payload") orelse
+            return error.InvalidReviewTurnBoundary;
+        const observed_turn_id = core_json.stringField(payload_obj, "turn_id") orelse
+            return error.InvalidReviewTurnBoundary;
+        if (observed_turn_id.len == 0) return error.InvalidReviewTurnBoundary;
+        scan.active_turn_matches = std.mem.eql(u8, observed_turn_id, review_turn_id);
+        scan.saw_review_turn = scan.saw_review_turn or scan.active_turn_matches;
+        return;
+    }
+    if (!std.mem.eql(u8, line_type, "event_msg")) return;
+    const payload_obj = core_json.objectField(root_obj, "payload") orelse return;
+    const event_turn_matches = if (payload_obj.get("turn_id")) |turn_value| blk: {
+        const observed_turn_id = switch (turn_value) {
+            .string => |value| value,
+            else => return error.InvalidReviewTurnBoundary,
+        };
+        if (observed_turn_id.len == 0) return error.InvalidReviewTurnBoundary;
+        const matches = std.mem.eql(u8, observed_turn_id, review_turn_id);
+        scan.saw_review_turn = scan.saw_review_turn or matches;
+        break :blk matches;
+    } else scan.active_turn_matches;
+    if (!event_turn_matches) return;
+
+    const payload_type = core_json.stringField(payload_obj, "type") orelse return;
+    const review_output = if (std.mem.eql(u8, payload_type, "exited_review_mode"))
+        payload_obj.get("review_output") orelse return error.InvalidReviewOutput
+    else if (std.mem.eql(u8, payload_type, "item_completed")) new_item: {
+        const item_obj = core_json.objectField(payload_obj, "item") orelse return;
+        const item_type = core_json.stringField(item_obj, "type") orelse return;
+        if (!std.mem.eql(u8, item_type, "ExitedReviewMode")) return;
+        break :new_item item_obj.get("review_output") orelse
+            return error.InvalidReviewOutput;
+    } else return;
+    const review_output_obj = switch (review_output) {
+        .object => |obj| obj,
+        else => return error.InvalidReviewOutput,
+    };
+    if (scan.latest_json != null) return error.InvalidReviewOutput;
+    const next_json = try buildReviewResultJsonAlloc(allocator, review_output_obj);
+    scan.latest_json = next_json;
 }
 
 const ReviewResultFieldNames = struct {
@@ -10102,6 +10270,28 @@ fn reviewFindingCount(allocator: std.mem.Allocator, review_result_json: ?[]const
     return validateReviewResultObject(root_obj, canonical_review_result_fields);
 }
 
+fn receiptPrincipalStrengthForOutput(receipt: OutputReceipt) []const u8 {
+    return if (receipt.account_fingerprint_reduced_protection)
+        principal_strength_reduced
+    else
+        principal_strength_strong;
+}
+
+fn writeReceiptFieldName(writer: *std.Io.Writer, name: []const u8) !void {
+    try writeJsonString(writer, name);
+    try writer.writeByte(':');
+}
+
+fn writeReceiptField(writer: *std.Io.Writer, name: []const u8, value: anytype) !void {
+    try writeReceiptFieldName(writer, name);
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeReceiptNextField(writer: *std.Io.Writer, name: []const u8, value: anytype) !void {
+    try writer.writeByte(',');
+    try writeReceiptField(writer, name, value);
+}
+
 fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
     try std.json.Stringify.value(text, .{}, writer);
 }
@@ -10205,8 +10395,16 @@ fn startReceiptTupleVerdictExists(
     return reviewAttemptExists(review_thread_id) and identityHasCompleteTuple(identity);
 }
 
-fn reviewVerdictJsonTupleVerdictExists(allocator: std.mem.Allocator, review_verdict_json: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, review_verdict_json, .{}) catch return false;
+fn reviewVerdictJsonTupleVerdictExists(
+    allocator: std.mem.Allocator,
+    review_verdict_json: []const u8,
+) bool {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        review_verdict_json,
+        .{},
+    ) catch return false;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |obj| obj,
@@ -10311,7 +10509,11 @@ fn fieldPresentNonNull(obj: std.json.ObjectMap, key: []const u8) bool {
     };
 }
 
-fn jsonFieldAsJsonAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) !?[]u8 {
+fn jsonFieldAsJsonAlloc(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+) !?[]u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .null => null,
@@ -10353,16 +10555,28 @@ fn dupOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
     return if (value) |text| try allocator.dupe(u8, text) else null;
 }
 
-fn optionalStringFromVerdictOrRoot(verdict: std.json.ObjectMap, root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+fn optionalStringFromVerdictOrRoot(
+    verdict: std.json.ObjectMap,
+    root: std.json.ObjectMap,
+    key: []const u8,
+) ?[]const u8 {
     return jsonStringField(verdict, key) orelse jsonStringField(root, key);
 }
 
-fn optionalBoolFromVerdictOrRoot(verdict: std.json.ObjectMap, root: std.json.ObjectMap, key: []const u8) ?bool {
+fn optionalBoolFromVerdictOrRoot(
+    verdict: std.json.ObjectMap,
+    root: std.json.ObjectMap,
+    key: []const u8,
+) ?bool {
     return jsonBoolField(verdict, key) orelse jsonBoolField(root, key);
 }
 
 fn receiptPrincipalReduced(verdict: std.json.ObjectMap, root: std.json.ObjectMap) bool {
-    if (optionalBoolFromVerdictOrRoot(verdict, root, "accountFingerprintReducedProtection")) |value| return value;
+    if (optionalBoolFromVerdictOrRoot(
+        verdict,
+        root,
+        "accountFingerprintReducedProtection",
+    )) |value| return value;
     return true;
 }
 
@@ -10371,16 +10585,31 @@ fn receiptPrincipalStrength(verdict: std.json.ObjectMap, root: std.json.ObjectMa
         if (std.mem.eql(u8, value, principal_strength_strong)) return principal_strength_strong;
         return principal_strength_reduced;
     }
-    return if (receiptPrincipalReduced(verdict, root)) principal_strength_reduced else principal_strength_strong;
+    return if (receiptPrincipalReduced(
+        verdict,
+        root,
+    )) principal_strength_reduced else principal_strength_strong;
 }
 
-fn optionalStringFromRootKeys(root: std.json.ObjectMap, primary: []const u8, secondary: []const u8) ?[]const u8 {
+fn optionalStringFromRootKeys(
+    root: std.json.ObjectMap,
+    primary: []const u8,
+    secondary: []const u8,
+) ?[]const u8 {
     return jsonStringField(root, primary) orelse jsonStringField(root, secondary);
 }
 
 fn receiptRepoRealpathAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]const u8 {
-    if (optionalStringFromRootKeys(root, "repoRealpath", "repo_realpath")) |value| return try allocator.dupe(u8, value);
-    if (optionalStringFromRootKeys(root, "cwd", "repo")) |cwd| return repoRealpathAlloc(allocator, cwd) catch try allocator.dupe(u8, cwd);
+    if (optionalStringFromRootKeys(
+        root,
+        "repoRealpath",
+        "repo_realpath",
+    )) |value| return try allocator.dupe(u8, value);
+    if (optionalStringFromRootKeys(
+        root,
+        "cwd",
+        "repo",
+    )) |cwd| return repoRealpathAlloc(allocator, cwd) catch try allocator.dupe(u8, cwd);
     return null;
 }
 
@@ -10413,9 +10642,21 @@ fn receiptAccountFingerprint(verdict: std.json.ObjectMap, root: std.json.ObjectM
 }
 
 fn optionalStringFromRootKey(root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, key, "baseSha")) return optionalStringFromRootKeys(root, "baseSha", "base_sha");
-    if (std.mem.eql(u8, key, "headSha")) return optionalStringFromRootKeys(root, "headSha", "head_sha");
-    if (std.mem.eql(u8, key, "targetFingerprint")) return optionalStringFromRootKeys(root, "targetFingerprint", "target_fingerprint");
+    if (std.mem.eql(
+        u8,
+        key,
+        "baseSha",
+    )) return optionalStringFromRootKeys(root, "baseSha", "base_sha");
+    if (std.mem.eql(
+        u8,
+        key,
+        "headSha",
+    )) return optionalStringFromRootKeys(root, "headSha", "head_sha");
+    if (std.mem.eql(
+        u8,
+        key,
+        "targetFingerprint",
+    )) return optionalStringFromRootKeys(root, "targetFingerprint", "target_fingerprint");
     return jsonStringField(root, key);
 }
 
@@ -10425,7 +10666,11 @@ fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn rootFieldMatchesIfPresent(root: std.json.ObjectMap, key: []const u8, verdict_value: ?[]const u8) bool {
+fn rootFieldMatchesIfPresent(
+    root: std.json.ObjectMap,
+    key: []const u8,
+    verdict_value: ?[]const u8,
+) bool {
     const root_value = optionalStringFromRootKey(root, key) orelse return true;
     return optionalStringsEqual(root_value, verdict_value);
 }
@@ -10433,7 +10678,10 @@ fn rootFieldMatchesIfPresent(root: std.json.ObjectMap, key: []const u8, verdict_
 fn rootTupleMatchesIdentity(root: std.json.ObjectMap, identity: TargetIdentity) bool {
     return optionalStringsEqual(optionalStringFromRootKey(root, "baseSha"), identity.base_sha) and
         optionalStringsEqual(optionalStringFromRootKey(root, "headSha"), identity.head_sha) and
-        optionalStringsEqual(optionalStringFromRootKey(root, "targetFingerprint"), identity.fingerprint);
+        optionalStringsEqual(
+            optionalStringFromRootKey(root, "targetFingerprint"),
+            identity.fingerprint,
+        );
 }
 
 fn rootTupleFieldsMatchIdentityIfPresent(root: std.json.ObjectMap, identity: TargetIdentity) bool {
@@ -10447,7 +10695,10 @@ fn rootHasTupleVerdictBinding(root: std.json.ObjectMap) bool {
     if (base_sha.len == 0) return false;
     const head_sha = optionalStringFromRootKey(root, "headSha") orelse return false;
     if (head_sha.len == 0) return false;
-    const target_fingerprint = optionalStringFromRootKey(root, "targetFingerprint") orelse return false;
+    const target_fingerprint = optionalStringFromRootKey(
+        root,
+        "targetFingerprint",
+    ) orelse return false;
     return target_fingerprint.len != 0;
 }
 
@@ -10461,7 +10712,11 @@ fn verdictTupleMatchesIdentity(verdict: std.json.ObjectMap, identity: TargetIden
         optionalStringsEqual(jsonStringField(verdict, "targetFingerprint"), identity.fingerprint);
 }
 
-fn verdictHasTupleBinding(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool) bool {
+fn verdictHasTupleBinding(
+    verdict: std.json.ObjectMap,
+    root: std.json.ObjectMap,
+    root_has_verdict: bool,
+) bool {
     const base_sha = jsonStringField(verdict, "baseSha") orelse return false;
     if (base_sha.len == 0) return false;
     const head_sha = jsonStringField(verdict, "headSha") orelse return false;
@@ -10484,7 +10739,12 @@ fn terminalReceiptStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "incomplete");
 }
 
-fn normalizedAttemptPhase(root: std.json.ObjectMap, status: []const u8, tuple_verdict_exists: bool, review_thread_id: ?[]const u8) []const u8 {
+fn normalizedAttemptPhase(
+    root: std.json.ObjectMap,
+    status: []const u8,
+    tuple_verdict_exists: bool,
+    review_thread_id: ?[]const u8,
+) []const u8 {
     if (tuple_verdict_exists) return "normalized_verdict";
     if (jsonStringField(root, "reviewAttemptPhase")) |phase| return phase;
     if (root.get("reviewVerdict")) |value| switch (value) {
@@ -10505,11 +10765,14 @@ fn normalizedAttemptPhase(root: std.json.ObjectMap, status: []const u8, tuple_ve
 fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn canonicalWorkflowBindingJsonFromValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+fn canonicalWorkflowBindingJsonFromValueAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
     const raw = try stringifyJsonValueAlloc(allocator, value);
     defer allocator.free(raw);
     if (std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{}) catch null) |parsed_value| {
@@ -10522,11 +10785,17 @@ fn canonicalWorkflowBindingJsonFromValueAlloc(allocator: std.mem.Allocator, valu
     return error.InvalidWorkflowBinding;
 }
 
-fn workflowBindingJsonFromRootAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]const u8 {
-    const nested_value: ?std.json.Value = if (root.get("record")) |record_value| switch (record_value) {
-        .object => |record| record.get("workflowBinding"),
-        else => null,
-    } else null;
+fn workflowBindingJsonFromRootAlloc(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+) !?[]const u8 {
+    const nested_value: ?std.json.Value = if (root.get("record")) |record_value|
+        switch (record_value) {
+            .object => |record| record.get("workflowBinding"),
+            else => null,
+        }
+    else
+        null;
     const candidates = [_]?std.json.Value{
         root.get("workflowBinding"),
         nested_value,
@@ -10567,12 +10836,18 @@ fn readRolloutReviewResultFromEventLogAlloc(
     defer allocator.free(raw);
 
     var latest_review_result: ?[]u8 = null;
+    errdefer if (latest_review_result) |value| allocator.free(value);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            trimmed,
+            .{},
+        ) catch continue;
         defer parsed.deinit();
         const root_obj = switch (parsed.value) {
             .object => |obj| obj,
@@ -10584,7 +10859,12 @@ fn readRolloutReviewResultFromEventLogAlloc(
         if (!std.mem.eql(u8, direction, "response")) continue;
 
         const payload_text = jsonStringField(root_obj, "payload") orelse continue;
-        var payload_parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_text, .{}) catch continue;
+        var payload_parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            payload_text,
+            .{},
+        ) catch continue;
         defer payload_parsed.deinit();
         const payload_obj = switch (payload_parsed.value) {
             .object => |obj| obj,
@@ -10605,31 +10885,131 @@ fn readRolloutReviewResultFromEventLogAlloc(
     return latest_review_result;
 }
 
-fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8, recover_event_logs: bool, context: NormalizeContext) !NormalizedReceipt {
+fn normalizeReceiptFromPathAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    recover_event_logs: bool,
+    context: NormalizeContext,
+) !NormalizedReceipt {
     const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
     defer allocator.free(raw);
     return normalizeReceiptFromJsonAlloc(allocator, path, raw, recover_event_logs, context);
 }
 
-fn tupleVerdictExistsForContext(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) bool {
+fn tupleVerdictExistsForContext(
+    verdict: std.json.ObjectMap,
+    root: std.json.ObjectMap,
+    root_has_verdict: bool,
+    context: NormalizeContext,
+) bool {
     if (context.requested_identity_required) {
         const requested = context.requested_identity orelse return false;
         if (!identityHasCompleteTuple(requested)) return false;
-        return verdictTupleMatchesIdentity(verdict, requested) and (!root_has_verdict or rootTupleFieldsMatchIdentityIfPresent(root, requested));
+        return verdictTupleMatchesIdentity(
+            verdict,
+            requested,
+        ) and (!root_has_verdict or rootTupleFieldsMatchIdentityIfPresent(root, requested));
     }
     return verdictHasTupleBinding(verdict, root, root_has_verdict);
 }
 
-fn tupleBindingFailureCode(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) ?[]const u8 {
+fn tupleBindingFailureCode(
+    verdict: std.json.ObjectMap,
+    root: std.json.ObjectMap,
+    root_has_verdict: bool,
+    context: NormalizeContext,
+) ?[]const u8 {
     if (!context.requested_identity_required) return null;
     const requested = context.requested_identity orelse return "target_identity_unavailable";
     if (!identityHasCompleteTuple(requested)) return "target_identity_unavailable";
     if (!verdictTupleMatchesIdentity(verdict, requested)) return "tuple_mismatch";
-    if (root_has_verdict and !rootTupleFieldsMatchIdentityIfPresent(root, requested)) return "tuple_mismatch";
+    if (root_has_verdict and !rootTupleFieldsMatchIdentityIfPresent(
+        root,
+        requested,
+    )) return "tuple_mismatch";
     return null;
 }
 
-fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []const u8, raw: []const u8, recover_event_logs: bool, context: NormalizeContext) !NormalizedReceipt {
+// All input slices are borrowed; the result owns each slice released by deinit.
+fn cloneNormalizedReceipt(
+    allocator: std.mem.Allocator,
+    borrowed: NormalizedReceipt,
+) !NormalizedReceipt {
+    var owned = borrowed;
+    inline for (std.meta.fields(NormalizedReceipt)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "principal_strength")) {
+            if (field.type == []const u8) @field(owned, field.name) = "";
+            if (field.type == ?[]const u8) @field(owned, field.name) = null;
+        }
+    }
+    errdefer owned.deinit(allocator);
+    inline for (std.meta.fields(NormalizedReceipt)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "principal_strength")) {
+            if (field.type == []const u8) {
+                @field(owned, field.name) = try allocator.dupe(u8, @field(borrowed, field.name));
+            }
+            if (field.type == ?[]const u8) {
+                @field(
+                    owned,
+                    field.name,
+                ) = try dupOptional(allocator, @field(borrowed, field.name));
+            }
+        }
+    }
+    return owned;
+}
+
+fn finishNormalizedReceiptAlloc(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    verdict: std.json.ObjectMap,
+    fields: NormalizedReceipt,
+) !NormalizedReceipt {
+    var borrowed = fields;
+    const repo_realpath = try receiptRepoRealpathAlloc(allocator, root);
+    errdefer if (repo_realpath) |value| allocator.free(value);
+    const binding = try workflowBindingJsonFromRootAlloc(allocator, root);
+    errdefer if (binding) |value| allocator.free(value);
+
+    borrowed.resolved_codex_path = receiptResolvedCodexPath(root);
+    borrowed.resolved_codex_version = receiptResolvedCodexVersion(root);
+    borrowed.codex_binary_digest = optionalStringFromRootKeys(
+        root,
+        "codexBinaryDigest",
+        "codex_binary_digest",
+    );
+    borrowed.app_server_contract_id = optionalStringFromRootKeys(
+        root,
+        "appServerContractId",
+        "app_server_contract_id",
+    );
+    borrowed.selected_transport = optionalStringFromRootKeys(
+        root,
+        "selectedTransport",
+        "transport_kind",
+    );
+    borrowed.code_mode_host_redacted = receiptCodeModeHostField(root, "origin");
+    borrowed.code_mode_host_digest = receiptCodeModeHostField(root, "sha256");
+    borrowed.codex_thread_id = receiptCodexThreadId(root);
+    borrowed.account_fingerprint = receiptAccountFingerprint(verdict, root);
+    borrowed.attempt_created_at_unix_s = receiptCreatedAtUnixS(root);
+    borrowed.target_json = null;
+    borrowed.findings_json = "";
+    var owned = try cloneNormalizedReceipt(allocator, borrowed);
+    owned.repo_realpath = repo_realpath;
+    owned.workflow_binding_json = binding;
+    owned.target_json = fields.target_json;
+    owned.findings_json = fields.findings_json;
+    return owned;
+}
+
+fn normalizeReceiptFromJsonAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    raw: []const u8,
+    recover_event_logs: bool,
+    context: NormalizeContext,
+) !NormalizedReceipt {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -10657,529 +11037,608 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
                 return normalizeStartReceiptAlloc(allocator, source_path, root, context);
             }
         }
-        if (jsonStringField(root, "reviewAttemptPhase") != null or jsonStringField(root, "failureCode") != null) {
+        if (jsonStringField(
+            root,
+            "reviewAttemptPhase",
+        ) != null or jsonStringField(root, "failureCode") != null) {
             return normalizeAttemptOnlyReceiptAlloc(allocator, source_path, root, context);
         }
-        return normalizeStoredSessionRecordReceiptAlloc(allocator, source_path, root, recover_event_logs, context);
+        return normalizeStoredSessionRecordReceiptAlloc(
+            allocator,
+            source_path,
+            root,
+            recover_event_logs,
+            context,
+        );
     }
 
-    const receipt_status = jsonStringField(verdict, "status") orelse return error.MissingReceiptStatus;
-    const backend_class = jsonStringField(verdict, "backendClass") orelse return error.MissingBackendClass;
-    const clean = jsonBoolField(verdict, "clean") orelse return error.MissingCleanFlag;
-    const finding_count = jsonUsizeField(verdict, "findingCount") orelse return error.MissingFindingCount;
-    const review_thread_id = optionalStringFromVerdictOrRoot(verdict, root, "reviewThreadId");
-    const review_attempt_exists = receiptReviewAttemptExists(root, review_thread_id);
-    const account_failure = rootHasStructuredAccountResourceExhaustion(root) or
-        if (optionalStringFromVerdictOrRoot(verdict, root, "failureCode")) |code| failureCodeIsAccountResourceExhausted(code) else false;
-    const raw_failure_code = optionalStringFromVerdictOrRoot(verdict, root, "failureCode");
-    const status_without_binding = if (account_failure and !review_attempt_exists)
-        "incomplete"
-    else if (account_failure)
-        "account_resource_exhausted"
-    else if (review_attempt_exists and
-        if (raw_failure_code) |code|
-            std.mem.indexOf(u8, code, "transport") != null
+    return normalizeVerdictReceiptAlloc(
+        allocator,
+        source_path,
+        root,
+        verdict,
+        root_has_verdict,
+        context,
+    );
+}
+
+const ReceiptVerdictState = struct {
+    status: []const u8,
+    backend_class: []const u8,
+    clean: bool,
+    finding_count: usize,
+    phase: []const u8,
+    attempt_exists: bool,
+    tuple_exists: bool,
+    review_thread_id: ?[]const u8,
+    failure_code: ?[]const u8,
+    failure_hint: ?[]const u8,
+    failure_class: ?[]const u8,
+    retryable: ?bool,
+};
+
+fn assembleNormalizedReceiptAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    root: std.json.ObjectMap,
+    verdict: std.json.ObjectMap,
+    state: ReceiptVerdictState,
+    target_json: ?[]const u8,
+    findings_json: []const u8,
+    stored: bool,
+) !NormalizedReceipt {
+    return finishNormalizedReceiptAlloc(allocator, root, verdict, .{
+        .source_path = source_path,
+        .status = state.status,
+        .backend_class = state.backend_class,
+        .clean = state.clean,
+        .finding_count = state.finding_count,
+        .review_attempt_phase = state.phase,
+        .review_attempt_exists = state.attempt_exists,
+        .tuple_verdict_exists = state.tuple_exists,
+        .principal_strength = receiptPrincipalStrength(verdict, root),
+        .account_fingerprint_reduced_protection = receiptPrincipalReduced(verdict, root),
+        .base_sha = normalizedReceiptString(root, verdict, "baseSha", stored),
+        .head_sha = normalizedReceiptString(root, verdict, "headSha", stored),
+        .target_fingerprint = normalizedReceiptString(root, verdict, "targetFingerprint", stored),
+        .target_json = target_json,
+        .review_thread_id = state.review_thread_id,
+        .review_turn_id = normalizedReceiptString(root, verdict, "reviewTurnId", stored),
+        .record_path = if (stored) source_path else optionalStringFromVerdictOrRoot(
+            verdict,
+            root,
+            "recordPath",
+        ),
+        .event_log_path = normalizedReceiptString(root, verdict, "eventLogPath", stored),
+        .failure_code = state.failure_code,
+        .failure_hint = state.failure_hint,
+        .failure_class = state.failure_class,
+        .retryable_same_tuple_now = state.retryable,
+        .findings_json = findings_json,
+    });
+}
+
+fn normalizedReceiptString(
+    root: std.json.ObjectMap,
+    verdict: std.json.ObjectMap,
+    key: []const u8,
+    stored: bool,
+) ?[]const u8 {
+    if (!stored) return optionalStringFromVerdictOrRoot(verdict, root, key);
+    if (std.mem.eql(u8, key, "reviewTurnId")) return jsonStringField(root, "review_turn_id");
+    if (std.mem.eql(u8, key, "eventLogPath")) return jsonStringField(root, "event_log_path");
+    return optionalStringFromRootKey(root, key);
+}
+
+fn normalizationFailureHint(
+    binding: ?[]const u8,
+    account: bool,
+    fallback: ?[]const u8,
+) ?[]const u8 {
+    if (binding) |code| return normalizationBindingHint(code, false);
+    return if (account) account_resource_exhausted_hint else fallback;
+}
+
+fn normalizationBindingHint(code: []const u8, stored: bool) []const u8 {
+    if (std.mem.eql(u8, code, "target_identity_unavailable")) {
+        return "requested target identity could not be computed for receipt normalization";
+    }
+    if (stored) return "stored review session tuple did not match the requested target identity";
+    return "reviewVerdict tuple did not match the requested target identity";
+}
+
+fn rootBindingFailure(root: std.json.ObjectMap, context: NormalizeContext) ?[]const u8 {
+    if (!context.requested_identity_required) return null;
+    const requested = context.requested_identity orelse return "target_identity_unavailable";
+    if (!identityHasCompleteTuple(requested)) return "target_identity_unavailable";
+    return if (rootTupleMatchesIdentity(root, requested)) null else "tuple_mismatch";
+}
+
+fn rootTupleVerdictExists(
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+    status: []const u8,
+    binding_failure: ?[]const u8,
+) bool {
+    return binding_failure == null and reviewVerdictStatusIsTupleTerminal(status) and
+        if (context.requested_identity_required)
+            rootTupleMatchesIdentity(root, context.requested_identity.?)
         else
-            false)
-        "review_transport_failure"
-    else
-        canonicalReceiptStatus(receipt_status, raw_failure_code, review_thread_id);
-    const binding_failure = if (reviewVerdictStatusIsTupleTerminal(status_without_binding))
-        tupleBindingFailureCode(verdict, root, root_has_verdict, context)
-    else
-        null;
-    const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else raw_failure_code;
-    const final_status = if (binding_failure != null) "incomplete" else status_without_binding;
-    const tuple_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsTupleTerminal(final_status) and
-        tupleVerdictExistsForContext(verdict, root, root_has_verdict, context);
-    const final_clean = if (binding_failure != null) false else clean;
-    const final_failure_hint = if (binding_failure) |code|
-        if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for receipt normalization"
-        else
-            "reviewVerdict tuple did not match the requested target identity"
-    else if (account_failure) account_resource_exhausted_hint else optionalStringFromVerdictOrRoot(verdict, root, "failureHint");
-    const final_failure_class = optionalStringFromVerdictOrRoot(verdict, root, "failureClass") orelse failureClassForCode(final_failure_code);
-    const final_retryable_same_tuple_now = jsonBoolField(root, "retryableSameTupleNow") orelse retryableSameTupleNowForCode(final_failure_code);
-    const review_attempt_phase = if (account_failure and review_attempt_exists)
-        "review_terminal"
-    else
-        normalizedAttemptPhase(root, final_status, tuple_verdict_exists, review_thread_id);
+            rootHasTupleVerdictBinding(root);
+}
+
+fn normalizeVerdictReceiptAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    root: std.json.ObjectMap,
+    verdict: std.json.ObjectMap,
+    root_has_verdict: bool,
+    context: NormalizeContext,
+) !NormalizedReceipt {
+    const state = try normalizedVerdictState(root, verdict, root_has_verdict, context);
     const findings_json = if (verdict.get("findings")) |value|
         try stringifyJsonValueAlloc(allocator, value)
     else
         try allocator.dupe(u8, "[]");
-    const account_fingerprint_reduced_protection = receiptPrincipalReduced(verdict, root);
-    const principal_strength = receiptPrincipalStrength(verdict, root);
+    errdefer allocator.free(findings_json);
     const target_json = try targetRecordJsonFromRootAlloc(allocator, root);
     errdefer if (target_json) |value| allocator.free(value);
+    return assembleNormalizedReceiptAlloc(
+        allocator,
+        source_path,
+        root,
+        verdict,
+        state,
+        target_json,
+        findings_json,
+        false,
+    );
+}
 
+fn normalizedVerdictStatus(
+    receipt_status: []const u8,
+    failure_code: ?[]const u8,
+    review_thread_id: ?[]const u8,
+    attempt_exists: bool,
+    account_failure: bool,
+) []const u8 {
+    if (account_failure) return if (attempt_exists) "account_resource_exhausted" else "incomplete";
+    if (attempt_exists) {
+        if (failure_code) |code| {
+            if (std.mem.indexOf(u8, code, "transport") != null) return "review_transport_failure";
+        }
+    }
+    return canonicalReceiptStatus(receipt_status, failure_code, review_thread_id);
+}
+
+fn normalizedVerdictState(
+    root: std.json.ObjectMap,
+    verdict: std.json.ObjectMap,
+    root_has_verdict: bool,
+    context: NormalizeContext,
+) !ReceiptVerdictState {
+    const raw_status = jsonStringField(verdict, "status") orelse return error.MissingReceiptStatus;
+    const backend = jsonStringField(
+        verdict,
+        "backendClass",
+    ) orelse return error.MissingBackendClass;
+    const clean = jsonBoolField(verdict, "clean") orelse return error.MissingCleanFlag;
+    const count = jsonUsizeField(verdict, "findingCount") orelse return error.MissingFindingCount;
+    const thread_id = optionalStringFromVerdictOrRoot(verdict, root, "reviewThreadId");
+    const attempt = receiptReviewAttemptExists(root, thread_id);
+    const raw_failure = optionalStringFromVerdictOrRoot(verdict, root, "failureCode");
+    const account = rootHasStructuredAccountResourceExhaustion(root) or
+        if (raw_failure) |code| failureCodeIsAccountResourceExhausted(code) else false;
+    const unbound = normalizedVerdictStatus(raw_status, raw_failure, thread_id, attempt, account);
+    const binding = if (reviewVerdictStatusIsTupleTerminal(unbound))
+        tupleBindingFailureCode(verdict, root, root_has_verdict, context)
+    else
+        null;
+    const failure = binding orelse if (account) "account_resource_exhausted" else raw_failure;
+    const status = if (binding != null) "incomplete" else unbound;
+    const tuple = binding == null and reviewVerdictStatusIsTupleTerminal(status) and
+        tupleVerdictExistsForContext(verdict, root, root_has_verdict, context);
     return .{
-        .source_path = try allocator.dupe(u8, source_path),
-        .status = try allocator.dupe(u8, final_status),
-        .backend_class = try allocator.dupe(u8, backend_class),
-        .clean = final_clean,
-        .finding_count = finding_count,
-        .review_attempt_phase = try allocator.dupe(u8, review_attempt_phase),
-        .review_attempt_exists = review_attempt_exists,
-        .tuple_verdict_exists = tuple_verdict_exists,
-        .principal_strength = principal_strength,
-        .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
-        .base_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "baseSha")),
-        .head_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "headSha")),
-        .target_fingerprint = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "targetFingerprint")),
-        .target_json = target_json,
-        .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
-        .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
-        .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        .status = status,
+        .backend_class = backend,
+        .clean = if (binding != null) false else clean,
+        .finding_count = count,
+        .phase = if (account and attempt) "review_terminal" else normalizedAttemptPhase(
+            root,
+            status,
+            tuple,
+            thread_id,
         ),
-        .app_server_contract_id = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
+        .attempt_exists = attempt,
+        .tuple_exists = tuple,
+        .review_thread_id = thread_id,
+        .failure_code = failure,
+        .failure_hint = normalizationFailureHint(
+            binding,
+            account,
+            optionalStringFromVerdictOrRoot(verdict, root, "failureHint"),
         ),
-        .selected_transport = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
-        ),
-        .code_mode_host_redacted = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "origin"),
-        ),
-        .code_mode_host_digest = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "sha256"),
-        ),
-        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
-        .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(verdict, root)),
-        .review_thread_id = try dupOptional(allocator, review_thread_id),
-        .review_turn_id = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "reviewTurnId")),
-        .record_path = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "recordPath")),
-        .event_log_path = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "eventLogPath")),
-        .attempt_created_at_unix_s = receiptCreatedAtUnixS(root),
-        .failure_code = try dupOptional(allocator, final_failure_code),
-        .failure_hint = try dupOptional(allocator, final_failure_hint),
-        .failure_class = try dupOptional(allocator, final_failure_class),
-        .retryable_same_tuple_now = final_retryable_same_tuple_now,
-        .findings_json = findings_json,
-        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
+        .failure_class = optionalStringFromVerdictOrRoot(verdict, root, "failureClass") orelse
+            failureClassForCode(failure),
+        .retryable = jsonBoolField(root, "retryableSameTupleNow") orelse
+            retryableSameTupleNowForCode(failure),
     };
 }
 
-fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: []const u8, root: std.json.ObjectMap, context: NormalizeContext) !NormalizedReceipt {
-    const review_thread_id = jsonStringField(root, "reviewThreadId");
-    const review_attempt_exists = receiptReviewAttemptExists(root, review_thread_id);
-    const failure_code = jsonStringField(root, "failureCode");
-    const account_failure = if (failure_code) |code|
-        failureCodeIsAccountResourceExhausted(code) or
-            rootHasStructuredAccountResourceExhaustion(root)
-    else
-        rootHasStructuredAccountResourceExhaustion(root);
-    const status = if (!review_attempt_exists)
-        "incomplete"
-    else if (account_failure)
-        "account_resource_exhausted"
-    else if (failure_code) |code|
-        if (std.mem.indexOf(u8, code, "transport") != null)
-            "review_transport_failure"
-        else
-            reviewVerdictStatus(
-                false,
-                0,
-                .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" },
-                review_thread_id,
-            )
-    else
-        "incomplete";
+fn normalizeAttemptOnlyReceiptAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+) !NormalizedReceipt {
     _ = context;
-    const tuple_verdict_exists = false;
-    const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
-    const principal_strength = receiptPrincipalStrength(root, root);
+    const state = normalizedAttemptOnlyState(root);
     const target_json = try targetRecordJsonFromRootAlloc(allocator, root);
     errdefer if (target_json) |value| allocator.free(value);
+    const findings_json = try allocator.dupe(u8, "[]");
+    errdefer allocator.free(findings_json);
+    return assembleNormalizedReceiptAlloc(
+        allocator,
+        source_path,
+        root,
+        root,
+        state,
+        target_json,
+        findings_json,
+        false,
+    );
+}
+
+fn attemptOnlyStatus(
+    root: std.json.ObjectMap,
+    thread_id: ?[]const u8,
+    attempt: bool,
+    account: bool,
+    failure: ?[]const u8,
+) []const u8 {
+    if (!attempt) return "incomplete";
+    if (account) return "account_resource_exhausted";
+    if (failure) |code| {
+        if (std.mem.indexOf(u8, code, "transport") != null) return "review_transport_failure";
+        return reviewVerdictStatus(false, 0, .{
+            .code = code,
+            .hint = jsonStringField(root, "failureHint") orelse "",
+        }, thread_id);
+    }
+    return "incomplete";
+}
+
+fn normalizedAttemptOnlyState(root: std.json.ObjectMap) ReceiptVerdictState {
+    const thread_id = jsonStringField(root, "reviewThreadId");
+    const attempt = receiptReviewAttemptExists(root, thread_id);
+    const failure = jsonStringField(root, "failureCode");
+    const account = rootHasStructuredAccountResourceExhaustion(root) or
+        if (failure) |code| failureCodeIsAccountResourceExhausted(code) else false;
+    const status = attemptOnlyStatus(root, thread_id, attempt, account, failure);
     return .{
-        .source_path = try allocator.dupe(u8, source_path),
-        .status = try allocator.dupe(u8, status),
-        .backend_class = try allocator.dupe(u8, "cas-receipt-normalized"),
+        .status = status,
+        .backend_class = "cas-receipt-normalized",
         .clean = false,
         .finding_count = 0,
-        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, status, tuple_verdict_exists, review_thread_id)),
-        .review_attempt_exists = review_attempt_exists,
-        .tuple_verdict_exists = tuple_verdict_exists,
-        .principal_strength = principal_strength,
-        .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
-        .base_sha = try dupOptional(allocator, jsonStringField(root, "baseSha")),
-        .head_sha = try dupOptional(allocator, jsonStringField(root, "headSha")),
-        .target_fingerprint = try dupOptional(allocator, jsonStringField(root, "targetFingerprint")),
-        .target_json = target_json,
-        .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
-        .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
-        .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        .phase = normalizedAttemptPhase(root, status, false, thread_id),
+        .attempt_exists = attempt,
+        .tuple_exists = false,
+        .review_thread_id = thread_id,
+        .failure_code = if (account) "account_resource_exhausted" else failure,
+        .failure_hint = if (account) account_resource_exhausted_hint else jsonStringField(
+            root,
+            "failureHint",
         ),
-        .app_server_contract_id = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
-        ),
-        .selected_transport = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
-        ),
-        .code_mode_host_redacted = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "origin"),
-        ),
-        .code_mode_host_digest = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "sha256"),
-        ),
-        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
-        .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
-        .review_thread_id = try dupOptional(allocator, review_thread_id),
-        .review_turn_id = try dupOptional(allocator, jsonStringField(root, "reviewTurnId")),
-        .record_path = try dupOptional(allocator, jsonStringField(root, "recordPath")),
-        .event_log_path = try dupOptional(allocator, jsonStringField(root, "eventLogPath")),
-        .attempt_created_at_unix_s = receiptCreatedAtUnixS(root),
-        .failure_code = try dupOptional(allocator, if (account_failure) "account_resource_exhausted" else failure_code),
-        .failure_hint = try dupOptional(allocator, if (account_failure) account_resource_exhausted_hint else jsonStringField(root, "failureHint")),
-        .failure_class = try dupOptional(allocator, if (account_failure) "account_resource" else failureClassForCode(failure_code)),
-        .retryable_same_tuple_now = if (account_failure) false else retryableSameTupleNowForCode(failure_code),
-        .findings_json = try allocator.dupe(u8, "[]"),
-        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
+        .failure_class = if (account) "account_resource" else failureClassForCode(failure),
+        .retryable = if (account) false else retryableSameTupleNowForCode(failure),
     };
 }
 
-fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const u8, root: std.json.ObjectMap, context: NormalizeContext) !NormalizedReceipt {
-    const review_thread_id = jsonStringField(root, "reviewThreadId");
-    const review_attempt_exists = receiptReviewAttemptExists(root, review_thread_id);
-    const failure_code = jsonStringField(root, "failureCode");
-    const review_result_json = try jsonFieldAsJsonAlloc(allocator, root, "reviewResult");
-    defer if (review_result_json) |value| allocator.free(value);
-    const finding_count = try reviewFindingCount(allocator, review_result_json);
-    const account_failure = if (failure_code) |code|
-        failureCodeIsAccountResourceExhausted(code) or
-            rootHasStructuredAccountResourceExhaustion(root)
-    else
-        rootHasStructuredAccountResourceExhaustion(root);
-    const timed_out = jsonBoolField(root, "timedOut") orelse false;
-    const status = if (account_failure and !review_attempt_exists)
-        "incomplete"
-    else if (account_failure)
-        "account_resource_exhausted"
-    else if (failure_code) |code|
-        if (std.mem.indexOf(u8, code, "transport") != null)
-            if (review_attempt_exists)
-                "review_transport_failure"
-            else
-                "incomplete"
-        else if (timed_out)
-            "timeout"
-        else if (!review_attempt_exists)
-            "incomplete"
-        else
-            reviewVerdictStatus(
-                false,
-                finding_count,
-                .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" },
-                review_thread_id,
-            )
-    else if (timed_out)
-        "timeout"
-    else if (!review_attempt_exists)
-        "incomplete"
-    else if (finding_count > 0)
-        "findings"
-    else if (review_result_json != null)
-        "clean"
-    else
-        "incomplete";
-    const binding_failure = if (context.requested_identity_required) blk: {
-        const requested = context.requested_identity orelse break :blk "target_identity_unavailable";
-        if (!identityHasCompleteTuple(requested)) break :blk "target_identity_unavailable";
-        break :blk if (rootTupleMatchesIdentity(root, requested)) @as(?[]const u8, null) else "tuple_mismatch";
-    } else null;
-    const final_status = if (binding_failure != null) "incomplete" else status;
-    const final_clean = binding_failure == null and std.mem.eql(u8, final_status, "clean");
-    const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else failure_code;
-    const final_failure_hint = if (binding_failure) |code|
-        if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for receipt normalization"
-        else
-            "reviewVerdict tuple did not match the requested target identity"
-    else if (account_failure) account_resource_exhausted_hint else jsonStringField(root, "failureHint");
-    const final_failure_class = jsonStringField(root, "failureClass") orelse failureClassForCode(final_failure_code);
-    const final_retryable_same_tuple_now = jsonBoolField(root, "retryableSameTupleNow") orelse retryableSameTupleNowForCode(final_failure_code);
-    const tuple_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsTupleTerminal(final_status) and
-        if (context.requested_identity_required)
-            rootTupleMatchesIdentity(root, context.requested_identity.?)
-        else
-            rootHasTupleVerdictBinding(root);
-    const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
-    const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
-    const principal_strength = receiptPrincipalStrength(root, root);
+fn normalizeStartReceiptAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+) !NormalizedReceipt {
+    const review_result = try jsonFieldAsJsonAlloc(allocator, root, "reviewResult");
+    defer if (review_result) |value| allocator.free(value);
+    const count = try reviewFindingCount(allocator, review_result);
+    const state = normalizedStartState(root, context, count, review_result != null);
+    const findings_json = compactFindingsJsonAlloc(allocator, review_result) catch
+        try allocator.dupe(u8, "[]");
+    errdefer allocator.free(findings_json);
     const target_json = try targetRecordJsonFromRootAlloc(allocator, root);
     errdefer if (target_json) |value| allocator.free(value);
+    return assembleNormalizedReceiptAlloc(
+        allocator,
+        source_path,
+        root,
+        root,
+        state,
+        target_json,
+        findings_json,
+        false,
+    );
+}
+
+fn normalizedStartStatus(
+    root: std.json.ObjectMap,
+    count: usize,
+    result_exists: bool,
+    account: bool,
+    attempt: bool,
+) []const u8 {
+    const failure = jsonStringField(root, "failureCode");
+    const timed_out = jsonBoolField(root, "timedOut") orelse false;
+    if (account) return if (attempt) "account_resource_exhausted" else "incomplete";
+    if (failure) |code| {
+        if (std.mem.indexOf(u8, code, "transport") != null) {
+            return if (attempt) "review_transport_failure" else "incomplete";
+        }
+        if (timed_out) return "timeout";
+        if (!attempt) return "incomplete";
+        return reviewVerdictStatus(false, count, .{
+            .code = code,
+            .hint = jsonStringField(root, "failureHint") orelse "",
+        }, jsonStringField(root, "reviewThreadId"));
+    }
+    if (timed_out) return "timeout";
+    if (!attempt) return "incomplete";
+    if (count > 0) return "findings";
+    return if (result_exists) "clean" else "incomplete";
+}
+
+fn normalizedStartState(
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+    count: usize,
+    result_exists: bool,
+) ReceiptVerdictState {
+    const thread_id = jsonStringField(root, "reviewThreadId");
+    const attempt = receiptReviewAttemptExists(root, thread_id);
+    const raw_failure = jsonStringField(root, "failureCode");
+    const account = rootHasStructuredAccountResourceExhaustion(root) or
+        if (raw_failure) |code| failureCodeIsAccountResourceExhausted(code) else false;
+    const unbound = normalizedStartStatus(root, count, result_exists, account, attempt);
+    const binding = rootBindingFailure(root, context);
+    const status = if (binding != null) "incomplete" else unbound;
+    const failure = binding orelse if (account) "account_resource_exhausted" else raw_failure;
+    const tuple = rootTupleVerdictExists(root, context, status, binding);
     return .{
-        .source_path = try allocator.dupe(u8, source_path),
-        .status = try allocator.dupe(u8, final_status),
-        .backend_class = try allocator.dupe(u8, "cas-start-wait"),
-        .clean = final_clean,
-        .finding_count = finding_count,
-        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, final_status, tuple_verdict_exists, review_thread_id)),
-        .review_attempt_exists = review_attempt_exists,
-        .tuple_verdict_exists = tuple_verdict_exists,
-        .principal_strength = principal_strength,
-        .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
-        .base_sha = try dupOptional(allocator, jsonStringField(root, "baseSha")),
-        .head_sha = try dupOptional(allocator, jsonStringField(root, "headSha")),
-        .target_fingerprint = try dupOptional(allocator, jsonStringField(root, "targetFingerprint")),
-        .target_json = target_json,
-        .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
-        .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
-        .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
+        .status = status,
+        .backend_class = "cas-start-wait",
+        .clean = binding == null and std.mem.eql(u8, status, "clean"),
+        .finding_count = count,
+        .phase = normalizedAttemptPhase(root, status, tuple, thread_id),
+        .attempt_exists = attempt,
+        .tuple_exists = tuple,
+        .review_thread_id = thread_id,
+        .failure_code = failure,
+        .failure_hint = normalizationFailureHint(
+            binding,
+            account,
+            jsonStringField(root, "failureHint"),
         ),
-        .app_server_contract_id = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
-        ),
-        .selected_transport = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
-        ),
-        .code_mode_host_redacted = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "origin"),
-        ),
-        .code_mode_host_digest = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "sha256"),
-        ),
-        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
-        .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
-        .review_thread_id = try dupOptional(allocator, review_thread_id),
-        .review_turn_id = try dupOptional(allocator, jsonStringField(root, "reviewTurnId")),
-        .record_path = try dupOptional(allocator, jsonStringField(root, "recordPath")),
-        .event_log_path = try dupOptional(allocator, jsonStringField(root, "eventLogPath")),
-        .attempt_created_at_unix_s = receiptCreatedAtUnixS(root),
-        .failure_code = try dupOptional(allocator, final_failure_code),
-        .failure_hint = try dupOptional(allocator, final_failure_hint),
-        .failure_class = try dupOptional(allocator, final_failure_class),
-        .retryable_same_tuple_now = final_retryable_same_tuple_now,
-        .findings_json = findings_json,
-        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
+        .failure_class = jsonStringField(root, "failureClass") orelse failureClassForCode(failure),
+        .retryable = jsonBoolField(root, "retryableSameTupleNow") orelse
+            retryableSameTupleNowForCode(failure),
     };
 }
 
-fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source_path: []const u8, root: std.json.ObjectMap, recover_event_logs: bool, context: NormalizeContext) !NormalizedReceipt {
-    const typed_json = try stringifyAnyAlloc(
-        allocator,
-        std.json.Value{ .object = root },
-    );
-    defer allocator.free(typed_json);
-    var typed = std.json.parseFromSlice(
-        SessionRecord,
-        allocator,
-        typed_json,
-        .{},
-    ) catch return error.InvalidSessionRecord;
-    defer typed.deinit();
-    try validateCurrentSessionRecordAlloc(allocator, source_path, typed.value);
-    var exact_lock = try loadExactReviewTupleLockForRecord(
-        allocator,
-        typed.value,
-        source_path,
-    );
-    defer exact_lock.deinit(allocator);
+const StoredReviewResult = struct {
+    json: ?[]u8,
+    source: ?[]const u8,
+};
 
-    const review_thread_id = jsonStringField(root, "review_thread_id") orelse
-        return error.NotReviewReceipt;
-    const review_turn_id = jsonStringField(root, "review_turn_id");
-    const event_log_path = jsonStringField(root, "event_log_path");
-    var result_source = jsonStringField(root, "terminal_review_result_source");
-
-    var review_result_json: ?[]u8 = null;
-    defer if (review_result_json) |value| allocator.free(value);
+fn storedReviewResultAlloc(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    record: SessionRecord,
+    recover_event_logs: bool,
+) !StoredReviewResult {
+    const source = jsonStringField(root, "terminal_review_result_source");
     if (jsonStringField(root, "terminal_review_result_json")) |json| {
-        if (std.mem.eql(u8, result_source orelse "", "rollout_exited_review_mode")) {
-            review_result_json = try allocator.dupe(u8, json);
-        }
-    } else if (recover_event_logs) {
-        if (event_log_path) |path| {
-            const recovered_rollout_result = readRolloutReviewResultFromEventLogAlloc(
+        return .{
+            .json = if (std.mem.eql(u8, source orelse "", "rollout_exited_review_mode"))
+                try allocator.dupe(u8, json)
+            else
+                null,
+            .source = source,
+        };
+    }
+    if (recover_event_logs) {
+        if (jsonStringField(root, "event_log_path")) |path| {
+            const recovered = readRolloutReviewResultFromEventLogAlloc(
                 allocator,
                 path,
-                typed.value.review_thread_id,
-                typed.value.review_turn_id,
+                record.review_thread_id,
+                record.review_turn_id,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,
             };
-            if (recovered_rollout_result) |rollout_result| {
-                review_result_json = rollout_result;
-                result_source = "rollout_exited_review_mode";
-            }
+            if (recovered) |json| return .{ .json = json, .source = "rollout_exited_review_mode" };
         }
     }
-    const structured_account_failure =
-        std.mem.eql(u8, exact_lock.record.state, "account_resource_exhausted") or
-        if (exact_lock.record.lastFailureCode) |code|
-            failureCodeIsAccountResourceExhausted(code)
-        else
-            false;
-    const persisted_terminal_failure_code = typed.value.terminal_failure_code;
-    const persisted_terminal_failure_hint = typed.value.terminal_failure_hint;
-    const structured_terminal_owner_failure = if (persisted_terminal_failure_code) |code| blk: {
-        if (!std.mem.eql(u8, exact_lock.record.state, "terminal")) {
-            return error.InvalidReviewTupleLockBinding;
-        }
-        const lock_code = exact_lock.record.lastFailureCode orelse
-            return error.InvalidReviewTupleLockBinding;
-        if (!std.mem.eql(u8, code, lock_code) or
-            terminalReviewOwnerFailure(code) == null)
-        {
-            return error.InvalidReviewTupleLockBinding;
-        }
-        break :blk true;
-    } else false;
+    return .{ .json = null, .source = source };
+}
 
-    const finding_count = try reviewFindingCount(allocator, review_result_json);
-    const missing_completed_result = review_result_json == null and
-        std.mem.eql(u8, jsonStringField(root, "last_observed_status") orelse "", "completed");
-    const failure_code: ?[]const u8 = if (structured_account_failure)
-        "account_resource_exhausted"
-    else if (structured_terminal_owner_failure)
-        persisted_terminal_failure_code
-    else if (missing_completed_result)
-        "review_output_missing"
-    else
-        null;
-    const failure_hint: ?[]const u8 = if (structured_account_failure)
-        account_resource_exhausted_hint
-    else if (structured_terminal_owner_failure)
-        persisted_terminal_failure_hint
-    else if (missing_completed_result)
-        "stored review session record did not include a materialized rollout reviewResult"
-    else
-        null;
-    const status = if (structured_account_failure)
-        "account_resource_exhausted"
-    else if (structured_terminal_owner_failure and
-        terminalReviewTransportFailure(persisted_terminal_failure_code.?) != null)
-        "review_transport_failure"
-    else if (structured_terminal_owner_failure)
-        "incomplete"
-    else if (finding_count > 0)
-        "findings"
-    else if (missing_completed_result)
-        "incomplete"
-    else if (std.mem.eql(u8, result_source orelse "", "rollout_exited_review_mode"))
-        "clean"
-    else
-        "incomplete";
-    const findings_json = compactFindingsJsonAlloc(
-        allocator,
-        review_result_json,
-    ) catch try allocator.dupe(u8, "[]");
-    const binding_failure = if (structured_terminal_owner_failure)
-        null
-    else if (!std.mem.eql(u8, exact_lock.record.state, "normalized"))
-        "review_tuple_lock_not_normalized"
-    else if (context.requested_identity_required) blk: {
-        const requested = context.requested_identity orelse break :blk "target_identity_unavailable";
-        if (!identityHasCompleteTuple(requested)) break :blk "target_identity_unavailable";
-        break :blk if (rootTupleMatchesIdentity(root, requested)) @as(?[]const u8, null) else "tuple_mismatch";
-    } else null;
-    const final_status = if (binding_failure != null) "incomplete" else status;
-    const final_clean = binding_failure == null and std.mem.eql(u8, final_status, "clean");
-    const final_failure_code = binding_failure orelse failure_code;
-    const final_failure_hint = if (binding_failure) |code|
-        if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for receipt normalization"
-        else
-            "stored review session tuple did not match the requested target identity"
-    else
-        failure_hint;
-    const final_failure_class = failureClassForCode(final_failure_code);
-    const final_retryable_same_tuple_now = retryableSameTupleNowForCode(final_failure_code);
-    const tuple_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsTupleTerminal(final_status) and
-        if (context.requested_identity_required)
-            rootTupleMatchesIdentity(root, context.requested_identity.?)
-        else
-            rootHasTupleVerdictBinding(root);
-    const review_attempt_phase = if (tuple_verdict_exists)
-        "normalized_verdict"
-    else if (structured_terminal_owner_failure or
-        std.mem.eql(u8, final_status, "account_resource_exhausted") or
-        isTerminalTurnStatus(jsonStringField(root, "last_observed_status") orelse ""))
-        "review_terminal"
-    else
-        "review_waiting";
-    const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
-    const principal_strength = receiptPrincipalStrength(root, root);
+fn storedTerminalOwnerFailure(record: SessionRecord, lock: LoadedReviewTupleLock) !bool {
+    const code = record.terminal_failure_code orelse return false;
+    if (!std.mem.eql(u8, lock.record.state, "terminal")) {
+        return error.InvalidReviewTupleLockBinding;
+    }
+    const lock_code = lock.record.lastFailureCode orelse return error.InvalidReviewTupleLockBinding;
+    if (!std.mem.eql(u8, code, lock_code) or terminalReviewOwnerFailure(code) == null) {
+        return error.InvalidReviewTupleLockBinding;
+    }
+    return true;
+}
+
+fn normalizeStoredSessionRecordReceiptAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    root: std.json.ObjectMap,
+    recover_event_logs: bool,
+    context: NormalizeContext,
+) !NormalizedReceipt {
+    const typed_json = try stringifyAnyAlloc(allocator, std.json.Value{ .object = root });
+    defer allocator.free(typed_json);
+    var typed = std.json.parseFromSlice(SessionRecord, allocator, typed_json, .{}) catch
+        return error.InvalidSessionRecord;
+    defer typed.deinit();
+    try validateCurrentSessionRecordAlloc(allocator, source_path, typed.value);
+    var lock = try loadExactReviewTupleLockForRecord(allocator, typed.value, source_path);
+    defer lock.deinit(allocator);
+    const thread_id = jsonStringField(
+        root,
+        "review_thread_id",
+    ) orelse return error.NotReviewReceipt;
+    const result = try storedReviewResultAlloc(allocator, root, typed.value, recover_event_logs);
+    defer if (result.json) |value| allocator.free(value);
+    const owner_failure = try storedTerminalOwnerFailure(typed.value, lock);
+    const count = try reviewFindingCount(allocator, result.json);
+    const state = normalizedStoredState(root, context, typed.value, lock, .{
+        .result = result,
+        .thread_id = thread_id,
+        .count = count,
+        .owner_failure = owner_failure,
+    });
+    const findings_json = compactFindingsJsonAlloc(allocator, result.json) catch
+        try allocator.dupe(u8, "[]");
+    errdefer allocator.free(findings_json);
     const target_json = try stringifyAnyAlloc(allocator, typed.value.target);
     errdefer allocator.free(target_json);
+    return assembleNormalizedReceiptAlloc(
+        allocator,
+        source_path,
+        root,
+        root,
+        state,
+        target_json,
+        findings_json,
+        true,
+    );
+}
 
+const StoredVerdictFacts = struct {
+    result: StoredReviewResult,
+    thread_id: []const u8,
+    count: usize,
+    owner_failure: bool,
+};
+
+fn storedUnboundStatus(
+    facts: StoredVerdictFacts,
+    account: bool,
+    missing_result: bool,
+    failure_code: ?[]const u8,
+) []const u8 {
+    if (account) return "account_resource_exhausted";
+    if (facts.owner_failure) {
+        if (terminalReviewTransportFailure(failure_code.?) != null) {
+            return "review_transport_failure";
+        }
+        return "incomplete";
+    }
+    if (facts.count > 0) return "findings";
+    if (missing_result) return "incomplete";
+    if (std.mem.eql(
+        u8,
+        facts.result.source orelse "",
+        "rollout_exited_review_mode",
+    )) return "clean";
+    return "incomplete";
+}
+
+const StoredReceiptFailure = struct {
+    code: ?[]const u8,
+    hint: ?[]const u8,
+};
+
+fn storedRawFailure(
+    record: SessionRecord,
+    owner_failure: bool,
+    account: bool,
+    missing: bool,
+) StoredReceiptFailure {
+    if (account) return .{
+        .code = "account_resource_exhausted",
+        .hint = account_resource_exhausted_hint,
+    };
+    if (owner_failure) return .{
+        .code = record.terminal_failure_code,
+        .hint = record.terminal_failure_hint,
+    };
+    if (missing) return .{
+        .code = "review_output_missing",
+        .hint = "stored review session record did not include a materialized rollout reviewResult",
+    };
+    return .{ .code = null, .hint = null };
+}
+
+fn storedBindingFailure(
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+    lock: LoadedReviewTupleLock,
+    owner_failure: bool,
+) ?[]const u8 {
+    if (owner_failure) return null;
+    if (!std.mem.eql(
+        u8,
+        lock.record.state,
+        "normalized",
+    )) return "review_tuple_lock_not_normalized";
+    return rootBindingFailure(root, context);
+}
+
+fn storedAttemptPhase(
+    root: std.json.ObjectMap,
+    status: []const u8,
+    tuple: bool,
+    owner_failure: bool,
+) []const u8 {
+    if (tuple) return "normalized_verdict";
+    if (owner_failure or std.mem.eql(u8, status, "account_resource_exhausted") or
+        isTerminalTurnStatus(jsonStringField(root, "last_observed_status") orelse ""))
+        return "review_terminal";
+    return "review_waiting";
+}
+
+fn normalizedStoredState(
+    root: std.json.ObjectMap,
+    context: NormalizeContext,
+    record: SessionRecord,
+    lock: LoadedReviewTupleLock,
+    facts: StoredVerdictFacts,
+) ReceiptVerdictState {
+    const lock_failure = lock.record.lastFailureCode;
+    const account = std.mem.eql(u8, lock.record.state, "account_resource_exhausted") or
+        if (lock_failure) |code| failureCodeIsAccountResourceExhausted(code) else false;
+    const missing = facts.result.json == null and
+        std.mem.eql(u8, jsonStringField(root, "last_observed_status") orelse "", "completed");
+    const raw_failure = storedRawFailure(record, facts.owner_failure, account, missing);
+    const unbound = storedUnboundStatus(facts, account, missing, record.terminal_failure_code);
+    const binding = storedBindingFailure(root, context, lock, facts.owner_failure);
+    const status = if (binding != null) "incomplete" else unbound;
+    const failure = binding orelse raw_failure.code;
+    const tuple = rootTupleVerdictExists(root, context, status, binding);
     return .{
-        .source_path = try allocator.dupe(u8, source_path),
-        .status = try allocator.dupe(u8, final_status),
-        .backend_class = try allocator.dupe(u8, "cas-start-wait"),
-        .clean = final_clean,
-        .finding_count = finding_count,
-        .review_attempt_phase = try allocator.dupe(u8, review_attempt_phase),
-        .review_attempt_exists = true,
-        .tuple_verdict_exists = tuple_verdict_exists,
-        .principal_strength = principal_strength,
-        .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
-        .base_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "baseSha", "base_sha")),
-        .head_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "headSha", "head_sha")),
-        .target_fingerprint = try dupOptional(allocator, optionalStringFromRootKeys(root, "targetFingerprint", "target_fingerprint")),
-        .target_json = target_json,
-        .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
-        .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
-        .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
-        .codex_binary_digest = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "codexBinaryDigest", "codex_binary_digest"),
-        ),
-        .app_server_contract_id = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "appServerContractId", "app_server_contract_id"),
-        ),
-        .selected_transport = try dupOptional(
-            allocator,
-            optionalStringFromRootKeys(root, "selectedTransport", "transport_kind"),
-        ),
-        .code_mode_host_redacted = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "origin"),
-        ),
-        .code_mode_host_digest = try dupOptional(
-            allocator,
-            receiptCodeModeHostField(root, "sha256"),
-        ),
-        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
-        .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
-        .review_thread_id = try allocator.dupe(u8, review_thread_id),
-        .review_turn_id = try dupOptional(allocator, review_turn_id),
-        .record_path = try allocator.dupe(u8, source_path),
-        .event_log_path = try dupOptional(allocator, event_log_path),
-        .attempt_created_at_unix_s = receiptCreatedAtUnixS(root),
-        .failure_code = try dupOptional(allocator, final_failure_code),
-        .failure_hint = try dupOptional(allocator, final_failure_hint),
-        .failure_class = try dupOptional(allocator, final_failure_class),
-        .retryable_same_tuple_now = final_retryable_same_tuple_now,
-        .findings_json = findings_json,
-        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
+        .status = status,
+        .backend_class = "cas-start-wait",
+        .clean = binding == null and std.mem.eql(u8, status, "clean"),
+        .finding_count = facts.count,
+        .phase = storedAttemptPhase(root, status, tuple, facts.owner_failure),
+        .attempt_exists = true,
+        .tuple_exists = tuple,
+        .review_thread_id = facts.thread_id,
+        .failure_code = failure,
+        .failure_hint = if (binding) |code| normalizationBindingHint(
+            code,
+            true,
+        ) else raw_failure.hint,
+        .failure_class = failureClassForCode(failure),
+        .retryable = retryableSameTupleNowForCode(failure),
     };
 }
 
@@ -11193,7 +11652,11 @@ const CasRerProjectionOptions = struct {
 };
 
 fn casRerTimestampAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "unix-ns:{d}", .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds});
+    return std.fmt.allocPrint(
+        allocator,
+        "unix-ns:{d}",
+        .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
+    );
 }
 
 fn publicReviewBrokerAction(raw: []const u8) []const u8 {
@@ -11203,23 +11666,25 @@ fn publicReviewBrokerAction(raw: []const u8) []const u8 {
     return raw;
 }
 
-fn writePublicReviewBrokerDecisionObject(writer: *std.Io.Writer, broker: ReviewBrokerDecision, fresh_attempt_required: bool) !void {
+fn writePublicReviewBrokerDecisionObject(
+    writer: *std.Io.Writer,
+    broker: ReviewBrokerDecision,
+    fresh_attempt_required: bool,
+) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "action");
-    try writer.writeByte(':');
-    try writeJsonString(writer, publicReviewBrokerAction(broker.action));
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reason");
-    try writer.writeByte(':');
-    try writeJsonString(writer, broker.reason);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "freshAttemptRequired");
-    try writer.writeByte(':');
-    try writer.writeAll(if (fresh_attempt_required) "true" else "false");
+    try writeReceiptField(writer, "action", publicReviewBrokerAction(broker.action));
+    try writeReceiptNextField(writer, "reason", broker.reason);
+    try writeReceiptNextField(writer, "freshAttemptRequired", fresh_attempt_required);
     try writer.writeByte('}');
 }
 
-fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.Writer, receipt: NormalizedReceipt, broker: ReviewBrokerDecision, fresh_attempt_required: bool) !void {
+fn writeCasRunEnvelopeFromReceipt(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    receipt: NormalizedReceipt,
+    broker: ReviewBrokerDecision,
+    fresh_attempt_required: bool,
+) !void {
     const timestamp = try casRerTimestampAlloc(allocator);
     defer allocator.free(timestamp);
     const record_json = try casRerJsonFromReceiptAlloc(allocator, receipt, .{
@@ -11233,7 +11698,11 @@ fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.
     defer allocator.free(record_json);
     var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
     defer parsed_record.deinit();
-    const validation = try validateCasRerRecordObjectAlloc(allocator, receipt.source_path, parsed_record.value.object);
+    const validation = try validateCasRerRecordObjectAlloc(
+        allocator,
+        receipt.source_path,
+        parsed_record.value.object,
+    );
     defer validation.deinit(allocator);
     if (!validation.ok()) return error.InvalidCasRerRecord;
     const ledger_record_path = try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json);
@@ -11249,15 +11718,26 @@ fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.
     try writer.writeByte('}');
 }
 
-fn writeCasRerShadowRecordFromReceipt(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
+fn writeCasRerShadowRecordFromReceipt(
+    allocator: std.mem.Allocator,
+    receipt: NormalizedReceipt,
+    opts: CasRerProjectionOptions,
+) ![]const u8 {
     const record_json = try casRerJsonFromReceiptAlloc(allocator, receipt, opts);
     defer allocator.free(record_json);
     var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
     defer parsed_record.deinit();
-    const validation = try validateCasRerRecordObjectAlloc(allocator, receipt.source_path, parsed_record.value.object);
+    const validation = try validateCasRerRecordObjectAlloc(
+        allocator,
+        receipt.source_path,
+        parsed_record.value.object,
+    );
     defer validation.deinit(allocator);
     if (!validation.ok()) {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stderr_writer = std.Io.File.stderr().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stderr = &stderr_writer.interface;
         try stderr.print("CAS-RER shadow validation failed for {s}\n", .{receipt.source_path});
         for (validation.errors) |err| {
@@ -11275,7 +11755,13 @@ fn writeCasRerShadowRecordFromJsonAlloc(
     context: NormalizeContext,
     opts: CasRerProjectionOptions,
 ) ![]const u8 {
-    const normalized = try normalizeReceiptFromJsonAlloc(allocator, source_path, payload_json, true, context);
+    const normalized = try normalizeReceiptFromJsonAlloc(
+        allocator,
+        source_path,
+        payload_json,
+        true,
+        context,
+    );
     defer normalized.deinit(allocator);
     return writeCasRerShadowRecordFromReceipt(allocator, normalized, opts);
 }
@@ -11314,9 +11800,13 @@ fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt
     return try sha256HexAlloc(allocator, material);
 }
 
-fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
-    const target_json = receipt.target_json orelse return error.MissingCasRerTarget;
-    const base_material = try std.fmt.allocPrint(
+fn casRerBaseMaterialAlloc(
+    allocator: std.mem.Allocator,
+    receipt: NormalizedReceipt,
+    opts: CasRerProjectionOptions,
+    target_json: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
         allocator,
         "repo_realpath={s}\n" ++
             "resolved_codex_path={s}\n" ++
@@ -11338,8 +11828,7 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
             "status={s}\n" ++
             "review_thread_id={s}\n" ++
             "review_turn_id={s}\n" ++
-            "base_sha={s}\n" ++
-            "head_sha={s}\n" ++
+            "base_sha={s}\nhead_sha={s}\n" ++
             "target_fingerprint={s}\n" ++
             "target={s}\n" ++
             "failure_code={s}\n" ++
@@ -11380,6 +11869,15 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
             receipt.findings_json,
         },
     );
+}
+
+fn casRerRecordIdAlloc(
+    allocator: std.mem.Allocator,
+    receipt: NormalizedReceipt,
+    opts: CasRerProjectionOptions,
+) ![]const u8 {
+    const target_json = receipt.target_json orelse return error.MissingCasRerTarget;
+    const base_material = try casRerBaseMaterialAlloc(allocator, receipt, opts, target_json);
     defer allocator.free(base_material);
     const material = if (receipt.workflow_binding_json) |workflow_binding_json|
         try std.fmt.allocPrint(
@@ -11395,166 +11893,86 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
     return std.fmt.allocPrint(allocator, "rer_{s}", .{digest});
 }
 
-fn writeCasRerCommandObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+fn writeCasRerCommandObject(
+    writer: *std.Io.Writer,
+    receipt: NormalizedReceipt,
+    opts: CasRerProjectionOptions,
+) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "surface");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.command_surface);
+    try writeReceiptField(writer, "surface", opts.command_surface);
     try writer.writeByte(',');
     try writeJsonString(writer, "argv");
     try writer.writeAll(":[]");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "backendSelected");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.backend_selected);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "sourceBackendClass");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.backend_class);
+    try writeReceiptNextField(writer, "backendSelected", opts.backend_selected);
+    try writeReceiptNextField(writer, "sourceBackendClass", receipt.backend_class);
     try writer.writeByte(',');
     try writeJsonString(writer, "brokerDecision");
     try writer.writeAll(":{");
-    try writeJsonString(writer, "action");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.broker_action);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reason");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.broker_reason);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "freshAttemptRequired");
-    try writer.writeByte(':');
-    try writer.writeAll(if (opts.fresh_attempt_required) "true" else "false");
+    try writeReceiptField(writer, "action", opts.broker_action);
+    try writeReceiptNextField(writer, "reason", opts.broker_reason);
+    try writeReceiptNextField(writer, "freshAttemptRequired", opts.fresh_attempt_required);
     try writer.writeAll("}}");
 }
 
 fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     const target_json = receipt.target_json orelse return error.MissingCasRerTarget;
     try writer.writeByte('{');
-    try writeJsonString(writer, "repoRealpath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.repo_realpath);
+    try writeReceiptField(writer, "repoRealpath", receipt.repo_realpath);
     try writer.writeByte(',');
-    try writeJsonString(writer, "target");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "target");
     try writer.writeAll(target_json);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "baseSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.base_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "headSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.head_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "targetFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.target_fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "resolvedCodexPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "resolvedCodexVersion");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_version);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "codexBinaryDigest");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_binary_digest);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "appServerContractId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.app_server_contract_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "selectedTransport");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.selected_transport);
+    try writeReceiptNextField(writer, "baseSha", receipt.base_sha);
+    try writeReceiptNextField(writer, "headSha", receipt.head_sha);
+    try writeReceiptNextField(writer, "targetFingerprint", receipt.target_fingerprint);
+    try writeReceiptNextField(writer, "resolvedCodexPath", receipt.resolved_codex_path);
+    try writeReceiptNextField(writer, "resolvedCodexVersion", receipt.resolved_codex_version);
+    try writeReceiptNextField(writer, "codexBinaryDigest", receipt.codex_binary_digest);
+    try writeReceiptNextField(writer, "appServerContractId", receipt.app_server_contract_id);
+    try writeReceiptNextField(writer, "selectedTransport", receipt.selected_transport);
     try writer.writeByte(',');
     try writeJsonString(writer, "codeModeHost");
     try writer.writeAll(":{");
-    try writeJsonString(writer, "origin");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.code_mode_host_redacted);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "sha256");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.code_mode_host_digest);
+    try writeReceiptField(writer, "origin", receipt.code_mode_host_redacted);
+    try writeReceiptNextField(writer, "sha256", receipt.code_mode_host_digest);
     try writer.writeAll("},");
-    try writeJsonString(writer, "codexThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_thread_id);
+    try writeReceiptField(writer, "codexThreadId", receipt.codex_thread_id);
     try writer.writeByte('}');
 }
 
-fn writeCasRerAttemptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, attempt_id: ?[]const u8) !void {
+fn writeCasRerAttemptObject(
+    writer: *std.Io.Writer,
+    receipt: NormalizedReceipt,
+    attempt_id: ?[]const u8,
+) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "exists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "attemptId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, attempt_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "phase");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.review_attempt_phase);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewTurnId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_turn_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "recordPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "eventLogPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.event_log_path);
+    try writeReceiptField(writer, "exists", receipt.review_attempt_exists);
+    try writeReceiptNextField(writer, "attemptId", attempt_id);
+    try writeReceiptNextField(writer, "phase", receipt.review_attempt_phase);
+    try writeReceiptNextField(writer, "reviewThreadId", receipt.review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", receipt.review_turn_id);
+    try writeReceiptNextField(writer, "recordPath", receipt.record_path);
+    try writeReceiptNextField(writer, "eventLogPath", receipt.event_log_path);
     try writer.writeByte('}');
 }
 
 fn writeCasRerVerdictObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "tupleVerdictExists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
+    try writeReceiptField(writer, "tupleVerdictExists", receipt.tuple_verdict_exists);
+    try writeReceiptNextField(writer, "status", casRerVerdictStatus(receipt.status));
+    try writeReceiptNextField(writer, "clean", receipt.clean);
+    try writeReceiptNextField(writer, "findingCount", receipt.finding_count);
     try writer.writeByte(',');
-    try writeJsonString(writer, "status");
-    try writer.writeByte(':');
-    try writeJsonString(writer, casRerVerdictStatus(receipt.status));
-    try writer.writeByte(',');
-    try writeJsonString(writer, "clean");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.clean) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findingCount");
-    try writer.writeByte(':');
-    try writer.print("{d}", .{receipt.finding_count});
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findings");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "findings");
     try writer.writeAll(receipt.findings_json);
     try writer.writeByte('}');
 }
 
 fn writeCasRerFailureObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "failureCode");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_code);
+    try writeReceiptField(writer, "failureCode", receipt.failure_code);
+    try writeReceiptNextField(writer, "failureClass", receipt.failure_class);
     try writer.writeByte(',');
-    try writeJsonString(writer, "failureClass");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "retryableSameTupleNow");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "retryableSameTupleNow");
     if (receipt.retryable_same_tuple_now) |value|
         try writer.writeAll(if (value) "true" else "false")
     else
@@ -11562,7 +11980,10 @@ fn writeCasRerFailureObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) 
     try writer.writeByte('}');
 }
 
-fn casRerPrincipalProofUsableWithFingerprint(receipt: NormalizedReceipt, account_fingerprint: ?[]const u8) bool {
+fn casRerPrincipalProofUsableWithFingerprint(
+    receipt: NormalizedReceipt,
+    account_fingerprint: ?[]const u8,
+) bool {
     return std.mem.eql(u8, casRerPrincipalKind(receipt), "strong") and
         std.mem.eql(u8, receipt.backend_class, "cas-start-wait") and
         !receipt.account_fingerprint_reduced_protection and
@@ -11572,29 +11993,18 @@ fn casRerPrincipalProofUsableWithFingerprint(receipt: NormalizedReceipt, account
 fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     const account_fingerprint = receipt.account_fingerprint;
     try writer.writeByte('{');
-    try writeJsonString(writer, "kind");
-    try writer.writeByte(':');
-    try writeJsonString(writer, casRerPrincipalKind(receipt));
+    try writeReceiptField(writer, "kind", casRerPrincipalKind(receipt));
+    try writeReceiptNextField(writer, "accountFingerprint", account_fingerprint);
+    try writeReceiptNextField(
+        writer,
+        "proofUsable",
+        casRerPrincipalProofUsableWithFingerprint(receipt, account_fingerprint),
+    );
+    try writeReceiptNextField(writer, "reduced", receipt.account_fingerprint_reduced_protection);
     try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, account_fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "proofUsable");
-    try writer.writeByte(':');
-    try writer.writeAll(if (casRerPrincipalProofUsableWithFingerprint(receipt, account_fingerprint)) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reduced");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "fallbackUsed");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "fallbackUsed");
     try writer.writeAll("false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "source");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.backend_class);
+    try writeReceiptNextField(writer, "source", receipt.backend_class);
     try writer.writeByte('}');
 }
 
@@ -11604,17 +12014,9 @@ fn writeCasRerAttachmentsObject(writer: *std.Io.Writer, receipt: NormalizedRecei
     try writer.writeAll(":null,");
     try writeJsonString(writer, "stderr");
     try writer.writeAll(":null,");
-    try writeJsonString(writer, "eventLog");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.event_log_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "rawSessionRecord");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "rawReceipt");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.source_path);
+    try writeReceiptField(writer, "eventLog", receipt.event_log_path);
+    try writeReceiptNextField(writer, "rawSessionRecord", receipt.record_path);
+    try writeReceiptNextField(writer, "rawReceipt", receipt.source_path);
     try writer.writeByte('}');
 }
 
@@ -11626,59 +12028,44 @@ fn writeCasRerRecordObject(
     opts: CasRerProjectionOptions,
 ) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "schema");
-    try writer.writeByte(':');
-    try writeJsonString(writer, cas_review_evidence_schema);
+    try writeReceiptField(writer, "schema", cas_review_evidence_schema);
+    try writeReceiptNextField(writer, "recordId", record_id);
+    try writeReceiptNextField(writer, "createdAt", opts.timestamp);
+    try writeReceiptNextField(writer, "updatedAt", opts.timestamp);
     try writer.writeByte(',');
-    try writeJsonString(writer, "recordId");
-    try writer.writeByte(':');
-    try writeJsonString(writer, record_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "createdAt");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.timestamp);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "updatedAt");
-    try writer.writeByte(':');
-    try writeJsonString(writer, opts.timestamp);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "command");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "command");
     try writeCasRerCommandObject(writer, receipt, opts);
     try writer.writeByte(',');
-    try writeJsonString(writer, "tuple");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "tuple");
     try writeCasRerTupleObject(writer, receipt);
     if (receipt.workflow_binding_json) |workflow_binding_json| {
         try writer.writeByte(',');
-        try writeJsonString(writer, "workflowBinding");
-        try writer.writeByte(':');
+        try writeReceiptFieldName(writer, "workflowBinding");
         try writer.writeAll(workflow_binding_json);
     }
     try writer.writeByte(',');
-    try writeJsonString(writer, "attempt");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "attempt");
     try writeCasRerAttemptObject(writer, receipt, attempt_id);
     try writer.writeByte(',');
-    try writeJsonString(writer, "verdict");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "verdict");
     try writeCasRerVerdictObject(writer, receipt);
     try writer.writeByte(',');
-    try writeJsonString(writer, "failure");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "failure");
     try writeCasRerFailureObject(writer, receipt);
     try writer.writeByte(',');
-    try writeJsonString(writer, "principal");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "principal");
     try writeCasRerPrincipalObject(writer, receipt);
     try writer.writeByte(',');
-    try writeJsonString(writer, "attachments");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "attachments");
     try writeCasRerAttachmentsObject(writer, receipt);
     try writer.writeByte('}');
 }
 
-fn casRerJsonFromReceiptAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]u8 {
+fn casRerJsonFromReceiptAlloc(
+    allocator: std.mem.Allocator,
+    receipt: NormalizedReceipt,
+    opts: CasRerProjectionOptions,
+) ![]u8 {
     const record_id = try casRerRecordIdAlloc(allocator, receipt, opts);
     defer allocator.free(record_id);
     const attempt_id = try casRerAttemptIdAlloc(allocator, receipt);
@@ -11692,64 +12079,26 @@ fn casRerJsonFromReceiptAlloc(allocator: std.mem.Allocator, receipt: NormalizedR
 
 fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "status");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.status);
+    try writeReceiptField(writer, "status", receipt.status);
+    try writeReceiptNextField(writer, "reviewAttemptPhase", receipt.review_attempt_phase);
+    try writeReceiptNextField(writer, "reviewAttemptExists", receipt.review_attempt_exists);
+    try writeReceiptNextField(writer, "tupleVerdictExists", receipt.tuple_verdict_exists);
+    try writeReceiptNextField(writer, "principalStrength", receipt.principal_strength);
+    try writeReceiptNextField(writer, "accountFingerprint", receipt.account_fingerprint);
+    try writeReceiptNextField(
+        writer,
+        "accountFingerprintReducedProtection",
+        receipt.account_fingerprint_reduced_protection,
+    );
+    try writeReceiptNextField(writer, "codexThreadId", receipt.codex_thread_id);
+    try writeReceiptNextField(writer, "backendClass", receipt.backend_class);
+    try writeReceiptNextField(writer, "clean", receipt.clean);
+    try writeReceiptNextField(writer, "findingCount", receipt.finding_count);
+    try writeReceiptNextField(writer, "failureCode", receipt.failure_code);
+    try writeReceiptNextField(writer, "failureHint", receipt.failure_hint);
+    try writeReceiptNextField(writer, "failureClass", receipt.failure_class);
     try writer.writeByte(',');
-    try writeJsonString(writer, "reviewAttemptPhase");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.review_attempt_phase);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewAttemptExists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "tupleVerdictExists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalStrength");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.principal_strength);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.account_fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprintReducedProtection");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "codexThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "backendClass");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.backend_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "clean");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.clean) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findingCount");
-    try writer.writeByte(':');
-    try writer.print("{d}", .{receipt.finding_count});
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureCode");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_code);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureHint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_hint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureClass");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "retryableSameTupleNow");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "retryableSameTupleNow");
     if (receipt.retryable_same_tuple_now) |value| {
         try writer.writeAll(if (value) "true" else "false");
     } else {
@@ -11757,141 +12106,57 @@ fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedRe
     }
     if (receipt.workflow_binding_json) |workflow_binding_json| {
         try writer.writeByte(',');
-        try writeJsonString(writer, "workflowBinding");
-        try writer.writeByte(':');
+        try writeReceiptFieldName(writer, "workflowBinding");
         try writer.writeAll(workflow_binding_json);
     }
+    try writeReceiptNextField(writer, "baseSha", receipt.base_sha);
+    try writeReceiptNextField(writer, "headSha", receipt.head_sha);
+    try writeReceiptNextField(writer, "targetFingerprint", receipt.target_fingerprint);
+    try writeReceiptNextField(writer, "reviewThreadId", receipt.review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", receipt.review_turn_id);
+    try writeReceiptNextField(writer, "recordPath", receipt.record_path);
+    try writeReceiptNextField(writer, "eventLogPath", receipt.event_log_path);
     try writer.writeByte(',');
-    try writeJsonString(writer, "baseSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.base_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "headSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.head_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "targetFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.target_fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewTurnId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_turn_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "recordPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "eventLogPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.event_log_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findings");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "findings");
     try writer.writeAll(receipt.findings_json);
     try writer.writeByte('}');
 }
 
 fn writeReceiptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
     try writer.writeByte('{');
-    try writeJsonString(writer, "sourcePath");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.source_path);
+    try writeReceiptField(writer, "sourcePath", receipt.source_path);
+    try writeReceiptNextField(writer, "status", receipt.status);
+    try writeReceiptNextField(writer, "backendClass", receipt.backend_class);
+    try writeReceiptNextField(writer, "clean", receipt.clean);
+    try writeReceiptNextField(writer, "findingCount", receipt.finding_count);
+    try writeReceiptNextField(writer, "reviewAttemptPhase", receipt.review_attempt_phase);
+    try writeReceiptNextField(writer, "reviewAttemptExists", receipt.review_attempt_exists);
+    try writeReceiptNextField(writer, "tupleVerdictExists", receipt.tuple_verdict_exists);
+    try writeReceiptNextField(writer, "principalStrength", receipt.principal_strength);
+    try writeReceiptNextField(
+        writer,
+        "accountFingerprintReducedProtection",
+        receipt.account_fingerprint_reduced_protection,
+    );
+    try writeReceiptNextField(writer, "codexThreadId", receipt.codex_thread_id);
+    try writeReceiptNextField(writer, "baseSha", receipt.base_sha);
+    try writeReceiptNextField(writer, "headSha", receipt.head_sha);
+    try writeReceiptNextField(writer, "targetFingerprint", receipt.target_fingerprint);
+    try writeReceiptNextField(writer, "reviewThreadId", receipt.review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", receipt.review_turn_id);
+    try writeReceiptNextField(writer, "recordPath", receipt.record_path);
+    try writeReceiptNextField(writer, "eventLogPath", receipt.event_log_path);
+    try writeReceiptNextField(writer, "failureCode", receipt.failure_code);
+    try writeReceiptNextField(writer, "failureHint", receipt.failure_hint);
+    try writeReceiptNextField(writer, "failureClass", receipt.failure_class);
     try writer.writeByte(',');
-    try writeJsonString(writer, "status");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.status);
+    try writeReceiptFieldName(writer, "retryableSameTupleNow");
+    try std.json.Stringify.value(receipt.retryable_same_tuple_now, .{}, writer);
     try writer.writeByte(',');
-    try writeJsonString(writer, "backendClass");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.backend_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "clean");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.clean) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findingCount");
-    try writer.writeByte(':');
-    try writer.print("{d}", .{receipt.finding_count});
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewAttemptPhase");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.review_attempt_phase);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewAttemptExists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "tupleVerdictExists");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalStrength");
-    try writer.writeByte(':');
-    try writeJsonString(writer, receipt.principal_strength);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprintReducedProtection");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "codexThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.codex_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "baseSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.base_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "headSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.head_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "targetFingerprint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.target_fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewTurnId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.review_turn_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "recordPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "eventLogPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.event_log_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureCode");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_code);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureHint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_hint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureClass");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.failure_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "retryableSameTupleNow");
-    try writer.writeByte(':');
-    if (receipt.retryable_same_tuple_now) |value| try writer.writeAll(if (value) "true" else "false") else try writer.writeAll("null");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findings");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "findings");
     try writer.writeAll(receipt.findings_json);
     try writer.writeByte(',');
-    try writeJsonString(writer, "reviewVerdict");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "reviewVerdict");
     try writeReceiptReviewVerdictObject(writer, receipt);
     try writer.writeByte('}');
 }
@@ -11932,16 +12197,10 @@ fn compactFindingsJsonAlloc(allocator: std.mem.Allocator, review_result_json: ?[
         };
         if (emitted > 0) try writer.writeByte(',');
         try writer.writeByte('{');
-        try writeJsonString(writer, "title");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, jsonStringField(finding, "title"));
+        try writeReceiptField(writer, "title", jsonStringField(finding, "title"));
+        try writeReceiptNextField(writer, "body", jsonStringField(finding, "body"));
         try writer.writeByte(',');
-        try writeJsonString(writer, "body");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, jsonStringField(finding, "body"));
-        try writer.writeByte(',');
-        try writeJsonString(writer, "file");
-        try writer.writeByte(':');
+        try writeReceiptFieldName(writer, "file");
         var file_path: ?[]const u8 = null;
         var start_line: ?i64 = null;
         if (finding.get("codeLocation")) |location_val| switch (location_val) {
@@ -11956,13 +12215,14 @@ fn compactFindingsJsonAlloc(allocator: std.mem.Allocator, review_result_json: ?[
         };
         try writeNullableJsonString(writer, file_path);
         try writer.writeByte(',');
-        try writeJsonString(writer, "line");
-        try writer.writeByte(':');
+        try writeReceiptFieldName(writer, "line");
         if (start_line) |line| try writer.print("{d}", .{line}) else try writer.writeAll("null");
         try writer.writeByte(',');
-        try writeJsonString(writer, "priority");
-        try writer.writeByte(':');
-        if (jsonI64Field(finding, "priority")) |priority| try writer.print("{d}", .{priority}) else try writer.writeAll("null");
+        try writeReceiptFieldName(writer, "priority");
+        if (jsonI64Field(
+            finding,
+            "priority",
+        )) |priority| try writer.print("{d}", .{priority}) else try writer.writeAll("null");
         try writer.writeByte('}');
         emitted += 1;
     }
@@ -11992,20 +12252,6 @@ fn reviewStatusHasTrustedResult(status: ReviewStatus) bool {
     return std.mem.eql(u8, source, "rollout_exited_review_mode");
 }
 
-fn failureControlJsonSuffixAlloc(allocator: std.mem.Allocator, failure: ?FailureInfo) ![]u8 {
-    const value = failure orelse return allocator.dupe(u8, "");
-    const failure_class = failureClassForCode(value.code) orelse return allocator.dupe(u8, "");
-    const retryable = retryableSameTupleNowForCode(value.code);
-    if (retryable) |flag| {
-        return std.fmt.allocPrint(
-            allocator,
-            ",\"failureClass\":\"{s}\",\"retryableSameTupleNow\":{s}",
-            .{ failure_class, if (flag) "true" else "false" },
-        );
-    }
-    return std.fmt.allocPrint(allocator, ",\"failureClass\":\"{s}\"", .{failure_class});
-}
-
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (haystack.len < needle.len) return false;
@@ -12031,7 +12277,9 @@ fn appendGateError(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    try errors.append(allocator, try std.fmt.allocPrint(allocator, fmt, args));
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(message);
+    try errors.append(allocator, message);
 }
 
 fn reviewPhaseAllowed(value: []const u8) bool {
@@ -12082,7 +12330,11 @@ fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, value, "parse") != null) return "parse";
     if (std.mem.eql(u8, value, "review_untrusted_source")) return "review_output";
     if (std.mem.indexOf(u8, value, "output") != null) return "review_output";
-    if (std.mem.eql(u8, value, "target_identity_unavailable") or std.mem.eql(u8, value, "tuple_mismatch")) return "caller_error";
+    if (std.mem.eql(
+        u8,
+        value,
+        "target_identity_unavailable",
+    ) or std.mem.eql(u8, value, "tuple_mismatch")) return "caller_error";
     return null;
 }
 
@@ -12102,7 +12354,12 @@ fn retryableSameTupleNowForCode(code: ?[]const u8) ?bool {
     return null;
 }
 
-fn reviewVerdictStatus(clean: ?bool, finding_count: ?usize, failure: ?FailureInfo, review_thread_id: ?[]const u8) []const u8 {
+fn reviewVerdictStatus(
+    clean: ?bool,
+    finding_count: ?usize,
+    failure: ?FailureInfo,
+    review_thread_id: ?[]const u8,
+) []const u8 {
     if (!reviewAttemptExists(review_thread_id)) return "incomplete";
     if (failure) |info| {
         if (std.mem.eql(u8, info.code, "wait_timed_out")) return "timeout";
@@ -12121,7 +12378,11 @@ fn reviewVerdictStatusIsTupleTerminal(status: []const u8) bool {
         std.mem.eql(u8, status, "findings");
 }
 
-fn canonicalReceiptStatus(status: []const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8) []const u8 {
+fn canonicalReceiptStatus(
+    status: []const u8,
+    failure_code: ?[]const u8,
+    review_thread_id: ?[]const u8,
+) []const u8 {
     _ = failure_code;
     if (std.mem.eql(u8, status, "no_attempt")) return "incomplete";
     if (std.mem.eql(u8, status, "transport_failure")) {
@@ -12129,6 +12390,51 @@ fn canonicalReceiptStatus(status: []const u8, failure_code: ?[]const u8, review_
         return "pre_review_transport_failure";
     }
     return status;
+}
+
+fn verdictAttemptPhase(
+    tuple_verdict_exists: bool,
+    review_thread_id: ?[]const u8,
+    status: []const u8,
+    failure: ?FailureInfo,
+) []const u8 {
+    return if (tuple_verdict_exists)
+        "normalized_verdict"
+    else if (reviewAttemptExists(review_thread_id))
+        if (std.mem.eql(u8, status, "timeout") or
+            if (failure) |info|
+                std.mem.eql(u8, info.code, "workflow_bound_review_owner_active")
+            else
+                false)
+            "review_waiting"
+        else
+            "review_terminal"
+    else
+        "pre_review_start";
+}
+
+fn writeOutputReceiptPrincipal(writer: *std.Io.Writer, receipt: OutputReceipt) !void {
+    try writer.writeByte(',');
+    try writeReceiptFieldName(writer, "principalStrength");
+    try writeJsonString(
+        writer,
+        if (receipt.account_fingerprint_reduced_protection)
+            principal_strength_reduced
+        else
+            principal_strength_strong,
+    );
+    try writeReceiptNextField(
+        writer,
+        "accountFingerprintReducedProtection",
+        receipt.account_fingerprint_reduced_protection,
+    );
+    try writer.writeByte(',');
+    try writeReceiptFieldName(writer, "workflowBinding");
+    if (receipt.workflow_binding) |binding| {
+        try std.json.Stringify.value(binding, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn buildReviewVerdictJsonAlloc(
@@ -12157,19 +12463,7 @@ fn buildReviewVerdictJsonAlloc(
         reviewAttemptExists(review_thread_id) and
         identityHasCompleteTuple(identity);
     const attempt_fields = identityReviewAttemptFields(
-        if (tuple_verdict_exists)
-            "normalized_verdict"
-        else if (reviewAttemptExists(review_thread_id))
-            if (std.mem.eql(u8, status, "timeout") or
-                if (failure) |info|
-                    std.mem.eql(u8, info.code, "workflow_bound_review_owner_active")
-                else
-                    false)
-                "review_waiting"
-            else
-                "review_terminal"
-        else
-            "pre_review_start",
+        verdictAttemptPhase(tuple_verdict_exists, review_thread_id, status, failure),
         tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
@@ -12180,83 +12474,23 @@ fn buildReviewVerdictJsonAlloc(
     defer out.deinit();
     const writer = &out.writer;
     try writer.writeByte('{');
-    try writeJsonString(writer, "status");
-    try writer.writeByte(':');
-    try writeJsonString(writer, status);
+    try writeReceiptField(writer, "status", status);
     try writeReviewAttemptStateFields(writer, attempt_fields);
+    try writeReceiptNextField(writer, "backendClass", backend_class);
+    try writeOutputReceiptPrincipal(writer, receipt);
+    try writeReceiptNextField(writer, "clean", normalized_clean);
+    try writeReceiptNextField(writer, "findingCount", normalized_finding_count);
+    try writeReceiptNextField(writer, "failureCode", if (failure) |value| value.code else null);
+    try writeReceiptNextField(writer, "failureHint", if (failure) |value| value.hint else null);
+    try writeReceiptNextField(writer, "baseSha", identity.base_sha);
+    try writeReceiptNextField(writer, "headSha", identity.head_sha);
+    try writeReceiptNextField(writer, "targetFingerprint", identity.fingerprint);
+    try writeReceiptNextField(writer, "reviewThreadId", review_thread_id);
+    try writeReceiptNextField(writer, "reviewTurnId", review_turn_id);
+    try writeReceiptNextField(writer, "recordPath", record_path);
+    try writeReceiptNextField(writer, "eventLogPath", event_log_path);
     try writer.writeByte(',');
-    try writeJsonString(writer, "backendClass");
-    try writer.writeByte(':');
-    try writeJsonString(writer, backend_class);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalStrength");
-    try writer.writeByte(':');
-    try writeJsonString(
-        writer,
-        if (receipt.account_fingerprint_reduced_protection)
-            principal_strength_reduced
-        else
-            principal_strength_strong,
-    );
-    try writer.writeByte(',');
-    try writeJsonString(writer, "accountFingerprintReducedProtection");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "workflowBinding");
-    try writer.writeByte(':');
-    if (receipt.workflow_binding) |binding| {
-        try std.json.Stringify.value(binding, .{}, writer);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeByte(',');
-    try writeJsonString(writer, "clean");
-    try writer.writeByte(':');
-    try writer.writeAll(if (normalized_clean) "true" else "false");
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findingCount");
-    try writer.writeByte(':');
-    try writer.print("{d}", .{normalized_finding_count});
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureCode");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, if (failure) |value| value.code else null);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "failureHint");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, if (failure) |value| value.hint else null);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "baseSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, identity.base_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "headSha");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, identity.head_sha);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "targetFingerprint");
-    try writer.writeByte(':');
-    try writeJsonString(writer, identity.fingerprint);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewThreadId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, review_thread_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "reviewTurnId");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, review_turn_id);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "recordPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, record_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "eventLogPath");
-    try writer.writeByte(':');
-    try writeNullableJsonString(writer, event_log_path);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "findings");
-    try writer.writeByte(':');
+    try writeReceiptFieldName(writer, "findings");
     try writer.writeAll(findings_json);
     try writer.writeByte('}');
     return out.toOwnedSlice();
@@ -12269,6 +12503,49 @@ fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f32 {
         .integer => |n| @floatFromInt(n),
         else => null,
     };
+}
+
+const normalization_ownership_test_json =
+    \\{"status":"incomplete","backendClass":"cas-receipt-normalized","clean":false,"findingCount":0,"reviewThreadId":"thread","reviewTurnId":"turn","baseSha":"base","headSha":"head","targetFingerprint":"fingerprint","resolvedCodexPath":"/codex","resolvedCodexVersion":"version","codexBinaryDigest":"digest","appServerContractId":"contract","selectedTransport":"stdio","codeModeHost":{"origin":"host","sha256":"host-digest"},"codexThreadId":"caller","accountFingerprint":"account","recordPath":"record","eventLogPath":"events","failureCode":"review_owner_failed","failureHint":"hint","findings":[]}
+;
+
+fn checkNormalizedReceiptAllocationFailures(allocator: std.mem.Allocator) !void {
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        allocator,
+        "receipt.json",
+        normalization_ownership_test_json,
+        false,
+        .{},
+    );
+    defer receipt.deinit(allocator);
+    try std.testing.expectEqualStrings("incomplete", receipt.status);
+    try std.testing.expectEqualStrings("thread", receipt.review_thread_id.?);
+    try std.testing.expectEqualStrings("account", receipt.account_fingerprint.?);
+    try std.testing.expectEqualStrings("host-digest", receipt.code_mode_host_digest.?);
+    try std.testing.expectEqualStrings("hint", receipt.failure_hint.?);
+    try std.testing.expectEqualStrings("[]", receipt.findings_json);
+}
+
+test "receipt normalization owns parsed fields and cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNormalizedReceiptAllocationFailures,
+        .{},
+    );
+}
+
+test "shared transport receipt fields preserve nulls escaping and byte order" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try writeReceiptTransportFields(&output.writer, .{
+        .resolved_codex_path = "a\"b\n",
+        .managed_server_pid = 42,
+        .multi_agent_mode_metric_eligible = true,
+    });
+    const expected =
+        \\,"resolvedCodexPath":"a\"b\n","resolvedCodexVersion":null,"codexBinaryDigest":null,"appServerContractId":null,"structuredReviewCapability":null,"codeModeHost":null,"compatibilityVerdict":"not_checked","selectedTransport":"stdio","selectionReason":"default_stdio","managedServerPid":42,"managedServerListenUrl":null,"managedServerStderrLogPath":null,"orphanTtlSeconds":null,"requestedMultiAgentMode":null,"effectiveMultiAgentMode":null,"multiAgentModeSupport":"not_requested","multiAgentModeMetricEligible":true
+    ;
+    try std.testing.expectEqualStrings(expected, output.written());
 }
 
 const test_workflow_binding_json =
@@ -12449,10 +12726,7 @@ test "custom instructions require one Git target and a fresh parent" {
         "--custom-instructions",
         "review carefully",
     };
-    try std.testing.expectError(
-        error.MissingTarget,
-        parseArgs(std.testing.allocator, &no_target),
-    );
+    try std.testing.expectError(error.MissingTarget, parseArgs(std.testing.allocator, &no_target));
 
     const reused_parent = [_][]const u8{
         "cas_review_session",
@@ -12490,7 +12764,10 @@ test "parseArgs preserves an explicit review timeout" {
 }
 
 test "workflow binding input is canonical and action scoped" {
-    var loaded = (try loadWorkflowBindingAlloc(std.testing.allocator, test_workflow_binding_json)).?;
+    var loaded = (try loadWorkflowBindingAlloc(
+        std.testing.allocator,
+        test_workflow_binding_json,
+    )).?;
     defer loaded.deinit();
     const canonical = try stringifyAnyAlloc(std.testing.allocator, loaded.value);
     defer std.testing.allocator.free(canonical);
@@ -12651,15 +12928,9 @@ test "server request provider failures retain terminal review identity" {
         try std.testing.expectEqualStrings(failure.code, replay.code);
         const pre_start = failureInfoForReviewStart(case.err, "opaque").?;
         try std.testing.expectEqualStrings(failure.code, pre_start.code);
-        try std.testing.expectError(
-            case.err,
-            materializedThreadResumeFailure(case.err),
-        );
+        try std.testing.expectError(case.err, materializedThreadResumeFailure(case.err));
     }
-    try std.testing.expectEqual(
-        false,
-        try materializedThreadResumeFailure(error.RequestFailed),
-    );
+    try std.testing.expectEqual(false, try materializedThreadResumeFailure(error.RequestFailed));
 }
 
 test "terminal-only thread reads omit polling snapshots and retain terminal evidence" {
@@ -12707,11 +12978,7 @@ test "owner-lived admission failure is an immediate caller retry" {
 }
 
 test "workflow-bound review start authority follows the actual send boundary" {
-    try std.testing.expect(!reviewStartFailureOwnsAttempt(
-        true,
-        false,
-        error.ConnectionTimedOut,
-    ));
+    try std.testing.expect(!reviewStartFailureOwnsAttempt(true, false, error.ConnectionTimedOut));
     try std.testing.expect(reviewStartFailureOwnsAttempt(
         true,
         true,
@@ -12734,10 +13001,7 @@ test "proven pre-review-start failure is structurally retryable" {
         "caller_error",
         failureClassForCode("pre_review_start_failed").?,
     );
-    try std.testing.expectEqual(
-        true,
-        retryableSameTupleNowForCode("pre_review_start_failed").?,
-    );
+    try std.testing.expectEqual(true, retryableSameTupleNowForCode("pre_review_start_failed").?);
 }
 
 test "workflow owner failures are total and owner-active remains waiting" {
@@ -12745,10 +13009,7 @@ test "workflow owner failures are total and owner-active remains waiting" {
     try std.testing.expectEqualStrings("review_transport_timeout", timeout.code);
     const invalid_output = workflowOwnedPostStartFailure(error.InvalidReviewOutput);
     try std.testing.expectEqualStrings("review_output_invalid", invalid_output.code);
-    try std.testing.expectEqualStrings(
-        "review_output",
-        failureClassForCode(invalid_output.code).?,
-    );
+    try std.testing.expectEqualStrings("review_output", failureClassForCode(invalid_output.code).?);
     const protocol = workflowOwnedPostStartFailure(error.InvalidAppServerResponse);
     try std.testing.expectEqualStrings("review_owner_failed", protocol.code);
     try std.testing.expectEqual(true, retryableSameTupleNowForCode(protocol.code).?);
@@ -12886,7 +13147,10 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
     defer std.testing.allocator.free(session_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(session_dir);
     const record_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "thr.json" });
-    const event_log_path = try std.fs.path.join(std.testing.allocator, &.{ store_root, "review_sessions", "thr.events.ndjson" });
+    const event_log_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ store_root, "review_sessions", "thr.events.ndjson" },
+    );
     defer std.testing.allocator.free(event_log_path);
     const raw = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -12921,7 +13185,11 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
 test "session record owns and validates workflow binding across reload" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(root);
     const store_root = try std.fs.path.join(std.testing.allocator, &.{ root, ".ledger", "cas" });
     defer std.testing.allocator.free(store_root);
@@ -13011,8 +13279,8 @@ test "session record rejects pre-kernel schema" {
     );
 }
 
-test "current session record rejects relocation and incomplete custody" {
-    const record = SessionRecord{
+fn testCurrentSessionRecord() SessionRecord {
+    return .{
         .cwd = "/repo",
         .store_root = "/repo/.ledger/cas",
         .store_scope = "repo-local",
@@ -13042,6 +13310,10 @@ test "current session record rejects relocation and incomplete custody" {
         .accountFingerprint = "acct:test",
         .accountFingerprintReducedProtection = false,
     };
+}
+
+test "current session record rejects relocation and incomplete custody" {
+    const record = testCurrentSessionRecord();
     try validateCurrentSessionRecordAlloc(
         std.testing.allocator,
         "/repo/.ledger/cas/review_sessions/thr.json",
@@ -13109,12 +13381,19 @@ test "store root falls back to cwd ledger outside git while repo root stays opti
     );
     defer std.testing.allocator.free(root);
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), root);
-    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(
+        std.Io.Threaded.global_single_threaded.io(),
+        root,
+    ) catch |err| @panic(@errorName(err));
     configured_store_cwd = root;
 
     const store_root = try casStoreRootAlloc(std.testing.allocator);
     defer std.testing.allocator.free(store_root);
-    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), root, std.testing.allocator);
+    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        root,
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(real_root);
     const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ledger/cas", .{real_root});
     defer std.testing.allocator.free(expected);
@@ -13168,12 +13447,16 @@ test "parseArgs rejects artifact-like review thread id selectors" {
             "--review-thread-id",
             value,
         };
-        try std.testing.expectError(error.InvalidReviewThreadId, parseArgs(std.testing.allocator, &argv));
+        try std.testing.expectError(
+            error.InvalidReviewThreadId,
+            parseArgs(std.testing.allocator, &argv),
+        );
     }
 }
 
 test "usage detail explains invalid review thread id selectors" {
-    const detail = usageDetailForParseError(error.InvalidReviewThreadId) orelse return error.TestExpectedEqual;
+    const detail = usageDetailForParseError(error.InvalidReviewThreadId) orelse
+        return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, detail, "bare reviewThreadId") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "--latest") != null);
 }
@@ -13186,7 +13469,10 @@ test "parseArgs rejects ambiguous and unsafe latest selectors" {
         "--review-thread-id",
         "thr_1",
     };
-    try std.testing.expectError(error.AmbiguousReviewSessionSelector, parseArgs(std.testing.allocator, &ambiguous_argv));
+    try std.testing.expectError(
+        error.AmbiguousReviewSessionSelector,
+        parseArgs(std.testing.allocator, &ambiguous_argv),
+    );
 
     const path_argv = [_][]const u8{
         "cas_review_session",
@@ -13208,8 +13494,16 @@ test "latestSessionRecordPathInDirAlloc selects newest top-level session record"
     try tmp.dir.writeFile(io, .{ .sub_path = "old.json", .data = "{}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "new.json", .data = "{}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "events.ndjson", .data = "" });
-    try tmp.dir.setTimestamps(io, "old.json", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 1 } } });
-    try tmp.dir.setTimestamps(io, "new.json", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 2 } } });
+    try tmp.dir.setTimestamps(
+        io,
+        "old.json",
+        .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 1 } } },
+    );
+    try tmp.dir.setTimestamps(
+        io,
+        "new.json",
+        .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 2 } } },
+    );
 
     const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
@@ -13287,10 +13581,7 @@ test "thread resume emits only fields admitted by the selected contract" {
         .{},
     );
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "thr_1",
-        parsed.value.object.get("threadId").?.string,
-    );
+    try std.testing.expectEqualStrings("thr_1", parsed.value.object.get("threadId").?.string);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
 }
 
@@ -13430,51 +13721,34 @@ test "targetIdentityForRecordAlloc prefers stored tuple fields" {
 }
 
 test "start receipt tuple verdict detection requires tuple and review thread" {
-    const identity = TargetIdentity{
-        .base_sha = "base",
-        .head_sha = "head",
-        .fingerprint = "fp",
+    const identity = TargetIdentity{ .base_sha = "base", .head_sha = "head", .fingerprint = "fp" };
+    const Case = struct {
+        raw: ?[]const u8 = "{\"tupleVerdictExists\":true}",
+        thread: ?[]const u8 = "thr_1",
+        identity: TargetIdentity = identity,
+        timed_out: bool = false,
+        expected: bool = false,
     };
-    try std.testing.expect(startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":false}", "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, null, "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", null, identity, null, false));
-    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", identity, null, true));
-
-    const missing_base = TargetIdentity{
-        .base_sha = null,
-        .head_sha = "head",
-        .fingerprint = "fp",
+    const cases = [_]Case{
+        .{ .expected = true },
+        .{ .raw = "{\"tupleVerdictExists\":false}" },
+        .{ .raw = null },
+        .{ .thread = null },
+        .{ .timed_out = true },
+        .{ .identity = .{ .base_sha = null, .head_sha = "head", .fingerprint = "fp" } },
+        .{ .identity = .{ .base_sha = "base", .head_sha = null, .fingerprint = "fp" } },
+        .{ .identity = .{ .base_sha = "base", .head_sha = "head", .fingerprint = "" } },
     };
-    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", missing_base, null, false));
-
-    const missing_head = TargetIdentity{
-        .base_sha = "base",
-        .head_sha = null,
-        .fingerprint = "fp",
-    };
-    try std.testing.expect(!startReceiptTupleVerdictExists(
-        std.testing.allocator,
-        "{\"tupleVerdictExists\":true}",
-        "thr_1",
-        missing_head,
-        null,
-        false,
-    ));
-
-    const empty_fingerprint = TargetIdentity{
-        .base_sha = "base",
-        .head_sha = "head",
-        .fingerprint = "",
-    };
-    try std.testing.expect(!startReceiptTupleVerdictExists(
-        std.testing.allocator,
-        "{\"tupleVerdictExists\":true}",
-        "thr_1",
-        empty_fingerprint,
-        null,
-        false,
-    ));
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, startReceiptTupleVerdictExists(
+            std.testing.allocator,
+            case.raw,
+            case.thread,
+            case.identity,
+            null,
+            case.timed_out,
+        ));
+    }
 }
 
 test "normalizer treats null start reviewResult as non-proof" {
@@ -13498,6 +13772,28 @@ test "normalizer treats null start reviewResult as non-proof" {
     try std.testing.expect(receipt.review_attempt_exists);
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expect(!receipt.clean);
+}
+
+fn checkInstructionIndependentTarget(parsed: ParsedArgs) !void {
+    const target_json = try buildTargetJson(std.testing.allocator, parsed.target.?);
+    defer std.testing.allocator.free(target_json);
+    var target_value = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        target_json,
+        .{},
+    );
+    defer target_value.deinit();
+    try std.testing.expectEqualStrings(
+        "baseBranch",
+        target_value.value.object.get("type").?.string,
+    );
+    try std.testing.expectEqualStrings("main", target_value.value.object.get("branch").?.string);
+    try std.testing.expect(target_value.value.object.get("instructions") == null);
+
+    const target_record = targetToRecord(parsed.target.?);
+    try std.testing.expectEqualStrings("baseBranch", target_record.type);
+    try std.testing.expectEqualStrings("main", target_record.branch.?);
 }
 
 test "target selector and custom instructions remain independently bound" {
@@ -13535,29 +13831,7 @@ test "target selector and custom instructions remain independently bound" {
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqualStrings("loaded instruction body", parsed.custom_instructions.?);
 
-    const target_json = try buildTargetJson(std.testing.allocator, parsed.target.?);
-    defer std.testing.allocator.free(target_json);
-    var target_value = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        target_json,
-        .{},
-    );
-    defer target_value.deinit();
-    try std.testing.expectEqualStrings(
-        "baseBranch",
-        target_value.value.object.get("type").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "main",
-        target_value.value.object.get("branch").?.string,
-    );
-    try std.testing.expect(target_value.value.object.get("instructions") == null);
-
-    const target_record = targetToRecord(parsed.target.?);
-    try std.testing.expectEqualStrings("baseBranch", target_record.type);
-    try std.testing.expectEqualStrings("main", target_record.branch.?);
-
+    try checkInstructionIndependentTarget(parsed);
     const reverse_argv = [_][]const u8{
         "cas_review_session",
         "run",
@@ -13589,6 +13863,25 @@ fn runTestGitCommand(
     defer allocator.free(output);
 }
 
+fn checkCanonicalCommitSelector(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    const expected_oid = try gitOutputAlloc(
+        allocator,
+        io,
+        root,
+        &.{ "rev-parse", "--verify", "HEAD^{commit}" },
+    );
+    defer allocator.free(expected_oid);
+    const canonical = try canonicalTargetAlloc(
+        allocator,
+        io,
+        root,
+        .{ .kind = .commit, .sha = "HEAD" },
+    );
+    defer canonical.deinit(allocator);
+    try std.testing.expectEqualStrings(expected_oid, canonical.value.sha.?);
+    try std.testing.expect(!std.mem.eql(u8, canonical.value.sha.?, "HEAD"));
+}
+
 test "commit selectors canonicalize and subject identity recaptures instructions and dirty state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -13608,23 +13901,7 @@ test "commit selectors canonicalize and subject identity recaptures instructions
     try runTestGitCommand(allocator, root, &.{ "add", "tracked.txt" });
     try runTestGitCommand(allocator, root, &.{ "commit", "--quiet", "-m", "second" });
 
-    const expected_oid = try gitOutputAlloc(
-        allocator,
-        io,
-        root,
-        &.{ "rev-parse", "--verify", "HEAD^{commit}" },
-    );
-    defer allocator.free(expected_oid);
-    const canonical = try canonicalTargetAlloc(
-        allocator,
-        io,
-        root,
-        .{ .kind = .commit, .sha = "HEAD" },
-    );
-    defer canonical.deinit(allocator);
-    try std.testing.expectEqualStrings(expected_oid, canonical.value.sha.?);
-    try std.testing.expect(!std.mem.eql(u8, canonical.value.sha.?, "HEAD"));
-
+    try checkCanonicalCommitSelector(allocator, io, root);
     var initial = try computeTargetIdentityAlloc(
         allocator,
         io,
@@ -13840,6 +14117,54 @@ test "receipt normalizer accepts strong principal metadata" {
     try std.testing.expect(normalizedReceiptCommandSucceeded(receipt));
 }
 
+fn checkTerminalFindingsProjection(
+    receipt: NormalizedReceipt,
+    rer_json: []const u8,
+    parsed: std.json.Parsed(std.json.Value),
+) !void {
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings(cas_review_evidence_schema, root.get("schema").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, root.get("recordId").?.string, "rer_"));
+    try std.testing.expectEqualStrings("run", root.get("command").?.object.get("surface").?.string);
+    try std.testing.expectEqualStrings(
+        "base_rer",
+        root.get("tuple").?.object.get("baseSha").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "head_rer",
+        root.get("tuple").?.object.get("headSha").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "fp_rer",
+        root.get("tuple").?.object.get("targetFingerprint").?.string,
+    );
+    const attempt = root.get("attempt").?.object;
+    try std.testing.expect(attempt.get("exists").?.bool);
+    try std.testing.expect(std.mem.startsWith(u8, attempt.get("attemptId").?.string, "sha256:"));
+    try std.testing.expectEqualStrings("thr_rer", attempt.get("reviewThreadId").?.string);
+    var copied_receipt = receipt;
+    copied_receipt.source_path = "/tmp/copied-findings-receipt.json";
+    const copied_attempt_id = (try casRerAttemptIdAlloc(
+        std.testing.allocator,
+        copied_receipt,
+    )).?;
+    defer std.testing.allocator.free(copied_attempt_id);
+    try std.testing.expectEqualStrings(attempt.get("attemptId").?.string, copied_attempt_id);
+    const verdict = root.get("verdict").?.object;
+    try std.testing.expect(verdict.get("tupleVerdictExists").?.bool);
+    try std.testing.expectEqualStrings("findings", verdict.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), verdict.get("findingCount").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, rer_json, "Ledger issue") != null);
+    const principal = root.get("principal").?.object;
+    try std.testing.expectEqualStrings(principal_strength_reduced, principal.get("kind").?.string);
+    try std.testing.expect(!principal.get("proofUsable").?.bool);
+    try std.testing.expect(root.get("workflowBinding") == null);
+
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "rer.json", root);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(gate.ok());
+}
+
 test "CAS-RER writer projects terminal findings receipt" {
     const raw =
         "{\"cwd\":\"/tmp/repo\",\"status\":\"findings\"," ++
@@ -13874,64 +14199,34 @@ test "CAS-RER writer projects terminal findings receipt" {
         .{},
     );
     defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expectEqualStrings(
-        cas_review_evidence_schema,
-        root.get("schema").?.string,
-    );
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        root.get("recordId").?.string,
-        "rer_",
-    ));
-    try std.testing.expectEqualStrings(
-        "run",
-        root.get("command").?.object.get("surface").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "base_rer",
-        root.get("tuple").?.object.get("baseSha").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "head_rer",
-        root.get("tuple").?.object.get("headSha").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "fp_rer",
-        root.get("tuple").?.object.get("targetFingerprint").?.string,
-    );
-    const attempt = root.get("attempt").?.object;
-    try std.testing.expect(attempt.get("exists").?.bool);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        attempt.get("attemptId").?.string,
-        "sha256:",
-    ));
-    try std.testing.expectEqualStrings("thr_rer", attempt.get("reviewThreadId").?.string);
-    var copied_receipt = receipt;
-    copied_receipt.source_path = "/tmp/copied-findings-receipt.json";
-    const copied_attempt_id = (try casRerAttemptIdAlloc(
-        std.testing.allocator,
-        copied_receipt,
-    )).?;
-    defer std.testing.allocator.free(copied_attempt_id);
-    try std.testing.expectEqualStrings(attempt.get("attemptId").?.string, copied_attempt_id);
-    const verdict = root.get("verdict").?.object;
-    try std.testing.expect(verdict.get("tupleVerdictExists").?.bool);
-    try std.testing.expectEqualStrings("findings", verdict.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 1), verdict.get("findingCount").?.integer);
-    try std.testing.expect(std.mem.indexOf(u8, rer_json, "Ledger issue") != null);
-    const principal = root.get("principal").?.object;
-    try std.testing.expectEqualStrings(
-        principal_strength_reduced,
-        principal.get("kind").?.string,
-    );
-    try std.testing.expect(!principal.get("proofUsable").?.bool);
-    try std.testing.expect(root.get("workflowBinding") == null);
+    try checkTerminalFindingsProjection(receipt, rer_json, parsed);
+}
 
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "rer.json", root);
-    defer gate.deinit(std.testing.allocator);
-    try std.testing.expect(gate.ok());
+fn testTargetProjectionReceipt(target_json: []const u8) NormalizedReceipt {
+    return .{
+        .source_path = "source.json",
+        .status = "clean",
+        .backend_class = "cas-start-wait",
+        .clean = true,
+        .finding_count = 0,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fingerprint",
+        .target_json = target_json,
+        .repo_realpath = "/tmp/repo",
+        .review_thread_id = "thread",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
 }
 
 test "CAS-RER target projection preserves schema-4 target variants and identity" {
@@ -13959,30 +14254,7 @@ test "CAS-RER target projection preserves schema-4 target variants and identity"
         const target_json = try stringifyAnyAlloc(std.testing.allocator, target);
         defer std.testing.allocator.free(target_json);
         try std.testing.expectEqualStrings(expected_targets[index], target_json);
-        const receipt = NormalizedReceipt{
-            .source_path = "source.json",
-            .status = "clean",
-            .backend_class = "cas-start-wait",
-            .clean = true,
-            .finding_count = 0,
-            .review_attempt_phase = "normalized_verdict",
-            .review_attempt_exists = true,
-            .tuple_verdict_exists = true,
-            .base_sha = "base",
-            .head_sha = "head",
-            .target_fingerprint = "fingerprint",
-            .target_json = target_json,
-            .repo_realpath = "/tmp/repo",
-            .review_thread_id = "thread",
-            .review_turn_id = "turn",
-            .record_path = "/tmp/record.json",
-            .event_log_path = "/tmp/events.ndjson",
-            .failure_code = null,
-            .failure_hint = null,
-            .failure_class = null,
-            .retryable_same_tuple_now = null,
-            .findings_json = "[]",
-        };
+        const receipt = testTargetProjectionReceipt(target_json);
         const rer_json = try casRerJsonFromReceiptAlloc(
             std.testing.allocator,
             receipt,
@@ -14051,6 +14323,31 @@ test "CAS-RER projection rejects a receipt without an owned target" {
     );
 }
 
+fn checkIncompleteWorkflowBindingRejected(bound_json: []const u8) !void {
+    const invalid_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        bound_json,
+        ",\"requestFingerprint\":\"sha256:request\"",
+        "",
+    );
+    defer std.testing.allocator.free(invalid_json);
+    var invalid_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        invalid_json,
+        .{},
+    );
+    defer invalid_parsed.deinit();
+    const invalid_gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "partial-bound-rer.json",
+        invalid_parsed.value.object,
+    );
+    defer invalid_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_gate.ok());
+}
+
 test "CAS-RER binding is source carried validated and identity bearing" {
     const raw = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -14100,29 +14397,7 @@ test "CAS-RER binding is source carried validated and identity bearing" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(gate.ok());
 
-    const invalid_json = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
-        bound_json,
-        ",\"requestFingerprint\":\"sha256:request\"",
-        "",
-    );
-    defer std.testing.allocator.free(invalid_json);
-    var invalid_parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        invalid_json,
-        .{},
-    );
-    defer invalid_parsed.deinit();
-    const invalid_gate = try validateCasRerRecordObjectAlloc(
-        std.testing.allocator,
-        "partial-bound-rer.json",
-        invalid_parsed.value.object,
-    );
-    defer invalid_gate.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_gate.ok());
-
+    try checkIncompleteWorkflowBindingRejected(bound_json);
     var unbound = bound;
     unbound.workflow_binding_json = null;
     const bound_id = try casRerRecordIdAlloc(
@@ -14187,6 +14462,30 @@ test "CAS run shell success requires clean proof usable principal" {
     try std.testing.expect(!normalizedReceiptCommandSucceeded(unknown_account));
 }
 
+fn checkStartShadowProjection(normalized: NormalizedReceipt) !void {
+    const rer_json = try casRerJsonFromReceiptAlloc(
+        std.testing.allocator,
+        normalized,
+        testCasRerProjectionOptions("unix-ns:1"),
+    );
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        rer_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const tuple = parsed.value.object.get("tuple").?.object;
+    try std.testing.expectEqualStrings("/bin/codex", tuple.get("resolvedCodexPath").?.string);
+    try std.testing.expectEqualStrings("codex 0.1.0", tuple.get("resolvedCodexVersion").?.string);
+    try std.testing.expectEqualStrings(
+        "uncommittedChanges",
+        tuple.get("target").?.object.get("type").?.string,
+    );
+    try std.testing.expect(tuple.get("tupleCurrentAtRecordTime") == null);
+}
+
 test "start shadow payload carries Codex identity into CAS-RER tuple" {
     const identity = TargetIdentity{
         .base_sha = "base",
@@ -14239,35 +14538,9 @@ test "start shadow payload carries Codex identity into CAS-RER tuple" {
     defer normalized.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/bin/codex", normalized.resolved_codex_path.?);
     try std.testing.expectEqualStrings("codex 0.1.0", normalized.resolved_codex_version.?);
-    try std.testing.expectEqualStrings(
-        test_uncommitted_target_json,
-        normalized.target_json.?,
-    );
+    try std.testing.expectEqualStrings(test_uncommitted_target_json, normalized.target_json.?);
 
-    const rer_json = try casRerJsonFromReceiptAlloc(
-        std.testing.allocator,
-        normalized,
-        testCasRerProjectionOptions("unix-ns:1"),
-    );
-    defer std.testing.allocator.free(rer_json);
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        rer_json,
-        .{},
-    );
-    defer parsed.deinit();
-    const tuple = parsed.value.object.get("tuple").?.object;
-    try std.testing.expectEqualStrings("/bin/codex", tuple.get("resolvedCodexPath").?.string);
-    try std.testing.expectEqualStrings(
-        "codex 0.1.0",
-        tuple.get("resolvedCodexVersion").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "uncommittedChanges",
-        tuple.get("target").?.object.get("type").?.string,
-    );
-    try std.testing.expect(tuple.get("tupleCurrentAtRecordTime") == null);
+    try checkStartShadowProjection(normalized);
 }
 
 const test_cas_rer_tuple =
@@ -14295,7 +14568,11 @@ test "CAS-RER validator rejects findings without finding count" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bad-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "bad-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14313,7 +14590,11 @@ test "CAS-RER validator rejects findings count without findings entries" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "findings-empty-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "findings-empty-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14332,7 +14613,11 @@ test "CAS-RER validator rejects non-terminal tuple verdicts" {
         "\"retryableSameTupleNow\":true}," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "tuple-timeout-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "tuple-timeout-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14352,7 +14637,11 @@ test "CAS-RER validator rejects terminal tuple verdict with waiting phase" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "waiting-clean-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "waiting-clean-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14373,7 +14662,11 @@ test "CAS-RER validator rejects unparseable timestamps" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bad-timestamp-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "bad-timestamp-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gateErrorsContain(gate, "createdAt"));
@@ -14388,7 +14681,12 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
         "\"verdict\":{\"tupleVerdictExists\":true,\"status\":\"clean\"," ++
         "\"clean\":false,\"findingCount\":0,\"findings\":[]}," ++
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
-    var clean_false = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, clean_false_raw, .{});
+    var clean_false = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        clean_false_raw,
+        .{},
+    );
     defer clean_false.deinit();
     const clean_false_gate = try validateCasRerRecordObjectAlloc(
         std.testing.allocator,
@@ -14491,7 +14789,11 @@ test "CAS-RER validator rejects terminal verdict without attempt" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "no-attempt-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "no-attempt-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 3);
@@ -14511,7 +14813,11 @@ test "CAS-RER validator rejects terminal tuple verdict without repo binding" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "no-repo-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "no-repo-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14530,7 +14836,11 @@ test "CAS-RER validator rejects attempt exists with empty review thread id" {
         "\"retryableSameTupleNow\":true}," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "empty-thread-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "empty-thread-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14550,7 +14860,11 @@ test "CAS-RER validator rejects proof usable principal without account fingerpri
         "\"fallbackUsed\":false,\"source\":\"cas-start-wait\"}}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "unbound-principal-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "unbound-principal-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14568,7 +14882,11 @@ test "CAS-RER validator rejects missing command section" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "missing-command-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "missing-command-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
@@ -14586,7 +14904,11 @@ test "CAS-RER validator rejects incomplete command metadata" {
         test_cas_rer_null_failure ++ "," ++ test_cas_rer_strong_principal ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "empty-command-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "empty-command-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gateErrorsContain(gate, "command.surface"));
@@ -14600,7 +14922,11 @@ test "CAS-RER validator rejects null required sections" {
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "null-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "null-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 5);
@@ -14609,20 +14935,43 @@ test "CAS-RER validator rejects null required sections" {
 test "CAS-RER ledger write rejects recordId collisions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const root_abs = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(root_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_collision.json" });
     defer std.testing.allocator.free(path);
 
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
-    try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":2}"));
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(
+        std.testing.allocator,
+        path,
+        "{\"recordId\":\"rer_collision\",\"value\":1}",
+    );
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(
+        std.testing.allocator,
+        path,
+        "{\"recordId\":\"rer_collision\",\"value\":1}",
+    );
+    try std.testing.expectError(
+        error.CasRerRecordIdCollision,
+        writeRawJsonFileExclusiveOrIdenticalAlloc(
+            std.testing.allocator,
+            path,
+            "{\"recordId\":\"rer_collision\",\"value\":2}",
+        ),
+    );
 }
 
 test "CAS-RER ledger write accepts stable content with regenerated timestamps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const root_abs = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(root_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_same.json" });
     defer std.testing.allocator.free(path);
@@ -14817,7 +15166,13 @@ test "receipt normalizer rejects target-only start receipt as proof" {
     const raw =
         \\{"demo":"cas-review-session","action":"start","reviewThreadId":"thr_target_only","reviewTurnId":"turn_target_only","targetFingerprint":"fp_only","reviewResult":{"findings":[],"overallCorrectness":"patch is correct","overallExplanation":"clean","overallConfidenceScore":1}}
     ;
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "start-target-only.json", raw, true, .{});
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "start-target-only.json",
+        raw,
+        true,
+        .{},
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("clean", receipt.status);
     try std.testing.expect(receipt.review_attempt_exists);
@@ -14835,10 +15190,16 @@ test "receipt normalizer rejects start receipt when requested identity is incomp
         .head_sha = null,
         .fingerprint = "fp_only",
     };
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "start-missing-requested.json", raw, true, .{
-        .requested_identity = requested,
-        .requested_identity_required = true,
-    });
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "start-missing-requested.json",
+        raw,
+        true,
+        .{
+            .requested_identity = requested,
+            .requested_identity_required = true,
+        },
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("target_identity_unavailable", receipt.failure_code.?);
@@ -14894,7 +15255,13 @@ test "receipt normalizer flags mismatched tuple proof" {
         "\"failureCode\":null,\"failureHint\":null,\"baseSha\":\"other_base\"," ++
         "\"headSha\":\"requested_head\",\"targetFingerprint\":\"requested_fp\"," ++
         "\"reviewThreadId\":\"thr_1\",\"reviewTurnId\":\"turn_1\",\"findings\":[]}}";
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "mismatch.json", raw, true, .{});
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "mismatch.json",
+        raw,
+        true,
+        .{},
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expect(receipt.review_attempt_exists);
     try std.testing.expect(!receipt.tuple_verdict_exists);
@@ -14915,15 +15282,41 @@ test "receipt normalizer rejects incomplete requested identity as proof" {
         .head_sha = null,
         .fingerprint = "requested_fp",
     };
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "missing-requested-tuple.json", raw, true, .{
-        .requested_identity = requested,
-        .requested_identity_required = true,
-    });
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "missing-requested-tuple.json",
+        raw,
+        true,
+        .{
+            .requested_identity = requested,
+            .requested_identity_required = true,
+        },
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expect(receipt.review_attempt_exists);
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("target_identity_unavailable", receipt.failure_code.?);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
+}
+
+fn testLegacySessionJsonAlloc(
+    thread: []const u8,
+    turn: []const u8,
+    event_path_json: []const u8,
+    tuple_fields: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\"," ++
+            "\"review_thread_id\":\"{s}\",\"review_turn_id\":\"{s}\"," ++
+            "\"delivery\":\"detached\"," ++
+            "\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}}," ++
+            "\"event_log_path\":{s},\"created_at_unix_s\":1," ++
+            "\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\"," ++
+            "\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\"," ++
+            "\"terminal_review_result_source\":null,\"terminal_review_result_json\":null{s}}}",
+        .{ thread, turn, event_path_json, tuple_fields },
+    );
 }
 
 test "receipt normalizer rejects pre-kernel stored findings recovery" {
@@ -14954,20 +15347,29 @@ test "receipt normalizer rejects pre-kernel stored findings recovery" {
     defer std.testing.allocator.free(notification_json);
     const line = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"recordedAtUnixS\":1,\"method\":\"item/completed\",\"direction\":\"notification\",\"payload\":{s}}}\n",
+        "{{\"recordedAtUnixS\":1,\"method\":\"item/completed\"," ++
+            "\"direction\":\"notification\",\"payload\":{s}}}\n",
         .{notification_json},
     );
     defer std.testing.allocator.free(line);
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.events.ndjson", .data = line });
-    const event_log_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "review.events.ndjson", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "review.events.ndjson", .data = line },
+    );
+    const event_log_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "review.events.ndjson",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(event_log_path);
     const event_log_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_log_path);
     defer std.testing.allocator.free(event_log_path_json);
 
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_event\",\"review_turn_id\":\"turn_event\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null}}",
-        .{event_log_path_json},
+    const raw = try testLegacySessionJsonAlloc(
+        "thr_event",
+        "turn_event",
+        event_log_path_json,
+        "",
     );
     defer std.testing.allocator.free(raw);
     try std.testing.expectError(
@@ -14982,6 +15384,14 @@ test "receipt normalizer rejects pre-kernel stored findings recovery" {
     );
 }
 
+fn testThreadReadPayloadJsonAlloc(thread_id: []const u8, rollout_path: []const u8) ![]u8 {
+    const payload = try stringifyAnyAlloc(std.testing.allocator, .{
+        .thread = .{ .id = thread_id, .path = rollout_path },
+    });
+    defer std.testing.allocator.free(payload);
+    return quoteJsonStringAlloc(std.testing.allocator, payload);
+}
+
 test "receipt normalizer rejects pre-kernel stored clean recovery" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -14990,7 +15400,10 @@ test "receipt normalizer rejects pre-kernel stored clean recovery" {
         \\{"type":"session_meta","payload":{"id":"thr_clean"}}
         \\{"type":"event_msg","payload":{"type":"exited_review_mode","review_output":{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No issues found.","overall_confidence_score":0.88}}}
     ;
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "rollout.jsonl", .data = rollout });
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "rollout.jsonl", .data = rollout },
+    );
     const rollout_path = try tmp.dir.realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         "rollout.jsonl",
@@ -14998,31 +15411,37 @@ test "receipt normalizer rejects pre-kernel stored clean recovery" {
     );
     defer std.testing.allocator.free(rollout_path);
 
-    const thread_read_payload = try stringifyAnyAlloc(std.testing.allocator, .{
-        .thread = .{
-            .id = "thr_clean",
-            .path = rollout_path,
-        },
-    });
-    defer std.testing.allocator.free(thread_read_payload);
-    const thread_read_payload_json = try quoteJsonStringAlloc(std.testing.allocator, thread_read_payload);
+    const thread_read_payload_json = try testThreadReadPayloadJsonAlloc("thr_clean", rollout_path);
     defer std.testing.allocator.free(thread_read_payload_json);
     const line = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\",\"direction\":\"response\",\"payload\":{s}}}\n{{\"recordedAtUnixS\":2,\"method\":\"item/completed\",\"direction\":\"notification\",\"payload\":\"reviewer searched for usageLimitExceeded handling\"}}\n",
+        "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\"," ++
+            "\"direction\":\"response\"," ++
+            "\"payload\":{s}}}\n{{\"recordedAtUnixS\":2," ++
+            "\"method\":\"item/completed\",\"direction\":\"notification\"," ++
+            "\"payload\":\"reviewer searched for usageLimitExceeded " ++
+            "handling\"}}\n",
         .{thread_read_payload_json},
     );
     defer std.testing.allocator.free(line);
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.events.ndjson", .data = line });
-    const event_log_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "review.events.ndjson", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "review.events.ndjson", .data = line },
+    );
+    const event_log_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "review.events.ndjson",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(event_log_path);
     const event_log_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_log_path);
     defer std.testing.allocator.free(event_log_path_json);
 
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_clean\",\"review_turn_id\":\"turn_clean\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null}}",
-        .{event_log_path_json},
+    const raw = try testLegacySessionJsonAlloc(
+        "thr_clean",
+        "turn_clean",
+        event_log_path_json,
+        "",
     );
     defer std.testing.allocator.free(raw);
     try std.testing.expectError(
@@ -15045,7 +15464,10 @@ test "receipt normalizer rejects pre-kernel snake-case stored tuple" {
         \\{"type":"session_meta","payload":{"id":"thr_snake"}}
         \\{"type":"event_msg","payload":{"type":"exited_review_mode","review_output":{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No issues found.","overall_confidence_score":0.91}}}
     ;
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "rollout.jsonl", .data = rollout });
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "rollout.jsonl", .data = rollout },
+    );
     const rollout_path = try tmp.dir.realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         "rollout.jsonl",
@@ -15053,31 +15475,34 @@ test "receipt normalizer rejects pre-kernel snake-case stored tuple" {
     );
     defer std.testing.allocator.free(rollout_path);
 
-    const thread_read_payload = try stringifyAnyAlloc(std.testing.allocator, .{
-        .thread = .{
-            .id = "thr_snake",
-            .path = rollout_path,
-        },
-    });
-    defer std.testing.allocator.free(thread_read_payload);
-    const thread_read_payload_json = try quoteJsonStringAlloc(std.testing.allocator, thread_read_payload);
+    const thread_read_payload_json = try testThreadReadPayloadJsonAlloc("thr_snake", rollout_path);
     defer std.testing.allocator.free(thread_read_payload_json);
     const line = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\",\"direction\":\"response\",\"payload\":{s}}}\n",
+        "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\"," ++
+            "\"direction\":\"response\",\"payload\":{s}}}\n",
         .{thread_read_payload_json},
     );
     defer std.testing.allocator.free(line);
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.events.ndjson", .data = line });
-    const event_log_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "review.events.ndjson", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "review.events.ndjson", .data = line },
+    );
+    const event_log_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "review.events.ndjson",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(event_log_path);
     const event_log_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_log_path);
     defer std.testing.allocator.free(event_log_path_json);
 
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_snake\",\"review_turn_id\":\"turn_snake\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null,\"base_sha\":\"base_snake\",\"head_sha\":\"head_snake\",\"target_fingerprint\":\"fp_snake\"}}",
-        .{event_log_path_json},
+    const raw = try testLegacySessionJsonAlloc(
+        "thr_snake",
+        "turn_snake",
+        event_log_path_json,
+        ",\"base_sha\":\"base_snake\",\"head_sha\":\"head_snake\"," ++
+            "\"target_fingerprint\":\"fp_snake\"",
     );
     defer std.testing.allocator.free(raw);
     const requested = TargetIdentity{
@@ -15119,7 +15544,13 @@ test "receipt normalizer rejects pre-kernel broad stored recovery" {
 test "receipt normalizer fails closed on missing verdict fields" {
     try std.testing.expectError(
         error.MissingBackendClass,
-        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"clean\":true,\"findingCount\":0}", true, .{}),
+        normalizeReceiptFromJsonAlloc(
+            std.testing.allocator,
+            "bad.json",
+            "{\"status\":\"clean\",\"clean\":true,\"findingCount\":0}",
+            true,
+            .{},
+        ),
     );
     try std.testing.expectError(
         error.MissingCleanFlag,
@@ -15143,10 +15574,16 @@ test "receipt normalizer downgrades requested tuple mismatch" {
         .head_sha = "head_a",
         .fingerprint = "fp_a",
     };
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "tuple.json", raw, true, .{
-        .requested_identity = requested,
-        .requested_identity_required = true,
-    });
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "tuple.json",
+        raw,
+        true,
+        .{
+            .requested_identity = requested,
+            .requested_identity_required = true,
+        },
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("incomplete", receipt.status);
     try std.testing.expect(!receipt.clean);
@@ -15163,10 +15600,16 @@ test "receipt normalizer preserves transport failure over requested tuple bindin
         .head_sha = "head_a",
         .fingerprint = "fp_a",
     };
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "transport.json", raw, true, .{
-        .requested_identity = requested,
-        .requested_identity_required = true,
-    });
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "transport.json",
+        raw,
+        true,
+        .{
+            .requested_identity = requested,
+            .requested_identity_required = true,
+        },
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("review_transport_failure", receipt.status);
     try std.testing.expect(!receipt.clean);
@@ -15253,7 +15696,10 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
     try std.testing.expectEqualStrings("cas-start-wait", verdict.get("backendClass").?.string);
     try std.testing.expect(verdict.get("clean").?.bool);
     try std.testing.expectEqual(@as(i64, 0), verdict.get("findingCount").?.integer);
-    try std.testing.expectEqualStrings(principal_strength_strong, verdict.get("principalStrength").?.string);
+    try std.testing.expectEqualStrings(
+        principal_strength_strong,
+        verdict.get("principalStrength").?.string,
+    );
     try std.testing.expect(!verdict.get("accountFingerprintReducedProtection").?.bool);
     try std.testing.expectEqualStrings("base", verdict.get("baseSha").?.string);
 
@@ -15262,13 +15708,24 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
     try writeReceiptReviewVerdictObject(&compact_out.writer, receipt);
     const compact_json = try compact_out.toOwnedSlice();
     defer std.testing.allocator.free(compact_json);
-    var compact_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, compact_json, .{});
+    var compact_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        compact_json,
+        .{},
+    );
     defer compact_parsed.deinit();
     const compact = compact_parsed.value.object;
-    try std.testing.expectEqualStrings("normalized_verdict", compact.get("reviewAttemptPhase").?.string);
+    try std.testing.expectEqualStrings(
+        "normalized_verdict",
+        compact.get("reviewAttemptPhase").?.string,
+    );
     try std.testing.expect(compact.get("reviewAttemptExists").?.bool);
     try std.testing.expect(compact.get("tupleVerdictExists").?.bool);
-    try std.testing.expectEqualStrings(principal_strength_strong, compact.get("principalStrength").?.string);
+    try std.testing.expectEqualStrings(
+        principal_strength_strong,
+        compact.get("principalStrength").?.string,
+    );
 }
 
 test "synthetic run receipt preserves root tuple binding" {
@@ -15298,10 +15755,16 @@ test "synthetic run receipt preserves root tuple binding" {
     );
     defer std.testing.allocator.free(synthetic);
 
-    const normalized = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "/tmp/record.json", synthetic, true, .{
-        .requested_identity = identity,
-        .requested_identity_required = true,
-    });
+    const normalized = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "/tmp/record.json",
+        synthetic,
+        true,
+        .{
+            .requested_identity = identity,
+            .requested_identity_required = true,
+        },
+    );
     defer normalized.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("clean", normalized.status);
@@ -15355,6 +15818,31 @@ test "synthetic run receipt preserves nested terminal attempt phase" {
     try std.testing.expectEqual(true, normalized.retryable_same_tuple_now.?);
 }
 
+fn checkCleanStructuredVerdict(verdict_json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        verdict_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const verdict = parsed.value.object;
+    try std.testing.expectEqualStrings("clean", verdict.get("status").?.string);
+    try std.testing.expectEqualStrings("cas-start-wait", verdict.get("backendClass").?.string);
+    try std.testing.expectEqualStrings(
+        principal_strength_strong,
+        verdict.get("principalStrength").?.string,
+    );
+    try std.testing.expect(!verdict.get("accountFingerprintReducedProtection").?.bool);
+    try std.testing.expectEqualStrings(
+        "request-test",
+        verdict.get("workflowBinding").?.object.get("requestId").?.string,
+    );
+    try std.testing.expect(verdict.get("clean").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), verdict.get("findingCount").?.integer);
+    try std.testing.expectEqualStrings("thr", verdict.get("reviewThreadId").?.string);
+}
+
 test "structured result alone determines clean despite diagnostic prose" {
     const review_result =
         \\{"findings":[],"overallCorrectness":"patch is correct","overallExplanation":"No issues found.","overallConfidenceScore":0.92}
@@ -15406,23 +15894,7 @@ test "structured result alone determines clean despite diagnostic prose" {
     )).?;
     defer std.testing.allocator.free(verdict_json);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, verdict_json, .{});
-    defer parsed.deinit();
-    const verdict = parsed.value.object;
-    try std.testing.expectEqualStrings("clean", verdict.get("status").?.string);
-    try std.testing.expectEqualStrings("cas-start-wait", verdict.get("backendClass").?.string);
-    try std.testing.expectEqualStrings(
-        principal_strength_strong,
-        verdict.get("principalStrength").?.string,
-    );
-    try std.testing.expect(!verdict.get("accountFingerprintReducedProtection").?.bool);
-    try std.testing.expectEqualStrings(
-        "request-test",
-        verdict.get("workflowBinding").?.object.get("requestId").?.string,
-    );
-    try std.testing.expect(verdict.get("clean").?.bool);
-    try std.testing.expectEqual(@as(i64, 0), verdict.get("findingCount").?.integer);
-    try std.testing.expectEqualStrings("thr", verdict.get("reviewThreadId").?.string);
+    try checkCleanStructuredVerdict(verdict_json);
 }
 
 test "non-blocking structured finding remains a findings verdict" {
@@ -15529,15 +16001,26 @@ test "start wait verdict builder rejects notification-only proof" {
     )).?;
     defer std.testing.allocator.free(verdict_json);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, verdict_json, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        verdict_json,
+        .{},
+    );
     defer parsed.deinit();
     const verdict = parsed.value.object;
     try std.testing.expectEqualStrings("review_untrusted_source", verdict.get("status").?.string);
     try std.testing.expect(!verdict.get("clean").?.bool);
     try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
-    try std.testing.expectEqualStrings("review_untrusted_source", verdict.get("failureCode").?.string);
+    try std.testing.expectEqualStrings(
+        "review_untrusted_source",
+        verdict.get("failureCode").?.string,
+    );
 
-    const lock_failure = terminalLockFailureForStatus(std.testing.allocator, status) orelse return error.ExpectedTerminalLockFailure;
+    const lock_failure = terminalLockFailureForStatus(
+        std.testing.allocator,
+        status,
+    ) orelse return error.ExpectedTerminalLockFailure;
     try std.testing.expectEqualStrings("review_untrusted_source", lock_failure.code);
 }
 
@@ -15600,7 +16083,9 @@ test "review verdict tuple terminal status is clean or findings only" {
 
 test "account resource exhaustion detector accepts required signals" {
     try std.testing.expect(detectAccountResourceExhaustion("usageLimitExceeded"));
-    try std.testing.expect(detectAccountResourceExhaustion("Rate Limit Exceeded while starting review"));
+    try std.testing.expect(detectAccountResourceExhaustion(
+        "Rate Limit Exceeded while starting review",
+    ));
     try std.testing.expect(detectAccountResourceExhaustion("quota exceeded for this account"));
     try std.testing.expect(detectAccountResourceExhaustion("temporary ACCOUNT LIMIT reached"));
     try std.testing.expect(!detectAccountResourceExhaustion("review transport lost"));
@@ -15639,10 +16124,19 @@ test "account resource exhaustion maps start and terminal status failures" {
 
     const status_failure = failureInfoForStatus(&status).?;
     try std.testing.expectEqualStrings("account_resource_exhausted", status_failure.code);
-    try std.testing.expectEqualStrings("account_resource", failureClassForCode(status_failure.code).?);
+    try std.testing.expectEqualStrings(
+        "account_resource",
+        failureClassForCode(status_failure.code).?,
+    );
     try std.testing.expectEqual(false, retryableSameTupleNowForCode(status_failure.code).?);
-    try std.testing.expectEqualStrings("pre_review_start", startReceiptReviewAttemptPhase(null, false, status_failure, null));
-    try std.testing.expectEqualStrings("review_terminal", startReceiptReviewAttemptPhase(null, false, status_failure, "thr_1"));
+    try std.testing.expectEqualStrings(
+        "pre_review_start",
+        startReceiptReviewAttemptPhase(null, false, status_failure, null),
+    );
+    try std.testing.expectEqualStrings(
+        "review_terminal",
+        startReceiptReviewAttemptPhase(null, false, status_failure, "thr_1"),
+    );
 }
 
 test "receipt normalizer preserves account resource retry metadata" {
@@ -15661,7 +16155,13 @@ test "receipt normalizer preserves account resource retry metadata" {
         "\"reviewThreadId\":\"thr_1\",\"reviewTurnId\":\"turn_1\"," ++
         "\"recordPath\":\"/tmp/record.json\"," ++
         "\"eventLogPath\":\"/tmp/events.jsonl\",\"findings\":[]}}";
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "account.json", raw, true, .{});
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "account.json",
+        raw,
+        true,
+        .{},
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
@@ -15671,19 +16171,8 @@ test "receipt normalizer preserves account resource retry metadata" {
     try std.testing.expect(receipt.review_attempt_exists);
 }
 
-test "blocked account-resource run payload projects valid CAS-RER" {
-    const tuple = ReviewTupleIdentity{
-        .repo_realpath = "/repo",
-        .base_sha = "base_a",
-        .head_sha = "head_a",
-        .target_fingerprint = "fp_a",
-        .resolved_codex_path = "/bin/codex",
-        .resolved_codex_version = "codex 0.1.0",
-        .account_fingerprint = "acct:test",
-        .account_fingerprint_reduced_protection = false,
-        .codex_thread_id = "thread-test",
-    };
-    const raw = try stringifyAnyAlloc(std.testing.allocator, .{
+fn testBlockedAccountPayloadAlloc(tuple: ReviewTupleIdentity) ![]u8 {
+    return stringifyAnyAlloc(std.testing.allocator, .{
         .demo = "cas-review-session",
         .action = "run",
         .reviewBrokerDecision = .{
@@ -15734,9 +16223,30 @@ test "blocked account-resource run payload projects valid CAS-RER" {
             .findings = [_]std.json.Value{},
         },
     });
+}
+
+test "blocked account-resource run payload projects valid CAS-RER" {
+    const tuple = ReviewTupleIdentity{
+        .repo_realpath = "/repo",
+        .base_sha = "base_a",
+        .head_sha = "head_a",
+        .target_fingerprint = "fp_a",
+        .resolved_codex_path = "/bin/codex",
+        .resolved_codex_version = "codex 0.1.0",
+        .account_fingerprint = "acct:test",
+        .account_fingerprint_reduced_protection = false,
+        .codex_thread_id = "thread-test",
+    };
+    const raw = try testBlockedAccountPayloadAlloc(tuple);
     defer std.testing.allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"findings\":[]") != null);
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "/tmp/record.json", raw, true, normalizeContextFromReviewTuple(tuple));
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "/tmp/record.json",
+        raw,
+        true,
+        normalizeContextFromReviewTuple(tuple),
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
@@ -15749,7 +16259,9 @@ test "blocked account-resource run payload projects valid CAS-RER" {
     const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
         .command_surface = "run",
         .backend_selected = "cas-run",
-        .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(.block_account_resource)),
+        .broker_action = publicReviewBrokerAction(
+            reviewBrokerActionForBlockedLock(.block_account_resource),
+        ),
         .broker_reason = "same-account review retry is blocked",
         .timestamp = "unix-ns:1",
     });
@@ -15757,22 +16269,38 @@ test "blocked account-resource run payload projects valid CAS-RER" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
     defer parsed.deinit();
 
-    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "blocked-account-rer.json", parsed.value.object);
+    const gate = try validateCasRerRecordObjectAlloc(
+        std.testing.allocator,
+        "blocked-account-rer.json",
+        parsed.value.object,
+    );
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(gate.ok());
     const verdict = parsed.value.object.get("verdict").?.object;
-    try std.testing.expectEqualStrings("account_resource_exhausted", verdict.get("status").?.string);
+    try std.testing.expectEqualStrings(
+        "account_resource_exhausted",
+        verdict.get("status").?.string,
+    );
     try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
     const tuple_obj = parsed.value.object.get("tuple").?.object;
     try std.testing.expectEqualStrings("/bin/codex", tuple_obj.get("resolvedCodexPath").?.string);
-    try std.testing.expectEqualStrings("codex 0.1.0", tuple_obj.get("resolvedCodexVersion").?.string);
+    try std.testing.expectEqualStrings(
+        "codex 0.1.0",
+        tuple_obj.get("resolvedCodexVersion").?.string,
+    );
 }
 
 test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
     const raw =
         \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"failureCode":"account_resource_exhausted","failureClass":"account_resource","retryableSameTupleNow":false,"failureHint":"usageLimitExceeded"}
     ;
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "pre-account.json", raw, true, .{});
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "pre-account.json",
+        raw,
+        true,
+        .{},
+    );
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("incomplete", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
@@ -15786,14 +16314,32 @@ test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
 test "pre-kernel stored account-limit receipt is rejected" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "events.ndjson", .data = "{\"payload\":\"usageLimitExceeded\"}\n" });
-    const event_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "events.ndjson", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "events.ndjson", .data = "{\"payload\":\"usageLimitExceeded\"}\n" },
+    );
+    const event_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "events.ndjson",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(event_path);
     const event_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_path);
     defer std.testing.allocator.free(event_path_json);
     const raw = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_account\",\"review_turn_id\":\"turn_account\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null}}",
+        "{{\"schema_version\":3,\"cwd\":\"/tmp\"," ++
+            "\"parent_thread_id\":\"parent\"," ++
+            "\"review_thread_id\":\"thr_account\"," ++
+            "\"review_turn_id\":\"turn_account\",\"delivery\":\"detached\"," ++
+            "\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}}," ++
+            "\"event_log_path\":{s},\"created_at_unix_s\":1," ++
+            "\"last_observed_status\":\"completed\"," ++
+            "\"codex_version\":\"0.140.0\"," ++
+            "\"compatibility_verdict\":\"compatible\"," ++
+            "\"transport_kind\":\"websocket\"," ++
+            "\"terminal_review_result_source\":null," ++
+            "\"terminal_review_result_json\":null}}",
         .{event_path_json},
     );
     defer std.testing.allocator.free(raw);
@@ -15813,14 +16359,33 @@ test "pre-kernel stored account-limit receipt is rejected" {
 test "pre-kernel stored account exhaustion with tuple is rejected" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "events.ndjson", .data = "{\"payload\":\"quota exceeded\"}\n" });
-    const event_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "events.ndjson", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "events.ndjson", .data = "{\"payload\":\"quota exceeded\"}\n" },
+    );
+    const event_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "events.ndjson",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(event_path);
     const event_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_path);
     defer std.testing.allocator.free(event_path_json);
     const raw = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_account\",\"review_turn_id\":\"turn_account\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null,\"base_sha\":\"base_a\",\"head_sha\":\"head_a\",\"target_fingerprint\":\"fp_a\"}}",
+        "{{\"schema_version\":3,\"cwd\":\"/tmp\"," ++
+            "\"parent_thread_id\":\"parent\"," ++
+            "\"review_thread_id\":\"thr_account\"," ++
+            "\"review_turn_id\":\"turn_account\",\"delivery\":\"detached\"," ++
+            "\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}}," ++
+            "\"event_log_path\":{s},\"created_at_unix_s\":1," ++
+            "\"last_observed_status\":\"inProgress\"," ++
+            "\"codex_version\":\"0.140.0\"," ++
+            "\"compatibility_verdict\":\"compatible\"," ++
+            "\"transport_kind\":\"websocket\"," ++
+            "\"terminal_review_result_source\":null," ++
+            "\"terminal_review_result_json\":null,\"base_sha\":\"base_a\"," ++
+            "\"head_sha\":\"head_a\",\"target_fingerprint\":\"fp_a\"}}",
         .{event_path_json},
     );
     defer std.testing.allocator.free(raw);
@@ -15866,7 +16431,10 @@ test "review verdict compacts findings for consumers" {
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("findings", root.get("status").?.string);
-    try std.testing.expectEqualStrings("normalized_verdict", root.get("reviewAttemptPhase").?.string);
+    try std.testing.expectEqualStrings(
+        "normalized_verdict",
+        root.get("reviewAttemptPhase").?.string,
+    );
     try std.testing.expect(root.get("reviewAttemptExists").?.bool);
     try std.testing.expect(root.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings("cas-start-wait", root.get("backendClass").?.string);
@@ -15874,7 +16442,10 @@ test "review verdict compacts findings for consumers" {
     try std.testing.expectEqual(@as(i64, 1), root.get("findingCount").?.integer);
     const finding = root.get("findings").?.array.items[0].object;
     try std.testing.expectEqualStrings("Count matching offers", finding.get("title").?.string);
-    try std.testing.expectEqualStrings("/tmp/src/program/evidence.zig", finding.get("file").?.string);
+    try std.testing.expectEqualStrings(
+        "/tmp/src/program/evidence.zig",
+        finding.get("file").?.string,
+    );
     try std.testing.expectEqual(@as(i64, 3571), finding.get("line").?.integer);
     try std.testing.expectEqual(@as(i64, 2), finding.get("priority").?.integer);
 }
@@ -16289,10 +16860,7 @@ test "readReviewResultJsonFromRolloutAlloc accepts event-local turn identity" {
         "turn_1",
     )).?;
     defer std.testing.allocator.free(json);
-    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(
-        std.testing.allocator,
-        json,
-    ));
+    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(std.testing.allocator, json));
 }
 
 test "readReviewResultJsonFromRolloutAlloc accepts Codex 0.151 item completion" {
@@ -16324,10 +16892,7 @@ test "readReviewResultJsonFromRolloutAlloc accepts Codex 0.151 item completion" 
         "turn-review",
     )).?;
     defer std.testing.allocator.free(json);
-    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(
-        std.testing.allocator,
-        json,
-    ));
+    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(std.testing.allocator, json));
 }
 
 test "readReviewResultJsonFromRolloutAlloc accepts non-blocking finding" {
@@ -16364,10 +16929,7 @@ test "readReviewResultJsonFromRolloutAlloc accepts non-blocking finding" {
         "turn-review",
     )).?;
     defer std.testing.allocator.free(json);
-    try std.testing.expectEqual(@as(usize, 1), try reviewFindingCount(
-        std.testing.allocator,
-        json,
-    ));
+    try std.testing.expectEqual(@as(usize, 1), try reviewFindingCount(std.testing.allocator, json));
 }
 
 test "readReviewResultJsonFromRolloutAlloc event-local turn overrides legacy context" {
@@ -16475,10 +17037,7 @@ test "readReviewResultJsonFromRolloutAlloc cannot credit a later turn" {
         "turn_expected",
     )).?;
     defer std.testing.allocator.free(json);
-    try std.testing.expectEqual(@as(usize, 1), try reviewFindingCount(
-        std.testing.allocator,
-        json,
-    ));
+    try std.testing.expectEqual(@as(usize, 1), try reviewFindingCount(std.testing.allocator, json));
     try std.testing.expectError(
         error.MissingReviewTurnBoundary,
         readReviewResultJsonFromRolloutAlloc(
@@ -16685,7 +17244,10 @@ test "failureInfoForStatus maps interrupted and approval failures" {
         .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
     };
     defer interrupted.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("review_interrupted", failureInfoForStatus(&interrupted).?.code);
+    try std.testing.expectEqualStrings(
+        "review_interrupted",
+        failureInfoForStatus(&interrupted).?.code,
+    );
 
     var denied = ReviewStatus{
         .thread_status = try std.testing.allocator.dupe(u8, "idle"),
@@ -16694,7 +17256,10 @@ test "failureInfoForStatus maps interrupted and approval failures" {
         .materialized = true,
         .thread_preview = try std.testing.allocator.dupe(u8, ""),
         .rollout_path = null,
-        .turn_error_message = try std.testing.allocator.dupe(u8, "permission denied by approval policy"),
+        .turn_error_message = try std.testing.allocator.dupe(
+            u8,
+            "permission denied by approval policy",
+        ),
         .last_turn_has_entered_review_mode = false,
         .last_turn_has_exited_review_mode = false,
         .review_result_available = false,
@@ -16723,7 +17288,10 @@ test "failureInfoForParentReuse rejects unsafe parents" {
         .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
     };
     defer parent.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("unsafe_parent_thread_state", failureInfoForParentReuse(&parent).?.code);
+    try std.testing.expectEqualStrings(
+        "unsafe_parent_thread_state",
+        failureInfoForParentReuse(&parent).?.code,
+    );
 }
 
 test "parseArgs accepts review lock override only for review starters" {
@@ -16763,7 +17331,10 @@ test "parseArgs accepts review lock override only for review starters" {
         "--review-lock-override",
         "not allowed",
     };
-    try std.testing.expectError(error.ReviewLockOverrideUnsupportedAction, parseArgs(std.testing.allocator, &wait_argv));
+    try std.testing.expectError(
+        error.ReviewLockOverrideUnsupportedAction,
+        parseArgs(std.testing.allocator, &wait_argv),
+    );
 }
 
 test "parseArgs accepts fresh attempt only for review starters" {
@@ -16818,7 +17389,10 @@ test "accountFingerprintFromJsonAlloc redacts account identifiers" {
     try std.testing.expect(std.mem.startsWith(u8, fingerprint, "acct:"));
     try std.testing.expect(std.mem.indexOf(u8, fingerprint, "person@example.com") == null);
 
-    const unknown = try accountFingerprintFromJsonAlloc(std.testing.allocator, "{\"account\":null}");
+    const unknown = try accountFingerprintFromJsonAlloc(
+        std.testing.allocator,
+        "{\"account\":null}",
+    );
     defer std.testing.allocator.free(unknown);
     try std.testing.expectEqualStrings(unknown_account_fingerprint, unknown);
 }
@@ -16851,55 +17425,20 @@ fn testTupleIdentity(account_fingerprint: []const u8) ReviewTupleIdentity {
         .resolved_codex_path = "/bin/codex",
         .resolved_codex_version = "codex 0.1.0",
         .account_fingerprint = account_fingerprint,
-        .account_fingerprint_reduced_protection = std.mem.eql(u8, account_fingerprint, unknown_account_fingerprint),
+        .account_fingerprint_reduced_protection = std.mem.eql(
+            u8,
+            account_fingerprint,
+            unknown_account_fingerprint,
+        ),
         .codex_thread_id = "thread-test",
     };
 }
 
-test "review tuple hash is stable and account-bound" {
-    const tuple_a = testTupleIdentity("acct:a");
-    const tuple_a_again = testTupleIdentity("acct:a");
-    const tuple_b = testTupleIdentity("acct:b");
-
-    const hash_a = try reviewTupleHashAlloc(std.testing.allocator, tuple_a);
-    defer std.testing.allocator.free(hash_a);
-    const hash_a_again = try reviewTupleHashAlloc(std.testing.allocator, tuple_a_again);
-    defer std.testing.allocator.free(hash_a_again);
-    const hash_b = try reviewTupleHashAlloc(std.testing.allocator, tuple_b);
-    defer std.testing.allocator.free(hash_b);
-
-    try std.testing.expectEqualStrings(
-        "sha256:c66dd7a40b9685685c7ae5bad41339208e92239f763bde715e664c7886a1de0d",
-        hash_a,
-    );
-    try std.testing.expectEqualStrings(hash_a, hash_a_again);
-    try std.testing.expect(!std.mem.eql(u8, hash_a, hash_b));
-
-    const binding_json = try stringifyAnyAlloc(std.testing.allocator, testWorkflowBinding());
-    defer std.testing.allocator.free(binding_json);
-    const binding_digest = try sha256HexAlloc(std.testing.allocator, binding_json);
-    defer std.testing.allocator.free(binding_digest);
-    var bound_tuple = tuple_a;
-    bound_tuple.workflow_binding = testWorkflowBinding();
-    bound_tuple.workflow_binding_digest = binding_digest;
-    const bound_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
-    defer std.testing.allocator.free(bound_hash);
-    try std.testing.expect(!std.mem.eql(u8, hash_a, bound_hash));
-
-    var other_binding = testWorkflowBinding();
-    other_binding.requestFingerprint = "sha256:other-request";
-    const other_json = try stringifyAnyAlloc(std.testing.allocator, other_binding);
-    defer std.testing.allocator.free(other_json);
-    const other_digest = try sha256HexAlloc(std.testing.allocator, other_json);
-    defer std.testing.allocator.free(other_digest);
-    bound_tuple.workflow_binding = other_binding;
-    bound_tuple.workflow_binding_digest = other_digest;
-    const other_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
-    defer std.testing.allocator.free(other_hash);
-    try std.testing.expect(!std.mem.eql(u8, bound_hash, other_hash));
-
-    bound_tuple.workflow_binding = testWorkflowBinding();
-    bound_tuple.workflow_binding_digest = binding_digest;
+fn checkBoundTupleLockVersions(
+    bound_hash: []const u8,
+    bound_tuple: ReviewTupleIdentity,
+    other_binding: WorkflowBinding,
+) !void {
     var bound_lock = makeReviewTupleLock(
         bound_hash,
         bound_tuple,
@@ -16949,6 +17488,66 @@ test "review tuple hash is stable and account-bound" {
     ));
 }
 
+test "review tuple hash is stable and account-bound" {
+    const tuple_a = testTupleIdentity("acct:a");
+    const tuple_a_again = testTupleIdentity("acct:a");
+    const tuple_b = testTupleIdentity("acct:b");
+
+    const hash_a = try reviewTupleHashAlloc(std.testing.allocator, tuple_a);
+    defer std.testing.allocator.free(hash_a);
+    const hash_a_again = try reviewTupleHashAlloc(std.testing.allocator, tuple_a_again);
+    defer std.testing.allocator.free(hash_a_again);
+    const hash_b = try reviewTupleHashAlloc(std.testing.allocator, tuple_b);
+    defer std.testing.allocator.free(hash_b);
+
+    try std.testing.expectEqualStrings(
+        "sha256:c66dd7a40b9685685c7ae5bad41339208e92239f763bde715e664c7886a1de0d",
+        hash_a,
+    );
+    try std.testing.expectEqualStrings(hash_a, hash_a_again);
+    try std.testing.expect(!std.mem.eql(u8, hash_a, hash_b));
+
+    const binding_json = try stringifyAnyAlloc(std.testing.allocator, testWorkflowBinding());
+    defer std.testing.allocator.free(binding_json);
+    const binding_digest = try sha256HexAlloc(std.testing.allocator, binding_json);
+    defer std.testing.allocator.free(binding_digest);
+    var bound_tuple = tuple_a;
+    bound_tuple.workflow_binding = testWorkflowBinding();
+    bound_tuple.workflow_binding_digest = binding_digest;
+    const bound_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
+    defer std.testing.allocator.free(bound_hash);
+    try std.testing.expect(!std.mem.eql(u8, hash_a, bound_hash));
+
+    var other_binding = testWorkflowBinding();
+    other_binding.requestFingerprint = "sha256:other-request";
+    const other_json = try stringifyAnyAlloc(std.testing.allocator, other_binding);
+    defer std.testing.allocator.free(other_json);
+    const other_digest = try sha256HexAlloc(std.testing.allocator, other_json);
+    defer std.testing.allocator.free(other_digest);
+    bound_tuple.workflow_binding = other_binding;
+    bound_tuple.workflow_binding_digest = other_digest;
+    const other_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
+    defer std.testing.allocator.free(other_hash);
+    try std.testing.expect(!std.mem.eql(u8, bound_hash, other_hash));
+
+    bound_tuple.workflow_binding = testWorkflowBinding();
+    bound_tuple.workflow_binding_digest = binding_digest;
+    try checkBoundTupleLockVersions(bound_hash, bound_tuple, other_binding);
+}
+
+fn expectReviewTupleFailure(
+    stored: ReviewTupleIdentity,
+    current: ReviewTupleIdentity,
+    code: []const u8,
+) !void {
+    const failure = (try reviewTupleCurrentnessFailureAlloc(
+        std.testing.allocator,
+        stored,
+        current,
+    )).?;
+    try std.testing.expectEqualStrings(code, failure.code);
+}
+
 test "review tuple currentness rejects runtime principal and thread drift" {
     const stored = testTupleIdentity("acct:a");
     try std.testing.expect((try reviewTupleCurrentnessFailureAlloc(
@@ -16967,58 +17566,23 @@ test "review tuple currentness rejects runtime principal and thread drift" {
     )) == null);
     var rewritten_contract = legacy_current;
     rewritten_contract.app_server_contract_id = app_server_contract_id;
-    try std.testing.expectEqualStrings(
-        "review_tuple_mismatch",
-        (try reviewTupleCurrentnessFailureAlloc(
-            std.testing.allocator,
-            legacy_stored,
-            rewritten_contract,
-        )).?.code,
-    );
+    try expectReviewTupleFailure(legacy_stored, rewritten_contract, "review_tuple_mismatch");
 
     var runtime_drift = stored;
     runtime_drift.resolved_codex_version = "codex 0.2.0";
-    try std.testing.expectEqualStrings(
-        "review_tuple_mismatch",
-        (try reviewTupleCurrentnessFailureAlloc(
-            std.testing.allocator,
-            stored,
-            runtime_drift,
-        )).?.code,
-    );
+    try expectReviewTupleFailure(stored, runtime_drift, "review_tuple_mismatch");
 
     var principal_drift = stored;
     principal_drift.account_fingerprint = "acct:b";
-    try std.testing.expectEqualStrings(
-        "review_tuple_mismatch",
-        (try reviewTupleCurrentnessFailureAlloc(
-            std.testing.allocator,
-            stored,
-            principal_drift,
-        )).?.code,
-    );
+    try expectReviewTupleFailure(stored, principal_drift, "review_tuple_mismatch");
 
     var reduced = stored;
     reduced.account_fingerprint_reduced_protection = true;
-    try std.testing.expectEqualStrings(
-        "review_principal_unavailable",
-        (try reviewTupleCurrentnessFailureAlloc(
-            std.testing.allocator,
-            stored,
-            reduced,
-        )).?.code,
-    );
+    try expectReviewTupleFailure(stored, reduced, "review_principal_unavailable");
 
     var thread_drift = stored;
     thread_drift.codex_thread_id = "thread-other";
-    try std.testing.expectEqualStrings(
-        "review_tuple_mismatch",
-        (try reviewTupleCurrentnessFailureAlloc(
-            std.testing.allocator,
-            stored,
-            thread_drift,
-        )).?.code,
-    );
+    try expectReviewTupleFailure(stored, thread_drift, "review_tuple_mismatch");
 }
 
 test "run and start wait terminal proof rejects tuple drift" {
@@ -17068,10 +17632,7 @@ test "run and start wait terminal proof rejects tuple drift" {
         stored,
         stored,
     )).?;
-    try std.testing.expectEqualStrings(
-        "review_subject_recapture_failed",
-        missing_subject.code,
-    );
+    try std.testing.expectEqualStrings("review_subject_recapture_failed", missing_subject.code);
 
     const missing_context = (try terminalReviewFailureAlloc(
         std.testing.allocator,
@@ -17081,15 +17642,11 @@ test "run and start wait terminal proof rejects tuple drift" {
         stored,
         null,
     )).?;
-    try std.testing.expectEqualStrings(
-        "review_context_unavailable",
-        missing_context.code,
-    );
+    try std.testing.expectEqualStrings("review_context_unavailable", missing_context.code);
 }
 
-test "review tuple lock action classifies active terminal exhausted and stale states" {
-    const now_s: i64 = 1000;
-    const active = ReviewTupleLock{
+fn testActiveReviewTupleLock(now_s: i64) ReviewTupleLock {
+    return .{
         .tupleHash = "sha256:active",
         .repoRealpath = "/repo",
         .baseSha = "base",
@@ -17106,32 +17663,23 @@ test "review tuple lock action classifies active terminal exhausted and stale st
         .expiresAtUnixS = now_s + 60,
         .ownerPid = 1,
     };
-    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("run", active, now_s, null, null));
-    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockActionWithProbe("run", active, now_s, null, null, true));
+}
 
-    var transport_lost = active;
-    transport_lost.lastFailureCode = "review_transport_lost";
-    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, false));
-    try std.testing.expectEqual(ReviewTupleLockAction.auto_replace_dead_transport, reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, true));
-
-    var timed_out = active;
-    timed_out.lastFailureCode = "wait_timed_out";
-    try std.testing.expectEqualStrings("timeout", tupleLockDiagnosticVerdictStatus(timed_out));
-    try std.testing.expectEqual(
-        ReviewTupleLockAction.return_existing,
-        reviewTupleLockActionWithProbe("run", timed_out, now_s, null, null, false),
-    );
-    try std.testing.expectEqual(
-        ReviewTupleLockAction.auto_replace_dead_transport,
-        reviewTupleLockActionWithProbe("run", timed_out, now_s, null, null, true),
-    );
-    try std.testing.expectEqualStrings("incomplete", tupleLockDiagnosticVerdictStatus(active));
-
+fn checkTerminalReviewLockActions(active: ReviewTupleLock, now_s: i64) !void {
     var terminal = active;
     terminal.state = "terminal";
-    try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockAction("run", terminal, now_s, null, null));
-    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockAction("run", terminal, now_s, null, "run 2"));
-    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockAction("start", terminal, now_s, null, "run 2"));
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.normalize_existing,
+        reviewTupleLockAction("run", terminal, now_s, null, null),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.fresh_after_terminal,
+        reviewTupleLockAction("run", terminal, now_s, null, "run 2"),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.fresh_after_terminal,
+        reviewTupleLockAction("start", terminal, now_s, null, "run 2"),
+    );
     terminal.expiresAtUnixS = now_s - 1;
     try std.testing.expectEqual(
         ReviewTupleLockAction.normalize_existing,
@@ -17160,7 +17708,9 @@ test "review tuple lock action classifies active terminal exhausted and stale st
         ReviewTupleLockAction.block_invalid,
         reviewTupleLockAction("run", legacy_active, now_s, "override", null),
     );
+}
 
+fn checkUnavailableReviewLockActions(active: ReviewTupleLock, now_s: i64) !void {
     var exhausted = active;
     exhausted.state = "account_resource_exhausted";
     try std.testing.expectEqual(
@@ -17187,7 +17737,68 @@ test "review tuple lock action classifies active terminal exhausted and stale st
         ReviewTupleLockAction.takeover_with_override,
         reviewTupleLockAction("run", stale, now_s, "stale owner", null),
     );
-    try std.testing.expectEqualStrings("blocked_stale_lock", reviewBrokerActionForBlockedLock(.block_stale));
+    try std.testing.expectEqualStrings(
+        "blocked_stale_lock",
+        reviewBrokerActionForBlockedLock(.block_stale),
+    );
+}
+
+test "review tuple lock action classifies active terminal exhausted and stale states" {
+    const now_s: i64 = 1000;
+    const active = testActiveReviewTupleLock(now_s);
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.return_existing,
+        reviewTupleLockAction("run", active, now_s, null, null),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.return_existing,
+        reviewTupleLockActionWithProbe("run", active, now_s, null, null, true),
+    );
+
+    var transport_lost = active;
+    transport_lost.lastFailureCode = "review_transport_lost";
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.return_existing,
+        reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, false),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.auto_replace_dead_transport,
+        reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, true),
+    );
+
+    var timed_out = active;
+    timed_out.lastFailureCode = "wait_timed_out";
+    try std.testing.expectEqualStrings("timeout", tupleLockDiagnosticVerdictStatus(timed_out));
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.return_existing,
+        reviewTupleLockActionWithProbe("run", timed_out, now_s, null, null, false),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.auto_replace_dead_transport,
+        reviewTupleLockActionWithProbe("run", timed_out, now_s, null, null, true),
+    );
+    try std.testing.expectEqualStrings("incomplete", tupleLockDiagnosticVerdictStatus(active));
+
+    try checkTerminalReviewLockActions(active, now_s);
+    try checkUnavailableReviewLockActions(active, now_s);
+}
+
+fn expectReviewAcquireAction(
+    lock: ReviewTupleLock,
+    now_s: i64,
+    identity: TargetIdentity,
+    expected: ReviewTupleLockAction,
+) !void {
+    try std.testing.expectEqual(expected, reviewTupleLockActionForAcquire(
+        std.testing.allocator,
+        "run",
+        lock,
+        now_s,
+        null,
+        null,
+        identity,
+        null,
+    ));
 }
 
 test "review tuple acquire does not reuse non-proof terminal receipts" {
@@ -17204,13 +17815,29 @@ test "review tuple acquire does not reuse non-proof terminal receipts" {
         "\"reviewTurnId\":\"turn\",\"accountFingerprint\":\"acct:a\"," ++
         "\"accountFingerprintReducedProtection\":true," ++
         "\"principalStrength\":\"reduced\",\"findings\":[]}}";
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "reusable.json", .data = reusable_receipt });
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "diagnostic.json", .data = diagnostic_receipt });
-    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "reusable.json", .data = reusable_receipt },
+    );
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "diagnostic.json", .data = diagnostic_receipt },
+    );
+    const root_abs = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(root_abs);
-    const reusable_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reusable.json" });
+    const reusable_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_abs, "reusable.json" },
+    );
     defer std.testing.allocator.free(reusable_path);
-    const diagnostic_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "diagnostic.json" });
+    const diagnostic_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_abs, "diagnostic.json" },
+    );
     defer std.testing.allocator.free(diagnostic_path);
     const target_identity = TargetIdentity{
         .base_sha = "base",
@@ -17218,60 +17845,27 @@ test "review tuple acquire does not reuse non-proof terminal receipts" {
         .fingerprint = "fp",
     };
     const now_s: i64 = 1000;
-    var lock = ReviewTupleLock{
-        .tupleHash = "sha256:terminal",
-        .repoRealpath = "/repo",
-        .baseSha = "base",
-        .headSha = "head",
-        .targetFingerprint = "fp",
-        .resolvedCodexPath = "/bin/codex",
-        .resolvedCodexVersion = "codex 0.1.0",
-        .accountFingerprint = "acct:a",
-        .accountFingerprintReducedProtection = false,
-        .state = "terminal",
-        .reviewThreadId = "thr",
-        .reviewTurnId = "turn",
-        .recordPath = reusable_path,
-        .createdAtUnixS = now_s,
-        .updatedAtUnixS = now_s,
-        .expiresAtUnixS = now_s + 60,
-        .ownerPid = 1,
-    };
-    try std.testing.expectEqual(
-        ReviewTupleLockAction.normalize_existing,
-        reviewTupleLockActionForAcquire(
-            std.testing.allocator,
-            "run",
-            lock,
-            now_s,
-            null,
-            null,
-            target_identity,
-            null,
-        ),
-    );
+    var lock = testActiveReviewTupleLock(now_s);
+    lock.tupleHash = "sha256:terminal";
+    lock.state = "terminal";
+    lock.reviewThreadId = "thr";
+    lock.reviewTurnId = "turn";
+    lock.recordPath = reusable_path;
+    try expectReviewAcquireAction(lock, now_s, target_identity, .normalize_existing);
 
     lock.recordPath = diagnostic_path;
-    try std.testing.expectEqual(
-        ReviewTupleLockAction.fresh_after_terminal,
-        reviewTupleLockActionForAcquire(
-            std.testing.allocator,
-            "run",
-            lock,
-            now_s,
-            null,
-            null,
-            target_identity,
-            null,
-        ),
-    );
+    try expectReviewAcquireAction(lock, now_s, target_identity, .fresh_after_terminal);
 }
 
 test "review tuple lock write and load roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(tmp_root);
     const tuple = testTupleIdentity("acct:a");
     const tuple_hash = try reviewTupleHashAlloc(std.testing.allocator, tuple);
@@ -17309,6 +17903,37 @@ test "review tuple lock write and load roundtrip" {
     try std.testing.expect(marked.record.reviewStartSendStarted);
 }
 
+fn checkPreSendRecoveryEvidence(
+    lock_path: []const u8,
+    lock: ReviewTupleLock,
+    identity: TargetIdentity,
+) !void {
+    const pre_send_predecessor_path = (try persistDeadOwnerRecoveryEvidence(
+        std.testing.allocator,
+        lock_path,
+        lock,
+        identity,
+    )).?;
+    defer std.testing.allocator.free(pre_send_predecessor_path);
+    var pre_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
+    defer pre_send.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pre_review_start_failed", pre_send.record.state);
+    try std.testing.expectEqualStrings(
+        "workflow_bound_review_owner_lost_before_start",
+        pre_send.record.lastFailureCode.?,
+    );
+    var pre_send_predecessor = (try loadReviewTupleLockArtifact(
+        std.testing.allocator,
+        pre_send_predecessor_path,
+        false,
+    )).?;
+    defer pre_send_predecessor.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "pre_review_start_failed",
+        pre_send_predecessor.record.state,
+    );
+}
+
 test "recordless dead owner recovery terminalizes the exact lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -17339,31 +17964,7 @@ test "recordless dead owner recovery terminalizes the exact lock" {
         .fingerprint = "fp",
     };
 
-    const pre_send_predecessor_path = (try persistDeadOwnerRecoveryEvidence(
-        std.testing.allocator,
-        lock_path,
-        lock,
-        identity,
-    )).?;
-    defer std.testing.allocator.free(pre_send_predecessor_path);
-    var pre_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
-    defer pre_send.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("pre_review_start_failed", pre_send.record.state);
-    try std.testing.expectEqualStrings(
-        "workflow_bound_review_owner_lost_before_start",
-        pre_send.record.lastFailureCode.?,
-    );
-    var pre_send_predecessor = (try loadReviewTupleLockArtifact(
-        std.testing.allocator,
-        pre_send_predecessor_path,
-        false,
-    )).?;
-    defer pre_send_predecessor.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "pre_review_start_failed",
-        pre_send_predecessor.record.state,
-    );
-
+    try checkPreSendRecoveryEvidence(lock_path, lock, identity);
     lock.ownerPid = 2;
     lock.createdAtUnixS = 2;
     lock.reviewStartSendStarted = true;
@@ -17378,10 +17979,7 @@ test "recordless dead owner recovery terminalizes the exact lock" {
     var post_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
     defer post_send.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("terminal", post_send.record.state);
-    try std.testing.expectEqualStrings(
-        "review_transport_lost",
-        post_send.record.lastFailureCode.?,
-    );
+    try std.testing.expectEqualStrings("review_transport_lost", post_send.record.lastFailureCode.?);
     var post_send_predecessor = (try loadReviewTupleLockArtifact(
         std.testing.allocator,
         post_send_predecessor_path,
@@ -17406,32 +18004,8 @@ test "recordless dead owner recovery terminalizes the exact lock" {
     try std.testing.expectEqual(@as(u64, 2), preserved_predecessor.record.ownerPid);
 }
 
-test "replacement admission requires exact predecessor shutdown receipt" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const receipt_path = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root, "shutdown-receipt.json" },
-    );
-    defer std.testing.allocator.free(receipt_path);
-    var child = try cas_websocket.spawnDetachedProcess(
-        std.testing.allocator,
-        "/tmp",
-        &.{ "/bin/sh", "-c", "sleep 10" },
-        io,
-    );
-    defer child.kill(io);
-    const process_id: u64 = switch (builtin.os.tag) {
-        .windows => @intCast(@intFromPtr(child.id.?)),
-        .wasi => 0,
-        else => @intCast(child.id.?),
-    };
-    const lock = ReviewTupleLock{
+fn testPredecessorLock(process_id: u64, receipt_path: []const u8) ReviewTupleLock {
+    return .{
         .lockVersion = previous_review_tuple_lock_version,
         .tupleHash = "sha256:predecessor",
         .repoRealpath = "/repo",
@@ -17451,29 +18025,9 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         .expiresAtUnixS = 61,
         .ownerPid = 1,
     };
+}
 
-    try std.testing.expectError(
-        error.ReviewPredecessorStillAlive,
-        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
-    );
-
-    try durable_store.writeTextAtomic(
-        std.testing.allocator,
-        receipt_path,
-        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"wrong-token\"}\n",
-    );
-    try std.testing.expectError(
-        error.InvalidReviewTupleLockBinding,
-        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
-    );
-    try durable_store.writeTextAtomic(
-        std.testing.allocator,
-        receipt_path,
-        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"generation-token\"}\n",
-    );
-    try ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1);
-    try std.testing.expect(cas_websocket.processAlive(process_id));
-
+fn checkPredecessorCompatibility(lock: ReviewTupleLock, process_id: u64) !void {
     if (builtin.os.tag == .linux) {
         const boot_id = try cas_websocket.currentBootIdAlloc(std.testing.allocator);
         defer std.testing.allocator.free(boot_id);
@@ -17504,6 +18058,58 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         cas_websocket.owner_watchdog_shutdown_grace_ms + 100,
     );
     try std.testing.expect(cas_websocket.processAlive(process_id));
+}
+
+test "replacement admission requires exact predecessor shutdown receipt" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const receipt_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "shutdown-receipt.json" },
+    );
+    defer std.testing.allocator.free(receipt_path);
+    var child = try cas_websocket.spawnDetachedProcess(
+        std.testing.allocator,
+        "/tmp",
+        &.{ "/bin/sh", "-c", "sleep 10" },
+        io,
+    );
+    defer child.kill(io);
+    const process_id: u64 = switch (builtin.os.tag) {
+        .windows => @intCast(@intFromPtr(child.id.?)),
+        .wasi => 0,
+        else => @intCast(child.id.?),
+    };
+    const lock = testPredecessorLock(process_id, receipt_path);
+
+    try std.testing.expectError(
+        error.ReviewPredecessorStillAlive,
+        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
+    );
+
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        receipt_path,
+        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"wrong-token\"}\n",
+    );
+    try std.testing.expectError(
+        error.InvalidReviewTupleLockBinding,
+        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
+    );
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        receipt_path,
+        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"generation-token\"}\n",
+    );
+    try ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1);
+    try std.testing.expect(cas_websocket.processAlive(process_id));
+
+    try checkPredecessorCompatibility(lock, process_id);
 }
 
 test "receiptless v3 predecessor retires by boot-bound process group" {
@@ -17739,35 +18345,12 @@ test "workflow owner lease is exclusive and kernel-released" {
     defer reacquired.deinit(std.testing.allocator);
 }
 
-test "terminal timeout session replays only through its exact tuple lock" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const store_root = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root, ".ledger", "cas" },
-    );
-    defer std.testing.allocator.free(store_root);
-    const old_store_root = configured_store_root_override;
-    configured_store_root_override = store_root;
-    defer configured_store_root_override = old_store_root;
-    const session_dir = try sessionDirAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(session_dir);
-    const record_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/thr.json",
-        .{session_dir},
-    );
-    defer std.testing.allocator.free(record_path);
-    const event_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/thr.events.ndjson",
-        .{session_dir},
-    );
-    defer std.testing.allocator.free(event_path);
-    var record = SessionRecord{
+fn testTimeoutReplayRecord(
+    root: []const u8,
+    store_root: []const u8,
+    event_path: []const u8,
+) SessionRecord {
+    return .{
         .cwd = root,
         .store_root = store_root,
         .store_scope = "repo-local",
@@ -17798,6 +18381,263 @@ test "terminal timeout session replays only through its exact tuple lock" {
         .accountFingerprintReducedProtection = false,
         .workflowBinding = testWorkflowBinding(),
     };
+}
+
+const TestTerminalReplayContext = struct {
+    io: std.Io,
+    record: SessionRecord,
+    record_path: []const u8,
+    lock_path: []const u8,
+    requested_identity: TargetIdentity,
+};
+
+fn checkTimeoutReplay(context: TestTerminalReplayContext) !void {
+    const failure = (try recordTerminalOwnerFailure(
+        std.testing.allocator,
+        context.record,
+        context.record_path,
+    )).?;
+    try std.testing.expectEqualStrings("review_transport_timeout", failure.code);
+    try std.testing.expect(try recordHasTerminalFailureReplayCandidate(
+        std.testing.allocator,
+        context.record,
+        context.record_path,
+    ));
+    try std.testing.expect(!try recordIsNormalizedVerdictReplayCandidate(
+        std.testing.allocator,
+        context.record,
+        context.record_path,
+    ));
+
+    const normalized = try normalizeReceiptFromPathAlloc(
+        std.testing.allocator,
+        context.record_path,
+        true,
+        .{
+            .requested_identity = context.requested_identity,
+            .requested_identity_required = true,
+        },
+    );
+    defer normalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review_transport_failure", normalized.status);
+    try std.testing.expectEqualStrings("review_terminal", normalized.review_attempt_phase);
+    try std.testing.expectEqualStrings("review_transport_timeout", normalized.failure_code.?);
+    try std.testing.expectEqual(true, normalized.retryable_same_tuple_now.?);
+    try std.testing.expect(!normalized.tuple_verdict_exists);
+
+    var mismatched = context.record;
+    mismatched.review_turn_id = "other-turn";
+    try std.testing.expectError(
+        error.InvalidReviewTupleLockBinding,
+        recordTerminalOwnerFailure(
+            std.testing.allocator,
+            mismatched,
+            context.record_path,
+        ),
+    );
+}
+
+fn checkOwnerFailureReplay(context: TestTerminalReplayContext, lock: *ReviewTupleLock) !void {
+    const owner_failure = terminalReviewOwnerFailure("review_owner_failed").?;
+    lock.lastFailureCode = owner_failure.code;
+    try writeReviewTupleLock(std.testing.allocator, context.lock_path, lock.*);
+    var owner_failed_record = context.record;
+    owner_failed_record.terminal_failure_code = owner_failure.code;
+    owner_failed_record.terminal_failure_hint = "historical owner-failure copy";
+    owner_failed_record.terminal_failure_at_unix_s = 2;
+    owner_failed_record.terminal_review_result_source = "rollout_exited_review_mode";
+    owner_failed_record.terminal_review_result_json =
+        "{\"findings\":[{\"title\":\"uncommitted\",\"body\":\"body\"," ++
+        "\"confidenceScore\":0.9,\"priority\":1,\"codeLocation\":{" ++
+        "\"absoluteFilePath\":\"/tmp/file\",\"lineRange\":{" ++
+        "\"start\":1,\"end\":1}}}],\"overallCorrectness\":" ++
+        "\"patch is incorrect\",\"overallExplanation\":\"uncommitted\"," ++
+        "\"overallConfidenceScore\":0.9}";
+    try writeSessionRecord(
+        std.testing.allocator,
+        context.record_path,
+        owner_failed_record,
+    );
+    var historical_copy = try loadOwnedSessionRecordPath(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, context.record_path),
+    );
+    historical_copy.deinit(std.testing.allocator);
+    const recorded_owner_failure = (try recordTerminalOwnerFailure(
+        std.testing.allocator,
+        owner_failed_record,
+        context.record_path,
+    )).?;
+    try std.testing.expectEqualStrings("review_owner_failed", recorded_owner_failure.code);
+    const owner_failed_receipt = try normalizeReceiptFromPathAlloc(
+        std.testing.allocator,
+        context.record_path,
+        true,
+        .{
+            .requested_identity = context.requested_identity,
+            .requested_identity_required = true,
+        },
+    );
+    defer owner_failed_receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("incomplete", owner_failed_receipt.status);
+    try std.testing.expectEqualStrings(
+        "review_terminal",
+        owner_failed_receipt.review_attempt_phase,
+    );
+    try std.testing.expectEqualStrings("review_owner_failed", owner_failed_receipt.failure_code.?);
+    try std.testing.expectEqualStrings(
+        "owner_review_attempt",
+        owner_failed_receipt.failure_class.?,
+    );
+    try std.testing.expectEqual(true, owner_failed_receipt.retryable_same_tuple_now.?);
+}
+
+fn acquireReplayOwnerLease(
+    context: TestTerminalReplayContext,
+    lock: *ReviewTupleLock,
+) !?ReviewOwnerLease {
+    lock.state = "waiting";
+    lock.lastFailureCode = null;
+    lock.ownerPid = currentProcessId();
+    try writeReviewTupleLock(std.testing.allocator, context.lock_path, lock.*);
+    try std.testing.expect(!try recordHasTerminalFailureReplayCandidate(
+        std.testing.allocator,
+        context.record,
+        context.record_path,
+    ));
+    {
+        var owner_lease = (try tryAcquireReviewOwnerLeaseAlloc(
+            std.testing.allocator,
+            context.lock_path,
+        )).?;
+        defer owner_lease.deinit(std.testing.allocator);
+        try std.testing.expect(try workflowBoundRecordHasLiveOwner(
+            std.testing.allocator,
+            context.record,
+            context.record_path,
+        ));
+    }
+    var retained_owner_lease: ?ReviewOwnerLease = null;
+    errdefer if (retained_owner_lease) |*lease| lease.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        WorkflowBoundRecordOwnerState.dead,
+        try workflowBoundRecordOwnerState(
+            std.testing.allocator,
+            context.record,
+            context.record_path,
+            &retained_owner_lease,
+        ),
+    );
+
+    return retained_owner_lease;
+}
+
+fn checkTerminalizedOwnerReplay(
+    context: TestTerminalReplayContext,
+    timeout_failure: FailureInfo,
+) !LoadedSessionRecord {
+    var active_record = context.record;
+    active_record.managed_server_pid = currentProcessId();
+    active_record.last_observed_status = "inProgress";
+    active_record.terminal_failure_code = null;
+    active_record.terminal_failure_hint = null;
+    active_record.terminal_failure_at_unix_s = null;
+    try terminalizeDeadWorkflowBoundOwner(
+        std.testing.allocator,
+        context.record_path,
+        &active_record,
+        .{
+            .code = timeout_failure.code,
+            .hint = "dead-owner-specific display copy",
+        },
+    );
+    try std.testing.expect(cas_websocket.processAlive(currentProcessId()));
+    var terminalized = try loadOwnedSessionRecordPath(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, context.record_path),
+    );
+    errdefer terminalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "review_transport_timeout",
+        terminalized.record.terminal_failure_code.?,
+    );
+    try std.testing.expectEqualStrings(
+        timeout_failure.hint,
+        terminalized.record.terminal_failure_hint.?,
+    );
+
+    return terminalized;
+}
+
+fn checkRecoveredReplayEvidence(
+    context: TestTerminalReplayContext,
+    lock: *ReviewTupleLock,
+    terminalized: SessionRecord,
+) !void {
+    var recovery_record = terminalized;
+    recovery_record.last_observed_status = "inProgress";
+    recovery_record.terminal_failure_code = null;
+    recovery_record.terminal_failure_hint = null;
+    recovery_record.terminal_failure_at_unix_s = null;
+    recovery_record.terminal_review_result_source = null;
+    recovery_record.terminal_review_result_json = null;
+    try writeSessionRecord(std.testing.allocator, context.record_path, recovery_record);
+    lock.state = "waiting";
+    lock.lastFailureCode = null;
+    try writeReviewTupleLock(std.testing.allocator, context.lock_path, lock.*);
+    const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
+        std.testing.allocator,
+        context.lock_path,
+        lock.*,
+        context.requested_identity,
+    );
+    defer std.testing.allocator.free(predecessor_rer_path.?);
+    try std.Io.Dir.accessAbsolute(context.io, predecessor_rer_path.?, .{});
+    var persisted_terminal = try loadOwnedSessionRecordPath(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, context.record_path),
+    );
+    defer persisted_terminal.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "review_transport_lost",
+        persisted_terminal.record.terminal_failure_code.?,
+    );
+
+    try checkNormalizedReplayPreserved(context, lock, recovery_record);
+}
+
+fn checkNormalizedReplayPreserved(
+    context: TestTerminalReplayContext,
+    lock: *ReviewTupleLock,
+    recovery_record: SessionRecord,
+) !void {
+    lock.state = "normalized";
+    lock.lastFailureCode = null;
+    try writeReviewTupleLock(std.testing.allocator, context.lock_path, lock.*);
+    try std.testing.expect(!(try transitionActiveReviewTupleLockForRecord(
+        std.testing.allocator,
+        recovery_record,
+        context.record_path,
+        "waiting",
+        "wait_timed_out",
+    )));
+    var preserved_normalized = (try loadReviewTupleLock(
+        std.testing.allocator,
+        context.lock_path,
+    )).?;
+    defer preserved_normalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("normalized", preserved_normalized.record.state);
+    try std.testing.expect(preserved_normalized.record.lastFailureCode == null);
+}
+
+fn checkTerminalReplayLifecycle(
+    io: std.Io,
+    root: []const u8,
+    store_root: []const u8,
+    record_path: []const u8,
+    event_path: []const u8,
+) !void {
+    var record = testTimeoutReplayRecord(root, store_root, event_path);
     var tuple = try storedReviewTupleIdentityAlloc(std.testing.allocator, record);
     defer tuple.deinit(std.testing.allocator);
     const tuple_hash = try reviewTupleHashAlloc(std.testing.allocator, tuple);
@@ -17827,222 +18667,56 @@ test "terminal timeout session replays only through its exact tuple lock" {
         try std.testing.allocator.dupe(u8, record_path),
     );
     defer loaded.deinit(std.testing.allocator);
-    const failure = (try recordTerminalOwnerFailure(
-        std.testing.allocator,
-        loaded.record,
-        record_path,
-    )).?;
-    try std.testing.expectEqualStrings("review_transport_timeout", failure.code);
-    try std.testing.expect(try recordHasTerminalFailureReplayCandidate(
-        std.testing.allocator,
-        loaded.record,
-        record_path,
-    ));
-    try std.testing.expect(!try recordIsNormalizedVerdictReplayCandidate(
-        std.testing.allocator,
-        loaded.record,
-        record_path,
-    ));
-    const requested_identity = TargetIdentity{
-        .base_sha = record.base_sha,
-        .head_sha = record.head_sha,
-        .fingerprint = record.target_fingerprint.?,
+
+    const context = TestTerminalReplayContext{
+        .io = io,
+        .record = loaded.record,
+        .record_path = record_path,
+        .lock_path = lock_path,
+        .requested_identity = .{
+            .base_sha = record.base_sha,
+            .head_sha = record.head_sha,
+            .fingerprint = record.target_fingerprint.?,
+        },
     };
-    const normalized = try normalizeReceiptFromPathAlloc(
-        std.testing.allocator,
-        record_path,
-        true,
-        .{
-            .requested_identity = requested_identity,
-            .requested_identity_required = true,
-        },
-    );
-    defer normalized.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("review_transport_failure", normalized.status);
-    try std.testing.expectEqualStrings("review_terminal", normalized.review_attempt_phase);
-    try std.testing.expectEqualStrings(
-        "review_transport_timeout",
-        normalized.failure_code.?,
-    );
-    try std.testing.expectEqual(true, normalized.retryable_same_tuple_now.?);
-    try std.testing.expect(!normalized.tuple_verdict_exists);
-
-    var mismatched = loaded.record;
-    mismatched.review_turn_id = "other-turn";
-    try std.testing.expectError(
-        error.InvalidReviewTupleLockBinding,
-        recordTerminalOwnerFailure(
-            std.testing.allocator,
-            mismatched,
-            record_path,
-        ),
-    );
-
-    const owner_failure = terminalReviewOwnerFailure("review_owner_failed").?;
-    lock.lastFailureCode = owner_failure.code;
-    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
-    var owner_failed_record = loaded.record;
-    owner_failed_record.terminal_failure_code = owner_failure.code;
-    owner_failed_record.terminal_failure_hint = "historical owner-failure copy";
-    owner_failed_record.terminal_failure_at_unix_s = 2;
-    owner_failed_record.terminal_review_result_source = "rollout_exited_review_mode";
-    owner_failed_record.terminal_review_result_json =
-        "{\"findings\":[{\"title\":\"uncommitted\",\"body\":\"body\"," ++
-        "\"confidenceScore\":0.9,\"priority\":1,\"codeLocation\":{" ++
-        "\"absoluteFilePath\":\"/tmp/file\",\"lineRange\":{" ++
-        "\"start\":1,\"end\":1}}}],\"overallCorrectness\":" ++
-        "\"patch is incorrect\",\"overallExplanation\":\"uncommitted\"," ++
-        "\"overallConfidenceScore\":0.9}";
-    try writeSessionRecord(
-        std.testing.allocator,
-        record_path,
-        owner_failed_record,
-    );
-    var historical_copy = try loadOwnedSessionRecordPath(
-        std.testing.allocator,
-        try std.testing.allocator.dupe(u8, record_path),
-    );
-    historical_copy.deinit(std.testing.allocator);
-    const recorded_owner_failure = (try recordTerminalOwnerFailure(
-        std.testing.allocator,
-        owner_failed_record,
-        record_path,
-    )).?;
-    try std.testing.expectEqualStrings("review_owner_failed", recorded_owner_failure.code);
-    const owner_failed_receipt = try normalizeReceiptFromPathAlloc(
-        std.testing.allocator,
-        record_path,
-        true,
-        .{
-            .requested_identity = requested_identity,
-            .requested_identity_required = true,
-        },
-    );
-    defer owner_failed_receipt.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("incomplete", owner_failed_receipt.status);
-    try std.testing.expectEqualStrings(
-        "review_terminal",
-        owner_failed_receipt.review_attempt_phase,
-    );
-    try std.testing.expectEqualStrings(
-        "review_owner_failed",
-        owner_failed_receipt.failure_code.?,
-    );
-    try std.testing.expectEqualStrings(
-        "owner_review_attempt",
-        owner_failed_receipt.failure_class.?,
-    );
-    try std.testing.expectEqual(true, owner_failed_receipt.retryable_same_tuple_now.?);
-
-    lock.state = "waiting";
-    lock.lastFailureCode = null;
-    lock.ownerPid = currentProcessId();
-    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
-    try std.testing.expect(!try recordHasTerminalFailureReplayCandidate(
-        std.testing.allocator,
-        loaded.record,
-        record_path,
-    ));
-    {
-        var owner_lease = (try tryAcquireReviewOwnerLeaseAlloc(
-            std.testing.allocator,
-            lock_path,
-        )).?;
-        defer owner_lease.deinit(std.testing.allocator);
-        try std.testing.expect(try workflowBoundRecordHasLiveOwner(
-            std.testing.allocator,
-            loaded.record,
-            record_path,
-        ));
-    }
-    var retained_owner_lease: ?ReviewOwnerLease = null;
-    defer if (retained_owner_lease) |*lease| lease.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        WorkflowBoundRecordOwnerState.dead,
-        try workflowBoundRecordOwnerState(
-            std.testing.allocator,
-            loaded.record,
-            record_path,
-            &retained_owner_lease,
-        ),
-    );
-
-    var active_record = loaded.record;
-    active_record.managed_server_pid = currentProcessId();
-    active_record.last_observed_status = "inProgress";
-    active_record.terminal_failure_code = null;
-    active_record.terminal_failure_hint = null;
-    active_record.terminal_failure_at_unix_s = null;
-    try terminalizeDeadWorkflowBoundOwner(
-        std.testing.allocator,
-        record_path,
-        &active_record,
-        .{
-            .code = timeout_failure.code,
-            .hint = "dead-owner-specific display copy",
-        },
-    );
-    try std.testing.expect(cas_websocket.processAlive(currentProcessId()));
-    var terminalized = try loadOwnedSessionRecordPath(
-        std.testing.allocator,
-        try std.testing.allocator.dupe(u8, record_path),
-    );
+    try checkTimeoutReplay(context);
+    try checkOwnerFailureReplay(context, &lock);
+    var lease = try acquireReplayOwnerLease(context, &lock);
+    defer if (lease) |*value| value.deinit(std.testing.allocator);
+    var terminalized = try checkTerminalizedOwnerReplay(context, timeout_failure);
     defer terminalized.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "review_transport_timeout",
-        terminalized.record.terminal_failure_code.?,
-    );
-    try std.testing.expectEqualStrings(
-        timeout_failure.hint,
-        terminalized.record.terminal_failure_hint.?,
-    );
+    try checkRecoveredReplayEvidence(context, &lock, terminalized.record);
+}
 
-    var recovery_record = terminalized.record;
-    recovery_record.last_observed_status = "inProgress";
-    recovery_record.terminal_failure_code = null;
-    recovery_record.terminal_failure_hint = null;
-    recovery_record.terminal_failure_at_unix_s = null;
-    recovery_record.terminal_review_result_source = null;
-    recovery_record.terminal_review_result_json = null;
-    try writeSessionRecord(std.testing.allocator, record_path, recovery_record);
-    lock.state = "waiting";
-    lock.lastFailureCode = null;
-    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
-    const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
+test "terminal timeout session replays only through its exact tuple lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store_root = try std.fs.path.join(
         std.testing.allocator,
-        lock_path,
-        lock,
-        requested_identity,
+        &.{ root, ".ledger", "cas" },
     );
-    defer std.testing.allocator.free(predecessor_rer_path.?);
-    try std.Io.Dir.accessAbsolute(io, predecessor_rer_path.?, .{});
-    var persisted_terminal = try loadOwnedSessionRecordPath(
+    defer std.testing.allocator.free(store_root);
+    const old_store_root = configured_store_root_override;
+    configured_store_root_override = store_root;
+    defer configured_store_root_override = old_store_root;
+    const session_dir = try sessionDirAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(session_dir);
+    const record_path = try std.fmt.allocPrint(
         std.testing.allocator,
-        try std.testing.allocator.dupe(u8, record_path),
+        "{s}/thr.json",
+        .{session_dir},
     );
-    defer persisted_terminal.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "review_transport_lost",
-        persisted_terminal.record.terminal_failure_code.?,
+    defer std.testing.allocator.free(record_path);
+    const event_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/thr.events.ndjson",
+        .{session_dir},
     );
-
-    lock.state = "normalized";
-    lock.lastFailureCode = null;
-    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
-    try std.testing.expect(!(try transitionActiveReviewTupleLockForRecord(
-        std.testing.allocator,
-        recovery_record,
-        record_path,
-        "waiting",
-        "wait_timed_out",
-    )));
-    var preserved_normalized = (try loadReviewTupleLock(
-        std.testing.allocator,
-        lock_path,
-    )).?;
-    defer preserved_normalized.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("normalized", preserved_normalized.record.state);
-    try std.testing.expect(preserved_normalized.record.lastFailureCode == null);
+    defer std.testing.allocator.free(event_path);
+    try checkTerminalReplayLifecycle(io, root, store_root, record_path, event_path);
 }
 
 test "terminal owner receipt survives persistence failure" {
@@ -18106,20 +18780,34 @@ test "review tuple lock load reports malformed lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(tmp_root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
 
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "lock.json", .data = "{\"lockVersion\":\"wrong\"" });
-    try std.testing.expectError(error.UnexpectedEndOfInput, loadReviewTupleLock(std.testing.allocator, path));
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "lock.json", .data = "{\"lockVersion\":\"wrong\"" },
+    );
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        loadReviewTupleLock(std.testing.allocator, path),
+    );
 }
 
 test "review tuple lock exclusive write rejects duplicate first claim" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(tmp_root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
@@ -18141,60 +18829,18 @@ test "review tuple lock exclusive write rejects duplicate first claim" {
         .ownerPid = 4,
     };
     try writeReviewTupleLockExclusive(std.testing.allocator, path, lock);
-    try std.testing.expectError(error.PathAlreadyExists, writeReviewTupleLockExclusive(std.testing.allocator, path, lock));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        writeReviewTupleLockExclusive(std.testing.allocator, path, lock),
+    );
 }
 
-test "terminal clean receipt preserves transport lock" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const allocator = std.testing.allocator;
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
-    const old_store_root = configured_store_root_override;
-    const old_store_cwd = configured_store_cwd;
-    const old_codex_thread_id = configured_codex_thread_id;
-    configured_store_root_override = tmp_root;
-    configured_store_cwd = tmp_root;
-    configured_codex_thread_id = "thread-clean";
-    defer {
-        configured_store_root_override = old_store_root;
-        configured_store_cwd = old_store_cwd;
-        configured_codex_thread_id = old_codex_thread_id;
-        allocator.free(tmp_root);
-    }
-
-    const record_path = try std.fmt.allocPrint(allocator, "{s}/review_sessions/thr_clean.json", .{tmp_root});
-    defer allocator.free(record_path);
-    const event_path = try std.fmt.allocPrint(allocator, "{s}/review_sessions/thr_clean.events.ndjson", .{tmp_root});
-    defer allocator.free(event_path);
-    const clean_result = "{\"findings\":[],\"overallCorrectness\":\"patch is correct\",\"overallExplanation\":\"clean\",\"overallConfidenceScore\":1}";
-    const record = SessionRecord{
-        .cwd = "/repo",
-        .store_root = tmp_root,
-        .store_scope = "repo-local",
-        .repo_root = "/repo",
-        .codex_thread_id = "thread-clean",
-        .parent_thread_id = "parent",
-        .review_thread_id = "thr_clean",
-        .review_turn_id = "turn_clean",
-        .delivery = "detached",
-        .target = .{ .type = "baseBranch", .branch = "main" },
-        .event_log_path = event_path,
-        .created_at_unix_s = 1,
-        .last_observed_status = "completed",
-        .codex_version = "codex 0.1.0",
-        .resolved_codex_path = "/bin/codex",
-        .compatibility_verdict = "compatible",
-        .transport_kind = "websocket",
-        .terminal_review_result_source = "rollout_exited_review_mode",
-        .terminal_review_result_json = clean_result,
-        .base_sha = "base",
-        .head_sha = "head",
-        .target_fingerprint = "fp",
-        .accountFingerprint = "acct:test",
-        .accountFingerprintReducedProtection = false,
-    };
-    try writeSessionRecord(allocator, record_path, record);
-
+fn checkCleanTransportLockUpdate(
+    allocator: std.mem.Allocator,
+    tmp_root: []const u8,
+    record_path: []const u8,
+    event_path: []const u8,
+) !void {
     const tuple = ReviewTupleIdentity{
         .repo_realpath = "/repo",
         .base_sha = "base",
@@ -18241,11 +18887,86 @@ test "terminal clean receipt preserves transport lock" {
     try std.testing.expectEqualStrings(record_path, updated.record.recordPath.?);
 }
 
+fn testCleanTransportRecord(tmp_root: []const u8, event_path: []const u8) SessionRecord {
+    const clean_result = "{\"findings\":[],\"overallCorrectness\":\"patch is correct\"," ++
+        "\"overallExplanation\":\"clean\",\"overallConfidenceScore\":1}";
+    return .{
+        .cwd = "/repo",
+        .store_root = tmp_root,
+        .store_scope = "repo-local",
+        .repo_root = "/repo",
+        .codex_thread_id = "thread-clean",
+        .parent_thread_id = "parent",
+        .review_thread_id = "thr_clean",
+        .review_turn_id = "turn_clean",
+        .delivery = "detached",
+        .target = .{ .type = "baseBranch", .branch = "main" },
+        .event_log_path = event_path,
+        .created_at_unix_s = 1,
+        .last_observed_status = "completed",
+        .codex_version = "codex 0.1.0",
+        .resolved_codex_path = "/bin/codex",
+        .compatibility_verdict = "compatible",
+        .transport_kind = "websocket",
+        .terminal_review_result_source = "rollout_exited_review_mode",
+        .terminal_review_result_json = clean_result,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .accountFingerprint = "acct:test",
+        .accountFingerprintReducedProtection = false,
+    };
+}
+
+test "terminal clean receipt preserves transport lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        allocator,
+    );
+    const old_store_root = configured_store_root_override;
+    const old_store_cwd = configured_store_cwd;
+    const old_codex_thread_id = configured_codex_thread_id;
+    configured_store_root_override = tmp_root;
+    configured_store_cwd = tmp_root;
+    configured_codex_thread_id = "thread-clean";
+    defer {
+        configured_store_root_override = old_store_root;
+        configured_store_cwd = old_store_cwd;
+        configured_codex_thread_id = old_codex_thread_id;
+        allocator.free(tmp_root);
+    }
+
+    const record_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/review_sessions/thr_clean.json",
+        .{tmp_root},
+    );
+    defer allocator.free(record_path);
+    const event_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/review_sessions/thr_clean.events.ndjson",
+        .{tmp_root},
+    );
+    defer allocator.free(event_path);
+    const record = testCleanTransportRecord(tmp_root, event_path);
+    try writeSessionRecord(allocator, record_path, record);
+
+    try checkCleanTransportLockUpdate(allocator, tmp_root, record_path, event_path);
+}
+
 test "review tuple lock rewrite lease is exclusive and kernel released" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(tmp_root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
@@ -18281,7 +19002,11 @@ test "review tuple lock rewrite lease ignores orphaned sidecar content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(tmp_root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
@@ -18345,6 +19070,11 @@ test "review runtime gate requires live managed structured-review preflight" {
     const valid =
         \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v2","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        checkReviewRuntimeGateAllocation,
+        .{valid},
+    );
     var gate = try parseReviewRuntimeGateAlloc(allocator, valid);
     defer gate.deinit(allocator);
     try std.testing.expectEqualStrings("/tmp/codex", gate.resolved_path);

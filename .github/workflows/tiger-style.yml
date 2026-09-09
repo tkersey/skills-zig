@@ -30,23 +30,12 @@ jobs:
         run: zig test tools/tiger_style/main.zig
       - name: Audit repository mappings
         run: zig run tools/tiger_style/main.zig -- audit-repository
-      - name: Check formatting of changed Zig files
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      - name: Check formatting of all tracked Zig files
         run: |
           set -euo pipefail
-          while IFS= read -r -d '' changed_file; do
-            zig fmt --check "$changed_file"
-          done < <(
-            git diff --name-only -z --diff-filter=ACMR \
-              "$BASE_SHA" "$HEAD_SHA" -- '*.zig'
-          )
-      - name: Audit changed Zig code
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          git ls-files -z '*.zig' | xargs -0 zig fmt --check
+      - name: Audit all tracked Zig code
         run: |
-          zig run tools/tiger_style/main.zig -- audit-diff \
-            --base "$BASE_SHA" \
-            --head "$HEAD_SHA"
+          set -euo pipefail
+          git ls-files -z '*.zig' |
+            xargs -0 zig run tools/tiger_style/main.zig -- audit-files

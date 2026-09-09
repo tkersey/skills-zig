@@ -14,6 +14,52 @@ const DriverSourceIdentity = struct {
     locator: []const u8,
     sha256: []const u8,
 };
+const DriverKind = enum { seq_replay, optimization };
+const optimization_driver_source = @embedFile("optimization_driver.zig");
+const optimization_build_source = @embedFile("optimization_build.zig");
+const optimization_driver_sha256 = comptimeDigest(optimization_driver_source);
+const optimization_build_sha256 = comptimeDigest(optimization_build_source);
+const optimization_source_tree_sha256 = optimizationSourceTreeDigest();
+const active_optimization_driver_v1 = DriverSourceIdentity{
+    .revision = &optimization_driver_sha256,
+    .tree = &optimization_source_tree_sha256,
+    .locator = "tools/optimization_driver.zig",
+    .sha256 = &optimization_driver_sha256,
+};
+
+fn comptimeDigest(comptime source: []const u8) [64]u8 {
+    @setEvalBranchQuota(4_000_000);
+    return evidenceDigest(source);
+}
+
+fn optimizationSourceTreeDigest() [64]u8 {
+    @setEvalBranchQuota(4_000_000);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("performance-optimization-source/v1\x00");
+    hasher.update(&optimization_driver_sha256);
+    hasher.update("\x00");
+    hasher.update(&optimization_build_sha256);
+    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+}
+
+fn driverIdentity(kind: DriverKind) DriverSourceIdentity {
+    return switch (kind) {
+        .seq_replay => active_seq_replay_driver_v1,
+        .optimization => active_optimization_driver_v1,
+    };
+}
+
+fn driverSourceBytes(kind: DriverKind) []const u8 {
+    return switch (kind) {
+        .seq_replay => sealed_seq_replay_driver_source,
+        .optimization => optimization_driver_source,
+    };
+}
+
+fn driverKindForCase(descriptor: perf_contract.CaseDescriptor) DriverKind {
+    return if (std.mem.eql(u8, descriptor.family, "optimization")) .optimization else .seq_replay;
+}
+
 const driver_overlay_path = "tools/perf_hub.zig";
 const legacy_generic_driver_v1 = DriverSourceIdentity{
     .revision = "ddf201901391ea625e4ac9b0c9649570bc56e58f",
@@ -376,6 +422,7 @@ const CompatCase = struct {
 };
 
 const DeepSetup = enum {
+    optimization,
     seq_observe,
     cas_automation_show,
     cas_automation_create,
@@ -388,6 +435,8 @@ const DeepSetup = enum {
 };
 
 const DeepCase = struct {
+    driver_kind: DriverKind = .seq_replay,
+    primary_optimization: bool = false,
     descriptor: perf_contract.CaseDescriptor,
     setup: DeepSetup,
     tolerance_pct: f64 = 20.0,
@@ -627,21 +676,102 @@ const CasAutomationCases = [_]perf_contract.CaseDescriptor{
 const CasAutomationCoverages = buildCasAutomationCoverages();
 
 const MiscCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "bench-stats-help", .binary = "bench_stats", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "bench-stats-parse", .binary = "bench_stats", .family = "parse", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "perf-report-help", .binary = "perf_report", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "perf-report-render", .binary = "perf_report", .family = "render", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "lift-bench-stats-driver", .binary = "bench_stats", .family = "driver", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
-    .{ .case_id = "cas-wrapper-smoke", .binary = "cas", .family = "wrapper", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-smoke-check-help", .binary = "cas_smoke_check", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-instance-runner-help", .binary = "cas_instance_runner", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-review-session-help", .binary = "cas_review_session", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-review-session-version", .binary = "cas_review_session", .family = "version", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cas-budget-governor-driver", .binary = "cas", .family = "driver", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
+    .{
+        .case_id = "bench-stats-help",
+        .binary = "bench_stats",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "bench-stats-parse",
+        .binary = "bench_stats",
+        .family = "parse",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "perf-report-help",
+        .binary = "perf_report",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "perf-report-render",
+        .binary = "perf_report",
+        .family = "render",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "lift-bench-stats-driver",
+        .binary = "bench_stats",
+        .family = "driver",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-wrapper-smoke",
+        .binary = "cas",
+        .family = "wrapper",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-smoke-check-help",
+        .binary = "cas_smoke_check",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-instance-runner-help",
+        .binary = "cas_instance_runner",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-review-session-help",
+        .binary = "cas_review_session",
+        .family = "help",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-review-session-version",
+        .binary = "cas_review_session",
+        .family = "version",
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+        .compat_case = true,
+    },
+    .{
+        .case_id = "cas-budget-governor-driver",
+        .binary = "cas",
+        .family = "driver",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+        .compat_case = true,
+    },
 };
 
 const MiscCoverages = [_]perf_contract.CommandCoverage{
-    .{ .family = "utilities", .coverage = .shallow, .reason = "current utility matrix" },
+    .{
+        .family = "utilities",
+        .coverage = .shallow,
+        .reason = "current utility matrix",
+    },
 };
 
 const CompatCases = [_]CompatCase{
@@ -686,17 +816,94 @@ const CompatCases = [_]CompatCase{
         "zig-out/bin/ledger",
         .ledger_doctor,
     ),
-    .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[3], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_render, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[4], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/lift-perf-bench-stats", .setup = .lift_bench_stats_driver, .tolerance_pct = 150.0 },
-    .{ .descriptor = MiscCases[5], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_wrapper_smoke, .tolerance_pct = 120.0 },
-    .{ .descriptor = MiscCases[6], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_smoke_check", .setup = .cas_smoke_check_help, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[7], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_instance_runner", .setup = .cas_instance_runner_help, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_help, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_version, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
+    .{
+        .descriptor = MiscCases[0],
+        .builder = .root,
+        .build_step = "build-lift",
+        .binary_path = "zig-out/bin/bench_stats",
+        .setup = .bench_stats_help,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = MiscCases[1],
+        .builder = .root,
+        .build_step = "build-lift",
+        .binary_path = "zig-out/bin/bench_stats",
+        .setup = .bench_stats_parse,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = MiscCases[2],
+        .builder = .root,
+        .build_step = "build-lift",
+        .binary_path = "zig-out/bin/perf_report",
+        .setup = .perf_report_help,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = MiscCases[3],
+        .builder = .root,
+        .build_step = "build-lift",
+        .binary_path = "zig-out/bin/perf_report",
+        .setup = .perf_report_render,
+        .tolerance_pct = 25.0,
+    },
+    .{
+        .descriptor = MiscCases[4],
+        .builder = .root,
+        .build_step = "build-lift",
+        .binary_path = "zig-out/bin/lift-perf-bench-stats",
+        .setup = .lift_bench_stats_driver,
+        .tolerance_pct = 150.0,
+    },
+    .{
+        .descriptor = MiscCases[5],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas",
+        .setup = .cas_wrapper_smoke,
+        .tolerance_pct = 120.0,
+    },
+    .{
+        .descriptor = MiscCases[6],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas_smoke_check",
+        .setup = .cas_smoke_check_help,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = MiscCases[7],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas_instance_runner",
+        .setup = .cas_instance_runner_help,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = MiscCases[8],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas_review_session",
+        .setup = .cas_review_session_help,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = MiscCases[9],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas_review_session",
+        .setup = .cas_review_session_version,
+        .tolerance_pct = 100.0,
+    },
+    .{
+        .descriptor = MiscCases[10],
+        .builder = .root,
+        .build_step = "build-cas",
+        .binary_path = "zig-out/bin/cas-perf-budget-governor",
+        .setup = .cas_budget_governor_driver,
+        .tolerance_pct = 45.0,
+    },
     .{
         .descriptor = CasAutomationCases[0],
         .builder = .root,
@@ -724,7 +931,11 @@ const DeepCases = [_]DeepCase{
         .samples = 30,
         .batch_iterations = 8,
     },
-    .{ .descriptor = CasAutomationCases[2], .setup = .cas_automation_show, .tolerance_pct = 200.0 },
+    .{
+        .descriptor = CasAutomationCases[2],
+        .setup = .cas_automation_show,
+        .tolerance_pct = 200.0,
+    },
     .{
         .descriptor = CasAutomationCases[3],
         .setup = .cas_automation_create,
@@ -760,7 +971,57 @@ const DeepCases = [_]DeepCase{
         .setup = .cas_automation_run_due,
         .tolerance_pct = 125.0,
     },
+} ++ OptimizationDeepCases;
+
+const OptimizationCases = [_]perf_contract.CaseDescriptor{
+    optimizationCase("ledger-topk-16384-k100", "ledger"),
+    optimizationCase("ledger-topk-16384-k1", "ledger"),
+    optimizationCase("ledger-topk-16384-k10", "ledger"),
+    optimizationCase("ledger-topk-16384-k1000", "ledger"),
+    optimizationCase("ledger-topk-32-k10", "ledger"),
+    optimizationCase("trace-full-1024", "seq"),
+    optimizationCase("trace-full-8", "seq"),
+    optimizationCase("trace-summary-1024", "seq"),
+    optimizationCase("trace-summary-8", "seq"),
 };
+const OptimizationDeepCases = optimizationDeepCases();
+const OptimizationCoverages = [_]perf_contract.CommandCoverage{.{
+    .family = "optimization",
+    .coverage = .deep,
+    .reason = "bounded top-K and full/summary trace workloads",
+}};
+
+fn optimizationCase(id: []const u8, binary: []const u8) perf_contract.CaseDescriptor {
+    return .{
+        .case_id = id,
+        .binary = binary,
+        .family = "optimization",
+        .case_kind = .driver,
+        .measurement_mode = .latency_alloc,
+    };
+}
+
+fn optimizationDeepCases() [OptimizationCases.len]DeepCase {
+    var result: [OptimizationCases.len]DeepCase = undefined;
+    for (OptimizationCases, 0..) |descriptor, index| result[index] = .{
+        .descriptor = descriptor,
+        .driver_kind = .optimization,
+        .primary_optimization = index == 0 or index == 5,
+        .setup = .optimization,
+        .tolerance_pct = 3.0,
+        .warmups = 3,
+        .samples = 30,
+        .batch_iterations = 1,
+    };
+    return result;
+}
+
+fn deepCaseForId(id: []const u8) ?DeepCase {
+    for (DeepCases) |case| {
+        if (std.mem.eql(u8, case.descriptor.case_id, id)) return case;
+    }
+    return null;
+}
 
 const CasAutomationCoverageArray =
     [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage;
@@ -781,10 +1042,20 @@ fn buildCasAutomationCoverages() CasAutomationCoverageArray {
 
 fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
-        .{ .binary = "seq", .coverages = &SeqCoverages, .datasets = &SeqDatasets, .cases = &SeqCases },
+        .{
+            .binary = "seq",
+            .coverages = &SeqCoverages,
+            .datasets = &SeqDatasets,
+            .cases = &SeqCases,
+        },
         .{ .binary = "ledger", .coverages = &LedgerCoverages, .cases = &LedgerCases },
         .{ .binary = "cas", .coverages = &CasAutomationCoverages, .cases = &CasAutomationCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
+        .{
+            .binary = "optimization",
+            .coverages = &OptimizationCoverages,
+            .cases = &OptimizationCases,
+        },
     };
 }
 
@@ -847,10 +1118,13 @@ fn parseCommand(raw: []const u8) ?Command {
 }
 
 fn cmdList(target: ?[]const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     for (CompatCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
         const case_desc = case_cfg.descriptor;
         try stdout.print("{s}\t{s}\t{s}\n", .{
             case_desc.case_id,
@@ -859,7 +1133,7 @@ fn cmdList(target: ?[]const u8) !void {
         });
     }
     for (DeepCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
         try stdout.print("{s}\t{s}\t{s}\n", .{
             case_cfg.descriptor.case_id,
             case_cfg.descriptor.binary,
@@ -869,13 +1143,19 @@ fn cmdList(target: ?[]const u8) !void {
 }
 
 fn cmdManifest(allocator: std.mem.Allocator) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     try perf_contract.writeManifestJson(allocator, &stdout_writer.interface, allManifests());
     try stdout_writer.interface.flush();
 }
 
 fn cmdAudit() !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     for (allManifests()) |manifest| {
         for (manifest.coverages) |coverage| {
@@ -919,10 +1199,7 @@ const CompilerEvidence = struct {
     file: SealedFile,
     version: []u8,
 
-    fn clone(
-        self: CompilerEvidence,
-        allocator: std.mem.Allocator,
-    ) !CompilerEvidence {
+    fn clone(self: CompilerEvidence, allocator: std.mem.Allocator) !CompilerEvidence {
         const approved_path = try allocator.dupeZ(u8, self.approved_path);
         errdefer allocator.free(approved_path);
         var file = try self.file.clone(allocator);
@@ -944,6 +1221,8 @@ const CompilerEvidence = struct {
 };
 
 const BuiltSource = struct {
+    driver_kind: DriverKind = .seq_replay,
+    driver_build_source_file: ?SealedFile = null,
     seq: SealedFile,
     ledger: SealedFile,
     perf_hub: SealedFile,
@@ -970,6 +1249,7 @@ const BuiltSource = struct {
         self.source_archive.deinit(allocator);
         allocator.free(self.driver_source_tree_sha);
         self.driver_source_file.deinit(allocator);
+        if (self.driver_build_source_file) |*file| file.deinit(allocator);
         self.compiler.deinit(allocator);
         self.* = undefined;
     }
@@ -1040,28 +1320,28 @@ fn cmdDoctor(allocator: std.mem.Allocator, target: ?[]const u8) !void {
 
     var count: usize = 0;
     for (CompatCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
         count += 1;
         const binary_path = resolveBinaryPath(allocator, case_cfg) catch return error.InvalidData;
         allocator.free(binary_path);
     }
     for (DeepCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
         count += 1;
     }
     if (count == 0) return error.NoMatchingPerfCases;
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     try stdout.print("machine_id={s}\n", .{machine_name});
     try stdout.print("cases={d}\n", .{count});
     try stdout.print("machine_dir={s}\n", .{current_dir});
 }
 
-fn invalidateCurrentCapsule(
-    allocator: std.mem.Allocator,
-    machine_dir: []const u8,
-) !void {
+fn invalidateCurrentCapsule(allocator: std.mem.Allocator, machine_dir: []const u8) !void {
     const reports_dir = try std.fs.path.join(
         allocator,
         &.{ machine_dir, "reports" },
@@ -1096,46 +1376,29 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
         for (rows.items) |*row| row.deinit(allocator);
         rows.deinit(allocator);
     }
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     var any_fail = false;
 
     for (CompatCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
-        const result = try compareCompatCase(
-            allocator,
-            machine_dir,
-            case_cfg,
-            &built,
-        );
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
+        const result = try compareCompatCase(allocator, machine_dir, case_cfg, &built);
         try rows.append(allocator, result);
         try stdout.print("{s}\t{s}\t{s}\n", .{ result.status, result.case_id, result.detail });
         if (comparisonStatusFailed(result.status)) any_fail = true;
     }
     for (DeepCases) |case_cfg| {
-        if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
-        const result = try compareDeepCase(
-            allocator,
-            machine_dir,
-            case_cfg,
-            &built,
-        );
+        if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
+        const result = try compareDeepCase(allocator, machine_dir, case_cfg, &built);
         try rows.append(allocator, result);
         try stdout.print("{s}\t{s}\t{s}\n", .{ result.status, result.case_id, result.detail });
         if (comparisonStatusFailed(result.status)) any_fail = true;
     }
-    if (!comparisonSummaryComplete(
-        target,
-        expected_rows,
-        rows.items,
-    )) any_fail = true;
-    try writeCompareSummaryRows(
-        allocator,
-        machine_dir,
-        target,
-        expected_rows,
-        rows.items,
-    );
+    if (!comparisonSummaryComplete(target, expected_rows, rows.items)) any_fail = true;
+    try writeCompareSummaryRows(allocator, machine_dir, target, expected_rows, rows.items);
     if (any_fail) std.process.exit(1);
 }
 
@@ -1173,35 +1436,17 @@ fn compareCompatCase(
     if (case_cfg.descriptor.case_kind == .driver) {
         return error.PairedBinaryRequired;
     }
-    const base_exec = try absolutePathForCwdRelative(
-        allocator,
-        base_binary,
-    );
+    const base_exec = try absolutePathForCwdRelative(allocator, base_binary);
     defer allocator.free(base_exec);
     var base_case = case_cfg;
     base_case.binary_path = base_exec;
     base_case.require_streamed_projection = false;
-    var baseline_evidence = try binaryEvidence(
-        allocator,
-        built,
-        base_case,
-    );
+    var baseline_evidence = try binaryEvidence(allocator, built, base_case);
     defer baseline_evidence.deinit(allocator);
-    var candidate_evidence = try binaryEvidence(
-        allocator,
-        built,
-        case_cfg,
-    );
+    var candidate_evidence = try binaryEvidence(allocator, built, case_cfg);
     defer candidate_evidence.deinit(allocator);
-    try requireExpectedPairedSources(
-        baseline_evidence,
-        candidate_evidence,
-    );
-    if (std.mem.eql(
-        u8,
-        &baseline_evidence.file.sha256,
-        &candidate_evidence.file.sha256,
-    )) {
+    try requireExpectedPairedSources(baseline_evidence, candidate_evidence);
+    if (std.mem.eql(u8, &baseline_evidence.file.sha256, &candidate_evidence.file.sha256)) {
         return error.ByteIdenticalPerfProducts;
     }
     if (isPreCutoverBinary(baseline_evidence.version) and
@@ -1214,19 +1459,11 @@ fn compareCompatCase(
     candidate_case.binary_path = candidate_evidence.file.path;
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
-    var paired = try runPairedMeasuredCases(
-        allocator,
-        base_case,
-        candidate_case,
-    );
+    var paired = try runPairedMeasuredCases(allocator, base_case, candidate_case);
     defer paired.deinit(allocator);
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
-    const compare = try compareMeasuredMetrics(
-        case_cfg,
-        paired.baseline,
-        paired.candidate,
-    );
+    const compare = try compareMeasuredMetrics(case_cfg, paired.baseline, paired.candidate);
     var evidence_case = case_cfg;
     evidence_case.samples = paired.candidate.samples.items.len;
     const evidence = try writePairedMetricsArtifact(
@@ -1269,43 +1506,21 @@ fn compareDeepCase(
     case_cfg: DeepCase,
     built: *BuiltState,
 ) !CompareRow {
-    if (!std.mem.eql(u8, case_cfg.descriptor.binary, "seq")) {
-        return error.PairedBinaryRequired;
-    }
-    var compat_case = rootCompat(
-        case_cfg.descriptor,
-        "build-seq",
-        "zig-out/bin/seq",
-        .seq_observe,
-    );
-    compat_case.warmups = case_cfg.warmups;
-    compat_case.samples = case_cfg.samples;
-    compat_case.tolerance_pct = case_cfg.tolerance_pct;
+    if (!std.mem.eql(u8, case_cfg.descriptor.binary, "seq") and
+        case_cfg.driver_kind != .optimization) return error.PairedBinaryRequired;
+    const compat_case = evidenceCaseConfig(case_cfg.descriptor.case_id) orelse
+        return error.InvalidPerfCase;
     const base_binary = baseBinaryOverride(compat_case) orelse
         return error.PairedBinaryRequired;
-    const base_exec = try absolutePathForCwdRelative(
-        allocator,
-        base_binary,
-    );
+    const base_exec = try absolutePathForCwdRelative(allocator, base_binary);
     defer allocator.free(base_exec);
     var base_case = compat_case;
     base_case.binary_path = base_exec;
-    var baseline_evidence = try binaryEvidence(
-        allocator,
-        built,
-        base_case,
-    );
+    var baseline_evidence = try binaryEvidence(allocator, built, base_case);
     defer baseline_evidence.deinit(allocator);
-    var candidate_evidence = try binaryEvidence(
-        allocator,
-        built,
-        compat_case,
-    );
+    var candidate_evidence = try binaryEvidence(allocator, built, compat_case);
     defer candidate_evidence.deinit(allocator);
-    try requireExpectedPairedSources(
-        baseline_evidence,
-        candidate_evidence,
-    );
+    try requireExpectedPairedSources(baseline_evidence, candidate_evidence);
     if (isPreCutoverBinary(baseline_evidence.version)) {
         return error.IncompatibleBaseSurface;
     }
@@ -1317,31 +1532,19 @@ fn compareDeepCase(
         candidate_evidence,
     );
     defer paired.deinit(allocator);
-    const driver_warmups = try std.math.mul(
-        usize,
-        case_cfg.warmups,
-        paired_comparison_rounds + 1,
-    );
-    const effective_warmups = try std.math.add(
-        usize,
-        driver_warmups,
-        case_cfg.samples,
-    );
-    const comparison_case = CompatCase{
-        .descriptor = case_cfg.descriptor,
-        .builder = .root,
-        .build_step = "build-seq",
-        .binary_path = "zig-out/bin/seq",
-        .setup = .seq_observe,
-        .warmups = effective_warmups,
-        .samples = paired.candidate.samples.items.len,
-        .tolerance_pct = case_cfg.tolerance_pct,
-    };
-    const compare = try compareBalancedDeepMetrics(
-        case_cfg,
-        paired.baseline,
-        paired.candidate,
-    );
+    return deepComparisonRow(allocator, case_cfg, baseline_evidence, candidate_evidence, paired);
+}
+
+fn deepComparisonRow(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+    paired: PairedMetrics,
+) !CompareRow {
+    const comparison_case = evidenceCaseConfig(case_cfg.descriptor.case_id) orelse
+        return error.InvalidPerfCase;
+    const compare = try compareBalancedDeepMetrics(case_cfg, paired.baseline, paired.candidate);
     const evidence = try writePairedMetricsArtifact(
         allocator,
         comparison_case,
@@ -1384,6 +1587,49 @@ fn writeCompareSummaryRows(
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const writer = &output.writer;
+    try writeComparisonCapsule(writer, target, expected_rows, rows);
+    var parsed = try std.json.parseFromSlice(
+        PerformanceCapsule,
+        allocator,
+        output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    _ = try validatePerformanceCapsule(allocator, parsed.value, false);
+    var capsule = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "capsule.json",
+        output.written(),
+        0o600,
+    );
+    defer capsule.deinit(allocator);
+    var locator_output: std.Io.Writer.Allocating = .init(allocator);
+    defer locator_output.deinit();
+    try locator_output.writer.writeAll(
+        "{\"schema\":\"performance-capsule-ref/v1\",\"capsule\":",
+    );
+    try writeSealedFile(&locator_output.writer, capsule);
+    try locator_output.writer.writeAll("}\n");
+    const locator_path = try std.fs.path.join(
+        allocator,
+        &.{ reports_dir, "current-capsule.json" },
+    );
+    defer allocator.free(locator_path);
+    try writeEvidenceFileAtomic(
+        allocator,
+        locator_path,
+        locator_output.written(),
+        0o600,
+    );
+}
+
+fn writeComparisonCapsule(
+    writer: *std.Io.Writer,
+    target: ?[]const u8,
+    expected_rows: usize,
+    rows: []const CompareRow,
+) !void {
     try writer.writeAll(
         "{\"schema\":\"performance-capsule/v1\",\"target\":",
     );
@@ -1393,26 +1639,9 @@ fn writeCompareSummaryRows(
         try writer.writeAll("null");
     }
     try writer.writeAll(",\"expected_base_sha\":");
-    const environment = process_environment;
-    if (environment) |values| {
-        if (values.get("PERF_EXPECT_BASE_SHA")) |sha| {
-            try std.json.Stringify.value(sha, .{}, writer);
-        } else {
-            try writer.writeAll("null");
-        }
-    } else {
-        try writer.writeAll("null");
-    }
+    try writeEnvironmentString(writer, "PERF_EXPECT_BASE_SHA");
     try writer.writeAll(",\"expected_candidate_sha\":");
-    if (environment) |values| {
-        if (values.get("PERF_EXPECT_CANDIDATE_SHA")) |sha| {
-            try std.json.Stringify.value(sha, .{}, writer);
-        } else {
-            try writer.writeAll("null");
-        }
-    } else {
-        try writer.writeAll("null");
-    }
+    try writeEnvironmentString(writer, "PERF_EXPECT_CANDIDATE_SHA");
     try writer.writeAll(",\"expected_rows\":");
     try writer.print("{d}", .{expected_rows});
     try writer.writeAll(",\"complete\":");
@@ -1446,44 +1675,15 @@ fn writeCompareSummaryRows(
         try writer.writeByte('}');
     }
     try writer.writeAll("]}\n");
-    var parsed = try std.json.parseFromSlice(
-        PerformanceCapsule,
-        allocator,
-        output.written(),
-        .{},
-    );
-    defer parsed.deinit();
-    _ = try validatePerformanceCapsule(
-        allocator,
-        parsed.value,
-        false,
-    );
-    var capsule = try sealEvidenceBytes(
-        allocator,
-        machine_dir,
-        "capsule.json",
-        output.written(),
-        0o600,
-    );
-    defer capsule.deinit(allocator);
-    var locator_output: std.Io.Writer.Allocating = .init(allocator);
-    defer locator_output.deinit();
-    try locator_output.writer.writeAll(
-        "{\"schema\":\"performance-capsule-ref/v1\",\"capsule\":",
-    );
-    try writeSealedFile(&locator_output.writer, capsule);
-    try locator_output.writer.writeAll("}\n");
-    const locator_path = try std.fs.path.join(
-        allocator,
-        &.{ reports_dir, "current-capsule.json" },
-    );
-    defer allocator.free(locator_path);
-    try writeEvidenceFileAtomic(
-        allocator,
-        locator_path,
-        locator_output.written(),
-        0o600,
-    );
+}
+
+fn writeEnvironmentString(writer: *std.Io.Writer, name: []const u8) !void {
+    if (process_environment) |environment| {
+        if (environment.get(name)) |value| {
+            return std.json.Stringify.value(value, .{}, writer);
+        }
+    }
+    try writer.writeAll("null");
 }
 
 fn comparisonSummaryComplete(
@@ -1495,7 +1695,8 @@ fn comparisonSummaryComplete(
     const selected = target orelse return true;
     if (!std.mem.eql(u8, selected, "seq") and
         !std.mem.eql(u8, selected, "ledger") and
-        !std.mem.eql(u8, selected, "cutover"))
+        !std.mem.eql(u8, selected, "cutover") and
+        !std.mem.eql(u8, selected, "optimization"))
     {
         return true;
     }
@@ -1522,6 +1723,7 @@ const Sqlite = struct {
 
     extern fn sqlite3_open(filename: [*:0]const u8, ppDb: *?*sqlite3) c_int;
     extern fn sqlite3_close(db: *sqlite3) c_int;
+    extern fn sqlite3_free(ptr: ?*anyopaque) void;
     extern fn sqlite3_errmsg(db: *sqlite3) [*:0]const u8;
     extern fn sqlite3_exec(
         db: *sqlite3,
@@ -1532,9 +1734,20 @@ const Sqlite = struct {
     ) c_int;
 };
 
+fn matchesDescriptorTarget(descriptor: perf_contract.CaseDescriptor, target: ?[]const u8) bool {
+    return matchesTarget(descriptor.case_id, descriptor.binary, target);
+}
+
 fn matchesTarget(case_id: []const u8, binary: []const u8, target: ?[]const u8) bool {
     const needle = target orelse return true;
+    if (std.mem.eql(u8, needle, "optimization")) {
+        const case = deepCaseForId(case_id) orelse return false;
+        return case.driver_kind == .optimization;
+    }
     if (std.mem.eql(u8, needle, "cutover")) {
+        if (deepCaseForId(case_id)) |case| {
+            if (case.driver_kind == .optimization) return false;
+        }
         return std.mem.eql(u8, binary, "seq") or
             std.mem.eql(u8, binary, "ledger");
     }
@@ -1593,17 +1806,10 @@ fn baseBinaryOverride(case_cfg: CompatCase) ?[]const u8 {
     return null;
 }
 
-fn requireExpectedPairedSources(
-    baseline: BinaryEvidence,
-    candidate: BinaryEvidence,
-) !void {
+fn requireExpectedPairedSources(baseline: BinaryEvidence, candidate: BinaryEvidence) !void {
     const environment = process_environment orelse
         return error.ExpectedSourceShaRequired;
-    try requireExpectedSourceShas(
-        environment,
-        baseline.source_sha,
-        candidate.source_sha,
-    );
+    try requireExpectedSourceShas(environment, baseline.source_sha, candidate.source_sha);
 }
 
 fn requireExpectedSourceShas(
@@ -1680,6 +1886,8 @@ const BinaryEvidence = struct {
 };
 
 const DriverEvidence = struct {
+    kind: DriverKind = .seq_replay,
+    build_source_file: ?SealedFile = null,
     file: SealedFile,
     source_sha: []const u8,
     source_tree_sha: []u8,
@@ -1693,6 +1901,7 @@ const DriverEvidence = struct {
         self.file.deinit(allocator);
         allocator.free(self.source_tree_sha);
         self.source_file.deinit(allocator);
+        if (self.build_source_file) |*file| file.deinit(allocator);
         allocator.free(self.product_source_sha);
         allocator.free(self.product_source_tree_sha);
         self.compiler.deinit(allocator);
@@ -1713,34 +1922,24 @@ fn binaryEvidence(
         allocator,
     );
     defer allocator.free(original_path);
-    const source_root = try sourceRootForBinaryAlloc(
-        allocator,
-        original_path,
-    );
+    const source_root = try sourceRootForBinaryAlloc(allocator, original_path);
     errdefer allocator.free(source_root);
     try requireCleanSourceRoot(allocator, source_root);
-    const source_sha = try sourceShaForRootAlloc(
-        allocator,
-        source_root,
-    );
+    const source_sha = try sourceShaForRootAlloc(allocator, source_root);
     errdefer allocator.free(source_sha);
-    const source_tree_sha = try sourceTreeShaForRootAlloc(
-        allocator,
-        source_root,
-    );
+    const source_tree_sha = try sourceTreeShaForRootAlloc(allocator, source_root);
     errdefer allocator.free(source_tree_sha);
     const isolated = try ensureSourceBuilt(
         allocator,
         built,
         source_root,
         source_sha,
+        driverKindForCase(case_cfg.descriptor),
     );
     if (!std.mem.eql(u8, isolated.source_tree_sha, source_tree_sha)) {
         return error.ProductSourceChanged;
     }
-    var file = try (try isolated.executable(
-        case_cfg.descriptor.binary,
-    )).clone(allocator);
+    var file = try (try isolated.executable(case_cfg.descriptor.binary)).clone(allocator);
     errdefer file.deinit(allocator);
     var source_archive = try isolated.source_archive.clone(allocator);
     errdefer source_archive.deinit(allocator);
@@ -1767,22 +1966,7 @@ fn binaryEvidence(
     if (!std.mem.eql(u8, &current_original_sha, &file.sha256)) {
         return error.ProductBinaryChanged;
     }
-    try requireCleanSourceRoot(allocator, source_root);
-    const current_source_sha = try sourceShaForRootAlloc(
-        allocator,
-        source_root,
-    );
-    defer allocator.free(current_source_sha);
-    const current_tree_sha = try sourceTreeShaForRootAlloc(
-        allocator,
-        source_root,
-    );
-    defer allocator.free(current_tree_sha);
-    if (!std.mem.eql(u8, current_source_sha, source_sha) or
-        !std.mem.eql(u8, current_tree_sha, source_tree_sha))
-    {
-        return error.ProductSourceChanged;
-    }
+    try requireSourceIdentityUnchanged(allocator, source_root, source_sha, source_tree_sha);
     return .{
         .file = file,
         .version = version,
@@ -1795,31 +1979,47 @@ fn binaryEvidence(
     };
 }
 
-fn driverEvidence(
+fn requireSourceIdentityUnchanged(
     allocator: std.mem.Allocator,
-    built: BuiltSource,
-) !DriverEvidence {
+    source_root: []const u8,
+    source_sha: []const u8,
+    source_tree_sha: []const u8,
+) !void {
+    try requireCleanSourceRoot(allocator, source_root);
+    const current_source_sha = try sourceShaForRootAlloc(allocator, source_root);
+    defer allocator.free(current_source_sha);
+    const current_tree_sha = try sourceTreeShaForRootAlloc(allocator, source_root);
+    defer allocator.free(current_tree_sha);
+    if (!std.mem.eql(u8, current_source_sha, source_sha) or
+        !std.mem.eql(u8, current_tree_sha, source_tree_sha))
+    {
+        return error.ProductSourceChanged;
+    }
+}
+
+fn driverEvidence(allocator: std.mem.Allocator, built: BuiltSource) !DriverEvidence {
     var file = try built.perf_hub.clone(allocator);
     errdefer file.deinit(allocator);
-    const source_tree_sha = try allocator.dupe(
-        u8,
-        built.driver_source_tree_sha,
-    );
+    const source_tree_sha = try allocator.dupe(u8, built.driver_source_tree_sha);
     errdefer allocator.free(source_tree_sha);
     var source_file = try built.driver_source_file.clone(allocator);
     errdefer source_file.deinit(allocator);
     const product_source_sha = try allocator.dupe(u8, built.source_sha);
     errdefer allocator.free(product_source_sha);
-    const product_source_tree_sha = try allocator.dupe(
-        u8,
-        built.source_tree_sha,
-    );
+    const product_source_tree_sha = try allocator.dupe(u8, built.source_tree_sha);
     errdefer allocator.free(product_source_tree_sha);
     var compiler = try built.compiler.clone(allocator);
     errdefer compiler.deinit(allocator);
+    var build_file = if (built.driver_build_source_file) |source_build|
+        try source_build.clone(allocator)
+    else
+        null;
+    errdefer if (build_file) |*source_build| source_build.deinit(allocator);
     return .{
         .file = file,
-        .source_sha = active_seq_replay_driver_v1.revision,
+        .kind = built.driver_kind,
+        .build_source_file = build_file,
+        .source_sha = driverIdentity(built.driver_kind).revision,
         .source_tree_sha = source_tree_sha,
         .source_file = source_file,
         .product_source_sha = product_source_sha,
@@ -1831,16 +2031,15 @@ fn driverEvidence(
 
 fn requireDriverUnchanged(driver: DriverEvidence) !void {
     verifySealedFile(driver.file) catch return error.DriverBinaryChanged;
+    try verifySealedFile(driver.source_file);
+    if (driver.build_source_file) |file| try verifySealedFile(file);
 }
 
 fn requireBinaryUnchanged(evidence: BinaryEvidence) !void {
     verifySealedFile(evidence.file) catch return error.ProductBinaryChanged;
 }
 
-fn requireCompilerDigestAtPath(
-    path: []const u8,
-    expected_digest: []const u8,
-) !void {
+fn requireCompilerDigestAtPath(path: []const u8, expected_digest: []const u8) !void {
     if (expected_digest.len != 64) return error.CompilerBinaryChanged;
     const observed = try sha256FileBounded(path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &observed, expected_digest)) {
@@ -1882,10 +2081,7 @@ fn approvedCompilerEvidence(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.CompilerVersionFailed;
-    const approved_digest = try sha256FileBounded(
-        approved_path,
-        64 * 1024 * 1024,
-    );
+    const approved_digest = try sha256FileBounded(approved_path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &approved_digest, &file.sha256)) {
         return error.CompilerBinaryChanged;
     }
@@ -1909,11 +2105,7 @@ fn sha256File(path: []const u8) ![64]u8 {
 }
 
 fn sha256FileBounded(path: []const u8, max_bytes: usize) ![64]u8 {
-    const bytes = try readRegularFileAlloc(
-        std.heap.page_allocator,
-        path,
-        max_bytes,
-    );
+    const bytes = try readRegularFileAlloc(std.heap.page_allocator, path, max_bytes);
     defer std.heap.page_allocator.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1921,11 +2113,7 @@ fn sha256FileBounded(path: []const u8, max_bytes: usize) ![64]u8 {
 }
 
 fn sha256BuildOutput(path: []const u8) ![64]u8 {
-    const bytes = try readBuildOutputAlloc(
-        std.heap.page_allocator,
-        path,
-        16 * 1024 * 1024,
-    );
+    const bytes = try readBuildOutputAlloc(std.heap.page_allocator, path, 16 * 1024 * 1024);
     defer std.heap.page_allocator.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1961,16 +2149,10 @@ fn sealEvidenceBytes(
     );
     defer allocator.free(blob_dir);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(blob_dir);
-    const blob_path = try std.fs.path.join(
-        allocator,
-        &.{ blob_dir, label },
-    );
+    const blob_path = try std.fs.path.join(allocator, &.{ blob_dir, label });
     defer allocator.free(blob_path);
     if (pathExists(blob_path)) {
-        const retained = try sha256FileBounded(
-            blob_path,
-            max_sealed_evidence_bytes,
-        );
+        const retained = try sha256FileBounded(blob_path, max_sealed_evidence_bytes);
         if (!std.mem.eql(u8, &retained, &digest)) {
             return error.PerfEvidenceDigestMismatch;
         }
@@ -2000,39 +2182,23 @@ fn sealEvidenceFile(
     if (max_bytes > max_sealed_evidence_bytes) {
         return error.InvalidPerfEvidenceFile;
     }
-    const bytes = try readStableFileAlloc(
-        allocator,
-        path,
-        max_bytes,
-        false,
-    );
+    const bytes = try readStableFileAlloc(allocator, path, max_bytes, false);
     defer allocator.free(bytes);
     return sealEvidenceBytes(allocator, machine_dir, label, bytes, mode);
 }
 
 fn verifySealedFile(file: SealedFile) !void {
-    const retained = try sha256FileBounded(
-        file.path,
-        64 * 1024 * 1024,
-    );
+    const retained = try sha256FileBounded(file.path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &retained, &file.sha256)) {
         return error.PerfEvidenceDigestMismatch;
     }
 }
 
-fn readRegularFileAlloc(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    max_bytes: usize,
-) ![]u8 {
+fn readRegularFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return readStableFileAlloc(allocator, path, max_bytes, true);
 }
 
-fn readBuildOutputAlloc(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    max_bytes: usize,
-) ![]u8 {
+fn readBuildOutputAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return readStableFileAlloc(allocator, path, max_bytes, false);
 }
 
@@ -2104,10 +2270,7 @@ fn caseConfigurationDigest(case_cfg: CompatCase) ![64]u8 {
         .{
             case_cfg.warmups,
             case_cfg.samples,
-            if (isDeepCaseId(case_cfg.descriptor.case_id))
-                DeepCases[0].batch_iterations
-            else
-                0,
+            if (deepCaseForId(case_cfg.descriptor.case_id)) |deep| deep.batch_iterations else 0,
             paired_comparison_rounds,
             case_cfg.tolerance_pct,
             resource_tolerance_pct,
@@ -2119,15 +2282,20 @@ fn caseConfigurationDigest(case_cfg: CompatCase) ![64]u8 {
         hasher.update(&.{0});
         hasher.update(deep_comparison_method);
     }
+    if (deepCaseForId(case_cfg.descriptor.case_id)) |deep| {
+        if (deep.driver_kind == .optimization) {
+            hasher.update("optimization-native/v1\x00");
+            hasher.update(if (deep.primary_optimization) "primary-p50-0.80" else "p50-1.03");
+            hasher.update("\x00p95-1.03\x00allocations-1.00\x00rss-1.02");
+            hasher.update("\x00target-aarch64-macos\x00cpu-baseline");
+        }
+    }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn sourceRootForBinaryAlloc(
-    allocator: std.mem.Allocator,
-    binary_path: []const u8,
-) ![]u8 {
+fn sourceRootForBinaryAlloc(allocator: std.mem.Allocator, binary_path: []const u8) ![]u8 {
     var cursor = std.fs.path.dirname(binary_path) orelse
         return error.BinarySourceUnavailable;
     for (0..16) |_| {
@@ -2147,10 +2315,7 @@ fn sourceRootForBinaryAlloc(
     return error.BinarySourceUnavailable;
 }
 
-fn requireCleanSourceRoot(
-    allocator: std.mem.Allocator,
-    source_root: []const u8,
-) !void {
+fn requireCleanSourceRoot(allocator: std.mem.Allocator, source_root: []const u8) !void {
     const result = try runChildCaptureOutput(
         allocator,
         ".",
@@ -2171,10 +2336,7 @@ fn requireCleanSourceRoot(
     }
 }
 
-fn sourceShaForRootAlloc(
-    allocator: std.mem.Allocator,
-    source_root: []const u8,
-) ![]u8 {
+fn sourceShaForRootAlloc(allocator: std.mem.Allocator, source_root: []const u8) ![]u8 {
     const result = try runChildCaptureOutput(
         allocator,
         ".",
@@ -2199,12 +2361,7 @@ fn observedWorkloadDigest(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(@tagName(case_cfg.setup));
     hasher.update(&.{0});
-    try hashObservedCommand(
-        allocator,
-        case_cfg,
-        temp_root,
-        &hasher,
-    );
+    try hashObservedCommand(allocator, case_cfg, temp_root, &hasher);
     var root = try std.Io.Dir.openDirAbsolute(
         std.Io.Threaded.global_single_threaded.io(),
         temp_root,
@@ -2242,7 +2399,6 @@ fn observedWorkloadDigest(
         }.lessThan,
     );
     var total_bytes: usize = 0;
-    var buffer: [64 * 1024]u8 = undefined;
     for (paths.items) |path| {
         hasher.update(if (isObservedBindingPath(path))
             "ledger-repo/.ledger/.bindings/<definition>.jsonl"
@@ -2250,43 +2406,48 @@ fn observedWorkloadDigest(
             path);
         hasher.update(&.{0});
         if (isObservedBindingPath(path)) {
-            try hashObservedBinding(
-                allocator,
-                &root,
-                path,
-                &hasher,
-            );
+            try hashObservedBinding(allocator, &root, path, &hasher);
             hasher.update(&.{0xff});
             continue;
         }
-        var file = try root.openFile(
-            std.Io.Threaded.global_single_threaded.io(),
-            path,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        );
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        var reader = file.reader(
-            std.Io.Threaded.global_single_threaded.io(),
-            &.{},
-        );
-        while (true) { // tiger: event-loop -- bounded by observed bytes.
-            const count = try reader.interface.readSliceShort(&buffer);
-            if (count == 0) break;
-            total_bytes = std.math.add(
-                usize,
-                total_bytes,
-                count,
-            ) catch return error.PerfWorkloadTooLarge;
-            if (total_bytes > 128 * 1024 * 1024) {
-                return error.PerfWorkloadTooLarge;
-            }
-            hasher.update(buffer[0..count]);
-        }
+        try hashObservedFile(&root, path, &hasher, &total_bytes);
         hasher.update(&.{0xff});
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn hashObservedFile(
+    root: *std.Io.Dir,
+    path: []const u8,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    total_bytes: *usize,
+) !void {
+    var buffer: [64 * 1024]u8 = undefined;
+    var file = try root.openFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .allow_directory = false, .follow_symlinks = false },
+    );
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    while (total_bytes.* <= 128 * 1024 * 1024) {
+        const count = try reader.interface.readSliceShort(&buffer);
+        if (count == 0) break;
+        total_bytes.* = std.math.add(
+            usize,
+            total_bytes.*,
+            count,
+        ) catch return error.PerfWorkloadTooLarge;
+        if (total_bytes.* > 128 * 1024 * 1024) {
+            return error.PerfWorkloadTooLarge;
+        }
+        hasher.update(buffer[0..count]);
+    }
 }
 
 fn hashObservedCommand(
@@ -2356,10 +2517,7 @@ fn hashObservedExternalArgument(
     hasher.update(&.{0xff});
 }
 
-fn observedWorkloadPath(
-    setup: CompatSetup,
-    path: []const u8,
-) bool {
+fn observedWorkloadPath(setup: CompatSetup, path: []const u8) bool {
     return switch (setup) {
         .seq_sessions, .seq_query => std.mem.startsWith(
             u8,
@@ -2413,11 +2571,7 @@ fn hashObservedBinding(
         if (payload.len == 0) continue;
         records += 1;
         if (records > 1024) return error.PerfWorkloadTooLarge;
-        try hashObservedBindingRecord(
-            allocator,
-            payload,
-            hasher,
-        );
+        try hashObservedBindingRecord(allocator, payload, hasher);
         hasher.update(&.{0xfe});
     }
     if (records == 0) return error.PerfWorkloadBindingInvalid;
@@ -2428,12 +2582,7 @@ fn hashObservedBindingRecord(
     raw: []const u8,
     hasher: *std.crypto.hash.sha2.Sha256,
 ) !void {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        raw,
-        .{},
-    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |value| value,
@@ -2469,6 +2618,77 @@ fn pathContainsGitComponent(path: []const u8) bool {
     return false;
 }
 
+const MetricSamples = struct {
+    times: std.ArrayList(u64) = .empty,
+    allocations: std.ArrayList(u64) = .empty,
+    rss: std.ArrayList(u64) = .empty,
+
+    fn init(allocator: std.mem.Allocator, count: usize, allocs: usize, rss: usize) !MetricSamples {
+        var result: MetricSamples = .{};
+        errdefer result.deinit(allocator);
+        try result.times.ensureTotalCapacity(allocator, count);
+        try result.allocations.ensureTotalCapacity(allocator, allocs);
+        try result.rss.ensureTotalCapacity(allocator, rss);
+        return result;
+    }
+
+    fn deinit(self: *MetricSamples, allocator: std.mem.Allocator) void {
+        self.times.deinit(allocator);
+        self.allocations.deinit(allocator);
+        self.rss.deinit(allocator);
+    }
+
+    fn finish(self: *MetricSamples, allocator: std.mem.Allocator) !Metrics {
+        const result = try metricsFromSamples(allocator, self.times, self.allocations, self.rss);
+        self.* = .{};
+        return result;
+    }
+
+    fn appendCompat(
+        self: *MetricSamples,
+        allocator: std.mem.Allocator,
+        case_cfg: CompatCase,
+        root: []const u8,
+    ) !void {
+        try appendCompatSample(
+            allocator,
+            case_cfg,
+            root,
+            &self.times,
+            &self.allocations,
+            &self.rss,
+        );
+    }
+
+    fn appendDeep(
+        self: *MetricSamples,
+        allocator: std.mem.Allocator,
+        case_cfg: DeepCase,
+        root: []const u8,
+        driver: DriverEvidence,
+    ) !void {
+        try appendSourceDeepMetrics(
+            allocator,
+            root,
+            case_cfg,
+            driver,
+            &self.times,
+            &self.allocations,
+            &self.rss,
+        );
+    }
+};
+
+const MeasuredPair = struct {
+    baseline: Metrics,
+    candidate: Metrics,
+
+    fn deinit(self: *MeasuredPair, allocator: std.mem.Allocator) void {
+        self.baseline.deinit(allocator);
+        self.candidate.deinit(allocator);
+    }
+};
+
 fn runPairedMeasuredCases(
     allocator: std.mem.Allocator,
     baseline_case: CompatCase,
@@ -2479,15 +2699,9 @@ fn runPairedMeasuredCases(
     {
         return error.MismatchedPairedPerfCase;
     }
-    const baseline_root = try makeTempRoot(
-        allocator,
-        "paired-baseline",
-    );
+    const baseline_root = try makeTempRoot(allocator, "paired-baseline");
     defer releaseTempRoot(allocator, baseline_root, retainPairedWorkloads());
-    const candidate_root = try makeTempRoot(
-        allocator,
-        "paired-candidate",
-    );
+    const candidate_root = try makeTempRoot(allocator, "paired-candidate");
     defer releaseTempRoot(allocator, candidate_root, retainPairedWorkloads());
     try prepareCompatCase(allocator, baseline_case, baseline_root);
     try prepareCompatCase(allocator, candidate_case, candidate_root);
@@ -2501,152 +2715,78 @@ fn runPairedMeasuredCases(
         candidate_case,
         candidate_root,
     );
-    try requireExecutionParity(
-        baseline_execution,
-        candidate_execution,
-    );
-    const baseline_workload = try observedWorkloadDigest(
-        allocator,
-        baseline_case,
-        baseline_root,
-    );
+    try requireExecutionParity(baseline_execution, candidate_execution);
+    const baseline_workload = try observedWorkloadDigest(allocator, baseline_case, baseline_root);
     const candidate_workload = try observedWorkloadDigest(
         allocator,
         candidate_case,
         candidate_root,
     );
-    if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
-        var stderr_writer = std.Io.File.stderr().writer(
-            std.Io.Threaded.global_single_threaded.io(),
-            &.{},
-        );
-        try stderr_writer.interface.print(
-            "paired workload mismatch: baseline=sha256:{s} " ++
-                "candidate=sha256:{s} baseline_root={s} " ++
-                "candidate_root={s}\n",
-            .{
-                baseline_workload,
-                candidate_workload,
-                baseline_root,
-                candidate_root,
-            },
-        );
-        return error.PerfWorkloadMismatch;
-    }
-
-    var baseline_samples: std.ArrayList(u64) = .empty;
-    errdefer baseline_samples.deinit(allocator);
-    var baseline_allocs: std.ArrayList(u64) = .empty;
-    errdefer baseline_allocs.deinit(allocator);
-    var baseline_rss: std.ArrayList(u64) = .empty;
-    errdefer baseline_rss.deinit(allocator);
-    var candidate_samples: std.ArrayList(u64) = .empty;
-    errdefer candidate_samples.deinit(allocator);
-    var candidate_allocs: std.ArrayList(u64) = .empty;
-    errdefer candidate_allocs.deinit(allocator);
-    var candidate_rss: std.ArrayList(u64) = .empty;
-    errdefer candidate_rss.deinit(allocator);
-    const measured_samples = std.math.mul(
-        usize,
-        baseline_case.samples,
-        paired_comparison_rounds,
-    ) catch return error.PerfSampleCountOverflow;
-    try baseline_samples.ensureTotalCapacity(
+    try requirePairedWorkload(baseline_workload, candidate_workload, baseline_root, candidate_root);
+    const measured = try measureCompatPair(
         allocator,
-        measured_samples,
+        baseline_case,
+        candidate_case,
+        baseline_root,
+        candidate_root,
     );
-    try baseline_allocs.ensureTotalCapacity(
-        allocator,
-        measured_samples,
-    );
-    try candidate_samples.ensureTotalCapacity(
-        allocator,
-        measured_samples,
-    );
-    try candidate_allocs.ensureTotalCapacity(
-        allocator,
-        measured_samples,
-    );
-    try baseline_rss.ensureTotalCapacity(allocator, measured_samples);
-    try candidate_rss.ensureTotalCapacity(allocator, measured_samples);
-
-    var warmup_idx: usize = 0;
-    while (warmup_idx < baseline_case.warmups) : (warmup_idx += 1) {
-        try runCompatWarmup(
-            allocator,
-            baseline_case,
-            baseline_root,
-        );
-        try runCompatWarmup(
-            allocator,
-            candidate_case,
-            candidate_root,
-        );
-    }
-    var sample_idx: usize = 0;
-    while (sample_idx < measured_samples) : (sample_idx += 1) {
-        if (sample_idx % 2 == 0) {
-            try appendCompatSample(
-                allocator,
-                baseline_case,
-                baseline_root,
-                &baseline_samples,
-                &baseline_allocs,
-                &baseline_rss,
-            );
-            try appendCompatSample(
-                allocator,
-                candidate_case,
-                candidate_root,
-                &candidate_samples,
-                &candidate_allocs,
-                &candidate_rss,
-            );
-        } else {
-            try appendCompatSample(
-                allocator,
-                candidate_case,
-                candidate_root,
-                &candidate_samples,
-                &candidate_allocs,
-                &candidate_rss,
-            );
-            try appendCompatSample(
-                allocator,
-                baseline_case,
-                baseline_root,
-                &baseline_samples,
-                &baseline_allocs,
-                &baseline_rss,
-            );
-        }
-    }
-    var baseline = try metricsFromSamples(
-        allocator,
-        baseline_samples,
-        baseline_allocs,
-        baseline_rss,
-    );
-    baseline_samples = .empty;
-    baseline_allocs = .empty;
-    baseline_rss = .empty;
-    errdefer baseline.deinit(allocator);
-    const candidate = try metricsFromSamples(
-        allocator,
-        candidate_samples,
-        candidate_allocs,
-        candidate_rss,
-    );
-    candidate_samples = .empty;
-    candidate_allocs = .empty;
-    candidate_rss = .empty;
     return .{
-        .baseline = baseline,
-        .candidate = candidate,
+        .baseline = measured.baseline,
+        .candidate = measured.candidate,
         .workload_digest = baseline_workload,
         .baseline_execution = baseline_execution,
         .candidate_execution = candidate_execution,
     };
+}
+
+fn requirePairedWorkload(
+    baseline: [64]u8,
+    candidate: [64]u8,
+    baseline_root: []const u8,
+    candidate_root: []const u8,
+) !void {
+    if (std.mem.eql(u8, &baseline, &candidate)) return;
+    var stderr_writer = std.Io.File.stderr().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    try stderr_writer.interface.print(
+        "paired workload mismatch: baseline=sha256:{s} " ++
+            "candidate=sha256:{s} baseline_root={s} candidate_root={s}\n",
+        .{ baseline, candidate, baseline_root, candidate_root },
+    );
+    return error.PerfWorkloadMismatch;
+}
+
+fn measureCompatPair(
+    allocator: std.mem.Allocator,
+    baseline_case: CompatCase,
+    candidate_case: CompatCase,
+    baseline_root: []const u8,
+    candidate_root: []const u8,
+) !MeasuredPair {
+    const count = std.math.mul(usize, baseline_case.samples, paired_comparison_rounds) catch
+        return error.PerfSampleCountOverflow;
+    var baseline_samples = try MetricSamples.init(allocator, count, count, count);
+    defer baseline_samples.deinit(allocator);
+    var candidate_samples = try MetricSamples.init(allocator, count, count, count);
+    defer candidate_samples.deinit(allocator);
+    for (0..baseline_case.warmups) |_| {
+        try runCompatWarmup(allocator, baseline_case, baseline_root);
+        try runCompatWarmup(allocator, candidate_case, candidate_root);
+    }
+    for (0..count) |sample_idx| {
+        if (sample_idx % 2 == 0) {
+            try baseline_samples.appendCompat(allocator, baseline_case, baseline_root);
+            try candidate_samples.appendCompat(allocator, candidate_case, candidate_root);
+        } else {
+            try candidate_samples.appendCompat(allocator, candidate_case, candidate_root);
+            try baseline_samples.appendCompat(allocator, baseline_case, baseline_root);
+        }
+    }
+    var baseline = try baseline_samples.finish(allocator);
+    errdefer baseline.deinit(allocator);
+    return .{ .baseline = baseline, .candidate = try candidate_samples.finish(allocator) };
 }
 
 fn runPairedDeepCases(
@@ -2656,200 +2796,296 @@ fn runPairedDeepCases(
     baseline_evidence: BinaryEvidence,
     candidate_evidence: BinaryEvidence,
 ) !PairedMetrics {
-    const baseline_root = baseline_evidence.source_root;
-    const candidate_root = candidate_evidence.source_root;
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
-    const baseline_built = ensureSourceBuilt(
+    var baseline_driver = try loadDeepDriver(
         allocator,
         built,
-        baseline_root,
-        baseline_evidence.source_sha,
-    ) catch |err| return deepStageError("baseline-driver-build", err);
-    var baseline_driver = try driverEvidence(
-        allocator,
-        baseline_built.*,
+        baseline_evidence,
+        case_cfg.driver_kind,
+        "baseline",
     );
     errdefer baseline_driver.deinit(allocator);
-    const candidate_built = ensureSourceBuilt(
+    var candidate_driver = try loadDeepDriver(
         allocator,
         built,
-        candidate_root,
-        candidate_evidence.source_sha,
-    ) catch |err| return deepStageError("candidate-driver-build", err);
-    var candidate_driver = try driverEvidence(
-        allocator,
-        candidate_built.*,
+        candidate_evidence,
+        case_cfg.driver_kind,
+        "candidate",
     );
     errdefer candidate_driver.deinit(allocator);
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
+    if (case_cfg.driver_kind == .optimization) return runOptimizationMeasurements(
+        allocator,
+        case_cfg,
+        baseline_evidence,
+        candidate_evidence,
+        baseline_driver,
+        candidate_driver,
+    );
+    return runSeqReplayMeasurements(
+        allocator,
+        case_cfg,
+        baseline_evidence,
+        candidate_evidence,
+        baseline_driver,
+        candidate_driver,
+    );
+}
+
+fn runSeqReplayMeasurements(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+    baseline_driver: DriverEvidence,
+    candidate_driver: DriverEvidence,
+) !PairedMetrics {
+    const baseline_root = baseline_evidence.source_root;
+    const candidate_root = candidate_evidence.source_root;
     const baseline_workload = deepWorkloadDigestForRoot(
         allocator,
         baseline_root,
         case_cfg,
-    ) catch |err| return deepStageError("baseline-workload", err);
+    ) catch |err|
+        return deepStageError("baseline-workload", err);
     const candidate_workload = deepWorkloadDigestForRoot(
         allocator,
         candidate_root,
         case_cfg,
-    ) catch |err| return deepStageError("candidate-workload", err);
+    ) catch |err|
+        return deepStageError("candidate-workload", err);
     if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
         return error.PerfWorkloadMismatch;
     }
-    // Each product is measured against its co-located immutable driver and
-    // source tree. The cross-product digest normalizes only the absolute-path
-    // component of a separately verified physical source-event identity.
-    const baseline_semantic = productDeepSemanticOutputEvidence(
+    const semantics = try deepSemanticPair(allocator, baseline_evidence, candidate_evidence);
+    var measured = try measureDeepPair(
         allocator,
-        baseline_evidence.file.path,
-        baseline_root,
-    ) catch |err| return deepStageError("baseline-semantic", err);
-    const candidate_semantic = productDeepSemanticOutputEvidence(
-        allocator,
-        candidate_evidence.file.path,
-        candidate_root,
-    ) catch |err| return deepStageError("candidate-semantic", err);
-    if (!std.mem.eql(
-        u8,
-        &baseline_semantic.output_sha256,
-        &candidate_semantic.output_sha256,
-    )) {
-        return error.PerfSemanticOutputMismatch;
-    }
-
-    var baseline_samples: std.ArrayList(u64) = .empty;
-    errdefer baseline_samples.deinit(allocator);
-    var baseline_allocs: std.ArrayList(u64) = .empty;
-    errdefer baseline_allocs.deinit(allocator);
-    var baseline_rss: std.ArrayList(u64) = .empty;
-    errdefer baseline_rss.deinit(allocator);
-    var candidate_samples: std.ArrayList(u64) = .empty;
-    errdefer candidate_samples.deinit(allocator);
-    var candidate_allocs: std.ArrayList(u64) = .empty;
-    errdefer candidate_allocs.deinit(allocator);
-    var candidate_rss: std.ArrayList(u64) = .empty;
-    errdefer candidate_rss.deinit(allocator);
-    const measured_samples = std.math.mul(
-        usize,
-        case_cfg.samples,
-        paired_comparison_rounds,
-    ) catch return error.PerfSampleCountOverflow;
-    try baseline_samples.ensureTotalCapacity(allocator, measured_samples);
-    try candidate_samples.ensureTotalCapacity(allocator, measured_samples);
-    try candidate_allocs.ensureTotalCapacity(allocator, measured_samples);
-    try baseline_rss.ensureTotalCapacity(
-        allocator,
-        paired_comparison_rounds,
-    );
-    try candidate_rss.ensureTotalCapacity(
-        allocator,
-        paired_comparison_rounds,
-    );
-    try baseline_allocs.ensureTotalCapacity(
-        allocator,
-        paired_comparison_rounds,
-    );
-    primeSourceDeepCase(
-        allocator,
-        baseline_root,
         case_cfg,
+        baseline_root,
+        candidate_root,
         baseline_driver,
-    ) catch |err| return deepStageError("baseline-prime", err);
-    primeSourceDeepCase(
-        allocator,
-        candidate_root,
-        case_cfg,
         candidate_driver,
-    ) catch |err| return deepStageError("candidate-prime", err);
-
-    var round: usize = 0;
-    while (round < paired_comparison_rounds) : (round += 1) {
-        if (round % 2 == 0) {
-            try appendSourceDeepMetrics(
-                allocator,
-                baseline_root,
-                case_cfg,
-                baseline_driver,
-                &baseline_samples,
-                &baseline_allocs,
-                &baseline_rss,
-            );
-            try appendSourceDeepMetrics(
-                allocator,
-                candidate_root,
-                case_cfg,
-                candidate_driver,
-                &candidate_samples,
-                &candidate_allocs,
-                &candidate_rss,
-            );
-        } else {
-            try appendSourceDeepMetrics(
-                allocator,
-                candidate_root,
-                case_cfg,
-                candidate_driver,
-                &candidate_samples,
-                &candidate_allocs,
-                &candidate_rss,
-            );
-            try appendSourceDeepMetrics(
-                allocator,
-                baseline_root,
-                case_cfg,
-                baseline_driver,
-                &baseline_samples,
-                &baseline_allocs,
-                &baseline_rss,
-            );
-        }
-    }
-    var baseline = try metricsFromSamples(
-        allocator,
-        baseline_samples,
-        baseline_allocs,
-        baseline_rss,
     );
-    baseline_samples = .empty;
-    baseline_allocs = .empty;
-    baseline_rss = .empty;
-    errdefer baseline.deinit(allocator);
-    const candidate = try metricsFromSamples(
-        allocator,
-        candidate_samples,
-        candidate_allocs,
-        candidate_rss,
-    );
-    candidate_samples = .empty;
-    candidate_allocs = .empty;
-    candidate_rss = .empty;
+    errdefer measured.deinit(allocator);
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
-    const final_baseline_workload = deepWorkloadDigestForRoot(
+    try requireFinalDeepWorkloads(
         allocator,
+        case_cfg,
         baseline_root,
-        case_cfg,
-    ) catch |err| return deepStageError("baseline-workload-final", err);
-    const final_candidate_workload = deepWorkloadDigestForRoot(
-        allocator,
         candidate_root,
-        case_cfg,
-    ) catch |err| return deepStageError("candidate-workload-final", err);
-    if (!std.mem.eql(u8, &baseline_workload, &final_baseline_workload) or
-        !std.mem.eql(u8, &candidate_workload, &final_candidate_workload))
-    {
-        return error.PerfWorkloadChanged;
-    }
+        baseline_workload,
+        candidate_workload,
+    );
     return .{
-        .baseline = baseline,
-        .candidate = candidate,
+        .baseline = measured.baseline,
+        .candidate = measured.candidate,
         .workload_digest = baseline_workload,
-        .baseline_execution = baseline_semantic,
-        .candidate_execution = candidate_semantic,
+        .baseline_execution = semantics[0],
+        .candidate_execution = semantics[1],
         .baseline_driver = baseline_driver,
         .candidate_driver = candidate_driver,
     };
+}
+
+fn loadDeepDriver(
+    allocator: std.mem.Allocator,
+    built: *BuiltState,
+    evidence: BinaryEvidence,
+    kind: DriverKind,
+    comptime side: []const u8,
+) !DriverEvidence {
+    const source = ensureSourceBuilt(
+        allocator,
+        built,
+        evidence.source_root,
+        evidence.source_sha,
+        kind,
+    ) catch |err| return deepStageError(side ++ "-driver-build", err);
+    return driverEvidence(allocator, source.*);
+}
+
+const OptimizationOracle = struct {
+    workload_digest: [64]u8,
+    execution: MeasuredOutputEvidence,
+};
+
+const OptimizationOracleWire = struct {
+    case_id: []const u8,
+    workload_sha256: []const u8,
+    output_sha256: []const u8,
+};
+
+fn optimizationOracle(
+    allocator: std.mem.Allocator,
+    driver_file: SealedFile,
+    case_id: []const u8,
+) !OptimizationOracle {
+    try verifySealedFile(driver_file);
+    const result = try runChildCaptureOutput(
+        allocator,
+        ".",
+        &.{ driver_file.path, "oracle", "--target", case_id },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.OptimizationOracleFailed;
+    var parsed = try std.json.parseFromSlice(OptimizationOracleWire, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, case_id, parsed.value.case_id)) return error.DeepArtifactIdentityMismatch;
+    const workload = try rawSha256Digest(parsed.value.workload_sha256);
+    const output = try rawSha256Digest(parsed.value.output_sha256);
+    try verifySealedFile(driver_file);
+    return .{
+        .workload_digest = workload,
+        .execution = .{ .output_sha256 = output, .semantic_output_sha256 = output },
+    };
+}
+
+fn rawSha256Digest(raw: []const u8) ![64]u8 {
+    if (raw.len != 64) return error.InvalidPerfEvidenceFile;
+    for (raw) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPerfEvidenceFile;
+    var digest: [64]u8 = undefined;
+    @memcpy(&digest, raw);
+    return digest;
+}
+
+fn runOptimizationMeasurements(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+    baseline_driver: DriverEvidence,
+    candidate_driver: DriverEvidence,
+) !PairedMetrics {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.UnsupportedOptimizationMeasurement;
+    }
+    const baseline = try optimizationOracle(
+        allocator,
+        baseline_driver.file,
+        case_cfg.descriptor.case_id,
+    );
+    const candidate = try optimizationOracle(
+        allocator,
+        candidate_driver.file,
+        case_cfg.descriptor.case_id,
+    );
+    try requireOptimizationParity(baseline, candidate);
+    var measured = try measureDeepPair(
+        allocator,
+        case_cfg,
+        baseline_evidence.source_root,
+        candidate_evidence.source_root,
+        baseline_driver,
+        candidate_driver,
+    );
+    errdefer measured.deinit(allocator);
+    try requireBinaryUnchanged(baseline_evidence);
+    try requireBinaryUnchanged(candidate_evidence);
+    try requireOptimizationUnchanged(allocator, case_cfg, baseline_driver, baseline);
+    try requireOptimizationUnchanged(allocator, case_cfg, candidate_driver, candidate);
+    return .{
+        .baseline = measured.baseline,
+        .candidate = measured.candidate,
+        .workload_digest = baseline.workload_digest,
+        .baseline_execution = baseline.execution,
+        .candidate_execution = candidate.execution,
+        .baseline_driver = baseline_driver,
+        .candidate_driver = candidate_driver,
+    };
+}
+
+fn requireOptimizationParity(baseline: OptimizationOracle, candidate: OptimizationOracle) !void {
+    if (!std.mem.eql(u8, &baseline.workload_digest, &candidate.workload_digest)) {
+        return error.PerfWorkloadMismatch;
+    }
+    try requireExecutionParity(baseline.execution, candidate.execution);
+}
+
+fn requireOptimizationUnchanged(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    driver: DriverEvidence,
+    original: OptimizationOracle,
+) !void {
+    try requireDriverUnchanged(driver);
+    const current = try optimizationOracle(allocator, driver.file, case_cfg.descriptor.case_id);
+    try requireOptimizationParity(original, current);
+    try requireDriverUnchanged(driver);
+}
+
+fn deepSemanticPair(
+    allocator: std.mem.Allocator,
+    baseline: BinaryEvidence,
+    candidate: BinaryEvidence,
+) ![2]MeasuredOutputEvidence {
+    // Verify each physical identity before normalizing its absolute-path component.
+    const baseline_semantic = productDeepSemanticOutputEvidence(
+        allocator,
+        baseline.file.path,
+        baseline.source_root,
+    ) catch |err| return deepStageError("baseline-semantic", err);
+    const candidate_semantic = productDeepSemanticOutputEvidence(
+        allocator,
+        candidate.file.path,
+        candidate.source_root,
+    ) catch |err| return deepStageError("candidate-semantic", err);
+    if (!std.mem.eql(u8, &baseline_semantic.output_sha256, &candidate_semantic.output_sha256)) {
+        return error.PerfSemanticOutputMismatch;
+    }
+    return .{ baseline_semantic, candidate_semantic };
+}
+
+fn requireFinalDeepWorkloads(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_root: []const u8,
+    candidate_root: []const u8,
+    baseline_workload: [64]u8,
+    candidate_workload: [64]u8,
+) !void {
+    const baseline = deepWorkloadDigestForRoot(allocator, baseline_root, case_cfg) catch |err|
+        return deepStageError("baseline-workload-final", err);
+    const candidate = deepWorkloadDigestForRoot(allocator, candidate_root, case_cfg) catch |err|
+        return deepStageError("candidate-workload-final", err);
+    if (!std.mem.eql(u8, &baseline_workload, &baseline) or
+        !std.mem.eql(u8, &candidate_workload, &candidate)) return error.PerfWorkloadChanged;
+}
+
+fn measureDeepPair(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_root: []const u8,
+    candidate_root: []const u8,
+    baseline_driver: DriverEvidence,
+    candidate_driver: DriverEvidence,
+) !MeasuredPair {
+    const count = std.math.mul(usize, case_cfg.samples, paired_comparison_rounds) catch
+        return error.PerfSampleCountOverflow;
+    const rounds = paired_comparison_rounds;
+    var baseline_samples = try MetricSamples.init(allocator, count, rounds, rounds);
+    defer baseline_samples.deinit(allocator);
+    var candidate_samples = try MetricSamples.init(allocator, count, count, rounds);
+    defer candidate_samples.deinit(allocator);
+    primeSourceDeepCase(allocator, baseline_root, case_cfg, baseline_driver) catch |err|
+        return deepStageError("baseline-prime", err);
+    primeSourceDeepCase(allocator, candidate_root, case_cfg, candidate_driver) catch |err|
+        return deepStageError("candidate-prime", err);
+    for (0..rounds) |round| {
+        if (round % 2 == 0) {
+            try baseline_samples.appendDeep(allocator, case_cfg, baseline_root, baseline_driver);
+            try candidate_samples.appendDeep(allocator, case_cfg, candidate_root, candidate_driver);
+        } else {
+            try candidate_samples.appendDeep(allocator, case_cfg, candidate_root, candidate_driver);
+            try baseline_samples.appendDeep(allocator, case_cfg, baseline_root, baseline_driver);
+        }
+    }
+    var baseline = try baseline_samples.finish(allocator);
+    errdefer baseline.deinit(allocator);
+    return .{ .baseline = baseline, .candidate = try candidate_samples.finish(allocator) };
 }
 
 fn deepStageError(stage: []const u8, err: anyerror) anyerror {
@@ -2888,133 +3124,218 @@ fn ensureSourceBuilt(
     built: *BuiltState,
     source_root: []const u8,
     expected_source_sha: []const u8,
+    kind: DriverKind,
 ) !*const BuiltSource {
-    if (!validFullRevision(expected_source_sha)) {
-        return error.DriverSourceRevisionMismatch;
-    }
+    if (!validFullRevision(expected_source_sha)) return error.DriverSourceRevisionMismatch;
     const key = try std.fmt.allocPrint(
         allocator,
-        "{s}:isolated-source",
-        .{source_root},
+        "{s}:isolated-source:{s}",
+        .{ source_root, @tagName(kind) },
     );
     defer allocator.free(key);
     if (built.sources.getPtr(key)) |driver| {
-        if (!std.mem.eql(
-            u8,
-            driver.source_sha,
-            expected_source_sha,
-        )) return error.DriverSourceRevisionMismatch;
+        if (!std.mem.eql(u8, driver.source_sha, expected_source_sha)) {
+            return error.DriverSourceRevisionMismatch;
+        }
         return driver;
     }
     try requireCleanSourceRoot(allocator, source_root);
-    const observed_source_sha = try sourceShaForRootAlloc(
-        allocator,
-        source_root,
-    );
+    const observed_source_sha = try sourceShaForRootAlloc(allocator, source_root);
     defer allocator.free(observed_source_sha);
-    if (!std.mem.eql(
-        u8,
-        observed_source_sha,
-        expected_source_sha,
-    )) return error.DriverSourceRevisionMismatch;
-    const source_tree_sha = try sourceTreeShaForRootAlloc(
+    if (!std.mem.eql(u8, observed_source_sha, expected_source_sha)) {
+        return error.DriverSourceRevisionMismatch;
+    }
+    const source_tree_sha = try sourceTreeShaForRootAlloc(allocator, source_root);
+    defer allocator.free(source_tree_sha);
+    var source = try buildIsolatedSource(
         allocator,
         source_root,
+        expected_source_sha,
+        source_tree_sha,
+        kind,
     );
-    defer allocator.free(source_tree_sha);
+    errdefer source.deinit(allocator);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try built.sources.put(owned_key, source);
+    return built.sources.getPtr(key) orelse unreachable;
+}
 
-    const machine_dir_relative = try ensureCurrentMachineDir(allocator);
-    defer allocator.free(machine_dir_relative);
-    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
+fn buildIsolatedSource(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    revision: []const u8,
+    tree: []const u8,
+    kind: DriverKind,
+) !BuiltSource {
+    const machine = try absoluteMachineDir(allocator);
+    defer allocator.free(machine);
+    const driver_bytes = driverSourceBytes(kind);
+    var driver_file = try sealDriverSource(allocator, machine, driver_bytes, kind);
+    errdefer driver_file.deinit(allocator);
+    var build_file = try sealDriverBuildSource(allocator, machine, kind);
+    errdefer if (build_file) |*file| file.deinit(allocator);
+    const staging = try sourceStagingDir(allocator, machine, revision);
+    defer allocator.free(staging);
+    defer removeBuildStaging(staging);
+    var compiler = try approvedCompilerEvidence(allocator, machine);
+    errdefer compiler.deinit(allocator);
+    const snapshot = try std.fs.path.join(allocator, &.{ staging, "source" });
+    defer allocator.free(snapshot);
+    var archive = try snapshotProductSource(
+        allocator,
+        root,
+        revision,
+        machine,
+        staging,
+        snapshot,
+    );
+    errdefer archive.deinit(allocator);
+    const prefix = try std.fs.path.join(allocator, &.{ snapshot, "zig-out" });
+    defer allocator.free(prefix);
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "", kind);
+    try requireBuildSourceUnchanged(allocator, root, revision, tree);
+    try verifySealedFile(compiler.file);
+    try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
+    var seq = try sealBuiltExecutable(allocator, machine, prefix, "seq");
+    errdefer seq.deinit(allocator);
+    var ledger = try sealBuiltExecutable(allocator, machine, prefix, "ledger");
+    errdefer ledger.deinit(allocator);
+    try overlayReplayDriver(allocator, snapshot, driver_bytes, driver_file);
+    if (build_file) |file| try overlayDriverBuild(allocator, snapshot, file);
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "driver-", kind);
+    try verifySealedFile(driver_file);
+    if (build_file) |file| try verifySealedFile(file);
+    try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
+    var driver = try sealBuiltExecutable(allocator, machine, prefix, "perf_hub");
+    errdefer driver.deinit(allocator);
+    try requireBuildSourceUnchanged(allocator, root, revision, tree);
+    try verifySealedFile(compiler.file);
+    return ownBuiltSource(
+        allocator,
+        revision,
+        tree,
+        seq,
+        ledger,
+        driver,
+        archive,
+        driver_file,
+        compiler,
+        kind,
+        build_file,
+    );
+}
+
+fn absoluteMachineDir(allocator: std.mem.Allocator) ![]u8 {
+    const relative = try ensureCurrentMachineDir(allocator);
+    defer allocator.free(relative);
+    return std.Io.Dir.cwd().realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
-        machine_dir_relative,
+        relative,
         allocator,
     );
-    defer allocator.free(machine_dir);
-    const driver_source_tree_sha = active_seq_replay_driver_v1.tree;
-    const driver_source_bytes = try seqReplayDriverSourceBytesAlloc(allocator);
-    defer allocator.free(driver_source_bytes);
-    const driver_source_digest = evidenceDigest(driver_source_bytes);
-    if (!std.mem.eql(
-        u8,
-        &driver_source_digest,
-        active_seq_replay_driver_v1.sha256,
-    )) return error.DriverSourceRevisionMismatch;
-    var driver_source_file = try sealEvidenceBytes(
+}
+
+fn sealDriverSource(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    bytes: []const u8,
+    kind: DriverKind,
+) !SealedFile {
+    const digest = evidenceDigest(bytes);
+    if (!std.mem.eql(u8, &digest, driverIdentity(kind).sha256)) {
+        return error.DriverSourceRevisionMismatch;
+    }
+    return sealEvidenceBytes(allocator, machine_dir, "perf_hub.zig", bytes, 0o400);
+}
+
+fn sealDriverBuildSource(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    kind: DriverKind,
+) !?SealedFile {
+    if (kind != .optimization) return null;
+    return try sealEvidenceBytes(
         allocator,
         machine_dir,
-        "perf_hub.zig",
-        driver_source_bytes,
+        "optimization_build.zig",
+        optimization_build_source,
         0o400,
     );
-    var driver_source_file_owned = true;
-    defer if (driver_source_file_owned) {
-        driver_source_file.deinit(allocator);
+}
+
+fn overlayDriverBuild(
+    allocator: std.mem.Allocator,
+    snapshot: []const u8,
+    build_file: SealedFile,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ snapshot, "build.zig" });
+    defer allocator.free(path);
+    const original = try readRegularFileAlloc(
+        allocator,
+        path,
+        max_sealed_evidence_bytes,
+    );
+    defer allocator.free(original);
+    const product_path = try std.fs.path.join(allocator, &.{ snapshot, "build_product.zig" });
+    defer allocator.free(product_path);
+    try writeEvidenceFileAtomic(allocator, product_path, original, 0o400);
+    const product_digest = try sha256FileBounded(product_path, max_sealed_evidence_bytes);
+    const original_digest = evidenceDigest(original);
+    if (!std.mem.eql(u8, &product_digest, &original_digest)) {
+        return error.DriverSourceChangedDuringBuild;
+    }
+    try verifySealedFile(build_file);
+    try writeEvidenceFileAtomic(allocator, path, optimization_build_source, 0o400);
+    const digest = try sha256FileBounded(path, max_sealed_evidence_bytes);
+    if (!std.mem.eql(u8, &digest, &build_file.sha256)) return error.DriverSourceChangedDuringBuild;
+}
+
+fn sourceStagingDir(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    source_sha: []const u8,
+) ![]u8 {
+    const root = try std.fs.path.join(allocator, &.{ machine_dir, "capsules", "staging" });
+    defer allocator.free(root);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(root);
+    const now = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+    const staging = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.build-{s}-{d}",
+        .{ root, source_sha[0..@min(source_sha.len, 12)], now },
+    );
+    errdefer allocator.free(staging);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(staging);
+    return staging;
+}
+
+fn removeBuildStaging(staging: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), staging) catch |err| {
+        std.debug.print("perf_hub warning: remove staging directory: {s}\n", .{@errorName(err)});
     };
-    const staging_root = try std.fs.path.join(
-        allocator,
-        &.{ machine_dir, "capsules", "staging" },
-    );
-    defer allocator.free(staging_root);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(staging_root);
-    const nonce = try std.fmt.allocPrint(
-        allocator,
-        "{d}",
-        .{std.Io.Clock.awake.now(
-            std.Io.Threaded.global_single_threaded.io(),
-        ).nanoseconds},
-    );
-    defer allocator.free(nonce);
-    const staging_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/.build-{s}-{s}",
-        .{
-            staging_root,
-            expected_source_sha[0..@min(expected_source_sha.len, 12)],
-            nonce,
-        },
-    );
-    defer allocator.free(staging_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(staging_dir);
-    defer std.Io.Dir.cwd().deleteTree(
-        std.Io.Threaded.global_single_threaded.io(),
-        staging_dir,
-    ) catch |err| {
-        std.debug.print(
-            "perf_hub warning: remove staging directory: {s}\n",
-            .{@errorName(err)},
-        );
-    };
-    var compiler = try approvedCompilerEvidence(allocator, machine_dir);
-    var compiler_owned = true;
-    defer if (compiler_owned) compiler.deinit(allocator);
-    const archive_path = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "source.tar" },
-    );
+}
+
+fn snapshotProductSource(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    source_sha: []const u8,
+    machine_dir: []const u8,
+    staging_dir: []const u8,
+    snapshot: []const u8,
+) !SealedFile {
+    const archive_path = try std.fs.path.join(allocator, &.{ staging_dir, "source.tar" });
     defer allocator.free(archive_path);
-    const source_snapshot = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "source" },
-    );
-    defer allocator.free(source_snapshot);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(source_snapshot);
-    const archive_result = try runChildCapture(
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(snapshot);
+    const result = try runChildCapture(
         allocator,
         source_root,
-        &.{
-            git_binary,
-            "archive",
-            "--format=tar",
-            "--output",
-            archive_path,
-            expected_source_sha,
-        },
+        &.{ git_binary, "archive", "--format=tar", "--output", archive_path, source_sha },
     );
-    defer allocator.free(archive_result.stdout);
-    defer allocator.free(archive_result.stderr);
-    if (archive_result.exit_code != 0) return error.SourceSnapshotFailed;
-    var source_archive = try sealEvidenceFile(
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.SourceSnapshotFailed;
+    var archive = try sealEvidenceFile(
         allocator,
         machine_dir,
         "source.tar",
@@ -3022,224 +3343,130 @@ fn ensureSourceBuilt(
         max_sealed_evidence_bytes,
         0o600,
     );
-    var source_archive_owned = true;
-    defer if (source_archive_owned) source_archive.deinit(allocator);
-    const extract_result = try runChildCapture(
+    errdefer archive.deinit(allocator);
+    const extract = try runChildCapture(
         allocator,
         staging_dir,
-        &.{
-            "/usr/bin/tar",
-            "-xf",
-            source_archive.path,
-            "-C",
-            source_snapshot,
-        },
+        &.{ "/usr/bin/tar", "-xf", archive.path, "-C", snapshot },
     );
-    defer allocator.free(extract_result.stdout);
-    defer allocator.free(extract_result.stderr);
-    if (extract_result.exit_code != 0) return error.SourceSnapshotFailed;
-    const prefix_dir = try std.fs.path.join(
+    defer allocator.free(extract.stdout);
+    defer allocator.free(extract.stderr);
+    if (extract.exit_code != 0) return error.SourceSnapshotFailed;
+    return archive;
+}
+
+fn runIsolatedBuild(
+    allocator: std.mem.Allocator,
+    snapshot: []const u8,
+    staging_dir: []const u8,
+    prefix: []const u8,
+    compiler: CompilerEvidence,
+    comptime cache_prefix: []const u8,
+    kind: DriverKind,
+) !void {
+    const cache = try std.fs.path.join(allocator, &.{ staging_dir, cache_prefix ++ "cache" });
+    defer allocator.free(cache);
+    const global = try std.fs.path.join(
         allocator,
-        &.{ source_snapshot, "zig-out" },
+        &.{ staging_dir, cache_prefix ++ "global-cache" },
     );
-    defer allocator.free(prefix_dir);
-    const cache_dir = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "cache" },
-    );
-    defer allocator.free(cache_dir);
-    const global_cache_dir = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "global-cache" },
-    );
-    defer allocator.free(global_cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(prefix_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global_cache_dir);
-    const result = try runChildCapture(
-        allocator,
-        source_snapshot,
-        &.{
-            compiler.approved_path,
-            "build",
-            "-Doptimize=ReleaseFast",
-            "--prefix",
-            prefix_dir,
-            "--cache-dir",
-            cache_dir,
-            "--global-cache-dir",
-            global_cache_dir,
-        },
-    );
+    defer allocator.free(global);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(prefix);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global);
+    const argv = [_][]const u8{
+        compiler.approved_path,
+        "build",
+        "-Doptimize=ReleaseFast",
+        "--prefix",
+        prefix,
+        "--cache-dir",
+        cache,
+        "--global-cache-dir",
+        global,
+    };
+    const driver_argv = argv ++ [_][]const u8{
+        "optimization-driver", "-Dtarget=aarch64-macos", "-Dcpu=baseline",
+    };
+    const command = if (kind == .optimization and cache_prefix.len != 0) &driver_argv else &argv;
+    const result = try runChildCapture(allocator, snapshot, command);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.BuildFailed;
-    try requireCleanSourceRoot(allocator, source_root);
-    const post_source_sha = try sourceShaForRootAlloc(
+}
+
+fn requireBuildSourceUnchanged(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    source_sha: []const u8,
+    source_tree_sha: []const u8,
+) !void {
+    requireSourceIdentityUnchanged(
         allocator,
         source_root,
-    );
-    defer allocator.free(post_source_sha);
-    const post_tree_sha = try sourceTreeShaForRootAlloc(
-        allocator,
-        source_root,
-    );
-    defer allocator.free(post_tree_sha);
-    if (!std.mem.eql(u8, post_source_sha, expected_source_sha) or
-        !std.mem.eql(u8, post_tree_sha, source_tree_sha))
-    {
-        return error.DriverSourceChangedDuringBuild;
-    }
-    try verifySealedFile(compiler.file);
-    try requireCompilerDigestAtPath(
-        compiler.approved_path,
-        &compiler.file.sha256,
-    );
-    var executables: [3]SealedFile = undefined;
-    var executable_count: usize = 0;
-    defer for (executables[0..executable_count]) |*file| {
-        file.deinit(allocator);
-    };
-    for ([_][]const u8{ "seq", "ledger" }, 0..) |name, index| {
-        const built_path = try std.fs.path.join(
-            allocator,
-            &.{ prefix_dir, "bin", name },
-        );
-        defer allocator.free(built_path);
-        executables[index] = try sealEvidenceFile(
-            allocator,
-            machine_dir,
-            name,
-            built_path,
-            16 * 1024 * 1024,
-            0o500,
-        );
-        executable_count += 1;
-    }
-    const driver_source_path = try std.fs.path.join(
-        allocator,
-        &.{ source_snapshot, driver_overlay_path },
-    );
-    defer allocator.free(driver_source_path);
-    try writeEvidenceFileAtomic(
-        allocator,
-        driver_source_path,
-        driver_source_bytes,
-        0o400,
-    );
-    const overlaid_driver_source_sha = try sha256FileBounded(
-        driver_source_path,
-        max_sealed_evidence_bytes,
-    );
-    if (!std.mem.eql(
-        u8,
-        &overlaid_driver_source_sha,
-        &driver_source_file.sha256,
-    )) return error.DriverSourceChangedDuringBuild;
-    const driver_cache_dir = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "driver-cache" },
-    );
-    defer allocator.free(driver_cache_dir);
-    const driver_global_cache_dir = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "driver-global-cache" },
-    );
-    defer allocator.free(driver_global_cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
-        driver_cache_dir,
-    );
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
-        driver_global_cache_dir,
-    );
-    const driver_build = try runChildCapture(
-        allocator,
-        source_snapshot,
-        &.{
-            compiler.approved_path,
-            "build",
-            "-Doptimize=ReleaseFast",
-            "--prefix",
-            prefix_dir,
-            "--cache-dir",
-            driver_cache_dir,
-            "--global-cache-dir",
-            driver_global_cache_dir,
-        },
-    );
-    defer allocator.free(driver_build.stdout);
-    defer allocator.free(driver_build.stderr);
-    if (driver_build.exit_code != 0) return error.BuildFailed;
-    try verifySealedFile(driver_source_file);
-    try requireCompilerDigestAtPath(
-        compiler.approved_path,
-        &compiler.file.sha256,
-    );
-    const built_driver_path = try std.fs.path.join(
-        allocator,
-        &.{ prefix_dir, "bin", "perf_hub" },
-    );
-    defer allocator.free(built_driver_path);
-    executables[2] = try sealEvidenceFile(
-        allocator,
-        machine_dir,
-        "perf_hub",
-        built_driver_path,
-        16 * 1024 * 1024,
-        0o500,
-    );
-    executable_count += 1;
-    try requireCleanSourceRoot(allocator, source_root);
-    const final_source_sha = try sourceShaForRootAlloc(
-        allocator,
-        source_root,
-    );
-    defer allocator.free(final_source_sha);
-    const final_tree_sha = try sourceTreeShaForRootAlloc(
-        allocator,
-        source_root,
-    );
-    defer allocator.free(final_tree_sha);
-    if (!std.mem.eql(u8, final_source_sha, expected_source_sha) or
-        !std.mem.eql(u8, final_tree_sha, source_tree_sha))
-    {
-        return error.DriverSourceChangedDuringBuild;
-    }
-    try verifySealedFile(compiler.file);
-    const owned_key = try allocator.dupe(u8, key);
-    errdefer allocator.free(owned_key);
-    const owned_source_sha = try allocator.dupe(
-        u8,
-        expected_source_sha,
-    );
-    errdefer allocator.free(owned_source_sha);
-    const owned_source_tree_sha = try allocator.dupe(
-        u8,
+        source_sha,
         source_tree_sha,
-    );
-    errdefer allocator.free(owned_source_tree_sha);
-    const owned_driver_source_tree_sha = try allocator.dupe(
-        u8,
-        driver_source_tree_sha,
-    );
-    errdefer allocator.free(owned_driver_source_tree_sha);
-    const owned_source: BuiltSource = .{
-        .seq = executables[0],
-        .ledger = executables[1],
-        .perf_hub = executables[2],
-        .source_sha = owned_source_sha,
-        .source_tree_sha = owned_source_tree_sha,
-        .source_archive = source_archive,
-        .driver_source_tree_sha = owned_driver_source_tree_sha,
-        .driver_source_file = driver_source_file,
+    ) catch |err| {
+        return if (err == error.ProductSourceChanged) error.DriverSourceChangedDuringBuild else err;
+    };
+}
+
+fn sealBuiltExecutable(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    prefix: []const u8,
+    name: []const u8,
+) !SealedFile {
+    const path = try std.fs.path.join(allocator, &.{ prefix, "bin", name });
+    defer allocator.free(path);
+    return sealEvidenceFile(allocator, machine_dir, name, path, 16 * 1024 * 1024, 0o500);
+}
+
+fn overlayReplayDriver(
+    allocator: std.mem.Allocator,
+    snapshot: []const u8,
+    bytes: []const u8,
+    source: SealedFile,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ snapshot, driver_overlay_path });
+    defer allocator.free(path);
+    try writeEvidenceFileAtomic(allocator, path, bytes, 0o400);
+    const digest = try sha256FileBounded(path, max_sealed_evidence_bytes);
+    if (!std.mem.eql(u8, &digest, &source.sha256)) return error.DriverSourceChangedDuringBuild;
+}
+
+fn ownBuiltSource(
+    allocator: std.mem.Allocator,
+    source_sha: []const u8,
+    source_tree_sha: []const u8,
+    seq: SealedFile,
+    ledger: SealedFile,
+    driver: SealedFile,
+    archive: SealedFile,
+    driver_source: SealedFile,
+    compiler: CompilerEvidence,
+    kind: DriverKind,
+    build_file: ?SealedFile,
+) !BuiltSource {
+    const owned_sha = try allocator.dupe(u8, source_sha);
+    errdefer allocator.free(owned_sha);
+    const owned_tree = try allocator.dupe(u8, source_tree_sha);
+    errdefer allocator.free(owned_tree);
+    const driver_tree = try allocator.dupe(u8, driverIdentity(kind).tree);
+    errdefer allocator.free(driver_tree);
+    return .{
+        .driver_kind = kind,
+        .driver_build_source_file = build_file,
+        .seq = seq,
+        .ledger = ledger,
+        .perf_hub = driver,
+        .source_sha = owned_sha,
+        .source_tree_sha = owned_tree,
+        .source_archive = archive,
+        .driver_source_tree_sha = driver_tree,
+        .driver_source_file = driver_source,
         .compiler = compiler,
     };
-    try built.sources.put(owned_key, owned_source);
-    executable_count = 0;
-    source_archive_owned = false;
-    driver_source_file_owned = false;
-    compiler_owned = false;
-    return built.sources.getPtr(key) orelse unreachable;
 }
 
 fn validFullRevision(revision: []const u8) bool {
@@ -3250,10 +3477,7 @@ fn validFullRevision(revision: []const u8) bool {
     return true;
 }
 
-fn sourceTreeShaForRootAlloc(
-    allocator: std.mem.Allocator,
-    source_root: []const u8,
-) ![]u8 {
+fn sourceTreeShaForRootAlloc(allocator: std.mem.Allocator, source_root: []const u8) ![]u8 {
     return revisionTreeShaForRootAlloc(
         allocator,
         source_root,
@@ -3282,16 +3506,7 @@ fn revisionTreeShaForRootAlloc(
     if (result.exit_code != 0) return error.BinarySourceUnavailable;
     const tree = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (!validFullRevision(tree)) return error.BinarySourceUnavailable;
-    return allocator.dupe(
-        u8,
-        tree,
-    );
-}
-
-fn seqReplayDriverSourceBytesAlloc(
-    allocator: std.mem.Allocator,
-) ![]u8 {
-    return allocator.dupe(u8, sealed_seq_replay_driver_source);
+    return allocator.dupe(u8, tree);
 }
 
 fn deepWorkloadDigestForRoot(
@@ -3315,10 +3530,7 @@ fn deepWorkloadDigestForRoot(
         "apps/seq/src/v1/fixtures/message-observation.json",
         "apps/seq/src/v1/fixtures/rollout.jsonl",
     }) |relative_path| {
-        const path = try std.fs.path.join(
-            allocator,
-            &.{ source_root, relative_path },
-        );
+        const path = try std.fs.path.join(allocator, &.{ source_root, relative_path });
         defer allocator.free(path);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(
             std.Io.Threaded.global_single_threaded.io(),
@@ -3348,25 +3560,7 @@ fn appendSourceDeepMetrics(
 ) !void {
     requireDriverUnchanged(driver) catch |err|
         return deepStageError("driver-preflight", err);
-    const machine_name = try currentMachineDirName(allocator);
-    defer allocator.free(machine_name);
-    const artifact_name = try std.fmt.allocPrint(
-        allocator,
-        "{s}.json",
-        .{case_cfg.descriptor.case_id},
-    );
-    defer allocator.free(artifact_name);
-    const artifact_path = try std.fs.path.join(
-        allocator,
-        &.{
-            source_root,
-            ".perf-local",
-            machine_name,
-            "baselines",
-            case_cfg.descriptor.binary,
-            artifact_name,
-        },
-    );
+    const artifact_path = try sourceDeepArtifactPath(allocator, source_root, case_cfg);
     defer allocator.free(artifact_path);
     std.Io.Dir.cwd().deleteFile(
         std.Io.Threaded.global_single_threaded.io(),
@@ -3402,42 +3596,87 @@ fn appendSourceDeepMetrics(
         .limited(4 * 1024 * 1024),
     );
     defer allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        bytes,
-        .{},
-    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    try validateSharedDriverArtifact(
-        parsed.value,
-        case_cfg,
-        driver.product_source_sha,
-    );
-    const metrics = parsed.value.object.get("metrics") orelse
-        return error.InvalidData;
-    const raw_samples = metrics.object.get("samples_ns") orelse
-        return error.InvalidData;
-    if (raw_samples.array.items.len != case_cfg.samples) {
-        return error.DeepMeasurementSampleCountMismatch;
+    try validateSharedDriverArtifact(parsed.value, case_cfg, driver.product_source_sha);
+    const metrics = try captureMetricsObject(parsed.value);
+    const raw_samples = switch (metrics.get("samples_ns") orelse return error.InvalidData) {
+        .array => |value| value.items,
+        else => return error.InvalidData,
+    };
+    if (raw_samples.len != case_cfg.samples) return error.DeepMeasurementSampleCountMismatch;
+    if (case_cfg.driver_kind == .optimization) {
+        try validateOptimizationCapture(allocator, parsed.value, case_cfg, driver);
     }
-    for (raw_samples.array.items) |raw| {
-        try samples.append(
-            allocator,
-            try jsonValueU64(raw, "samples_ns"),
-        );
+    for (raw_samples) |raw| try samples.append(allocator, try jsonValueU64(raw, "samples_ns"));
+    const batch_allocs = try jsonFieldU64(metrics, "p50_alloc_calls");
+    try alloc_samples.append(allocator, batch_allocs / case_cfg.batch_iterations);
+    try rss_samples.append(allocator, result.peak_rss_bytes orelse return error.MissingPeakRss);
+}
+
+fn captureMetricsObject(artifact: std.json.Value) !std.json.ObjectMap {
+    const object = switch (artifact) {
+        .object => |value| value,
+        else => return error.InvalidData,
+    };
+    return switch (object.get("metrics") orelse return error.InvalidData) {
+        .object => |value| value,
+        else => return error.InvalidData,
+    };
+}
+
+fn validateOptimizationCapture(
+    allocator: std.mem.Allocator,
+    artifact: std.json.Value,
+    case_cfg: DeepCase,
+    driver: DriverEvidence,
+) !void {
+    const oracle = try optimizationOracle(allocator, driver.file, case_cfg.descriptor.case_id);
+    const workload = try artifactDigest(artifact, "workload_sha256");
+    const output = try artifactDigest(artifact, "output_sha256");
+    if (!std.mem.eql(u8, &workload, &oracle.workload_digest) or
+        !std.mem.eql(u8, &output, &oracle.execution.output_sha256))
+    {
+        return error.PerfSemanticOutputMismatch;
     }
-    const batch_allocs = try jsonFieldU64(
-        metrics.object,
-        "p50_alloc_calls",
-    );
-    try alloc_samples.append(
+    try requireDriverUnchanged(driver);
+}
+
+fn artifactDigest(artifact: std.json.Value, name: []const u8) ![64]u8 {
+    const object = switch (artifact) {
+        .object => |value| value,
+        else => return error.InvalidData,
+    };
+    const raw = switch (object.get(name) orelse return error.InvalidData) {
+        .string => |value| value,
+        else => return error.InvalidData,
+    };
+    return rawSha256Digest(raw);
+}
+
+fn sourceDeepArtifactPath(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    case_cfg: DeepCase,
+) ![]u8 {
+    const machine_name = try currentMachineDirName(allocator);
+    defer allocator.free(machine_name);
+    const artifact_name = try std.fmt.allocPrint(
         allocator,
-        batch_allocs / case_cfg.batch_iterations,
+        "{s}.json",
+        .{case_cfg.descriptor.case_id},
     );
-    try rss_samples.append(
+    defer allocator.free(artifact_name);
+    return std.fs.path.join(
         allocator,
-        result.peak_rss_bytes orelse return error.MissingPeakRss,
+        &.{
+            source_root,
+            ".perf-local",
+            machine_name,
+            "baselines",
+            case_cfg.descriptor.binary,
+            artifact_name,
+        },
     );
 }
 
@@ -3490,11 +3729,7 @@ fn validateSharedDriverArtifact(
         "schema_version",
     );
     const source_matches = std.mem.eql(u8, git_sha, "unknown") or
-        (git_sha.len > 0 and std.mem.startsWith(
-            u8,
-            product_source_sha,
-            git_sha,
-        ));
+        (git_sha.len > 0 and std.mem.startsWith(u8, product_source_sha, git_sha));
     if (!std.mem.eql(u8, case_id, case_cfg.descriptor.case_id) or
         !std.mem.eql(u8, binary, case_cfg.descriptor.binary) or
         !source_matches or schema_version != 1)
@@ -3541,12 +3776,7 @@ fn canonicalDeepDataEvidence(
     rendered: []const u8,
     source_root: []const u8,
 ) !MeasuredOutputEvidence {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        rendered,
-        .{},
-    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |*value| value,
@@ -3594,11 +3824,7 @@ fn canonicalDeepDataEvidence(
     };
 }
 
-fn expectedSourceEventId(
-    path: []const u8,
-    line_number: usize,
-    ordinal: usize,
-) [71]u8 {
+fn expectedSourceEventId(path: []const u8, line_number: usize, ordinal: usize) [71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("trace-source-event/v1\x00");
     hasher.update(path);
@@ -3669,23 +3895,12 @@ fn appendCompatSample(
     if (result.exit_code != 0) return error.CaseFailed;
     try samples.append(allocator, elapsed);
     try alloc_samples.append(allocator, 0);
-    try rss_samples.append(
-        allocator,
-        result.peak_rss_bytes orelse return error.MissingPeakRss,
-    );
+    try rss_samples.append(allocator, result.peak_rss_bytes orelse return error.MissingPeakRss);
 }
 
-fn validateMeasuredOutput(
-    case_cfg: CompatCase,
-    raw: []const u8,
-) !void {
+fn validateMeasuredOutput(case_cfg: CompatCase, raw: []const u8) !void {
     if (!case_cfg.require_streamed_projection) return;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.heap.page_allocator,
-        raw,
-        .{},
-    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |value| value,
@@ -3716,10 +3931,7 @@ fn requireExecutionParity(
     if (baseline.streamed == true and candidate.streamed != true) {
         return error.PerfExecutionTopologyMismatch;
     }
-    try requireOptionalEqual(
-        baseline.records_emitted,
-        candidate.records_emitted,
-    );
+    try requireOptionalEqual(baseline.records_emitted, candidate.records_emitted);
     for ([_][2]?u64{
         .{ baseline.records_scanned, candidate.records_scanned },
         .{ baseline.physical_passes, candidate.physical_passes },
@@ -3740,10 +3952,7 @@ fn requireOptionalEqual(baseline: ?u64, candidate: ?u64) !void {
     }
 }
 
-fn requireOptionalNonIncreasing(
-    baseline: ?u64,
-    candidate: ?u64,
-) !void {
+fn requireOptionalNonIncreasing(baseline: ?u64, candidate: ?u64) !void {
     if (baseline == null and candidate == null) return;
     if (baseline == null or candidate == null or
         candidate.? > baseline.?)
@@ -3764,11 +3973,7 @@ fn measuredOutputEvidenceOnce(
         case_cfg,
         temp_root,
     );
-    const result = try runChildCaptureOutput(
-        allocator,
-        run.cwd,
-        run.argv,
-    );
+    const result = try runChildCaptureOutput(allocator, run.cwd, run.argv);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.CaseFailed;
@@ -3777,18 +3982,17 @@ fn measuredOutputEvidenceOnce(
     std.crypto.hash.sha2.Sha256.hash(result.stdout, &digest, .{});
     var evidence: MeasuredOutputEvidence = .{
         .output_sha256 = std.fmt.bytesToHex(digest, .lower),
-        .semantic_output_sha256 = try semanticOutputDigest(
-            allocator,
-            result.stdout,
-            temp_root,
-        ),
+        .semantic_output_sha256 = try semanticOutputDigest(allocator, result.stdout, temp_root),
     };
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
         result.stdout,
         .{},
-    ) catch return evidence;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return evidence,
+    };
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |value| value,
@@ -3831,9 +4035,12 @@ fn semanticOutputDigest(
         allocator,
         raw,
         .{},
-    ) catch return evidenceDigest(raw);
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return evidenceDigest(raw),
+    };
     defer parsed.deinit();
-    try normalizeSemanticOutput(&parsed.value);
+    try normalizeSemanticOutput(allocator, &parsed.value, raw.len);
     const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
         allocator,
         parsed.value,
@@ -3850,75 +4057,103 @@ fn semanticOutputDigest(
     return evidenceDigest(normalized);
 }
 
-fn normalizeSemanticOutput(value: *std.json.Value) !void {
-    switch (value.*) {
+const SemanticFrame = struct {
+    value: *std.json.Value,
+    next_index: usize = 0,
+};
+
+fn normalizeSemanticOutput(
+    allocator: std.mem.Allocator,
+    value: *std.json.Value,
+    source_bytes: usize,
+) !void {
+    // A parsed tree has fewer nesting frames than source bytes. Each child is visited once.
+    var frames: std.ArrayList(SemanticFrame) = .empty;
+    defer frames.deinit(allocator);
+    if (source_bytes == 0) return error.InvalidPerfSemanticOutput;
+    try frames.append(allocator, .{ .value = value });
+    while (frames.items.len > 0) {
+        const frame = &frames.items[frames.items.len - 1];
+        if (try nextSemanticChild(frame)) |child| {
+            if (frames.items.len >= source_bytes) return error.InvalidPerfSemanticOutput;
+            try frames.append(allocator, .{ .value = child });
+        } else {
+            frames.items.len -= 1;
+        }
+    }
+}
+
+fn nextSemanticChild(frame: *SemanticFrame) !?*std.json.Value {
+    switch (frame.value.*) {
         .object => |*object| {
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "stats")) {
-                    switch (entry.value_ptr.*) {
-                        .object => entry.value_ptr.* = .null,
-                        else => return error.InvalidPerfSemanticOutput,
-                    }
-                    continue;
-                }
-                if (std.mem.eql(u8, entry.key_ptr.*, "definition")) {
-                    const definition = switch (entry.value_ptr.*) {
-                        .object => |*nested| nested,
-                        else => return error.InvalidPerfSemanticOutput,
-                    };
-                    const digest = definition.getPtr("digest") orelse
-                        return error.InvalidPerfSemanticOutput;
-                    const encoded = switch (digest.*) {
-                        .string => |string| string,
-                        else => return error.InvalidPerfSemanticOutput,
-                    };
-                    if (!validSha256Identity(encoded)) {
-                        return error.InvalidPerfSemanticOutput;
-                    }
-                    digest.* = .{ .string = normalized_source_event_id };
-                }
-                if (std.mem.eql(u8, entry.key_ptr.*, "compile_ns") or
-                    std.mem.eql(u8, entry.key_ptr.*, "execution_ns") or
-                    std.mem.eql(u8, entry.key_ptr.*, "output_bytes"))
-                {
-                    entry.value_ptr.* = .{ .integer = 0 };
-                    continue;
-                }
-                if (std.mem.eql(u8, entry.key_ptr.*, "source_event_id")) {
-                    const encoded = switch (entry.value_ptr.*) {
-                        .string => |string| string,
-                        else => return error.InvalidPerfSemanticOutput,
-                    };
-                    if (!validSha256Identity(encoded)) {
-                        return error.InvalidPerfSourceEventIdentity;
-                    }
-                    entry.value_ptr.* = .{
-                        .string = normalized_source_event_id,
-                    };
-                    continue;
-                }
-                if (std.mem.eql(u8, entry.key_ptr.*, "transaction_id")) {
-                    switch (entry.value_ptr.*) {
-                        .string => |string| if (string.len == 0) {
-                            return error.InvalidPerfSemanticOutput;
-                        },
-                        .null => continue,
-                        else => return error.InvalidPerfSemanticOutput,
-                    }
-                    entry.value_ptr.* = .{
-                        .string = normalized_transaction_id,
-                    };
-                    continue;
-                }
-                try normalizeSemanticOutput(entry.value_ptr);
+            while (frame.next_index < object.count()) {
+                const index = frame.next_index;
+                frame.next_index += 1;
+                const child = &object.values()[index];
+                if (try normalizeSemanticEntry(object.keys()[index], child)) return child;
             }
         },
-        .array => |*array| for (array.items) |*item| {
-            try normalizeSemanticOutput(item);
+        .array => |*array| {
+            if (frame.next_index < array.items.len) {
+                const index = frame.next_index;
+                frame.next_index += 1;
+                return &array.items[index];
+            }
         },
         else => {},
     }
+    return null;
+}
+
+fn normalizeSemanticEntry(key: []const u8, value: *std.json.Value) !bool {
+    if (std.mem.eql(u8, key, "stats")) {
+        switch (value.*) {
+            .object => value.* = .null,
+            else => return error.InvalidPerfSemanticOutput,
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "definition")) try normalizeDefinitionDigest(value);
+    if (std.mem.eql(u8, key, "compile_ns") or
+        std.mem.eql(u8, key, "execution_ns") or
+        std.mem.eql(u8, key, "output_bytes"))
+    {
+        value.* = .{ .integer = 0 };
+        return false;
+    }
+    if (std.mem.eql(u8, key, "source_event_id")) {
+        const encoded = switch (value.*) {
+            .string => |string| string,
+            else => return error.InvalidPerfSemanticOutput,
+        };
+        if (!validSha256Identity(encoded)) return error.InvalidPerfSourceEventIdentity;
+        value.* = .{ .string = normalized_source_event_id };
+        return false;
+    }
+    if (std.mem.eql(u8, key, "transaction_id")) {
+        switch (value.*) {
+            .string => |string| if (string.len == 0) return error.InvalidPerfSemanticOutput,
+            .null => return false,
+            else => return error.InvalidPerfSemanticOutput,
+        }
+        value.* = .{ .string = normalized_transaction_id };
+        return false;
+    }
+    return true;
+}
+
+fn normalizeDefinitionDigest(value: *std.json.Value) !void {
+    const definition = switch (value.*) {
+        .object => |*object| object,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    const digest = definition.getPtr("digest") orelse return error.InvalidPerfSemanticOutput;
+    const encoded = switch (digest.*) {
+        .string => |string| string,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    if (!validSha256Identity(encoded)) return error.InvalidPerfSemanticOutput;
+    digest.* = .{ .string = normalized_source_event_id };
 }
 
 fn validSha256Identity(encoded: []const u8) bool {
@@ -3945,43 +4180,21 @@ fn metricsFromSamples(
         .rss_samples = rss_samples,
         .p50_ns = try percentileU64(allocator, samples.items, 50),
         .p95_ns = try percentileU64(allocator, samples.items, 95),
-        .p50_alloc_calls = try percentileU64(
-            allocator,
-            alloc_samples.items,
-            50,
-        ),
-        .p95_rss_bytes = try percentileU64(
-            allocator,
-            rss_samples.items,
-            95,
-        ),
+        .p50_alloc_calls = try percentileU64(allocator, alloc_samples.items, 50),
+        .p95_rss_bytes = try percentileU64(allocator, rss_samples.items, 95),
     };
 }
 
-fn canonicalDataDigest(
-    allocator: std.mem.Allocator,
-    rendered: []const u8,
-) ![64]u8 {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        rendered,
-        .{},
-    );
+fn canonicalDataDigest(allocator: std.mem.Allocator, rendered: []const u8) ![64]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
     defer parsed.deinit();
     const data = parsed.value.object.get("data") orelse
         return error.InvalidPerfSemanticOutput;
     return canonicalValueDigest(allocator, data);
 }
 
-fn canonicalValueDigest(
-    allocator: std.mem.Allocator,
-    value: std.json.Value,
-) ![64]u8 {
-    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
-        allocator,
-        value,
-    );
+fn canonicalValueDigest(allocator: std.mem.Allocator, value: std.json.Value) ![64]u8 {
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(allocator, value);
     defer allocator.free(canonical);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
@@ -3993,10 +4206,7 @@ fn compareMeasuredMetrics(
     baseline: anytype,
     candidate: anytype,
 ) !StatusDetail {
-    const allowed_rss = try observableRssUpperBound(
-        baseline.p95_rss_bytes,
-        resource_tolerance_pct,
-    );
+    const allowed_rss = try observableRssUpperBound(baseline.p95_rss_bytes, resource_tolerance_pct);
     if (candidate.p95_rss_bytes > allowed_rss) {
         return .{
             .status = "FAIL",
@@ -4011,14 +4221,8 @@ fn compareMeasuredMetrics(
             ),
         };
     }
-    const allowed_p50 = allowedUpperBoundWithTolerance(
-        baseline.p50_ns,
-        case_cfg.tolerance_pct,
-    );
-    const allowed_p95 = allowedUpperBoundWithTolerance(
-        baseline.p95_ns,
-        case_cfg.tolerance_pct,
-    );
+    const allowed_p50 = allowedUpperBoundWithTolerance(baseline.p50_ns, case_cfg.tolerance_pct);
+    const allowed_p95 = allowedUpperBoundWithTolerance(baseline.p95_ns, case_cfg.tolerance_pct);
     if (candidate.p50_ns > allowed_p50) {
         return .{
             .status = "FAIL",
@@ -4090,11 +4294,7 @@ fn compareBalancedDeepMetrics(
     const candidate_allocations = allocationSamples(candidate);
     const baseline_rss = rssSamples(baseline);
     const candidate_rss = rssSamples(candidate);
-    const expected_samples = try std.math.mul(
-        usize,
-        case_cfg.samples,
-        paired_comparison_rounds,
-    );
+    const expected_samples = try std.math.mul(usize, case_cfg.samples, paired_comparison_rounds);
     if (baseline_latency.len != expected_samples or
         candidate_latency.len != expected_samples)
     {
@@ -4131,46 +4331,55 @@ fn compareBalancedDeepMetrics(
             baseline_allocations[round],
             candidate_allocations[round],
         );
-        rss_ratios[round] = try ratioPpm(
-            baseline_rss[round],
-            candidate_rss[round],
-        );
+        rss_ratios[round] = try ratioPpm(baseline_rss[round], candidate_rss[round]);
     }
-    const p50_ratio = medianRatioPpm(&p50_ratios);
-    const p95_ratio = medianRatioPpm(&p95_ratios);
-    const allocation_ratio = medianRatioPpm(&allocation_ratios);
-    const rss_ratio = medianRatioPpm(&rss_ratios);
+    return compareBalancedRatios(case_cfg, .{
+        .p50 = medianRatioPpm(&p50_ratios),
+        .p95 = medianRatioPpm(&p95_ratios),
+        .allocations = medianRatioPpm(&allocation_ratios),
+        .rss = medianRatioPpm(&rss_ratios),
+    });
+}
+
+const BalancedRatios = struct { p50: u64, p95: u64, allocations: u64, rss: u64 };
+
+fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDetail {
     const allowed_ratio: u64 = @intFromFloat(std.math.ceil(
         @as(f64, @floatFromInt(ratio_scale)) *
             (1.0 + case_cfg.tolerance_pct / 100.0),
     ));
-    if (p50_ratio > allowed_ratio) {
+    const allowed_p50 = if (case_cfg.primary_optimization) 800_000 else allowed_ratio;
+    const allowed_allocations = if (case_cfg.driver_kind == .optimization)
+        ratio_scale
+    else
+        allowed_ratio;
+    if (ratios.p50 > allowed_p50) {
         return .{
             .status = "FAIL",
             .detail = try std.fmt.allocPrint(
                 std.heap.page_allocator,
                 "balanced round p50 ratio_ppm={d} > {d}",
-                .{ p50_ratio, allowed_ratio },
+                .{ ratios.p50, allowed_p50 },
             ),
         };
     }
-    if (p95_ratio > allowed_ratio) {
+    if (ratios.p95 > allowed_ratio) {
         return .{
             .status = "FAIL",
             .detail = try std.fmt.allocPrint(
                 std.heap.page_allocator,
                 "balanced round p95 ratio_ppm={d} > {d}",
-                .{ p95_ratio, allowed_ratio },
+                .{ ratios.p95, allowed_ratio },
             ),
         };
     }
-    if (allocation_ratio > allowed_ratio) {
+    if (ratios.allocations > allowed_allocations) {
         return .{
             .status = "FAIL",
             .detail = try std.fmt.allocPrint(
                 std.heap.page_allocator,
                 "balanced round allocation ratio_ppm={d} > {d}",
-                .{ allocation_ratio, allowed_ratio },
+                .{ ratios.allocations, allowed_allocations },
             ),
         };
     }
@@ -4178,13 +4387,13 @@ fn compareBalancedDeepMetrics(
         @as(f64, @floatFromInt(ratio_scale)) *
             (1.0 + resource_tolerance_pct / 100.0),
     ));
-    if (rss_ratio > allowed_rss_ratio) {
+    if (ratios.rss > allowed_rss_ratio) {
         return .{
             .status = "FAIL",
             .detail = try std.fmt.allocPrint(
                 std.heap.page_allocator,
                 "balanced round rss ratio_ppm={d} > {d}",
-                .{ rss_ratio, allowed_rss_ratio },
+                .{ ratios.rss, allowed_rss_ratio },
             ),
         };
     }
@@ -4194,7 +4403,7 @@ fn compareBalancedDeepMetrics(
             std.heap.page_allocator,
             "balanced round ratios p50_ppm={d} p95_ppm={d} " ++
                 "allocation_ppm={d} rss_ppm={d}",
-            .{ p50_ratio, p95_ratio, allocation_ratio, rss_ratio },
+            .{ ratios.p50, ratios.p95, ratios.allocations, ratios.rss },
         ),
     };
 }
@@ -4220,21 +4429,9 @@ fn rssSamples(metrics: anytype) []const u64 {
         metrics.rss_samples.items;
 }
 
-fn quantileRatioPpm(
-    baseline: []const u64,
-    candidate: []const u64,
-    percentile: usize,
-) !u64 {
-    const base = try percentileU64(
-        std.heap.page_allocator,
-        baseline,
-        percentile,
-    );
-    const current = try percentileU64(
-        std.heap.page_allocator,
-        candidate,
-        percentile,
-    );
+fn quantileRatioPpm(baseline: []const u64, candidate: []const u64, percentile: usize) !u64 {
+    const base = try percentileU64(std.heap.page_allocator, baseline, percentile);
+    const current = try percentileU64(std.heap.page_allocator, candidate, percentile);
     return ratioPpm(base, current);
 }
 
@@ -4251,11 +4448,7 @@ fn medianRatioPpm(ratios: *[paired_comparison_rounds]u64) u64 {
     return lower + (upper - lower + 1) / 2;
 }
 
-fn writeMetricsObject(
-    writer: *std.Io.Writer,
-    metrics: Metrics,
-    include_allocations: bool,
-) !void {
+fn writeMetricsObject(writer: *std.Io.Writer, metrics: Metrics, include_allocations: bool) !void {
     try writer.writeAll("{\"samples_ns\":[");
     for (metrics.samples.items, 0..) |sample, idx| {
         if (idx > 0) try writer.writeByte(',');
@@ -4288,10 +4481,7 @@ fn writeMetricsObject(
     try writer.writeByte('}');
 }
 
-fn writeSealedFile(
-    writer: *std.Io.Writer,
-    file: SealedFile,
-) !void {
+fn writeSealedFile(writer: *std.Io.Writer, file: SealedFile) !void {
     try writer.writeAll("{\"label\":");
     try writeJsonString(writer, std.fs.path.basename(file.path));
     try writer.writeAll(",\"sha256\":\"sha256:");
@@ -4299,10 +4489,7 @@ fn writeSealedFile(
     try writer.writeAll("\"}");
 }
 
-fn writeBinaryEvidence(
-    writer: *std.Io.Writer,
-    evidence: BinaryEvidence,
-) !void {
+fn writeBinaryEvidence(writer: *std.Io.Writer, evidence: BinaryEvidence) !void {
     try writer.writeAll("{\"file\":");
     try writeSealedFile(writer, evidence.file);
     try writer.writeAll(",\"version\":");
@@ -4326,10 +4513,7 @@ fn writeBinaryEvidence(
     try writer.writeAll("}}");
 }
 
-fn writeCompilerEvidence(
-    writer: *std.Io.Writer,
-    compiler: CompilerEvidence,
-) !void {
+fn writeCompilerEvidence(writer: *std.Io.Writer, compiler: CompilerEvidence) !void {
     try writer.writeAll("{\"approved_path\":");
     try writeJsonString(writer, compiler.approved_path);
     try writer.writeAll(",\"version\":");
@@ -4339,10 +4523,7 @@ fn writeCompilerEvidence(
     try writer.writeByte('}');
 }
 
-fn writeDriverEvidence(
-    writer: *std.Io.Writer,
-    evidence: DriverEvidence,
-) !void {
+fn writeDriverEvidence(writer: *std.Io.Writer, evidence: DriverEvidence) !void {
     try writer.writeAll("{\"file\":");
     try writeSealedFile(writer, evidence.file);
     try writer.writeAll(",\"source\":{\"revision\":");
@@ -4350,9 +4531,13 @@ fn writeDriverEvidence(
     try writer.writeAll(",\"tree\":");
     try writeJsonString(writer, evidence.source_tree_sha);
     try writer.writeAll(",\"path\":");
-    try writeJsonString(writer, active_seq_replay_driver_v1.locator);
+    try writeJsonString(writer, driverIdentity(evidence.kind).locator);
     try writer.writeAll(",\"file\":");
     try writeSealedFile(writer, evidence.source_file);
+    if (evidence.build_source_file) |build_file| {
+        try writer.writeAll(",\"build_file\":");
+        try writeSealedFile(writer, build_file);
+    }
     try writer.writeAll("},\"product_source\":{\"revision\":");
     try writeJsonString(writer, evidence.product_source_sha);
     try writer.writeAll(",\"tree\":");
@@ -4362,9 +4547,16 @@ fn writeDriverEvidence(
     try writer.writeByte('"');
     try writer.writeAll("},\"compiler\":");
     try writeCompilerEvidence(writer, evidence.compiler);
+    try writer.writeAll(",\"build\":{\"optimize\":\"ReleaseFast\",\"step\":");
+    try writeJsonString(writer, switch (evidence.kind) {
+        .seq_replay => "install",
+        .optimization => "optimization-driver",
+    });
+    if (evidence.kind == .optimization) {
+        try writer.writeAll(",\"target\":\"aarch64-macos\",\"cpu\":\"baseline\"");
+    }
     try writer.writeAll(
-        ",\"build\":{\"optimize\":\"ReleaseFast\",\"step\":\"install\"," ++
-            "\"repo_local_prefix\":true,\"isolated_caches\":true," ++
+        ",\"repo_local_prefix\":true,\"isolated_caches\":true," ++
             "\"product_output_isolated\":true}}",
     );
 }
@@ -4409,35 +4601,26 @@ fn writePairedMetricsArtifact(
     if ((baseline_driver == null) != (candidate_driver == null)) {
         return error.IncompletePerfDriverEvidence;
     }
-    try writer.writeAll(",\"baseline\":{\"binary\":");
-    try writeBinaryEvidence(writer, baseline_evidence);
-    if (baseline_driver) |driver| {
-        try writer.writeAll(",\"driver\":");
-        try writeDriverEvidence(writer, driver);
-    }
-    try writer.writeAll(",\"metrics\":");
-    try writeMetricsObject(
+    const include_allocations = case_cfg.descriptor.measurement_mode == .latency_alloc;
+    try writer.writeAll(",\"baseline\":");
+    try writePairedSide(
         writer,
+        baseline_evidence,
+        baseline_driver,
         baseline,
-        case_cfg.descriptor.measurement_mode == .latency_alloc,
+        baseline_execution,
+        include_allocations,
     );
-    try writer.writeAll(",\"execution\":");
-    try writeMeasuredOutputEvidence(writer, baseline_execution);
-    try writer.writeAll("},\"candidate\":{\"binary\":");
-    try writeBinaryEvidence(writer, candidate_evidence);
-    if (candidate_driver) |driver| {
-        try writer.writeAll(",\"driver\":");
-        try writeDriverEvidence(writer, driver);
-    }
-    try writer.writeAll(",\"metrics\":");
-    try writeMetricsObject(
+    try writer.writeAll(",\"candidate\":");
+    try writePairedSide(
         writer,
+        candidate_evidence,
+        candidate_driver,
         candidate,
-        case_cfg.descriptor.measurement_mode == .latency_alloc,
+        candidate_execution,
+        include_allocations,
     );
-    try writer.writeAll(",\"execution\":");
-    try writeMeasuredOutputEvidence(writer, candidate_execution);
-    try writer.writeAll("},\"compare_status\":");
+    try writer.writeAll(",\"compare_status\":");
     try writeJsonString(writer, compare_status);
     try writer.writeAll(",\"compare_detail\":");
     try writeJsonString(writer, compare_detail);
@@ -4445,10 +4628,28 @@ fn writePairedMetricsArtifact(
     return output.toOwnedSlice();
 }
 
-fn writeMeasuredOutputEvidence(
+fn writePairedSide(
     writer: *std.Io.Writer,
-    evidence: MeasuredOutputEvidence,
+    binary: BinaryEvidence,
+    driver: ?DriverEvidence,
+    metrics: Metrics,
+    execution: MeasuredOutputEvidence,
+    include_allocations: bool,
 ) !void {
+    try writer.writeAll("{\"binary\":");
+    try writeBinaryEvidence(writer, binary);
+    if (driver) |evidence| {
+        try writer.writeAll(",\"driver\":");
+        try writeDriverEvidence(writer, evidence);
+    }
+    try writer.writeAll(",\"metrics\":");
+    try writeMetricsObject(writer, metrics, include_allocations);
+    try writer.writeAll(",\"execution\":");
+    try writeMeasuredOutputEvidence(writer, execution);
+    try writer.writeAll("}");
+}
+
+fn writeMeasuredOutputEvidence(writer: *std.Io.Writer, evidence: MeasuredOutputEvidence) !void {
     try writer.writeAll("{\"output_sha256\":\"sha256:");
     try writer.writeAll(&evidence.output_sha256);
     try writer.writeAll("\",\"semantic_output_sha256\":\"sha256:");
@@ -4494,11 +4695,7 @@ fn writeMeasuredOutputEvidence(
     try writer.writeByte('}');
 }
 
-fn writeOptionalU64(
-    writer: *std.Io.Writer,
-    field: []const u8,
-    value: ?u64,
-) !void {
+fn writeOptionalU64(writer: *std.Io.Writer, field: []const u8, value: ?u64) !void {
     try writer.writeAll(",\"");
     try writer.writeAll(field);
     try writer.writeAll("\":");
@@ -4527,23 +4724,12 @@ fn prepareCompatCase(
     );
     defer allocator.free(repo_path);
     try makeRepoAwarePath(allocator, repo_path);
-    const definition_path = try prepareLedgerPerfDefinition(
-        allocator,
-        temp_root,
-    );
+    const definition_path = try prepareLedgerPerfDefinition(allocator, temp_root);
     defer allocator.free(definition_path);
-    try prepareLedgerPerfStore(
-        allocator,
-        repo_path,
-        definition_path,
-        case_cfg,
-    );
+    try prepareLedgerPerfStore(allocator, repo_path, definition_path, case_cfg);
 }
 
-fn prepareSeqPerfCorpus(
-    allocator: std.mem.Allocator,
-    temp_root: []const u8,
-) !void {
+fn prepareSeqPerfCorpus(allocator: std.mem.Allocator, temp_root: []const u8) !void {
     const session_dir = try std.fs.path.join(
         allocator,
         &.{ temp_root, "seq-sessions/2026/07/26" },
@@ -4564,10 +4750,7 @@ fn prepareSeqPerfCorpus(
     );
 }
 
-fn prepareLedgerPerfDefinition(
-    allocator: std.mem.Allocator,
-    temp_root: []const u8,
-) ![]u8 {
+fn prepareLedgerPerfDefinition(allocator: std.mem.Allocator, temp_root: []const u8) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         "apps/ledger/src/v1/fixtures/event-definition.json",
@@ -4682,7 +4865,11 @@ fn prepareLedgerPerfStore(
     if (result.exit_code != 0) return error.PerfSetupFailed;
 }
 
-fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root: []const u8) !CommandRun {
+fn renderCompatRun(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    temp_root: []const u8,
+) !CommandRun {
     const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
     errdefer allocator.free(binary_path);
     _ = case_cfg.builder;
@@ -4691,6 +4878,39 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
     errdefer args.deinit(allocator);
 
     switch (case_cfg.setup) {
+        .seq_definition_check,
+        .seq_observe,
+        .seq_sessions,
+        .seq_query,
+        => try appendSeqCompatArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
+        .ledger_definition_check,
+        .ledger_validate,
+        .ledger_materialize,
+        => try appendLedgerRecordArgs(allocator, &args, case_cfg.setup, binary_path),
+        .ledger_transact,
+        .ledger_project,
+        .ledger_doctor,
+        => try appendLedgerStoreArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
+        .cas_wrapper_smoke => return renderCasWrapperSmoke(allocator, binary_path, temp_root, cwd),
+        .cas_automation_list => try appendCasAutomationListArgs(
+            allocator,
+            &args,
+            binary_path,
+            temp_root,
+        ),
+        else => try appendMiscCompatArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
+    }
+    return .{ .cwd = cwd, .argv = try args.toOwnedSlice(allocator) };
+}
+
+fn appendSeqCompatArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    setup: CompatSetup,
+    binary_path: []const u8,
+    temp_root: []const u8,
+) !void {
+    switch (setup) {
         .seq_definition_check => try args.appendSlice(allocator, &.{
             binary_path,
             "definition",
@@ -4714,38 +4934,34 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
-        .seq_sessions => {
-            const root = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "seq-sessions" },
-            );
-            try args.appendSlice(allocator, &.{
-                binary_path,
-                "sessions",
-                "--root",
-                root,
-                "--format",
-                "json",
-            });
+        .seq_sessions, .seq_query => {
+            const root = try std.fs.path.join(allocator, &.{ temp_root, "seq-sessions" });
+            if (setup == .seq_sessions) {
+                try args.appendSlice(allocator, &.{
+                    binary_path, "sessions", "--root", root, "--format", "json",
+                });
+            } else {
+                try args.appendSlice(allocator, &.{
+                    binary_path, "query", "--root", root, "--spec",
+                    "{\"dataset\":\"messages\",\"where\":[" ++
+                        "{\"field\":\"text\",\"op\":\"contains\"," ++
+                        "\"value\":\"failure\",\"case_insensitive\":true}]," ++
+                        "\"select\":[\"session_id\",\"role\",\"text\"]," ++
+                        "\"limit\":5,\"format\":\"json\"}",
+                });
+            }
         },
-        .seq_query => {
-            const root = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "seq-sessions" },
-            );
-            try args.appendSlice(allocator, &.{
-                binary_path,
-                "query",
-                "--root",
-                root,
-                "--spec",
-                "{\"dataset\":\"messages\",\"where\":[" ++
-                    "{\"field\":\"text\",\"op\":\"contains\"," ++
-                    "\"value\":\"failure\",\"case_insensitive\":true}]," ++
-                    "\"select\":[\"session_id\",\"role\",\"text\"]," ++
-                    "\"limit\":5,\"format\":\"json\"}",
-            });
-        },
+        else => return error.InvalidCommand,
+    }
+}
+
+fn appendLedgerRecordArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    setup: CompatSetup,
+    binary_path: []const u8,
+) !void {
+    switch (setup) {
         .ledger_definition_check => try args.appendSlice(allocator, &.{
             binary_path,
             "definition",
@@ -4755,9 +4971,9 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
-        .ledger_validate => try args.appendSlice(allocator, &.{
+        .ledger_validate, .ledger_materialize => try args.appendSlice(allocator, &.{
             binary_path,
-            "validate",
+            if (setup == .ledger_validate) "validate" else "materialize",
             "--definition",
             "apps/ledger/src/v1/fixtures/record-definition.json",
             "--input",
@@ -4765,84 +4981,60 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
-        .ledger_materialize => try args.appendSlice(allocator, &.{
+        else => return error.InvalidCommand,
+    }
+}
+
+fn appendLedgerStoreArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    setup: CompatSetup,
+    binary_path: []const u8,
+    temp_root: []const u8,
+) !void {
+    const repo_path = try std.fs.path.join(allocator, &.{ temp_root, "ledger-repo" });
+    const definition_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_root, "ledger-event-definition.json" },
+    );
+    switch (setup) {
+        .ledger_transact => try args.appendSlice(allocator, &.{
             binary_path,
-            "materialize",
+            "transact",
             "--definition",
-            "apps/ledger/src/v1/fixtures/record-definition.json",
+            definition_path,
+            "--operation",
+            "append",
+            "--repo",
+            repo_path,
             "--input",
-            "record=apps/ledger/src/v1/fixtures/record-valid.json",
+            "event=apps/ledger/src/v1/fixtures/event-one.json",
+            "--param",
+            "request=perf",
             "--format",
             "json",
         }),
-        .ledger_transact => {
-            const repo_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-repo" },
-            );
-            const definition_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-event-definition.json" },
-            );
-            try args.appendSlice(allocator, &.{
-                binary_path,
-                "transact",
-                "--definition",
-                definition_path,
-                "--operation",
-                "append",
-                "--repo",
-                repo_path,
-                "--input",
-                "event=apps/ledger/src/v1/fixtures/event-one.json",
-                "--param",
-                "request=perf",
-                "--format",
-                "json",
-            });
-        },
-        .ledger_project => {
-            const repo_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-repo" },
-            );
-            const definition_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-event-definition.json" },
-            );
-            try args.appendSlice(allocator, &.{
-                binary_path,
-                "project",
-                "--definition",
-                definition_path,
-                "--projection",
-                "all",
-                "--repo",
-                repo_path,
-                "--format",
-                "json",
-            });
-        },
-        .ledger_doctor => {
-            const repo_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-repo" },
-            );
-            const definition_path = try std.fs.path.join(
-                allocator,
-                &.{ temp_root, "ledger-event-definition.json" },
-            );
-            try args.appendSlice(allocator, &.{
-                binary_path,
-                "doctor",
-                "--definition",
-                definition_path,
-                "--repo",
-                repo_path,
-                "--format",
-                "json",
-            });
-        },
+        .ledger_project => try args.appendSlice(allocator, &.{
+            binary_path,    "project", "--definition", definition_path,
+            "--projection", "all",     "--repo",       repo_path,
+            "--format",     "json",
+        }),
+        .ledger_doctor => try args.appendSlice(allocator, &.{
+            binary_path, "doctor",  "--definition", definition_path,
+            "--repo",    repo_path, "--format",     "json",
+        }),
+        else => return error.InvalidCommand,
+    }
+}
+
+fn appendMiscCompatArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    setup: CompatSetup,
+    binary_path: []const u8,
+    temp_root: []const u8,
+) !void {
+    switch (setup) {
         .bench_stats_help,
         .perf_report_help,
         .cas_smoke_check_help,
@@ -4853,40 +5045,66 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             allocator,
             &.{ binary_path, "automation", "--help" },
         ),
-        .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
+        .cas_review_session_version => try args.appendSlice(
+            allocator,
+            &.{ binary_path, "--version" },
+        ),
         .bench_stats_parse => {
-            const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
+            const input_path = try std.fs.path.join(
+                allocator,
+                &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" },
+            );
             try args.appendSlice(allocator, &.{ binary_path, "--input", input_path, "--json" });
         },
         .perf_report_render => {
             const output_path = try std.fs.path.join(allocator, &.{ temp_root, "perf-report.md" });
-            try args.appendSlice(allocator, &.{ binary_path, "--title", "Perf", "--owner", "tk", "--system", "skills-zig", "--output", output_path });
-        },
-        .cas_wrapper_smoke => {
-            const wrapper_dir = try std.fs.path.join(allocator, &.{ temp_root, "cas-wrapper" });
-            try makeRepoAwarePath(allocator, wrapper_dir);
-            const wrapper_binary = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas" });
-            const source_binary = try absolutePathForCwdRelative(allocator, binary_path);
-            defer allocator.free(source_binary);
-            try std.Io.Dir.copyFileAbsolute(source_binary, wrapper_binary, std.Io.Threaded.global_single_threaded.io(), .{});
-            try makeExecutable(wrapper_binary);
-            const stub_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas_smoke_check" });
-            try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = stub_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
-            try makeExecutable(stub_path);
-            return .{ .cwd = cwd, .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }) };
-        },
-        .cas_automation_list => {
-            const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)});
-            const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
-            try seedCasAutomationDb(allocator, db_path);
-            try args.appendSlice(
-                allocator,
-                &.{ binary_path, "automation", "--db", db_path, "list" },
-            );
+            try args.appendSlice(allocator, &.{
+                binary_path, "--title",   "Perf", "--owner", "tk", "--system", "skills-zig",
+                "--output",  output_path,
+            });
         },
         else => return error.InvalidCommand,
     }
-    return .{ .cwd = cwd, .argv = try args.toOwnedSlice(allocator) };
+}
+
+fn renderCasWrapperSmoke(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+    temp_root: []const u8,
+    cwd: []const u8,
+) !CommandRun {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const wrapper_dir = try std.fs.path.join(allocator, &.{ temp_root, "cas-wrapper" });
+    try makeRepoAwarePath(allocator, wrapper_dir);
+    const wrapper_binary = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas" });
+    const source_binary = try absolutePathForCwdRelative(allocator, binary_path);
+    defer allocator.free(source_binary);
+    try std.Io.Dir.copyFileAbsolute(source_binary, wrapper_binary, io, .{});
+    try makeExecutable(wrapper_binary);
+    const stub_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas_smoke_check" });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = stub_path,
+        .data = "#!/usr/bin/env bash\nexit 0\n",
+    });
+    try makeExecutable(stub_path);
+    return .{
+        .cwd = cwd,
+        .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }),
+    };
+}
+
+fn appendCasAutomationListArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    binary_path: []const u8,
+    temp_root: []const u8,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const stamp_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{stamp_ms});
+    const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
+    try seedCasAutomationDb(allocator, db_path);
+    try args.appendSlice(allocator, &.{ binary_path, "automation", "--db", db_path, "list" });
 }
 
 const ChildResult = struct {
@@ -4896,7 +5114,11 @@ const ChildResult = struct {
     peak_rss_bytes: ?u64 = null,
 };
 
-fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
+fn runChildCapture(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+) !ChildResult {
     if (builtin.os.tag == .macos) {
         return runChildCapturePosixSpawn(allocator, cwd, argv, false);
     }
@@ -4936,30 +5158,14 @@ fn runChildCapturePosixSpawn(
     capture_stdout: bool,
 ) !ChildResult {
     if (argv.len == 0) return error.FileNotFound;
-
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer allocator.free(argv_buf);
-
-    var arg_storage = try allocator.alloc([:0]u8, argv.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-    for (argv, 0..) |arg, idx| {
-        arg_storage[idx] = try allocator.dupeZ(u8, arg);
-        arg_count += 1;
-        argv_buf[idx] = arg_storage[idx].ptr;
-    }
-
+    var arguments = try SpawnArguments.init(allocator, argv);
+    defer arguments.deinit(allocator);
     const cwd_z = try allocator.dupeZ(u8, cwd);
     defer allocator.free(cwd_z);
-
     var actions: std.c.posix_spawn_file_actions_t = undefined;
     const init_rc = std.c.posix_spawn_file_actions_init(&actions);
     if (init_rc != 0) return posixSpawnError(init_rc);
-    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
-
+    defer destroySpawnActions(&actions);
     const capture_root = if (capture_stdout)
         try makeTempRoot(allocator, "capture")
     else
@@ -4975,6 +5181,61 @@ fn runChildCapturePosixSpawn(
     else
         null;
     defer if (capture_path_z) |path| allocator.free(path);
+    try configureSpawnActions(&actions, cwd_z, capture_path_z);
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = std.c.posix_spawnp(
+        &pid,
+        arguments.pointers[0].?,
+        &actions,
+        null,
+        arguments.pointers.ptr,
+        envp,
+    );
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+    return waitForCapturedChild(allocator, pid, capture_path);
+}
+
+const SpawnArguments = struct {
+    pointers: [:null]?[*:0]const u8,
+    storage: [][:0]u8,
+    count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, argv: []const []const u8) !SpawnArguments {
+        const pointers = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+        errdefer allocator.free(pointers);
+        const storage = try allocator.alloc([:0]u8, argv.len);
+        errdefer allocator.free(storage);
+        var result = SpawnArguments{ .pointers = pointers, .storage = storage };
+        errdefer for (storage[0..result.count]) |arg| allocator.free(arg);
+        for (argv, 0..) |arg, idx| {
+            storage[idx] = try allocator.dupeZ(u8, arg);
+            result.count += 1;
+            pointers[idx] = storage[idx].ptr;
+        }
+        return result;
+    }
+
+    fn deinit(self: *SpawnArguments, allocator: std.mem.Allocator) void {
+        for (self.storage[0..self.count]) |arg| allocator.free(arg);
+        allocator.free(self.storage);
+        allocator.free(self.pointers);
+    }
+};
+
+fn destroySpawnActions(actions: *std.c.posix_spawn_file_actions_t) void {
+    const rc = std.c.posix_spawn_file_actions_destroy(actions);
+    if (rc != 0) {
+        std.log.warn("spawn action cleanup failed error={s}", .{@errorName(posixSpawnError(rc))});
+    }
+}
+
+fn configureSpawnActions(
+    actions: *std.c.posix_spawn_file_actions_t,
+    cwd: [:0]const u8,
+    capture_path: ?[:0]const u8,
+) !void {
     const dev_null = "/dev/null";
     const dev_null_flags: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .ACCMODE = .WRONLY })));
     const stdout_flags: c_int = @intCast(@as(u32, @bitCast(std.c.O{
@@ -4983,29 +5244,30 @@ fn runChildCapturePosixSpawn(
         .TRUNC = true,
     })));
     const stdout_rc = std.c.posix_spawn_file_actions_addopen(
-        &actions,
+        actions,
         1,
-        if (capture_path_z) |path| path else dev_null,
-        if (capture_stdout) stdout_flags else dev_null_flags,
-        if (capture_stdout) 0o600 else 0,
+        if (capture_path) |path| path else dev_null,
+        if (capture_path != null) stdout_flags else dev_null_flags,
+        if (capture_path != null) 0o600 else 0,
     );
     if (stdout_rc != 0) return posixSpawnError(stdout_rc);
     const stderr_rc = std.c.posix_spawn_file_actions_addopen(
-        &actions,
+        actions,
         2,
         dev_null,
         dev_null_flags,
         0,
     );
     if (stderr_rc != 0) return posixSpawnError(stderr_rc);
-    const chdir_rc = std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z);
+    const chdir_rc = std.c.posix_spawn_file_actions_addchdir_np(actions, cwd);
     if (chdir_rc != 0) return posixSpawnError(chdir_rc);
+}
 
-    var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
-
+fn waitForCapturedChild(
+    allocator: std.mem.Allocator,
+    pid: std.c.pid_t,
+    capture_path: ?[]const u8,
+) !ChildResult {
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     var usage: std.posix.rusage = undefined;
     while (true) switch (std.posix.errno( // tiger: event-loop -- bounded by child exit.
@@ -5021,6 +5283,7 @@ fn runChildCapturePosixSpawn(
                 )
             else
                 try allocator.dupe(u8, "");
+            errdefer allocator.free(stdout);
             return .{
                 .exit_code = statusToExitCode(@bitCast(status)),
                 .stdout = stdout,
@@ -5060,19 +5323,23 @@ fn statusToExitCode(status: u32) u8 {
 }
 
 fn makeTempRoot(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     const stamp = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
-    const base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/perf-hub/{d}-{s}", .{ cwd, stamp, label });
+    const base = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/perf-hub/{d}-{s}",
+        .{ cwd, stamp, label },
+    );
+    errdefer allocator.free(base);
     try makeRepoAwarePath(allocator, base);
     return base;
 }
 
-fn releaseTempRoot(
-    allocator: std.mem.Allocator,
-    path: []u8,
-    retain: bool,
-) void {
+fn releaseTempRoot(allocator: std.mem.Allocator, path: []u8, retain: bool) void {
     if (!retain) {
         std.Io.Dir.cwd().deleteTree(
             std.Io.Threaded.global_single_threaded.io(),
@@ -5088,14 +5355,21 @@ fn releaseTempRoot(
 }
 
 fn makeExecutable(path: []const u8) !void {
-    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .read_write });
+    var file = try std.Io.Dir.cwd().openFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .mode = .read_write },
+    );
     defer file.close(std.Io.Threaded.global_single_threaded.io());
     try file.setPermissions(std.Io.Threaded.global_single_threaded.io(), @enumFromInt(0o755));
 }
 
 fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
@@ -5104,8 +5378,11 @@ fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void 
     const db_path_z = try allocator.dupeZ(u8, db_path);
     defer allocator.free(db_path_z);
     var db_opt: ?*Sqlite.sqlite3 = null;
-    if (Sqlite.sqlite3_open(db_path_z, &db_opt) != Sqlite.SQLITE_OK or db_opt == null) return error.InvalidData;
-    defer _ = Sqlite.sqlite3_close(db_opt.?);
+    const open_rc = Sqlite.sqlite3_open(db_path_z, &db_opt);
+    defer if (db_opt) |db| closeAutomationDb(db);
+    if (open_rc != Sqlite.SQLITE_OK or db_opt == null) {
+        return error.InvalidData;
+    }
 
     const schema =
         \\create table automations (
@@ -5140,16 +5417,27 @@ fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void 
     const schema_z = try allocator.dupeZ(u8, schema);
     defer allocator.free(schema_z);
     var err_msg: ?[*:0]u8 = null;
+    defer if (err_msg) |message| Sqlite.sqlite3_free(@ptrCast(message));
     if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
-        if (err_msg) |msg| {
-            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stderr_writer.interface.print(
-                "seedCasAutomationDb sqlite error: {s}\n",
-                .{std.mem.sliceTo(msg, 0)},
-            );
-        }
+        if (err_msg) |msg| try reportAutomationDbError(msg);
         return error.InvalidData;
     }
+}
+
+fn reportAutomationDbError(message: [*:0]const u8) !void {
+    var stderr_writer = std.Io.File.stderr().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    try stderr_writer.interface.print(
+        "seedCasAutomationDb sqlite error: {s}\n",
+        .{std.mem.sliceTo(message, 0)},
+    );
+}
+
+fn closeAutomationDb(db: *Sqlite.sqlite3) void {
+    const rc = Sqlite.sqlite3_close(db);
+    if (rc != Sqlite.SQLITE_OK) std.log.warn("automation database cleanup failed code={d}", .{rc});
 }
 
 fn percentileU64(allocator: std.mem.Allocator, samples: []const u64, p: usize) !u64 {
@@ -5177,7 +5465,7 @@ fn jsonFieldU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
 fn jsonValueU64(value: std.json.Value, _: []const u8) !u64 {
     return switch (value) {
         .integer => |v| if (v >= 0) @intCast(v) else error.InvalidData,
-        .float => |v| if (v >= 0) @intFromFloat(v) else error.InvalidData,
+        .float => |v| if (v >= 0 and v < 0x1p64) @intFromFloat(v) else error.InvalidData,
         else => error.InvalidData,
     };
 }
@@ -5198,6 +5486,8 @@ const CapsuleCompiler = struct {
 const CapsuleBuild = struct {
     optimize: []const u8,
     step: []const u8,
+    target: ?[]const u8 = null,
+    cpu: ?[]const u8 = null,
     repo_local_prefix: bool,
     isolated_caches: bool,
     product_output_isolated: bool,
@@ -5214,6 +5504,7 @@ const CapsuleDriverSource = struct {
     tree: []const u8,
     path: []const u8,
     file: CapsuleFile,
+    build_file: ?CapsuleFile = null,
 };
 const CapsuleDriverProductSource = struct {
     revision: []const u8,
@@ -5293,6 +5584,21 @@ const CapsuleLocator = struct {
 };
 
 fn cmdReport(allocator: std.mem.Allocator) !void {
+    const data = try loadReportCapsuleBytes(allocator);
+    defer allocator.free(data);
+    var parsed = std.json.parseFromSlice(
+        PerformanceCapsule,
+        allocator,
+        data,
+        .{},
+    ) catch return error.InvalidCompareSummary;
+    defer parsed.deinit();
+    try validatePerformanceCapsule(allocator, parsed.value, true);
+    try validateCutoverReportSource(allocator, parsed.value);
+    try renderReportTotals(allocator, parsed.value.rows);
+}
+
+fn loadReportCapsuleBytes(allocator: std.mem.Allocator) ![]u8 {
     const machine_dir = try resolveMachineDir(allocator, ".perf-local");
     defer allocator.free(machine_dir);
     const locator_path = try std.fs.path.join(
@@ -5321,37 +5627,34 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         locator.value.schema,
         "performance-capsule-ref/v1",
     )) return error.InvalidCompareSummary;
-    const data = try loadCapsuleFileAlloc(
+    return loadCapsuleFileAlloc(
         allocator,
         locator.value.capsule orelse return error.MissingCompareSummary,
         4 * 1024 * 1024,
     );
-    defer allocator.free(data);
-    var parsed = std.json.parseFromSlice(
-        PerformanceCapsule,
-        allocator,
-        data,
-        .{},
-    ) catch return error.InvalidCompareSummary;
-    defer parsed.deinit();
-    try validatePerformanceCapsule(allocator, parsed.value, true);
-    const cutover = parsed.value.target != null and
-        std.mem.eql(u8, parsed.value.target.?, "cutover");
-    if (cutover) {
-        const value = ReportTuple{
-            .base_sha = parsed.value.expected_base_sha,
-            .candidate_sha = parsed.value.expected_candidate_sha,
-        };
-        const environment = process_environment orelse
-            return error.ExpectedSourceShaRequired;
-        const current_sha = try sourceShaForRootAlloc(allocator, ".");
-        defer allocator.free(current_sha);
-        try requireCutoverReportTuple(environment, value, current_sha);
-        try requireCleanSourceRoot(allocator, ".");
-    }
+}
+
+fn validateCutoverReportSource(
+    allocator: std.mem.Allocator,
+    capsule: PerformanceCapsule,
+) !void {
+    const target = capsule.target orelse return;
+    if (!std.mem.eql(u8, target, "cutover")) return;
+    const value = ReportTuple{
+        .base_sha = capsule.expected_base_sha,
+        .candidate_sha = capsule.expected_candidate_sha,
+    };
+    const environment = process_environment orelse return error.ExpectedSourceShaRequired;
+    const current_sha = try sourceShaForRootAlloc(allocator, ".");
+    defer allocator.free(current_sha);
+    try requireCutoverReportTuple(environment, value, current_sha);
+    try requireCleanSourceRoot(allocator, ".");
+}
+
+fn renderReportTotals(allocator: std.mem.Allocator, rows: []const CapsuleRow) !void {
     var totals = std.StringHashMap(ReportCounts).init(allocator);
     defer totals.deinit();
-    for (parsed.value.rows) |row| {
+    for (rows) |row| {
         const entry = try totals.getOrPutValue(row.binary, .{});
         if (std.mem.eql(u8, row.status, "PASS")) {
             entry.value_ptr.pass += 1;
@@ -5360,7 +5663,10 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         }
     }
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     var row_keys: std.ArrayList([]const u8) = .empty;
     defer row_keys.deinit(allocator);
@@ -5459,16 +5765,8 @@ fn validatePairedEvidence(
         return error.PerfDriverConfigurationMismatch;
     }
     try requireDigestIdentity(evidence.workload_digest);
-    try validateProductEvidence(
-        allocator,
-        evidence.baseline.binary,
-        expected_base,
-    );
-    try validateProductEvidence(
-        allocator,
-        evidence.candidate.binary,
-        expected_candidate,
-    );
+    try validateProductEvidence(allocator, evidence.baseline.binary, expected_base);
+    try validateProductEvidence(allocator, evidence.candidate.binary, expected_candidate);
     if (!std.mem.eql(
         u8,
         evidence.baseline.binary.compiler.file.sha256,
@@ -5476,52 +5774,14 @@ fn validatePairedEvidence(
     )) return error.CompilerBinaryChanged;
     const deep = isDeepCaseId(row.case_id);
     if (deep) {
-        const baseline_driver = evidence.baseline.driver orelse
-            return error.IncompletePerfDriverEvidence;
-        const candidate_driver = evidence.candidate.driver orelse
-            return error.IncompletePerfDriverEvidence;
-        try validateDriverEvidence(
-            allocator,
-            baseline_driver,
-            evidence.baseline.binary,
-        );
-        try validateDriverEvidence(
-            allocator,
-            candidate_driver,
-            evidence.candidate.binary,
-        );
-        try validateRetainedDeepWorkload(
-            allocator,
-            evidence.workload_digest,
-            evidence.baseline.binary.source.revision,
-            evidence.candidate.binary.source.revision,
-        );
-        if (!std.mem.eql(
-            u8,
-            baseline_driver.source.file.sha256,
-            candidate_driver.source.file.sha256,
-        ) or !std.mem.eql(
-            u8,
-            baseline_driver.source.revision,
-            candidate_driver.source.revision,
-        )) return error.PerfDriverSourceMismatch;
+        try validatePairedDeepDrivers(allocator, evidence);
     } else if (evidence.baseline.driver != null or
         evidence.candidate.driver != null)
     {
         return error.InvalidPerfEvidenceFile;
     }
-    try validateRetainedMetrics(
-        allocator,
-        evidence.baseline.metrics,
-        config,
-        deep,
-    );
-    try validateRetainedMetrics(
-        allocator,
-        evidence.candidate.metrics,
-        config,
-        deep,
-    );
+    try validateRetainedMetrics(allocator, evidence.baseline.metrics, config, deep);
+    try validateRetainedMetrics(allocator, evidence.candidate.metrics, config, deep);
     try validateExecution(evidence.baseline.execution);
     try validateExecution(evidence.candidate.execution);
     try requireExecutionParity(
@@ -5530,16 +5790,12 @@ fn validatePairedEvidence(
     );
     const computed = if (deep)
         try compareBalancedDeepMetrics(
-            DeepCases[0],
+            deepCaseForId(row.case_id) orelse return error.InvalidPerfEvidenceFile,
             evidence.baseline.metrics,
             evidence.candidate.metrics,
         )
     else
-        try compareMeasuredMetrics(
-            config,
-            evidence.baseline.metrics,
-            evidence.candidate.metrics,
-        );
+        try compareMeasuredMetrics(config, evidence.baseline.metrics, evidence.candidate.metrics);
     if (!std.mem.eql(u8, computed.status, evidence.compare_status) or
         !std.mem.eql(u8, evidence.compare_status, row.status))
     {
@@ -5547,8 +5803,100 @@ fn validatePairedEvidence(
     }
 }
 
+fn validatePairedDeepDrivers(
+    allocator: std.mem.Allocator,
+    evidence: CapsuleEvidence,
+) !void {
+    const case_cfg = deepCaseForId(evidence.case_id) orelse
+        return error.InvalidPerfEvidenceFile;
+    const baseline_driver = evidence.baseline.driver orelse
+        return error.IncompletePerfDriverEvidence;
+    const candidate_driver = evidence.candidate.driver orelse
+        return error.IncompletePerfDriverEvidence;
+    try validateDriverEvidence(allocator, baseline_driver, evidence.baseline.binary);
+    try validateDriverEvidence(allocator, candidate_driver, evidence.candidate.binary);
+    for ([_]CapsuleDriver{ baseline_driver, candidate_driver }) |driver| {
+        const optimization = driverSourceMatchesIdentity(
+            driver.source,
+            active_optimization_driver_v1,
+        );
+        if (optimization != (case_cfg.driver_kind == .optimization)) {
+            return error.PerfDriverSourceMismatch;
+        }
+    }
+    if (case_cfg.driver_kind == .optimization) {
+        try validateRetainedOptimization(
+            allocator,
+            case_cfg,
+            evidence.workload_digest,
+            evidence.baseline,
+        );
+        try validateRetainedOptimization(
+            allocator,
+            case_cfg,
+            evidence.workload_digest,
+            evidence.candidate,
+        );
+    } else {
+        try validateRetainedDeepWorkload(
+            allocator,
+            case_cfg,
+            evidence.workload_digest,
+            evidence.baseline.binary.source.revision,
+            evidence.candidate.binary.source.revision,
+        );
+    }
+    if (!std.mem.eql(
+        u8,
+        baseline_driver.source.file.sha256,
+        candidate_driver.source.file.sha256,
+    ) or !std.mem.eql(
+        u8,
+        baseline_driver.source.revision,
+        candidate_driver.source.revision,
+    )) return error.PerfDriverSourceMismatch;
+}
+
+fn validateRetainedOptimization(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    workload_identity: []const u8,
+    side: CapsuleSide,
+) !void {
+    const driver = side.driver orelse return error.IncompletePerfDriverEvidence;
+    var retained_driver = try capsuleSealedFile(allocator, driver.file);
+    defer retained_driver.deinit(allocator);
+    const oracle = try optimizationOracle(allocator, retained_driver, case_cfg.descriptor.case_id);
+    try verifyCapsuleFile(allocator, driver.source.file);
+    try verifyCapsuleFile(
+        allocator,
+        driver.source.build_file orelse return error.PerfDriverSourceMismatch,
+    );
+    try validateOptimizationObservation(oracle, workload_identity, side.execution);
+}
+
+fn validateOptimizationObservation(
+    oracle: OptimizationOracle,
+    workload_identity: []const u8,
+    retained_execution: CapsuleExecution,
+) !void {
+    const workload = try digestBytes(workload_identity);
+    if (!std.mem.eql(u8, &workload, &oracle.workload_digest)) return error.PerfWorkloadMismatch;
+    const execution = try executionEvidence(retained_execution);
+    if (!std.mem.eql(u8, &execution.output_sha256, &oracle.execution.output_sha256) or
+        !std.mem.eql(
+            u8,
+            &execution.semantic_output_sha256,
+            &oracle.execution.semantic_output_sha256,
+        ))
+    {
+        return error.PerfSemanticOutputMismatch;
+    }
+}
+
 fn validateRetainedDeepWorkload(
     allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
     identity: []const u8,
     baseline_revision: []const u8,
     candidate_revision: []const u8,
@@ -5561,15 +5909,15 @@ fn validateRetainedDeepWorkload(
         candidate_revision,
     }) |revision| {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hasher.update(DeepCases[0].descriptor.case_id);
+        hasher.update(case_cfg.descriptor.case_id);
         hasher.update(&.{0});
-        hasher.update(@tagName(DeepCases[0].setup));
+        hasher.update(@tagName(case_cfg.setup));
         hasher.update(&.{0});
         var encoded: [32]u8 = undefined;
         hasher.update(try std.fmt.bufPrint(
             &encoded,
             "{d}",
-            .{DeepCases[0].batch_iterations},
+            .{case_cfg.batch_iterations},
         ));
         for ([_][]const u8{
             "apps/seq/src/v1/fixtures/message-observation.json",
@@ -5605,23 +5953,15 @@ fn validateRetainedDeepWorkload(
 
 fn evidenceCaseConfig(case_id: []const u8) ?CompatCase {
     for (CompatCases) |config| {
-        if (std.mem.eql(
-            u8,
-            config.descriptor.case_id,
-            case_id,
-        )) return config;
+        if (std.mem.eql(u8, config.descriptor.case_id, case_id)) return config;
     }
-    for (DeepCases) |deep| {
-        if (!std.mem.eql(
-            u8,
-            deep.descriptor.case_id,
-            case_id,
-        )) continue;
+    if (deepCaseForId(case_id)) |deep| {
+        const ledger_case = std.mem.eql(u8, deep.descriptor.binary, "ledger");
         var config = rootCompat(
             deep.descriptor,
-            "build-seq",
-            "zig-out/bin/seq",
-            .seq_observe,
+            if (ledger_case) "build-ledger" else "build-seq",
+            if (ledger_case) "zig-out/bin/ledger" else "zig-out/bin/seq",
+            if (ledger_case) .ledger_project else .seq_observe,
         );
         config.samples = deep.samples;
         config.warmups = deep.warmups;
@@ -5655,23 +5995,21 @@ fn validateDriverEvidence(
     product: CapsuleProduct,
 ) !void {
     try validateDriverSourceMetadata(driver.source);
-    if (!std.mem.eql(
-        u8,
-        driver.product_source.revision,
-        product.source.revision,
-    ) or !std.mem.eql(
+    if (driverSourceMatchesIdentity(driver.source, active_optimization_driver_v1)) {
+        try validateOptimizationDriverBuild(driver.build);
+    }
+    if (!std.mem.eql(u8, driver.product_source.revision, product.source.revision) or !std.mem.eql(
         u8,
         driver.product_source.tree,
         product.source.tree,
-    ) or !std.mem.eql(
-        u8,
-        driver.product_source.archive_sha256,
-        product.source.archive.sha256,
-    )) {
+    ) or !std.mem.eql(u8, driver.product_source.archive_sha256, product.source.archive.sha256)) {
         return error.PerfEvidenceIdentityMismatch;
     }
     try verifyCapsuleFile(allocator, driver.file);
     try verifyCapsuleFile(allocator, driver.source.file);
+    if (driver.source.build_file) |build_file| {
+        try verifyCapsuleFile(allocator, build_file);
+    }
     try validateCompilerEvidence(allocator, driver.compiler);
     if (!std.mem.eql(
         u8,
@@ -5681,8 +6019,23 @@ fn validateDriverEvidence(
     try validateIsolatedBuild(driver.build);
 }
 
+fn validateOptimizationDriverBuild(build: CapsuleBuild) !void {
+    if (!std.mem.eql(u8, build.step, "optimization-driver") or
+        !std.mem.eql(u8, build.target orelse "", "aarch64-macos") or
+        !std.mem.eql(u8, build.cpu orelse "", "baseline"))
+    {
+        return error.InvalidPerfEvidenceFile;
+    }
+}
+
 fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
-    if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
+    if (source.build_file) |build_file| {
+        if (driverSourceMatchesIdentity(source, active_optimization_driver_v1) and
+            std.mem.eql(u8, build_file.sha256, "sha256:" ++ optimization_build_sha256))
+        {
+            return;
+        }
+    } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
         driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
     {
         return;
@@ -5690,10 +6043,7 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
     return error.PerfEvidenceIdentityMismatch;
 }
 
-fn driverSourceMatchesIdentity(
-    source: CapsuleDriverSource,
-    identity: DriverSourceIdentity,
-) bool {
+fn driverSourceMatchesIdentity(source: CapsuleDriverSource, identity: DriverSourceIdentity) bool {
     if (!std.mem.eql(u8, source.revision, identity.revision) or
         !std.mem.eql(u8, source.tree, identity.tree) or
         !std.mem.eql(u8, source.path, identity.locator) or
@@ -5709,10 +6059,7 @@ fn driverSourceMatchesIdentity(
         );
 }
 
-fn validateCompilerEvidence(
-    allocator: std.mem.Allocator,
-    compiler: CapsuleCompiler,
-) !void {
+fn validateCompilerEvidence(allocator: std.mem.Allocator, compiler: CapsuleCompiler) !void {
     if (!std.fs.path.isAbsolute(compiler.approved_path) or
         compiler.version.len == 0)
     {
@@ -5766,17 +6113,9 @@ fn validateRetainedMetrics(
         metrics.p95_ns !=
             try percentileU64(allocator, metrics.samples_ns, 95) or
         metrics.p95_rss_bytes !=
-            try percentileU64(
-                allocator,
-                metrics.rss_samples_bytes,
-                95,
-            ) or
+            try percentileU64(allocator, metrics.rss_samples_bytes, 95) or
         (deep and metrics.p50_alloc_calls !=
-            try percentileU64(
-                allocator,
-                metrics.allocation_samples,
-                50,
-            )))
+            try percentileU64(allocator, metrics.allocation_samples, 50)))
     {
         return error.InvalidPerfDerivedMetric;
     }
@@ -5831,30 +6170,15 @@ fn expectedBinaryForCase(case_id: []const u8) ?[]const u8 {
             case_cfg.descriptor.case_id,
         )) return case_cfg.descriptor.binary;
     }
-    for (DeepCases) |case_cfg| {
-        if (std.mem.eql(
-            u8,
-            case_id,
-            case_cfg.descriptor.case_id,
-        )) return case_cfg.descriptor.binary;
-    }
+    if (deepCaseForId(case_id)) |case_cfg| return case_cfg.descriptor.binary;
     return null;
 }
 
 fn isDeepCaseId(case_id: []const u8) bool {
-    for (DeepCases) |case_cfg| {
-        if (std.mem.eql(u8, case_id, case_cfg.descriptor.case_id)) {
-            return true;
-        }
-    }
-    return false;
+    return deepCaseForId(case_id) != null;
 }
 
-fn loadCapsuleFileAlloc(
-    allocator: std.mem.Allocator,
-    file: CapsuleFile,
-    max_bytes: usize,
-) ![]u8 {
+fn loadCapsuleFileAlloc(allocator: std.mem.Allocator, file: CapsuleFile, max_bytes: usize) ![]u8 {
     try requireDigestIdentity(file.sha256);
     if (file.label.len == 0 or
         !std.mem.eql(u8, file.label, std.fs.path.basename(file.label)) or
@@ -5863,61 +6187,8 @@ fn loadCapsuleFileAlloc(
     {
         return error.PerfEvidencePathOutsideCapsule;
     }
-    const machine_dir_relative = try resolveMachineDir(
-        allocator,
-        ".perf-local",
-    );
-    defer allocator.free(machine_dir_relative);
-    durable_store.rejectSymlinkComponents(machine_dir_relative) catch |err| switch (err) {
-        error.SymlinkComponent => return error.PerfEvidencePathOutsideCapsule,
-        else => return err,
-    };
-    const machine_stat = try std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        machine_dir_relative,
-        .{ .follow_symlinks = false },
-    );
-    if (machine_stat.kind == .sym_link or
-        machine_stat.kind != .directory)
-    {
-        return error.PerfEvidencePathOutsideCapsule;
-    }
-    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        machine_dir_relative,
-        allocator,
-    );
-    defer allocator.free(machine_dir);
-    const capsules_root = try std.fs.path.join(
-        allocator,
-        &.{ machine_dir, "capsules" },
-    );
-    defer allocator.free(capsules_root);
-    const capsules_stat = try std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        capsules_root,
-        .{ .follow_symlinks = false },
-    );
-    if (capsules_stat.kind == .sym_link or
-        capsules_stat.kind != .directory)
-    {
-        return error.PerfEvidencePathOutsideCapsule;
-    }
-    const blobs_root = try std.fs.path.join(
-        allocator,
-        &.{ capsules_root, "blobs" },
-    );
+    const blobs_root = try resolveCapsuleBlobsRoot(allocator);
     defer allocator.free(blobs_root);
-    const blobs_stat = try std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        blobs_root,
-        .{ .follow_symlinks = false },
-    );
-    if (blobs_stat.kind == .sym_link or
-        blobs_stat.kind != .directory)
-    {
-        return error.PerfEvidencePathOutsideCapsule;
-    }
     const digest = file.sha256["sha256:".len..];
     var root = try std.Io.Dir.openDirAbsolute(
         std.Io.Threaded.global_single_threaded.io(),
@@ -5933,10 +6204,7 @@ fn loadCapsuleFileAlloc(
     if (digest_stat.kind == .sym_link or digest_stat.kind != .directory) {
         return error.PerfEvidencePathOutsideCapsule;
     }
-    const relative_path = try std.fs.path.join(
-        allocator,
-        &.{ digest, file.label },
-    );
+    const relative_path = try std.fs.path.join(allocator, &.{ digest, file.label });
     defer allocator.free(relative_path);
     var opened = try root.openFile(
         std.Io.Threaded.global_single_threaded.io(),
@@ -5948,6 +6216,58 @@ fn loadCapsuleFileAlloc(
         },
     );
     defer opened.close(std.Io.Threaded.global_single_threaded.io());
+    return readVerifiedCapsuleFileAlloc(allocator, opened, file.sha256, max_bytes);
+}
+
+fn resolveCapsuleBlobsRoot(allocator: std.mem.Allocator) ![]u8 {
+    const machine_dir_relative = try resolveMachineDir(
+        allocator,
+        ".perf-local",
+    );
+    defer allocator.free(machine_dir_relative);
+    durable_store.rejectSymlinkComponents(machine_dir_relative) catch |err| switch (err) {
+        error.SymlinkComponent => return error.PerfEvidencePathOutsideCapsule,
+        else => return err,
+    };
+    try requireCapsuleDirectory(machine_dir_relative);
+    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        machine_dir_relative,
+        allocator,
+    );
+    defer allocator.free(machine_dir);
+    const capsules_root = try std.fs.path.join(
+        allocator,
+        &.{ machine_dir, "capsules" },
+    );
+    defer allocator.free(capsules_root);
+    try requireCapsuleDirectory(capsules_root);
+    const blobs_root = try std.fs.path.join(
+        allocator,
+        &.{ capsules_root, "blobs" },
+    );
+    errdefer allocator.free(blobs_root);
+    try requireCapsuleDirectory(blobs_root);
+    return blobs_root;
+}
+
+fn requireCapsuleDirectory(path: []const u8) !void {
+    const stat = try std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind == .sym_link or stat.kind != .directory) {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+}
+
+fn readVerifiedCapsuleFileAlloc(
+    allocator: std.mem.Allocator,
+    opened: std.Io.File,
+    sha256: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     const before = try opened.stat(
         std.Io.Threaded.global_single_threaded.io(),
     );
@@ -5979,21 +6299,24 @@ fn loadCapsuleFileAlloc(
     if (!std.mem.eql(
         u8,
         &observed,
-        file.sha256["sha256:".len..],
+        sha256["sha256:".len..],
     )) return error.PerfEvidenceDigestMismatch;
     return data;
 }
 
-fn verifyCapsuleFile(
-    allocator: std.mem.Allocator,
-    file: CapsuleFile,
-) !void {
-    const data = try loadCapsuleFileAlloc(
-        allocator,
-        file,
-        max_sealed_evidence_bytes,
-    );
+fn verifyCapsuleFile(allocator: std.mem.Allocator, file: CapsuleFile) !void {
+    const data = try loadCapsuleFileAlloc(allocator, file, max_sealed_evidence_bytes);
     allocator.free(data);
+}
+
+fn capsuleSealedFile(allocator: std.mem.Allocator, file: CapsuleFile) !SealedFile {
+    try verifyCapsuleFile(allocator, file);
+    const blobs_root = try resolveCapsuleBlobsRoot(allocator);
+    defer allocator.free(blobs_root);
+    const digest = try digestBytes(file.sha256);
+    const path = try std.fs.path.join(allocator, &.{ blobs_root, &digest, file.label });
+    defer allocator.free(path);
+    return .{ .path = try allocator.dupeZ(u8, path), .sha256 = digest };
 }
 
 fn requireCutoverReportTuple(
@@ -6001,11 +6324,7 @@ fn requireCutoverReportTuple(
     tuple: ReportTuple,
     current_sha: []const u8,
 ) !void {
-    try requireExpectedSourceShas(
-        environment,
-        tuple.base_sha,
-        tuple.candidate_sha,
-    );
+    try requireExpectedSourceShas(environment, tuple.base_sha, tuple.candidate_sha);
     if (!std.mem.eql(u8, current_sha, tuple.candidate_sha)) {
         return error.CandidateSourceShaMismatch;
     }
@@ -6050,12 +6369,19 @@ fn inferBinary(case_id: []const u8) []const u8 {
 }
 
 fn pathExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().access(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{},
+    ) catch return false;
     return true;
 }
 
 fn makeRepoAwarePath(allocator: std.mem.Allocator, path: []const u8) !void {
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     if (std.fs.path.isAbsolute(path) and std.mem.startsWith(u8, path, cwd)) {
         const rel = if (path.len == cwd.len) "." else path[cwd.len + 1 ..];
@@ -6092,17 +6418,9 @@ fn writeEvidenceFileAtomic(
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(parent);
     try requireReplaceableEvidenceTarget(path);
     var dir = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openDirAbsolute(
-            io,
-            parent,
-            .{ .follow_symlinks = false },
-        )
+        try std.Io.Dir.openDirAbsolute(io, parent, .{ .follow_symlinks = false })
     else
-        try std.Io.Dir.cwd().openDir(
-            io,
-            parent,
-            .{ .follow_symlinks = false },
-        );
+        try std.Io.Dir.cwd().openDir(io, parent, .{ .follow_symlinks = false });
     defer dir.close(io);
     const tag = std.Io.Clock.awake.now(io).nanoseconds;
     const temp_name = try std.fmt.allocPrint(
@@ -6111,20 +6429,7 @@ fn writeEvidenceFileAtomic(
         .{ base, tag },
     );
     defer allocator.free(temp_name);
-    var file = try dir.createFile(io, temp_name, .{
-        .exclusive = true,
-        .read = true,
-        .truncate = false,
-        .permissions = if (@hasDecl(
-            std.Io.File.Permissions,
-            "fromMode",
-        ))
-            std.Io.File.Permissions.fromMode(
-                @as(std.posix.mode_t, @intCast(mode)),
-            )
-        else
-            .default_file,
-    });
+    var file = try createEvidenceTempFile(dir, io, temp_name, mode);
     var file_open = true;
     errdefer if (file_open) file.close(io);
     errdefer dir.deleteFile(io, temp_name) catch |err| {
@@ -6156,6 +6461,28 @@ fn writeEvidenceFileAtomic(
     });
     defer dir_file.close(io);
     try dir_file.sync(io);
+}
+
+fn createEvidenceTempFile(
+    dir: std.Io.Dir,
+    io: std.Io,
+    temp_name: []const u8,
+    mode: u32,
+) !std.Io.File {
+    return dir.createFile(io, temp_name, .{
+        .exclusive = true,
+        .read = true,
+        .truncate = false,
+        .permissions = if (@hasDecl(
+            std.Io.File.Permissions,
+            "fromMode",
+        ))
+            std.Io.File.Permissions.fromMode(
+                @as(std.posix.mode_t, @intCast(mode)),
+            )
+        else
+            .default_file,
+    });
 }
 
 fn requireReplaceableEvidenceTarget(path: []const u8) !void {
@@ -6235,14 +6562,33 @@ test "capsule files are digest-addressed beneath the current machine root" {
     const bytes = try loadCapsuleFileAlloc(allocator, valid, 64);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("bound", bytes);
+    var reopened = try capsuleSealedFile(allocator, valid);
+    defer reopened.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &sealed.sha256, &reopened.sha256);
+    try verifySealedFile(reopened);
 
-    try tmp.dir.rename(
+    try expectCapsuleRejectsLinkedRoot(tmp.dir, valid);
+    try std.testing.expectError(
+        error.PerfEvidencePathOutsideCapsule,
+        loadCapsuleFileAlloc(
+            allocator,
+            .{ .label = "../payload", .sha256 = identity },
+            64,
+        ),
+    );
+    try expectCapsuleRejectsLinkedBlob(machine_dir, tmp_root);
+}
+
+fn expectCapsuleRejectsLinkedRoot(dir: std.Io.Dir, valid: CapsuleFile) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try dir.rename(
         ".perf-local",
-        tmp.dir,
+        dir,
         "external-perf-local",
         io,
     );
-    try tmp.dir.symLink(
+    try dir.symLink(
         io,
         "external-perf-local",
         ".perf-local",
@@ -6252,23 +6598,18 @@ test "capsule files are digest-addressed beneath the current machine root" {
         error.PerfEvidencePathOutsideCapsule,
         loadCapsuleFileAlloc(allocator, valid, 64),
     );
-    try tmp.dir.deleteFile(io, ".perf-local");
-    try tmp.dir.rename(
+    try dir.deleteFile(io, ".perf-local");
+    try dir.rename(
         "external-perf-local",
-        tmp.dir,
+        dir,
         ".perf-local",
         io,
     );
+}
 
-    try std.testing.expectError(
-        error.PerfEvidencePathOutsideCapsule,
-        loadCapsuleFileAlloc(
-            allocator,
-            .{ .label = "../payload", .sha256 = identity },
-            64,
-        ),
-    );
-
+fn expectCapsuleRejectsLinkedBlob(machine_dir: []const u8, tmp_root: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var symlinked = try sealEvidenceBytes(
         allocator,
         machine_dir,
@@ -6370,6 +6711,109 @@ test "driver source metadata accepts active and legacy tuples only" {
     );
 }
 
+fn testOptimizationDriverSource() CapsuleDriverSource {
+    return .{
+        .revision = active_optimization_driver_v1.revision,
+        .tree = active_optimization_driver_v1.tree,
+        .path = active_optimization_driver_v1.locator,
+        .file = .{
+            .label = "optimization_driver.zig",
+            .sha256 = "sha256:" ++ active_optimization_driver_v1.sha256,
+        },
+        .build_file = .{
+            .label = "optimization_build.zig",
+            .sha256 = "sha256:" ++ optimization_build_sha256,
+        },
+    };
+}
+
+test "optimization driver build requires the exact step target and cpu" {
+    const valid = CapsuleBuild{
+        .optimize = "ReleaseFast",
+        .step = "optimization-driver",
+        .target = "aarch64-macos",
+        .cpu = "baseline",
+        .repo_local_prefix = true,
+        .isolated_caches = true,
+        .product_output_isolated = true,
+    };
+    try validateOptimizationDriverBuild(valid);
+    var changed = [_]CapsuleBuild{ valid, valid, valid, valid, valid };
+    changed[0].step = "install";
+    changed[1].target = null;
+    changed[2].target = "x86_64-linux";
+    changed[3].cpu = null;
+    changed[4].cpu = "native";
+    for (changed) |build| {
+        try std.testing.expectError(
+            error.InvalidPerfEvidenceFile,
+            validateOptimizationDriverBuild(build),
+        );
+    }
+}
+
+test "optimization driver source requires the exact build source identity" {
+    var source = testOptimizationDriverSource();
+    try validateDriverSourceMetadata(source);
+    source.build_file = null;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    for ([_][]const u8{
+        "",
+        "sha256:" ++ "0" ** 64,
+        "sha257:" ++ optimization_build_sha256,
+        "sha256:" ++ optimization_build_sha256 ++ "0",
+    }) |wrong_digest| {
+        source.build_file = .{ .label = "optimization_build.zig", .sha256 = wrong_digest };
+        try std.testing.expectError(
+            error.PerfEvidenceIdentityMismatch,
+            validateDriverSourceMetadata(source),
+        );
+    }
+}
+
+test "optimization driver source rejects mixed source tuples" {
+    const valid = testOptimizationDriverSource();
+    var sources = [_]CapsuleDriverSource{ valid, valid, valid, valid };
+    sources[0].revision = active_seq_replay_driver_v1.revision;
+    sources[1].tree = active_seq_replay_driver_v1.tree;
+    sources[2].path = active_seq_replay_driver_v1.locator;
+    sources[3].file.sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256;
+    for (sources) |source| {
+        try std.testing.expectError(
+            error.PerfEvidenceIdentityMismatch,
+            validateDriverSourceMetadata(source),
+        );
+    }
+}
+
+test "Seq replay and legacy sources reject optimization build evidence" {
+    var source = CapsuleDriverSource{
+        .revision = active_seq_replay_driver_v1.revision,
+        .tree = active_seq_replay_driver_v1.tree,
+        .path = active_seq_replay_driver_v1.locator,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+        },
+        .build_file = testOptimizationDriverSource().build_file,
+    };
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source.revision = legacy_generic_driver_v1.revision;
+    source.tree = legacy_generic_driver_v1.tree;
+    source.path = legacy_generic_driver_v1.locator;
+    source.file.sha256 = "sha256:" ++ legacy_generic_driver_v1.sha256;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
 test "sealed Seq replay driver source is capture-only and dependency-minimal" {
     const digest = sealedSeqReplayDriverDigest();
     try std.testing.expectEqualStrings(
@@ -6461,10 +6905,11 @@ test "report errors clearly when compare summary is missing" {
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
-    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
+    const io = std.testing.io;
+    const cwd_before = try std.process.currentPathAlloc(io, alloc);
     defer alloc.free(cwd_before);
-    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
-    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer restoreTestCwd(io, cwd_before);
 
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
@@ -6489,12 +6934,7 @@ test "unmatched comparison target preserves prior evidence artifacts" {
         std.Io.Threaded.global_single_threaded.io(),
         tmp.dir,
     );
-    defer std.process.setCurrentPath(
-        std.Io.Threaded.global_single_threaded.io(),
-        cwd_before,
-    ) catch |err| {
-        std.debug.panic("restore working directory: {s}", .{@errorName(err)});
-    };
+    defer restoreTestCwd(std.Io.Threaded.global_single_threaded.io(), cwd_before);
 
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
@@ -6546,12 +6986,7 @@ test "matching comparison invalidation retires stale locator authority" {
     );
     defer allocator.free(cwd_before);
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
-    defer std.process.setCurrentPath(
-        std.testing.io,
-        cwd_before,
-    ) catch |err| {
-        std.debug.panic("restore working directory: {s}", .{@errorName(err)});
-    };
+    defer restoreTestCwd(std.testing.io, cwd_before);
     const machine_dir = try ensureCurrentMachineDir(allocator);
     defer allocator.free(machine_dir);
     try invalidateCurrentCapsule(allocator, machine_dir);
@@ -6586,12 +7021,7 @@ test "report rejects malformed rows in a verified capsule" {
         std.Io.Threaded.global_single_threaded.io(),
         tmp.dir,
     );
-    defer std.process.setCurrentPath(
-        std.Io.Threaded.global_single_threaded.io(),
-        cwd_before,
-    ) catch |err| {
-        std.debug.panic("restore working directory: {s}", .{@errorName(err)});
-    };
+    defer restoreTestCwd(std.Io.Threaded.global_single_threaded.io(), cwd_before);
 
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
@@ -6719,15 +7149,7 @@ test "evidence writer rejects symlink targets without changing referent" {
     );
     defer allocator.free(cwd_before);
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
-    defer std.process.setCurrentPath(
-        std.testing.io,
-        cwd_before,
-    ) catch |err| {
-        std.debug.panic(
-            "restore working directory: {s}",
-            .{@errorName(err)},
-        );
-    };
+    defer restoreTestCwd(std.testing.io, cwd_before);
 
     try tmp.dir.createDirPath(std.testing.io, "reports");
     try tmp.dir.writeFile(std.testing.io, .{
@@ -6767,40 +7189,10 @@ test "evidence writer rejects symlink targets without changing referent" {
 
 test "balanced round ratios reject repeatable regressions not one noisy round" {
     const alloc = std.testing.allocator;
-    var baseline_samples: std.ArrayList(u64) = .empty;
-    var candidate_samples: std.ArrayList(u64) = .empty;
-    var baseline_allocs: std.ArrayList(u64) = .empty;
-    var candidate_allocs: std.ArrayList(u64) = .empty;
-    var baseline_rss: std.ArrayList(u64) = .empty;
-    var candidate_rss: std.ArrayList(u64) = .empty;
     const case_cfg = DeepCases[0];
-    const sample_count = case_cfg.samples * paired_comparison_rounds;
-    for (0..sample_count) |index| {
-        try baseline_samples.append(alloc, 100);
-        try candidate_samples.append(
-            alloc,
-            if (index < case_cfg.samples) 110 else 100,
-        );
-    }
-    for (0..paired_comparison_rounds) |_| {
-        try baseline_allocs.append(alloc, 100);
-        try candidate_allocs.append(alloc, 100);
-        try baseline_rss.append(alloc, 100);
-        try candidate_rss.append(alloc, 100);
-    }
-    var baseline = try metricsFromSamples(
-        alloc,
-        baseline_samples,
-        baseline_allocs,
-        baseline_rss,
-    );
+    var baseline = try makeTestRoundMetrics(case_cfg, 100);
     defer baseline.deinit(alloc);
-    var candidate = try metricsFromSamples(
-        alloc,
-        candidate_samples,
-        candidate_allocs,
-        candidate_rss,
-    );
+    var candidate = try makeTestRoundMetrics(case_cfg, 110);
     defer candidate.deinit(alloc);
     const null_control = try compareBalancedDeepMetrics(
         case_cfg,
@@ -6857,6 +7249,28 @@ test "balanced round ratios reject repeatable regressions not one noisy round" {
     try std.testing.expectEqualStrings("FAIL", repeated_rss_regression.status);
 }
 
+fn makeTestRoundMetrics(case_cfg: DeepCase, first_round_ns: u64) !Metrics {
+    const allocator = std.testing.allocator;
+    var samples: std.ArrayList(u64) = .empty;
+    errdefer samples.deinit(allocator);
+    var allocations: std.ArrayList(u64) = .empty;
+    errdefer allocations.deinit(allocator);
+    var rss: std.ArrayList(u64) = .empty;
+    errdefer rss.deinit(allocator);
+    const sample_count = case_cfg.samples * paired_comparison_rounds;
+    for (0..sample_count) |index| {
+        try samples.append(
+            allocator,
+            if (index < case_cfg.samples) first_round_ns else 100,
+        );
+    }
+    for (0..paired_comparison_rounds) |_| {
+        try allocations.append(allocator, 100);
+        try rss.append(allocator, 100);
+    }
+    return metricsFromSamples(allocator, samples, allocations, rss);
+}
+
 test "rss tolerance rounds only to the observable page quantum" {
     const allowed = try observableRssUpperBound(2_637_824, 2.0);
     try std.testing.expect(allowed >= 2_690_581);
@@ -6901,47 +7315,30 @@ test "shared deep artifact identity is exact" {
         product_source_sha,
     );
     parsed.value.object.getPtr("git_sha").?.* = .{ .string = "other" };
-    try std.testing.expectError(
-        error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(
-            parsed.value,
-            case_cfg,
-            product_source_sha,
-        ),
-    );
+    try expectSharedArtifactMismatch(parsed.value, case_cfg, product_source_sha);
     parsed.value.object.getPtr("git_sha").?.* = .{ .string = "unknown" };
     parsed.value.object.getPtr("case_id").?.* = .{ .string = "other" };
-    try std.testing.expectError(
-        error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(
-            parsed.value,
-            case_cfg,
-            product_source_sha,
-        ),
-    );
+    try expectSharedArtifactMismatch(parsed.value, case_cfg, product_source_sha);
     parsed.value.object.getPtr("case_id").?.* = .{
         .string = case_cfg.descriptor.case_id,
     };
     parsed.value.object.getPtr("binary").?.* = .{ .string = "other" };
-    try std.testing.expectError(
-        error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(
-            parsed.value,
-            case_cfg,
-            product_source_sha,
-        ),
-    );
+    try expectSharedArtifactMismatch(parsed.value, case_cfg, product_source_sha);
     parsed.value.object.getPtr("binary").?.* = .{
         .string = case_cfg.descriptor.binary,
     };
     parsed.value.object.getPtr("schema_version").?.* = .{ .integer = 2 };
+    try expectSharedArtifactMismatch(parsed.value, case_cfg, product_source_sha);
+}
+
+fn expectSharedArtifactMismatch(
+    value: std.json.Value,
+    case_cfg: DeepCase,
+    product_source_sha: []const u8,
+) !void {
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(
-            parsed.value,
-            case_cfg,
-            product_source_sha,
-        ),
+        validateSharedDriverArtifact(value, case_cfg, product_source_sha),
     );
 }
 
@@ -7141,11 +7538,11 @@ test "doctor counts compat and deep cases" {
 
 test "cutover comparison requires the complete Seq and Ledger matrix" {
     try std.testing.expectEqual(
-        SeqCases.len,
+        SeqCases.len + 4,
         matchingCaseCount("seq"),
     );
     try std.testing.expectEqual(
-        LedgerCases.len,
+        LedgerCases.len + 5,
         matchingCaseCount("ledger"),
     );
     try std.testing.expectEqual(
@@ -7265,5 +7662,217 @@ test "cutover report tuple must match the request and current source" {
             tuple,
             "2222222222222222222222222222222222222222",
         ),
+    );
+}
+
+test "measurement integers reject floats outside the representable range" {
+    for ([_]f64{ -1, std.math.inf(f64), std.math.nan(f64), 0x1p64 }) |value| {
+        try std.testing.expectError(error.InvalidData, jsonValueU64(.{ .float = value }, "test"));
+    }
+    try std.testing.expectEqual(@as(u64, 1), try jsonValueU64(.{ .float = 1.75 }, "test"));
+    try std.testing.expectEqual(
+        @as(u64, 18_446_744_073_709_549_568),
+        try jsonValueU64(.{ .float = 18_446_744_073_709_549_568.0 }, "test"),
+    );
+}
+
+test "semantic normalization traverses deep arrays and preserves error precedence" {
+    try expectDeepSemanticNormalization(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidPerfSourceEventIdentity,
+        semanticOutputDigest(
+            std.testing.allocator,
+            "{\"nested\":[{\"source_event_id\":\"invalid\"}],\"stats\":7}",
+            "/tmp/unused",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPerfSemanticOutput,
+        semanticOutputDigest(
+            std.testing.allocator,
+            "{\"stats\":7,\"nested\":[{\"source_event_id\":\"invalid\"}]}",
+            "/tmp/unused",
+        ),
+    );
+}
+
+test "semantic normalization propagates allocation failure without leaking" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectDeepSemanticNormalization,
+        .{},
+    );
+}
+
+fn expectDeepSemanticNormalization(allocator: std.mem.Allocator) !void {
+    const depth = 512;
+    const payload =
+        "{\"source_event_id\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"stats\":{\"source_event_id\":\"ignored\"}}";
+    const raw = try allocator.alloc(u8, depth * 2 + payload.len);
+    defer allocator.free(raw);
+    @memset(raw[0..depth], '[');
+    @memcpy(raw[depth..][0..payload.len], payload);
+    @memset(raw[depth + payload.len ..], ']');
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    try normalizeSemanticOutput(allocator, &parsed.value, raw.len);
+    var leaf = &parsed.value;
+    for (0..depth) |_| {
+        try std.testing.expect(leaf.* == .array);
+        leaf = &leaf.array.items[0];
+    }
+    try std.testing.expectEqualStrings(
+        normalized_source_event_id,
+        leaf.object.get("source_event_id").?.string,
+    );
+    try std.testing.expect(leaf.object.get("stats").? == .null);
+}
+
+test "metric sample ownership transfers only after all percentile allocations succeed" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectMetricSampleTransfer,
+        .{},
+    );
+}
+
+fn expectMetricSampleTransfer(allocator: std.mem.Allocator) !void {
+    var samples = try MetricSamples.init(allocator, 3, 3, 3);
+    defer samples.deinit(allocator);
+    const times = [_]u64{ 10, 20, 30 };
+    const allocations = [_]u64{ 2, 4, 6 };
+    const rss = [_]u64{ 100, 200, 300 };
+    try samples.times.appendSlice(allocator, &times);
+    try samples.allocations.appendSlice(allocator, &allocations);
+    try samples.rss.appendSlice(allocator, &rss);
+    var metrics = samples.finish(allocator) catch |err| {
+        try std.testing.expectEqualSlices(u64, &times, samples.times.items);
+        try std.testing.expectEqualSlices(u64, &allocations, samples.allocations.items);
+        try std.testing.expectEqualSlices(u64, &rss, samples.rss.items);
+        return err;
+    };
+    defer metrics.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), samples.times.items.len);
+    try std.testing.expectEqual(@as(usize, 0), samples.allocations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), samples.rss.items.len);
+    try std.testing.expectEqualSlices(u64, &times, metrics.samples.items);
+    try std.testing.expectEqualSlices(u64, &allocations, metrics.alloc_samples.items);
+    try std.testing.expectEqualSlices(u64, &rss, metrics.rss_samples.items);
+}
+
+test "optimization readback uses each case's product and sample configuration" {
+    const ledger = evidenceCaseConfig("ledger-topk-16384-k100").?;
+    const trace = evidenceCaseConfig("trace-full-1024").?;
+    try std.testing.expectEqualStrings("build-ledger", ledger.build_step.?);
+    try std.testing.expectEqualStrings("zig-out/bin/ledger", ledger.binary_path);
+    try std.testing.expectEqual(CompatSetup.ledger_project, ledger.setup);
+    try std.testing.expectEqualStrings("build-seq", trace.build_step.?);
+    try std.testing.expectEqualStrings("zig-out/bin/seq", trace.binary_path);
+    try std.testing.expectEqual(CompatSetup.seq_observe, trace.setup);
+    try std.testing.expectEqual(@as(usize, 30), ledger.samples);
+    try std.testing.expectEqual(@as(usize, 30), trace.samples);
+    try std.testing.expectEqual(@as(usize, 3), ledger.warmups);
+    try std.testing.expectEqual(@as(usize, 3), trace.warmups);
+}
+
+test "optimization target includes the complete workload and regression matrix" {
+    const ids = [_][]const u8{
+        "ledger-topk-16384-k100",
+        "ledger-topk-16384-k1",
+        "ledger-topk-16384-k10",
+        "ledger-topk-16384-k1000",
+        "ledger-topk-32-k10",
+        "trace-full-1024",
+        "trace-full-8",
+        "trace-summary-1024",
+        "trace-summary-8",
+    };
+    try std.testing.expectEqual(ids.len, matchingCaseCount("optimization"));
+    for (ids) |id| {
+        const case = deepCaseForId(id).?;
+        try std.testing.expect(matchesTarget(id, case.descriptor.binary, "optimization"));
+        try std.testing.expect(!matchesTarget(id, case.descriptor.binary, "cutover"));
+    }
+}
+
+test "optimization primary and secondary budgets reject each over-budget metric" {
+    const limit = BalancedRatios{
+        .p50 = 800_000,
+        .p95 = 1_030_000,
+        .allocations = 1_000_000,
+        .rss = 1_020_000,
+    };
+    for ([_][]const u8{ "ledger-topk-16384-k100", "trace-full-1024" }) |id| {
+        const primary = deepCaseForId(id).?;
+        try expectBalancedStatus(primary, limit, "PASS");
+        inline for (std.meta.fields(BalancedRatios)) |field| {
+            var exceeded = limit;
+            @field(exceeded, field.name) += 1;
+            try expectBalancedStatus(primary, exceeded, "FAIL");
+        }
+    }
+    for (OptimizationCases) |descriptor| {
+        const case = deepCaseForId(descriptor.case_id).?;
+        const primary = std.mem.eql(u8, descriptor.case_id, "ledger-topk-16384-k100") or
+            std.mem.eql(u8, descriptor.case_id, "trace-full-1024");
+        try std.testing.expectEqual(primary, case.primary_optimization);
+        if (primary) continue;
+        var regression = limit;
+        regression.p50 = 1_030_000;
+        try expectBalancedStatus(case, regression, "PASS");
+        regression.p50 += 1;
+        try expectBalancedStatus(case, regression, "FAIL");
+    }
+}
+
+fn expectBalancedStatus(case: DeepCase, ratios: BalancedRatios, expected: []const u8) !void {
+    const result = try compareBalancedRatios(case, ratios);
+    defer if (std.mem.eql(u8, result.status, "FAIL")) std.heap.page_allocator.free(result.detail);
+    try std.testing.expectEqualStrings(expected, result.status);
+}
+
+test "optimization readback recomputes workload and output identities" {
+    const workload = "sha256:" ++ "a" ** 64;
+    const output = "sha256:" ++ "b" ** 64;
+    const changed = "sha256:" ++ "c" ** 64;
+    const output_digest = try digestBytes(output);
+    const oracle = OptimizationOracle{
+        .workload_digest = try digestBytes(workload),
+        .execution = .{
+            .output_sha256 = output_digest,
+            .semantic_output_sha256 = output_digest,
+        },
+    };
+    var execution = CapsuleExecution{
+        .output_sha256 = output,
+        .semantic_output_sha256 = output,
+        .local_output_sha256 = null,
+        .streamed = null,
+        .records_scanned = null,
+        .records_emitted = null,
+        .physical_passes = null,
+        .files_opened = null,
+        .bytes_read = null,
+        .rows_materialized = null,
+        .compile_ns = null,
+        .execution_ns = null,
+    };
+    try validateOptimizationObservation(oracle, workload, execution);
+    try std.testing.expectError(
+        error.PerfWorkloadMismatch,
+        validateOptimizationObservation(oracle, changed, execution),
+    );
+    execution.output_sha256 = changed;
+    try std.testing.expectError(
+        error.PerfSemanticOutputMismatch,
+        validateOptimizationObservation(oracle, workload, execution),
+    );
+    execution.output_sha256 = output;
+    execution.semantic_output_sha256 = changed;
+    try std.testing.expectError(
+        error.PerfSemanticOutputMismatch,
+        validateOptimizationObservation(oracle, workload, execution),
     );
 }

@@ -199,7 +199,7 @@ pub fn fromCanonicalJson(
     std.sort.heap(Binding, items, {}, lessThanBinding);
     return .{
         .items = items,
-        .values_digest = try digestBindings(items),
+        .values_digest = try digestBindings(allocator, items),
     };
 }
 
@@ -250,7 +250,7 @@ fn bindMode(
         }
     }
     std.sort.heap(Binding, items.items, {}, lessThanBinding);
-    const values_digest = try digestBindings(items.items);
+    const values_digest = try digestBindings(allocator, items.items);
     return .{
         .items = try items.toOwnedSlice(allocator),
         .values_digest = values_digest,
@@ -375,13 +375,13 @@ fn digestDeclarations(items: []const Declaration) [71]u8 {
     return finishDigest(&hasher);
 }
 
-fn digestBindings(items: []const Binding) ![71]u8 {
+fn digestBindings(allocator: std.mem.Allocator, items: []const Binding) ![71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("definition-parameter-values/v1\x00");
     for (items) |item| {
         updateLengthPrefixed(&hasher, item.name);
         updateLengthPrefixed(&hasher, @tagName(item.value.kind()));
-        var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         try item.value.writeCanonical(&out.writer);
         updateLengthPrefixed(&hasher, out.written());
@@ -504,5 +504,55 @@ test "parameter declarations round trip through bounded cache plans" {
     try std.testing.expectEqualStrings(
         declarations.items[1].name,
         decoded.items[1].name,
+    );
+}
+
+fn bindForAllocationFailure(
+    allocator: std.mem.Allocator,
+    declarations: *const Declarations,
+) !void {
+    var bindings = bind(allocator, declarations, &.{
+        .{ .name = "name", .raw_value = "example" },
+    }) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer bindings.deinit(allocator);
+}
+
+fn restoreForAllocationFailure(
+    allocator: std.mem.Allocator,
+    declarations: *const Declarations,
+) !void {
+    var bindings = fromCanonicalJson(
+        allocator,
+        declarations,
+        "{\"name\":\"example\"}",
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer bindings.deinit(allocator);
+}
+
+test "parameter value digest scratch uses the caller allocator and cleans up on failure" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"name\":{\"type\":\"string\",\"required\":true}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var declarations = try compile(std.testing.allocator, parsed.value);
+    defer declarations.deinit(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        bindForAllocationFailure,
+        .{&declarations},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        restoreForAllocationFailure,
+        .{&declarations},
     );
 }

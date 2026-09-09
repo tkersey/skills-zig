@@ -1,3 +1,4 @@
+const core_calendar = @import("core_calendar");
 const std = @import("std");
 
 pub const Day = enum {
@@ -91,6 +92,7 @@ pub fn parseAndCanonicalizeRrule(allocator: std.mem.Allocator, raw_input: []cons
 
 pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
     var out = RRule.init(allocator);
+    errdefer out.deinit(allocator);
     var have_freq = false;
     var have_byminute = false;
     var have_byhour = false;
@@ -118,7 +120,8 @@ pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
         }
         if (std.ascii.eqlIgnoreCase(key, "INTERVAL")) {
             const parsed = try parsePositiveUsize(value, "INTERVAL");
-            out.interval = @intCast(parsed);
+            out.interval = std.math.cast(u32, parsed) orelse
+                return userErrorFmt("INTERVAL must fit an unsigned 32-bit integer", .{});
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYHOUR")) {
@@ -224,9 +227,10 @@ fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
     return error.UserInput;
 }
 
-pub fn alignMsToMinute(ms: i64) i64 {
-    const sec = @divFloor(ms, 1000);
-    return @as(i64, @intCast(@divFloor(sec, 60) * 60 * 1000));
+pub fn alignMsToMinute(ms: i64) !i64 {
+    const minute = @divFloor(ms, 60_000);
+    return std.math.mul(i64, minute, 60_000) catch
+        return userErrorFmt("aligned minute is outside the timestamp range", .{});
 }
 
 const CivilDate = struct {
@@ -236,24 +240,11 @@ const CivilDate = struct {
 };
 
 pub fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
-    const z = days_since_unix_epoch + 719_468;
-    const era = @divFloor(z, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(
-        doe - @divFloor(doe, 1_460) +
-            @divFloor(doe, 36_524) -
-            @divFloor(doe, 146_096),
-        365,
-    );
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const m = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
+    const date = core_calendar.civilFromDays(days_since_unix_epoch, .gregorian);
     return .{
-        .year = y + (if (m <= 2) @as(i64, 1) else @as(i64, 0)),
-        .month = @intCast(m),
-        .day = @intCast(d),
+        .year = @intCast(date.year),
+        .month = @intCast(date.month),
+        .day = @intCast(date.day),
     };
 }
 
@@ -314,8 +305,8 @@ pub fn computeNextRunAt(allocator: std.mem.Allocator, row: anytype, run_started_
     else
         row.created_at;
 
-    const dtstart = alignMsToMinute(dtstart_ms);
-    const anchor = alignMsToMinute(run_started_ms);
+    const dtstart = try alignMsToMinute(dtstart_ms);
+    const anchor = try alignMsToMinute(run_started_ms);
 
     return switch (rule.freq) {
         .HOURLY => nextHourly(rule, dtstart, anchor),
@@ -334,10 +325,10 @@ pub fn nextHourly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
     var hour = @max(base_hour, @divFloor(anchor_sec, 3600) - 1);
 
     while (hour < base_hour + 24 * 365 * 10) : (hour += 1) {
-        if (@mod(hour - base_hour, @as(i64, @intCast(rule.interval))) != 0) continue;
+        if (@mod(hour - base_hour, @as(i64, rule.interval)) != 0) continue;
         const candidate_sec = hour * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
-        return candidate_sec * 1000;
+        return checkedTimestampMillis(candidate_sec);
     }
 
     return userErrorFmt("unable to compute next HOURLY run", .{});
@@ -354,10 +345,10 @@ pub fn nextDaily(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
     var day = @max(base_day, @divFloor(anchor_sec, 86_400) - 1);
 
     while (day < base_day + 366 * 20) : (day += 1) {
-        if (@mod(day - base_day, @as(i64, @intCast(rule.interval))) != 0) continue;
+        if (@mod(day - base_day, @as(i64, rule.interval)) != 0) continue;
         const candidate_sec = day * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
-        return candidate_sec * 1000;
+        return checkedTimestampMillis(candidate_sec);
     }
 
     return userErrorFmt("unable to compute next DAILY run", .{});
@@ -384,12 +375,12 @@ pub fn nextWeekly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
         const week_start = day - @as(i64, wd);
         const week_index = @divFloor(week_start - base_week_start, 7);
         if (week_index < 0) continue;
-        if (@mod(week_index, @as(i64, @intCast(rule.interval))) != 0) continue;
+        if (@mod(week_index, @as(i64, rule.interval)) != 0) continue;
 
         const candidate_sec = day * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
 
-        return candidate_sec * 1000;
+        return checkedTimestampMillis(candidate_sec);
     }
 
     return userErrorFmt("unable to compute next WEEKLY run", .{});
@@ -400,4 +391,55 @@ pub fn weekdayAllowed(days: []const Day, weekday_index_mon: u8) bool {
         if (day.weekdayMonIndex() == weekday_index_mon) return true;
     }
     return false;
+}
+
+fn checkedTimestampMillis(seconds: i64) !i64 {
+    return std.math.mul(i64, seconds, 1000) catch
+        return userErrorFmt("next run is outside the timestamp range", .{});
+}
+
+test "minute alignment preserves negative floors and rejects an unrepresentable floor" {
+    try std.testing.expectEqual(@as(i64, -60_000), try alignMsToMinute(-1));
+    try std.testing.expectEqual(@as(i64, 60_000), try alignMsToMinute(60_001));
+    try std.testing.expectError(error.UserInput, alignMsToMinute(std.math.minInt(i64)));
+}
+
+test "hourly recurrence preserves the largest representable interval" {
+    var rule = RRule.init(std.testing.allocator);
+    defer rule.deinit(std.testing.allocator);
+    rule.interval = std.math.maxInt(u32);
+    rule.byminute = 1;
+    try std.testing.expectEqual(@as(i64, 60_000), try nextHourly(rule, 0, 0));
+}
+
+test "hourly recurrence reports when the next timestamp exceeds i64" {
+    var rule = RRule.init(std.testing.allocator);
+    defer rule.deinit(std.testing.allocator);
+    rule.byminute = 59;
+    const last = std.math.maxInt(i64);
+    try std.testing.expectError(error.UserInput, nextHourly(rule, last, last));
+}
+
+fn parseWeeklyWithAllocator(allocator: std.mem.Allocator) !void {
+    var rule = try parseRrule(allocator, "FREQ=WEEKLY;BYDAY=MO,TU,WE;BYHOUR=1;BYMINUTE=2");
+    defer rule.deinit(allocator);
+}
+
+test "recurrence parser releases accumulated days on allocation or shape failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseWeeklyWithAllocator,
+        .{},
+    );
+    try std.testing.expectError(
+        error.UserInput,
+        parseRrule(std.testing.allocator, "FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=1"),
+    );
+}
+
+test "recurrence parser rejects intervals that do not fit the stored representation" {
+    try std.testing.expectError(
+        error.UserInput,
+        parseRrule(std.testing.allocator, "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296"),
+    );
 }

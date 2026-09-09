@@ -234,7 +234,7 @@ pub const ShowArgs = automation_store.ShowArgs;
 
 pub const RunDueArgs = struct {
     automation_id: ?[]const u8,
-    limit: usize,
+    limit: i64,
     dry_run: bool,
     codex_bin: []const u8,
     lock_label: []const u8,
@@ -735,7 +735,7 @@ fn parseUpdateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Upda
 
 fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
     var id_value: ?[]const u8 = null;
-    var limit: usize = 10;
+    var limit: i64 = 10;
     var dry_run = false;
     var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
     var lock_label: []const u8 =
@@ -752,7 +752,7 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
         }
         if (std.mem.eql(u8, arg, "--limit")) {
             if (i + 1 >= args.len) return userErrorFmt("--limit requires a value", .{});
-            limit = try parsePositiveUsize(args[i + 1], "--limit");
+            limit = try parsePositiveI64(args[i + 1], "--limit");
             i += 1;
             continue;
         }
@@ -779,7 +779,7 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
 
     return .{
         .automation_id = id_value,
-        .limit = if (limit == 0) 1 else limit,
+        .limit = limit,
         .dry_run = dry_run,
         .codex_bin = codex_bin,
         .lock_label = validated_lock_label,
@@ -924,21 +924,7 @@ fn parsePositiveI64(raw: []const u8, field: []const u8) !i64 {
     return parsed;
 }
 
-fn parsePositiveUsize(raw: []const u8, field: []const u8) !usize {
-    const parsed = std.fmt.parseInt(usize, raw, 10) catch {
-        return userErrorFmt("{s} must be a positive integer", .{field});
-    };
-    if (parsed < 1) return userErrorFmt("{s} must be >= 1", .{field});
-    return parsed;
-}
-
-fn parseUnixTimestampMs(raw: []const u8) !i64 {
-    const parsed = std.fmt.parseInt(i64, raw, 10) catch {
-        return userErrorFmt("timestamp must be an integer unix value", .{});
-    };
-    if (parsed < 10_000_000_000) return parsed * 1000;
-    return parsed;
-}
+const parseUnixTimestampMs = automation_store.parseUnixTimestampMs;
 
 const c = automation_store.c;
 const SqlParam = automation_store.SqlParam;
@@ -2040,4 +2026,55 @@ test "doctor CLI keeps scheduler identity environment-only" {
         error.UserInput,
         parseDoctorArgs(&.{ "--label", "com.example.scheduler" }),
     );
+}
+
+test "run-due limits remain positive and fit the SQLite integer domain" {
+    const label_args = &.{ "--lock-label", "com.example.numeric-test" };
+    try std.testing.expectEqual(@as(i64, 10), (try parseRunDueArgs(label_args)).limit);
+    try std.testing.expectEqual(@as(i64, 1), (try parseRunDueArgs(&.{
+        "--limit", "1", "--lock-label", "com.example.numeric-test",
+    })).limit);
+    try std.testing.expectEqual(std.math.maxInt(i64), (try parseRunDueArgs(&.{
+        "--limit", "9223372036854775807", "--lock-label", "com.example.numeric-test",
+    })).limit);
+    for ([_][]const u8{ "0", "-1", "9223372036854775808", "18446744073709551615" }) |raw| {
+        try std.testing.expectError(error.UserInput, parseRunDueArgs(&.{
+            "--limit", raw, "--lock-label", "com.example.numeric-test",
+        }));
+    }
+}
+
+test "automation timestamp projection uses store-owned admission" {
+    try std.testing.expectEqual(@as(i64, -1000), try parseUnixTimestampMs("-1"));
+    try std.testing.expectError(error.UserInput, parseUnixTimestampMs("-9223372036854775808"));
+}
+
+test "due selection binds the largest positive SQLite limit without narrowing" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "db", .data = "" });
+    const path = try tmp.dir.realPathFileAlloc(io, "db", allocator);
+    defer allocator.free(path);
+    var db = try Db.open(allocator, path);
+    defer db.close();
+    try createTestSchema(allocator, &db);
+    var rows = try selectDueAutomations(allocator, &db, 0, std.math.maxInt(i64), null);
+    defer rows.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    try std.testing.expectError(error.UserInput, selectDueAutomations(
+        allocator,
+        &db,
+        0,
+        0,
+        null,
+    ));
+    try std.testing.expectError(error.UserInput, selectDueAutomations(
+        allocator,
+        &db,
+        0,
+        -1,
+        null,
+    ));
 }

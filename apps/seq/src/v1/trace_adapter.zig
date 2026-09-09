@@ -237,13 +237,31 @@ pub fn parseRelationsFileSelected(
         &replay_reader.interface
     else
         &file_reader.interface;
+    return parseSelectedRelations(
+        allocator,
+        path,
+        reader,
+        stat.mtime.nanoseconds,
+        relations,
+        options,
+    );
+}
+
+fn parseSelectedRelations(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    modified_at: i128,
+    relations: []const physical.Relation,
+    options: Options,
+) !SelectedParse {
     var metrics = trace_core.StreamMetrics{};
     var corpus_hasher = CorpusHasher{};
     const trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
         allocator,
         path,
         reader,
-        stat.mtime.nanoseconds,
+        modified_at,
         relationParseOptions(relations, options),
         &corpus_hasher,
         CorpusHasher.visit,
@@ -1108,7 +1126,11 @@ fn cloneValue(
     value: execution.Value,
 ) !execution.Value {
     return switch (value) {
-        .string => |text| .{ .string = try interner.intern(map_allocator, retained_allocator, text) },
+        .string => |text| .{ .string = try interner.intern(
+            map_allocator,
+            retained_allocator,
+            text,
+        ) },
         .json => |text| .{ .json = try interner.intern(map_allocator, retained_allocator, text) },
         else => value,
     };

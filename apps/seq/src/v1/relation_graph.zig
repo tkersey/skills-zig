@@ -68,6 +68,7 @@ pub fn streamingLineagePlan(
     defer allocator.free(reachable);
     @memset(reachable, false);
     try markReachable(
+        allocator,
         definition_plan,
         native_plan,
         native_plan.projections[projection_index].stage_index,
@@ -114,6 +115,12 @@ pub fn streamingLineagePlan(
     return null;
 }
 
+const StageFrame = struct {
+    stage_index: u16,
+    next_input: usize = 0,
+    entered: bool = false,
+};
+
 fn partitionScanRoot(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -122,20 +129,53 @@ fn partitionScanRoot(
     expected: ?u16,
     depth: usize,
 ) !u16 {
-    if (depth > definition_plan.bounds.max_graph_depth) {
-        return error.ObservationGraphDepthExceeded;
-    }
-    const stage = native_plan.stages[stage_index];
-    if (stage.operation == .scan) {
-        const scan = stage.operation.scan;
-        if (scan.relation.layout().partition_field == null) {
-            return error.ObservationPartitionLayoutMissing;
+    const max_depth = definition_plan.bounds.max_graph_depth;
+    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
+    const frames = try allocator.alloc(StageFrame, max_depth - depth + 1);
+    defer allocator.free(frames);
+    frames[0] = .{ .stage_index = stage_index };
+    var count: usize = 1;
+    var root = expected;
+    while (count > 0) {
+        const frame = &frames[count - 1];
+        const stage = native_plan.stages[frame.stage_index];
+        if (!frame.entered) {
+            frame.entered = true;
+            if (stage.operation == .scan) {
+                try validatePartitionScan(stage, frame.stage_index, root);
+                root = frame.stage_index;
+                count -= 1;
+                continue;
+            }
+            try validatePartitionOperator(stage);
         }
-        if (expected) |wanted| if (wanted != stage_index) {
-            return error.ObservationPartitionPrefixHasMultipleScans;
-        };
-        return stage_index;
+        const step = definition_plan.steps[frame.stage_index];
+        if (step.input_names.len == 0) return error.ObservationPartitionLayoutMissing;
+        if (frame.next_input == step.input_names.len) {
+            count -= 1;
+            continue;
+        }
+        const name = step.input_names[frame.next_input];
+        frame.next_input += 1;
+        const input = native_plan.findStage(name) orelse
+            return error.ObservationExternalGraphInputUnsupported;
+        if (count == frames.len) return error.ObservationGraphDepthExceeded;
+        frames[count] = .{ .stage_index = input };
+        count += 1;
     }
+    return root.?;
+}
+
+fn validatePartitionScan(stage: plan.Stage, stage_index: u16, expected: ?u16) !void {
+    if (stage.operation.scan.relation.layout().partition_field == null) {
+        return error.ObservationPartitionLayoutMissing;
+    }
+    if (expected) |wanted| if (wanted != stage_index) {
+        return error.ObservationPartitionPrefixHasMultipleScans;
+    };
+}
+
+fn validatePartitionOperator(stage: plan.Stage) !void {
     switch (stage.operation) {
         .filter, .project, .alias, .distinct => {},
         .generic => |generic| switch (generic.operator) {
@@ -144,23 +184,6 @@ fn partitionScanRoot(
         },
         else => return error.ObservationPartitionOperatorUnsupported,
     }
-    const step = definition_plan.steps[stage_index];
-    if (step.input_names.len == 0) return error.ObservationPartitionLayoutMissing;
-    var root = expected;
-    for (step.input_names) |name| {
-        const input_index = native_plan.findStage(name) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const found = try partitionScanRoot(
-            allocator,
-            definition_plan,
-            native_plan,
-            input_index,
-            root,
-            depth + 1,
-        );
-        root = found;
-    }
-    return root.?;
 }
 
 pub fn requiredScanStages(
@@ -175,6 +198,7 @@ pub fn requiredScanStages(
     defer allocator.free(reachable);
     @memset(reachable, false);
     try markReachable(
+        allocator,
         definition_plan,
         native_plan,
         native_plan.projections[projection_index].stage_index,
@@ -192,6 +216,168 @@ pub fn requiredScanStages(
     return scans.toOwnedSlice(allocator);
 }
 
+const GraphExecution = struct {
+    allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    selectors: RuntimeSelectors,
+    scans: []ScanInput,
+    reachable: []bool,
+    tables: []?Table,
+    owned: []bool,
+    allocations: []?[]execution.Value,
+    consumers: []usize,
+    source_rows: usize = 0,
+    materialized_rows: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        retained_allocator: std.mem.Allocator,
+        definition_plan: *const definition.Plan,
+        native_plan: *const plan.Plan,
+        bindings: *const definition_core.parameters.Bindings,
+        selectors: RuntimeSelectors,
+        scans: []ScanInput,
+        target: u16,
+    ) !GraphExecution {
+        const count = native_plan.stages.len;
+        const reachable = try allocator.alloc(bool, count);
+        errdefer allocator.free(reachable);
+        @memset(reachable, false);
+        try markReachable(allocator, definition_plan, native_plan, target, reachable, scans, 0);
+        const tables = try allocator.alloc(?Table, count);
+        errdefer allocator.free(tables);
+        @memset(tables, null);
+        const owned = try allocator.alloc(bool, count);
+        errdefer allocator.free(owned);
+        @memset(owned, false);
+        const allocations = try allocator.alloc(?[]execution.Value, count);
+        errdefer allocator.free(allocations);
+        @memset(allocations, null);
+        const consumers = try allocator.alloc(usize, count);
+        errdefer allocator.free(consumers);
+        @memset(consumers, 0);
+        var result: GraphExecution = .{
+            .allocator = allocator,
+            .retained_allocator = retained_allocator,
+            .definition_plan = definition_plan,
+            .native_plan = native_plan,
+            .bindings = bindings,
+            .selectors = selectors,
+            .scans = scans,
+            .reachable = reachable,
+            .tables = tables,
+            .owned = owned,
+            .allocations = allocations,
+            .consumers = consumers,
+        };
+        try result.countConsumers(target);
+        return result;
+    }
+
+    fn countConsumers(self: *GraphExecution, target: u16) !void {
+        for (self.definition_plan.steps, 0..) |step, index| {
+            if (!self.reachable[index] or findScan(self.scans, @intCast(index)) != null) continue;
+            for (step.input_names) |name| {
+                const input = self.native_plan.findStage(name) orelse continue;
+                self.consumers[input] = try std.math.add(usize, self.consumers[input], 1);
+            }
+        }
+        self.consumers[target] = try std.math.add(usize, self.consumers[target], 1);
+    }
+
+    fn deinit(self: *GraphExecution) void {
+        for (self.tables, self.owned, 0..) |table, owned, index| {
+            if (owned and table != null) self.release(index);
+        }
+        self.allocator.free(self.consumers);
+        self.allocator.free(self.allocations);
+        self.allocator.free(self.owned);
+        self.allocator.free(self.tables);
+        self.allocator.free(self.reachable);
+    }
+
+    fn release(self: *GraphExecution, index: usize) void {
+        releaseStage(
+            self.allocator,
+            self.tables,
+            self.owned,
+            self.allocations,
+            index,
+            self.scans,
+        );
+    }
+
+    fn run(self: *GraphExecution, target: u16) !Table {
+        for (self.native_plan.stages, 0..) |_, index| {
+            if (self.reachable[index]) try self.runStage(@intCast(index));
+        }
+        return self.tables[target] orelse error.ObservationProjectionNotExecuted;
+    }
+
+    fn runStage(self: *GraphExecution, index: u16) !void {
+        const step = self.definition_plan.steps[index];
+        const scan = findScan(self.scans, index);
+        const table = if (scan) |found| blk: {
+            self.source_rows = try std.math.add(
+                usize,
+                self.source_rows,
+                try found.table.rowCount(),
+            );
+            self.owned[index] = found.owned;
+            self.allocations[index] = found.allocation orelse found.table.values;
+            break :blk found.table;
+        } else blk: {
+            const value = try executeStage(
+                self.allocator,
+                self.retained_allocator,
+                self.definition_plan,
+                self.native_plan,
+                self.bindings,
+                self.selectors,
+                self.native_plan.stages[index],
+                step,
+                self.tables,
+            );
+            self.adoptTable(index, step, value);
+            break :blk value;
+        };
+        // Record the owner before any subsequent fallible validation.
+        self.tables[index] = table;
+        const count = try table.rowCount();
+        if (count > self.definition_plan.bounds.max_rows) return error.ObservationRowBoundExceeded;
+        self.materialized_rows = try std.math.add(usize, self.materialized_rows, count);
+        if (scan == null) self.consumeInputs(step);
+    }
+
+    fn adoptTable(self: *GraphExecution, index: u16, step: definition.Step, table: Table) void {
+        self.owned[index] = true;
+        self.allocations[index] = table.values;
+        for (step.input_names) |name| {
+            const input = self.native_plan.findStage(name) orelse continue;
+            const prior = self.tables[input] orelse continue;
+            if (table.values.ptr != prior.values.ptr) continue;
+            self.owned[index] = self.owned[input];
+            self.owned[input] = false;
+            self.allocations[index] = self.allocations[input];
+            self.allocations[input] = null;
+            if (findScan(self.scans, input)) |scan| scan.owned = false;
+            break;
+        }
+    }
+
+    fn consumeInputs(self: *GraphExecution, step: definition.Step) void {
+        for (step.input_names) |name| {
+            const input = self.native_plan.findStage(name) orelse continue;
+            std.debug.assert(self.consumers[input] > 0);
+            self.consumers[input] -= 1;
+            if (self.consumers[input] == 0 and self.owned[input]) self.release(input);
+        }
+    }
+};
+
 pub fn execute(
     allocator: std.mem.Allocator,
     retained_allocator: std.mem.Allocator,
@@ -205,141 +391,33 @@ pub fn execute(
     const projection_index = findProjection(definition_plan, projection_name) orelse
         return error.UnknownObservationProjection;
     const projection = native_plan.projections[projection_index];
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
-    defer allocator.free(reachable);
-    @memset(reachable, false);
-    try markReachable(
+    var graph = try GraphExecution.init(
+        allocator,
+        retained_allocator,
         definition_plan,
         native_plan,
-        projection.stage_index,
-        reachable,
+        bindings,
+        selectors,
         scans,
-        0,
+        projection.stage_index,
     );
-    var tables = try allocator.alloc(?Table, native_plan.stages.len);
-    defer allocator.free(tables);
-    @memset(tables, null);
-    const owned = try allocator.alloc(bool, native_plan.stages.len);
-    defer allocator.free(owned);
-    @memset(owned, false);
-    const allocations = try allocator.alloc(?[]execution.Value, native_plan.stages.len);
-    defer allocator.free(allocations);
-    @memset(allocations, null);
-    errdefer for (tables, owned, 0..) |table, is_owned, stage_index| {
-        if (is_owned and table != null) releaseStage(
-            allocator,
-            tables,
-            owned,
-            allocations,
-            stage_index,
-            scans,
-        );
-    };
-    const consumers = try allocator.alloc(usize, native_plan.stages.len);
-    defer allocator.free(consumers);
-    @memset(consumers, 0);
-    for (definition_plan.steps, 0..) |step, stage_index| {
-        if (!reachable[stage_index]) continue;
-        if (findScan(scans, @intCast(stage_index)) != null) continue;
-        for (step.input_names) |name| {
-            const input_index = native_plan.findStage(name) orelse continue;
-            consumers[input_index] = try std.math.add(usize, consumers[input_index], 1);
-        }
-    }
-    consumers[projection.stage_index] = try std.math.add(
-        usize,
-        consumers[projection.stage_index],
-        1,
-    );
-    var source_rows: usize = 0;
-    var materialized_rows: usize = 0;
-    for (native_plan.stages, 0..) |stage, stage_index| {
-        if (!reachable[stage_index]) continue;
-        const step = definition_plan.steps[stage_index];
-        var table_owned = true;
-        var table_allocation: ?[]execution.Value = null;
-        const table = if (findScan(scans, @intCast(stage_index))) |found| blk: {
-            table_owned = found.owned;
-            table_allocation = found.allocation;
-            source_rows = try std.math.add(
-                usize,
-                source_rows,
-                try found.table.rowCount(),
-            );
-            break :blk found.table;
-        } else try executeStage(
-            allocator,
-            retained_allocator,
-            definition_plan,
-            native_plan,
-            bindings,
-            selectors,
-            stage,
-            step,
-            tables,
-        );
-        if (findScan(scans, @intCast(stage_index)) == null) {
-            for (step.input_names) |name| {
-                const input_index = native_plan.findStage(name) orelse continue;
-                if (tables[input_index]) |input_table| {
-                    if (table.values.ptr == input_table.values.ptr) {
-                        table_owned = owned[input_index];
-                        owned[input_index] = false;
-                        allocations[stage_index] = allocations[input_index];
-                        allocations[input_index] = null;
-                        if (findScan(scans, @intCast(input_index))) |scan| {
-                            scan.owned = false;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        owned[stage_index] = table_owned;
-        if (table_owned and allocations[stage_index] == null) {
-            allocations[stage_index] = table_allocation orelse table.values;
-        }
-        const count = try table.rowCount();
-        if (count > definition_plan.bounds.max_rows) {
-            return error.ObservationRowBoundExceeded;
-        }
-        materialized_rows = try std.math.add(
-            usize,
-            materialized_rows,
-            count,
-        );
-        tables[stage_index] = table;
-        if (findScan(scans, @intCast(stage_index)) == null) {
-            for (step.input_names) |name| {
-                const input_index = native_plan.findStage(name) orelse continue;
-                consumers[input_index] -= 1;
-                if (consumers[input_index] == 0 and owned[input_index]) {
-                    releaseStage(allocator, tables, owned, allocations, input_index, scans);
-                }
-            }
-        }
-    }
-    const projected = tables[projection.stage_index] orelse
-        return error.ObservationProjectionNotExecuted;
+    defer graph.deinit();
+    const projected = try graph.run(projection.stage_index);
+    const rows = try projected.rowCount();
     const output = try allocator.alloc(
         execution.Value,
-        (try projected.rowCount()) * projection.field_indices.len,
+        try std.math.mul(usize, rows, projection.field_indices.len),
     );
-    for (0..try projected.rowCount()) |row_index| {
+    for (0..rows) |row_index| {
         const row = projected.row(row_index);
         for (projection.field_indices, 0..) |field, field_index| {
-            output[row_index * projection.field_indices.len + field_index] =
-                row[field];
+            output[row_index * projection.field_indices.len + field_index] = row[field];
         }
-    }
-    consumers[projection.stage_index] -= 1;
-    if (consumers[projection.stage_index] == 0 and owned[projection.stage_index]) {
-        releaseStage(allocator, tables, owned, allocations, projection.stage_index, scans);
     }
     return .{
         .table = .{ .values = output, .width = projection.field_indices.len },
-        .source_rows = source_rows,
-        .materialized_rows = materialized_rows,
+        .source_rows = graph.source_rows,
+        .materialized_rows = graph.materialized_rows,
     };
 }
 
@@ -353,117 +431,28 @@ pub fn executeTarget(
     target_stage: u16,
     scans: []ScanInput,
 ) !TargetResult {
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
-    defer allocator.free(reachable);
-    @memset(reachable, false);
-    try markReachable(
+    var graph = try GraphExecution.init(
+        allocator,
+        retained_allocator,
         definition_plan,
         native_plan,
-        target_stage,
-        reachable,
+        bindings,
+        selectors,
         scans,
-        0,
+        target_stage,
     );
-    var tables = try allocator.alloc(?Table, native_plan.stages.len);
-    defer allocator.free(tables);
-    @memset(tables, null);
-    const owned = try allocator.alloc(bool, native_plan.stages.len);
-    defer allocator.free(owned);
-    @memset(owned, false);
-    const allocations = try allocator.alloc(?[]execution.Value, native_plan.stages.len);
-    defer allocator.free(allocations);
-    @memset(allocations, null);
-    errdefer for (tables, owned, 0..) |table, is_owned, stage_index| {
-        if (is_owned and table != null) releaseStage(
-            allocator,
-            tables,
-            owned,
-            allocations,
-            stage_index,
-            scans,
-        );
-    };
-    const consumers = try allocator.alloc(usize, native_plan.stages.len);
-    defer allocator.free(consumers);
-    @memset(consumers, 0);
-    for (definition_plan.steps, 0..) |step, stage_index| {
-        if (!reachable[stage_index] or findScan(scans, @intCast(stage_index)) != null) continue;
-        for (step.input_names) |name| {
-            const input_index = native_plan.findStage(name) orelse continue;
-            consumers[input_index] = try std.math.add(usize, consumers[input_index], 1);
-        }
-    }
-    consumers[target_stage] = try std.math.add(usize, consumers[target_stage], 1);
-    var source_rows: usize = 0;
-    var materialized_rows: usize = 0;
-    for (native_plan.stages, 0..) |stage, stage_index| {
-        if (!reachable[stage_index]) continue;
-        const step = definition_plan.steps[stage_index];
-        var table_owned = true;
-        var table_allocation: ?[]execution.Value = null;
-        const table = if (findScan(scans, @intCast(stage_index))) |found| blk: {
-            table_owned = found.owned;
-            table_allocation = found.allocation;
-            source_rows = try std.math.add(usize, source_rows, try found.table.rowCount());
-            break :blk found.table;
-        } else try executeStage(
-            allocator,
-            retained_allocator,
-            definition_plan,
-            native_plan,
-            bindings,
-            selectors,
-            stage,
-            step,
-            tables,
-        );
-        if (findScan(scans, @intCast(stage_index)) == null) {
-            for (step.input_names) |name| {
-                const input_index = native_plan.findStage(name) orelse continue;
-                if (tables[input_index]) |input_table| {
-                    if (table.values.ptr == input_table.values.ptr) {
-                        table_owned = owned[input_index];
-                        owned[input_index] = false;
-                        allocations[stage_index] = allocations[input_index];
-                        allocations[input_index] = null;
-                        if (findScan(scans, @intCast(input_index))) |scan| scan.owned = false;
-                        break;
-                    }
-                }
-            }
-        }
-        owned[stage_index] = table_owned;
-        if (table_owned and allocations[stage_index] == null) {
-            allocations[stage_index] = table_allocation orelse table.values;
-        }
-        const count = try table.rowCount();
-        if (count > definition_plan.bounds.max_rows) return error.ObservationRowBoundExceeded;
-        materialized_rows = try std.math.add(usize, materialized_rows, count);
-        tables[stage_index] = table;
-        if (findScan(scans, @intCast(stage_index)) == null) {
-            for (step.input_names) |name| {
-                const input_index = native_plan.findStage(name) orelse continue;
-                consumers[input_index] -= 1;
-                if (consumers[input_index] == 0 and owned[input_index]) {
-                    releaseStage(allocator, tables, owned, allocations, input_index, scans);
-                }
-            }
-        }
-    }
-    const target = tables[target_stage] orelse return error.ObservationProjectionNotExecuted;
+    defer graph.deinit();
+    const target = try graph.run(target_stage);
     const output = try allocator.dupe(execution.Value, target.values);
-    consumers[target_stage] -= 1;
-    if (consumers[target_stage] == 0 and owned[target_stage]) {
-        releaseStage(allocator, tables, owned, allocations, target_stage, scans);
-    }
     return .{
         .table = .{ .values = output, .width = target.width },
-        .source_rows = source_rows,
-        .materialized_rows = materialized_rows,
+        .source_rows = graph.source_rows,
+        .materialized_rows = graph.materialized_rows,
     };
 }
 
 fn markReachable(
+    allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     native_plan: *const plan.Plan,
     stage_index: u16,
@@ -471,23 +460,37 @@ fn markReachable(
     scans: []ScanInput,
     depth: usize,
 ) !void {
-    if (depth > definition_plan.bounds.max_graph_depth) {
-        return error.ObservationGraphDepthExceeded;
-    }
-    if (reachable[stage_index]) return;
-    reachable[stage_index] = true;
-    if (findScan(scans, stage_index) != null) return;
-    const step = definition_plan.steps[stage_index];
-    for (step.input_names) |name| {
-        const input_index = native_plan.findStage(name) orelse continue;
-        try markReachable(
-            definition_plan,
-            native_plan,
-            input_index,
-            reachable,
-            scans,
-            depth + 1,
-        );
+    const max_depth = definition_plan.bounds.max_graph_depth;
+    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
+    const frames = try allocator.alloc(StageFrame, max_depth - depth + 1);
+    defer allocator.free(frames);
+    frames[0] = .{ .stage_index = stage_index };
+    var count: usize = 1;
+    while (count > 0) {
+        const frame = &frames[count - 1];
+        if (!frame.entered) {
+            frame.entered = true;
+            if (reachable[frame.stage_index]) {
+                count -= 1;
+                continue;
+            }
+            reachable[frame.stage_index] = true;
+            if (findScan(scans, frame.stage_index) != null) {
+                count -= 1;
+                continue;
+            }
+        }
+        const step = definition_plan.steps[frame.stage_index];
+        if (frame.next_input == step.input_names.len) {
+            count -= 1;
+            continue;
+        }
+        const name = step.input_names[frame.next_input];
+        frame.next_input += 1;
+        const input = native_plan.findStage(name) orelse continue;
+        if (count == frames.len) return error.ObservationGraphDepthExceeded;
+        frames[count] = .{ .stage_index = input };
+        count += 1;
     }
 }
 
@@ -556,67 +559,26 @@ fn executeStage(
             limit,
         ),
         .sort => |sort| try sortTable(allocator, input, sort),
-        .top_k => |top_k| blk: {
-            const sorted = try sortTable(
-                allocator,
-                input,
-                .{ .keys = top_k.keys },
-            );
-            break :blk try limitTable(
-                allocator,
-                definition_plan,
-                bindings,
-                sorted,
-                top_k.limit,
-            );
-        },
+        .top_k => |top_k| try topKTable(allocator, definition_plan, bindings, input, top_k),
         .distinct => |distinct| try distinctTable(
             allocator,
             input,
             distinct,
         ),
         .alias => try copyTable(allocator, input),
-        .generic => |generic| switch (generic.operator) {
-            .derive => try deriveTable(
-                allocator,
-                retained_allocator,
-                bindings,
-                selectors,
-                input,
-                &native_plan.stages[first_index].schema,
-                stage.schema,
-                generic.canonical_config,
-            ),
-            .join => try joinTable(
-                allocator,
-                native_plan,
-                step,
-                tables,
-                stage.schema,
-                generic.canonical_config,
-                definition_plan.bounds,
-            ),
-            .ordered_fold => try orderedFoldTable(
-                allocator,
-                retained_allocator,
-                bindings,
-                selectors,
-                input,
-                &native_plan.stages[first_index].schema,
-                stage.schema,
-                generic.canonical_config,
-                definition_plan.bounds.max_fold_states,
-            ),
-            .reachability => try reachabilityTable(
-                allocator,
-                input,
-                &native_plan.stages[first_index].schema,
-                stage.schema,
-                generic.canonical_config,
-                definition_plan.bounds,
-            ),
-            else => error.ObservationOperatorPlanNotCompiled,
-        },
+        .generic => try executeGenericStage(
+            allocator,
+            retained_allocator,
+            definition_plan,
+            native_plan,
+            bindings,
+            selectors,
+            stage,
+            step,
+            tables,
+            input,
+            first_index,
+        ),
         .aggregate => |aggregate| try aggregateTable(
             allocator,
             input,
@@ -624,6 +586,75 @@ fn executeStage(
             stage.schema,
         ),
         .scan => error.ObservationOperatorPlanNotCompiled,
+    };
+}
+
+fn topKTable(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    input: Table,
+    top_k: plan.TopK,
+) !Table {
+    const sorted = try sortTable(allocator, input, .{ .keys = top_k.keys });
+    defer allocator.free(sorted.values);
+    return limitTable(allocator, definition_plan, bindings, sorted, top_k.limit);
+}
+
+fn executeGenericStage(
+    allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    selectors: RuntimeSelectors,
+    stage: plan.Stage,
+    step: definition.Step,
+    tables: []const ?Table,
+    input: Table,
+    first_index: u16,
+) !Table {
+    const generic = stage.operation.generic;
+    return switch (generic.operator) {
+        .derive => try deriveTable(
+            allocator,
+            retained_allocator,
+            bindings,
+            selectors,
+            input,
+            &native_plan.stages[first_index].schema,
+            stage.schema,
+            generic.canonical_config,
+        ),
+        .join => try joinTable(
+            allocator,
+            native_plan,
+            step,
+            tables,
+            stage.schema,
+            generic.canonical_config,
+            definition_plan.bounds,
+        ),
+        .ordered_fold => try orderedFoldTable(
+            allocator,
+            retained_allocator,
+            bindings,
+            selectors,
+            input,
+            &native_plan.stages[first_index].schema,
+            stage.schema,
+            generic.canonical_config,
+            definition_plan.bounds.max_fold_states,
+        ),
+        .reachability => try reachabilityTable(
+            allocator,
+            input,
+            &native_plan.stages[first_index].schema,
+            stage.schema,
+            generic.canonical_config,
+            definition_plan.bounds,
+        ),
+        else => error.ObservationOperatorPlanNotCompiled,
     };
 }
 
@@ -725,37 +756,7 @@ fn aggregateTable(
             const value = row[metric.field_index.?];
             if (value == .null) continue;
             state.count = try std.math.add(usize, state.count, 1);
-            switch (metric.function) {
-                .count => {},
-                .sum, .average => switch (value) {
-                    .integer => |number| {
-                        state.integer = std.math.add(i64, state.integer, number) catch
-                            return error.ObservationAggregateOverflow;
-                        state.float += @floatFromInt(number);
-                    },
-                    .float => |number| state.float += number,
-                    else => return error.ObservationAggregateTypeMismatch,
-                },
-                .min, .max => switch (value) {
-                    .integer => |number| {
-                        if (!state.seen or
-                            (metric.function == .min and number < state.integer) or
-                            (metric.function == .max and number > state.integer))
-                        {
-                            state.integer = number;
-                        }
-                    },
-                    .float => |number| {
-                        if (!state.seen or
-                            (metric.function == .min and number < state.float) or
-                            (metric.function == .max and number > state.float))
-                        {
-                            state.float = number;
-                        }
-                    },
-                    else => return error.ObservationAggregateTypeMismatch,
-                },
-            }
+            try accumulateMetric(state, metric, value);
             state.seen = true;
             if (!std.math.isFinite(state.float)) return error.ObservationAggregateOverflow;
         }
@@ -785,6 +786,44 @@ fn aggregateTable(
     return .{ .values = values, .width = values.len };
 }
 
+fn accumulateMetric(
+    state: *AggregateState,
+    metric: plan.AggregateMetric,
+    value: execution.Value,
+) !void {
+    switch (metric.function) {
+        .count => {},
+        .sum, .average => switch (value) {
+            .integer => |number| {
+                state.integer = std.math.add(i64, state.integer, number) catch
+                    return error.ObservationAggregateOverflow;
+                state.float += @floatFromInt(number);
+            },
+            .float => |number| state.float += number,
+            else => return error.ObservationAggregateTypeMismatch,
+        },
+        .min, .max => switch (value) {
+            .integer => |number| {
+                if (!state.seen or
+                    (metric.function == .min and number < state.integer) or
+                    (metric.function == .max and number > state.integer))
+                {
+                    state.integer = number;
+                }
+            },
+            .float => |number| {
+                if (!state.seen or
+                    (metric.function == .min and number < state.float) or
+                    (metric.function == .max and number > state.float))
+                {
+                    state.float = number;
+                }
+            },
+            else => return error.ObservationAggregateTypeMismatch,
+        },
+    }
+}
+
 fn resolveOperand(
     bindings: *const definition_core.parameters.Bindings,
     definition_plan: *const definition.Plan,
@@ -806,7 +845,9 @@ fn resolveOperand(
 
 fn scalarValue(value: definition_core.scalar.Value) execution.Value {
     return switch (value) {
-        .string, .digest, .timestamp, .safe_identifier, .relative_path => |text| .{ .string = text },
+        .string, .digest, .timestamp, .safe_identifier, .relative_path => |text| .{
+            .string = text,
+        },
         .integer => |number| .{ .integer = number },
         .boolean => |flag| .{ .boolean = flag },
     };
@@ -952,7 +993,8 @@ fn sortTableInPlace(
         if (indices[start] == start) continue;
         @memcpy(temporary, input.row(start));
         var current = start;
-        while (true) {
+        var moved: usize = 0;
+        while (moved < count) : (moved += 1) {
             const next = indices[current];
             indices[current] = current;
             const target = input.values[current * input.width ..][0..input.width];
@@ -1025,6 +1067,8 @@ fn deriveTable(
     output_schema: plan.Schema,
     config: []const u8,
 ) !Table {
+    var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = config.len };
+    defer workspace.deinit();
     var parsed = try parseConfig(allocator, config);
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
@@ -1056,12 +1100,14 @@ fn deriveTable(
         execution.Value,
         (try input.rowCount()) * output_schema.columns.len,
     );
+    errdefer allocator.free(values);
     for (0..try input.rowCount()) |row_index| {
         const row = input.row(row_index);
         const out = values[row_index * output_schema.columns.len ..][0..output_schema.columns.len];
         if (preserve_input) @memcpy(out[0..input.width], row);
         for (expressions, 0..) |expression, index| {
             out[(if (preserve_input) input.width else 0) + index] = try evalCompiledExpr(
+                &workspace,
                 retained_allocator,
                 expression,
                 row,
@@ -1114,6 +1160,111 @@ const CompiledExpr = union(enum) {
     },
 };
 
+const ExpressionCompiler = struct {
+    allocator: std.mem.Allocator,
+    schema: *const plan.Schema,
+    output_schema: ?*const plan.Schema,
+    output_limit: usize,
+    tasks: std.ArrayList(Task) = .empty,
+
+    const Task = struct { source: std.json.Value, output: *CompiledExpr };
+
+    fn compile(self: *ExpressionCompiler, expression: std.json.Value) !*CompiledExpr {
+        const root = try self.allocator.create(CompiledExpr);
+        try self.tasks.append(self.allocator, .{ .source = expression, .output = root });
+        defer self.tasks.deinit(self.allocator);
+        // Each task belongs to one node of the already bounded, parsed config.
+        while (self.tasks.pop()) |task| {
+            task.output.* = try self.compileNode(task.source);
+        }
+        return root;
+    }
+
+    fn compileNode(self: *ExpressionCompiler, source: std.json.Value) !CompiledExpr {
+        return switch (source) {
+            .null => .null_value,
+            .bool => |value| .{ .boolean = value },
+            .integer => |value| .{ .integer = value },
+            .float => |value| .{ .float = value },
+            .number_string => |value| if (std.fmt.parseInt(i64, value, 10)) |integer|
+                .{ .integer = integer }
+            else |_|
+                .{ .float = try std.fmt.parseFloat(f64, value) },
+            .string => |value| .{ .text = value },
+            .array => .{ .dynamic = source },
+            .object => |object| try self.compileObject(source, object),
+        };
+    }
+
+    fn compileObject(
+        self: *ExpressionCompiler,
+        source: std.json.Value,
+        object: std.json.ObjectMap,
+    ) !CompiledExpr {
+        if (object.get("field")) |raw| return self.compileField(raw);
+        if (object.get("state") != null or object.get("param") != null or
+            object.get("selector") != null)
+        {
+            return .{ .dynamic = source };
+        }
+        const op = try definition_core.json.requiredString(object, "op");
+        const args = try definition_core.json.array(
+            try definition_core.json.field(object, "args"),
+        );
+        if (std.mem.eql(u8, op, "coalesce")) {
+            return .{ .coalesce = try self.children(args.items) };
+        }
+        if (std.mem.eql(u8, op, "if")) {
+            if (args.items.len != 3) return error.InvalidObservationExpressionArity;
+            const nodes = try self.children(args.items);
+            return .{ .if_else = .{
+                .condition = nodes[0],
+                .then_value = nodes[1],
+                .else_value = nodes[2],
+            } };
+        }
+        if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not")) {
+            if (args.items.len != 1) return error.InvalidObservationExpressionArity;
+            const nodes = try self.children(args.items);
+            return if (std.mem.eql(u8, op, "is-null"))
+                .{ .is_null = nodes[0] }
+            else
+                .{ .not = nodes[0] };
+        }
+        const compiled_op = parseCompiledOp(op) orelse return .{ .dynamic = source };
+        if (args.items.len != 2) return error.InvalidObservationExpressionArity;
+        const nodes = try self.children(args.items);
+        return .{ .binary = .{ .op = compiled_op, .left = nodes[0], .right = nodes[1] } };
+    }
+
+    fn compileField(self: *const ExpressionCompiler, raw: std.json.Value) !CompiledExpr {
+        const name = try definition_core.json.string(raw);
+        if (self.schema.find(name)) |index| return .{ .field = index };
+        if (self.output_schema) |output| {
+            for (output.columns[0..self.output_limit], 0..) |column, index| {
+                if (std.mem.eql(u8, column.name, name)) {
+                    return .{ .output_field = @intCast(index) };
+                }
+            }
+        }
+        return error.UnknownObservationExpressionField;
+    }
+
+    fn children(self: *ExpressionCompiler, args: []const std.json.Value) ![]*CompiledExpr {
+        const nodes = try self.allocator.alloc(*CompiledExpr, args.len);
+        for (nodes) |*node| node.* = try self.allocator.create(CompiledExpr);
+        var remaining = args.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            try self.tasks.append(self.allocator, .{
+                .source = args[remaining],
+                .output = nodes[remaining],
+            });
+        }
+        return nodes;
+    }
+};
+
 fn compileExpr(
     allocator: std.mem.Allocator,
     expression: std.json.Value,
@@ -1121,80 +1272,13 @@ fn compileExpr(
     output_schema: ?*const plan.Schema,
     output_limit: usize,
 ) !*CompiledExpr {
-    const result = try allocator.create(CompiledExpr);
-    result.* = switch (expression) {
-        .null => .null_value,
-        .bool => |value| .{ .boolean = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| if (std.fmt.parseInt(i64, value, 10)) |integer|
-            .{ .integer = integer }
-        else |_|
-            .{ .float = try std.fmt.parseFloat(f64, value) },
-        .string => |value| .{ .text = value },
-        .array => .{ .dynamic = expression },
-        .object => |object| blk: {
-            if (object.get("field")) |raw| {
-                const name = try definition_core.json.string(raw);
-                if (schema.find(name)) |index| break :blk .{ .field = index };
-                if (output_schema) |output| {
-                    for (output.columns[0..output_limit], 0..) |column, index| {
-                        if (std.mem.eql(u8, column.name, name)) {
-                            break :blk .{ .output_field = @intCast(index) };
-                        }
-                    }
-                }
-                return error.UnknownObservationExpressionField;
-            }
-            if (object.get("state") != null or object.get("param") != null or
-                object.get("selector") != null)
-            {
-                break :blk .{ .dynamic = expression };
-            }
-            const op = try definition_core.json.requiredString(object, "op");
-            const args = try definition_core.json.array(
-                try definition_core.json.field(object, "args"),
-            );
-            if (std.mem.eql(u8, op, "coalesce")) {
-                const children = try allocator.alloc(*CompiledExpr, args.items.len);
-                for (args.items, 0..) |arg, index| {
-                    children[index] = try compileExpr(
-                        allocator,
-                        arg,
-                        schema,
-                        output_schema,
-                        output_limit,
-                    );
-                }
-                break :blk .{ .coalesce = children };
-            }
-            if (std.mem.eql(u8, op, "if")) {
-                if (args.items.len != 3) return error.InvalidObservationExpressionArity;
-                break :blk .{ .if_else = .{
-                    .condition = try compileExpr(allocator, args.items[0], schema, output_schema, output_limit),
-                    .then_value = try compileExpr(allocator, args.items[1], schema, output_schema, output_limit),
-                    .else_value = try compileExpr(allocator, args.items[2], schema, output_schema, output_limit),
-                } };
-            }
-            if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not")) {
-                if (args.items.len != 1) return error.InvalidObservationExpressionArity;
-                const child = try compileExpr(allocator, args.items[0], schema, output_schema, output_limit);
-                break :blk if (std.mem.eql(u8, op, "is-null"))
-                    .{ .is_null = child }
-                else
-                    .{ .not = child };
-            }
-            const compiled_op = parseCompiledOp(op) orelse
-                break :blk .{ .dynamic = expression };
-            if (args.items.len != 2) return error.InvalidObservationExpressionArity;
-            break :blk .{ .binary = .{
-                .op = compiled_op,
-                .left = try compileExpr(allocator, args.items[0], schema, output_schema, output_limit),
-                .right = try compileExpr(allocator, args.items[1], schema, output_schema, output_limit),
-            } };
-        },
+    var compiler: ExpressionCompiler = .{
+        .allocator = allocator,
+        .schema = schema,
+        .output_schema = output_schema,
+        .output_limit = output_limit,
     };
-    return result;
+    return compiler.compile(expression);
 }
 
 fn parseCompiledOp(op: []const u8) ?CompiledOp {
@@ -1214,6 +1298,7 @@ fn parseCompiledOp(op: []const u8) ?CompiledOp {
 }
 
 fn evalCompiledExpr(
+    workspace: *ExpressionWorkspace,
     allocator: std.mem.Allocator,
     expression: *const CompiledExpr,
     row: []const execution.Value,
@@ -1221,111 +1306,134 @@ fn evalCompiledExpr(
     schema: *const plan.Schema,
     bindings: *const definition_core.parameters.Bindings,
     selectors: RuntimeSelectors,
-) anyerror!execution.Value {
-    return switch (expression.*) {
-        .null_value => .null,
-        .boolean => |value| .{ .boolean = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .text => |value| .{ .string = try allocator.dupe(u8, value) },
-        .field => |index| row[index],
-        .output_field => |index| output[index],
-        .dynamic => |value| evalExpr(
-            allocator,
-            value,
-            row,
-            schema,
-            &.{},
-            &.{},
-            bindings,
-            selectors,
-        ),
-        .is_null => |child| .{ .boolean = (try evalCompiledExpr(
-            allocator,
-            child,
-            row,
-            output,
-            schema,
-            bindings,
-            selectors,
-        )) == .null },
-        .not => |child| .{ .boolean = !truthy(try evalCompiledExpr(
-            allocator,
-            child,
-            row,
-            output,
-            schema,
-            bindings,
-            selectors,
-        )) },
-        .if_else => |value| evalCompiledExpr(
-            allocator,
-            if (truthy(try evalCompiledExpr(
-                allocator,
-                value.condition,
-                row,
-                output,
-                schema,
-                bindings,
-                selectors,
-            ))) value.then_value else value.else_value,
-            row,
-            output,
-            schema,
-            bindings,
-            selectors,
-        ),
-        .coalesce => |children| blk: {
-            for (children) |child| {
-                const value = try evalCompiledExpr(
-                    allocator,
-                    child,
-                    row,
-                    output,
-                    schema,
-                    bindings,
-                    selectors,
-                );
-                if (value != .null) break :blk value;
-            }
-            break :blk .null;
-        },
-        .binary => |value| blk: {
-            const left = try evalCompiledExpr(
-                allocator,
-                value.left,
-                row,
-                output,
-                schema,
-                bindings,
-                selectors,
-            );
-            const right = try evalCompiledExpr(
-                allocator,
-                value.right,
-                row,
-                output,
-                schema,
-                bindings,
-                selectors,
-            );
-            break :blk switch (value.op) {
-                .eq => .{ .boolean = valuesEqual(left, right, false) },
-                .ne => .{ .boolean = !valuesEqual(left, right, false) },
-                .lt => .{ .boolean = compareValues(left, right) == .lt },
-                .le => .{ .boolean = compareValues(left, right) != .gt },
-                .gt => .{ .boolean = compareValues(left, right) == .gt },
-                .ge => .{ .boolean = compareValues(left, right) != .lt },
-                .and_op => .{ .boolean = truthy(left) and truthy(right) },
-                .or_op => .{ .boolean = truthy(left) or truthy(right) },
-                .add => try numericOperator("add", left, right),
-                .subtract => try numericOperator("subtract", left, right),
-                .multiply => try numericOperator("multiply", left, right),
-                .divide => try numericOperator("divide", left, right),
-            };
-        },
-    };
+) !execution.Value {
+    return workspace.evaluate(.{ .compiled = expression }, .{
+        .allocator = allocator,
+        .row = row,
+        .output = output,
+        .schema = schema,
+        .bindings = bindings,
+        .selectors = selectors,
+    });
 }
+
+const JoinContext = struct {
+    allocator: std.mem.Allocator,
+    left: Table,
+    right: Table,
+    left_schema: plan.Schema,
+    right_schema: plan.Schema,
+    output_width: usize,
+    on: std.json.ObjectMap,
+    keys: std.json.Array,
+    fields: std.json.Array,
+    kind: []const u8,
+    lineage: ?*LineageIndex,
+    index: *const JoinIndex,
+    max_rows: usize,
+
+    fn first(self: *const JoinContext, row: []const execution.Value) ?usize {
+        if (!joinRequiredTrue(self.left_schema, row, self.on, "left_true")) return null;
+        const hash = joinEqualityHash(self.left_schema, row, self.keys, true) orelse return null;
+        return self.index.first(hash);
+    }
+
+    fn matches(
+        self: *const JoinContext,
+        left: []const execution.Value,
+        right: []const execution.Value,
+    ) !bool {
+        if (!joinKeysMatch(self.left_schema, left, self.right_schema, right, self.keys)) {
+            return false;
+        }
+        if (self.lineage) |lineage| return lineage.matches(left, right);
+        return true;
+    }
+
+    fn membership(self: *const JoinContext) !Table {
+        const keep = try self.allocator.alloc(bool, try self.left.rowCount());
+        defer self.allocator.free(keep);
+        for (0..keep.len) |left_index| {
+            const row = self.left.row(left_index);
+            var matched = false;
+            var candidate = self.first(row);
+            while (candidate) |right_index| : (candidate = self.index.after(right_index)) {
+                if (!try self.matches(row, self.right.row(right_index))) continue;
+                matched = true;
+                break;
+            }
+            keep[left_index] = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
+        }
+        const aliases_right = self.left.values.ptr == self.right.values.ptr;
+        var retained: usize = 0;
+        for (keep) |retain| if (retain) {
+            retained += 1;
+        };
+        const output = if (aliases_right)
+            try self.allocator.alloc(execution.Value, retained * self.left.width)
+        else
+            self.left.values;
+        var kept: usize = 0;
+        for (keep, 0..) |retain, source_index| {
+            if (!retain) continue;
+            if (aliases_right or kept != source_index) {
+                @memcpy(
+                    output[kept * self.left.width ..][0..self.left.width],
+                    self.left.row(source_index),
+                );
+            }
+            kept += 1;
+        }
+        return .{ .values = output[0 .. kept * self.left.width], .width = self.left.width };
+    }
+
+    fn materialize(self: *const JoinContext, membership_join: bool) !Table {
+        if (membership_join and !joinProjectsOnlyLeft(self.fields)) {
+            return error.ObservationMembershipJoinProjectsRight;
+        }
+        var values: std.ArrayList(execution.Value) = .empty;
+        errdefer values.deinit(self.allocator);
+        for (0..try self.left.rowCount()) |left_index| {
+            const row = self.left.row(left_index);
+            var matched = false;
+            var candidate = self.first(row);
+            while (candidate) |right_index| : (candidate = self.index.after(right_index)) {
+                const right = self.right.row(right_index);
+                if (!try self.matches(row, right)) continue;
+                matched = true;
+                if (membership_join) break;
+                try self.append(&values, row, right);
+                if (values.items.len / self.output_width > self.max_rows) {
+                    return error.ObservationRowBoundExceeded;
+                }
+            }
+            if (membership_join) {
+                const retain = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
+                if (retain) try self.append(&values, row, null);
+            } else if (!matched and std.mem.eql(u8, self.kind, "left")) {
+                try self.append(&values, row, null);
+            }
+        }
+        return .{ .values = try values.toOwnedSlice(self.allocator), .width = self.output_width };
+    }
+
+    fn append(
+        self: *const JoinContext,
+        values: *std.ArrayList(execution.Value),
+        left: []const execution.Value,
+        right: ?[]const execution.Value,
+    ) !void {
+        try appendJoinRow(
+            self.allocator,
+            values,
+            self.fields,
+            self.left_schema,
+            left,
+            self.right_schema,
+            right,
+        );
+    }
+};
 
 fn joinTable(
     allocator: std.mem.Allocator,
@@ -1348,200 +1456,100 @@ fn joinTable(
     var parsed = try parseConfig(allocator, config);
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
-    const on = try definition_core.json.object(
-        try definition_core.json.field(root, "on"),
+    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
+    const kind = if (on.get("kind")) |raw| try definition_core.json.string(raw) else "inner";
+    const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
+    var lineage = try initJoinLineage(
+        allocator,
+        native_plan,
+        step,
+        tables,
+        on,
+        left_index,
+        right_index,
+        bounds.max_graph_depth,
     );
-    const keys = try definition_core.json.array(
-        try definition_core.json.field(on, "keys"),
-    );
-    const kind = if (on.get("kind")) |raw|
-        try definition_core.json.string(raw)
-    else
-        "inner";
-    const fields = try definition_core.json.array(
-        try definition_core.json.field(root, "fields"),
-    );
-    var lineage: ?LineageIndex = null;
     defer if (lineage) |*index| index.deinit(allocator);
-    if (on.get("lineage")) |raw_lineage| {
-        if (step.input_names.len != 3) return error.ObservationLineageInputMissing;
-        const graph_index = native_plan.findStage(step.input_names[2]) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const graph = tables[graph_index] orelse return error.ObservationInputNotExecuted;
-        lineage = try LineageIndex.init(
-            allocator,
-            graph,
-            native_plan.stages[graph_index].schema,
-            try definition_core.json.object(raw_lineage),
-            native_plan.stages[left_index].schema,
-            native_plan.stages[right_index].schema,
-            bounds.max_graph_depth,
-        );
-    }
     var index = try JoinIndex.init(allocator, try right.rowCount());
     defer index.deinit(allocator);
+    try populateJoinIndex(
+        allocator,
+        &index,
+        right,
+        native_plan.stages[right_index].schema,
+        on,
+        keys,
+    );
+    const context: JoinContext = .{
+        .allocator = allocator,
+        .left = left,
+        .right = right,
+        .left_schema = native_plan.stages[left_index].schema,
+        .right_schema = native_plan.stages[right_index].schema,
+        .output_width = output_schema.columns.len,
+        .on = on,
+        .keys = keys,
+        .fields = fields,
+        .kind = kind,
+        .lineage = if (lineage) |*value| value else null,
+        .index = &index,
+        .max_rows = bounds.max_rows,
+    };
+    const membership_join = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
+    if (membership_join and joinProjectsLeft(fields, context.left_schema)) {
+        return context.membership();
+    }
+    return context.materialize(membership_join);
+}
+
+fn initJoinLineage(
+    allocator: std.mem.Allocator,
+    native_plan: *const plan.Plan,
+    step: definition.Step,
+    tables: []const ?Table,
+    on: std.json.ObjectMap,
+    left_index: u16,
+    right_index: u16,
+    max_depth: usize,
+) !?LineageIndex {
+    const raw = on.get("lineage") orelse return null;
+    if (step.input_names.len != 3) return error.ObservationLineageInputMissing;
+    const graph_index = native_plan.findStage(step.input_names[2]) orelse
+        return error.ObservationExternalGraphInputUnsupported;
+    const graph = tables[graph_index] orelse return error.ObservationInputNotExecuted;
+    return try LineageIndex.init(
+        allocator,
+        graph,
+        native_plan.stages[graph_index].schema,
+        try definition_core.json.object(raw),
+        native_plan.stages[left_index].schema,
+        native_plan.stages[right_index].schema,
+        max_depth,
+    );
+}
+
+fn populateJoinIndex(
+    allocator: std.mem.Allocator,
+    index: *JoinIndex,
+    right: Table,
+    schema: plan.Schema,
+    on: std.json.ObjectMap,
+    keys: std.json.Array,
+) !void {
     var equality_keys: usize = 0;
     for (keys.items) |item| {
         const key = try definition_core.json.object(item);
-        const op = if (key.get("op")) |raw|
-            try definition_core.json.string(raw)
-        else
-            "eq";
+        const op = if (key.get("op")) |raw| try definition_core.json.string(raw) else "eq";
         if (std.mem.eql(u8, op, "eq")) equality_keys += 1;
     }
     if (equality_keys == 0) return error.ObservationJoinRequiresEqualityKey;
-    for (0..try right.rowCount()) |right_row_index| {
-        if (!joinRequiredTrue(
-            native_plan.stages[right_index].schema,
-            right.row(right_row_index),
-            on,
-            "right_true",
-        )) continue;
-        const hash = joinEqualityHash(
-            native_plan.stages[right_index].schema,
-            right.row(right_row_index),
-            keys,
-            false,
-        ) orelse continue;
-        try index.add(allocator, hash, right_row_index);
+    for (0..try right.rowCount()) |row_index| {
+        const row = right.row(row_index);
+        if (!joinRequiredTrue(schema, row, on, "right_true")) continue;
+        const hash = joinEqualityHash(schema, row, keys, false) orelse continue;
+        try index.add(allocator, hash, row_index);
     }
-    if ((std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti")) and
-        joinProjectsLeft(fields, native_plan.stages[left_index].schema))
-    {
-        const keep = try allocator.alloc(bool, try left.rowCount());
-        defer allocator.free(keep);
-        for (0..try left.rowCount()) |left_row_index| {
-            const left_row = left.row(left_row_index);
-            var matched = false;
-            const hash = if (joinRequiredTrue(
-                native_plan.stages[left_index].schema,
-                left_row,
-                on,
-                "left_true",
-            )) joinEqualityHash(
-                native_plan.stages[left_index].schema,
-                left_row,
-                keys,
-                true,
-            ) else null;
-            var candidate = if (hash) |value| index.first(value) else null;
-            while (candidate) |right_row_index| : (candidate = index.after(right_row_index)) {
-                const right_row = right.row(right_row_index);
-                if (!joinKeysMatch(
-                    native_plan.stages[left_index].schema,
-                    left_row,
-                    native_plan.stages[right_index].schema,
-                    right_row,
-                    keys,
-                )) continue;
-                if (lineage) |*lineage_index| {
-                    if (!try lineage_index.matches(left_row, right_row)) continue;
-                }
-                matched = true;
-                break;
-            }
-            keep[left_row_index] = if (std.mem.eql(u8, kind, "anti"))
-                !matched
-            else
-                matched;
-        }
-        const aliases_right = left.values.ptr == right.values.ptr;
-        var retained: usize = 0;
-        for (keep) |retain| if (retain) {
-            retained += 1;
-        };
-        const output = if (aliases_right)
-            try allocator.alloc(execution.Value, retained * left.width)
-        else
-            left.values;
-        var kept: usize = 0;
-        for (keep, 0..) |retain, source_index| {
-            if (!retain) continue;
-            if (aliases_right or kept != source_index) {
-                @memcpy(output[kept * left.width ..][0..left.width], left.row(source_index));
-            }
-            kept += 1;
-        }
-        return .{
-            .values = output[0 .. kept * left.width],
-            .width = left.width,
-        };
-    }
-    var values: std.ArrayList(execution.Value) = .empty;
-    errdefer values.deinit(allocator);
-    const membership_join = std.mem.eql(u8, kind, "semi") or
-        std.mem.eql(u8, kind, "anti");
-    if (membership_join and !joinProjectsOnlyLeft(fields)) {
-        return error.ObservationMembershipJoinProjectsRight;
-    }
-    for (0..try left.rowCount()) |left_row_index| {
-        const left_row = left.row(left_row_index);
-        var matched = false;
-        const hash = if (joinRequiredTrue(
-            native_plan.stages[left_index].schema,
-            left_row,
-            on,
-            "left_true",
-        )) joinEqualityHash(
-            native_plan.stages[left_index].schema,
-            left_row,
-            keys,
-            true,
-        ) else null;
-        var candidate = if (hash) |value| index.first(value) else null;
-        while (candidate) |right_row_index| : (candidate = index.after(right_row_index)) {
-            const right_row = right.row(right_row_index);
-            if (!joinKeysMatch(
-                native_plan.stages[left_index].schema,
-                left_row,
-                native_plan.stages[right_index].schema,
-                right_row,
-                keys,
-            )) continue;
-            if (lineage) |*lineage_index| {
-                if (!try lineage_index.matches(left_row, right_row)) continue;
-            }
-            matched = true;
-            if (membership_join) break;
-            try appendJoinRow(
-                allocator,
-                &values,
-                fields,
-                native_plan.stages[left_index].schema,
-                left_row,
-                native_plan.stages[right_index].schema,
-                right_row,
-            );
-            if (values.items.len / output_schema.columns.len > bounds.max_rows) {
-                return error.ObservationRowBoundExceeded;
-            }
-        }
-        if (membership_join) {
-            const retain = if (std.mem.eql(u8, kind, "anti")) !matched else matched;
-            if (retain) try appendJoinRow(
-                allocator,
-                &values,
-                fields,
-                native_plan.stages[left_index].schema,
-                left_row,
-                native_plan.stages[right_index].schema,
-                null,
-            );
-            continue;
-        }
-        if (!matched and std.mem.eql(u8, kind, "left")) {
-            try appendJoinRow(
-                allocator,
-                &values,
-                fields,
-                native_plan.stages[left_index].schema,
-                left_row,
-                native_plan.stages[right_index].schema,
-                null,
-            );
-        }
-    }
-    return .{ .values = try values.toOwnedSlice(allocator), .width = output_schema.columns.len };
 }
 
 fn joinProjectsOnlyLeft(fields: std.json.Array) bool {
@@ -1574,6 +1582,45 @@ const CompiledJoinKey = struct {
     right: u16,
     nulls_equal: bool,
 };
+
+fn joinTrueFieldIndex(on: std.json.ObjectMap, schema: plan.Schema, key: []const u8) !?u16 {
+    const raw = on.get(key) orelse return null;
+    return schema.find(try definition_core.json.string(raw)) orelse
+        error.UnknownObservationJoinField;
+}
+
+fn compileStreamingJoinKeys(
+    allocator: std.mem.Allocator,
+    on: std.json.ObjectMap,
+    left_schema: plan.Schema,
+) ![]CompiledJoinKey {
+    const raw_keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
+    const keys = try allocator.alloc(CompiledJoinKey, raw_keys.items.len);
+    errdefer allocator.free(keys);
+    for (raw_keys.items, 0..) |item, index| {
+        const key = try definition_core.json.object(item);
+        const op = if (key.get("op")) |raw|
+            try definition_core.json.string(raw)
+        else
+            "eq";
+        if (!std.mem.eql(u8, op, "eq")) {
+            return error.ObservationStreamingLineageKeyUnsupported;
+        }
+        keys[index] = .{
+            .left = left_schema.find(
+                try definition_core.json.requiredString(key, "left"),
+            ) orelse return error.UnknownObservationJoinField,
+            .right = left_schema.find(
+                try definition_core.json.requiredString(key, "right"),
+            ) orelse return error.UnknownObservationJoinField,
+            .nulls_equal = if (key.get("nulls_equal")) |raw|
+                try definition_core.json.boolean(raw)
+            else
+                false,
+        };
+    }
+    return keys;
+}
 
 pub const StreamingLineageReducer = struct {
     allocator: std.mem.Allocator,
@@ -1620,60 +1667,31 @@ pub const StreamingLineageReducer = struct {
         if (!joinProjectsLeft(fields, left_schema)) {
             return error.ObservationStreamingLineageProjectionUnsupported;
         }
-        const raw_keys = try definition_core.json.array(
-            try definition_core.json.field(on, "keys"),
-        );
-        const keys = try allocator.alloc(CompiledJoinKey, raw_keys.items.len);
+        const keys = try compileStreamingJoinKeys(allocator, on, left_schema);
         errdefer allocator.free(keys);
-        for (raw_keys.items, 0..) |item, index| {
-            const key = try definition_core.json.object(item);
-            const op = if (key.get("op")) |raw|
-                try definition_core.json.string(raw)
-            else
-                "eq";
-            if (!std.mem.eql(u8, op, "eq")) {
-                return error.ObservationStreamingLineageKeyUnsupported;
-            }
-            keys[index] = .{
-                .left = left_schema.find(
-                    try definition_core.json.requiredString(key, "left"),
-                ) orelse return error.UnknownObservationJoinField,
-                .right = left_schema.find(
-                    try definition_core.json.requiredString(key, "right"),
-                ) orelse return error.UnknownObservationJoinField,
-                .nulls_equal = if (key.get("nulls_equal")) |raw|
-                    try definition_core.json.boolean(raw)
-                else
-                    false,
-            };
-        }
         const lineage_config = try definition_core.json.object(
             on.get("lineage") orelse return error.ObservationLineageInputMissing,
         );
+        var lineage = try LineageIndex.init(
+            allocator,
+            graph,
+            native_plan.stages[schedule.graph_stage].schema,
+            lineage_config,
+            left_schema,
+            left_schema,
+            definition_plan.bounds.max_graph_depth,
+        );
+        errdefer lineage.deinit(allocator);
+        const left_true = try joinTrueFieldIndex(on, left_schema, "left_true");
+        const right_true = try joinTrueFieldIndex(on, left_schema, "right_true");
         return .{
             .allocator = allocator,
             .left_schema = left_schema,
             .output_width = stage.schema.columns.len,
             .keys = keys,
-            .lineage = try LineageIndex.init(
-                allocator,
-                graph,
-                native_plan.stages[schedule.graph_stage].schema,
-                lineage_config,
-                left_schema,
-                left_schema,
-                definition_plan.bounds.max_graph_depth,
-            ),
-            .left_true_index = if (on.get("left_true")) |raw|
-                left_schema.find(try definition_core.json.string(raw)) orelse
-                    return error.UnknownObservationJoinField
-            else
-                null,
-            .right_true_index = if (on.get("right_true")) |raw|
-                left_schema.find(try definition_core.json.string(raw)) orelse
-                    return error.UnknownObservationJoinField
-            else
-                null,
+            .lineage = lineage,
+            .left_true_index = left_true,
+            .right_true_index = right_true,
             .max_rows = definition_plan.bounds.max_rows,
             .max_retained_bytes = max_retained_bytes,
         };
@@ -2049,6 +2067,10 @@ fn appendJoinRow(
     }
 }
 
+fn configArray(object: std.json.ObjectMap, name: []const u8) !std.json.Array {
+    return definition_core.json.array(try definition_core.json.field(object, name));
+}
+
 fn orderedFoldTable(
     allocator: std.mem.Allocator,
     retained_allocator: std.mem.Allocator,
@@ -2060,6 +2082,8 @@ fn orderedFoldTable(
     config: []const u8,
     max_states: usize,
 ) !Table {
+    var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = config.len };
+    defer workspace.deinit();
     var parsed = try parseConfig(allocator, config);
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
@@ -2080,27 +2104,12 @@ fn orderedFoldTable(
     );
     defer allocator.free(order);
     const sorted = try sortTableInPlace(allocator, input, .{ .keys = order });
-    const state_defs = try definition_core.json.array(
-        try definition_core.json.field(root, "state"),
-    );
+    const state_defs = try configArray(root, "state");
     if (state_defs.items.len > max_states) return error.ObservationFoldStateBoundExceeded;
-    const transitions = try definition_core.json.array(
-        try definition_core.json.field(root, "transitions"),
-    );
-    const emit = try definition_core.json.array(
-        try definition_core.json.field(root, "emit"),
-    );
-    var state = try allocator.alloc(execution.Value, state_defs.items.len);
-    defer allocator.free(state);
-    var state_names = try allocator.alloc([]const u8, state_defs.items.len);
-    defer allocator.free(state_names);
-    const current_key = try allocator.alloc(execution.Value, keys.len);
-    defer allocator.free(current_key);
-    var has_current_key = false;
-    const emit_values = try allocator.alloc(execution.Value, emit.items.len);
-    defer allocator.free(emit_values);
-    const previous = try allocator.alloc(execution.Value, state_defs.items.len);
-    defer allocator.free(previous);
+    const transitions = try configArray(root, "transitions");
+    const emit = try configArray(root, "emit");
+    var scratch = try FoldScratch.init(allocator, state_defs.items.len, keys.len, emit.items.len);
+    defer scratch.deinit(allocator);
     const in_place = output_schema.columns.len <= input.width;
     const output_values = if (in_place)
         input.values
@@ -2110,68 +2119,143 @@ fn orderedFoldTable(
             (try sorted.rowCount()) * output_schema.columns.len,
         );
     errdefer if (!in_place) allocator.free(output_values);
-    for (0..try sorted.rowCount()) |row_index| {
-        const row = sorted.row(row_index);
-        const new_partition = !has_current_key or
-            !rowMatchesKey(row, current_key, keys);
-        if (new_partition) {
-            for (keys, 0..) |key, index| current_key[index] = row[key];
-            has_current_key = true;
-            for (state_defs.items, 0..) |item, index| {
-                const object = try definition_core.json.object(item);
-                state_names[index] = try definition_core.json.requiredString(object, "name");
-                state[index] = try evalExpr(
-                    retained_allocator,
-                    try definition_core.json.field(object, "initial"),
-                    row,
-                    input_schema,
-                    state,
-                    state_names,
-                    bindings,
-                    selectors,
-                );
-            }
-        }
-        @memcpy(previous, state);
-        for (transitions.items) |item| {
-            const transition = try definition_core.json.object(item);
-            const name = try definition_core.json.requiredString(transition, "state");
-            const index = findName(state_names, name) orelse
-                return error.UnknownObservationFoldState;
-            state[index] = try evalExpr(
-                retained_allocator,
-                try definition_core.json.field(transition, "expr"),
-                row,
-                input_schema,
-                previous,
-                state_names,
-                bindings,
-                selectors,
-            );
-        }
-        for (emit.items, 0..) |item, emit_index| {
-            const field = try definition_core.json.object(item);
-            emit_values[emit_index] = try evalExpr(
-                retained_allocator,
-                try definition_core.json.field(field, "expr"),
-                row,
-                input_schema,
-                state,
-                state_names,
-                bindings,
-                selectors,
-            );
-        }
-        @memcpy(
-            output_values[row_index * output_schema.columns.len ..][0..output_schema.columns.len],
-            emit_values,
-        );
-    }
+    var fold: FoldExecution = .{
+        .workspace = &workspace,
+        .allocator = retained_allocator,
+        .bindings = bindings,
+        .selectors = selectors,
+        .input_schema = input_schema,
+        .state_defs = state_defs,
+        .transitions = transitions,
+        .emit = emit,
+        .keys = keys,
+        .scratch = &scratch,
+    };
+    try fold.run(sorted, output_values, output_schema.columns.len);
     return .{
         .values = output_values[0 .. (try sorted.rowCount()) * output_schema.columns.len],
         .width = output_schema.columns.len,
     };
 }
+
+const FoldScratch = struct {
+    state: []execution.Value,
+    state_names: [][]const u8,
+    current_key: []execution.Value,
+    emit_values: []execution.Value,
+    previous: []execution.Value,
+
+    fn init(allocator: std.mem.Allocator, states: usize, keys: usize, emit: usize) !FoldScratch {
+        const state = try allocator.alloc(execution.Value, states);
+        errdefer allocator.free(state);
+        const names = try allocator.alloc([]const u8, states);
+        errdefer allocator.free(names);
+        const current_key = try allocator.alloc(execution.Value, keys);
+        errdefer allocator.free(current_key);
+        const emit_values = try allocator.alloc(execution.Value, emit);
+        errdefer allocator.free(emit_values);
+        const previous = try allocator.alloc(execution.Value, states);
+        return .{
+            .state = state,
+            .state_names = names,
+            .current_key = current_key,
+            .emit_values = emit_values,
+            .previous = previous,
+        };
+    }
+
+    fn deinit(self: *FoldScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.previous);
+        allocator.free(self.emit_values);
+        allocator.free(self.current_key);
+        allocator.free(self.state_names);
+        allocator.free(self.state);
+    }
+};
+
+const FoldExecution = struct {
+    workspace: *ExpressionWorkspace,
+    allocator: std.mem.Allocator,
+    bindings: *const definition_core.parameters.Bindings,
+    selectors: RuntimeSelectors,
+    input_schema: *const plan.Schema,
+    state_defs: std.json.Array,
+    transitions: std.json.Array,
+    emit: std.json.Array,
+    keys: []const u16,
+    scratch: *FoldScratch,
+
+    fn run(self: *FoldExecution, sorted: Table, output: []execution.Value, width: usize) !void {
+        var has_current_key = false;
+        for (0..try sorted.rowCount()) |row_index| {
+            const row = sorted.row(row_index);
+            if (!has_current_key or !rowMatchesKey(row, self.scratch.current_key, self.keys)) {
+                for (self.keys, 0..) |key, index| self.scratch.current_key[index] = row[key];
+                has_current_key = true;
+                try self.initializePartition(row);
+            }
+            try self.transition(row);
+            for (self.emit.items, 0..) |item, index| {
+                const field = try definition_core.json.object(item);
+                self.scratch.emit_values[index] = try self.evaluate(
+                    row,
+                    try definition_core.json.field(field, "expr"),
+                    self.scratch.state,
+                );
+            }
+            @memcpy(output[row_index * width ..][0..width], self.scratch.emit_values);
+        }
+    }
+
+    fn initializePartition(self: *FoldExecution, row: []const execution.Value) !void {
+        for (self.state_defs.items, 0..) |item, index| {
+            const object = try definition_core.json.object(item);
+            self.scratch.state_names[index] = try definition_core.json.requiredString(
+                object,
+                "name",
+            );
+            self.scratch.state[index] = try self.evaluate(
+                row,
+                try definition_core.json.field(object, "initial"),
+                self.scratch.state,
+            );
+        }
+    }
+
+    fn transition(self: *FoldExecution, row: []const execution.Value) !void {
+        @memcpy(self.scratch.previous, self.scratch.state);
+        for (self.transitions.items) |item| {
+            const step = try definition_core.json.object(item);
+            const name = try definition_core.json.requiredString(step, "state");
+            const index = findName(self.scratch.state_names, name) orelse
+                return error.UnknownObservationFoldState;
+            self.scratch.state[index] = try self.evaluate(
+                row,
+                try definition_core.json.field(step, "expr"),
+                self.scratch.previous,
+            );
+        }
+    }
+
+    fn evaluate(
+        self: *FoldExecution,
+        row: []const execution.Value,
+        expression: std.json.Value,
+        state: []const execution.Value,
+    ) !execution.Value {
+        return evalExpr(
+            self.workspace,
+            self.allocator,
+            expression,
+            row,
+            self.input_schema,
+            state,
+            self.scratch.state_names,
+            self.bindings,
+            self.selectors,
+        );
+    }
+};
 
 fn rowMatchesKey(
     row: []const execution.Value,
@@ -2235,6 +2319,31 @@ fn reachabilityTable(
         }
         return error.UnknownObservationReachabilityMode;
     }
+    return reachabilitySeeded(
+        allocator,
+        input,
+        input_schema,
+        output_schema,
+        fields,
+        keys,
+        parent_index,
+        bounds,
+        &nodes,
+    );
+}
+
+fn reachabilitySeeded(
+    allocator: std.mem.Allocator,
+    input: Table,
+    input_schema: *const plan.Schema,
+    output_schema: plan.Schema,
+    fields: std.json.Array,
+    keys: std.json.ObjectMap,
+    parent_index: u16,
+    bounds: definition.Bounds,
+    nodes: *const std.StringHashMapUnmanaged(usize),
+) !Table {
+    const count = try input.rowCount();
     const seed_index = input_schema.find(
         try definition_core.json.requiredString(keys, "seed"),
     ) orelse return error.UnknownObservationReachabilityField;
@@ -2262,8 +2371,40 @@ fn reachabilityTable(
         },
         else => {},
     };
+    try expandReachability(
+        input,
+        parent_index,
+        bounds.max_graph_depth,
+        nodes,
+        walk_ancestors,
+        walk_descendants,
+        reachable,
+        depths,
+    );
+    return projectReachability(
+        allocator,
+        input,
+        input_schema,
+        output_schema,
+        fields,
+        reachable,
+        depths,
+    );
+}
+
+fn expandReachability(
+    input: Table,
+    parent_index: u16,
+    max_depth: usize,
+    nodes: *const std.StringHashMapUnmanaged(usize),
+    walk_ancestors: bool,
+    walk_descendants: bool,
+    reachable: []bool,
+    depths: []i64,
+) !void {
+    const count = try input.rowCount();
     var depth: usize = 0;
-    while (depth < bounds.max_graph_depth) : (depth += 1) {
+    while (depth < max_depth) : (depth += 1) {
         var changed = false;
         for (0..count) |child_index| {
             const parent = input.row(child_index)[parent_index];
@@ -2289,6 +2430,18 @@ fn reachabilityTable(
         }
         if (!changed) break;
     }
+}
+
+fn projectReachability(
+    allocator: std.mem.Allocator,
+    input: Table,
+    input_schema: *const plan.Schema,
+    output_schema: plan.Schema,
+    fields: std.json.Array,
+    reachable: []const bool,
+    depths: []const i64,
+) !Table {
+    const count = try input.rowCount();
     var output: std.ArrayList(execution.Value) = .empty;
     errdefer output.deinit(allocator);
     for (0..count) |row_index| {
@@ -2403,7 +2556,313 @@ fn parseConfig(
     });
 }
 
+const ExpressionContext = struct {
+    allocator: std.mem.Allocator,
+    row: []const execution.Value,
+    output: []const execution.Value = &.{},
+    schema: *const plan.Schema,
+    state: []const execution.Value = &.{},
+    state_names: []const []const u8 = &.{},
+    bindings: *const definition_core.parameters.Bindings,
+    selectors: RuntimeSelectors,
+};
+
+const ExpressionBranch = struct {
+    kind: enum { coalesce, if_else, unary, binary, concat },
+    op: []const u8,
+    count: usize,
+    compiled_op: ?CompiledOp = null,
+};
+
+const ExpressionInspection = union(enum) {
+    value: execution.Value,
+    branch: ExpressionBranch,
+};
+
+const ExpressionNode = union(enum) {
+    compiled: *const CompiledExpr,
+    dynamic: std.json.Value,
+
+    fn inspect(self: ExpressionNode, context: ExpressionContext) !ExpressionInspection {
+        return switch (self) {
+            .dynamic => |value| inspectDynamicExpression(value, context),
+            .compiled => |expression| switch (expression.*) {
+                .null_value => .{ .value = .null },
+                .boolean => |value| .{ .value = .{ .boolean = value } },
+                .integer => |value| .{ .value = .{ .integer = value } },
+                .float => |value| .{ .value = .{ .float = value } },
+                .text => |value| .{ .value = .{
+                    .string = try context.allocator.dupe(u8, value),
+                } },
+                .field => |index| .{ .value = context.row[index] },
+                .output_field => |index| .{ .value = context.output[index] },
+                .dynamic => |value| inspectDynamicExpression(value, context),
+                .is_null => expressionBranch("is-null", 1),
+                .not => expressionBranch("not", 1),
+                .if_else => expressionBranch("if", 3),
+                .coalesce => |children| expressionBranch("coalesce", children.len),
+                .binary => |binary| .{ .branch = .{
+                    .kind = .binary,
+                    .op = compiledOpName(binary.op),
+                    .count = 2,
+                    .compiled_op = binary.op,
+                } },
+            },
+        };
+    }
+
+    fn child(self: ExpressionNode, index: usize) ExpressionNode {
+        return switch (self) {
+            .dynamic => |value| .{ .dynamic = value.object.get("args").?.array.items[index] },
+            .compiled => |expression| switch (expression.*) {
+                .dynamic => |value| .{
+                    .dynamic = value.object.get("args").?.array.items[index],
+                },
+                .is_null, .not => |value| .{ .compiled = value },
+                .if_else => |value| .{ .compiled = switch (index) {
+                    0 => value.condition,
+                    1 => value.then_value,
+                    2 => value.else_value,
+                    else => unreachable,
+                } },
+                .coalesce => |children| .{ .compiled = children[index] },
+                .binary => |value| .{ .compiled = if (index == 0) value.left else value.right },
+                else => unreachable,
+            },
+        };
+    }
+};
+
+fn compiledOpName(op: CompiledOp) []const u8 {
+    return switch (op) {
+        .and_op => "and",
+        .or_op => "or",
+        else => @tagName(op),
+    };
+}
+
+fn expressionBranch(op: []const u8, count: usize) !ExpressionInspection {
+    const kind: @FieldType(ExpressionBranch, "kind") = if (std.mem.eql(u8, op, "coalesce"))
+        .coalesce
+    else if (std.mem.eql(u8, op, "if"))
+        .if_else
+    else if (std.mem.eql(u8, op, "concat"))
+        .concat
+    else if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not") or
+        std.mem.eql(u8, op, "parse-time"))
+        .unary
+    else
+        .binary;
+    const required: ?usize = switch (kind) {
+        .if_else => 3,
+        .unary => 1,
+        .binary => 2,
+        .coalesce, .concat => null,
+    };
+    if (required) |arity| if (count != arity) return error.InvalidObservationExpressionArity;
+    return .{ .branch = .{ .kind = kind, .op = op, .count = count } };
+}
+
+fn inspectDynamicExpression(
+    expression: std.json.Value,
+    context: ExpressionContext,
+) !ExpressionInspection {
+    return switch (expression) {
+        .null => .{ .value = .null },
+        .bool => |value| .{ .value = .{ .boolean = value } },
+        .integer => |value| .{ .value = .{ .integer = value } },
+        .float => |value| .{ .value = .{ .float = value } },
+        .number_string => |value| .{ .value = if (std.fmt.parseInt(i64, value, 10)) |integer|
+            .{ .integer = integer }
+        else |_|
+            .{ .float = try std.fmt.parseFloat(f64, value) } },
+        .string => |value| .{ .value = .{ .string = try context.allocator.dupe(u8, value) } },
+        .array => error.InvalidObservationExpression,
+        .object => |object| inspectDynamicObject(object, context),
+    };
+}
+
+fn inspectDynamicObject(
+    object: std.json.ObjectMap,
+    context: ExpressionContext,
+) !ExpressionInspection {
+    if (object.get("field")) |raw| {
+        const name = try definition_core.json.string(raw);
+        const index = context.schema.find(name) orelse
+            return error.UnknownObservationExpressionField;
+        return .{ .value = context.row[index] };
+    }
+    if (object.get("state")) |raw| {
+        const name = try definition_core.json.string(raw);
+        const index = findName(context.state_names, name) orelse
+            return error.UnknownObservationFoldState;
+        return .{ .value = context.state[index] };
+    }
+    if (object.get("param")) |raw| {
+        const name = try definition_core.json.string(raw);
+        const binding = context.bindings.find(name) orelse return error.UnknownParameter;
+        return .{ .value = scalarValue(binding.value) };
+    }
+    if (object.get("selector")) |raw| {
+        return .{ .value = try selectorValue(
+            context.selectors,
+            try definition_core.json.string(raw),
+        ) };
+    }
+    const op = try definition_core.json.requiredString(object, "op");
+    const args = try definition_core.json.array(try definition_core.json.field(object, "args"));
+    return expressionBranch(op, args.items.len);
+}
+
+const ExpressionFrame = struct {
+    node: ExpressionNode,
+    branch: ExpressionBranch,
+    next: usize = 0,
+    left: execution.Value = .null,
+    text: std.ArrayList(u8) = .empty,
+
+    fn accept(
+        self: *ExpressionFrame,
+        value: *execution.Value,
+        scratch_allocator: std.mem.Allocator,
+        retained_allocator: std.mem.Allocator,
+    ) !bool {
+        switch (self.branch.kind) {
+            .coalesce => {
+                if (value.* != .null or self.next + 1 == self.branch.count) return true;
+                self.next += 1;
+                return false;
+            },
+            .if_else => {
+                if (self.next != 0) return true;
+                self.next = if (truthy(value.*)) 1 else 2;
+                return false;
+            },
+            .unary => value.* = unaryExpression(self.branch.op, value.*),
+            .binary => {
+                if (self.next == 0) {
+                    self.left = value.*;
+                    self.next = 1;
+                    return false;
+                }
+                value.* = if (self.branch.compiled_op) |op|
+                    try compiledBinaryExpression(op, self.left, value.*)
+                else
+                    try binaryExpression(self.branch.op, self.left, value.*);
+            },
+            .concat => {
+                try self.text.appendSlice(scratch_allocator, valueText(value.*) orelse "");
+                self.next += 1;
+                if (self.next < self.branch.count) return false;
+                value.* = .{ .string = try retained_allocator.dupe(u8, self.text.items) };
+            },
+        }
+        return true;
+    }
+};
+
+const ExpressionWorkspace = struct {
+    allocator: std.mem.Allocator,
+    // Every pending expression consumes at least one byte in this bounded config.
+    config_bytes: usize,
+    frames: std.ArrayList(ExpressionFrame) = .empty,
+
+    fn deinit(self: *ExpressionWorkspace) void {
+        std.debug.assert(self.frames.items.len == 0);
+        self.frames.deinit(self.allocator);
+    }
+
+    fn evaluate(
+        self: *ExpressionWorkspace,
+        root: ExpressionNode,
+        context: ExpressionContext,
+    ) !execution.Value {
+        std.debug.assert(self.frames.items.len == 0);
+        defer {
+            for (self.frames.items) |*frame| frame.text.deinit(self.allocator);
+            self.frames.clearRetainingCapacity();
+        }
+        var pending: ?ExpressionNode = root;
+        var value: execution.Value = .null;
+        while (pending != null or self.frames.items.len > 0) {
+            if (pending) |node| {
+                pending = null;
+                switch (try node.inspect(context)) {
+                    .value => |result| value = result,
+                    .branch => |branch| {
+                        if (branch.count == 0) {
+                            value = if (branch.kind == .concat)
+                                .{ .string = try context.allocator.alloc(u8, 0) }
+                            else
+                                .null;
+                        } else {
+                            if (self.frames.items.len >= self.config_bytes) {
+                                return error.InvalidObservationExpression;
+                            }
+                            try self.frames.append(self.allocator, .{
+                                .node = node,
+                                .branch = branch,
+                            });
+                            pending = node.child(0);
+                            continue;
+                        }
+                    },
+                }
+            }
+            if (self.frames.items.len == 0) return value;
+            const frame = &self.frames.items[self.frames.items.len - 1];
+            if (try frame.accept(&value, self.allocator, context.allocator)) {
+                frame.text.deinit(self.allocator);
+                _ = self.frames.pop();
+            } else {
+                std.debug.assert(frame.next < frame.branch.count);
+                pending = frame.node.child(frame.next);
+            }
+        }
+        return value;
+    }
+};
+
+fn unaryExpression(op: []const u8, value: execution.Value) execution.Value {
+    if (std.mem.eql(u8, op, "parse-time")) {
+        const text = valueText(value) orelse return .null;
+        return if (seq_time.parseIsoTimestampMillis(text)) |millis|
+            .{ .integer = millis }
+        else
+            .null;
+    }
+    return .{ .boolean = if (std.mem.eql(u8, op, "is-null")) value == .null else !truthy(value) };
+}
+
+fn binaryExpression(
+    op: []const u8,
+    left: execution.Value,
+    right: execution.Value,
+) !execution.Value {
+    if (parseCompiledOp(op)) |compiled| return compiledBinaryExpression(compiled, left, right);
+    return numericOperator(op, left, right);
+}
+
+fn compiledBinaryExpression(
+    op: CompiledOp,
+    left: execution.Value,
+    right: execution.Value,
+) !execution.Value {
+    return switch (op) {
+        .eq => .{ .boolean = valuesEqual(left, right, false) },
+        .ne => .{ .boolean = !valuesEqual(left, right, false) },
+        .lt => .{ .boolean = compareValues(left, right) == .lt },
+        .le => .{ .boolean = compareValues(left, right) != .gt },
+        .gt => .{ .boolean = compareValues(left, right) == .gt },
+        .ge => .{ .boolean = compareValues(left, right) != .lt },
+        .and_op => .{ .boolean = truthy(left) and truthy(right) },
+        .or_op => .{ .boolean = truthy(left) or truthy(right) },
+        .add, .subtract, .multiply, .divide => numericOperator(@tagName(op), left, right),
+    };
+}
+
 fn evalExpr(
+    workspace: *ExpressionWorkspace,
     allocator: std.mem.Allocator,
     expression: std.json.Value,
     row: []const execution.Value,
@@ -2412,139 +2871,16 @@ fn evalExpr(
     state_names: []const []const u8,
     bindings: *const definition_core.parameters.Bindings,
     selectors: RuntimeSelectors,
-) anyerror!execution.Value {
-    return switch (expression) {
-        .null => .null,
-        .bool => |value| .{ .boolean = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| if (std.fmt.parseInt(i64, value, 10)) |integer|
-            .{ .integer = integer }
-        else |_|
-            .{ .float = try std.fmt.parseFloat(f64, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => error.InvalidObservationExpression,
-        .object => |object| {
-            if (object.get("field")) |raw| {
-                const name = try definition_core.json.string(raw);
-                return row[schema.find(name) orelse return error.UnknownObservationExpressionField];
-            }
-            if (object.get("state")) |raw| {
-                const name = try definition_core.json.string(raw);
-                return state[
-                    findName(state_names, name) orelse
-                        return error.UnknownObservationFoldState
-                ];
-            }
-            if (object.get("param")) |raw| {
-                const name = try definition_core.json.string(raw);
-                const binding = bindings.find(name) orelse return error.UnknownParameter;
-                return scalarValue(binding.value);
-            }
-            if (object.get("selector")) |raw| {
-                return selectorValue(
-                    selectors,
-                    try definition_core.json.string(raw),
-                );
-            }
-            const op = try definition_core.json.requiredString(object, "op");
-            const args = try definition_core.json.array(
-                try definition_core.json.field(object, "args"),
-            );
-            return evalOperator(
-                allocator,
-                op,
-                args,
-                row,
-                schema,
-                state,
-                state_names,
-                bindings,
-                selectors,
-            );
-        },
-    };
-}
-
-fn evalOperator(
-    allocator: std.mem.Allocator,
-    op: []const u8,
-    args: std.json.Array,
-    row: []const execution.Value,
-    schema: *const plan.Schema,
-    state: []const execution.Value,
-    state_names: []const []const u8,
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-) anyerror!execution.Value {
-    if (std.mem.eql(u8, op, "coalesce")) {
-        for (args.items) |arg| {
-            const value = try evalExpr(allocator, arg, row, schema, state, state_names, bindings, selectors);
-            if (value != .null) return value;
-        }
-        return .null;
-    }
-    if (std.mem.eql(u8, op, "if")) {
-        if (args.items.len != 3) return error.InvalidObservationExpressionArity;
-        const condition = try evalExpr(allocator, args.items[0], row, schema, state, state_names, bindings, selectors);
-        return evalExpr(
-            allocator,
-            args.items[if (truthy(condition)) 1 else 2],
-            row,
-            schema,
-            state,
-            state_names,
-            bindings,
-            selectors,
-        );
-    }
-    if (std.mem.eql(u8, op, "is-null") or
-        std.mem.eql(u8, op, "not") or
-        std.mem.eql(u8, op, "parse-time"))
-    {
-        if (args.items.len != 1) return error.InvalidObservationExpressionArity;
-        const value = try evalExpr(allocator, args.items[0], row, schema, state, state_names, bindings, selectors);
-        if (std.mem.eql(u8, op, "parse-time")) {
-            const text = valueText(value) orelse return .null;
-            return if (seq_time.parseIsoTimestampMillis(text)) |millis|
-                .{ .integer = millis }
-            else
-                .null;
-        }
-        return .{ .boolean = if (std.mem.eql(u8, op, "is-null")) value == .null else !truthy(value) };
-    }
-    if (std.mem.eql(u8, op, "concat")) {
-        var size: usize = 0;
-        for (args.items) |arg| {
-            const value = try evalExpr(allocator, arg, row, schema, state, state_names, bindings, selectors);
-            size = try std.math.add(
-                usize,
-                size,
-                (valueText(value) orelse @as([]const u8, "")).len,
-            );
-        }
-        const text = try allocator.alloc(u8, size);
-        var cursor: usize = 0;
-        for (args.items) |arg| {
-            const value = try evalExpr(allocator, arg, row, schema, state, state_names, bindings, selectors);
-            const part = valueText(value) orelse @as([]const u8, "");
-            @memcpy(text[cursor..][0..part.len], part);
-            cursor += part.len;
-        }
-        return .{ .string = text };
-    }
-    if (args.items.len != 2) return error.InvalidObservationExpressionArity;
-    const left = try evalExpr(allocator, args.items[0], row, schema, state, state_names, bindings, selectors);
-    const right = try evalExpr(allocator, args.items[1], row, schema, state, state_names, bindings, selectors);
-    if (std.mem.eql(u8, op, "eq")) return .{ .boolean = valuesEqual(left, right, false) };
-    if (std.mem.eql(u8, op, "ne")) return .{ .boolean = !valuesEqual(left, right, false) };
-    if (std.mem.eql(u8, op, "lt")) return .{ .boolean = compareValues(left, right) == .lt };
-    if (std.mem.eql(u8, op, "le")) return .{ .boolean = compareValues(left, right) != .gt };
-    if (std.mem.eql(u8, op, "gt")) return .{ .boolean = compareValues(left, right) == .gt };
-    if (std.mem.eql(u8, op, "ge")) return .{ .boolean = compareValues(left, right) != .lt };
-    if (std.mem.eql(u8, op, "and")) return .{ .boolean = truthy(left) and truthy(right) };
-    if (std.mem.eql(u8, op, "or")) return .{ .boolean = truthy(left) or truthy(right) };
-    return numericOperator(op, left, right);
+) !execution.Value {
+    return workspace.evaluate(.{ .dynamic = expression }, .{
+        .allocator = allocator,
+        .row = row,
+        .schema = schema,
+        .state = state,
+        .state_names = state_names,
+        .bindings = bindings,
+        .selectors = selectors,
+    });
 }
 
 fn selectorValue(
@@ -2741,7 +3077,9 @@ test "lineage ownership is strict and does not cross siblings" {
     };
     var parsed = try parseConfig(
         std.testing.allocator,
-        "{\"left\":\"session_id\",\"right\":\"session_id\",\"node\":\"session_id\",\"parent\":\"parent_session_id\"}",
+        "{\"left\":\"session_id\",\"right\":\"session_id\"," ++
+            "\"node\":\"session_id\",\"parent\":\"parent_sessi" ++
+            "on_id\"}",
     );
     defer parsed.deinit();
     var index = try LineageIndex.init(
@@ -2771,7 +3109,9 @@ test "join equality hashes null-safe cumulative tuples consistently" {
     };
     var parsed = try parseConfig(
         std.testing.allocator,
-        "[{\"left\":\"total\",\"right\":\"total\"},{\"left\":\"cached\",\"right\":\"cached\",\"nulls_equal\":true}]",
+        "[{\"left\":\"total\",\"right\":\"total\"},{\"left\":" ++
+            "\"cached\",\"right\":\"cached\",\"nulls_equal\":tr" ++
+            "ue}]",
     );
     defer parsed.deinit();
     const keys = try definition_core.json.array(parsed.value);
@@ -2845,4 +3185,341 @@ test "streaming lineage lowering is selected from non-token topology" {
         "assistant_rows",
         native_plan.stages[schedule.local_stage].name,
     );
+}
+
+const expression_test_bindings: definition_core.parameters.Bindings = .{
+    .items = &.{},
+    .values_digest = .{0} ** 71,
+};
+const expression_test_schema: plan.Schema = .{ .columns = &.{} };
+
+fn testExpressionValue(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    compiled: bool,
+) !execution.Value {
+    var parsed = try parseConfig(allocator, source);
+    defer parsed.deinit();
+    var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = source.len };
+    defer workspace.deinit();
+    const node: ExpressionNode = if (compiled)
+        .{ .compiled = try compileExpr(allocator, parsed.value, &expression_test_schema, null, 0) }
+    else
+        .{ .dynamic = parsed.value };
+    return workspace.evaluate(node, .{
+        .allocator = allocator,
+        .row = &.{},
+        .schema = &expression_test_schema,
+        .bindings = &expression_test_bindings,
+        .selectors = .{},
+    });
+}
+
+test "compiled and dynamic expressions preserve lazy and eager branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, expected: execution.Value }{
+        .{ .source = "{\"op\":\"if\",\"args\":[true,7,{\"op\":\"unknown\"," ++
+            "\"args\":[1,2]}]}", .expected = .{ .integer = 7 } },
+        .{ .source = "{\"op\":\"coalesce\",\"args\":[null,9,{\"op\":\"unk" ++
+            "nown\",\"args\":[1,2]}]}", .expected = .{ .integer = 9 } },
+        .{ .source = "{\"op\":\"unknown\",\"args\":[null,2]}", .expected = .null },
+        .{ .source = "{\"op\":\"concat\",\"args\":[\"a\",{\"op\":\"concat\"," ++
+            "\"args\":[\"b\",\"c\"]}]}", .expected = .{ .string = "abc" } },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |compiled| {
+        const actual = try testExpressionValue(arena.allocator(), case.source, compiled);
+        try std.testing.expect(valuesEqual(case.expected, actual, false));
+    };
+    for ([_]bool{ false, true }) |compiled| {
+        try std.testing.expectError(error.UnsupportedObservationExpression, testExpressionValue(
+            arena.allocator(),
+            "{\"op\":\"and\",\"args\":[false,{\"op\":\"unknown\",\"args\":[1,2]}]}",
+            compiled,
+        ));
+    }
+}
+
+test "compiled field validation remains eager before row execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = "{\"op\":\"if\",\"args\":[true,7,{\"field\":\"missing\"}]}";
+    try std.testing.expectError(
+        error.UnknownObservationExpressionField,
+        testExpressionValue(arena.allocator(), source, true),
+    );
+    const actual = try testExpressionValue(arena.allocator(), source, false);
+    try std.testing.expectEqual(7, actual.integer);
+}
+
+test "deep expressions compile and evaluate with explicit frames" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    for (0..8192) |_| try source.appendSlice(std.testing.allocator, "{\"op\":\"not\",\"args\":[");
+    try source.appendSlice(std.testing.allocator, "true");
+    for (0..8192) |_| try source.appendSlice(std.testing.allocator, "]}");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |compiled| {
+        const value = try testExpressionValue(arena.allocator(), source.items, compiled);
+        try std.testing.expect(value.boolean);
+    }
+}
+
+fn exerciseExpressionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const source = "{\"op\":\"if\",\"args\":[true,{\"op\":\"concat\",\"args\":[\"a\"," ++
+        "{\"op\":\"if\",\"args\":[true,\"b\",\"c\"]}]},\"unused\"]}";
+    var parsed = try parseConfig(allocator, source);
+    defer parsed.deinit();
+    var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = source.len };
+    defer workspace.deinit();
+    const compiled = try compileExpr(
+        arena.allocator(),
+        parsed.value,
+        &expression_test_schema,
+        null,
+        0,
+    );
+    const value = try workspace.evaluate(.{ .compiled = compiled }, .{
+        .allocator = arena.allocator(),
+        .row = &.{},
+        .schema = &expression_test_schema,
+        .bindings = &expression_test_bindings,
+        .selectors = .{},
+    });
+    try std.testing.expectEqualStrings("ab", value.string);
+}
+
+test "expression workspace releases active frames at each allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExpressionAllocationFailures,
+        .{},
+    );
+}
+
+const graph_test_columns = [_]plan.Column{
+    .{ .name = @constCast("value"), .kind = .integer, .nullable = false },
+};
+const graph_test_fields = [_]u16{0};
+const graph_test_sort = [_]plan.SortKey{
+    .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+};
+const graph_test_stages = [_]plan.Stage{
+    .{
+        .name = @constCast("source"),
+        .source = null,
+        .schema = .{
+            .columns = @constCast(&graph_test_columns),
+        },
+        .operation = .{
+            .scan = .{
+                .relation = .sessions,
+                .field_indices = @constCast(&graph_test_fields),
+            },
+        },
+    },
+    .{
+        .name = @constCast("copy"),
+        .source = .{
+            .stage = 0,
+        },
+        .schema = .{
+            .columns = @constCast(&graph_test_columns),
+        },
+        .operation = .alias,
+    },
+    .{
+        .name = @constCast("ranked"),
+        .source = .{
+            .stage = 1,
+        },
+        .schema = .{
+            .columns = @constCast(&graph_test_columns),
+        },
+        .operation = .{
+            .top_k = .{
+                .keys = @constCast(&graph_test_sort),
+                .limit = .{
+                    .fixed = 1,
+                },
+            },
+        },
+    },
+};
+const graph_test_steps = [_]definition.Step{
+    .{
+        .operator = .scan,
+        .output_name = @constCast("source"),
+        .input_names = &.{},
+        .canonical_config = @constCast("{}"),
+    },
+    .{
+        .operator = .named_relation,
+        .output_name = @constCast("copy"),
+        .input_names = @constCast(&[_][]u8{@constCast("source")}),
+        .canonical_config = @constCast("{}"),
+    },
+    .{
+        .operator = .top_k,
+        .output_name = @constCast("ranked"),
+        .input_names = @constCast(&[_][]u8{@constCast("copy")}),
+        .canonical_config = @constCast("{}"),
+    },
+};
+const graph_test_projection = [_]definition.Projection{
+    .{
+        .name = @constCast("rows"),
+        .relation = @constCast("ranked"),
+        .schema_id = @constCast("test/rows"),
+        .fields = &.{},
+        .renderer_mask = 1,
+    },
+};
+const graph_test_definition: definition.Plan = .{
+    .id = @constCast("test/graph"),
+    .closure_digest = .{0} ** 71,
+    .operator_mask = 0,
+    .parameter_declarations = .{
+        .items = &.{},
+        .shape_digest = .{0} ** 71,
+    },
+    .selector_mask = 0,
+    .relations = &.{},
+    .inputs = &.{},
+    .steps = @constCast(&graph_test_steps),
+    .projections = @constCast(&graph_test_projection),
+    .bounds = .{
+        .max_rows = 3,
+        .max_output_bytes = 4096,
+        .max_fold_states = 1,
+        .max_input_bytes = 4096,
+        .max_graph_depth = 2,
+        .max_graph_nodes = 3,
+        .max_diagnostics = 1,
+    },
+};
+const graph_test_native: plan.Plan = .{
+    .stages = @constCast(&graph_test_stages),
+    .projections = @constCast(&[_]plan.Projection{
+        .{
+            .definition_index = 0,
+            .stage_index = 2,
+            .field_indices = @constCast(&graph_test_fields),
+        },
+    }),
+    .max_rows = 3,
+    .max_output_bytes = 4096,
+};
+
+fn exerciseGraphAllocationFailures(allocator: std.mem.Allocator, max_rows: usize) !void {
+    const source = [_]execution.Value{ .{ .integer = 3 }, .{ .integer = 1 }, .{ .integer = 2 } };
+    const owned = try allocator.dupe(execution.Value, &source);
+    var scans = [_]ScanInput{
+        .{ .stage_index = 0, .table = .{ .values = owned, .width = 1 }, .owned = true },
+    };
+    defer if (scans[0].owned) allocator.free(owned);
+    var definition_plan = graph_test_definition;
+    definition_plan.bounds.max_rows = max_rows;
+    const result = execute(
+        allocator,
+        allocator,
+        &definition_plan,
+        &graph_test_native,
+        &expression_test_bindings,
+        .{},
+        "rows",
+        &scans,
+    ) catch |err| {
+        if (err != error.ObservationRowBoundExceeded or max_rows >= 3) return err;
+        try std.testing.expect(!scans[0].owned);
+        return;
+    };
+    defer allocator.free(result.table.values);
+    try std.testing.expectEqual(3, max_rows);
+    try std.testing.expectEqual(1, result.table.values.len);
+    try std.testing.expectEqual(1, result.table.values[0].integer);
+    try std.testing.expectEqual(3, result.source_rows);
+    try std.testing.expectEqual(7, result.materialized_rows);
+    try std.testing.expect(!scans[0].owned);
+}
+
+test "graph ownership cleans up sorted intermediates and every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseGraphAllocationFailures,
+        .{@as(usize, 3)},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseGraphAllocationFailures,
+        .{@as(usize, 2)},
+    );
+}
+
+test "target graph output survives shared execution scratch teardown" {
+    var source = [_]execution.Value{ .{ .integer = 3 }, .{ .integer = 1 }, .{ .integer = 2 } };
+    var scans = [_]ScanInput{
+        .{ .stage_index = 0, .table = .{ .values = &source, .width = 1 } },
+    };
+    const result = try executeTarget(
+        std.testing.allocator,
+        std.testing.allocator,
+        &graph_test_definition,
+        &graph_test_native,
+        &expression_test_bindings,
+        .{},
+        2,
+        &scans,
+    );
+    defer std.testing.allocator.free(result.table.values);
+    try std.testing.expectEqual(1, result.table.values.len);
+    try std.testing.expectEqual(1, result.table.values[0].integer);
+    try std.testing.expectEqual(3, source[0].integer);
+    try std.testing.expectEqual(3, result.source_rows);
+    try std.testing.expectEqual(7, result.materialized_rows);
+}
+
+test "stage traversal checks depth before memoization and respects scan boundaries" {
+    var definition_plan = graph_test_definition;
+    definition_plan.bounds.max_graph_depth = 1;
+    var reachable = [_]bool{ true, false, false };
+    try std.testing.expectError(error.ObservationGraphDepthExceeded, markReachable(
+        std.testing.allocator,
+        &definition_plan,
+        &graph_test_native,
+        2,
+        &reachable,
+        &.{},
+        0,
+    ));
+    @memset(&reachable, false);
+    definition_plan.bounds.max_graph_depth = 2;
+    try markReachable(
+        std.testing.allocator,
+        &definition_plan,
+        &graph_test_native,
+        2,
+        &reachable,
+        &.{},
+        0,
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
+    @memset(&reachable, false);
+    definition_plan.bounds.max_graph_depth = 1;
+    var scans = [_]ScanInput{
+        .{ .stage_index = 1, .table = .{ .values = &.{}, .width = 1 } },
+    };
+    try markReachable(
+        std.testing.allocator,
+        &definition_plan,
+        &graph_test_native,
+        2,
+        &reachable,
+        &scans,
+        0,
+    );
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &reachable);
 }
