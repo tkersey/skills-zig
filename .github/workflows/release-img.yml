@@ -30,9 +30,11 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
+            zig_target: x86_64-linux
             runs_on: ubuntu-latest
             zig_archive: zig-x86_64-linux-0.16.0.tar.xz
           - target: darwin-arm64
+            zig_target: aarch64-macos
             runs_on: macos-14
             zig_archive: zig-aarch64-macos-0.16.0.tar.xz
     runs-on: ${{ matrix.runs_on }}
@@ -57,7 +59,7 @@ jobs:
           zig_dir="${archive%.tar.xz}"
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build img
-        run: zig build build-img -Doptimize=ReleaseFast --summary all
+        run: zig build build-img -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast --summary all
       - name: Test img
         run: zig build test-img --summary all
       - name: Verify img version
