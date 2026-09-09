@@ -374,3 +374,24 @@ test "receiver recursion is rejected across multiline declarations and calls" {
     , &result);
     try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
 }
+
+test "receiver recursion is rejected with comptime and noalias parameters" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result = Audit{};
+    try source(&output.writer, "modifiers.zig",
+        \\fn visit(comptime self: Builder) void { self.visit(); }
+        \\fn walk(
+        \\    noalias self: *Builder,
+        \\) void {
+        \\    self.walk();
+        \\}
+        \\fn run(
+        \\    comptime T: type,
+        \\    self: *Runner,
+        \\) void {
+        \\    self.run();
+        \\}
+    , &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
