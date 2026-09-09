@@ -65,7 +65,7 @@ pub const PlanSet = struct {
     pub fn deinit(self: *PlanSet, allocator: std.mem.Allocator) void {
         if (self.cache_arena) |arena_value| {
             var arena = arena_value;
-            self.deinitPlans(arena.allocator());
+            // Decoders allocate every retained plan, including nested arenas, from this owner.
             arena.deinit();
         } else {
             self.deinitPlans(allocator);
