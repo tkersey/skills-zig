@@ -92,14 +92,20 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(parsed.opt_out_methods);
 
     if (parsed.show_version) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -109,6 +115,15 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
 
+    return runConfiguredSmoke(allocator, init.io, parsed, cwd);
+}
+
+fn runConfiguredSmoke(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+) !void {
     const validated_transport = launch.validateTransport(
         parsed.requested_transport,
         parsed.transport_endpoint,
@@ -130,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
 
     var acquired = acquireClient(
         allocator,
-        init.io,
+        io,
         cwd,
         parsed,
         validated_transport,
@@ -140,11 +155,29 @@ pub fn main(init: std.process.Init) !void {
     };
     defer acquired.deinit();
 
+    return runSmokeChecks(
+        allocator,
+        io,
+        parsed,
+        cwd,
+        &acquired,
+        if (code_mode_host) |*host| host else null,
+    );
+}
+
+fn runSmokeChecks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+    acquired: *AcquiredClient,
+    code_mode_host: ?*const launch.CodeModeHost,
+) !void {
     var checks: std.ArrayList(CheckResult) = .empty;
     defer checks.deinit(allocator);
 
     const hook_log_path = if (parsed.hook_policy.shouldCaptureNotifications())
-        try cas.hooks.defaultHookLogPathAlloc(allocator, "cas-smoke-check")
+        try cas.hooks.defaultHookLogPathAlloc(allocator, io, "cas-smoke-check")
     else
         null;
     defer if (hook_log_path) |path| allocator.free(path);
@@ -154,313 +187,132 @@ pub fn main(init: std.process.Init) !void {
         for (captured_notifications.items) |line| allocator.free(line);
         captured_notifications.deinit(allocator);
     }
-    const notification_capture: ?*std.ArrayList([]u8) = if (parsed.hook_policy.shouldCaptureNotifications()) &captured_notifications else null;
+    const notification_capture: ?*std.ArrayList([]u8) =
+        if (parsed.hook_policy.shouldCaptureNotifications())
+            &captured_notifications
+        else
+            null;
 
     var thread_id = parsed.thread_id;
-    const client = &acquired.client;
+    defer if (parsed.thread_id == null) {
+        if (thread_id) |id| allocator.free(id);
+    };
+    const context = SmokeContext{
+        .allocator = allocator,
+        .io = io,
+        .client = &acquired.client,
+        .notification_capture = notification_capture,
+    };
 
-    // Check 1: experimentalFeature/list succeeds.
-    {
-        const maybe_result = client.requestJsonCaptureNotifications("experimentalFeature/list", "{\"cursor\":null,\"limit\":1}", notification_capture) catch |err| blk: {
-            try checks.append(allocator, .{
-                .name = "experimentalFeature/list",
-                .ok = false,
-                .detail = try errorSummary(allocator, client, err),
-            });
-            break :blk null;
-        };
+    try checks.append(allocator, try checkFeatureList(context));
+    try checks.append(allocator, try checkResume(context, cwd, &thread_id));
+    const turn = try checkTurnStart(context, thread_id);
+    defer if (turn.id) |id| allocator.free(id);
+    try checks.append(allocator, turn.check);
+    if (parsed.hook_policy == .require_observed) try drainHooks(context, thread_id);
+    try checks.append(allocator, try checkInterrupt(context, thread_id, turn.id));
+    try checks.append(allocator, try checkSteer(context, thread_id));
+    const ok = try reportSmokeChecks(
+        context,
+        parsed,
+        cwd,
+        acquired,
+        code_mode_host,
+        thread_id,
+        checks.items,
+        captured_notifications.items,
+        hook_log_path,
+    );
+    std.process.exit(if (ok) 0 else 1);
+}
 
-        if (maybe_result) |result_json| {
-            defer allocator.free(result_json);
-            const rows = try countDataRows(allocator, result_json);
-            const rows_text = if (rows) |r| try std.fmt.allocPrint(allocator, "{d}", .{r}) else "unknown";
-            try checks.append(allocator, .{
-                .name = "experimentalFeature/list",
-                .ok = true,
-                .detail = try std.fmt.allocPrint(allocator, "ok (rows={s})", .{rows_text}),
-            });
-        }
-    }
-
-    // Check 2: thread/resume method is wired.
-    {
-        var thread_resume_ok = true;
-        var detail: []const u8 = "ok";
-
-        const maybe_resumed = blk: {
-            if (thread_id == null) {
-                const start_params = try stringifyAnyAlloc(allocator, .{
-                    .cwd = cwd,
-                    .experimentalRawEvents = false,
-                });
-                defer allocator.free(start_params);
-                const start_json = client.requestJsonCaptureNotifications("thread/start", start_params, notification_capture) catch |err| {
-                    const summary = try errorSummary(allocator, client, err);
-                    if (isMethodUnavailableError(summary)) {
-                        thread_resume_ok = false;
-                        detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
-                    } else {
-                        detail = try std.fmt.allocPrint(allocator, "method reached server: {s}", .{summary});
-                    }
-                    break :blk null;
-                };
-                defer allocator.free(start_json);
-                thread_id = try extractThreadId(allocator, start_json);
-            }
-
-            const resolved_thread_id = thread_id orelse {
-                thread_resume_ok = false;
-                detail = "thread/start did not return thread.id";
-                break :blk null;
-            };
-
-            const resume_params = try stringifyAnyAlloc(allocator, .{
-                .threadId = resolved_thread_id,
-            });
-            defer allocator.free(resume_params);
-
-            const resume_json = client.requestJsonCaptureNotifications("thread/resume", resume_params, notification_capture) catch |err| {
-                const summary = try errorSummary(allocator, client, err);
-                if (isMethodUnavailableError(summary)) {
-                    thread_resume_ok = false;
-                    detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
-                } else {
-                    detail = try std.fmt.allocPrint(allocator, "method reached server: {s}", .{summary});
-                }
-                break :blk null;
-            };
-            defer allocator.free(resume_json);
-            break :blk try extractThreadId(allocator, resume_json);
-        };
-
-        if (thread_resume_ok and maybe_resumed != null and thread_id != null) {
-            const resumed = maybe_resumed.?;
-            if (!std.mem.eql(u8, resumed, thread_id.?)) {
-                thread_resume_ok = false;
-                detail = try std.fmt.allocPrint(allocator, "thread/resume returned unexpected thread id: {s}", .{resumed});
-            }
-        }
-
-        try checks.append(allocator, .{
-            .name = "thread/resume",
-            .ok = thread_resume_ok,
-            .detail = detail,
-        });
-    }
-
-    // Check 3: turn/start returns a turn id for a resumed thread.
-    {
-        var turn_start_ok = true;
-        var turn_start_detail: []const u8 = "ok";
-        var started_turn_id: ?[]const u8 = null;
-
-        if (thread_id == null) {
-            turn_start_ok = false;
-            turn_start_detail = "no threadId available for turn/start check";
-        } else {
-            const turn_start_params = try stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id.?,
-                .input = [_]struct {
-                    type: []const u8,
-                    text: []const u8,
-                }{
-                    .{
-                        .type = "text",
-                        .text = "cas smoke-check turn start",
-                    },
-                },
-            });
-            defer allocator.free(turn_start_params);
-
-            const turn_start_json = client.requestJsonCaptureNotifications("turn/start", turn_start_params, notification_capture) catch |err| blk: {
-                const summary = try errorSummary(allocator, client, err);
-                if (isMethodUnavailableError(summary)) {
-                    turn_start_ok = false;
-                    turn_start_detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
-                } else {
-                    turn_start_detail = try std.fmt.allocPrint(allocator, "method reached server: {s}", .{summary});
-                }
-                break :blk null;
-            };
-
-            if (turn_start_json) |json| {
-                defer allocator.free(json);
-                started_turn_id = try extractTurnId(allocator, json);
-                if (started_turn_id == null) {
-                    turn_start_ok = false;
-                    turn_start_detail = "turn/start did not return turn.id";
-                }
-            }
-        }
-
-        try checks.append(allocator, .{
-            .name = "turn/start",
-            .ok = turn_start_ok,
-            .detail = turn_start_detail,
-        });
-
-        if (parsed.hook_policy == .require_observed) {
-            if (notification_capture) |captured| {
-                if (thread_id != null) {
-                    const drain_params = try stringifyAnyAlloc(allocator, .{
-                        .threadId = thread_id.?,
-                        .includeTurns = false,
-                    });
-                    defer allocator.free(drain_params);
-                    var attempts: usize = 0;
-                    while (attempts < 12 and !hasCapturedCompletedHookNotification(allocator, captured.items)) : (attempts += 1) {
-                        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromSeconds(1), .awake) catch {};
-                        const drain_json = client.requestJsonCaptureNotifications("thread/read", drain_params, captured) catch null;
-                        if (drain_json) |json| allocator.free(json);
-                    }
-                }
-            }
-        }
-
-        // Check 4: turn/interrupt method is wired; race/precondition failures are acceptable.
-        var interrupt_ok = true;
-        var interrupt_detail: []const u8 = "ok";
-
-        if (thread_id == null or started_turn_id == null) {
-            interrupt_ok = false;
-            interrupt_detail = "no active turnId available for turn/interrupt check";
-        } else {
-            const interrupt_params = try stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id.?,
-                .turnId = started_turn_id.?,
-            });
-            defer allocator.free(interrupt_params);
-
-            const maybe_interrupt_json = client.requestJsonCaptureNotifications("turn/interrupt", interrupt_params, notification_capture) catch |err| blk: {
-                const summary = try errorSummary(allocator, client, err);
-                if (isMethodUnavailableError(summary)) {
-                    interrupt_ok = false;
-                    interrupt_detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
-                } else {
-                    interrupt_detail = try std.fmt.allocPrint(allocator, "method reached server (expected race/precondition rejection): {s}", .{summary});
-                }
-                break :blk null;
-            };
-            if (maybe_interrupt_json) |interrupt_json| allocator.free(interrupt_json);
-        }
-
-        try checks.append(allocator, .{
-            .name = "turn/interrupt",
-            .ok = interrupt_ok,
-            .detail = interrupt_detail,
-        });
-    }
-
-    // Check 5: turn/steer method is wired; precondition failures are acceptable.
-    {
-        var steer_ok = true;
-        var steer_detail: []const u8 = "ok";
-
-        if (thread_id == null) {
-            steer_ok = false;
-            steer_detail = "no threadId available for turn/steer check";
-        } else {
-            const expected_turn_id = try std.fmt.allocPrint(allocator, "cas-smoke-{d}", .{@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)});
-            defer allocator.free(expected_turn_id);
-
-            const steer_params = try stringifyAnyAlloc(allocator, .{
-                .threadId = thread_id.?,
-                .expectedTurnId = expected_turn_id,
-                .input = [_]struct {
-                    type: []const u8,
-                    text: []const u8,
-                    text_elements: []const []const u8,
-                }{
-                    .{
-                        .type = "text",
-                        .text = "cas smoke-check turn steer",
-                        .text_elements = &.{},
-                    },
-                },
-            });
-            defer allocator.free(steer_params);
-
-            const maybe_steer_json = client.requestJsonCaptureNotifications("turn/steer", steer_params, notification_capture) catch |err| blk: {
-                const summary = try errorSummary(allocator, client, err);
-                if (isMethodUnavailableError(summary)) {
-                    steer_ok = false;
-                    steer_detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
-                } else {
-                    steer_detail = try std.fmt.allocPrint(allocator, "method reached server (expected precondition rejection): {s}", .{summary});
-                }
-                break :blk null;
-            };
-            if (maybe_steer_json) |steer_json| allocator.free(steer_json);
-        }
-
-        try checks.append(allocator, .{
-            .name = "turn/steer",
-            .ok = steer_ok,
-            .detail = steer_detail,
-        });
-    }
-
+fn reportSmokeChecks(
+    context: SmokeContext,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+    acquired: *const AcquiredClient,
+    code_mode_host: ?*const launch.CodeModeHost,
+    thread_id: ?[]const u8,
+    checks: []const CheckResult,
+    captured_notifications: []const []u8,
+    hook_log_path: ?[]const u8,
+) !bool {
+    const allocator = context.allocator;
     var overall_ok = true;
-    for (checks.items) |check| {
+    for (checks) |check| {
         if (!check.ok) overall_ok = false;
     }
-    var hook_accumulator = cas.hooks.HookAccumulator.init(parsed.hook_policy, hook_log_path);
-    try hook_accumulator.absorbLines(allocator, captured_notifications.items);
+    var hook_accumulator = cas.hooks.HookAccumulator.init(
+        parsed.hook_policy,
+        if (hook_log_path) |path| .{ .io = context.io, .path = path } else null,
+    );
+    try hook_accumulator.absorbLines(allocator, captured_notifications);
     const hook_summary = hook_accumulator.summary();
     if (hook_summary.failureCode != null) overall_ok = false;
 
     var code_mode_digest: [64]u8 = undefined;
-    const code_mode_report: ?CodeModeHostReport = if (code_mode_host) |*host| .{
+    const code_mode_report: ?CodeModeHostReport = if (code_mode_host) |host| .{
         .endpoint = host.redacted_origin,
         .digest = host.digestHex(&code_mode_digest),
     } else null;
 
-    if (parsed.json) {
-        const report = .{
-            .check = "cas-smoke-check",
-            .cwd = cwd,
-            .codexPath = acquired.codex_path_identity,
-            .transport = .{
-                .selected = acquired.selected_transport.asString(),
-                .endpoint = acquired.endpoint_identity,
-            },
-            .codeModeHost = code_mode_report,
-            .threadId = thread_id,
-            .ok = overall_ok,
-            .hookSummary = hook_summary,
-            .checks = checks.items,
-        };
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const report = .{
+        .check = "cas-smoke-check",
+        .cwd = cwd,
+        .codexPath = acquired.codex_path_identity,
+        .transport = .{
+            .selected = acquired.selected_transport.asString(),
+            .endpoint = acquired.endpoint_identity,
+        },
+        .codeModeHost = code_mode_report,
+        .threadId = thread_id,
+        .ok = overall_ok,
+        .hookSummary = hook_summary,
+        .checks = checks,
+    };
+    try writeSmokeReport(parsed.json, report);
+    return overall_ok;
+}
+
+fn writeSmokeReport(json: bool, report: anytype) !void {
+    if (json) {
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, stdout);
         try stdout.writeAll("\n");
     } else {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try stdout.print("cas smoke-check\n", .{});
-        try stdout.print("cwd: {s}\n", .{cwd});
+        try stdout.print("cwd: {s}\n", .{report.cwd});
         try stdout.print(
             "codexPath: {s}\n",
-            .{acquired.codex_path_identity orelse "external-endpoint"},
+            .{report.codexPath orelse "external-endpoint"},
         );
         try stdout.print("transport: {s} ({s})\n", .{
-            acquired.selected_transport.asString(),
-            acquired.endpoint_identity,
+            report.transport.selected,
+            report.transport.endpoint,
         });
-        if (code_mode_report) |identity| {
+        if (report.codeModeHost) |identity| {
             try stdout.print(
                 "codeModeHost: {s} (sha256:{s})\n",
                 .{ identity.endpoint, identity.digest },
             );
         }
-        try stdout.print("threadId: {s}\n", .{thread_id orelse "n/a"});
-        try stdout.print("overall: {s}\n", .{if (overall_ok) "pass" else "fail"});
+        try stdout.print("threadId: {s}\n", .{report.threadId orelse "n/a"});
+        try stdout.print("overall: {s}\n", .{if (report.ok) "pass" else "fail"});
         try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
-            hook_summary.policy,
-            hook_summary.observed,
-            hook_summary.failureCode orelse "none",
+            report.hookSummary.policy,
+            report.hookSummary.observed,
+            report.hookSummary.failureCode orelse "none",
         });
-        for (checks.items) |check| {
+        for (report.checks) |check| {
             try stdout.print("- {s}: {s} ({s})\n", .{
                 check.name,
                 if (check.ok) "pass" else "fail",
@@ -468,8 +320,6 @@ pub fn main(init: std.process.Init) !void {
             });
         }
     }
-
-    std.process.exit(if (overall_ok) 0 else 1);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
@@ -497,46 +347,11 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         if (i >= argv.len) return error.MissingValue;
         const value = argv[i];
 
-        if (std.mem.eql(u8, arg, "--cwd")) {
-            out.cwd = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--codex-path")) {
-            out.codex_path = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--app-server-transport")) {
-            out.requested_transport = launch.RequestedTransport.parse(value) orelse
-                return error.InvalidAppServerTransport;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
-            out.transport_endpoint = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--code-mode-host")) {
-            out.code_mode_host = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--thread-id")) {
-            out.thread_id = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--request-timeout-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidTimeout;
-            out.request_timeout_ms = @intCast(parsed);
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--hooks")) {
-            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
-            continue;
-        }
-        return error.UnknownArg;
+        try parseValueArg(&out, arg, value);
     }
 
     out.opt_out_methods = try methods.toOwnedSlice(allocator);
@@ -599,33 +414,7 @@ fn acquireClient(
                 .endpoint_identity = endpoint_identity,
             };
         },
-        .auto => blk: {
-            const managed_server = startManaged(
-                allocator,
-                io,
-                cwd,
-                parsed,
-                code_mode_host,
-            ) catch |err| {
-                if (!launch.autoMayFallback(
-                    .auto,
-                    .managed_websocket,
-                    .stdio,
-                    .before_first_rpc,
-                    true,
-                )) return err;
-                break :blk acquireStdio(
-                    allocator,
-                    io,
-                    cwd,
-                    parsed,
-                    code_mode_host,
-                );
-            };
-            // From this point Client.start performs initialize, so a failure is
-            // observable protocol work and must not trigger a transport retry.
-            break :blk connectManaged(allocator, io, cwd, parsed, managed_server);
-        },
+        .auto => acquireAuto(allocator, io, cwd, parsed, code_mode_host),
     };
 }
 
@@ -803,7 +592,12 @@ fn hasCapturedCompletedHookNotification(allocator: std.mem.Allocator, lines: []c
 }
 
 fn isMethodUnavailableError(text: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, text, .{}) catch null;
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        text,
+        .{},
+    ) catch null;
     defer if (parsed) |*p| p.deinit();
     if (parsed) |p| {
         if (p.value == .object) {
@@ -902,21 +696,320 @@ test "parseArgs rejects non-positive request timeout" {
 
 test "usage text references installed binary" {
     try std.testing.expect(std.mem.indexOf(u8, UsageText, "zig run codex/skills") == null);
-    try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas_smoke_check --cwd DIR [options]") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        UsageText,
+        "cas_smoke_check --cwd DIR [options]",
+    ) != null);
 }
 
 test "countDataRows and extractThreadId parse expected fields" {
-    const rows = try countDataRows(std.testing.allocator, "{\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}");
+    const rows = try countDataRows(
+        std.testing.allocator,
+        "{\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}",
+    );
     try std.testing.expectEqual(@as(?usize, 2), rows);
 
-    const thread_id = try extractThreadId(std.testing.allocator, "{\"thread\":{\"id\":\"thr_abc\"}}");
+    const thread_id = try extractThreadId(
+        std.testing.allocator,
+        "{\"thread\":{\"id\":\"thr_abc\"}}",
+    );
     defer if (thread_id) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(thread_id != null);
     try std.testing.expectEqualStrings("thr_abc", thread_id.?);
 }
 
 test "isMethodUnavailableError handles structured and text errors" {
-    try std.testing.expect(isMethodUnavailableError("{\"code\":-32601,\"message\":\"Method not found\"}"));
+    try std.testing.expect(isMethodUnavailableError(
+        "{\"code\":-32601,\"message\":\"Method not found\"}",
+    ));
     try std.testing.expect(isMethodUnavailableError("UNKNOWN METHOD thread/resume"));
-    try std.testing.expect(!isMethodUnavailableError("{\"code\":-32000,\"message\":\"server error\"}"));
+    try std.testing.expect(!isMethodUnavailableError(
+        "{\"code\":-32000,\"message\":\"server error\"}",
+    ));
+}
+
+fn acquireAuto(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    parsed: ParsedArgs,
+    code_mode_host: ?*const launch.CodeModeHost,
+) !AcquiredClient {
+    const managed_server = startManaged(
+        allocator,
+        io,
+        cwd,
+        parsed,
+        code_mode_host,
+    ) catch |err| {
+        if (!launch.autoMayFallback(
+            .auto,
+            .managed_websocket,
+            .stdio,
+            .before_first_rpc,
+            true,
+        )) return err;
+        return acquireStdio(
+            allocator,
+            io,
+            cwd,
+            parsed,
+            code_mode_host,
+        );
+    };
+    // From this point Client.start performs initialize, so a failure is
+    // observable protocol work and must not trigger a transport retry.
+    return connectManaged(allocator, io, cwd, parsed, managed_server);
+}
+
+const SmokeContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *cas.Client,
+    notification_capture: ?*std.ArrayList([]u8),
+
+    const Response = struct { json: ?[]u8, ok: bool = true, detail: []const u8 = "ok" };
+
+    fn request(
+        self: SmokeContext,
+        method: []const u8,
+        params: []const u8,
+        comptime rejection_format: []const u8,
+    ) !Response {
+        const json = self.client.requestJsonCaptureNotifications(
+            method,
+            params,
+            self.notification_capture,
+        ) catch |err| {
+            const summary = try errorSummary(self.allocator, self.client, err);
+            defer self.allocator.free(summary);
+            const unavailable = isMethodUnavailableError(summary);
+            return .{
+                .json = null,
+                .ok = !unavailable,
+                .detail = if (unavailable)
+                    try std.fmt.allocPrint(self.allocator, "method unavailable: {s}", .{summary})
+                else
+                    try std.fmt.allocPrint(self.allocator, rejection_format, .{summary}),
+            };
+        };
+        return .{ .json = json };
+    }
+};
+
+fn checkFeatureList(ctx: SmokeContext) !CheckResult {
+    const allocator = ctx.allocator;
+    const json = ctx.client.requestJsonCaptureNotifications(
+        "experimentalFeature/list",
+        "{\"cursor\":null,\"limit\":1}",
+        ctx.notification_capture,
+    ) catch |err| return .{
+        .name = "experimentalFeature/list",
+        .ok = false,
+        .detail = try errorSummary(allocator, ctx.client, err),
+    };
+    defer allocator.free(json);
+    const rows = try countDataRows(allocator, json);
+    const rows_text = if (rows) |count|
+        try std.fmt.allocPrint(allocator, "{d}", .{count})
+    else
+        "unknown";
+    defer if (rows != null) allocator.free(rows_text);
+    return .{
+        .name = "experimentalFeature/list",
+        .ok = true,
+        .detail = try std.fmt.allocPrint(allocator, "ok (rows={s})", .{rows_text}),
+    };
+}
+
+fn checkResume(ctx: SmokeContext, cwd: []const u8, thread_id: *?[]const u8) !CheckResult {
+    const allocator = ctx.allocator;
+    if (thread_id.* == null) {
+        const params = try stringifyAnyAlloc(
+            allocator,
+            .{ .cwd = cwd, .experimentalRawEvents = false },
+        );
+        defer allocator.free(params);
+        const started = try ctx.request("thread/start", params, "method reached server: {s}");
+        const json = started.json orelse return .{
+            .name = "thread/resume",
+            .ok = started.ok,
+            .detail = started.detail,
+        };
+        defer allocator.free(json);
+        thread_id.* = try extractThreadId(allocator, json);
+    }
+    const id = thread_id.* orelse return .{
+        .name = "thread/resume",
+        .ok = false,
+        .detail = "thread/start did not return thread.id",
+    };
+    const params = try stringifyAnyAlloc(allocator, .{ .threadId = id });
+    defer allocator.free(params);
+    const resumed = try ctx.request("thread/resume", params, "method reached server: {s}");
+    if (resumed.json) |json| {
+        defer allocator.free(json);
+        if (try extractThreadId(allocator, json)) |resumed_id| {
+            defer allocator.free(resumed_id);
+            if (!std.mem.eql(u8, resumed_id, id)) return .{
+                .name = "thread/resume",
+                .ok = false,
+                .detail = try std.fmt.allocPrint(
+                    allocator,
+                    "thread/resume returned unexpected thread id: {s}",
+                    .{resumed_id},
+                ),
+            };
+        }
+    }
+    return .{ .name = "thread/resume", .ok = resumed.ok, .detail = resumed.detail };
+}
+
+const TurnCheck = struct { check: CheckResult, id: ?[]const u8 = null };
+
+fn checkTurnStart(ctx: SmokeContext, thread_id: ?[]const u8) !TurnCheck {
+    const id = thread_id orelse return .{ .check = .{
+        .name = "turn/start",
+        .ok = false,
+        .detail = "no threadId available for turn/start check",
+    } };
+    const params = try stringifyAnyAlloc(ctx.allocator, .{
+        .threadId = id,
+        .input = [_]struct { type: []const u8, text: []const u8 }{
+            .{ .type = "text", .text = "cas smoke-check turn start" },
+        },
+    });
+    defer ctx.allocator.free(params);
+    const response = try ctx.request("turn/start", params, "method reached server: {s}");
+    if (response.json) |json| {
+        defer ctx.allocator.free(json);
+        const turn_id = try extractTurnId(ctx.allocator, json) orelse return .{ .check = .{
+            .name = "turn/start",
+            .ok = false,
+            .detail = "turn/start did not return turn.id",
+        } };
+        return .{ .check = .{ .name = "turn/start", .ok = true, .detail = "ok" }, .id = turn_id };
+    }
+    return .{ .check = .{ .name = "turn/start", .ok = response.ok, .detail = response.detail } };
+}
+
+fn drainHooks(ctx: SmokeContext, thread_id: ?[]const u8) !void {
+    const captured = ctx.notification_capture orelse return;
+    const id = thread_id orelse return;
+    const params = try stringifyAnyAlloc(ctx.allocator, .{ .threadId = id, .includeTurns = false });
+    defer ctx.allocator.free(params);
+    var attempts: usize = 0;
+    while (attempts < 12 and !hasCapturedCompletedHookNotification(
+        ctx.allocator,
+        captured.items,
+    )) : (attempts += 1) {
+        try std.Io.sleep(ctx.io, .fromSeconds(1), .awake);
+        // A transient drain failure leaves the hook witness absent; the final
+        // require-observed check remains responsible for that failure.
+        const response = ctx.client.requestJsonCaptureNotifications(
+            "thread/read",
+            params,
+            captured,
+        ) catch null;
+        if (response) |json| ctx.allocator.free(json);
+    }
+}
+
+fn checkInterrupt(ctx: SmokeContext, thread_id: ?[]const u8, turn_id: ?[]const u8) !CheckResult {
+    if (thread_id == null or turn_id == null) return .{
+        .name = "turn/interrupt",
+        .ok = false,
+        .detail = "no active turnId available for turn/interrupt check",
+    };
+    const params = try stringifyAnyAlloc(ctx.allocator, .{
+        .threadId = thread_id.?,
+        .turnId = turn_id.?,
+    });
+    defer ctx.allocator.free(params);
+    const response = try ctx.request(
+        "turn/interrupt",
+        params,
+        "method reached server (expected race/precondition rejection): {s}",
+    );
+    if (response.json) |json| ctx.allocator.free(json);
+    return .{ .name = "turn/interrupt", .ok = response.ok, .detail = response.detail };
+}
+
+fn checkSteer(ctx: SmokeContext, thread_id: ?[]const u8) !CheckResult {
+    const id = thread_id orelse return .{
+        .name = "turn/steer",
+        .ok = false,
+        .detail = "no threadId available for turn/steer check",
+    };
+    const expected_turn_id = try std.fmt.allocPrint(ctx.allocator, "cas-smoke-{d}", .{@divFloor(
+        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        1_000_000_000,
+    )});
+    defer ctx.allocator.free(expected_turn_id);
+    const params = try stringifyAnyAlloc(ctx.allocator, .{
+        .threadId = id,
+        .expectedTurnId = expected_turn_id,
+        .input = [_]struct {
+            type: []const u8,
+            text: []const u8,
+            text_elements: []const []const u8,
+        }{
+            .{ .type = "text", .text = "cas smoke-check turn steer", .text_elements = &.{} },
+        },
+    });
+    defer ctx.allocator.free(params);
+    const response = try ctx.request(
+        "turn/steer",
+        params,
+        "method reached server (expected precondition rejection): {s}",
+    );
+    if (response.json) |json| ctx.allocator.free(json);
+    return .{ .name = "turn/steer", .ok = response.ok, .detail = response.detail };
+}
+
+fn parseValueArg(out: *ParsedArgs, arg: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, arg, "--cwd")) {
+        out.cwd = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--codex-path")) {
+        out.codex_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--app-server-transport")) {
+        out.requested_transport = launch.RequestedTransport.parse(value) orelse
+            return error.InvalidAppServerTransport;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
+        out.transport_endpoint = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--code-mode-host")) {
+        out.code_mode_host = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--thread-id")) {
+        out.thread_id = value;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--request-timeout-ms")) {
+        const parsed = try std.fmt.parseInt(i64, value, 10);
+        if (parsed <= 0) return error.InvalidTimeout;
+        out.request_timeout_ms = std.math.cast(u32, parsed) orelse return error.InvalidTimeout;
+        return;
+    }
+    if (std.mem.eql(u8, arg, "--hooks")) {
+        out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse
+            return error.InvalidHooksPolicy;
+        return;
+    }
+    return error.UnknownArg;
+}
+
+test "parseArgs rejects timeout outside the client integer domain" {
+    try std.testing.expectError(error.InvalidTimeout, parseArgs(std.testing.allocator, &.{
+        "cas_smoke_check", "--request-timeout-ms", "4294967296",
+    }));
 }

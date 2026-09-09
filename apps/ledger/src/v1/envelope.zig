@@ -245,7 +245,35 @@ pub fn writeTransactionJson(
     try writer.writeAll(",\"transaction_id\":");
     try writeOptionalString(writer, result.transaction_id);
     try writer.writeAll(",\"effects\":[");
-    for (result.effects, 0..) |effect, index| {
+    try writeTransactionEffectsJson(writer, result.effects);
+    try writer.writeAll("],\"returned_content\":");
+    try writeOptionalString(writer, result.returned_content);
+    try writer.writeAll(",\"generated_outputs\":{");
+    for (result.generated_outputs, 0..) |output, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, output.name);
+        try writer.writeByte(':');
+        try definition_core.canonical_json.writeCanonicalString(writer, output.value);
+    }
+    try writer.writeByte('}');
+    try writer.writeAll(",\"valid\":");
+    try writer.writeAll(if (result.validation_result.valid) "true" else "false");
+    if (!result.validation_result.valid) {
+        try writer.writeAll(",\"errors\":");
+        try writeDiagnosticsJson(writer, result.validation_result.diagnostics.items.items);
+    }
+    try writer.writeAll(",\"structural_claims\":[],\"compile_stats\":");
+    try writeCompileStatsJson(writer, compile_stats);
+    try writer.writeAll(",\"semantic_authority_granted\":false,\"storage_mutated\":");
+    try writer.writeAll(if (result.storage_mutated) "true" else "false");
+    try writer.writeByte('}');
+}
+
+fn writeTransactionEffectsJson(
+    writer: *std.Io.Writer,
+    effects: []const transaction.EffectReceipt,
+) !void {
+    for (effects, 0..) |effect, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"slot\":");
         try definition_core.canonical_json.writeCanonicalString(writer, effect.slot);
@@ -265,38 +293,6 @@ pub fn writeTransactionJson(
         try definition_core.canonical_json.writeCanonicalString(writer, effect.result);
         try writer.writeByte('}');
     }
-    try writer.writeAll("],\"returned_content\":");
-    try writeOptionalString(writer, result.returned_content);
-    try writer.writeAll(",\"generated_outputs\":{");
-    for (result.generated_outputs, 0..) |output, index| {
-        if (index != 0) try writer.writeByte(',');
-        try definition_core.canonical_json.writeCanonicalString(
-            writer,
-            output.name,
-        );
-        try writer.writeByte(':');
-        try definition_core.canonical_json.writeCanonicalString(
-            writer,
-            output.value,
-        );
-    }
-    try writer.writeByte('}');
-    try writer.writeAll(",\"valid\":");
-    try writer.writeAll(if (result.validation_result.valid) "true" else "false");
-    if (!result.validation_result.valid) {
-        try writer.writeAll(",\"errors\":");
-        try writeDiagnosticsJson(
-            writer,
-            result.validation_result.diagnostics.items.items,
-        );
-    }
-    try writer.writeAll(",\"structural_claims\":[],\"compile_stats\":");
-    try writeCompileStatsJson(writer, compile_stats);
-    try writer.writeAll(
-        ",\"semantic_authority_granted\":false,\"storage_mutated\":",
-    );
-    try writer.writeAll(if (result.storage_mutated) "true" else "false");
-    try writer.writeByte('}');
 }
 
 fn writeDiagnosticsJson(

@@ -749,6 +749,39 @@ const RowMetadata = struct {
     }
 };
 
+// Run the ordinary projection writer for rejected rows without retaining its bytes.
+// The endpoints preserve the relevance score's object-shape validation too.
+const PayloadValidator = struct {
+    first: ?u8 = null,
+    last: ?u8 = null,
+    writer: std.Io.Writer,
+
+    fn init(buffer: []u8) PayloadValidator {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn observe(self: *PayloadValidator, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        if (self.first == null) self.first = bytes[0];
+        self.last = bytes[bytes.len - 1];
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) !usize {
+        const self: *PayloadValidator = @alignCast(@fieldParentPtr("writer", writer));
+        self.observe(writer.buffered());
+        writer.end = 0;
+        const slices = data[0 .. data.len - 1];
+        const pattern = data[slices.len];
+        var written = pattern.len * splat;
+        for (slices) |bytes| {
+            self.observe(bytes);
+            written += bytes.len;
+        }
+        if (splat != 0) self.observe(pattern);
+        return written;
+    }
+};
+
 const SortedAccumulator = struct {
     allocator: std.mem.Allocator,
     projection: *const Projection,
@@ -838,19 +871,37 @@ const SortedAccumulator = struct {
         raw: ?[]const u8,
     ) !void {
         const record_index = self.records_seen;
-        self.records_seen += 1;
-        try self.trackReference(value);
-        if (!matches(self.projection, value, self.parameters)) return;
-        const relevance_score = (try self.score(value)) orelse return;
-        self.records_matched += 1;
+        const next_seen = std.math.add(usize, record_index, 1) catch
+            return error.ProjectionRecordBoundsExceeded;
+        const reference = try self.prepareReference(value);
+        errdefer if (reference) |bytes| self.allocator.free(bytes);
+        const matched = try self.observeMatched(value, raw, record_index);
+        // Capacity and owned rows are prepared before this non-fallible commit.
+        if (reference) |bytes| self.referenced_ids.putAssumeCapacityNoClobber(bytes, {});
+        self.records_seen = next_seen;
+        if (matched) self.records_matched += 1;
+    }
+
+    fn observeMatched(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: ?[]const u8,
+        record_index: usize,
+    ) !bool {
+        if (!matches(self.projection, value, self.parameters)) return false;
+        const relevance_score = (try self.score(value)) orelse return false;
         const keys = try self.sortKeys(
             value,
             record_index,
             relevance_score,
         );
-        errdefer {
-            for (keys) |*key| key.deinit(self.allocator);
-            self.allocator.free(keys);
+        var keys_owned = true;
+        defer if (keys_owned) self.freeKeys(keys);
+        if (!self.admits(keys, record_index)) {
+            try self.validatePayload(value, raw);
+            var metadata = try self.rowMetadata(value);
+            metadata.deinit(self.allocator);
+            return true;
         }
         const rendered_payload = try self.renderPayload(
             value,
@@ -860,51 +911,122 @@ const SortedAccumulator = struct {
         errdefer self.allocator.free(rendered_payload);
         var metadata = try self.rowMetadata(value);
         errdefer metadata.deinit(self.allocator);
-        try self.rows.append(self.allocator, .{
+        try self.retain(.{
             .payload = rendered_payload,
             .keys = keys,
             .record_index = record_index,
             .row_id = metadata.row_id,
             .theme = metadata.theme,
         });
+        keys_owned = false;
         metadata.row_id = null;
         metadata.theme = null;
-        self.pruneRetainedRows();
+        return true;
     }
 
-    fn pruneRetainedRows(self: *SortedAccumulator) void {
-        const limit = self.retained_limit orelse return;
-        if (self.rows.items.len <= limit) return;
-        var worst_index: usize = 0;
-        for (self.rows.items[1..], 1..) |row, index| {
-            if (lessSortedRow(
-                self.projection.sort_keys,
-                self.rows.items[worst_index],
-                row,
-            )) {
-                worst_index = index;
-            }
+    fn freeKeys(self: *SortedAccumulator, keys: []Scalar) void {
+        for (keys) |*key| key.deinit(self.allocator);
+        self.allocator.free(keys);
+    }
+
+    fn admits(self: *const SortedAccumulator, keys: []const Scalar, record_index: usize) bool {
+        const limit = self.retained_limit orelse return true;
+        if (limit == 0) return false;
+        if (self.rows.items.len < limit) return true;
+        const worst = self.rows.items[0];
+        return lessSortedKeys(
+            self.projection.sort_keys,
+            keys,
+            record_index,
+            worst.keys,
+            worst.record_index,
+        );
+    }
+
+    fn retain(self: *SortedAccumulator, row: SortedRow) !void {
+        std.debug.assert(row.keys.len == self.projection.sort_keys.len);
+        const limit = self.retained_limit orelse {
+            try self.rows.append(self.allocator, row);
+            return;
+        };
+        std.debug.assert(limit > 0);
+        std.debug.assert(self.rows.items.len <= limit);
+        if (self.rows.items.len < limit) {
+            try self.rows.append(self.allocator, row);
+            self.siftUp(self.rows.items.len - 1);
+        } else {
+            var removed = self.rows.items[0];
+            self.rows.items[0] = row;
+            self.siftDown();
+            removed.deinit(self.allocator);
         }
-        var removed = self.rows.swapRemove(worst_index);
-        removed.deinit(self.allocator);
     }
 
-    fn trackReference(
+    fn siftUp(self: *SortedAccumulator, start: usize) void {
+        std.debug.assert(start < self.rows.items.len);
+        var child = start;
+        while (child > 0) {
+            const parent = (child - 1) / 2;
+            if (!self.lessAt(parent, child)) break;
+            std.mem.swap(SortedRow, &self.rows.items[parent], &self.rows.items[child]);
+            child = parent;
+        }
+    }
+
+    fn siftDown(self: *SortedAccumulator) void {
+        var parent: usize = 0;
+        const count = self.rows.items.len;
+        std.debug.assert(count > 0);
+        // Only internal nodes have children; this guard also bounds child arithmetic.
+        while (parent < count / 2) {
+            var child = parent * 2 + 1;
+            if (child + 1 < count and self.lessAt(child, child + 1)) child += 1;
+            if (!self.lessAt(parent, child)) break;
+            std.mem.swap(SortedRow, &self.rows.items[parent], &self.rows.items[child]);
+            parent = child;
+        }
+    }
+
+    fn lessAt(self: *const SortedAccumulator, left: usize, right: usize) bool {
+        const rows = self.rows.items;
+        return lessSortedRow(self.projection.sort_keys, rows[left], rows[right]);
+    }
+
+    fn prepareReference(
         self: *SortedAccumulator,
         value: std.json.Value,
-    ) !void {
-        const relevance = self.projection.relevance orelse return;
-        const ranked = relevance.ranked_plan orelse return;
-        if (!self.prepared_relevance.?.ranked.exclude_referenced) return;
+    ) !?[]u8 {
+        const relevance = self.projection.relevance orelse return null;
+        const ranked = relevance.ranked_plan orelse return null;
+        if (!self.prepared_relevance.?.ranked.exclude_referenced) return null;
         const reference = ranked_relevance.referencedId(
             ranked,
             value,
-        ) orelse return;
-        if (self.referenced_ids.contains(reference)) return;
-        try self.referenced_ids.put(
-            try self.allocator.dupe(u8, reference),
-            {},
-        );
+        ) orelse return null;
+        if (self.referenced_ids.contains(reference)) return null;
+        try self.referenced_ids.ensureUnusedCapacity(1);
+        return try self.allocator.dupe(u8, reference);
+    }
+
+    fn validatePayload(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: ?[]const u8,
+    ) !void {
+        if (self.projection.raw) {
+            if (raw == null) return error.FusedRawProjectionUnsupported;
+            return;
+        }
+        var buffer: [256]u8 = undefined;
+        var validator = PayloadValidator.init(&buffer);
+        try writeProjectedValue(self.allocator, &validator.writer, self.projection, value);
+        try validator.writer.flush();
+        const relevance = self.projection.relevance orelse return;
+        if (relevance.score_field != null and
+            (validator.first != '{' or validator.last != '}'))
+        {
+            return error.RelevanceScoreRequiresProjectionObject;
+        }
     }
 
     fn score(
@@ -1034,6 +1156,9 @@ const SortedAccumulator = struct {
         limit: usize,
         stats: *Stats,
     ) !void {
+        if (self.retained_limit) |retained_limit| {
+            std.debug.assert(self.rows.items.len <= retained_limit);
+        }
         std.sort.heap(
             SortedRow,
             self.rows.items,
@@ -2626,14 +2751,20 @@ const ProjectionCompiler = struct {
             step,
         );
         errdefer predicate.deinit(self.allocator);
-        try self.predicates.append(self.allocator, predicate);
-        if (operator != .id_lookup) return;
-        if (self.single) return error.DuplicateProjectionCardinality;
-        self.single = true;
-        self.require_match = if (step.get("required")) |value|
+        if (operator == .id_lookup and self.single) {
+            return error.DuplicateProjectionCardinality;
+        }
+        const require_match = if (operator != .id_lookup)
+            false
+        else if (step.get("required")) |value|
             try definition_core.json.boolean(value)
         else
             false;
+        try self.predicates.append(self.allocator, predicate);
+        if (operator == .id_lookup) {
+            self.single = true;
+            self.require_match = require_match;
+        }
     }
 
     fn applyLatest(
@@ -2769,18 +2900,10 @@ const ProjectionCompiler = struct {
         event_protocol: *const protocol.Plan,
         step: std.json.ObjectMap,
     ) !KeyedFold {
-        if (event_protocol.reducer_plan == null) {
-            return error.FoldRequiresKeyedReducer;
-        }
+        if (event_protocol.reducer_plan == null) return error.FoldRequiresKeyedReducer;
         try requireKeyedFoldStep(step);
-        const key_field = try definition_core.json.requiredString(
-            step,
-            "key_field",
-        );
-        const state_field = try definition_core.json.requiredString(
-            step,
-            "state_field",
-        );
+        const key_field = try definition_core.json.requiredString(step, "key_field");
+        const state_field = try definition_core.json.requiredString(step, "state_field");
         try definition_core.json.safeIdentifier(key_field, 128);
         try definition_core.json.safeIdentifier(state_field, 128);
         const retained = try self.compileKeyedRetained(step);
@@ -2825,22 +2948,13 @@ const ProjectionCompiler = struct {
             &history,
             error.ProjectionFieldsConflict,
         );
-        var relation_query = if (step.get("relation")) |raw|
-            try relation.Query.compile(self.allocator, raw)
-        else
-            null;
+        var relation_query = try self.compileKeyedRelation(
+            step,
+            &event_protocol.reducer_plan.?,
+            history.active(),
+            &.{ key_field, state_field, retained_field, event_count_field },
+        );
         errdefer if (relation_query) |*value| value.deinit(self.allocator);
-        if (relation_query) |*query| {
-            if (event_protocol.reducer_plan.?.relation_plan == null or history.active()) {
-                return error.RelationFoldRequiresDeclaredRelation;
-            }
-            try query.validate(event_protocol.reducer_plan.?.states, &.{
-                key_field,
-                state_field,
-                retained_field,
-                event_count_field,
-            });
-        }
         return self.ownKeyedFold(
             key_field,
             state_field,
@@ -2850,6 +2964,23 @@ const ProjectionCompiler = struct {
             history,
             relation_query,
         );
+    }
+
+    fn compileKeyedRelation(
+        self: *ProjectionCompiler,
+        step: std.json.ObjectMap,
+        reducer_plan: *const reducer.Plan,
+        history_active: bool,
+        fields: []const ?[]const u8,
+    ) !?relation.Query {
+        const raw = step.get("relation") orelse return null;
+        var query = try relation.Query.compile(self.allocator, raw);
+        errdefer query.deinit(self.allocator);
+        if (reducer_plan.relation_plan == null or history_active) {
+            return error.RelationFoldRequiresDeclaredRelation;
+        }
+        try query.validate(reducer_plan.states, fields);
+        return query;
     }
 
     const KeyedRetained = struct {
@@ -4648,6 +4779,30 @@ fn executeResolvedProjection(
         slot,
         parameters,
     );
+    return executeResolvedSlotProjection(
+        allocator,
+        definition_plan,
+        event_protocol,
+        plan,
+        compiled,
+        projection_name,
+        repo_root,
+        slot,
+        parameters,
+    );
+}
+
+fn executeResolvedSlotProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+) !Result {
     const effective_limit =
         try resolveLimit(compiled.limit, parameters, plan.max_records);
     const stream_candidate = slot.kind == .event_log and
@@ -4725,33 +4880,20 @@ fn executeSegmentedProjection(
         snapshot.head_exists,
     );
     if (compiled.fold == null) {
-        if (snapshot.head_exists) {
-            try replay.validateSegmentedHistory(
-                allocator,
-                repo_root,
-                definition_plan.id,
-                slot,
-                &snapshot,
-                parameters,
-                event_protocol != null,
-            );
-        }
-        return executeSegmentedHistoryProjection(
+        return executeValidatedSegmentedHistory(
             allocator,
             definition_plan,
+            event_protocol != null,
             plan,
             compiled,
             projection_name,
+            repo_root,
             slot,
             parameters,
             &snapshot,
         );
     }
-    var fold_history = try initFoldHistory(
-        allocator,
-        compiled,
-        event_protocol,
-    );
+    var fold_history = try initFoldHistory(allocator, compiled, event_protocol);
     defer if (fold_history) |*history| history.deinit();
     if (fold_history != null) {
         return error.SegmentedProjectionHistoryRequiresFullReplay;
@@ -4780,6 +4922,41 @@ fn executeSegmentedProjection(
         parameters,
         revision,
         &replay_stats,
+    );
+}
+
+fn executeValidatedSegmentedHistory(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    has_event_protocol: bool,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    snapshot: *const segmented_event_log.Snapshot,
+) !Result {
+    if (snapshot.head_exists) {
+        try replay.validateSegmentedHistory(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            snapshot,
+            parameters,
+            has_event_protocol,
+        );
+    }
+    return executeSegmentedHistoryProjection(
+        allocator,
+        definition_plan,
+        plan,
+        compiled,
+        projection_name,
+        slot,
+        parameters,
+        snapshot,
     );
 }
 
@@ -5478,29 +5655,19 @@ fn executeKeyedFoldProjection(
     records_validated: usize,
 ) !void {
     if (keyed.relation_query) |*query| {
-        const reducer_plan = if (event_plan.reducer_plan) |*value|
-            value
-        else
-            return error.FoldRequiresKeyedReducer;
-        const relation_plan = if (reducer_plan.relation_plan) |*value|
-            value
-        else
-            return error.RelationFoldRequiresDeclaredRelation;
         const counts = try writeRelationFold(
             allocator,
             output,
             compiled,
             keyed,
             query,
-            relation_plan,
+            try requireFoldRelation(event_plan),
             &replay_state.reducer_state,
             parameters,
             effective_limit,
             max_output_bytes,
         );
-        stats.records_matched = counts.matched;
-        stats.records_emitted = counts.emitted;
-        return;
+        return counts.apply(stats);
     }
     if (compiled.constructed_value != null) {
         stats.records_emitted = try writeConstructedKeyedFold(
@@ -5528,9 +5695,7 @@ fn executeKeyedFoldProjection(
             effective_limit,
             max_output_bytes,
         );
-        stats.records_matched = filtered.matched;
-        stats.records_emitted = filtered.emitted;
-        return;
+        return filtered.apply(stats);
     }
     stats.records_matched = replay_state.reducer_state.count();
     stats.records_emitted = try writeCompleteKeyedFold(
@@ -5543,6 +5708,17 @@ fn executeKeyedFoldProjection(
         max_output_bytes,
         records_validated,
     );
+}
+
+fn requireFoldRelation(event_plan: *const protocol.Plan) !*const relation.Plan {
+    const reducer_plan = if (event_plan.reducer_plan) |*value|
+        value
+    else
+        return error.FoldRequiresKeyedReducer;
+    return if (reducer_plan.relation_plan) |*value|
+        value
+    else
+        error.RelationFoldRequiresDeclaredRelation;
 }
 
 fn writeRelationFold(
@@ -6207,6 +6383,11 @@ fn writeConstructedKeyedFold(
 const FilteredFoldCounts = struct {
     matched: usize,
     emitted: usize,
+
+    fn apply(self: FilteredFoldCounts, stats: *Stats) void {
+        stats.records_matched = self.matched;
+        stats.records_emitted = self.emitted;
+    }
 };
 
 fn writeFilteredKeyedFold(
@@ -7036,14 +7217,15 @@ fn updateLatestJsonl(
     {
         return;
     }
-    if (latest_key.*) |*prior| prior.deinit(allocator);
-    latest_key.* = key;
-    key_owned = false;
-    if (latest_value.*) |prior| allocator.free(prior);
-    latest_value.* = if (projection.raw)
+    const rendered = if (projection.raw)
         try allocator.dupe(u8, line)
     else
         try projectedValueAlloc(allocator, projection, value);
+    if (latest_key.*) |*prior| prior.deinit(allocator);
+    if (latest_value.*) |prior| allocator.free(prior);
+    latest_key.* = key;
+    latest_value.* = rendered;
+    key_owned = false;
 }
 
 fn writeJsonlValue(
@@ -7121,15 +7303,25 @@ fn lessSortedRow(
     left: SortedRow,
     right: SortedRow,
 ) bool {
+    return lessSortedKeys(keys, left.keys, left.record_index, right.keys, right.record_index);
+}
+
+fn lessSortedKeys(
+    keys: []const SortKey,
+    left: []const Scalar,
+    left_index: usize,
+    right: []const Scalar,
+    right_index: usize,
+) bool {
     for (keys, 0..) |key, index| {
-        const order = compareSortScalars(left.keys[index], right.keys[index]);
+        const order = compareSortScalars(left[index], right[index]);
         if (order == .eq) continue;
         return switch (key.order) {
             .ascending => order == .lt,
             .descending => order == .gt,
         };
     }
-    return left.record_index < right.record_index;
+    return left_index < right_index;
 }
 
 fn compareSortScalars(left: Scalar, right: Scalar) std.math.Order {
@@ -8407,4 +8599,481 @@ fn relationRowAllocationProbe(
         "1e999",
         object.get("current").?.object.get("opaque").?.number_string,
     );
+}
+
+const topk_empty_bindings: definition_core.parameters.Bindings = .{
+    .items = &.{},
+    .values_digest = [_]u8{0} ** 71,
+};
+
+const TopkTestKeys = struct {
+    keys: [2]SortKey,
+
+    fn init(order: SortOrder) !TopkTestKeys {
+        var number = try definition_core.json_pointer.compile(std.testing.allocator, "/n");
+        errdefer number.deinit(std.testing.allocator);
+        const tag = try definition_core.json_pointer.compile(std.testing.allocator, "/tag");
+        return .{ .keys = .{
+            .{ .source = .{ .pointer = number }, .order = order },
+            .{ .source = .{ .pointer = tag }, .order = .ascending },
+        } };
+    }
+
+    fn deinit(self: *TopkTestKeys) void {
+        for (&self.keys) |*key| key.deinit(std.testing.allocator);
+    }
+};
+
+fn topkTestProjection(keys: []SortKey) Projection {
+    return .{
+        .name = @constCast("topk"),
+        .slot_index = 0,
+        .source_scope = .resolved,
+        .required_parameters = &.{},
+        .predicates = &.{},
+        .fields = &.{},
+        .preserve_field_order = false,
+        .raw = false,
+        .value_path = null,
+        .constructed_value = null,
+        .single = false,
+        .require_match = false,
+        .sort_keys = keys,
+        .relevance = null,
+        .latest = null,
+        .limit = null,
+        .fold = null,
+        .exit_policy = .{},
+    };
+}
+
+fn topkObserveText(accumulator: *SortedAccumulator, text: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        text,
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    try accumulator.observeRaw(parsed.value, text);
+}
+
+fn topkRenderedAlloc(accumulator: *SortedAccumulator, limit: usize) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{ .records_scanned = 0, .records_matched = 0, .records_emitted = 0 };
+    try accumulator.write(&output.writer, limit, &stats);
+    return output.toOwnedSlice();
+}
+
+fn topkObserveGenerated(heap: *SortedAccumulator, oracle: *SortedAccumulator) !void {
+    for (0..160) |index| {
+        var buffer: [192]u8 = undefined;
+        const number: i64 = @as(i64, @intCast((index * 17) % 23)) - 11;
+        const suffix: []const u8 = switch (index % 3) {
+            0 => "",
+            1 => ".0",
+            else => "e0",
+        };
+        const text = try std.fmt.bufPrint(
+            &buffer,
+            "{{\"n\":{d}{s},\"tag\":\"tag{d}\",\"id\":{d}}}",
+            .{ number, suffix, index % 3, index },
+        );
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            text,
+            .{ .parse_numbers = index % 3 != 2 },
+        );
+        defer parsed.deinit();
+        try heap.observeRaw(parsed.value, text);
+        try oracle.observeRaw(parsed.value, text);
+        const maximum = if (heap.projection.single) 1 else heap.retained_limit.?;
+        try std.testing.expect(heap.rows.items.len <= maximum);
+        for (heap.rows.items, 0..) |_, child| {
+            if (child == 0) continue;
+            const parent = (child - 1) / 2;
+            try std.testing.expect(!lessSortedRow(
+                heap.projection.sort_keys,
+                heap.rows.items[parent],
+                heap.rows.items[child],
+            ));
+        }
+    }
+}
+
+fn topkCompareRetention(order: SortOrder, limit: usize, single: bool) !void {
+    var keys = try TopkTestKeys.init(order);
+    defer keys.deinit();
+    var projection = topkTestProjection(&keys.keys);
+    projection.single = single;
+    var heap = try SortedAccumulator.init(
+        std.testing.allocator,
+        &projection,
+        &topk_empty_bindings,
+        limit,
+    );
+    defer heap.deinit();
+    var oracle = try SortedAccumulator.init(
+        std.testing.allocator,
+        &projection,
+        &topk_empty_bindings,
+        limit,
+    );
+    defer oracle.deinit();
+    // Full retention and final sorting bypass every bounded heap operation.
+    oracle.retained_limit = null;
+    try topkObserveGenerated(&heap, &oracle);
+    const expected = try topkRenderedAlloc(&oracle, limit);
+    defer std.testing.allocator.free(expected);
+    const actual = try topkRenderedAlloc(&heap, limit);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqual(oracle.records_seen, heap.records_seen);
+    try std.testing.expectEqual(oracle.records_matched, heap.records_matched);
+}
+
+test "top-K heap matches full sorting across limits mixed numbers strings and stable ties" {
+    for ([_]SortOrder{ .ascending, .descending }) |order| {
+        for ([_]usize{ 0, 1, 2, 10, 100 }) |limit| {
+            try topkCompareRetention(order, limit, false);
+            try topkCompareRetention(order, limit, true);
+        }
+    }
+}
+
+test "top-K validates losing projection and sort fields before discarding rows" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    var fields = [_]Field{.{
+        .name = @constCast("selected"),
+        .pointer = try definition_core.json_pointer.compile(std.testing.allocator, "/selected"),
+    }};
+    defer fields[0].pointer.deinit(std.testing.allocator);
+    var projection = topkTestProjection(&keys.keys);
+    projection.fields = &fields;
+    var accumulator = try SortedAccumulator.init(
+        std.testing.allocator,
+        &projection,
+        &topk_empty_bindings,
+        1,
+    );
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, "{\"n\":0,\"tag\":\"a\",\"selected\":\"first\"}");
+    try std.testing.expectError(
+        error.ProjectionFieldMissing,
+        topkObserveText(&accumulator, "{\"n\":9,\"tag\":\"z\"}"),
+    );
+    try std.testing.expectError(
+        error.ProjectionSortFieldMissing,
+        topkObserveText(&accumulator, "{\"n\":9,\"selected\":\"missing tag\"}"),
+    );
+    try std.testing.expectError(
+        error.ProjectionOrderingTypeMismatch,
+        topkObserveText(&accumulator, "{\"n\":\"wrong\",\"tag\":\"z\",\"selected\":0}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), accumulator.records_seen);
+    try std.testing.expectEqual(@as(usize, 1), accumulator.records_matched);
+    try std.testing.expectEqualStrings(
+        "{\"selected\":\"first\"}",
+        accumulator.rows.items[0].payload,
+    );
+}
+
+fn topkQueryBindings(
+    items: []definition_core.parameters.Binding,
+) definition_core.parameters.Bindings {
+    return .{ .items = items, .values_digest = [_]u8{0} ** 71 };
+}
+
+test "top-K rejects nonobject scored output even when the row loses admission" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    var selected = try definition_core.json_pointer.compile(std.testing.allocator, "/selected");
+    defer selected.deinit(std.testing.allocator);
+    var paths = [_]definition_core.json_pointer.Pointer{keys.keys[1].source.pointer};
+    var inputs = [_]definition_core.parameters.Binding{
+        .{ .name = @constCast("query"), .value = .{ .string = @constCast("token") } },
+    };
+    const bindings = topkQueryBindings(&inputs);
+    var projection = topkTestProjection(&keys.keys);
+    projection.value_path = selected;
+    projection.relevance = .{
+        .paths = &paths,
+        .parameter = @constCast("query"),
+        .mode = .tokens,
+        .score_field = @constCast("score"),
+        .ranked_plan = null,
+    };
+    var accumulator = try SortedAccumulator.init(std.testing.allocator, &projection, &bindings, 1);
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, "{\"n\":0,\"tag\":\"token\",\"selected\":{}}");
+    try std.testing.expectError(
+        error.RelevanceScoreRequiresProjectionObject,
+        topkObserveText(&accumulator, "{\"n\":9,\"tag\":\"token\",\"selected\":[]}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), accumulator.records_seen);
+}
+
+fn topkReplaceFailureAt(projection: *const Projection, offset: usize) !bool {
+    const original = "{\"n\":9,\"tag\":\"z\",\"selected\":\"original\"}";
+    const replacement = "{\"n\":0,\"tag\":\"a\",\"selected\":\"replacement\"}";
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var accumulator = try SortedAccumulator.init(
+        failing.allocator(),
+        projection,
+        &topk_empty_bindings,
+        1,
+    );
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, original);
+    const prior_payload = try std.testing.allocator.dupe(u8, accumulator.rows.items[0].payload);
+    defer std.testing.allocator.free(prior_payload);
+    const prior_key = accumulator.rows.items[0].keys[0];
+    failing.fail_index = failing.alloc_index + offset;
+    topkObserveText(&accumulator, replacement) catch |err| {
+        if (err != error.OutOfMemory and err != error.WriteFailed) return err;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), accumulator.rows.items.len);
+        try std.testing.expectEqual(@as(usize, 1), accumulator.records_seen);
+        try std.testing.expectEqual(@as(usize, 1), accumulator.records_matched);
+        try std.testing.expectEqual(@as(u32, 0), accumulator.referenced_ids.count());
+        try std.testing.expectEqual(@as(usize, 0), accumulator.rows.items[0].record_index);
+        try std.testing.expectEqual(
+            .eq,
+            try compareScalars(prior_key, accumulator.rows.items[0].keys[0]),
+        );
+        try std.testing.expectEqualStrings(prior_payload, accumulator.rows.items[0].payload);
+        return false;
+    };
+    try std.testing.expectEqual(@as(usize, 2), accumulator.records_seen);
+    try std.testing.expectEqual(@as(usize, 1), accumulator.rows.items[0].record_index);
+    return true;
+}
+
+test "top-K replacement preserves retained state at every allocation failure" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    const projection = topkTestProjection(&keys.keys);
+    for (0..128) |offset| {
+        if (try topkReplaceFailureAt(&projection, offset)) {
+            try std.testing.expect(offset >= 3);
+            return;
+        }
+    }
+    return error.AllocationFailureProbeDidNotTerminate;
+}
+
+const topk_ranked_plan_json =
+    \\{"tokenizer":{"minimum_length":2,"stopwords":[],"suffixes":[]},
+    \\ "weights":{"jaccard":1,"token_group":0,"path_match":0,"recency":0,"presence":0},
+    \\ "exclude_referenced":{"enabled_param":"drop","id_path":"/id","reference_path":"/ref"},
+    \\ "diversity":{"paths":["/theme"],"token_limit":2,"max_per_key":1}}
+;
+
+fn topkRankedPlan() !ranked_relevance.Plan {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        topk_ranked_plan_json,
+        .{},
+    );
+    defer parsed.deinit();
+    var declarations = [_]definition_core.parameters.Declaration{
+        .{ .name = @constCast("drop"), .kind = .boolean, .required = false },
+    };
+    const declared: definition_core.parameters.Declarations = .{
+        .items = &declarations,
+        .shape_digest = [_]u8{0} ** 71,
+    };
+    return ranked_relevance.compile(std.testing.allocator, parsed.value, &declared);
+}
+
+fn topkRankedProjection(
+    keys: []SortKey,
+    paths: []definition_core.json_pointer.Pointer,
+    ranked: ranked_relevance.Plan,
+) Projection {
+    var projection = topkTestProjection(keys);
+    projection.relevance = .{
+        .paths = paths,
+        .parameter = @constCast("query"),
+        .mode = .ranked_tokens,
+        .score_field = null,
+        .ranked_plan = ranked,
+    };
+    return projection;
+}
+
+const topk_ranked_rows = [_][]const u8{
+    "{\"id\":\"old\",\"n\":0,\"tag\":\"token\",\"theme\":\"alpha\"}",
+    "{\"id\":\"first\",\"n\":1,\"tag\":\"token\",\"theme\":\"beta\"}",
+    "{\"id\":\"duplicate\",\"n\":2,\"tag\":\"token\",\"theme\":\"beta\"}",
+    "{\"id\":\"second\",\"n\":3,\"tag\":\"token\",\"theme\":\"gamma\"}",
+    "{\"ref\":\"old\",\"n\":4,\"tag\":\"unrelated\",\"theme\":\"delta\"}",
+};
+
+fn topkRankedInputs() [2]definition_core.parameters.Binding {
+    return .{
+        .{ .name = @constCast("drop"), .value = .{ .boolean = true } },
+        .{ .name = @constCast("query"), .value = .{ .string = @constCast("token") } },
+    };
+}
+
+test "top-K ranked exclusion and diversity retain lower ranked eligible rows" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    var ranked = try topkRankedPlan();
+    defer ranked.deinit(std.testing.allocator);
+    var paths = [_]definition_core.json_pointer.Pointer{keys.keys[1].source.pointer};
+    const projection = topkRankedProjection(&keys.keys, &paths, ranked);
+    var inputs = topkRankedInputs();
+    const bindings = topkQueryBindings(&inputs);
+    var accumulator = try SortedAccumulator.init(std.testing.allocator, &projection, &bindings, 2);
+    defer accumulator.deinit();
+    try std.testing.expectEqual(@as(?usize, null), accumulator.retained_limit);
+    for (topk_ranked_rows) |row| try topkObserveText(&accumulator, row);
+    try std.testing.expectEqual(@as(usize, 4), accumulator.rows.items.len);
+    try std.testing.expect(accumulator.referenced_ids.contains("old"));
+    const actual = try topkRenderedAlloc(&accumulator, 2);
+    defer std.testing.allocator.free(actual);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    const rows = parsed.value.array.items;
+    try std.testing.expectEqualStrings("first", rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("second", rows[1].object.get("id").?.string);
+}
+
+fn topkReferenceFailureAt(
+    projection: *const Projection,
+    bindings: *const definition_core.parameters.Bindings,
+    offset: usize,
+) !bool {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var accumulator = try SortedAccumulator.init(failing.allocator(), projection, bindings, 1);
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, topk_ranked_rows[0]);
+    failing.fail_index = failing.alloc_index + offset;
+    const candidate = "{\"ref\":\"old\",\"n\":-1,\"tag\":\"token\",\"theme\":\"beta\"}";
+    topkObserveText(&accumulator, candidate) catch |err| {
+        if (err != error.OutOfMemory and err != error.WriteFailed) return err;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(u32, 0), accumulator.referenced_ids.count());
+        try std.testing.expectEqual(@as(usize, 1), accumulator.records_seen);
+        try std.testing.expectEqual(@as(usize, 1), accumulator.records_matched);
+        try std.testing.expectEqual(@as(usize, 1), accumulator.rows.items.len);
+        try std.testing.expectEqual(@as(usize, 0), accumulator.rows.items[0].record_index);
+        try std.testing.expectEqualStrings("alpha", accumulator.rows.items[0].theme.?);
+        try std.testing.expectEqualStrings("old", accumulator.rows.items[0].row_id.?);
+        return false;
+    };
+    try std.testing.expect(accumulator.referenced_ids.contains("old"));
+    try std.testing.expectEqual(@as(usize, 2), accumulator.records_seen);
+    return true;
+}
+
+test "top-K reference insertion and row retention commit together under allocation failures" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    var ranked = try topkRankedPlan();
+    defer ranked.deinit(std.testing.allocator);
+    var paths = [_]definition_core.json_pointer.Pointer{keys.keys[1].source.pointer};
+    var projection = topkRankedProjection(&keys.keys, &paths, ranked);
+    projection.single = true;
+    var inputs = topkRankedInputs();
+    const bindings = topkQueryBindings(&inputs);
+    for (0..128) |offset| {
+        if (try topkReferenceFailureAt(&projection, &bindings, offset)) {
+            try std.testing.expect(offset >= 5);
+            return;
+        }
+    }
+    return error.AllocationFailureProbeDidNotTerminate;
+}
+
+fn topkLatestFailureAt(projection: *const Projection, offset: usize) !bool {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var latest_value: ?[]u8 = try allocator.dupe(u8, "{\"original\":true}");
+    defer if (latest_value) |bytes| allocator.free(bytes);
+    var latest_key: ?Scalar = .{ .number = try allocator.dupe(u8, "1") };
+    defer if (latest_key) |*key| key.deinit(allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"n\":2,\"tag\":\"replacement\"}",
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    failing.fail_index = failing.alloc_index + offset;
+    updateLatestJsonl(
+        allocator,
+        projection,
+        projection.sort_keys[0].source.pointer,
+        parsed.value,
+        "{\"n\":2,\"tag\":\"replacement\"}",
+        &latest_value,
+        &latest_key,
+    ) catch |err| {
+        if (err != error.OutOfMemory and err != error.WriteFailed) return err;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqualStrings("{\"original\":true}", latest_value.?);
+        try std.testing.expectEqualStrings("1", latest_key.?.number);
+        return false;
+    };
+    try std.testing.expectEqual(@as(i64, 2), latest_key.?.integer);
+    return true;
+}
+
+test "latest projection preserves its previous key and value on allocation failure" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    const projection = topkTestProjection(&keys.keys);
+    for (0..64) |offset| {
+        if (try topkLatestFailureAt(&projection, offset)) return;
+    }
+    return error.AllocationFailureProbeDidNotTerminate;
+}
+
+test "id lookup failures preserve predicate ownership and cardinality" {
+    var plans = try ProjectionTestPlans.init(exact_projection_definition);
+    defer plans.deinit();
+    var compiler = try ProjectionCompiler.init(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+        null,
+        0,
+        .resolved,
+        null,
+        null,
+    );
+    defer compiler.deinit();
+    const prefix = "{\"op\":\"id-lookup\",\"path\":\"/record/id\",\"param\":\"id\"";
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        prefix ++ ",\"required\":\"invalid\"}",
+        .{},
+    );
+    defer invalid.deinit();
+    try std.testing.expectError(error.ExpectedBoolean, compiler.applyStep(invalid.value));
+    try std.testing.expectEqual(@as(usize, 0), compiler.predicates.items.len);
+    try std.testing.expect(!compiler.single);
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        prefix ++ "}",
+        .{},
+    );
+    defer valid.deinit();
+    try compiler.applyStep(valid.value);
+    try std.testing.expectError(
+        error.DuplicateProjectionCardinality,
+        compiler.applyStep(valid.value),
+    );
+    try std.testing.expectEqual(@as(usize, 1), compiler.predicates.items.len);
+    try std.testing.expect(compiler.single);
 }

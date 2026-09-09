@@ -124,7 +124,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Parsed
         } else if (std.mem.eql(u8, arg, "--poll-ms")) {
             out.poll_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, arg, "--hooks")) {
-            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
+            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse
+                return error.InvalidHooksPolicy;
         } else if (std.mem.eql(u8, arg, "--server-request-timeout-ms")) {
             out.server_request_timeout_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, arg, "--codex-path")) {
@@ -144,15 +145,21 @@ pub fn validateArgs(opts: ParsedArgs) !void {
             if (opts.thread_id == null and !opts.latest) return error.MissingTargetSelector;
         },
         .set => {
-            if (opts.objective == null and opts.status == null and !opts.token_budget.isSet()) return error.MissingGoalMutation;
-            if (opts.objective == null and opts.thread_id == null and !opts.latest) return error.MissingObjectiveForCreate;
+            if (opts.objective == null and opts.status == null and !opts.token_budget.isSet())
+                return error.MissingGoalMutation;
+            if (opts.objective == null and opts.thread_id == null and !opts.latest)
+                return error.MissingObjectiveForCreate;
         },
     }
-    if (opts.command == .status and opts.status == null and !opts.token_budget.isSet()) return error.MissingStatusMutation;
+    if (opts.command == .status and opts.status == null and !opts.token_budget.isSet())
+        return error.MissingStatusMutation;
     if (opts.poll_ms == 0) return error.InvalidPollInterval;
 }
 
-pub fn parseLatestThreadTarget(allocator: std.mem.Allocator, result_json: []const u8) !SelectedTarget {
+pub fn parseLatestThreadTarget(
+    allocator: std.mem.Allocator,
+    result_json: []const u8,
+) !SelectedTarget {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer parsed.deinit();
     const root_obj = switch (parsed.value) {
@@ -176,14 +183,18 @@ pub fn parseLatestThreadTarget(allocator: std.mem.Allocator, result_json: []cons
         };
         if (boolField(thread_obj, "ephemeral") orelse false) continue;
         const id = core_json.stringField(thread_obj, "id") orelse continue;
-        const updated_at = core_json.intField(thread_obj, "updatedAt") orelse core_json.intField(thread_obj, "updated_at");
+        const updated_at = core_json.intField(thread_obj, "updatedAt") orelse core_json.intField(
+            thread_obj,
+            "updated_at",
+        );
         if (first_id == null) {
             first_id = id;
             first_updated_at = updated_at;
             continue;
         }
         if ((first_updated_at == null and updated_at == null) or
-            (first_updated_at != null and updated_at != null and first_updated_at.? == updated_at.?))
+            (first_updated_at != null and
+                updated_at != null and first_updated_at.? == updated_at.?))
         {
             second_same_timestamp = true;
         }
@@ -207,7 +218,8 @@ pub fn buildThreadListParamsJson(allocator: std.mem.Allocator, cwd: []const u8) 
     defer allocator.free(quoted_cwd);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"cursor\":null,\"limit\":20,\"sortKey\":\"updated_at\",\"sortDirection\":\"desc\",\"archived\":false,\"cwd\":{s}}}",
+        "{{\"cursor\":null,\"limit\":20,\"sortKey\":\"updated_at\",\"sortD" ++
+            "irection\":\"desc\",\"archived\":false,\"cwd\":{s}}}",
         .{quoted_cwd},
     );
 }
@@ -218,7 +230,11 @@ pub fn buildThreadIdParamsJson(allocator: std.mem.Allocator, thread_id: []const 
     return std.fmt.allocPrint(allocator, "{{\"threadId\":{s}}}", .{quoted_thread_id});
 }
 
-pub fn buildGoalSetParamsJson(allocator: std.mem.Allocator, thread_id: []const u8, opts: ParsedArgs) ![]u8 {
+pub fn buildGoalSetParamsJson(
+    allocator: std.mem.Allocator,
+    thread_id: []const u8,
+    opts: ParsedArgs,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
@@ -257,7 +273,10 @@ pub fn parseGoalEnvelope(allocator: std.mem.Allocator, result_json: []const u8) 
     };
     const goal_json = try core_json.stringifyAlloc(allocator, goal_val);
     const status = switch (goal_val) {
-        .object => |obj| if (core_json.stringField(obj, "status")) |raw| try allocator.dupe(u8, raw) else null,
+        .object => |obj| if (core_json.stringField(
+            obj,
+            "status",
+        )) |raw| try allocator.dupe(u8, raw) else null,
         else => null,
     };
     return .{
@@ -333,7 +352,15 @@ fn boolField(obj: core_json.ObjectMap, key: []const u8) ?bool {
 }
 
 test "parseArgs accepts set with objective and default creation" {
-    const argv = [_][]const u8{ "cas_goal", "set", "--cwd", "/repo", "--objective", "finish", "--json" };
+    const argv = [_][]const u8{
+        "cas_goal",
+        "set",
+        "--cwd",
+        "/repo",
+        "--objective",
+        "finish",
+        "--json",
+    };
     const parsed = try parseArgs(std.testing.allocator, &argv);
     try std.testing.expectEqual(Command.set, parsed.command);
     try std.testing.expectEqualStrings("/repo", parsed.cwd.?);
@@ -343,7 +370,16 @@ test "parseArgs accepts set with objective and default creation" {
 }
 
 test "parseArgs rejects invalid status" {
-    const argv = [_][]const u8{ "cas_goal", "status", "--cwd", "/repo", "--thread-id", "thr_1", "--status", "done" };
+    const argv = [_][]const u8{
+        "cas_goal",
+        "status",
+        "--cwd",
+        "/repo",
+        "--thread-id",
+        "thr_1",
+        "--status",
+        "done",
+    };
     try std.testing.expectError(error.InvalidStatus, parseArgs(std.testing.allocator, &argv));
 }
 
@@ -354,7 +390,20 @@ test "validateArgs requires target selectors for mutating non-create commands" {
 }
 
 test "buildGoalSetParamsJson includes nullable token budget" {
-    const argv = [_][]const u8{ "cas_goal", "set", "--cwd", "/repo", "--thread-id", "thr_1", "--objective", "finish", "--token-budget", "null", "--status", "active" };
+    const argv = [_][]const u8{
+        "cas_goal",
+        "set",
+        "--cwd",
+        "/repo",
+        "--thread-id",
+        "thr_1",
+        "--objective",
+        "finish",
+        "--token-budget",
+        "null",
+        "--status",
+        "active",
+    };
     const parsed = try parseArgs(std.testing.allocator, &argv);
     const json = try buildGoalSetParamsJson(std.testing.allocator, "thr_1", parsed);
     defer std.testing.allocator.free(json);
@@ -376,12 +425,18 @@ test "parseLatestThreadTarget skips ephemeral and rejects same-timestamp ambigui
     const ambiguous_json =
         \\{"data":[{"id":"thr_1","ephemeral":false,"updatedAt":9},{"id":"thr_2","ephemeral":false,"updatedAt":9}]}
     ;
-    try std.testing.expectError(error.AmbiguousTarget, parseLatestThreadTarget(std.testing.allocator, ambiguous_json));
+    try std.testing.expectError(
+        error.AmbiguousTarget,
+        parseLatestThreadTarget(std.testing.allocator, ambiguous_json),
+    );
 
     const missing_timestamp_json =
         \\{"data":[{"id":"thr_1","ephemeral":false},{"id":"thr_2","ephemeral":false}]}
     ;
-    try std.testing.expectError(error.AmbiguousTarget, parseLatestThreadTarget(std.testing.allocator, missing_timestamp_json));
+    try std.testing.expectError(
+        error.AmbiguousTarget,
+        parseLatestThreadTarget(std.testing.allocator, missing_timestamp_json),
+    );
 }
 
 test "parseGoalEnvelope extracts status and preserves goal json" {

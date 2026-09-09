@@ -305,17 +305,19 @@ pub const TraceOccurrence = struct {
         text: ?[]const u8,
         private: bool,
     ) !TraceOccurrence {
-        return .{
+        var occurrence = TraceOccurrence{
             .source_event_id = computeSourceEventId(path, line_number, ordinal),
             .line_number = line_number,
             .ordinal = ordinal,
             .turn_index = turn_index,
             .entry_type = try allocator.dupe(u8, entry_type),
-            .event_type = if (event_type) |value| try allocator.dupe(u8, value) else null,
-            .role = if (role) |value| try allocator.dupe(u8, value) else null,
-            .text = if (text) |value| try allocator.dupe(u8, value) else null,
             .private = private,
         };
+        errdefer occurrence.deinit(allocator);
+        occurrence.event_type = try dupOpt(allocator, event_type);
+        occurrence.role = try dupOpt(allocator, role);
+        occurrence.text = try dupOpt(allocator, text);
+        return occurrence;
     }
 
     pub fn deinit(self: *TraceOccurrence, allocator: std.mem.Allocator) void {
@@ -451,19 +453,49 @@ pub fn parseRawTraceEvent(
 ) !?RawTraceEvent {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     if (trimmed.len == 0) return null;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
     defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |obj| obj,
-        else => return null,
-    };
-
+    const root = valueObject(parsed.value) orelse return null;
     if (stringField(root, "record_type")) |record_type| {
         if (std.mem.eql(u8, record_type, "state")) return null;
     }
+    const classification = classifyRawEvent(root);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    var event = RawTraceEvent{
+        .path = owned_path,
+        .line_number = line_number,
+        .entry_type = try allocator.dupe(u8, classification.entry_type),
+        .format = classification.format,
+    };
+    // The separate path cleanup remains armed until the event is returned.
+    errdefer {
+        allocator.free(event.entry_type);
+        freeOpt(allocator, event.event_type);
+        freeOpt(allocator, event.timestamp);
+        freeOpt(allocator, event.payload_json);
+        freeOpt(allocator, event.raw_json);
+    }
+    event.event_type = try dupOpt(allocator, classification.event_type);
+    event.timestamp = try dupOpt(allocator, bestTimestamp(root));
+    if (root.get("payload")) |payload| {
+        event.payload_json = try stringifyJsonValue(allocator, payload);
+    }
+    event.raw_json = try allocator.dupe(u8, trimmed);
+    return event;
+}
 
+const RawEventClassification = struct {
+    entry_type: []const u8,
+    event_type: ?[]const u8,
+    format: TraceFormat,
+};
+
+fn classifyRawEvent(root: std.json.ObjectMap) RawEventClassification {
     var entry_type: []const u8 = "unknown";
     var event_type: ?[]const u8 = null;
     var format: TraceFormat = .unknown;
@@ -484,7 +516,9 @@ pub fn parseRawTraceEvent(
         format = .old_2025_08_root_meta;
         if (root.get("id") != null and root.get("timestamp") != null) {
             entry_type = "session_meta";
-        } else if (root.get("call_id") != null and root.get("arguments") != null and root.get("name") != null) {
+        } else if (root.get("call_id") != null and
+            root.get("arguments") != null and root.get("name") != null)
+        {
             entry_type = "function_call";
             event_type = "function_call";
         } else if (root.get("call_id") != null and root.get("output") != null) {
@@ -501,19 +535,7 @@ pub fn parseRawTraceEvent(
         }
     }
 
-    const payload_json = if (root.get("payload")) |payload| try stringifyJsonValue(allocator, payload) else null;
-    errdefer if (payload_json) |v| allocator.free(v);
-
-    return .{
-        .path = try allocator.dupe(u8, path),
-        .line_number = line_number,
-        .entry_type = try allocator.dupe(u8, entry_type),
-        .event_type = if (event_type) |v| try allocator.dupe(u8, v) else null,
-        .timestamp = if (bestTimestamp(root)) |v| try allocator.dupe(u8, v) else null,
-        .payload_json = payload_json,
-        .raw_json = try allocator.dupe(u8, trimmed),
-        .format = format,
-    };
+    return .{ .entry_type = entry_type, .event_type = event_type, .format = format };
 }
 
 pub fn parseSessionTrace(
@@ -521,7 +543,8 @@ pub fn parseSessionTrace(
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
-    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
@@ -559,7 +582,15 @@ pub fn parseSessionTraceReader(
     const Ignore = struct {
         fn visit(_: void, _: []const u8, _: usize) !void {}
     };
-    return parseSessionTraceReaderWithVisitor(allocator, path, reader, source_mtime_ns, options, {}, Ignore.visit);
+    return parseSessionTraceReaderWithVisitor(
+        allocator,
+        path,
+        reader,
+        source_mtime_ns,
+        options,
+        {},
+        Ignore.visit,
+    );
 }
 
 pub fn parseSessionTraceReaderWithVisitor(
@@ -572,7 +603,93 @@ pub fn parseSessionTraceReaderWithVisitor(
     comptime visit: anytype,
 ) !CanonicalSessionTrace {
     var metrics = StreamMetrics{};
-    return parseSessionTraceReaderWithVisitorMetrics(allocator, path, reader, source_mtime_ns, options, context, visit, &metrics);
+    return parseSessionTraceReaderWithVisitorMetrics(
+        allocator,
+        path,
+        reader,
+        source_mtime_ns,
+        options,
+        context,
+        visit,
+        &metrics,
+    );
+}
+
+const scratch_retention_limit = 1024 * 1024;
+const MessageDigestMap = std.AutoHashMap([std.crypto.hash.sha2.Sha256.digest_length]u8, u8);
+
+/// Parsed strings borrow the current line or this arena only until reset.
+/// Every retained trace field is separately owned by the result allocator.
+const ParseScratch = struct {
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: std.mem.Allocator) ParseScratch {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    fn deinit(self: *ParseScratch) void {
+        self.arena.deinit();
+    }
+
+    fn reset(self: *ParseScratch) void {
+        // Reset retains at most one used and one free node; include both headers.
+        const node_bytes = @sizeOf(@TypeOf(self.arena.state.used_list.?.*));
+        const payload_limit = scratch_retention_limit - 2 * node_bytes;
+        if (!self.arena.reset(.{ .retain_with_limit = payload_limit })) {
+            // Failed arena shrinking may retain the old oversized chunk.
+            self.arena.deinit();
+            self.arena.state = .init;
+        }
+        std.debug.assert(self.arena.queryCapacity() <= payload_limit);
+    }
+
+    fn parse(self: *ParseScratch, line: []const u8) !?std.json.ObjectMap {
+        const value = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            self.arena.allocator(),
+            line,
+            .{},
+        );
+        return valueObject(value);
+    }
+};
+
+const ParsedRecord = struct {
+    root: std.json.ObjectMap,
+    root_type: ?[]const u8,
+    payload: ?std.json.ObjectMap,
+    timestamp: ?[]const u8,
+    line_number: usize,
+    line: []const u8,
+
+    fn init(root: std.json.ObjectMap, number: usize, line: []const u8) ParsedRecord {
+        return .{
+            .root = root,
+            .root_type = stringField(root, "type"),
+            .payload = objectField(root, "payload"),
+            .timestamp = bestTimestamp(root),
+            .line_number = number,
+            .line = line,
+        };
+    }
+
+    fn isState(self: ParsedRecord) bool {
+        return std.mem.eql(u8, stringField(self.root, "record_type") orelse "", "state");
+    }
+};
+
+fn appendMalformedWarning(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    line_number: usize,
+) !void {
+    const warning = try std.fmt.allocPrint(
+        allocator,
+        "{s}:{d}: malformed JSONL skipped",
+        .{ trace.session.path, line_number },
+    );
+    errdefer allocator.free(warning);
+    try trace.warnings.append(allocator, warning);
 }
 
 pub fn parseSessionTraceReaderWithVisitorMetrics(
@@ -585,267 +702,407 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     comptime visit: anytype,
     metrics: *StreamMetrics,
 ) !CanonicalSessionTrace {
-    var trace = CanonicalSessionTrace{
-        .session = try SessionRecord.init(allocator, path),
-    };
+    var trace = CanonicalSessionTrace{ .session = try SessionRecord.init(allocator, path) };
     errdefer trace.deinit(allocator);
     trace.session.date_group = try deriveDateGroup(allocator, path);
-
-    var current_turn_index: ?usize = null;
-    var synthetic_turns: i64 = 0;
-    var saw_task_started = false;
-    var saw_primary_session_meta = false;
-    var seen_messages = std.AutoHashMap(
-        [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        u8,
-    ).init(allocator);
-    defer seen_messages.deinit();
+    var parser = TraceParser{
+        .allocator = allocator,
+        .trace = &trace,
+        .options = options,
+        .seen_messages = MessageDigestMap.init(allocator),
+        .tool_lookup = .{ .enabled = options.max_tools == null },
+    };
+    defer parser.seen_messages.deinit();
+    defer parser.tool_lookup.deinit(allocator);
+    var scratch = ParseScratch.init(allocator);
+    defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
     defer lines.deinit();
     while (try lines.next()) |record| {
-        const line_number = record.number;
-        const raw_line = record.bytes;
-        try visit(context, raw_line, line_number);
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        defer scratch.reset();
+        try visit(context, record.bytes, record.number);
+        const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
+        const root = scratch.parse(line) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try appendMalformedWarning(allocator, &trace, record.number);
+                continue;
+            },
+        } orelse continue;
+        try parser.apply(ParsedRecord.init(root, record.number, line));
+    }
+    try finalizeTrace(allocator, &trace, source_mtime_ns, options);
+    metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
+    return trace;
+}
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch {
-            try trace.warnings.append(allocator, try std.fmt.allocPrint(allocator, "{s}:{d}: malformed JSONL skipped", .{ path, line_number }));
-            continue;
-        };
-        const root = switch (parsed.value) {
-            .object => |obj| obj,
-            else => continue,
-        };
-        const root_type = stringField(root, "type");
-        const payload = objectField(root, "payload");
-        const timestamp = bestTimestamp(root);
-        const occurrence_index = if (options.include_occurrences)
+const TraceParser = struct {
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    options: TraceParseOptions,
+    current_turn_index: ?usize = null,
+    synthetic_turns: i64 = 0,
+    saw_task_started: bool = false,
+    saw_primary_session_meta: bool = false,
+    seen_messages: MessageDigestMap,
+    tool_lookup: ToolLookup,
+
+    fn ensure(self: *TraceParser, record: ParsedRecord, turn_id: ?[]const u8) !usize {
+        return ensureTurn(
+            self.allocator,
+            self.trace,
+            self.trace.session.path,
+            &self.current_turn_index,
+            &self.synthetic_turns,
+            record.timestamp,
+            turn_id,
+        );
+    }
+
+    fn assignOccurrence(self: *TraceParser, occurrence_index: ?usize) void {
+        const index = occurrence_index orelse return;
+        const turn = self.current_turn_index orelse return;
+        self.trace.occurrences.items[index].turn_index = self.trace.turns.items[turn].turn_index;
+    }
+
+    fn apply(self: *TraceParser, record: ParsedRecord) !void {
+        const occurrence_index = if (self.options.include_occurrences)
             try appendOccurrence(
-                allocator,
-                &trace,
-                root,
-                root_type,
-                payload,
-                timestamp,
-                current_turn_index,
-                line_number,
-                line,
-                options.include_raw,
-                options.include_occurrence_payloads,
-                saw_task_started,
-                &seen_messages,
+                self.allocator,
+                self.trace,
+                record.root,
+                record.root_type,
+                record.payload,
+                record.timestamp,
+                self.current_turn_index,
+                record.line_number,
+                record.line,
+                self.options.include_raw,
+                self.options.include_occurrence_payloads,
+                self.saw_task_started,
+                &self.seen_messages,
             )
         else
             null;
-        if (stringField(root, "record_type")) |record_type| {
-            // Preserve state carriers in the canonical occurrence stream so
-            // exact-context consumers can explicitly retain or reject them.
-            if (std.mem.eql(u8, record_type, "state")) continue;
+        if (record.isState()) return;
+        try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
+        if (record.root_type) |entry_type| {
+            return self.applyTyped(record, entry_type, occurrence_index);
         }
-        if (trace.session.start_time == null) trace.session.start_time = try dupOpt(allocator, timestamp);
-        if (timestamp) |ts| try replaceOpt(allocator, &trace.session.end_time, ts);
-
-        if (root_type) |entry_type| {
-            if (std.mem.eql(u8, entry_type, "session_meta")) {
-                if (payload) |p| try applyPrimarySessionMeta(allocator, &trace, p, &saw_primary_session_meta, line_number);
-                continue;
+        if (record.payload) |payload| {
+            if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
+                try self.applyMeta(payload, record.line_number);
             }
-            if (std.mem.eql(u8, entry_type, "turn_context")) {
-                const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try applyTurnContext(allocator, &trace.turns.items[idx], payload orelse root);
-                try applySessionContextFromTurn(allocator, &trace.session, trace.turns.items[idx]);
-                if (occurrence_index) |index| {
-                    trace.occurrences.items[index].turn_index =
-                        trace.turns.items[idx].turn_index;
-                }
-                continue;
-            }
-            if (std.mem.eql(u8, entry_type, "compacted")) {
-                const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                trace.turns.items[idx].has_compaction = true;
-                if (occurrence_index) |index| {
-                    trace.occurrences.items[index].turn_index =
-                        trace.turns.items[idx].turn_index;
-                }
-                continue;
-            }
-            if (std.mem.eql(u8, entry_type, "event_msg")) {
-                if (payload) |p| {
-                    const event_type = stringField(p, "type") orelse "";
-                    if (std.mem.eql(u8, event_type, "task_started")) {
-                        saw_task_started = true;
-                        const idx = try startTurn(allocator, &trace, path, &current_turn_index, stringField(p, "turn_id"), timestamp);
-                        trace.turns.items[idx].status_reason = try dupReplace(allocator, trace.turns.items[idx].status_reason, "task_started");
-                    } else if (std.mem.eql(u8, event_type, "user_message")) {
-                        const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        if (options.include_message_bodies) {
-                            const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
-                            try replaceUserMessage(allocator, &trace.turns.items[idx], msg);
-                        }
-                    } else if (std.mem.eql(u8, event_type, "agent_message")) {
-                        const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        if (options.include_message_bodies) {
-                            const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
-                            try attachAssistantMessage(allocator, &trace.turns.items[idx], msg, line_number);
-                        }
-                    } else if (std.mem.eql(u8, event_type, "task_complete")) {
-                        if (current_turn_index) |idx| try completeTurn(allocator, &trace.turns.items[idx], .complete, "task_complete", timestamp, p);
-                    } else if (std.mem.eql(u8, event_type, "turn_aborted")) {
-                        if (current_turn_index) |idx| {
-                            try completeTurn(allocator, &trace.turns.items[idx], .aborted, "turn_aborted", timestamp, p);
-                            try replaceOpt(allocator, &trace.turns.items[idx].aborted_reason, stringField(p, "reason") orelse "turn_aborted");
-                        }
-                    } else if (std.mem.eql(u8, event_type, "error")) {
-                        const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        try completeTurn(allocator, &trace.turns.items[idx], .@"error", "error", timestamp, p);
-                        try replaceOpt(allocator, &trace.turns.items[idx].@"error", stringField(p, "message") orelse stringField(p, "error") orelse "error");
-                    } else if (std.mem.eql(u8, event_type, "token_count")) {
-                        const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        applyTokenCount(&trace.turns.items[idx], &trace.session, p);
-                        if (options.include_token_events) {
-                            try trace.token_events.append(
-                                allocator,
-                                try tokenEvent(
-                                    allocator,
-                                    occurrence_index orelse
-                                        return error.TokenEventOccurrenceMissing,
-                                    trace.turns.items[idx].turn_index,
-                                    trace.session,
-                                    p,
-                                ),
-                            );
-                        }
-                    } else if (std.mem.eql(u8, event_type, "thread_settings_applied")) {
-                        if (objectField(p, "thread_settings")) |settings| {
-                            if (stringField(settings, "model")) |value| {
-                                try replaceOpt(allocator, &trace.session.model, value);
-                            }
-                            if (stringField(settings, "service_tier")) |value| {
-                                try replaceOpt(allocator, &trace.session.service_tier, value);
-                            }
-                        }
-                    } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
-                        const name = stringField(p, "thread_name") orelse stringField(p, "name");
-                        if (name) |value| {
-                            try replaceOpt(allocator, &trace.session.thread_name, value);
-                            if (current_turn_index) |idx| try replaceOpt(allocator, &trace.turns.items[idx].thread_name, value);
-                        }
-                    } else if (std.mem.endsWith(u8, event_type, "_end")) {
-                        const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        try finalizeToolEvent(allocator, &trace, idx, p, event_type, timestamp, line_number, options.max_tools);
-                    }
-                }
-                if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| {
-                        trace.occurrences.items[index].turn_index =
-                            trace.turns.items[idx].turn_index;
-                    }
-                }
-                continue;
-            }
-            if (std.mem.eql(u8, entry_type, "response_item")) {
-                if (payload) |p| {
-                    try applyResponseItem(
-                        allocator,
-                        &trace,
-                        path,
-                        &current_turn_index,
-                        &synthetic_turns,
-                        saw_task_started,
-                        p,
-                        timestamp,
-                        line_number,
-                        options,
-                    );
-                }
-                if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| {
-                        trace.occurrences.items[index].turn_index =
-                            trace.turns.items[idx].turn_index;
-                    }
-                }
-                continue;
-            }
+            return;
         }
+        try self.applyLegacy(record);
+        self.assignOccurrence(occurrence_index);
+    }
 
-        if (root_type == null and payload != null) {
-            const p = payload.?;
-            if (stringField(p, "type")) |payload_type| {
-                if (std.mem.eql(u8, payload_type, "session_meta")) try applyPrimarySessionMeta(allocator, &trace, p, &saw_primary_session_meta, line_number);
-            }
-            continue;
+    fn applyMeta(self: *TraceParser, meta: std.json.ObjectMap, line_number: usize) !void {
+        try applyPrimarySessionMeta(
+            self.allocator,
+            self.trace,
+            meta,
+            &self.saw_primary_session_meta,
+            line_number,
+        );
+    }
+
+    fn applyTyped(
+        self: *TraceParser,
+        record: ParsedRecord,
+        entry_type: []const u8,
+        occurrence_index: ?usize,
+    ) !void {
+        const Kind = enum { session_meta, turn_context, compacted, event_msg, response_item };
+        const kind = std.meta.stringToEnum(Kind, entry_type) orelse return;
+        switch (kind) {
+            .session_meta => {
+                if (record.payload) |payload| try self.applyMeta(payload, record.line_number);
+                return;
+            },
+            .turn_context => {
+                const idx = try self.ensure(record, null);
+                const turn = &self.trace.turns.items[idx];
+                try applyTurnContext(self.allocator, turn, record.payload orelse record.root);
+                try applySessionContextFromTurn(self.allocator, &self.trace.session, turn.*);
+            },
+            .compacted => {
+                const idx = try self.ensure(record, null);
+                self.trace.turns.items[idx].has_compaction = true;
+            },
+            .event_msg => if (record.payload) |payload| {
+                try self.applyEvent(record, payload, occurrence_index);
+            },
+            .response_item => if (record.payload) |payload| {
+                try applyResponseItem(
+                    self.allocator,
+                    self.trace,
+                    &self.tool_lookup,
+                    self.trace.session.path,
+                    &self.current_turn_index,
+                    &self.synthetic_turns,
+                    self.saw_task_started,
+                    payload,
+                    record.timestamp,
+                    record.line_number,
+                    self.options,
+                );
+            },
         }
+        self.assignOccurrence(occurrence_index);
+    }
 
-        if (root_type == null) {
-            if (root.get("id") != null and root.get("timestamp") != null) {
-                try applyPrimarySessionMeta(allocator, &trace, root, &saw_primary_session_meta, line_number);
-            } else if (root.get("role") != null and root.get("content") != null) {
-                const role = stringField(root, "role") orelse "";
-                if (std.mem.eql(u8, role, "user")) {
-                    const idx = try startSyntheticTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp);
-                    if (options.include_message_bodies) {
-                        const text = try messageTextAlloc(allocator, root);
-                        defer allocator.free(text);
-                        try attachUserMessage(allocator, &trace.turns.items[idx], text);
-                    }
-                } else if (std.mem.eql(u8, role, "assistant")) {
-                    const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                    if (options.include_message_bodies) {
-                        const text = try messageTextAlloc(allocator, root);
-                        defer allocator.free(text);
-                        try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
-                    }
-                    try completeTurn(allocator, &trace.turns.items[idx], .complete, "synthetic_message_boundary", timestamp, root);
-                }
-            } else if (root.get("call_id") != null and root.get("arguments") != null and root.get("name") != null) {
-                const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try declareTool(allocator, &trace, idx, root, timestamp, line_number, options.max_tools);
-            } else if (root.get("call_id") != null and root.get("output") != null) {
-                const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number, options.max_tools);
+    fn applyEvent(
+        self: *TraceParser,
+        record: ParsedRecord,
+        payload: std.json.ObjectMap,
+        occurrence_index: ?usize,
+    ) !void {
+        const event_type = stringField(payload, "type") orelse "";
+        const Kind = enum {
+            task_started,
+            user_message,
+            agent_message,
+            task_complete,
+            turn_aborted,
+            @"error",
+            token_count,
+            thread_settings_applied,
+            thread_name_updated,
+        };
+        const kind = std.meta.stringToEnum(Kind, event_type) orelse {
+            if (std.mem.endsWith(u8, event_type, "_end")) {
+                const idx = try self.ensure(record, stringField(payload, "turn_id"));
+                try finalizeToolEvent(
+                    self.allocator,
+                    self.trace,
+                    &self.tool_lookup,
+                    idx,
+                    payload,
+                    event_type,
+                    record.timestamp,
+                    record.line_number,
+                    self.options.max_tools,
+                );
             }
-            if (current_turn_index) |idx| {
-                if (occurrence_index) |index| {
-                    trace.occurrences.items[index].turn_index =
-                        trace.turns.items[idx].turn_index;
+            return;
+        };
+        switch (kind) {
+            .task_started => try self.start(record, payload),
+            .user_message, .agent_message => {
+                const idx = try self.ensure(record, stringField(payload, "turn_id"));
+                if (!self.options.include_message_bodies) return;
+                const msg = stringField(payload, "message") orelse
+                    stringField(payload, "text") orelse "";
+                const turn = &self.trace.turns.items[idx];
+                if (kind == .user_message) {
+                    try replaceUserMessage(self.allocator, turn, msg);
+                } else {
+                    try attachAssistantMessage(self.allocator, turn, msg, record.line_number);
                 }
-            }
+            },
+            .task_complete, .turn_aborted, .@"error" => {
+                try self.complete(record, payload, event_type);
+            },
+            .token_count => try self.tokens(record, payload, occurrence_index),
+            .thread_settings_applied => {
+                try applyThreadSettings(self.allocator, &self.trace.session, payload);
+            },
+            .thread_name_updated => {
+                const name = stringField(payload, "thread_name") orelse
+                    stringField(payload, "name");
+                const value = name orelse return;
+                try replaceOpt(self.allocator, &self.trace.session.thread_name, value);
+                if (self.current_turn_index) |idx| {
+                    try replaceOpt(self.allocator, &self.trace.turns.items[idx].thread_name, value);
+                }
+            },
         }
     }
 
-    const now_ns = nowRealtimeNs();
-    const age_secs = @divTrunc(now_ns - source_mtime_ns, std.time.ns_per_s);
-    for (trace.turns.items) |*turn| {
-        if (turn.status == .ongoing) {
-            if (age_secs <= options.ongoing_threshold_secs) {
-                turn.status_reason = try dupReplace(allocator, turn.status_reason, "fresh_ongoing_turn");
-                trace.session.is_ongoing = true;
-                try replaceOpt(allocator, &trace.session.status_reason, "fresh_ongoing_turn");
+    fn start(self: *TraceParser, record: ParsedRecord, payload: std.json.ObjectMap) !void {
+        self.saw_task_started = true;
+        const idx = try startTurn(
+            self.allocator,
+            self.trace,
+            self.trace.session.path,
+            &self.current_turn_index,
+            stringField(payload, "turn_id"),
+            record.timestamp,
+        );
+        try replaceOpt(self.allocator, &self.trace.turns.items[idx].status_reason, "task_started");
+    }
+
+    fn complete(
+        self: *TraceParser,
+        record: ParsedRecord,
+        payload: std.json.ObjectMap,
+        event_type: []const u8,
+    ) !void {
+        const is_error = std.mem.eql(u8, event_type, "error");
+        const idx = if (is_error)
+            try self.ensure(record, stringField(payload, "turn_id"))
+        else
+            self.current_turn_index orelse return;
+        const turn = &self.trace.turns.items[idx];
+        const status: TurnStatus = if (is_error) .@"error" else status: {
+            break :status if (std.mem.eql(u8, event_type, "turn_aborted")) .aborted else .complete;
+        };
+        try completeTurn(self.allocator, turn, status, event_type, record.timestamp, payload);
+        if (status == .aborted) {
+            const reason = stringField(payload, "reason") orelse "turn_aborted";
+            try replaceOpt(self.allocator, &turn.aborted_reason, reason);
+        } else if (is_error) {
+            const message = stringField(payload, "message") orelse
+                stringField(payload, "error") orelse "error";
+            try replaceOpt(self.allocator, &turn.@"error", message);
+        }
+    }
+
+    fn tokens(
+        self: *TraceParser,
+        record: ParsedRecord,
+        payload: std.json.ObjectMap,
+        occurrence_index: ?usize,
+    ) !void {
+        const idx = try self.ensure(record, stringField(payload, "turn_id"));
+        applyTokenCount(&self.trace.turns.items[idx], &self.trace.session, payload);
+        if (!self.options.include_token_events) return;
+        var event = try tokenEvent(
+            self.allocator,
+            occurrence_index orelse return error.TokenEventOccurrenceMissing,
+            self.trace.turns.items[idx].turn_index,
+            self.trace.session,
+            payload,
+        );
+        errdefer event.deinit(self.allocator);
+        try self.trace.token_events.append(self.allocator, event);
+    }
+
+    fn applyLegacy(self: *TraceParser, record: ParsedRecord) !void {
+        const root = record.root;
+        if (root.get("id") != null and root.get("timestamp") != null) {
+            try self.applyMeta(root, record.line_number);
+        } else if (root.get("role") != null and root.get("content") != null) {
+            try self.applyLegacyMessage(record);
+        } else if (root.get("call_id") != null and
+            root.get("arguments") != null and root.get("name") != null)
+        {
+            const idx = try self.ensure(record, null);
+            try declareTool(
+                self.allocator,
+                self.trace,
+                &self.tool_lookup,
+                idx,
+                root,
+                record.timestamp,
+                record.line_number,
+                self.options.max_tools,
+            );
+        } else if (root.get("call_id") != null and root.get("output") != null) {
+            const idx = try self.ensure(record, null);
+            try finalizeToolOutput(
+                self.allocator,
+                self.trace,
+                &self.tool_lookup,
+                idx,
+                root,
+                "function_call_output",
+                record.timestamp,
+                record.line_number,
+                self.options.max_tools,
+            );
+        }
+    }
+
+    fn applyLegacyMessage(self: *TraceParser, record: ParsedRecord) !void {
+        const role = stringField(record.root, "role") orelse "";
+        const is_user = std.mem.eql(u8, role, "user");
+        if (!is_user and !std.mem.eql(u8, role, "assistant")) return;
+        const idx = if (is_user)
+            try startSyntheticTurn(
+                self.allocator,
+                self.trace,
+                self.trace.session.path,
+                &self.current_turn_index,
+                &self.synthetic_turns,
+                record.timestamp,
+            )
+        else
+            try self.ensure(record, null);
+        const turn = &self.trace.turns.items[idx];
+        if (self.options.include_message_bodies) {
+            const text = try messageTextAlloc(self.allocator, record.root);
+            defer self.allocator.free(text);
+            if (is_user) {
+                try attachUserMessage(self.allocator, turn, text);
             } else {
-                turn.status = .aborted;
-                turn.status_reason = try dupReplace(allocator, turn.status_reason, "stale_ongoing_file");
-                try replaceOpt(allocator, &trace.session.status_reason, "stale_ongoing_file");
+                try attachAssistantMessage(self.allocator, turn, text, record.line_number);
             }
         }
+        if (!is_user) {
+            try completeTurn(
+                self.allocator,
+                turn,
+                .complete,
+                "synthetic_message_boundary",
+                record.timestamp,
+                record.root,
+            );
+        }
+    }
+};
+
+fn applySessionTimestamp(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    timestamp: ?[]const u8,
+) !void {
+    if (session.start_time == null) session.start_time = try dupOpt(allocator, timestamp);
+    if (timestamp) |value| try replaceOpt(allocator, &session.end_time, value);
+}
+
+fn applyThreadSettings(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    payload: std.json.ObjectMap,
+) !void {
+    const settings = objectField(payload, "thread_settings") orelse return;
+    if (stringField(settings, "model")) |value| try replaceOpt(allocator, &session.model, value);
+    if (stringField(settings, "service_tier")) |value| {
+        try replaceOpt(allocator, &session.service_tier, value);
+    }
+}
+
+fn finalizeTrace(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+) !void {
+    const age_secs = @divTrunc(nowRealtimeNs() - source_mtime_ns, std.time.ns_per_s);
+    for (trace.turns.items) |*turn| {
+        if (turn.status != .ongoing) continue;
+        const fresh = age_secs <= options.ongoing_threshold_secs;
+        const reason = if (fresh) "fresh_ongoing_turn" else "stale_ongoing_file";
+        if (fresh) trace.session.is_ongoing = true else turn.status = .aborted;
+        try replaceOpt(allocator, &turn.status_reason, reason);
+        try replaceOpt(allocator, &trace.session.status_reason, reason);
     }
     if (!trace.session.is_ongoing and trace.session.status_reason == null) {
-        if (trace.turns.items.len == 0) {
-            try replaceOpt(allocator, &trace.session.status_reason, "no_turns");
-        } else {
+        const reason = if (trace.turns.items.len == 0) "no_turns" else blk: {
             const last = trace.turns.items[trace.turns.items.len - 1];
-            try replaceOpt(allocator, &trace.session.status_reason, last.status_reason orelse @tagName(last.status));
-        }
+            break :blk last.status_reason orelse @tagName(last.status);
+        };
+        try replaceOpt(allocator, &trace.session.status_reason, reason);
     }
-
     for (trace.tools.items) |*tool| {
         if (tool.lifecycle_status == .declared) tool.lifecycle_status = .unresolved;
     }
     trace.session.turn_count = @intCast(trace.turns.items.len);
-    metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
-    return trace;
 }
 
 pub fn parseSessionSummaryTrace(
@@ -853,7 +1110,8 @@ pub fn parseSessionSummaryTrace(
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
-    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
@@ -877,7 +1135,15 @@ pub fn parseSessionSummaryTraceReader(
     const Ignore = struct {
         fn visit(_: void, _: []const u8, _: usize) !void {}
     };
-    return parseSessionSummaryTraceReaderWithVisitor(allocator, path, reader, source_mtime_ns, options, {}, Ignore.visit);
+    return parseSessionSummaryTraceReaderWithVisitor(
+        allocator,
+        path,
+        reader,
+        source_mtime_ns,
+        options,
+        {},
+        Ignore.visit,
+    );
 }
 
 pub fn parseSessionSummaryTraceReaderWithVisitor(
@@ -890,7 +1156,16 @@ pub fn parseSessionSummaryTraceReaderWithVisitor(
     comptime visit: anytype,
 ) !CanonicalSessionTrace {
     var metrics = StreamMetrics{};
-    return parseSessionSummaryTraceReaderWithVisitorMetrics(allocator, path, reader, source_mtime_ns, options, context, visit, &metrics);
+    return parseSessionSummaryTraceReaderWithVisitorMetrics(
+        allocator,
+        path,
+        reader,
+        source_mtime_ns,
+        options,
+        context,
+        visit,
+        &metrics,
+    );
 }
 
 pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
@@ -903,136 +1178,234 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
     comptime visit: anytype,
     metrics: *StreamMetrics,
 ) !CanonicalSessionTrace {
-    var trace = CanonicalSessionTrace{
-        .session = try SessionRecord.init(allocator, path),
-    };
+    var trace = CanonicalSessionTrace{ .session = try SessionRecord.init(allocator, path) };
     errdefer trace.deinit(allocator);
     trace.session.date_group = try deriveDateGroup(allocator, path);
-
-    var seen_turn_ids = std.StringHashMap(void).init(allocator);
-    defer {
-        var it = seen_turn_ids.keyIterator();
-        while (it.next()) |key| allocator.free(key.*);
-        seen_turn_ids.deinit();
-    }
-
-    var last_turn_open = false;
-    var saw_primary_session_meta = false;
+    var parser = SummaryParser{
+        .allocator = allocator,
+        .trace = &trace,
+        .seen_turn_ids = std.StringHashMap(void).init(allocator),
+    };
+    defer parser.deinit();
+    var scratch = ParseScratch.init(allocator);
+    defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
     defer lines.deinit();
     while (try lines.next()) |record| {
-        const line_number = record.number;
-        const raw_line = record.bytes;
-        try visit(context, raw_line, line_number);
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        defer scratch.reset();
+        try visit(context, record.bytes, record.number);
+        const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
-
-        if (fastTimestampSlice(line)) |ts| {
-            if (trace.session.start_time == null) trace.session.start_time = try allocator.dupe(u8, ts);
-            try replaceOpt(allocator, &trace.session.end_time, ts);
+        if (fastTimestampSlice(line)) |timestamp| {
+            try applySessionTimestamp(allocator, &trace.session, timestamp);
         }
         if (!sessionSummaryLineCouldMatter(line)) continue;
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch {
-            try trace.warnings.append(allocator, try std.fmt.allocPrint(allocator, "{s}:{d}: malformed JSONL skipped", .{ path, line_number }));
-            continue;
-        };
-        const root = switch (parsed.value) {
-            .object => |obj| obj,
-            else => continue,
-        };
-        if (stringField(root, "record_type")) |record_type| {
-            if (std.mem.eql(u8, record_type, "state")) continue;
-        }
-
-        const root_type = stringField(root, "type");
-        const payload = objectField(root, "payload");
-        const timestamp = bestTimestamp(root);
-        if (trace.session.start_time == null) trace.session.start_time = try dupOpt(allocator, timestamp);
-        if (timestamp) |ts| try replaceOpt(allocator, &trace.session.end_time, ts);
-
-        if (root_type) |entry_type| {
-            if (std.mem.eql(u8, entry_type, "session_meta")) {
-                if (payload) |p| try applyPrimarySessionMeta(allocator, &trace, p, &saw_primary_session_meta, line_number);
+        const root = scratch.parse(line) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try appendMalformedWarning(allocator, &trace, record.number);
                 continue;
-            }
-            if (std.mem.eql(u8, entry_type, "turn_context")) {
-                if (payload) |p| try applySessionContextFields(allocator, &trace.session, p);
-                continue;
-            }
-            if (std.mem.eql(u8, entry_type, "event_msg")) {
-                const p = payload orelse continue;
-                const event_type = stringField(p, "type") orelse "";
-                if (std.mem.eql(u8, event_type, "task_started")) {
-                    try noteSummaryTurn(allocator, &trace.session, &seen_turn_ids, stringField(p, "turn_id"));
-                    last_turn_open = true;
-                    try replaceOpt(allocator, &trace.session.status_reason, "task_started");
-                } else if (std.mem.eql(u8, event_type, "task_complete")) {
-                    last_turn_open = false;
-                    try replaceOpt(allocator, &trace.session.status_reason, "task_complete");
-                } else if (std.mem.eql(u8, event_type, "turn_aborted")) {
-                    last_turn_open = false;
-                    try replaceOpt(allocator, &trace.session.status_reason, stringField(p, "reason") orelse "turn_aborted");
-                } else if (std.mem.eql(u8, event_type, "error")) {
-                    try noteSummaryTurn(allocator, &trace.session, &seen_turn_ids, stringField(p, "turn_id"));
-                    last_turn_open = false;
-                    try replaceOpt(allocator, &trace.session.status_reason, stringField(p, "message") orelse stringField(p, "error") orelse "error");
-                } else if (std.mem.eql(u8, event_type, "token_count")) {
-                    applyTokenCountToSession(&trace.session, p);
-                } else if (std.mem.eql(u8, event_type, "thread_settings_applied")) {
-                    if (objectField(p, "thread_settings")) |settings| {
-                        if (stringField(settings, "model")) |value| {
-                            try replaceOpt(allocator, &trace.session.model, value);
-                        }
-                        if (stringField(settings, "service_tier")) |value| {
-                            try replaceOpt(allocator, &trace.session.service_tier, value);
-                        }
-                    }
-                } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
-                    const name = stringField(p, "thread_name") orelse stringField(p, "name");
-                    if (name) |value| try replaceOpt(allocator, &trace.session.thread_name, value);
-                } else if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
-                    try appendGraphEdge(allocator, &trace, p, timestamp);
-                    trace.session.spawned_worker_count += 1;
-                }
-                continue;
-            }
-        }
-
-        if (root_type == null and payload != null) {
-            const p = payload.?;
-            if (stringField(p, "type")) |payload_type| {
-                if (std.mem.eql(u8, payload_type, "session_meta")) try applyPrimarySessionMeta(allocator, &trace, p, &saw_primary_session_meta, line_number);
-            }
-            continue;
-        }
-
-        if (root_type == null and root.get("id") != null and root.get("timestamp") != null) {
-            try applyPrimarySessionMeta(allocator, &trace, root, &saw_primary_session_meta, line_number);
-        }
+            },
+        } orelse continue;
+        try parser.apply(ParsedRecord.init(root, record.number, line));
     }
-
-    const now_ns = nowRealtimeNs();
-    const age_secs = @divTrunc(now_ns - source_mtime_ns, std.time.ns_per_s);
-    if (last_turn_open) {
-        if (age_secs <= options.ongoing_threshold_secs) {
-            trace.session.is_ongoing = true;
-            try replaceOpt(allocator, &trace.session.status_reason, "fresh_ongoing_turn");
-        } else {
-            try replaceOpt(allocator, &trace.session.status_reason, "stale_ongoing_file");
-        }
-    }
-    if (!trace.session.is_ongoing and trace.session.status_reason == null) {
-        if (trace.session.turn_count == 0) {
-            try replaceOpt(allocator, &trace.session.status_reason, "no_turns");
-        } else {
-            try replaceOpt(allocator, &trace.session.status_reason, "task_complete");
-        }
-    }
+    try parser.finish(source_mtime_ns, options);
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
+}
+
+const SummaryParser = struct {
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    seen_turn_ids: std.StringHashMap(void),
+    last_turn_open: bool = false,
+    saw_primary_session_meta: bool = false,
+
+    fn deinit(self: *SummaryParser) void {
+        var it = self.seen_turn_ids.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.seen_turn_ids.deinit();
+    }
+
+    fn applyMeta(self: *SummaryParser, meta: std.json.ObjectMap, line_number: usize) !void {
+        try applyPrimarySessionMeta(
+            self.allocator,
+            self.trace,
+            meta,
+            &self.saw_primary_session_meta,
+            line_number,
+        );
+    }
+
+    fn apply(self: *SummaryParser, record: ParsedRecord) !void {
+        if (record.isState()) return;
+        try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
+        if (record.root_type) |entry_type| {
+            const payload = record.payload orelse return;
+            if (std.mem.eql(u8, entry_type, "session_meta")) {
+                try self.applyMeta(payload, record.line_number);
+            } else if (std.mem.eql(u8, entry_type, "turn_context")) {
+                try applySessionContextFields(self.allocator, &self.trace.session, payload);
+            } else if (std.mem.eql(u8, entry_type, "event_msg")) {
+                try self.applyEvent(payload, record.timestamp);
+            }
+            return;
+        }
+        if (record.payload) |payload| {
+            if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
+                try self.applyMeta(payload, record.line_number);
+            }
+        } else if (record.root.get("id") != null and record.root.get("timestamp") != null) {
+            try self.applyMeta(record.root, record.line_number);
+        }
+    }
+
+    fn applyEvent(
+        self: *SummaryParser,
+        payload: std.json.ObjectMap,
+        timestamp: ?[]const u8,
+    ) !void {
+        const event_type = stringField(payload, "type") orelse "";
+        const Kind = enum {
+            task_started,
+            task_complete,
+            turn_aborted,
+            @"error",
+            token_count,
+            thread_settings_applied,
+            thread_name_updated,
+            collab_agent_spawn_end,
+        };
+        const kind = std.meta.stringToEnum(Kind, event_type) orelse return;
+        const session = &self.trace.session;
+        switch (kind) {
+            .task_started, .@"error" => {
+                try noteSummaryTurn(
+                    self.allocator,
+                    session,
+                    &self.seen_turn_ids,
+                    stringField(payload, "turn_id"),
+                );
+                self.last_turn_open = kind == .task_started;
+                const error_message = stringField(payload, "message") orelse
+                    stringField(payload, "error") orelse "error";
+                const reason = if (self.last_turn_open) "task_started" else error_message;
+                try replaceOpt(self.allocator, &session.status_reason, reason);
+            },
+            .task_complete, .turn_aborted => {
+                self.last_turn_open = false;
+                const aborted_reason = stringField(payload, "reason") orelse "turn_aborted";
+                const reason = if (kind == .task_complete) "task_complete" else aborted_reason;
+                try replaceOpt(self.allocator, &session.status_reason, reason);
+            },
+            .token_count => applyTokenCountToSession(session, payload),
+            .thread_settings_applied => try applyThreadSettings(self.allocator, session, payload),
+            .thread_name_updated => {
+                const name = stringField(payload, "thread_name") orelse
+                    stringField(payload, "name");
+                if (name) |value| try replaceOpt(self.allocator, &session.thread_name, value);
+            },
+            .collab_agent_spawn_end => {
+                try appendGraphEdge(self.allocator, self.trace, payload, timestamp);
+                session.spawned_worker_count += 1;
+            },
+        }
+    }
+
+    fn finish(
+        self: *SummaryParser,
+        source_mtime_ns: i128,
+        options: TraceParseOptions,
+    ) !void {
+        const session = &self.trace.session;
+        const age_secs = @divTrunc(nowRealtimeNs() - source_mtime_ns, std.time.ns_per_s);
+        if (self.last_turn_open) {
+            const fresh = age_secs <= options.ongoing_threshold_secs;
+            const reason = if (fresh) "fresh_ongoing_turn" else "stale_ongoing_file";
+            session.is_ongoing = fresh;
+            try replaceOpt(self.allocator, &session.status_reason, reason);
+        }
+        if (!session.is_ongoing and session.status_reason == null) {
+            const reason = if (session.turn_count == 0) "no_turns" else "task_complete";
+            try replaceOpt(self.allocator, &session.status_reason, reason);
+        }
+    }
+};
+
+const OccurrenceSource = struct {
+    source: std.json.ObjectMap,
+    entry_type: []const u8,
+    event_type: ?[]const u8,
+    role: ?[]const u8,
+    private: bool,
+
+    fn init(
+        root: std.json.ObjectMap,
+        root_type: ?[]const u8,
+        payload: ?std.json.ObjectMap,
+    ) OccurrenceSource {
+        const source = payload orelse root;
+        const entry_type = occurrenceEntryType(root, root_type, source);
+        const event_type = stringField(source, "type") orelse
+            if (std.mem.eql(u8, entry_type, "message")) stringField(source, "role") else null;
+        const role = stringField(source, "role") orelse role: {
+            if (!std.mem.eql(u8, entry_type, "event_msg")) break :role null;
+            const kind = event_type orelse "";
+            if (std.mem.eql(u8, kind, "user_message")) break :role "user";
+            if (std.mem.eql(u8, kind, "agent_message")) break :role "assistant";
+            break :role null;
+        };
+        return .{
+            .source = source,
+            .entry_type = entry_type,
+            .event_type = event_type,
+            .role = role,
+            .private = std.mem.eql(u8, entry_type, "reasoning") or
+                std.mem.eql(u8, event_type orelse "", "reasoning"),
+        };
+    }
+
+    fn textAlloc(self: OccurrenceSource, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.private) return null;
+        const kind = self.event_type orelse "";
+        if ((std.mem.eql(u8, self.entry_type, "response_item") and
+            std.mem.eql(u8, kind, "message")) or std.mem.eql(u8, self.entry_type, "message"))
+        {
+            return try messageTextAlloc(allocator, self.source);
+        }
+        if (std.mem.eql(u8, self.entry_type, "event_msg") and
+            oneOfString(kind, &.{ "user_message", "agent_message" }))
+        {
+            const message = stringField(self.source, "message") orelse
+                stringField(self.source, "text") orelse "";
+            return try allocator.dupe(u8, message);
+        }
+        return null;
+    }
+};
+
+fn occurrenceEntryType(
+    root: std.json.ObjectMap,
+    root_type: ?[]const u8,
+    source: std.json.ObjectMap,
+) []const u8 {
+    if (stringField(root, "record_type")) |kind| {
+        return if (std.mem.eql(u8, kind, "state")) "state" else "unknown";
+    }
+    if (root_type) |kind| return kind;
+    if (stringField(source, "type")) |kind| {
+        const allowed = &.{
+            "session_meta", "turn_context",  "compacted",
+            "event_msg",    "response_item", "world_state",
+        };
+        return if (oneOfString(kind, allowed)) kind else "unknown";
+    }
+    if (root.get("id") != null and root.get("timestamp") != null) return "session_meta";
+    if (root.get("role") != null) return "message";
+    if (root.get("call_id") != null and root.get("arguments") != null) return "function_call";
+    if (root.get("call_id") != null and root.get("output") != null) return "function_call_output";
+    if (root.get("encrypted_content") != null) return "reasoning";
+    return "unknown";
 }
 
 fn appendOccurrence(
@@ -1048,141 +1421,91 @@ fn appendOccurrence(
     include_raw: bool,
     include_payload: bool,
     saw_task_started: bool,
-    seen_messages: *std.AutoHashMap(
-        [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        u8,
-    ),
+    seen_messages: *MessageDigestMap,
 ) !usize {
-    const source = payload orelse root;
-    const source_type = stringField(source, "type");
-    const record_type = stringField(root, "record_type");
-    const entry_type = if (record_type) |kind|
-        if (std.mem.eql(u8, kind, "state")) "state" else "unknown"
-    else
-        root_type orelse if (source_type) |kind|
-            if (oneOfString(kind, &.{ "session_meta", "turn_context", "compacted", "event_msg", "response_item", "world_state" })) kind else "unknown"
-        else if (root.get("id") != null and root.get("timestamp") != null)
-            "session_meta"
-        else if (root.get("role") != null)
-            "message"
-        else if (root.get("call_id") != null and root.get("arguments") != null)
-            "function_call"
-        else if (root.get("call_id") != null and root.get("output") != null)
-            "function_call_output"
-        else if (root.get("encrypted_content") != null)
-            "reasoning"
-        else
-            "unknown";
-    const event_type = stringField(source, "type") orelse if (std.mem.eql(u8, entry_type, "message")) stringField(source, "role") else null;
-    const role = stringField(source, "role") orelse if (std.mem.eql(u8, entry_type, "event_msg")) blk: {
-        const kind = event_type orelse "";
-        if (std.mem.eql(u8, kind, "user_message")) break :blk "user";
-        if (std.mem.eql(u8, kind, "agent_message")) break :blk "assistant";
-        break :blk null;
-    } else null;
-    const private = std.mem.eql(u8, entry_type, "reasoning") or std.mem.eql(u8, event_type orelse "", "reasoning");
-
-    var text: ?[]u8 = null;
-    errdefer freeOpt(allocator, text);
-    if (!private) {
-        if ((std.mem.eql(u8, entry_type, "response_item") and std.mem.eql(u8, event_type orelse "", "message")) or
-            std.mem.eql(u8, entry_type, "message"))
-        {
-            text = try messageTextAlloc(allocator, source);
-        } else if (std.mem.eql(u8, entry_type, "event_msg") and
-            (std.mem.eql(u8, event_type orelse "", "user_message") or std.mem.eql(u8, event_type orelse "", "agent_message")))
-        {
-            text = try allocator.dupe(u8, stringField(source, "message") orelse stringField(source, "text") orelse "");
-        }
-    }
-    var message_visible = false;
-    if (role) |message_role| {
-        if (text) |message_text| {
-            if (std.mem.eql(u8, message_role, "user") or
-                std.mem.eql(u8, message_role, "assistant"))
-            {
-                const selected = if (std.mem.eql(u8, message_role, "assistant"))
-                    stripEchoView(message_text)
-                else
-                    message_text;
-                const normalized = try normalizeMessageTextAlloc(
-                    allocator,
-                    selected,
-                );
-                allocator.free(message_text);
-                text = normalized;
-                if (normalized.len != 0 and
-                    !(std.mem.eql(u8, message_role, "user") and
-                        isMetaUserMessage(normalized)))
-                {
-                    const carrier: u8 = if (std.mem.eql(
-                        u8,
-                        entry_type,
-                        "event_msg",
-                    )) 0b10 else 0b01;
-                    const counterpart: u8 = if (carrier == 0b01)
-                        0b10
-                    else
-                        0b01;
-                    const digest = messageMirrorDigest(
-                        message_role,
-                        normalized,
-                        messageTurnKey(
-                            trace,
-                            source,
-                            entry_type,
-                            message_role,
-                            current_turn_index,
-                            saw_task_started,
-                        ),
-                        timestamp,
-                    );
-                    const entry = try seen_messages.getOrPut(digest);
-                    if (!entry.found_existing) entry.value_ptr.* = 0;
-                    message_visible = entry.value_ptr.* & counterpart == 0;
-                    entry.value_ptr.* |= carrier;
-                }
-            }
-        }
-    }
-
+    const source = OccurrenceSource.init(root, root_type, payload);
+    var text = try source.textAlloc(allocator);
+    defer freeOpt(allocator, text);
+    const visible = try occurrenceMessageVisible(
+        allocator,
+        trace,
+        source,
+        &text,
+        current_turn_index,
+        saw_task_started,
+        timestamp,
+        seen_messages,
+    );
     var occurrence = try TraceOccurrence.init(
         allocator,
         trace.session.path,
         line_number,
         trace.occurrences.items.len,
-        if (current_turn_index) |index|
-            trace.turns.items[index].turn_index
-        else
-            null,
-        entry_type,
-        event_type,
-        role,
+        if (current_turn_index) |index| trace.turns.items[index].turn_index else null,
+        source.entry_type,
+        source.event_type,
+        source.role,
         text,
-        private,
+        source.private,
     );
     errdefer occurrence.deinit(allocator);
-    occurrence.message_visible = message_visible;
-    freeOpt(allocator, text);
-    text = null;
+    occurrence.message_visible = visible;
     occurrence.timestamp = if (timestamp) |value|
         try normalizeTimestampAlloc(allocator, value)
     else
         null;
-    occurrence.payload_json = if (!private and include_payload)
+    occurrence.payload_json = if (!source.private and include_payload)
         try stringifyJsonValue(
             allocator,
             if (payload != null) root.get("payload").? else std.json.Value{ .object = root },
         )
     else
         null;
-    occurrence.raw_json = if (include_raw)
-        try allocator.dupe(u8, raw_json)
-    else
-        null;
+    occurrence.raw_json = if (include_raw) try allocator.dupe(u8, raw_json) else null;
     occurrence.format = traceFormat(root, root_type, payload);
     try trace.occurrences.append(allocator, occurrence);
     return trace.occurrences.items.len - 1;
+}
+
+fn occurrenceMessageVisible(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    source: OccurrenceSource,
+    text: *?[]u8,
+    current_turn_index: ?usize,
+    saw_task_started: bool,
+    timestamp: ?[]const u8,
+    seen_messages: *MessageDigestMap,
+) !bool {
+    const role = source.role orelse return false;
+    const message = text.* orelse return false;
+    if (!oneOfString(role, &.{ "user", "assistant" })) return false;
+    const selected = if (std.mem.eql(u8, role, "assistant")) stripEchoView(message) else message;
+    const normalized = try normalizeMessageTextAlloc(allocator, selected);
+    allocator.free(message);
+    text.* = normalized;
+    if (normalized.len == 0) return false;
+    if (std.mem.eql(u8, role, "user") and isMetaUserMessage(normalized)) return false;
+    const carrier: u8 = if (std.mem.eql(u8, source.entry_type, "event_msg")) 0b10 else 0b01;
+    const counterpart: u8 = if (carrier == 0b01) 0b10 else 0b01;
+    const digest = messageMirrorDigest(
+        role,
+        normalized,
+        messageTurnKey(
+            trace,
+            source.source,
+            source.entry_type,
+            role,
+            current_turn_index,
+            saw_task_started,
+        ),
+        timestamp,
+    );
+    const entry = try seen_messages.getOrPut(digest);
+    if (!entry.found_existing) entry.value_ptr.* = 0;
+    const visible = entry.value_ptr.* & counterpart == 0;
+    entry.value_ptr.* |= carrier;
+    return visible;
 }
 
 fn computeSourceEventId(path: []const u8, line_number: usize, ordinal: usize) [71]u8 {
@@ -1221,14 +1544,26 @@ fn traceFormat(
     return .unknown;
 }
 
-pub fn cutBoundContextAlloc(allocator: std.mem.Allocator, trace: CanonicalSessionTrace, last_fixed_line: usize) !CutBoundContext {
+pub fn cutBoundContextAlloc(
+    allocator: std.mem.Allocator,
+    trace: CanonicalSessionTrace,
+    last_fixed_line: usize,
+) !CutBoundContext {
     var context = CutBoundContext{};
     errdefer context.deinit(allocator);
     var saw_primary_meta = false;
     for (trace.occurrences.items) |occurrence| {
         if (occurrence.line_number > last_fixed_line) break;
         const payload_json = occurrence.payload_json orelse continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            payload_json,
+            .{},
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            continue;
+        };
         defer parsed.deinit();
         const payload = switch (parsed.value) {
             .object => |map| map,
@@ -1237,26 +1572,56 @@ pub fn cutBoundContextAlloc(allocator: std.mem.Allocator, trace: CanonicalSessio
         if (std.mem.eql(u8, occurrence.entry_type, "session_meta")) {
             if (saw_primary_meta) continue;
             saw_primary_meta = true;
-            if (stringField(payload, "cwd")) |value| try replaceOpt(allocator, &context.cwd, value);
-            if (stringField(payload, "cli_version")) |value| try replaceOpt(allocator, &context.cli_version, value);
-            if (stringField(payload, "model")) |value| try replaceOpt(allocator, &context.model, value);
-            if (stringField(payload, "model_provider")) |value| try replaceOpt(allocator, &context.model_provider, value);
-            if (stringField(payload, "git_commit_hash")) |value| try replaceOpt(allocator, &context.git_commit_hash, value);
-            if (objectField(payload, "git")) |git| if (stringField(git, "commit_hash")) |value| try replaceOpt(allocator, &context.git_commit_hash, value);
-            if (payload.get("context_window")) |value| {
-                const encoded = try stringifyJsonValue(allocator, value);
-                defer allocator.free(encoded);
-                try replaceOpt(allocator, &context.context_window_json, encoded);
-            }
+            try applyCutSessionContext(allocator, &context, payload);
         } else if (std.mem.eql(u8, occurrence.entry_type, "turn_context")) {
-            if (stringField(payload, "cwd")) |value| try replaceOpt(allocator, &context.cwd, value);
-            if (stringField(payload, "model")) |value| try replaceOpt(allocator, &context.model, value);
-            if (stringField(payload, "model_provider")) |value| try replaceOpt(allocator, &context.model_provider, value);
-            if (stringField(payload, "reasoning_effort") orelse stringField(payload, "effort")) |value| try replaceOpt(allocator, &context.reasoning_effort, value);
-            if (stringField(payload, "comp_hash")) |value| try replaceOpt(allocator, &context.compaction_identity, value);
+            try applyCutTurnContext(allocator, &context, payload);
         }
     }
     return context;
+}
+
+fn applyCutSessionContext(
+    allocator: std.mem.Allocator,
+    context: *CutBoundContext,
+    payload: std.json.ObjectMap,
+) !void {
+    if (stringField(payload, "cwd")) |v| try replaceOpt(allocator, &context.cwd, v);
+    if (stringField(payload, "cli_version")) |v| try replaceOpt(allocator, &context.cli_version, v);
+    if (stringField(payload, "model")) |v| try replaceOpt(allocator, &context.model, v);
+    if (stringField(payload, "model_provider")) |v| {
+        try replaceOpt(allocator, &context.model_provider, v);
+    }
+    if (stringField(payload, "git_commit_hash")) |v| {
+        try replaceOpt(allocator, &context.git_commit_hash, v);
+    }
+    if (objectField(payload, "git")) |git| {
+        if (stringField(git, "commit_hash")) |v| {
+            try replaceOpt(allocator, &context.git_commit_hash, v);
+        }
+    }
+    if (payload.get("context_window")) |value| {
+        const encoded = try stringifyJsonValue(allocator, value);
+        defer allocator.free(encoded);
+        try replaceOpt(allocator, &context.context_window_json, encoded);
+    }
+}
+
+fn applyCutTurnContext(
+    allocator: std.mem.Allocator,
+    context: *CutBoundContext,
+    payload: std.json.ObjectMap,
+) !void {
+    if (stringField(payload, "cwd")) |v| try replaceOpt(allocator, &context.cwd, v);
+    if (stringField(payload, "model")) |v| try replaceOpt(allocator, &context.model, v);
+    if (stringField(payload, "model_provider")) |v| {
+        try replaceOpt(allocator, &context.model_provider, v);
+    }
+    if (stringField(payload, "reasoning_effort") orelse stringField(payload, "effort")) |v| {
+        try replaceOpt(allocator, &context.reasoning_effort, v);
+    }
+    if (stringField(payload, "comp_hash")) |v| {
+        try replaceOpt(allocator, &context.compaction_identity, v);
+    }
 }
 
 fn oneOfString(value: []const u8, allowed: []const []const u8) bool {
@@ -1300,9 +1665,17 @@ fn fastTimestampSlice(line: []const u8) ?[]const u8 {
     return line[start..i];
 }
 
-fn applySessionContextFields(allocator: std.mem.Allocator, session: *SessionRecord, ctx: std.json.ObjectMap) !void {
-    if (session.model == null) if (stringField(ctx, "model")) |v| try replaceOpt(allocator, &session.model, v);
-    if (session.cwd == null) if (stringField(ctx, "cwd")) |v| try replaceOpt(allocator, &session.cwd, v);
+fn applySessionContextFields(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    ctx: std.json.ObjectMap,
+) !void {
+    if (session.model == null) {
+        if (stringField(ctx, "model")) |v| try replaceOpt(allocator, &session.model, v);
+    }
+    if (session.cwd == null) {
+        if (stringField(ctx, "cwd")) |v| try replaceOpt(allocator, &session.cwd, v);
+    }
 }
 
 fn noteSummaryTurn(
@@ -1313,14 +1686,17 @@ fn noteSummaryTurn(
 ) !void {
     if (turn_id_opt) |turn_id| {
         if (seen_turn_ids.contains(turn_id)) return;
-        try seen_turn_ids.put(try allocator.dupe(u8, turn_id), {});
+        const owned_id = try allocator.dupe(u8, turn_id);
+        errdefer allocator.free(owned_id);
+        try seen_turn_ids.put(owned_id, {});
     }
     session.turn_count += 1;
 }
 
 fn applyTokenCountToSession(session: *SessionRecord, payload: std.json.ObjectMap) void {
     const info = objectField(payload, "info") orelse payload;
-    const total = objectField(info, "total_token_usage") orelse objectField(info, "last_token_usage") orelse return;
+    const total = objectField(info, "total_token_usage") orelse
+        objectField(info, "last_token_usage") orelse return;
     if (intField(total, "input_tokens")) |v| session.input_tokens = v;
     if (intField(total, "cached_input_tokens")) |v| session.cached_input_tokens = v;
     if (intField(total, "output_tokens")) |v| session.output_tokens = v;
@@ -1362,7 +1738,11 @@ fn intField(root: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = root.get(key) orelse return null;
     return switch (value) {
         .integer => |v| v,
-        .float => |v| @intFromFloat(v),
+        .float => |v| blk: {
+            // The upper i64 bound rounds to 2^63 in f64 and must stay exclusive.
+            if (!std.math.isFinite(v) or v < -0x1p63 or v >= 0x1p63) break :blk null;
+            break :blk @intFromFloat(v);
+        },
         else => null,
     };
 }
@@ -1385,13 +1765,13 @@ fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
 }
 
 fn replaceOpt(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
-    if (slot.*) |old| allocator.free(old);
-    slot.* = try allocator.dupe(u8, value);
+    slot.* = try dupReplace(allocator, slot.*, value);
 }
 
 fn dupReplace(allocator: std.mem.Allocator, old: ?[]u8, value: []const u8) ![]u8 {
+    const replacement = try allocator.dupe(u8, value);
     if (old) |v| allocator.free(v);
-    return allocator.dupe(u8, value);
+    return replacement;
 }
 
 fn deriveDateGroup(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
@@ -1405,24 +1785,38 @@ fn deriveDateGroup(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
             std.ascii.isDigit(path[i + 6]) and path[i + 7] == '/' and
             std.ascii.isDigit(path[i + 8]) and std.ascii.isDigit(path[i + 9]))
         {
-            return try std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ path[i .. i + 4], path[i + 5 .. i + 7], path[i + 8 .. i + 10] });
+            return try std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{
+                path[i .. i + 4],
+                path[i + 5 .. i + 7],
+                path[i + 8 .. i + 10],
+            });
         }
     }
     return null;
 }
 
-fn applySessionMeta(allocator: std.mem.Allocator, session: *SessionRecord, meta: std.json.ObjectMap) !void {
+fn applySessionMeta(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    meta: std.json.ObjectMap,
+) !void {
     if (stringField(meta, "id")) |v| try replaceOpt(allocator, &session.session_id, v);
     if (stringField(meta, "session_id")) |v| try replaceOpt(allocator, &session.root_session_id, v);
     if (stringField(meta, "cwd")) |v| try replaceOpt(allocator, &session.cwd, v);
     if (stringField(meta, "originator")) |v| try replaceOpt(allocator, &session.originator, v);
     if (stringField(meta, "cli_version")) |v| try replaceOpt(allocator, &session.cli_version, v);
     if (stringField(meta, "model")) |v| try replaceOpt(allocator, &session.model, v);
-    if (stringField(meta, "model_provider")) |v| try replaceOpt(allocator, &session.model_provider, v);
+    if (stringField(meta, "model_provider")) |v| {
+        try replaceOpt(allocator, &session.model_provider, v);
+    }
     if (stringField(meta, "thread_name")) |v| try replaceOpt(allocator, &session.thread_name, v);
     if (stringField(meta, "git_branch")) |v| try replaceOpt(allocator, &session.git_branch, v);
-    if (stringField(meta, "git_commit_hash")) |v| try replaceOpt(allocator, &session.git_commit_hash, v);
-    if (stringField(meta, "git_repository_url")) |v| try replaceOpt(allocator, &session.git_repository_url, v);
+    if (stringField(meta, "git_commit_hash")) |v| {
+        try replaceOpt(allocator, &session.git_commit_hash, v);
+    }
+    if (stringField(meta, "git_repository_url")) |v| {
+        try replaceOpt(allocator, &session.git_repository_url, v);
+    }
     const parent_thread_id = stringField(meta, "parent_thread_id");
     const forked_from_id = stringField(meta, "forked_from_id");
     if (parent_thread_id != null and forked_from_id != null and
@@ -1444,8 +1838,12 @@ fn applySessionMeta(allocator: std.mem.Allocator, session: *SessionRecord, meta:
     if (nestedObject(meta, "source", "subagent")) |_| session.is_external_worker = true;
     if (objectField(meta, "git")) |git| {
         if (stringField(git, "branch")) |v| try replaceOpt(allocator, &session.git_branch, v);
-        if (stringField(git, "commit_hash")) |v| try replaceOpt(allocator, &session.git_commit_hash, v);
-        if (stringField(git, "repository_url")) |v| try replaceOpt(allocator, &session.git_repository_url, v);
+        if (stringField(git, "commit_hash")) |v| {
+            try replaceOpt(allocator, &session.git_commit_hash, v);
+        }
+        if (stringField(git, "repository_url")) |v| {
+            try replaceOpt(allocator, &session.git_repository_url, v);
+        }
     }
 }
 
@@ -1464,21 +1862,34 @@ fn applyPrimarySessionMeta(
     const later_id = stringField(meta, "id") orelse return;
     const primary_id = trace.session.session_id orelse return;
     if (!std.mem.eql(u8, later_id, primary_id)) {
-        try trace.warnings.append(allocator, try std.fmt.allocPrint(
+        const warning = try std.fmt.allocPrint(
             allocator,
-            "{s}:{d}: conflicting later session_meta {s} preserved as an occurrence; primary session {s} remains authoritative",
+            "{s}:{d}: conflicting later session_meta {s} preserved as an occurrence; " ++
+                "primary session {s} remains authoritative",
             .{ trace.session.path, line_number, later_id, primary_id },
-        ));
+        );
+        errdefer allocator.free(warning);
+        try trace.warnings.append(allocator, warning);
     }
 }
 
-fn applyTurnContext(allocator: std.mem.Allocator, turn: *TurnRecord, ctx: std.json.ObjectMap) !void {
+fn applyTurnContext(
+    allocator: std.mem.Allocator,
+    turn: *TurnRecord,
+    ctx: std.json.ObjectMap,
+) !void {
     if (stringField(ctx, "model")) |v| try replaceOpt(allocator, &turn.model, v);
     if (stringField(ctx, "cwd")) |v| try replaceOpt(allocator, &turn.cwd, v);
-    if (stringField(ctx, "reasoning_effort") orelse stringField(ctx, "effort")) |v| try replaceOpt(allocator, &turn.reasoning_effort, v);
+    if (stringField(ctx, "reasoning_effort") orelse stringField(ctx, "effort")) |v| {
+        try replaceOpt(allocator, &turn.reasoning_effort, v);
+    }
 }
 
-fn applySessionContextFromTurn(allocator: std.mem.Allocator, session: *SessionRecord, turn: TurnRecord) !void {
+fn applySessionContextFromTurn(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    turn: TurnRecord,
+) !void {
     if (session.model == null) if (turn.model) |v| try replaceOpt(allocator, &session.model, v);
     if (session.cwd == null) if (turn.cwd) |v| try replaceOpt(allocator, &session.cwd, v);
 }
@@ -1498,14 +1909,15 @@ fn startTurn(
         break :blk owned_id.?;
     };
     var turn = TurnRecord{
-        .session_id = try dupOpt(allocator, trace.session.session_id),
         .path = try allocator.dupe(u8, path),
-        .turn_id = try allocator.dupe(u8, turn_id),
+        .turn_id = &.{},
         .turn_index = @intCast(trace.turns.items.len + 1),
-        .started_at = try dupOpt(allocator, timestamp),
         .status = .ongoing,
     };
     errdefer turn.deinit(allocator);
+    turn.turn_id = try allocator.dupe(u8, turn_id);
+    turn.session_id = try dupOpt(allocator, trace.session.session_id);
+    turn.started_at = try dupOpt(allocator, timestamp);
     if (trace.session.thread_name) |name| turn.thread_name = try allocator.dupe(u8, name);
     try trace.turns.append(allocator, turn);
     current_turn_index.* = trace.turns.items.len - 1;
@@ -1544,38 +1956,114 @@ fn ensureTurn(
         }
     }
     if (current_turn_index.*) |idx| return idx;
-    return startSyntheticTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp);
+    return startSyntheticTurn(
+        allocator,
+        trace,
+        path,
+        current_turn_index,
+        synthetic_turns,
+        timestamp,
+    );
 }
 
 fn attachUserMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []const u8) !void {
-    if (turn.user_message == null) {
-        turn.user_message = try allocator.dupe(u8, text);
-        turn.user_preview = try previewAlloc(allocator, text);
-    }
+    if (turn.user_message == null) try replaceUserMessage(allocator, turn, text);
 }
 
 fn replaceUserMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []const u8) !void {
+    const message = try allocator.dupe(u8, text);
+    errdefer allocator.free(message);
+    const preview = try previewAlloc(allocator, text);
     if (turn.user_message) |old| allocator.free(old);
-    turn.user_message = try allocator.dupe(u8, text);
     if (turn.user_preview) |old| allocator.free(old);
-    turn.user_preview = try previewAlloc(allocator, text);
+    turn.user_message = message;
+    turn.user_preview = preview;
 }
 
-fn attachAssistantMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []const u8, line_number: usize) !void {
+fn attachAssistantMessage(
+    allocator: std.mem.Allocator,
+    turn: *TurnRecord,
+    text: []const u8,
+    line_number: usize,
+) !void {
+    const message = try allocator.dupe(u8, text);
+    errdefer allocator.free(message);
+    const preview = try previewAlloc(allocator, text);
     if (turn.final_answer) |old| allocator.free(old);
-    turn.final_answer = try allocator.dupe(u8, text);
+    turn.final_answer = message;
     turn.final_answer_line = line_number;
     if (turn.assistant_preview) |old| allocator.free(old);
-    turn.assistant_preview = try previewAlloc(allocator, text);
+    turn.assistant_preview = preview;
 }
 
-fn completeTurn(allocator: std.mem.Allocator, turn: *TurnRecord, status: TurnStatus, reason: []const u8, timestamp: ?[]const u8, payload: std.json.ObjectMap) !void {
+fn completeTurn(
+    allocator: std.mem.Allocator,
+    turn: *TurnRecord,
+    status: TurnStatus,
+    reason: []const u8,
+    timestamp: ?[]const u8,
+    payload: std.json.ObjectMap,
+) !void {
     turn.status = status;
     turn.status_reason = try dupReplace(allocator, turn.status_reason, reason);
     if (timestamp) |ts| try replaceOpt(allocator, &turn.completed_at, ts);
     if (intField(payload, "duration_ms")) |v| turn.duration_ms = v;
     if (intField(payload, "duration")) |v| turn.duration_ms = v;
-    if (intField(payload, "duration_secs")) |v| turn.duration_ms = v * 1000;
+    if (intField(payload, "duration_secs")) |v| {
+        if (durationMilliseconds(v)) |milliseconds| turn.duration_ms = milliseconds;
+    }
+}
+
+fn durationMilliseconds(seconds: i64) ?i64 {
+    return std.math.mul(i64, seconds, 1000) catch null;
+}
+
+test "numeric fields ignore unrepresentable integer values" {
+    const allocator = std.testing.allocator;
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(allocator);
+    const cases = [_]struct { value: f64, expected: ?i64 }{
+        .{ .value = 3.9, .expected = 3 },
+        .{ .value = -3.9, .expected = -3 },
+        .{ .value = -0x1p63, .expected = std.math.minInt(i64) },
+        .{ .value = 0x1p63, .expected = null },
+        .{ .value = -0x1p64, .expected = null },
+        .{ .value = std.math.inf(f64), .expected = null },
+        .{ .value = -std.math.inf(f64), .expected = null },
+        .{ .value = std.math.nan(f64), .expected = null },
+    };
+    for (cases) |case| {
+        try object.put(allocator, "value", .{ .float = case.value });
+        try std.testing.expectEqual(case.expected, intField(object, "value"));
+    }
+    try std.testing.expectEqual(@as(?i64, 3000), durationMilliseconds(3));
+    try std.testing.expectEqual(@as(?i64, -3000), durationMilliseconds(-3));
+    try std.testing.expectEqual(@as(?i64, null), durationMilliseconds(std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(?i64, null), durationMilliseconds(std.math.minInt(i64)));
+}
+
+test "message replacements preserve allocation ownership at every failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkMessageReplacementAllocationFailures,
+        .{},
+    );
+}
+
+fn checkMessageReplacementAllocationFailures(allocator: std.mem.Allocator) !void {
+    var turn = TurnRecord{
+        .path = try allocator.dupe(u8, "trace.jsonl"),
+        .turn_id = &.{},
+        .turn_index = 1,
+    };
+    defer turn.deinit(allocator);
+    try replaceUserMessage(allocator, &turn, "user one");
+    try replaceUserMessage(allocator, &turn, "user two");
+    try attachAssistantMessage(allocator, &turn, "assistant one", 1);
+    try attachAssistantMessage(allocator, &turn, "assistant two", 2);
+    try replaceOpt(allocator, &turn.model, "initial");
+    try replaceOpt(allocator, &turn.model, turn.model.?);
+    try std.testing.expectEqualStrings("initial", turn.model.?);
 }
 
 fn applyTokenCount(turn: *TurnRecord, session: *SessionRecord, payload: std.json.ObjectMap) void {
@@ -1760,6 +2248,7 @@ test "cumulative token snapshots become per-turn deltas" {
 fn applyResponseItem(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
+    lookup: *ToolLookup,
     path: []const u8,
     current_turn_index: *?usize,
     synthetic_turns: *i64,
@@ -1770,28 +2259,70 @@ fn applyResponseItem(
     options: TraceParseOptions,
 ) !void {
     const payload_type = stringField(payload, "type") orelse return;
-    if (std.mem.eql(u8, payload_type, "message")) {
-        const role = stringField(payload, "role") orelse "";
-        const idx = if (std.mem.eql(u8, role, "user") and !saw_task_started)
-            try startSyntheticTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp)
-        else
-            try ensureTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp, stringField(payload, "turn_id"));
+    const is_message = std.mem.eql(u8, payload_type, "message");
+    const role = stringField(payload, "role") orelse "";
+    const idx = if (is_message and std.mem.eql(u8, role, "user") and !saw_task_started)
+        try startSyntheticTurn(
+            allocator,
+            trace,
+            path,
+            current_turn_index,
+            synthetic_turns,
+            timestamp,
+        )
+    else
+        try ensureTurn(
+            allocator,
+            trace,
+            path,
+            current_turn_index,
+            synthetic_turns,
+            timestamp,
+            stringField(payload, "turn_id"),
+        );
+    if (is_message) {
         if (options.include_message_bodies) {
-            const text = try messageTextAlloc(allocator, payload);
-            defer allocator.free(text);
-            if (std.mem.eql(u8, role, "user")) {
-                try attachUserMessage(allocator, &trace.turns.items[idx], text);
-            } else if (std.mem.eql(u8, role, "assistant")) {
-                try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
-            }
+            try applyResponseMessage(
+                allocator,
+                &trace.turns.items[idx],
+                payload,
+                role,
+                line_number,
+            );
         }
         return;
     }
-    const idx = try ensureTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp, stringField(payload, "turn_id"));
-    if (std.mem.eql(u8, payload_type, "function_call") or std.mem.eql(u8, payload_type, "custom_tool_call")) {
-        try declareTool(allocator, trace, idx, payload, timestamp, line_number, options.max_tools);
-    } else if (std.mem.eql(u8, payload_type, "function_call_output") or std.mem.eql(u8, payload_type, "custom_tool_call_output")) {
-        try finalizeToolOutput(allocator, trace, idx, payload, payload_type, timestamp, line_number, options.max_tools);
+    const limit = options.max_tools;
+    if (oneOfString(payload_type, &.{ "function_call", "custom_tool_call" })) {
+        try declareTool(allocator, trace, lookup, idx, payload, timestamp, line_number, limit);
+    } else if (oneOfString(payload_type, &.{ "function_call_output", "custom_tool_call_output" })) {
+        try finalizeToolOutput(
+            allocator,
+            trace,
+            lookup,
+            idx,
+            payload,
+            payload_type,
+            timestamp,
+            line_number,
+            options.max_tools,
+        );
+    }
+}
+
+fn applyResponseMessage(
+    allocator: std.mem.Allocator,
+    turn: *TurnRecord,
+    payload: std.json.ObjectMap,
+    role: []const u8,
+    line_number: usize,
+) !void {
+    const text = try messageTextAlloc(allocator, payload);
+    defer allocator.free(text);
+    if (std.mem.eql(u8, role, "user")) {
+        try attachUserMessage(allocator, turn, text);
+    } else if (std.mem.eql(u8, role, "assistant")) {
+        try attachAssistantMessage(allocator, turn, text, line_number);
     }
 }
 
@@ -1939,9 +2470,7 @@ fn messageTextPartsAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
         parts.deinit(allocator);
     }
     if (stringField(obj, "content")) |text| {
-        const owned = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned);
-        try parts.append(allocator, .{ .text = owned });
+        try appendMessageTextPart(allocator, &parts, text);
         return parts.toOwnedSlice(allocator);
     }
     const content = obj.get("content") orelse return parts.toOwnedSlice(allocator);
@@ -1949,14 +2478,43 @@ fn messageTextPartsAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
     for (arr.items) |part| {
         const part_obj = valueObject(part) orelse continue;
         const part_type = stringField(part_obj, "type") orelse "";
-        if (!std.mem.eql(u8, part_type, "input_text") and !std.mem.eql(u8, part_type, "output_text") and !std.mem.eql(u8, part_type, "text")) continue;
+        if (!oneOfString(part_type, &.{ "input_text", "output_text", "text" })) continue;
         if (stringField(part_obj, "text")) |text| {
-            const owned = try allocator.dupe(u8, text);
-            errdefer allocator.free(owned);
-            try parts.append(allocator, .{ .text = owned });
+            try appendMessageTextPart(allocator, &parts, text);
         }
     }
     return parts.toOwnedSlice(allocator);
+}
+
+fn appendMessageTextPart(
+    allocator: std.mem.Allocator,
+    parts: *std.ArrayList(MessageTextPart),
+    text: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned);
+    try parts.append(allocator, .{ .text = owned });
+}
+
+test "message text parts retain one owner across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkMessagePartAllocationFailures,
+        .{},
+    );
+}
+
+fn checkMessagePartAllocationFailures(allocator: std.mem.Allocator) !void {
+    const inputs = [_][]const u8{
+        "{\"content\":\"plain\"}",
+        "{\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}," ++
+            "{\"type\":\"output_text\",\"text\":\"b\"}]}",
+    };
+    for (inputs) |input| {
+        const parts = try messageTextPartsFromPayloadAlloc(allocator, input);
+        defer freeMessageTextParts(allocator, parts);
+        try std.testing.expect(parts.len > 0);
+    }
 }
 
 pub fn completeTraceDigest(
@@ -1996,54 +2554,39 @@ pub fn retainedTraceDigest(
             {
                 continue;
             }
-            try writer.writeAll("tool|");
-            if (tool.call_id) |value| try writer.writeAll(value);
-            try writer.writeByte('|');
-            if (tool.tool_name) |value| try writer.writeAll(value);
-            try writer.writeByte('|');
-            try writer.writeAll(@tagName(tool.lifecycle_status));
-            try writer.writeByte('|');
-            if (tool.arguments_json) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.input_text) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.output_text) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.command_text) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.cwd) |value| try writeTraceContentDigest(writer, value);
-            try writer.writeByte('|');
-            if (tool.patch_changes_json) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.web_query) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.web_url) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.image_prompt) |value| {
-                try writeTraceContentDigest(writer, value);
-            }
-            try writer.writeByte('|');
-            if (tool.exit_code) |value| try writer.print("{d}", .{value});
-            try writer.writeByte('\n');
+            try writeToolTraceDigest(writer, tool);
         }
     }
     const canonical = try writer_alloc.toOwnedSlice();
     defer allocator.free(canonical);
     return sha256Prefixed(allocator, canonical);
+}
+
+fn writeToolTraceDigest(writer: anytype, tool: ToolLifecycleRecord) !void {
+    try writer.writeAll("tool|");
+    if (tool.call_id) |value| try writer.writeAll(value);
+    try writer.writeByte('|');
+    if (tool.tool_name) |value| try writer.writeAll(value);
+    try writer.writeByte('|');
+    try writer.writeAll(@tagName(tool.lifecycle_status));
+    const content = [_]?[]const u8{
+        tool.arguments_json,
+        tool.input_text,
+        tool.output_text,
+        tool.command_text,
+        tool.cwd,
+        tool.patch_changes_json,
+        tool.web_query,
+        tool.web_url,
+        tool.image_prompt,
+    };
+    for (content) |item| {
+        try writer.writeByte('|');
+        if (item) |value| try writeTraceContentDigest(writer, value);
+    }
+    try writer.writeByte('|');
+    if (tool.exit_code) |value| try writer.print("{d}", .{value});
+    try writer.writeByte('\n');
 }
 
 fn writeTraceContentDigest(writer: anytype, text: []const u8) !void {
@@ -2100,9 +2643,11 @@ test "retained trace digest changes with observed tool payload" {
 
 test "message text-part projection preserves ordered source boundaries" {
     const split =
-        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"},{\"type\":\"input_text\",\"text\":\"b\"}]}";
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\",\"text\":\"a\"},{\"type\":\"input_text\",\"text\":\"b\"}]}";
     const joined =
-        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ab\"}]}";
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\",\"text\":\"ab\"}]}";
     const split_parts = try messageTextPartsFromPayloadAlloc(std.testing.allocator, split);
     defer freeMessageTextParts(std.testing.allocator, split_parts);
     const joined_parts = try messageTextPartsFromPayloadAlloc(std.testing.allocator, joined);
@@ -2119,6 +2664,53 @@ fn previewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const end = @min(trimmed.len, 120);
     return allocator.dupe(u8, trimmed[0..end]);
 }
+
+/// Uncapped parsing appends tools only, so owned call-ID bytes remain stable.
+/// Capped parsing keeps its existing bounded reverse scan across ordered removals.
+const ToolLookup = struct {
+    // Small scans avoid populating allocator size classes for a short-lived index.
+    const scan_tools_max: usize = 64;
+    enabled: bool,
+    promoted: bool = false,
+    by_call_id: std.StringHashMapUnmanaged(usize) = .empty,
+
+    fn deinit(self: *ToolLookup, allocator: std.mem.Allocator) void {
+        self.by_call_id.deinit(allocator);
+    }
+
+    fn find(self: *const ToolLookup, trace: *CanonicalSessionTrace, call_id: []const u8) ?usize {
+        if (!self.promoted) return findToolByCallId(trace, call_id);
+        const index = self.by_call_id.get(call_id) orelse return null;
+        std.debug.assert(index < trace.tools.items.len);
+        std.debug.assert(std.mem.eql(u8, trace.tools.items[index].call_id.?, call_id));
+        return index;
+    }
+
+    fn remember(
+        self: *ToolLookup,
+        allocator: std.mem.Allocator,
+        trace: *const CanonicalSessionTrace,
+    ) !void {
+        if (!self.enabled) return;
+        std.debug.assert(trace.tools.items.len > 0);
+        if (!self.promoted) {
+            if (trace.tools.items.len <= scan_tools_max) return;
+            const capacity = std.math.cast(u32, trace.tools.items.len) orelse
+                return error.OutOfMemory;
+            try self.by_call_id.ensureTotalCapacity(allocator, capacity);
+            for (trace.tools.items, 0..) |tool, index| {
+                const call_id = tool.call_id orelse continue;
+                self.by_call_id.putAssumeCapacity(call_id, index);
+            }
+            self.promoted = true;
+            return;
+        }
+        const index = trace.tools.items.len - 1;
+        const call_id = trace.tools.items[index].call_id orelse return;
+        try self.by_call_id.put(allocator, call_id, index);
+        std.debug.assert(self.by_call_id.count() <= trace.tools.items.len);
+    }
+};
 
 fn findToolByCallId(trace: *CanonicalSessionTrace, call_id: []const u8) ?usize {
     var idx = trace.tools.items.len;
@@ -2170,6 +2762,7 @@ fn retainNewestTools(
 fn declareTool(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
+    lookup: *ToolLookup,
     turn_idx: usize,
     payload: std.json.ObjectMap,
     timestamp: ?[]const u8,
@@ -2177,36 +2770,50 @@ fn declareTool(
     max_tools: ?usize,
 ) !void {
     const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse return;
-    if (findToolByCallId(trace, call_id)) |_| return;
+    if (lookup.find(trace, call_id)) |_| return;
     if (trace.omitted_tool_call_ids.contains(call_id)) return;
-    const name = stringField(payload, "name") orelse stringField(payload, "tool_name") orelse "unknown";
-    var record = ToolLifecycleRecord{
-        .session_id = try dupOpt(allocator, trace.session.session_id),
-        .path = try allocator.dupe(u8, trace.session.path),
-        .turn_id = try allocator.dupe(u8, trace.turns.items[turn_idx].turn_id),
-        .turn_index = trace.turns.items[turn_idx].turn_index,
-        .started_at = try dupOpt(allocator, timestamp),
-        .call_id = try allocator.dupe(u8, call_id),
-        .kind = kindFromName(name),
-        .tool_name = try allocator.dupe(u8, name),
-        .namespace = try namespaceFromName(allocator, name),
-        .arguments_json = if (stringField(payload, "arguments")) |v| try allocator.dupe(u8, v) else null,
-        .input_text = if (stringField(payload, "input")) |v| try allocator.dupe(u8, v) else null,
-        .lifecycle_status = .declared,
-        .declared_line = @intCast(line_number),
-    };
+    const name = stringField(payload, "name") orelse
+        stringField(payload, "tool_name") orelse "unknown";
+    var record = try initToolRecord(allocator, trace, turn_idx, call_id);
     var record_owned = true;
     errdefer if (record_owned) record.deinit(allocator);
+    record.started_at = try dupOpt(allocator, timestamp);
+    record.kind = kindFromName(name);
+    record.tool_name = try allocator.dupe(u8, name);
+    record.namespace = try namespaceFromName(allocator, name);
+    record.arguments_json = try dupOpt(allocator, stringField(payload, "arguments"));
+    record.input_text = try dupOpt(allocator, stringField(payload, "input"));
+    record.lifecycle_status = .declared;
+    record.declared_line = @intCast(line_number);
     if (record.arguments_json) |args| try parseExecArgsIntoRecord(allocator, &record, args);
-    trace.turns.items[turn_idx].tool_count += 1;
     try trace.tools.append(allocator, record);
     record_owned = false;
+    try lookup.remember(allocator, trace);
+    trace.turns.items[turn_idx].tool_count += 1;
     try retainNewestTools(allocator, trace, max_tools);
+}
+
+fn initToolRecord(
+    allocator: std.mem.Allocator,
+    trace: *const CanonicalSessionTrace,
+    turn_idx: usize,
+    call_id: []const u8,
+) !ToolLifecycleRecord {
+    var record = ToolLifecycleRecord{
+        .path = try allocator.dupe(u8, trace.session.path),
+        .turn_index = trace.turns.items[turn_idx].turn_index,
+    };
+    errdefer record.deinit(allocator);
+    record.session_id = try dupOpt(allocator, trace.session.session_id);
+    record.turn_id = try allocator.dupe(u8, trace.turns.items[turn_idx].turn_id);
+    record.call_id = try allocator.dupe(u8, call_id);
+    return record;
 }
 
 fn finalizeToolEvent(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
+    lookup: *ToolLookup,
     turn_idx: usize,
     payload: std.json.ObjectMap,
     event_type: []const u8,
@@ -2214,7 +2821,17 @@ fn finalizeToolEvent(
     line_number: usize,
     max_tools: ?usize,
 ) !void {
-    try finalizeToolOutput(allocator, trace, turn_idx, payload, event_type, timestamp, line_number, max_tools);
+    try finalizeToolOutput(
+        allocator,
+        trace,
+        lookup,
+        turn_idx,
+        payload,
+        event_type,
+        timestamp,
+        line_number,
+        max_tools,
+    );
     if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
         try appendGraphEdge(allocator, trace, payload, timestamp);
         trace.turns.items[turn_idx].spawned_worker_count += 1;
@@ -2225,6 +2842,7 @@ fn finalizeToolEvent(
 fn finalizeToolOutput(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
+    lookup: *ToolLookup,
     turn_idx: usize,
     payload: std.json.ObjectMap,
     event_type: []const u8,
@@ -2232,38 +2850,59 @@ fn finalizeToolOutput(
     line_number: usize,
     max_tools: ?usize,
 ) !void {
-    const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse event_type;
-    const idx = findToolByCallId(trace, call_id) orelse blk: {
+    const call_id = stringField(payload, "call_id") orelse
+        stringField(payload, "id") orelse event_type;
+    const idx = lookup.find(trace, call_id) orelse blk: {
         if (trace.omitted_tool_call_ids.contains(call_id)) return;
-        var record = ToolLifecycleRecord{
-            .session_id = try dupOpt(allocator, trace.session.session_id),
-            .path = try allocator.dupe(u8, trace.session.path),
-            .turn_id = try allocator.dupe(u8, trace.turns.items[turn_idx].turn_id),
-            .turn_index = trace.turns.items[turn_idx].turn_index,
-            .completed_at = try dupOpt(allocator, timestamp),
-            .call_id = try allocator.dupe(u8, call_id),
-            .lifecycle_status = .inferred,
-        };
-        var record_owned = true;
-        errdefer if (record_owned) record.deinit(allocator);
-        try trace.tools.append(allocator, record);
-        record_owned = false;
-        trace.turns.items[turn_idx].tool_count += 1;
-        try retainNewestTools(allocator, trace, max_tools);
+        try inferToolRecord(allocator, trace, lookup, turn_idx, call_id, timestamp, max_tools);
         if (trace.omitted_tool_call_ids.contains(call_id)) return;
-        const retained_index = findToolByCallId(trace, call_id) orelse return;
+        const retained_index = lookup.find(trace, call_id) orelse return;
         break :blk retained_index;
     };
     var rec = &trace.tools.items[idx];
     rec.kind = kindFromEndEvent(event_type, rec.tool_name);
     rec.finalized_line = @intCast(line_number);
     if (timestamp) |ts| try replaceOpt(allocator, &rec.completed_at, ts);
-    try replaceOpt(allocator, &rec.output_text, stringField(payload, "output") orelse stringField(payload, "aggregated_output") orelse stringField(payload, "stdout") orelse "");
+    try applyToolOutput(allocator, rec, payload);
+    rec.lifecycle_status = completedToolStatus(rec.exit_code, boolField(payload, "success"));
+}
+
+fn inferToolRecord(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    lookup: *ToolLookup,
+    turn_idx: usize,
+    call_id: []const u8,
+    timestamp: ?[]const u8,
+    max_tools: ?usize,
+) !void {
+    var record = try initToolRecord(allocator, trace, turn_idx, call_id);
+    var record_owned = true;
+    errdefer if (record_owned) record.deinit(allocator);
+    record.completed_at = try dupOpt(allocator, timestamp);
+    record.lifecycle_status = .inferred;
+    try trace.tools.append(allocator, record);
+    record_owned = false;
+    try lookup.remember(allocator, trace);
+    trace.turns.items[turn_idx].tool_count += 1;
+    try retainNewestTools(allocator, trace, max_tools);
+}
+
+fn applyToolOutput(
+    allocator: std.mem.Allocator,
+    rec: *ToolLifecycleRecord,
+    payload: std.json.ObjectMap,
+) !void {
+    const output = stringField(payload, "output") orelse
+        stringField(payload, "aggregated_output") orelse stringField(payload, "stdout") orelse "";
+    try replaceOpt(allocator, &rec.output_text, output);
     if (stringField(payload, "command")) |v| try replaceOpt(allocator, &rec.command_text, v);
     if (stringField(payload, "cwd")) |v| try replaceOpt(allocator, &rec.cwd, v);
     if (intField(payload, "exit_code")) |v| rec.exit_code = v;
     if (intField(payload, "duration_ms")) |v| rec.duration_ms = v;
-    if (intField(payload, "duration_secs")) |v| rec.duration_ms = v * 1000;
+    if (intField(payload, "duration_secs")) |v| {
+        if (durationMilliseconds(v)) |ms| rec.duration_ms = ms;
+    }
     if (objectField(payload, "invocation")) |inv| {
         if (stringField(inv, "server")) |v| try replaceOpt(allocator, &rec.mcp_server, v);
         if (stringField(inv, "tool")) |v| try replaceOpt(allocator, &rec.mcp_tool, v);
@@ -2275,13 +2914,27 @@ fn finalizeToolOutput(
         try replaceOpt(allocator, &rec.patch_changes_json, json);
     }
     if (stringField(payload, "query")) |v| try replaceOpt(allocator, &rec.web_query, v);
-    if (objectField(payload, "action")) |action| if (stringField(action, "url")) |v| try replaceOpt(allocator, &rec.web_url, v);
+    if (objectField(payload, "action")) |action| {
+        if (stringField(action, "url")) |v| try replaceOpt(allocator, &rec.web_url, v);
+    }
     if (stringField(payload, "prompt")) |v| try replaceOpt(allocator, &rec.image_prompt, v);
-    rec.lifecycle_status = if (rec.exit_code) |code| if (code == 0) .completed else .failed else if (boolField(payload, "success")) |ok| if (ok) .completed else .failed else .completed;
 }
 
-fn parseExecArgsIntoRecord(allocator: std.mem.Allocator, record: *ToolLifecycleRecord, args: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch return;
+fn completedToolStatus(exit_code: ?i64, success: ?bool) ToolLifecycleStatus {
+    if (exit_code) |code| return if (code == 0) .completed else .failed;
+    if (success) |ok| return if (ok) .completed else .failed;
+    return .completed;
+}
+
+fn parseExecArgsIntoRecord(
+    allocator: std.mem.Allocator,
+    record: *ToolLifecycleRecord,
+    args: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return;
+    };
     defer parsed.deinit();
     const obj = valueObject(parsed.value) orelse return;
     if (stringField(obj, "cmd")) |v| try replaceOpt(allocator, &record.command_text, v);
@@ -2289,26 +2942,36 @@ fn parseExecArgsIntoRecord(allocator: std.mem.Allocator, record: *ToolLifecycleR
     if (stringField(obj, "cwd")) |v| try replaceOpt(allocator, &record.cwd, v);
 }
 
-fn appendGraphEdge(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, payload: std.json.ObjectMap, timestamp: ?[]const u8) !void {
+fn appendGraphEdge(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    payload: std.json.ObjectMap,
+    timestamp: ?[]const u8,
+) !void {
     var edge = SessionGraphEdge{
-        .parent_session_id = try dupOpt(allocator, trace.session.session_id),
-        .worker_session_id = if (stringField(payload, "new_thread_id")) |v| try allocator.dupe(u8, v) else if (stringField(payload, "worker_session_id")) |v| try allocator.dupe(u8, v) else null,
         .parent_path = try allocator.dupe(u8, trace.session.path),
-        .call_id = if (stringField(payload, "call_id")) |v| try allocator.dupe(u8, v) else null,
-        .agent_nickname = if (stringField(payload, "agent_nickname")) |v| try allocator.dupe(u8, v) else null,
-        .agent_role = if (stringField(payload, "agent_role")) |v| try allocator.dupe(u8, v) else null,
-        .model = if (stringField(payload, "model")) |v| try allocator.dupe(u8, v) else null,
-        .reasoning_effort = if (stringField(payload, "reasoning_effort") orelse stringField(payload, "effort")) |v| try allocator.dupe(u8, v) else null,
-        .spawned_at = try dupOpt(allocator, timestamp),
-        .prompt_preview = if (stringField(payload, "prompt")) |v| try previewAlloc(allocator, v) else null,
-        .worker_status = if (stringField(payload, "status")) |v| try allocator.dupe(u8, v) else null,
     };
     errdefer edge.deinit(allocator);
+    edge.parent_session_id = try dupOpt(allocator, trace.session.session_id);
+    const worker_id = stringField(payload, "new_thread_id") orelse
+        stringField(payload, "worker_session_id");
+    edge.worker_session_id = try dupOpt(allocator, worker_id);
+    edge.call_id = try dupOpt(allocator, stringField(payload, "call_id"));
+    edge.agent_nickname = try dupOpt(allocator, stringField(payload, "agent_nickname"));
+    edge.agent_role = try dupOpt(allocator, stringField(payload, "agent_role"));
+    edge.model = try dupOpt(allocator, stringField(payload, "model"));
+    const effort = stringField(payload, "reasoning_effort") orelse stringField(payload, "effort");
+    edge.reasoning_effort = try dupOpt(allocator, effort);
+    edge.spawned_at = try dupOpt(allocator, timestamp);
+    if (stringField(payload, "prompt")) |v| edge.prompt_preview = try previewAlloc(allocator, v);
+    edge.worker_status = try dupOpt(allocator, stringField(payload, "status"));
     try trace.graph_edges.append(allocator, edge);
 }
 
 fn kindFromName(name: []const u8) ToolKind {
-    if (std.mem.eql(u8, name, "exec_command") or std.mem.eql(u8, name, "shell")) return .exec_command;
+    if (std.mem.eql(u8, name, "exec_command") or std.mem.eql(u8, name, "shell")) {
+        return .exec_command;
+    }
     if (std.mem.eql(u8, name, "apply_patch")) return .patch_apply;
     if (std.mem.indexOf(u8, name, "web") != null) return .web_search;
     if (std.mem.indexOf(u8, name, "image") != null) return .image_generation;
@@ -2356,10 +3019,7 @@ fn bestTimestamp(root: std.json.ObjectMap) ?[]const u8 {
 }
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    return out.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
@@ -2368,7 +3028,8 @@ fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
 
 test "parseRawTraceEvent detects newer event_msg" {
     const line =
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-04-01T00:00:00Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-04-01T00:00:00Z\"," ++
+        "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}";
     var event = (try parseRawTraceEvent(std.testing.allocator, "rollout.jsonl", 1, line)).?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(TraceFormat.new_044_plus, event.format);
@@ -2461,7 +3122,12 @@ test "canonical messages preserve identical text across turns" {
 
 test "parseRawTraceEvent skips state and malformed lines" {
     try std.testing.expect((try parseRawTraceEvent(std.testing.allocator, "x", 1, "")) == null);
-    try std.testing.expect((try parseRawTraceEvent(std.testing.allocator, "x", 2, "{\"record_type\":\"state\"}")) == null);
+    try std.testing.expect((try parseRawTraceEvent(
+        std.testing.allocator,
+        "x",
+        2,
+        "{\"record_type\":\"state\"}",
+    )) == null);
     try std.testing.expect((try parseRawTraceEvent(std.testing.allocator, "x", 3, "{bad")) == null);
 }
 
@@ -2475,7 +3141,10 @@ test "parseRawTraceEvent detects old root function call output" {
 }
 
 fn testPath(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, relative });
 }
@@ -2517,9 +3186,11 @@ test "parseSessionTrace reconstructs new complete turn" {
 
 test "lossless token events retain lineage, both usage tuples, and event settings" {
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"worker\",\"session_id\":\"root\",\"parent_thread_id\":\"parent\",\"model\":\"gpt-before\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model\":\"gpt-after\",\"service_tier\":\"priority\"}}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"cached_input_tokens\":8,\"output_tokens\":3,\"reasoning_output_tokens\":1,\"total_tokens\":23},\"last_token_usage\":{\"input_tokens\":7,\"cached_input_tokens\":4,\"output_tokens\":2,\"reasoning_output_tokens\":1,\"total_tokens\":9}}}}\n";
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"worker","session_id":"root","parent_thread_id":"parent","model":"gpt-before"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:01Z","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-after","service_tier":"priority"}}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":23},"last_token_usage":{"input_tokens":7,"cached_input_tokens":4,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":9}}}}
+        \\
+    ;
     var trace = try parseSessionTraceBytes(
         std.testing.allocator,
         "/provenance/worker.jsonl",
@@ -2552,10 +3223,12 @@ test "lossless token events retain lineage, both usage tuples, and event setting
 
 test "bytes-backed trace parsing preserves the exact assistant occurrence line" {
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"session-bytes\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"selected\"}}\n";
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"session-bytes"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:01Z","payload":{"type":"task_started","turn_id":"turn-one"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:03Z","payload":{"type":"agent_message","message":"selected"}}
+        \\
+    ;
     var trace = try parseSessionTraceBytes(
         std.testing.allocator,
         "/provenance/only.jsonl",
@@ -2591,12 +3264,14 @@ test "bytes-backed trace parsing preserves the exact assistant occurrence line" 
 
 test "bounded tool retention still observes the retained call completion" {
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"bounded-tools\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"omitted\"}]}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-one\",\"arguments\":\"{}\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:04Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-two\",\"arguments\":\"{}\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:05Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-one\",\"output\":\"done\"}}\n";
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"bounded-tools"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:01Z","payload":{"type":"task_started","turn_id":"turn-one"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"omitted"}]}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:03Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-one","arguments":"{}"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:04Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-two","arguments":"{}"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:05Z","payload":{"type":"function_call_output","call_id":"call-one","output":"done"}}
+        \\
+    ;
     var trace = try parseSessionTraceBytes(
         std.testing.allocator,
         "/provenance/bounded.jsonl",
@@ -2615,19 +3290,24 @@ test "bounded tool retention still observes the retained call completion" {
     try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
     try std.testing.expectEqualStrings("call-one", trace.tools.items[0].call_id.?);
     try std.testing.expectEqualStrings("done", trace.tools.items[0].output_text.?);
-    try std.testing.expectEqual(ToolLifecycleStatus.completed, trace.tools.items[0].lifecycle_status);
+    try std.testing.expectEqual(
+        ToolLifecycleStatus.completed,
+        trace.tools.items[0].lifecycle_status,
+    );
 }
 
 test "bounded tool retention preserves newest-turn query semantics" {
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"bounded-newest-tools\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-one\",\"arguments\":\"{}\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-one\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:04Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-two\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:05Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-two\",\"arguments\":\"{}\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:06Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-two\",\"output\":\"newest\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:07Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-one\",\"output\":\"late-old-output\"}}\n";
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"bounded-newest-tools"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:01Z","payload":{"type":"task_started","turn_id":"turn-one"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-one","arguments":"{}"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:03Z","payload":{"type":"task_complete","turn_id":"turn-one"}}
+        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:04Z","payload":{"type":"task_started","turn_id":"turn-two"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:05Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-two","arguments":"{}"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:06Z","payload":{"type":"function_call_output","call_id":"call-two","output":"newest"}}
+        \\{"type":"response_item","timestamp":"2026-07-13T00:00:07Z","payload":{"type":"function_call_output","call_id":"call-one","output":"late-old-output"}}
+        \\
+    ;
     var trace = try parseSessionTraceBytes(
         std.testing.allocator,
         "/provenance/bounded-newest.jsonl",
@@ -2675,7 +3355,9 @@ test "parseSessionSummaryTrace preserves session inventory fields" {
     defer std.testing.allocator.free(path);
     var full = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
     defer full.deinit(std.testing.allocator);
-    var summary = try parseSessionSummaryTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var summary = try parseSessionSummaryTrace(std.testing.allocator, path, .{
+        .ongoing_threshold_secs = 0,
+    });
     defer summary.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(full.session.session_id.?, summary.session.session_id.?);
@@ -2685,17 +3367,26 @@ test "parseSessionSummaryTrace preserves session inventory fields" {
     try std.testing.expectEqual(full.session.turn_count, summary.session.turn_count);
     try std.testing.expectEqual(full.session.total_tokens.?, summary.session.total_tokens.?);
     try std.testing.expectEqual(full.session.is_ongoing, summary.session.is_ongoing);
-    try std.testing.expectEqualStrings(full.session.status_reason.?, summary.session.status_reason.?);
+    try std.testing.expectEqualStrings(
+        full.session.status_reason.?,
+        summary.session.status_reason.?,
+    );
 }
 
 test "first file-owner session metadata remains authoritative" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"worker\",\"cwd\":\"/worker\",\"cli_version\":\"2\",\"model\":\"worker-model\",\"git\":{\"branch\":\"feature\",\"commit_hash\":\"worker-commit\"}}}\n" ++
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"id\":\"parent\",\"cwd\":\"/parent\",\"cli_version\":\"1\",\"model\":\"parent-model\",\"git\":{\"branch\":\"main\",\"commit_hash\":\"parent-commit\"}}}\n";
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"worker","cwd":"/worker","cli_version":"2","model":"worker-model","git":{"branch":"feature","commit_hash":"worker-commit"}}}
+        \\{"type":"session_meta","timestamp":"2026-07-13T00:00:01Z","payload":{"id":"parent","cwd":"/parent","cli_version":"1","model":"parent-model","git":{"branch":"main","commit_hash":"parent-commit"}}}
+        \\
+    ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rollout-worker.jsonl", .data = source });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "rollout-worker.jsonl", std.testing.allocator);
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout-worker.jsonl",
+        std.testing.allocator,
+    );
     defer std.testing.allocator.free(path);
 
     var full = try parseSessionTrace(std.testing.allocator, path, .{});
@@ -2722,7 +3413,9 @@ test "parseSessionTrace reconstructs old synthetic turns" {
         "libs/trace_core/testdata/old_2025_08_root_meta.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var trace = try parseSessionTrace(std.testing.allocator, path, .{
+        .ongoing_threshold_secs = 0,
+    });
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("old-session", trace.session.session_id.?);
     try std.testing.expectEqual(@as(usize, 2), trace.turns.items.len);
@@ -2736,7 +3429,9 @@ test "parseSessionTrace reports lifecycle and graph edges" {
         "libs/trace_core/testdata/tools.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var trace = try parseSessionTrace(std.testing.allocator, path, .{
+        .ongoing_threshold_secs = 0,
+    });
     defer trace.deinit(std.testing.allocator);
     try std.testing.expect(trace.tools.items.len >= 7);
     try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
@@ -2746,4 +3441,192 @@ test "parseSessionTrace reports lifecycle and graph edges" {
         if (tool.lifecycle_status == .unresolved) saw_unresolved = true;
     }
     try std.testing.expect(saw_unresolved);
+}
+
+const allocation_trace =
+    \\{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"session","cwd":"/tmp","git":{"commit_hash":"abc"}}}
+    \\{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}
+    \\{"type":"event_msg","payload":{"type":"user_message","message":"first message"}}
+    \\{"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"cwd\":\"/tmp\"}"}}
+    \\{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call","output":"hi","exit_code":0,"duration_ms":1}}
+    \\{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}
+    \\{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"worker","new_thread_id":"child","prompt":"work","status":"running"}}
+    \\{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_complete"}}
+    \\{bad
+;
+
+test "full trace propagates allocation failure and cleans every partial result" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkFullTraceAllocation,
+        .{},
+    );
+}
+
+fn checkFullTraceAllocation(allocator: std.mem.Allocator) !void {
+    var trace = try parseSessionTraceBytes(allocator, "trace.jsonl", allocation_trace, 0, .{
+        .include_raw = true,
+        .include_token_events = true,
+    });
+    defer trace.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), trace.turns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), trace.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+    try std.testing.expectEqualStrings("first message", trace.turns.items[0].user_message.?);
+    try std.testing.expectEqualStrings("hi", trace.tools.items[0].output_text.?);
+}
+
+test "summary trace propagates allocation failure and cleans every partial result" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSummaryAllocation, .{});
+}
+
+fn checkSummaryAllocation(allocator: std.mem.Allocator) !void {
+    var reader = std.Io.Reader.fixed(allocation_trace);
+    var trace = try parseSessionSummaryTraceReader(allocator, "trace.jsonl", &reader, 0, .{});
+    defer trace.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
+    try std.testing.expectEqual(@as(i64, 1), trace.session.spawned_worker_count);
+}
+
+test "raw event propagates allocation failure and cleans every acquired field" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRawEventAllocation, .{});
+}
+
+fn checkRawEventAllocation(allocator: std.mem.Allocator) !void {
+    const line =
+        \\{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}
+    ;
+    var event = (try parseRawTraceEvent(allocator, "trace.jsonl", 1, line)).?;
+    defer event.deinit(allocator);
+    try std.testing.expectEqualStrings("user_message", event.event_type.?);
+}
+
+test "parse scratch retains at most one MiB after small large small records" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var scratch = ParseScratch.init(counted.allocator());
+    defer scratch.deinit();
+    const first = (try scratch.parse("{\"value\":\"first\"}")).?;
+    const owned = try std.testing.allocator.dupe(u8, stringField(first, "value").?);
+    defer std.testing.allocator.free(owned);
+    scratch.reset();
+    try std.testing.expect(
+        counted.allocated_bytes - counted.freed_bytes <= scratch_retention_limit,
+    );
+
+    var line = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer line.deinit();
+    try line.writer.writeAll("{\"value\":\"");
+    for (0..scratch_retention_limit + 1) |_| try line.writer.writeAll("\\u0061");
+    try line.writer.writeAll("\"}");
+    const large = (try scratch.parse(line.written())).?;
+    try std.testing.expectEqual(scratch_retention_limit + 1, stringField(large, "value").?.len);
+    try std.testing.expect(scratch.arena.queryCapacity() > scratch_retention_limit);
+    scratch.reset();
+    try std.testing.expect(
+        counted.allocated_bytes - counted.freed_bytes <= scratch_retention_limit,
+    );
+    const last = (try scratch.parse("{\"value\":\"last\"}")).?;
+    try std.testing.expectEqualStrings("last", stringField(last, "value").?);
+    try std.testing.expectEqualStrings("first", owned);
+}
+
+test "scratch drops oversized storage if optional shrinking allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var scratch = ParseScratch.init(failing.allocator());
+    defer scratch.deinit();
+    const temporary = try scratch.arena.allocator().alloc(u8, scratch_retention_limit * 2);
+    @memset(temporary, 0);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    scratch.reset();
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), scratch.arena.queryCapacity());
+    failing.fail_index = std.math.maxInt(usize);
+    const parsed = (try scratch.parse("{\"value\":\"after failed shrink\"}")).?;
+    try std.testing.expectEqualStrings("after failed shrink", stringField(parsed, "value").?);
+}
+
+test "tool lookup preserves duplicate declarations and latest completion" {
+    const input =
+        \\{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}
+        \\{"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"exec_command","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"call","output":"first"}}
+        \\{"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"replacement","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"call","output":"last"}}
+    ;
+    for ([_]?usize{ null, 1 }) |limit| {
+        var trace = try parseSessionTraceBytes(std.testing.allocator, "trace.jsonl", input, 0, .{
+            .max_tools = limit,
+        });
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
+        try std.testing.expectEqual(@as(i64, 1), trace.turns.items[0].tool_count);
+        try std.testing.expectEqualStrings("exec_command", trace.tools.items[0].tool_name.?);
+        try std.testing.expectEqualStrings("last", trace.tools.items[0].output_text.?);
+        try std.testing.expectEqual(@as(?i64, 2), trace.tools.items[0].declared_line);
+        try std.testing.expectEqual(@as(?i64, 5), trace.tools.items[0].finalized_line);
+    }
+}
+
+test "tool lookup borrows stable row keys across growth and keeps latest matching row" {
+    const allocator = std.testing.allocator;
+    var trace = CanonicalSessionTrace{
+        .session = try SessionRecord.init(allocator, "trace.jsonl"),
+    };
+    defer trace.deinit(allocator);
+    var lookup = ToolLookup{ .enabled = true };
+    defer lookup.deinit(allocator);
+    var turn: ?usize = null;
+    const turn_index = try startTurn(allocator, &trace, "trace.jsonl", &turn, "turn", null);
+    for (0..96) |index| {
+        var tool = try initToolRecord(allocator, &trace, turn_index, "same-call");
+        var transferred = false;
+        errdefer if (!transferred) tool.deinit(allocator);
+        try trace.tools.append(allocator, tool);
+        transferred = true;
+        try lookup.remember(allocator, &trace);
+        try std.testing.expectEqual(index, lookup.find(&trace, "same-call").?);
+        try std.testing.expectEqual(index >= ToolLookup.scan_tools_max, lookup.promoted);
+    }
+    try std.testing.expectEqual(@as(?usize, null), lookup.find(&trace, "missing"));
+}
+
+test "tool lookup promotes without losing earlier rows or exposing partial state on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseToolLookupPromotion,
+        .{},
+    );
+}
+
+fn exerciseToolLookupPromotion(allocator: std.mem.Allocator) !void {
+    var trace = CanonicalSessionTrace{
+        .session = try SessionRecord.init(allocator, "trace.jsonl"),
+    };
+    defer trace.deinit(allocator);
+    var lookup = ToolLookup{ .enabled = true };
+    defer lookup.deinit(allocator);
+    var current: ?usize = null;
+    const turn = try startTurn(allocator, &trace, "trace.jsonl", &current, "turn", null);
+    for (0..ToolLookup.scan_tools_max + 1) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "call-{d}", .{index});
+        var tool = try initToolRecord(allocator, &trace, turn, name);
+        trace.tools.append(allocator, tool) catch |err| {
+            tool.deinit(allocator);
+            return err;
+        };
+        lookup.remember(allocator, &trace) catch |err| {
+            try std.testing.expect(!lookup.promoted);
+            try std.testing.expectEqual(@as(?usize, 0), lookup.find(&trace, "call-0"));
+            return err;
+        };
+        if (index < ToolLookup.scan_tools_max) {
+            try std.testing.expectEqual(@as(u32, 0), lookup.by_call_id.capacity());
+        }
+    }
+    try std.testing.expect(lookup.promoted);
+    try std.testing.expectEqual(@as(?usize, 0), lookup.find(&trace, "call-0"));
+    try std.testing.expectEqual(@as(?usize, 64), lookup.find(&trace, "call-64"));
+    try std.testing.expectEqual(@as(?usize, null), lookup.find(&trace, "missing"));
 }

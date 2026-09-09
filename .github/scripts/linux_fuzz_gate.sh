@@ -30,23 +30,9 @@ if ! command -v "$timeout_bin" >/dev/null 2>&1; then
   if command -v gtimeout >/dev/null 2>&1; then
     timeout_bin="gtimeout"
   else
-    echo "no timeout binary found; running command without timeout guard" >&2
-    set +e
-    "$@"
-    exit_code=$?
-    set -e
-    if [[ "$exit_code" -ne 0 ]]; then
-      exit "$exit_code"
-    fi
-    exit 0
+    echo "no timeout binary found; cannot enforce fuzz deadline" >&2
+    exit 127
   fi
 fi
 
-set +e
-"$timeout_bin" "$timeout_seconds" "$@"
-exit_code=$?
-set -e
-
-if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
-  exit "$exit_code"
-fi
+exec "$timeout_bin" "$timeout_seconds" "$@"

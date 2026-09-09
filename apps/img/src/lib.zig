@@ -56,7 +56,14 @@ pub fn execute(
 ) !void {
     var empty_environment = std.process.Environ.Map.init(allocator);
     defer empty_environment.deinit();
-    return executeWithEnvironment(allocator, process_io, &empty_environment, options, stdout, stderr);
+    return executeWithEnvironment(
+        allocator,
+        process_io,
+        &empty_environment,
+        options,
+        stdout,
+        stderr,
+    );
 }
 
 pub fn executeWithEnvironment(
@@ -67,7 +74,14 @@ pub fn executeWithEnvironment(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !void {
-    var corpus = try input.collectWithEnvironment(allocator, process_io, parent_environment, options.source, options.include, options.exclude);
+    var corpus = try input.collectWithEnvironment(
+        allocator,
+        process_io,
+        parent_environment,
+        options.source,
+        options.include,
+        options.exclude,
+    );
     defer corpus.deinit(allocator);
     for (corpus.warnings) |warning| {
         try stderr.print("img: warning: {s}: ", .{warning.kind.jsonName()});
@@ -75,7 +89,10 @@ pub fn executeWithEnvironment(
         try stderr.writeByte('\n');
     }
 
-    var fact_report: ?facts.Report = if (options.facts) try facts.extract(allocator, corpus.text) else null;
+    var fact_report: ?facts.Report = if (options.facts) try facts.extract(
+        allocator,
+        corpus.text,
+    ) else null;
     defer if (fact_report) |*report| report.deinit(allocator);
     const fact_text = if (fact_report) |report| try report.textAlloc(allocator) else null;
     defer if (fact_text) |text| allocator.free(text);
@@ -86,6 +103,69 @@ pub fn executeWithEnvironment(
     if (page_count == 0) return error.EmptyInput;
     if (page_count > max_pages) return error.TooManyPages;
 
+    try renderAndPublish(
+        allocator,
+        options,
+        corpus,
+        &renderer,
+        fact_report,
+        fact_text,
+        stdout,
+        stderr,
+    );
+}
+
+const RenderedPages = struct {
+    pages: std.ArrayList(PageSummary) = .empty,
+    png_bytes: usize = 0,
+    dropped_chars: usize = 0,
+};
+
+fn writePages(
+    allocator: std.mem.Allocator,
+    renderer: *render.Renderer,
+    stage_abs: []const u8,
+) !RenderedPages {
+    const page_count = renderer.pageCount();
+    var result = RenderedPages{};
+    errdefer result.pages.deinit(allocator);
+    try result.pages.ensureTotalCapacity(allocator, page_count);
+    for (0..page_count) |index| {
+        var page = (try renderer.next()) orelse return error.PageCountMismatch;
+        defer page.deinit(allocator);
+        var filename_buf: [16]u8 = undefined;
+        const filename = try pageFilename(&filename_buf, index + 1);
+        const path = try std.fs.path.join(allocator, &.{ stage_abs, filename });
+        defer allocator.free(path);
+        try writePrivateFile(path, page.png);
+        result.pages.appendAssumeCapacity(.{
+            .width = page.width,
+            .height = page.height,
+            .png_bytes = page.png.len,
+            .chars_rendered = page.chars_rendered,
+            .dropped_chars = page.dropped_chars,
+        });
+        result.png_bytes += page.png.len;
+        result.dropped_chars += page.dropped_chars;
+    }
+    if (try renderer.next()) |extra| {
+        var page = extra;
+        page.deinit(allocator);
+        return error.PageCountMismatch;
+    }
+    return result;
+}
+
+fn renderAndPublish(
+    allocator: std.mem.Allocator,
+    options: cli.Options,
+    corpus: input.Corpus,
+    renderer: *render.Renderer,
+    fact_report: ?facts.Report,
+    fact_text: ?[]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
     const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), ".", allocator);
     defer allocator.free(cwd_abs);
     const out_abs = try std.fs.path.resolve(allocator, &.{ cwd_abs, options.out });
@@ -94,72 +174,106 @@ pub fn executeWithEnvironment(
     const stage_abs = try reserveStage(allocator, out_abs);
     defer allocator.free(stage_abs);
     var stage_owned = true;
-    defer if (stage_owned) std.Io.Dir.cwd().deleteTree(defaultIo(), stage_abs) catch {};
-
-    var pages: std.ArrayList(PageSummary) = .empty;
-    defer pages.deinit(allocator);
-    try pages.ensureTotalCapacity(allocator, page_count);
-    var total_png_bytes: usize = 0;
-    var dropped_chars: usize = 0;
-    var index: usize = 0;
-    while (try renderer.next()) |page_value| {
-        var page = page_value;
-        defer page.deinit(allocator);
-        if (index >= page_count or index >= max_pages) return error.PageCountMismatch;
-        var filename_buf: [16]u8 = undefined;
-        const filename = try pageFilename(&filename_buf, index + 1);
-        const path = try std.fs.path.join(allocator, &.{ stage_abs, filename });
-        defer allocator.free(path);
-        try writePrivateFile(path, page.png);
-        pages.appendAssumeCapacity(.{
-            .width = page.width,
-            .height = page.height,
-            .png_bytes = page.png.len,
-            .chars_rendered = page.chars_rendered,
-            .dropped_chars = page.dropped_chars,
-        });
-        total_png_bytes += page.png.len;
-        dropped_chars += page.dropped_chars;
-        index += 1;
-    }
-    if (index != page_count) return error.PageCountMismatch;
+    defer if (stage_owned) {
+        std.Io.Dir.cwd().deleteTree(defaultIo(), stage_abs) catch |err| {
+            std.log.warn("img: could not clean staging directory {s}: {s}", .{
+                stage_abs, @errorName(err),
+            });
+        };
+    };
+    var rendered = try writePages(allocator, renderer, stage_abs);
+    defer rendered.pages.deinit(allocator);
     if (fact_text) |text| {
         const path = try std.fs.path.join(allocator, &.{ stage_abs, "factsheet.txt" });
         defer allocator.free(path);
         try writePrivateFile(path, text);
     }
-
     const facts_receipt_path = if (!options.json and options.facts)
         try std.fs.path.join(allocator, &.{ out_abs, "factsheet.txt" })
     else
         null;
     defer if (facts_receipt_path) |path| allocator.free(path);
-
     try publishStage(stage_abs, out_abs, existing);
     stage_owned = false;
+    // The rename commits output. Sink failures are diagnosed without rolling back
+    // or misreporting successful publication as a failed render.
+    deliverReceipt(
+        options.json,
+        stdout,
+        stderr,
+        out_abs,
+        corpus,
+        rendered,
+        fact_report,
+        facts_receipt_path,
+    );
+}
 
-    // The rename above is the commit point. Receipt delivery cannot roll it
-    // back, so every observation below is allocation-free and best-effort.
-    if (options.json) {
-        writeJsonSummary(stdout, out_abs, corpus, pages.items, total_png_bytes, dropped_chars, fact_report) catch {};
-    } else {
-        writeHumanReceipt(stdout, out_abs, page_count, facts_receipt_path) catch {};
-        if (dropped_chars > 0) stderr.print("img: warning: renderer dropped {d} unsupported codepoint{s}\n", .{ dropped_chars, if (dropped_chars == 1) "" else "s" }) catch {};
-        if (fact_report) |report| {
-            if (report.dropped > 0) stderr.print("img: warning: factsheet budget dropped {d} identifier{s}\n", .{ report.dropped, if (report.dropped == 1) "" else "s" }) catch {};
-        }
+fn deliverReceipt(
+    json: bool,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    out_abs: []const u8,
+    corpus: input.Corpus,
+    rendered: RenderedPages,
+    fact_report: ?facts.Report,
+    facts_path: ?[]const u8,
+) void {
+    if (json) {
+        writeJsonSummary(
+            stdout,
+            out_abs,
+            corpus,
+            rendered.pages.items,
+            rendered.png_bytes,
+            rendered.dropped_chars,
+            fact_report,
+        ) catch |err| reportReceiptFailure(err);
+        return;
+    }
+    writeHumanReceipt(stdout, out_abs, rendered.pages.items.len, facts_path) catch |err|
+        reportReceiptFailure(err);
+    writeRenderWarnings(stderr, rendered.dropped_chars, fact_report) catch |err|
+        reportReceiptFailure(err);
+}
+
+fn writeRenderWarnings(writer: *std.Io.Writer, dropped: usize, report: ?facts.Report) !void {
+    if (dropped > 0) try writer.print(
+        "img: warning: renderer dropped {d} unsupported codepoint{s}\n",
+        .{ dropped, if (dropped == 1) "" else "s" },
+    );
+    if (report) |facts_report| {
+        if (facts_report.dropped > 0) try writer.print(
+            "img: warning: factsheet budget dropped {d} identifier{s}\n",
+            .{ facts_report.dropped, if (facts_report.dropped == 1) "" else "s" },
+        );
     }
 }
 
+fn reportReceiptFailure(err: anyerror) void {
+    std.log.warn(
+        "img: output published; receipt or warning delivery failed: {s}",
+        .{@errorName(err)},
+    );
+}
+
 fn inspectOutput(out_abs: []const u8) !ExistingOutput {
-    const stat = std.Io.Dir.cwd().statFile(defaultIo(), out_abs, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const stat = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        out_abs,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
         error.FileNotFound => return .absent,
         error.NotDir => return error.OutputNotDirectory,
         else => return err,
     };
     if (stat.kind == .sym_link) return error.OutputSymlink;
     if (stat.kind != .directory) return error.OutputNotDirectory;
-    var dir = try std.Io.Dir.openDirAbsolute(defaultIo(), out_abs, .{ .iterate = true, .follow_symlinks = false });
+    var dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        out_abs,
+        .{ .iterate = true, .follow_symlinks = false },
+    );
     defer dir.close(defaultIo());
     var it = dir.iterate();
     if (try it.next(defaultIo()) != null) return error.OutputNotEmpty;
@@ -169,8 +283,16 @@ fn inspectOutput(out_abs: []const u8) !ExistingOutput {
 fn reserveStage(allocator: std.mem.Allocator, out_abs: []const u8) ![]u8 {
     var candidate_index: usize = 0;
     while (candidate_index < 1000) : (candidate_index += 1) {
-        const candidate = try std.fmt.allocPrint(allocator, "{s}.img-stage-{d:0>3}", .{ out_abs, candidate_index });
-        std.Io.Dir.createDirAbsolute(defaultIo(), candidate, @enumFromInt(0o700)) catch |err| switch (err) {
+        const candidate = try std.fmt.allocPrint(
+            allocator,
+            "{s}.img-stage-{d:0>3}",
+            .{ out_abs, candidate_index },
+        );
+        std.Io.Dir.createDirAbsolute(
+            defaultIo(),
+            candidate,
+            @enumFromInt(0o700),
+        ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(candidate);
                 continue;
@@ -193,7 +315,11 @@ fn publishStage(stage_abs: []const u8, out_abs: []const u8, existing: ExistingOu
     switch (existing) {
         .absent => {
             const still_absent = blk: {
-                _ = std.Io.Dir.cwd().statFile(defaultIo(), out_abs, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                _ = std.Io.Dir.cwd().statFile(
+                    defaultIo(),
+                    out_abs,
+                    .{ .follow_symlinks = false },
+                ) catch |err| switch (err) {
                     error.FileNotFound => break :blk true,
                     else => return err,
                 };
@@ -204,14 +330,24 @@ fn publishStage(stage_abs: []const u8, out_abs: []const u8, existing: ExistingOu
         .empty => {
             const now = inspectOutput(out_abs) catch return error.OutputChanged;
             if (now != .empty) return error.OutputChanged;
-            std.Io.Dir.cwd().rename(stage_abs, std.Io.Dir.cwd(), out_abs, defaultIo()) catch |err| switch (err) {
+            std.Io.Dir.cwd().rename(
+                stage_abs,
+                std.Io.Dir.cwd(),
+                out_abs,
+                defaultIo(),
+            ) catch |err| switch (err) {
                 error.DirNotEmpty => return error.OutputChanged,
                 else => return err,
             };
             return;
         },
     }
-    std.Io.Dir.cwd().rename(stage_abs, std.Io.Dir.cwd(), out_abs, defaultIo()) catch |err| switch (err) {
+    std.Io.Dir.cwd().rename(
+        stage_abs,
+        std.Io.Dir.cwd(),
+        out_abs,
+        defaultIo(),
+    ) catch |err| switch (err) {
         error.DirNotEmpty => return error.OutputChanged,
         else => return err,
     };
@@ -238,7 +374,10 @@ fn writeHumanReceipt(
     page_count: usize,
     facts_path: ?[]const u8,
 ) !void {
-    try writer.print("wrote {d} PNG page{s} to ", .{ page_count, if (page_count == 1) "" else "s" });
+    try writer.print(
+        "wrote {d} PNG page{s} to ",
+        .{ page_count, if (page_count == 1) "" else "s" },
+    );
     try std.json.Stringify.value(out_abs, .{}, writer);
     try writer.writeByte('\n');
     if (facts_path) |path| {
@@ -273,13 +412,20 @@ fn writeJsonSummary(
         const filename = try pageFilename(&filename_buf, i + 1);
         try writer.writeAll("{\"file\":");
         try std.json.Stringify.value(filename, .{}, writer);
-        try writer.print(",\"width\":{d},\"height\":{d},\"png_bytes\":{d},\"chars_rendered\":{d},\"dropped_chars\":{d}}}", .{
-            page.width, page.height, page.png_bytes, page.chars_rendered, page.dropped_chars,
-        });
+        try writer.print(
+            ",\"width\":{d},\"height\":{d},\"png_bytes\":{d}," ++
+                "\"chars_rendered\":{d},\"dropped_chars\":{d}}}",
+            .{
+                page.width, page.height, page.png_bytes, page.chars_rendered, page.dropped_chars,
+            },
+        );
     }
-    try writer.print("],\"page_count\":{d},\"total_png_bytes\":{d},\"dropped_chars\":{d},\"facts\":", .{
-        pages.len, total_png_bytes, dropped_chars,
-    });
+    try writer.print(
+        "],\"page_count\":{d},\"total_png_bytes\":{d},\"dropped_chars\":{d},\"facts\":",
+        .{
+            pages.len, total_png_bytes, dropped_chars,
+        },
+    );
     if (fact_report) |report| {
         try writer.writeAll("{\"enabled\":true,\"file\":\"factsheet.txt\",\"item_count\":");
         try writer.print("{d},\"dropped\":{d}}}", .{ report.entries.len, report.dropped });
@@ -334,12 +480,24 @@ test "stale concurrent publisher cannot mix output pages" {
     try std.testing.expectError(error.OutputChanged, publishStage(second, out, .absent));
     const published_first = try std.fs.path.join(std.testing.allocator, &.{ out, "page-001.png" });
     defer std.testing.allocator.free(published_first);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, published_first, std.testing.allocator, .limited(16));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        published_first,
+        std.testing.allocator,
+        .limited(16),
+    );
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("first", bytes);
-    const unpublished_second = try std.fs.path.join(std.testing.allocator, &.{ out, "page-002.png" });
+    const unpublished_second = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ out, "page-002.png" },
+    );
     defer std.testing.allocator.free(unpublished_second);
-    _ = std.Io.Dir.cwd().statFile(std.testing.io, unpublished_second, .{}) catch |err| switch (err) {
+    _ = std.Io.Dir.cwd().statFile(
+        std.testing.io,
+        unpublished_second,
+        .{},
+    ) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -363,7 +521,12 @@ test "empty output directory is replaced atomically" {
     try publishStage(stage, out, .empty);
     const published = try std.fs.path.join(std.testing.allocator, &.{ out, "page-001.png" });
     defer std.testing.allocator.free(published);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, published, std.testing.allocator, .limited(16));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        published,
+        std.testing.allocator,
+        .limited(16),
+    );
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("page", bytes);
 }
@@ -414,7 +577,10 @@ test "committed output succeeds when receipt and warning sinks fail" {
     const human_page = try std.fs.path.join(std.testing.allocator, &.{ human_out, "page-001.png" });
     defer std.testing.allocator.free(human_page);
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, human_page, .{});
-    const facts_path = try std.fs.path.join(std.testing.allocator, &.{ human_out, "factsheet.txt" });
+    const facts_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ human_out, "factsheet.txt" },
+    );
     defer std.testing.allocator.free(facts_path);
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, facts_path, .{});
 }

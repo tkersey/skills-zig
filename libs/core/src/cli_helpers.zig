@@ -32,7 +32,11 @@ pub fn printVersion(writer: anytype, version_text: []const u8) !void {
     try writer.print("{s}\n", .{normalizeVersion(version_text)});
 }
 
-pub fn printHelpWithVersion(writer: anytype, usage_text: []const u8, version_text: []const u8) !void {
+pub fn printHelpWithVersion(
+    writer: anytype,
+    usage_text: []const u8,
+    version_text: []const u8,
+) !void {
     try writer.print("{s}\n\nVersion: {s}\n", .{ usage_text, normalizeVersion(version_text) });
 }
 
@@ -76,7 +80,10 @@ pub fn handleDefaultHelpAndVersionSurface(
     surface: HelpSurface,
     version_text: []const u8,
 ) !bool {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
 
     if (argv.len <= 1) {
@@ -102,9 +109,15 @@ pub fn exitUsageFailure(
     err_token: []const u8,
     detail: ?[]const u8,
 ) noreturn {
-    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stderr_writer = std.Io.File.stderr().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stderr = &stderr_writer.interface;
-    printUsageFailureWithHelp(stderr, surface, version_text, err_token, detail) catch {};
+    printUsageFailureWithHelp(stderr, surface, version_text, err_token, detail) catch {
+        // An unwritable diagnostic is an I/O failure, not a reported usage error.
+        std.process.exit(1);
+    };
     std.process.exit(2);
 }
 
@@ -129,10 +142,10 @@ test "containsHelpArg recognizes help anywhere in an argument tail" {
 }
 
 test "printUsageFailureWithHelp renders token detail and versioned help" {
-    var out: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&out);
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
     try printUsageFailureWithHelp(
-        fbs.writer(),
+        &output.writer,
         .{
             .executable_name = "demo",
             .help_text = "demo\n\nUsage:\n  demo --help",
@@ -143,6 +156,17 @@ test "printUsageFailureWithHelp renders token detail and versioned help" {
     );
     try std.testing.expectEqualStrings(
         "MissingValue: --input\ndemo\n\nUsage:\n  demo --help\n\nVersion: 1.2.3\n",
-        fbs.getWritten(),
+        output.written(),
     );
+}
+
+test "usage diagnostic reports writer failure" {
+    var writer = std.Io.Writer.fixed(&.{});
+    try std.testing.expectError(error.WriteFailed, printUsageFailureWithHelp(
+        &writer,
+        .{ .executable_name = "demo", .help_text = "demo --help" },
+        "1.2.3",
+        "MissingValue",
+        "--input",
+    ));
 }

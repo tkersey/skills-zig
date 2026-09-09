@@ -58,35 +58,61 @@ const PlanCache = struct {
             self.repo_root,
             digest,
         );
-        errdefer archive.deinit(self.allocator);
+        var archive_owned = true;
+        errdefer if (archive_owned) archive.deinit(self.allocator);
         if (!std.mem.eql(u8, archive.definition_id, self.definition_id)) {
             return error.DefinitionArchiveOwnerMismatch;
         }
         const archive_bytes = archive.closure.total_definition_bytes;
+        const evictions = try self.evictionsFor(archive_bytes);
+        var prepared = try self.compileArchive(archive, digest);
+        archive_owned = false;
+        errdefer prepared.deinit(self.allocator);
+        try self.plans.ensureUnusedCapacity(self.allocator, 1);
+        try self.indices.ensureUnusedCapacity(self.allocator, 1);
+        // Reserve both owners before eviction, transfer, or index publication.
+        for (0..evictions) |_| self.evictOldest();
+        const index = self.plans.items.len;
+        self.plans.appendAssumeCapacity(prepared);
+        self.indices.putAssumeCapacityNoClobber(prepared.digest, index);
+        self.definition_bytes += archive_bytes;
+        std.debug.assert(self.definition_bytes <= max_historical_definition_bytes);
+        return &self.plans.items[index];
+    }
+
+    fn evictionsFor(self: *const PlanCache, archive_bytes: usize) !usize {
         if (archive_bytes > max_historical_definition_bytes) {
             return error.HistoricalDefinitionBytesBoundExceeded;
         }
+        var evictions: usize = 0;
+        var retained_bytes = self.definition_bytes;
         if (self.rolling) {
-            while (self.plans.items.len >=
+            while (self.plans.items.len - evictions >=
                 max_historical_definition_versions or
-                archive_bytes >
-                    max_historical_definition_bytes - self.definition_bytes)
+                archive_bytes > max_historical_definition_bytes - retained_bytes)
             {
-                self.evictOldest();
+                std.debug.assert(evictions < self.plans.items.len);
+                const oldest_bytes =
+                    self.plans.items[evictions].archive.closure.total_definition_bytes;
+                retained_bytes -= oldest_bytes;
+                evictions += 1;
             }
         } else if (self.plans.items.len >=
             max_historical_definition_versions)
         {
             return error.HistoricalDefinitionVersionBoundExceeded;
         }
-        const next_definition_bytes = std.math.add(
-            usize,
-            self.definition_bytes,
-            archive_bytes,
-        ) catch return error.HistoricalDefinitionBytesBoundExceeded;
-        if (next_definition_bytes > max_historical_definition_bytes) {
+        if (archive_bytes > max_historical_definition_bytes - retained_bytes) {
             return error.HistoricalDefinitionBytesBoundExceeded;
         }
+        return evictions;
+    }
+
+    fn compileArchive(
+        self: *const PlanCache,
+        archive: definition_archive.Loaded,
+        digest: []const u8,
+    ) !ArchivedPlan {
         var definition_plan = try definition.compile(
             self.allocator,
             &archive.closure,
@@ -111,22 +137,14 @@ const PlanCache = struct {
         errdefer if (protocol_plan) |*plan| plan.deinit(self.allocator);
         const owned_digest = try self.allocator.dupe(u8, digest);
         errdefer self.allocator.free(owned_digest);
-        const index = self.plans.items.len;
-        try self.plans.append(self.allocator, .{
+        return .{
             .digest = owned_digest,
             .archive = archive,
             .definition_plan = definition_plan,
             .validation_plan = validation_plan,
             .storage_plan = storage_plan,
             .protocol_plan = protocol_plan,
-        });
-        errdefer {
-            var removed = self.plans.pop().?;
-            removed.deinit(self.allocator);
-        }
-        try self.indices.put(self.allocator, owned_digest, index);
-        self.definition_bytes = next_definition_bytes;
-        return &self.plans.items[index];
+        };
     }
 
     fn evictOldest(self: *PlanCache) void {
@@ -257,6 +275,22 @@ pub fn validateSegmentedHistory(
     if (validator.checkpoint_records.? == 0) {
         try validator.verifyCheckpoint();
     }
+    try replaySegmentedEvents(allocator, slot.relative_path, snapshot, &validator);
+    try rows.finish();
+    if (validator.record_offset != snapshot.head.total_event_records or
+        validator.raw_bytes_observed != snapshot.head.total_event_bytes or
+        !validator.checkpoint_verified or validator.protocol_state == null)
+    {
+        return error.SegmentedHistoryMismatch;
+    }
+}
+
+fn replaySegmentedEvents(
+    allocator: std.mem.Allocator,
+    relative_path: []const u8,
+    snapshot: *const segmented_event_log.Snapshot,
+    validator: *StreamEventValidator,
+) !void {
     var events = segmented_event_log.EventHistoryIterator{
         .allocator = allocator,
         .snapshot = snapshot,
@@ -266,10 +300,10 @@ pub fn validateSegmentedHistory(
         if (bytes.len == 0) continue;
         var summary = try scanSegmentBytes(
             allocator,
-            slot.relative_path,
+            relative_path,
             bytes,
             .{
-                .context = &validator,
+                .context = validator,
                 .visitFn = StreamEventValidator.visit,
                 .rawFn = StreamEventValidator.observeRaw,
             },
@@ -287,13 +321,6 @@ pub fn validateSegmentedHistory(
         ) catch return error.CurrentStoreBoundsExceeded;
     }
     try events.finish();
-    try rows.finish();
-    if (validator.record_offset != snapshot.head.total_event_records or
-        validator.raw_bytes_observed != snapshot.head.total_event_bytes or
-        !validator.checkpoint_verified or validator.protocol_state == null)
-    {
-        return error.SegmentedHistoryMismatch;
-    }
 }
 
 pub const Stats = struct {
@@ -1899,31 +1926,34 @@ fn validateMaterializedEvent(
     );
     defer execution.deinit();
     if (!execution.isValid()) return error.HistoricalArtifactInvalid;
-    if (historical_plan) |plan| {
-        if (lifetime_protocol) {
-            try protocol.applyValueFullHistory(
-                allocator,
-                plan,
-                &protocol_state.*.?,
-                parsed.value,
-                parameters,
-            );
-        } else {
-            try protocol.applyValueBound(
-                allocator,
-                plan,
-                &protocol_state.*.?,
-                parsed.value,
-                parameters,
-            );
-        }
-    }
+    if (historical_plan) |plan| try applyHistoricalValue(
+        allocator,
+        plan,
+        &protocol_state.*.?,
+        parsed.value,
+        parameters,
+        lifetime_protocol,
+    );
     try notifyObserver(
         observer,
         parsed.value,
         bytes,
         if (protocol_state.*) |*state| state else null,
     );
+}
+
+fn applyHistoricalValue(
+    allocator: std.mem.Allocator,
+    plan: *const protocol.Plan,
+    state: *protocol.ReplayState,
+    value: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+    lifetime_protocol: bool,
+) !void {
+    if (lifetime_protocol) {
+        return protocol.applyValueFullHistory(allocator, plan, state, value, parameters);
+    }
+    return protocol.applyValueBound(allocator, plan, state, value, parameters);
 }
 
 fn canonicalStoredEventAlloc(
@@ -2116,7 +2146,29 @@ test "segmented rolling replay retains a bounded recent plan set" {
         allocator,
     );
     defer allocator.free(repo_root);
-    const closures = [_]*const definition_core.Closure{ &first, &second };
+    try archiveReplayTestDefinitions(repo_root, &first, &second);
+    try expectArchiveInsertionAllocationFailure(repo_root, first.digestSlice());
+    var cache = PlanCache{
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = "example/plain-protocol",
+        .rolling = true,
+    };
+    defer cache.deinit();
+    _ = try cache.get(first.digestSlice());
+    _ = try cache.get(second.digestSlice());
+    _ = try cache.get(first.digestSlice());
+    _ = try cache.get(second.digestSlice());
+    try std.testing.expectEqual(@as(usize, 2), cache.plans.items.len);
+}
+
+fn archiveReplayTestDefinitions(
+    repo_root: []const u8,
+    first: *const definition_core.Closure,
+    second: *const definition_core.Closure,
+) !void {
+    const allocator = std.testing.allocator;
+    const closures = [_]*const definition_core.Closure{ first, second };
     const entries = [_][]const u8{ "first.json", "second.json" };
     for (closures, entries) |closure, entry| {
         const content = try definition_archive.renderAlloc(
@@ -2134,16 +2186,38 @@ test "segmented rolling replay retains a bounded recent plan set" {
         defer allocator.free(path);
         try durable_store.writeTextAtomic(allocator, path, content);
     }
-    var cache = PlanCache{
-        .allocator = allocator,
+}
+
+fn archiveInsertionAllocationCount(repo_root: []const u8, digest: []const u8) !usize {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache: PlanCache = .{
+        .allocator = failing.allocator(),
         .repo_root = repo_root,
         .definition_id = "example/plain-protocol",
-        .rolling = true,
     };
     defer cache.deinit();
-    _ = try cache.get(first.digestSlice());
-    _ = try cache.get(second.digestSlice());
-    _ = try cache.get(first.digestSlice());
-    _ = try cache.get(second.digestSlice());
-    try std.testing.expectEqual(@as(usize, 2), cache.plans.items.len);
+    _ = try cache.get(digest);
+    return failing.alloc_index;
+}
+
+fn expectArchiveInsertionAllocationFailure(repo_root: []const u8, digest: []const u8) !void {
+    const allocation_count = try archiveInsertionAllocationCount(repo_root, digest);
+    try std.testing.expect(allocation_count >= 2);
+    // On an empty cache the final two allocations reserve its row and index owners.
+    for (1..3) |offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = allocation_count - offset,
+        });
+        var cache: PlanCache = .{
+            .allocator = failing.allocator(),
+            .repo_root = repo_root,
+            .definition_id = "example/plain-protocol",
+        };
+        defer cache.deinit();
+        try std.testing.expectError(error.OutOfMemory, cache.get(digest));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), cache.plans.items.len);
+        try std.testing.expectEqual(@as(u32, 0), cache.indices.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.definition_bytes);
+    }
 }

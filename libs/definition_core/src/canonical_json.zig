@@ -43,7 +43,11 @@ fn canonicalJsonAllocWithOmission(
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
-    try writeCanonicalJsonWithOmission(allocator, &out.writer, value, omission, 0);
+    writeCanonicalJsonWithOmission(allocator, &out.writer, value, omission) catch |err| {
+        // This sink owns only allocator-backed memory, so WriteFailed is OOM.
+        if (err == error.WriteFailed) return error.OutOfMemory;
+        return err;
+    };
     return out.toOwnedSlice();
 }
 
@@ -52,7 +56,95 @@ pub fn writeCanonicalJson(
     writer: *std.Io.Writer,
     value: std.json.Value,
 ) !void {
-    try writeCanonicalJsonWithOmission(allocator, writer, value, .{}, 0);
+    try writeCanonicalJsonWithOmission(allocator, writer, value, .{});
+}
+
+const WriteFrame = struct {
+    value: std.json.Value,
+    keys: std.ArrayList([]const u8) = .empty,
+    index: usize = 0,
+    started: bool = false,
+
+    fn deinit(self: *WriteFrame, allocator: std.mem.Allocator) void {
+        self.keys.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn start(
+        self: *WriteFrame,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        omission: Omission,
+        depth: usize,
+    ) !bool {
+        self.started = true;
+        switch (self.value) {
+            .null => try writer.writeAll("null"),
+            .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
+            .integer => |number| try writer.print("{d}", .{number}),
+            .float => |number| try writeCanonicalFloat(writer, number),
+            .number_string => |text| try exact_number.writeCanonical(writer, text),
+            .string => |text| try writeCanonicalString(writer, text),
+            .array => {
+                try writer.writeByte('[');
+                return true;
+            },
+            .object => |map| {
+                self.keys = try canonicalKeysAlloc(allocator, map, omission, depth);
+                try writer.writeByte('{');
+                return true;
+            },
+        }
+        return false;
+    }
+
+    fn next(self: *WriteFrame, writer: *std.Io.Writer) !?std.json.Value {
+        switch (self.value) {
+            .array => |items| {
+                if (self.index == items.items.len) {
+                    try writer.writeByte(']');
+                    return null;
+                }
+                if (self.index != 0) try writer.writeByte(',');
+                const item = items.items[self.index];
+                self.index += 1;
+                return item;
+            },
+            .object => |map| {
+                const keys = self.keys.items;
+                if (self.index == keys.len) {
+                    try writer.writeByte('}');
+                    return null;
+                }
+                if (self.index != 0) try writer.writeByte(',');
+                const key = keys[self.index];
+                try writeCanonicalString(writer, key);
+                try writer.writeByte(':');
+                self.index += 1;
+                return map.get(key).?;
+            },
+            else => unreachable,
+        }
+    }
+};
+
+fn canonicalKeysAlloc(
+    allocator: std.mem.Allocator,
+    map: std.json.ObjectMap,
+    omission: Omission,
+    depth: usize,
+) !std.ArrayList([]const u8) {
+    var keys: std.ArrayList([]const u8) = .empty;
+    errdefer keys.deinit(allocator);
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        const omit_here = omission.key != null and
+            std.mem.eql(u8, entry.key_ptr.*, omission.key.?) and
+            (omission.recursive or depth == 0);
+        if (!omit_here) try keys.append(allocator, entry.key_ptr.*);
+    }
+    sortKeys(keys.items);
+    return keys;
 }
 
 fn writeCanonicalJsonWithOmission(
@@ -60,50 +152,27 @@ fn writeCanonicalJsonWithOmission(
     writer: *std.Io.Writer,
     value: std.json.Value,
     omission: Omission,
-    depth: usize,
 ) !void {
-    if (depth > max_nesting_depth) return error.JsonNestingExceeded;
-    switch (value) {
-        .null => try writer.writeAll("null"),
-        .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
-        .integer => |number| try writer.print("{d}", .{number}),
-        .float => |number| try writeCanonicalFloat(writer, number),
-        .number_string => |text| try exact_number.writeCanonical(writer, text),
-        .string => |text| try writeCanonicalString(writer, text),
-        .array => |items| {
-            try writer.writeByte('[');
-            for (items.items, 0..) |item, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeCanonicalJsonWithOmission(allocator, writer, item, omission, depth + 1);
-            }
-            try writer.writeByte(']');
-        },
-        .object => |map| {
-            var keys: std.ArrayList([]const u8) = .empty;
-            defer keys.deinit(allocator);
-            var iterator = map.iterator();
-            while (iterator.next()) |entry| {
-                const omit_here = omission.key != null and
-                    std.mem.eql(u8, entry.key_ptr.*, omission.key.?) and
-                    (omission.recursive or depth == 0);
-                if (!omit_here) try keys.append(allocator, entry.key_ptr.*);
-            }
-            sortKeys(keys.items);
-            try writer.writeByte('{');
-            for (keys.items, 0..) |key, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeCanonicalString(writer, key);
-                try writer.writeByte(':');
-                try writeCanonicalJsonWithOmission(
-                    allocator,
-                    writer,
-                    map.get(key).?,
-                    omission,
-                    depth + 1,
-                );
-            }
-            try writer.writeByte('}');
-        },
+    // The root has depth zero; one slot covers each admitted nesting level.
+    var frames: [max_nesting_depth + 1]WriteFrame = undefined;
+    frames[0] = .{ .value = value };
+    var count: usize = 1;
+    defer for (frames[0..count]) |*frame| frame.deinit(allocator);
+    while (count != 0) {
+        const frame = &frames[count - 1];
+        if (!frame.started and !try frame.start(allocator, writer, omission, count - 1)) {
+            frame.deinit(allocator);
+            count -= 1;
+            continue;
+        }
+        const child = try frame.next(writer) orelse {
+            frame.deinit(allocator);
+            count -= 1;
+            continue;
+        };
+        if (count == frames.len) return error.JsonNestingExceeded;
+        frames[count] = .{ .value = child };
+        count += 1;
     }
 }
 
@@ -166,7 +235,11 @@ fn fixedIntegerFitsI64(layout: *const FloatLayout, position: usize) bool {
     return true;
 }
 
-fn writeFixedFloat(writer: *std.Io.Writer, layout: *const FloatLayout, decimal_position: i32) !void {
+fn writeFixedFloat(
+    writer: *std.Io.Writer,
+    layout: *const FloatLayout,
+    decimal_position: i32,
+) !void {
     const digits = layout.digits();
     if (decimal_position > 0) {
         const position: usize = @intCast(decimal_position);
@@ -332,7 +405,9 @@ pub fn verifyFingerprintAlloc(
 
 pub fn isFingerprint(value: []const u8) bool {
     if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) return false;
-    for (value[7..]) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    for (value[7..]) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
     return true;
 }
 
@@ -411,10 +486,21 @@ test "canonical omission modes preserve their declared depth" {
         .{},
     );
     defer parsed.deinit();
-    const root_only = try canonicalObjectOmittingKeyAlloc(std.testing.allocator, parsed.value, "packet_id");
+    const root_only = try canonicalObjectOmittingKeyAlloc(
+        std.testing.allocator,
+        parsed.value,
+        "packet_id",
+    );
     defer std.testing.allocator.free(root_only);
-    try std.testing.expectEqualStrings("{\"nested\":{\"packet_id\":\"nested\",\"value\":1}}", root_only);
-    const recursive = try canonicalJsonOmittingKeyAlloc(std.testing.allocator, parsed.value, "packet_id");
+    try std.testing.expectEqualStrings(
+        "{\"nested\":{\"packet_id\":\"nested\",\"value\":1}}",
+        root_only,
+    );
+    const recursive = try canonicalJsonOmittingKeyAlloc(
+        std.testing.allocator,
+        parsed.value,
+        "packet_id",
+    );
     defer std.testing.allocator.free(recursive);
     try std.testing.expectEqualStrings("{\"nested\":{\"value\":1}}", recursive);
 }
@@ -428,5 +514,109 @@ test "self fingerprint is canonical and tamper evident" {
     defer std.testing.allocator.free(finalized);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, finalized, .{});
     defer parsed.deinit();
-    try std.testing.expect(try verifyFingerprintAlloc(std.testing.allocator, parsed.value, "fingerprint"));
+    try std.testing.expect(try verifyFingerprintAlloc(
+        std.testing.allocator,
+        parsed.value,
+        "fingerprint",
+    ));
+}
+
+test "canonical JSON preserves the exact nesting boundary without recursive calls" {
+    var values: [max_nesting_depth + 2]std.json.Value = undefined;
+    values[values.len - 1] = .null;
+    var index: usize = values.len - 1;
+    while (index != 0) {
+        index -= 1;
+        values[index] = .{ .array = .{
+            .items = values[index + 1 .. index + 2],
+            .capacity = 1,
+            .allocator = std.testing.allocator,
+        } };
+    }
+    const bytes = try canonicalJsonAlloc(std.testing.allocator, values[1]);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(
+        "[" ** max_nesting_depth ++ "null" ++ "]" ** max_nesting_depth,
+        bytes,
+    );
+    try std.testing.expectError(
+        error.JsonNestingExceeded,
+        canonicalJsonAlloc(std.testing.allocator, values[0]),
+    );
+}
+
+fn canonicalizeForAllocationFailure(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const bytes = try canonicalJsonAlloc(allocator, value);
+    defer allocator.free(bytes);
+}
+
+test "canonical traversal releases all live frame keys on allocation failure" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"z\":1,\"a\":[{\"z\":[],\"a\":{\"b\":true,\"a\":false}}]}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        canonicalizeForAllocationFailure,
+        .{parsed.value},
+    );
+}
+
+fn fuzzCanonicalJson(_: void, smith: *std.testing.Smith) !void {
+    var storage: [4096]u8 = undefined;
+    const input = storage[0..smith.slice(&storage)];
+    const allocator = std.testing.allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{
+        .parse_numbers = false,
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = storage.len,
+    }) catch |err| switch (err) {
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.DuplicateField,
+        => return,
+        else => return err,
+    };
+    defer parsed.deinit();
+    const canonical = canonicalJsonAlloc(allocator, parsed.value) catch |err| switch (err) {
+        // Arbitrary valid JSON can exceed the canonicalizer's depth or exponent domain.
+        error.JsonNestingExceeded, error.InvalidNumber => return,
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, canonical, .{
+        .parse_numbers = false,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer reparsed.deinit();
+    const repeated = try canonicalJsonAlloc(allocator, reparsed.value);
+    defer allocator.free(repeated);
+    try std.testing.expectEqualStrings(canonical, repeated);
+}
+
+fn canonicalFuzzSeed(comptime json: []const u8) []const u8 {
+    // Smith.slice reads a little-endian length and clamps it to the remaining seed bytes.
+    return "\xff\xff\xff\xff" ++ json;
+}
+
+test "fuzz canonical JSON preserves parse and canonicalization closure" {
+    try std.testing.fuzz({}, fuzzCanonicalJson, .{ .corpus = &.{
+        canonicalFuzzSeed("null"),
+        canonicalFuzzSeed("[true,false,0,-0,\"\",[],{}]"),
+        canonicalFuzzSeed("{\"z\":1,\"a\":[{\"b\":2,\"a\":3}]}"),
+        canonicalFuzzSeed("{\"é\":\"\\u0000\\n\\t\\\"\\\\\",\"a\":\"\\ud83d\\ude00\"}"),
+        canonicalFuzzSeed("[9007199254740992.1,9007199254740992.2,1.2300e+2,-0.0000001]"),
+        canonicalFuzzSeed("[1e9223372036854775807,1e-9223372036854775808]"),
+        canonicalFuzzSeed("[" ** max_nesting_depth ++ "null" ++ "]" ** max_nesting_depth),
+        canonicalFuzzSeed("[" ** (max_nesting_depth + 1) ++ "0" ++ "]" ** (max_nesting_depth + 1)),
+        canonicalFuzzSeed("{\"duplicate\":0,\"duplicate\":1}"),
+        canonicalFuzzSeed("\xff[invalid"),
+    } });
 }

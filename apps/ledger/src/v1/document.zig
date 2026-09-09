@@ -1,3 +1,4 @@
+const core_calendar = @import("core_calendar");
 const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
@@ -1178,25 +1179,12 @@ const Date = struct {
 };
 
 fn civilFromDays(days_since_unix_epoch: i64) Date {
-    const z = days_since_unix_epoch + 719_468;
-    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(
-        doe - @divFloor(doe, 1_460) +
-            @divFloor(doe, 36_524) -
-            @divFloor(doe, 146_096),
-        365,
-    );
-    var year = yoe + era * 400;
-    const day_of_year =
-        doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const month_position = @divFloor(5 * day_of_year + 2, 153);
-    const day = day_of_year -
-        @divFloor(153 * month_position + 2, 5) + 1;
-    var month = month_position + 3;
-    if (month > 12) month -= 12;
-    if (month <= 2) year += 1;
-    return .{ .year = year, .month = month, .day = day };
+    const date = core_calendar.civilFromDays(days_since_unix_epoch, .legacy_negative_era);
+    return .{
+        .year = @intCast(date.year),
+        .month = @intCast(date.month),
+        .day = @intCast(date.day),
+    };
 }
 
 fn deinitFragments(

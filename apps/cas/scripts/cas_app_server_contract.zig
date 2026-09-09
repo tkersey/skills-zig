@@ -171,7 +171,7 @@ const StagingPaths = struct {
         const root = try std.fmt.allocPrint(allocator, "{s}.staging.{d}", .{ cache_path, nonce });
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().deleteTree(io, root);
-        errdefer std.Io.Dir.cwd().deleteTree(io, root) catch |err| ignoreError(err);
+        errdefer std.Io.Dir.cwd().deleteTree(io, root) catch |err| logCacheRecoveryFailure(err);
         const stable = try std.fs.path.join(allocator, &.{ root, "stable" });
         errdefer allocator.free(stable);
         const experimental = try std.fs.path.join(allocator, &.{ root, "experimental" });
@@ -334,7 +334,7 @@ fn generateSchemaCache(
     const nonce = std.Io.Clock.awake.now(io).nanoseconds;
     const staging = try StagingPaths.init(allocator, io, paths.cache, nonce);
     defer staging.deinit(allocator);
-    errdefer std.Io.Dir.cwd().deleteTree(io, staging.root) catch |err| ignoreError(err);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging.root) catch |err| logCacheRecoveryFailure(err);
     var generated = try stageSchemaCache(
         allocator,
         io,
@@ -644,7 +644,7 @@ fn fileDigestAlloc(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, 
     var buffer: [64 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io, &buffer);
     var total: u64 = 0;
-    while (true) { // tiger: event-loop
+    while (total <= limit) {
         const slice = reader.interface.peek(1) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
@@ -675,11 +675,11 @@ fn acquireCacheLock(io: std.Io, path: []const u8, limits: CacheLimits) !std.Io.F
     const deadline = awakeDeadline(io, limits.lock_timeout_ms);
     while (!(try file.tryLock(io, .exclusive))) {
         if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.CacheLockTimedOut;
-        std.Io.sleep(
+        try std.Io.sleep(
             io,
             .fromMilliseconds(@intCast(limits.lock_retry_ms)),
             .awake,
-        ) catch |err| ignoreError(err);
+        );
     }
     return file;
 }
@@ -983,26 +983,27 @@ fn promoteCacheDirectory(
     std.Io.Dir.renameAbsolute(staging, target, io) catch |err| {
         if (had_target) {
             std.Io.Dir.renameAbsolute(backup, target, io) catch |restore_err|
-                ignoreError(restore_err);
+                logCacheRecoveryFailure(restore_err);
         }
         return err;
     };
     const parent = std.fs.path.dirname(target) orelse return error.InvalidCachePath;
     syncDirectory(io, parent) catch |err| {
-        std.Io.Dir.cwd().deleteTree(io, target) catch |delete_err| ignoreError(delete_err);
+        std.Io.Dir.cwd().deleteTree(io, target) catch |delete_err|
+            logCacheRecoveryFailure(delete_err);
         if (had_target) {
             std.Io.Dir.renameAbsolute(backup, target, io) catch |restore_err|
-                ignoreError(restore_err);
+                logCacheRecoveryFailure(restore_err);
         }
         return err;
     };
     if (had_target) {
-        std.Io.Dir.cwd().deleteTree(io, backup) catch |err| ignoreError(err);
+        std.Io.Dir.cwd().deleteTree(io, backup) catch |err| logCacheRecoveryFailure(err);
     }
 }
 
-fn ignoreError(err: anyerror) void {
-    _ = @errorName(err);
+fn logCacheRecoveryFailure(err: anyerror) void {
+    std.log.warn("CAS schema cache cleanup/recovery failed: {s}", .{@errorName(err)});
 }
 
 pub const Profile = enum { core, review, session_inquiry, full };
@@ -1704,17 +1705,6 @@ fn compareRequired(
     }
 }
 
-fn requireMethod(
-    allocator: std.mem.Allocator,
-    baseline: std.json.Array,
-    actual: []const []u8,
-    method: []const u8,
-    failures: *std.ArrayList([]u8),
-) !void {
-    if (!jsonArrayContains(baseline, method)) return error.InvalidContract;
-    if (!contains(actual, method)) try appendUnique(allocator, failures, method);
-}
-
 fn collectAdditive(
     allocator: std.mem.Allocator,
     actual: []const []u8,
@@ -2255,23 +2245,7 @@ fn referenceTargetMatches(selector: std.json.Value, schema: std.json.Value) bool
         .bool => |value| value,
         else => return false,
     };
-    var keys = schema_object.iterator();
-    while (keys.next()) |entry| {
-        const name = entry.key_ptr.*;
-        const allowed = std.mem.eql(u8, name, "$ref") or
-            std.mem.eql(u8, name, "anyOf") or
-            std.mem.eql(u8, name, "oneOf") or
-            std.mem.eql(u8, name, "allOf") or
-            std.mem.eql(u8, name, "title") or
-            std.mem.eql(u8, name, "description") or
-            std.mem.eql(u8, name, "default") or
-            std.mem.eql(u8, name, "examples") or
-            std.mem.eql(u8, name, "$comment") or
-            std.mem.eql(u8, name, "deprecated") or
-            std.mem.eql(u8, name, "readOnly") or
-            std.mem.eql(u8, name, "writeOnly");
-        if (!allowed) return false;
-    }
+    if (!referenceKeysAllowed(schema_object)) return false;
     var applicator_count: u8 = if (schema_object.get("$ref") != null) 1 else 0;
     for ([_][]const u8{ "anyOf", "oneOf", "allOf" }) |union_name| {
         if (schema_object.get(union_name) != null) applicator_count += 1;
@@ -3647,4 +3621,25 @@ fn makeTestExecutable(io: std.Io, path: []const u8) !void {
         std.Io.File.Permissions.fromMode(0o755),
         .{},
     );
+}
+
+fn referenceKeysAllowed(schema_object: std.json.ObjectMap) bool {
+    var keys = schema_object.iterator();
+    while (keys.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const allowed = std.mem.eql(u8, name, "$ref") or
+            std.mem.eql(u8, name, "anyOf") or
+            std.mem.eql(u8, name, "oneOf") or
+            std.mem.eql(u8, name, "allOf") or
+            std.mem.eql(u8, name, "title") or
+            std.mem.eql(u8, name, "description") or
+            std.mem.eql(u8, name, "default") or
+            std.mem.eql(u8, name, "examples") or
+            std.mem.eql(u8, name, "$comment") or
+            std.mem.eql(u8, name, "deprecated") or
+            std.mem.eql(u8, name, "readOnly") or
+            std.mem.eql(u8, name, "writeOnly");
+        if (!allowed) return false;
+    }
+    return true;
 }

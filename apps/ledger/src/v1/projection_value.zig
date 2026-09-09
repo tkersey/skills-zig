@@ -59,15 +59,6 @@ const Choice = struct {
     pointer: definition_core.json_pointer.Pointer,
     cases: []ChoiceCase,
     fallback: *Value,
-
-    fn deinit(self: *Choice, allocator: std.mem.Allocator) void {
-        self.pointer.deinit(allocator);
-        for (self.cases) |*case| case.deinit(allocator);
-        allocator.free(self.cases);
-        self.fallback.deinit(allocator);
-        allocator.destroy(self.fallback);
-        self.* = undefined;
-    }
 };
 
 const Field = struct {
@@ -91,24 +82,136 @@ pub const Value = union(enum) {
     pending,
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
+        var frames: [max_depth + 2]DeinitFrame = undefined;
+        frames[0] = .{ .value = self };
+        var count: usize = 1;
+        while (count != 0) {
+            const frame = &frames[count - 1];
+            if (frame.nextChild()) |child| {
+                std.debug.assert(count < frames.len);
+                frames[count] = .{ .value = child };
+                count += 1;
+            } else {
+                frame.value.deinitShallow(allocator);
+                count -= 1;
+            }
+        }
+    }
+
+    fn deinitShallow(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .literal => |bytes| allocator.free(bytes),
             .pointer => |*pointer| pointer.deinit(allocator),
             .concat => |*concat| concat.deinit(allocator),
             .object => |fields| {
-                for (fields) |*field| field.deinit(allocator);
+                for (fields) |field| if (field.name.len > 0) allocator.free(field.name);
                 allocator.free(fields);
             },
-            .array => |items| {
-                for (items) |*item| item.deinit(allocator);
-                allocator.free(items);
+            .array => |items| allocator.free(items),
+            .choice => |*choice| {
+                choice.pointer.deinit(allocator);
+                for (choice.cases) |case| if (case.equals.len > 0) allocator.free(case.equals);
+                allocator.free(choice.cases);
+                allocator.destroy(choice.fallback);
             },
-            .choice => |*choice| choice.deinit(allocator),
             .pending => {},
         }
         self.* = undefined;
     }
 };
+
+const DeinitFrame = struct {
+    value: *Value,
+    next: usize = 0,
+
+    fn nextChild(self: *DeinitFrame) ?*Value {
+        const child: *Value = switch (self.value.*) {
+            .object => |fields| if (self.next < fields.len)
+                &fields[self.next].value
+            else
+                return null,
+            .array => |items| if (self.next < items.len) &items[self.next] else return null,
+            .choice => |choice| if (self.next < choice.cases.len)
+                &choice.cases[self.next].value
+            else if (self.next == choice.cases.len)
+                choice.fallback
+            else
+                return null,
+            else => return null,
+        };
+        self.next += 1;
+        return child;
+    }
+};
+
+fn projectionValueAllocationProbe(allocator: std.mem.Allocator, source: std.json.Value) !void {
+    var value = compile(allocator, source, 4096) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer value.deinit(allocator);
+    var encoder = definition_core.cache.Encoder.init(allocator, 16 * 1024);
+    defer encoder.deinit();
+    encodeCache(value, &encoder) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    const bytes = try encoder.toOwnedSlice();
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var cached = decodeCache(allocator, &decoder, 4096) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer cached.deinit(allocator);
+    try decoder.finish();
+}
+
+test "projection value cleanup traverses every variant under allocation failures" {
+    const text =
+        \\{"object":[{"name":"selection","value":{"switch":{"path":"/choice",
+        \\ "cases":[{"equals":"first","value":{"array":[{"path":"/value","default":null}]}}],
+        \\ "default":{"concat":[{"literal":"default"},{"path":"/value"}],"max_bytes":128}}}}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        projectionValueAllocationProbe,
+        .{parsed.value},
+    );
+}
+
+fn projectionValueDepthProbe(depth: usize) !void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    for (0..depth) |_| try writer.writeAll("{\"array\":[");
+    try writer.writeAll("{\"literal\":\"leaf\"}");
+    for (0..depth) |_| try writer.writeAll("]}");
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer.buffered(),
+        .{},
+    );
+    defer parsed.deinit();
+    if (depth > max_depth) {
+        try std.testing.expectError(
+            error.ProjectionValueDepthExceeded,
+            compile(std.testing.allocator, parsed.value, 4096),
+        );
+    } else {
+        var value = try compile(std.testing.allocator, parsed.value, 4096);
+        defer value.deinit(std.testing.allocator);
+        var cursor = &value;
+        for (0..depth) |_| cursor = &cursor.array[0];
+        try std.testing.expectEqualStrings("\"leaf\"", cursor.literal);
+    }
+}
+
+test "projection value cleanup supports the admitted depth and pending overdepth nodes" {
+    for ([_]usize{ 0, 1, 7, 8, 9 }) |depth| try projectionValueDepthProbe(depth);
+}
 
 const CompileState = struct {
     nodes: usize = 0,

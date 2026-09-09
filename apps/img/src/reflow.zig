@@ -49,7 +49,7 @@ fn appendExpandedLine(
     var column: usize = 0;
     var byte_index: usize = 0;
     while (iterator.nextCodepointSlice()) |slice| {
-        const codepoint = std.unicode.utf8Decode(slice) catch unreachable;
+        const codepoint = std.unicode.utf8Decode(slice) catch return error.InvalidUtf8;
         byte_index += slice.len;
         if (codepoint != '\t') {
             try out.appendSlice(allocator, slice);
@@ -86,7 +86,7 @@ pub fn prepare(
     try out.ensureTotalCapacity(allocator, minified.len);
 
     var start: usize = 0;
-    while (true) {
+    while (start <= minified.len) {
         const relative_end = std.mem.indexOfScalar(u8, minified[start..], '\n');
         const end = if (relative_end) |relative| start + relative else minified.len;
         try appendExpandedLine(allocator, &out, minified[start..end]);
@@ -108,7 +108,7 @@ pub fn prepareForWrap(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, minified.len);
     var start: usize = 0;
-    while (true) {
+    while (start <= minified.len) {
         const relative_end = std.mem.indexOfScalar(u8, minified[start..], '\n');
         const end = if (relative_end) |relative| start + relative else minified.len;
         try appendExpandedLine(allocator, &out, minified[start..end]);

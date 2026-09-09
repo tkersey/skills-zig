@@ -37,6 +37,12 @@ interruption or partial persistence.
 Estimate the relevant network, disk, memory, and CPU costs. State why the
 control plane and data plane remain appropriately separated.
 
+For performance work, list every verified performance gain and briefly describe
+the change responsible. Each entry must name the workload and metric, report
+before/after measurements and the percentage improvement, and link to final
+benchmark evidence. Cover latency, throughput, allocations, and memory wherever
+measured, and disclose material tradeoffs or regressions.
+
 ## Validation
 
 ```text
@@ -59,4 +65,5 @@ compatibility behavior.
 - [ ] Tests cover positive and negative space, including boundary mutations.
 - [ ] Library options and capabilities are explicit at important call sites.
 - [ ] No unresolved technical-debt markers or silent error discards remain.
+- [ ] Performance work includes all verified gains, descriptions, measurements, and evidence.
 - [ ] The commit message explains both what changed and why.

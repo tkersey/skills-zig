@@ -10,7 +10,7 @@ test "public modules and their focused tests compile" {
     std.testing.refAllDecls(lib.render);
 }
 
-test "path collection is sorted, preserves CRLF, and warns on recursive binary and symlink entries" {
+test "path collection sorts, preserves CRLF, and warns on recursive binary and symlink entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTmpFile(tmp.dir, "z.txt", "z\r\n");
@@ -20,10 +20,24 @@ test "path collection is sorted, preserves CRLF, and warns on recursive binary a
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    var corpus = try lib.input.collect(std.testing.allocator, std.testing.io, .{ .paths = &.{root} }, &.{}, &.{});
+    var corpus = try lib.input.collect(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .paths = &.{root} },
+        &.{},
+        &.{},
+    );
     defer corpus.deinit(std.testing.allocator);
-    const a_pos = std.mem.indexOf(u8, corpus.text, "a.txt") orelse return error.TestUnexpectedResult;
-    const z_pos = std.mem.indexOf(u8, corpus.text, "z.txt") orelse return error.TestUnexpectedResult;
+    const a_pos = std.mem.indexOf(
+        u8,
+        corpus.text,
+        "a.txt",
+    ) orelse return error.TestUnexpectedResult;
+    const z_pos = std.mem.indexOf(
+        u8,
+        corpus.text,
+        "z.txt",
+    ) orelse return error.TestUnexpectedResult;
     try std.testing.expect(a_pos < z_pos);
     try std.testing.expect(std.mem.indexOf(u8, corpus.text, "a\r\n") != null);
     try std.testing.expectEqual(@as(usize, 2), corpus.files.len);
@@ -55,14 +69,21 @@ test "explicit invalid UTF-8 fails before output publication" {
         .facts = false,
         .json = true,
     };
-    try std.testing.expectError(error.ExplicitInvalidUtf8, lib.execute(std.testing.allocator, std.testing.io, options, &stdout, &stderr));
+    try std.testing.expectError(
+        error.ExplicitInvalidUtf8,
+        lib.execute(std.testing.allocator, std.testing.io, options, &stdout, &stderr),
+    );
     try expectMissing(out_path);
 }
 
 test "render publishes only pages and optional facts through a private atomic directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTmpFile(tmp.dir, "skill.md", "# Skill\n\nUse --max-tokens with tokenLedgerShard at PROJ-1482.\n");
+    try writeTmpFile(
+        tmp.dir,
+        "skill.md",
+        "# Skill\n\nUse --max-tokens with tokenLedgerShard at PROJ-1482.\n",
+    );
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const input_path = try std.fs.path.join(std.testing.allocator, &.{ root, "skill.md" });
@@ -85,22 +106,53 @@ test "render publishes only pages and optional facts through a private atomic di
     try lib.execute(std.testing.allocator, std.testing.io, options, &stdout, &stderr);
 
     const json_bytes = stdout.buffer[0..stdout.end];
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_bytes, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_bytes,
+        .{},
+    );
     defer parsed.deinit();
     try std.testing.expectEqualStrings("img.render.v1", parsed.value.object.get("schema").?.string);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("page_count").?.integer);
+    try verifyPublishedFiles(out_path);
+}
+
+fn verifyPublishedFiles(out_path: []const u8) !void {
     const page_path = try std.fs.path.join(std.testing.allocator, &.{ out_path, "page-001.png" });
     defer std.testing.allocator.free(page_path);
     const facts_path = try std.fs.path.join(std.testing.allocator, &.{ out_path, "factsheet.txt" });
     defer std.testing.allocator.free(facts_path);
-    const png = try std.Io.Dir.cwd().readFileAlloc(io, page_path, std.testing.allocator, .limited(2 * 1024 * 1024));
+    const png = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        page_path,
+        std.testing.allocator,
+        .limited(2 * 1024 * 1024),
+    );
     defer std.testing.allocator.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G' }, png[0..4]);
-    const sheet = try std.Io.Dir.cwd().readFileAlloc(io, facts_path, std.testing.allocator, .limited(64 * 1024));
+    const sheet = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        facts_path,
+        std.testing.allocator,
+        .limited(64 * 1024),
+    );
     defer std.testing.allocator.free(sheet);
     try std.testing.expect(std.mem.indexOf(u8, sheet, "tokenLedgerShard") != null);
-    try std.testing.expectEqual(@as(u16, 0o600), @as(u16, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(io, page_path, .{})).permissions))) & 0o777);
-    try std.testing.expectEqual(@as(u16, 0o700), @as(u16, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(io, out_path, .{})).permissions))) & 0o777);
+    try std.testing.expectEqual(
+        @as(u16, 0o600),
+        @as(
+            u16,
+            @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(io, page_path, .{})).permissions)),
+        ) & 0o777,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0o700),
+        @as(
+            u16,
+            @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(io, out_path, .{})).permissions)),
+        ) & 0o777,
+    );
 }
 
 test "nonempty output remains untouched" {
@@ -127,10 +179,18 @@ test "nonempty output remains untouched" {
         .facts = false,
         .json = true,
     };
-    try std.testing.expectError(error.OutputNotEmpty, lib.execute(std.testing.allocator, std.testing.io, options, &stdout, &stderr));
+    try std.testing.expectError(
+        error.OutputNotEmpty,
+        lib.execute(std.testing.allocator, std.testing.io, options, &stdout, &stderr),
+    );
     const sentinel_path = try std.fs.path.join(std.testing.allocator, &.{ out_path, "sentinel" });
     defer std.testing.allocator.free(sentinel_path);
-    const sentinel = try std.Io.Dir.cwd().readFileAlloc(io, sentinel_path, std.testing.allocator, .limited(16));
+    const sentinel = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        sentinel_path,
+        std.testing.allocator,
+        .limited(16),
+    );
     defer std.testing.allocator.free(sentinel);
     try std.testing.expectEqualStrings("keep", sentinel);
 }
@@ -163,7 +223,7 @@ test "human output JSON-quotes a newline-bearing output path" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\n"));
 }
 
-test "git mode includes deterministic tracked diff and sorted untracked text; diff mode omits untracked" {
+test "git mode sorts untracked text with deterministic diff; diff mode omits untracked" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
@@ -178,15 +238,35 @@ test "git mode includes deterministic tracked diff and sorted untracked text; di
     try writeTmpFile(tmp.dir, "z-new.txt", "z-new\n");
     try writeTmpFile(tmp.dir, "a-new.txt", "a-new\n");
 
-    var git_corpus = try lib.input.collect(std.testing.allocator, std.testing.io, .{ .git = root }, &.{}, &.{});
+    var git_corpus = try lib.input.collect(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .git = root },
+        &.{},
+        &.{},
+    );
     defer git_corpus.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, git_corpus.text, "-before") != null);
     try std.testing.expect(std.mem.indexOf(u8, git_corpus.text, "+after") != null);
-    const a_pos = std.mem.indexOf(u8, git_corpus.text, "a-new.txt") orelse return error.TestUnexpectedResult;
-    const z_pos = std.mem.indexOf(u8, git_corpus.text, "z-new.txt") orelse return error.TestUnexpectedResult;
+    const a_pos = std.mem.indexOf(
+        u8,
+        git_corpus.text,
+        "a-new.txt",
+    ) orelse return error.TestUnexpectedResult;
+    const z_pos = std.mem.indexOf(
+        u8,
+        git_corpus.text,
+        "z-new.txt",
+    ) orelse return error.TestUnexpectedResult;
     try std.testing.expect(a_pos < z_pos);
 
-    var diff_corpus = try lib.input.collect(std.testing.allocator, std.testing.io, .{ .diff = .{ .ref = "HEAD", .repo = root } }, &.{}, &.{});
+    var diff_corpus = try lib.input.collect(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .diff = .{ .ref = "HEAD", .repo = root } },
+        &.{},
+        &.{},
+    );
     defer diff_corpus.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, diff_corpus.text, "-before") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff_corpus.text, "a-new") == null);

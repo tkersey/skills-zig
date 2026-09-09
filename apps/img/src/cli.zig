@@ -107,128 +107,142 @@ pub const help_text =
     \\Globs support *, **, and ?. A pattern without '/' matches basenames.
 ;
 
-pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !ParseResult {
-    var paths: std.ArrayList([]const u8) = .empty;
-    defer paths.deinit(allocator);
-    var includes: std.ArrayList([]const u8) = .empty;
-    defer includes.deinit(allocator);
-    var excludes: std.ArrayList([]const u8) = .empty;
-    defer excludes.deinit(allocator);
+const Parser = struct {
+    allocator: std.mem.Allocator,
+    paths: std.ArrayList([]const u8) = .empty,
+    includes: std.ArrayList([]const u8) = .empty,
+    excludes: std.ArrayList([]const u8) = .empty,
+    use_stdin: bool = false,
+    git_seen: bool = false,
+    git_repo: ?[]const u8 = null,
+    diff_ref: ?[]const u8 = null,
+    diff_repo: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+    facts: bool = false,
+    json: bool = false,
+    positional_only: bool = false,
 
-    var use_stdin = false;
-    var git_seen = false;
-    var git_repo: ?[]const u8 = null;
-    var diff_ref: ?[]const u8 = null;
-    var diff_repo: ?[]const u8 = null;
-    var out: ?[]const u8 = null;
-    var facts = false;
-    var json = false;
-    var positional_only = false;
+    fn deinit(self: *Parser) void {
+        self.paths.deinit(self.allocator);
+        self.includes.deinit(self.allocator);
+        self.excludes.deinit(self.allocator);
+    }
 
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (positional_only) {
-            try paths.append(allocator, arg);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--")) {
-            positional_only = true;
+    fn output(self: *Parser, value: []const u8) !void {
+        if (self.out != null) return error.DuplicateOutput;
+        if (value.len == 0) return error.MissingOptionValue;
+        self.out = value;
+    }
+
+    fn argument(self: *Parser, args: []const []const u8, i: *usize) !?ParseResult {
+        const arg = args[i.*];
+        if (self.positional_only) {
+            try self.paths.append(self.allocator, arg);
+        } else if (std.mem.eql(u8, arg, "--")) {
+            self.positional_only = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return .help;
         } else if (std.mem.eql(u8, arg, "--version")) {
             return .version;
         } else if (std.mem.eql(u8, arg, "--facts")) {
-            facts = true;
+            self.facts = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
-            json = true;
+            self.json = true;
         } else if (std.mem.eql(u8, arg, "--stdin")) {
-            use_stdin = true;
+            self.use_stdin = true;
         } else if (std.mem.eql(u8, arg, "--git")) {
-            git_seen = true;
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                i += 1;
-                git_repo = args[i];
-            }
+            self.git_seen = true;
+            if (optionalRepo(args, i)) |repo| self.git_repo = repo;
         } else if (std.mem.eql(u8, arg, "--diff")) {
-            if (i + 1 >= args.len) return error.MissingOptionValue;
-            i += 1;
-            diff_ref = args[i];
-            if (diff_ref.?.len == 0 or std.mem.startsWith(u8, diff_ref.?, "-")) return error.UnsafeDiffRef;
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                i += 1;
-                diff_repo = args[i];
-            }
+            self.diff_ref = try nextValue(args, i);
+            const ref = self.diff_ref.?;
+            if (ref.len == 0 or std.mem.startsWith(u8, ref, "-")) return error.UnsafeDiffRef;
+            if (optionalRepo(args, i)) |repo| self.diff_repo = repo;
         } else if (std.mem.eql(u8, arg, "--out")) {
-            if (out != null) return error.DuplicateOutput;
-            if (i + 1 >= args.len) return error.MissingOptionValue;
-            i += 1;
-            if (args[i].len == 0) return error.MissingOptionValue;
-            out = args[i];
+            if (self.out != null) return error.DuplicateOutput;
+            try self.output(try nextValue(args, i));
         } else if (std.mem.startsWith(u8, arg, "--out=")) {
-            if (out != null) return error.DuplicateOutput;
-            const value = arg["--out=".len..];
-            if (value.len == 0) return error.MissingOptionValue;
-            out = value;
+            try self.output(arg["--out=".len..]);
         } else if (std.mem.eql(u8, arg, "--include") or std.mem.eql(u8, arg, "--exclude")) {
-            const include = std.mem.eql(u8, arg, "--include");
-            if (i + 1 >= args.len) return error.MissingOptionValue;
-            i += 1;
-            if (args[i].len == 0) return error.MissingOptionValue;
-            if (include) try includes.append(allocator, args[i]) else try excludes.append(allocator, args[i]);
+            try self.filter(std.mem.eql(u8, arg, "--include"), try nextValue(args, i));
         } else if (std.mem.startsWith(u8, arg, "--include=")) {
-            const value = arg["--include=".len..];
-            if (value.len == 0) return error.MissingOptionValue;
-            try includes.append(allocator, value);
+            try self.filter(true, arg["--include=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--exclude=")) {
-            const value = arg["--exclude=".len..];
-            if (value.len == 0) return error.MissingOptionValue;
-            try excludes.append(allocator, value);
+            try self.filter(false, arg["--exclude=".len..]);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else {
-            try paths.append(allocator, arg);
+            try self.paths.append(self.allocator, arg);
         }
+        return null;
     }
 
-    const source_count: usize = @as(usize, @intFromBool(paths.items.len > 0)) +
-        @as(usize, @intFromBool(use_stdin)) + @as(usize, @intFromBool(git_seen)) +
-        @as(usize, @intFromBool(diff_ref != null));
-    if (source_count == 0) return error.SourceRequired;
-    if (source_count != 1) return error.ConflictingSources;
-    if (out == null) return error.OutputRequired;
-    if ((includes.items.len > 0 or excludes.items.len > 0) and paths.items.len == 0) {
-        return error.FiltersRequirePaths;
+    fn filter(self: *Parser, include: bool, value: []const u8) !void {
+        if (value.len == 0) return error.MissingOptionValue;
+        const list = if (include) &self.includes else &self.excludes;
+        try list.append(self.allocator, value);
     }
 
-    const include_owned = try includes.toOwnedSlice(allocator);
-    errdefer allocator.free(include_owned);
-    const exclude_owned = try excludes.toOwnedSlice(allocator);
-    errdefer allocator.free(exclude_owned);
+    fn finish(self: *Parser) !ParseResult {
+        const source_count = @as(usize, @intFromBool(self.paths.items.len > 0)) +
+            @as(usize, @intFromBool(self.use_stdin)) + @as(usize, @intFromBool(self.git_seen)) +
+            @as(usize, @intFromBool(self.diff_ref != null));
+        if (source_count == 0) return error.SourceRequired;
+        if (source_count != 1) return error.ConflictingSources;
+        if (self.out == null) return error.OutputRequired;
+        if ((self.includes.items.len > 0 or self.excludes.items.len > 0) and
+            self.paths.items.len == 0) return error.FiltersRequirePaths;
+        const includes = try self.includes.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(includes);
+        const excludes = try self.excludes.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(excludes);
+        const source: Source = if (self.paths.items.len > 0)
+            .{ .paths = try self.paths.toOwnedSlice(self.allocator) }
+        else if (self.use_stdin)
+            .stdin
+        else if (self.git_seen)
+            .{ .git = self.git_repo }
+        else
+            .{ .diff = .{ .ref = self.diff_ref.?, .repo = self.diff_repo } };
+        return .{ .options = .{
+            .source = source,
+            .out = self.out.?,
+            .include = includes,
+            .exclude = excludes,
+            .facts = self.facts,
+            .json = self.json,
+        } };
+    }
+};
 
-    const source: Source = if (paths.items.len > 0) blk: {
-        const owned = try paths.toOwnedSlice(allocator);
-        break :blk .{ .paths = owned };
-    } else if (use_stdin)
-        .stdin
-    else if (git_seen)
-        .{ .git = git_repo }
-    else
-        .{ .diff = .{ .ref = diff_ref.?, .repo = diff_repo } };
+fn nextValue(args: []const []const u8, i: *usize) ![]const u8 {
+    if (i.* + 1 >= args.len) return error.MissingOptionValue;
+    i.* += 1;
+    return args[i.*];
+}
 
-    return .{ .options = .{
-        .source = source,
-        .out = out.?,
-        .include = include_owned,
-        .exclude = exclude_owned,
-        .facts = facts,
-        .json = json,
-    } };
+fn optionalRepo(args: []const []const u8, i: *usize) ?[]const u8 {
+    if (i.* + 1 >= args.len or std.mem.startsWith(u8, args[i.* + 1], "-")) return null;
+    i.* += 1;
+    return args[i.*];
+}
+
+pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !ParseResult {
+    var parser = Parser{ .allocator = allocator };
+    defer parser.deinit();
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (try parser.argument(args, &i)) |result| return result;
+    }
+    return parser.finish();
 }
 
 test "parse requires an explicit source and output" {
     try std.testing.expectError(error.SourceRequired, parse(std.testing.allocator, &.{}));
-    try std.testing.expectError(error.OutputRequired, parse(std.testing.allocator, &.{"README.md"}));
+    try std.testing.expectError(
+        error.OutputRequired,
+        parse(std.testing.allocator, &.{"README.md"}),
+    );
 }
 
 test "parse accepts paths after option terminator" {
@@ -241,6 +255,12 @@ test "parse accepts paths after option terminator" {
 }
 
 test "parse locks source modes and path-only filters" {
-    try std.testing.expectError(error.ConflictingSources, parse(std.testing.allocator, &.{ "--out", "o", "--stdin", "a.md" }));
-    try std.testing.expectError(error.FiltersRequirePaths, parse(std.testing.allocator, &.{ "--out", "o", "--stdin", "--include", "*.md" }));
+    try std.testing.expectError(
+        error.ConflictingSources,
+        parse(std.testing.allocator, &.{ "--out", "o", "--stdin", "a.md" }),
+    );
+    try std.testing.expectError(
+        error.FiltersRequirePaths,
+        parse(std.testing.allocator, &.{ "--out", "o", "--stdin", "--include", "*.md" }),
+    );
 }

@@ -175,8 +175,20 @@ fn startInstance(
     attestation_response: ?[]const u8,
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) !InstanceSlot {
+    var direct = clientOptions(
+        opts,
+        cwd,
+        codex_path,
+        client_name,
+        state_file,
+        auth_refresh_response,
+        attestation_response,
+        code_mode_host,
+    );
+    direct.io = io;
+    direct.transport = selected_transport;
     switch (selected_transport) {
-        .auto => {
+        .auto, .managed_websocket => {
             var server = startManagedServer(
                 allocator,
                 io,
@@ -186,23 +198,12 @@ fn startInstance(
                 code_mode_host,
             ) catch |err| {
                 if (!cas.app_server_launch.autoMayFallback(
-                    .auto,
+                    if (selected_transport == .auto) .auto else .managed_websocket,
                     .managed_websocket,
                     .stdio,
                     .before_first_rpc,
                     true,
                 )) return err;
-                var direct = clientOptions(
-                    opts,
-                    cwd,
-                    codex_path,
-                    client_name,
-                    state_file,
-                    auth_refresh_response,
-                    attestation_response,
-                    code_mode_host,
-                );
-                direct.io = io;
                 direct.transport = .stdio;
                 return .{ .client = try cas.Client.start(allocator, direct), .transport = "stdio" };
             };
@@ -219,41 +220,7 @@ fn startInstance(
                 &server,
             );
         },
-        .managed_websocket => {
-            var server = try startManagedServer(
-                allocator,
-                io,
-                cwd,
-                codex_path,
-                opts.hook_policy,
-                code_mode_host,
-            );
-            return finishManagedStart(
-                allocator,
-                io,
-                opts,
-                cwd,
-                codex_path,
-                state_file,
-                client_name,
-                auth_refresh_response,
-                attestation_response,
-                &server,
-            );
-        },
         .stdio, .explicit_websocket, .unix_socket => {
-            var direct = clientOptions(
-                opts,
-                cwd,
-                codex_path,
-                client_name,
-                state_file,
-                auth_refresh_response,
-                attestation_response,
-                code_mode_host,
-            );
-            direct.io = io;
-            direct.transport = selected_transport;
             const identity: []const u8 = switch (selected_transport) {
                 .stdio => "stdio",
                 .explicit_websocket => "websocket",
@@ -368,18 +335,29 @@ pub fn main(init: std.process.Init) !void {
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const opts = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), usageDetailForParseError(err));
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            @errorName(err),
+            usageDetailForParseError(err),
+        );
     };
 
     if (opts.show_version) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (opts.show_help) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -390,10 +368,24 @@ pub fn main(init: std.process.Init) !void {
     };
     defer allocator.free(opts.opt_out_methods);
 
+    return runConfiguredInstances(allocator, init.io, opts, cwd);
+}
+
+fn runConfiguredInstances(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ParsedArgs,
+    cwd: []const u8,
+) !void {
     if (opts.instances > 1 and opts.state_file_dir == null) {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stderr_writer = std.Io.File.stderr().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stderr = &stderr_writer.interface;
-        try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel instances may share it. Use --state-file-dir for per-instance state isolation.\n");
+        try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel " ++
+            "instances may share it. Use --state-file-dir for per-instance " ++
+            "state isolation.\n");
     }
 
     const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
@@ -410,12 +402,12 @@ pub fn main(init: std.process.Init) !void {
     const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, opts.codex_path);
     defer allocator.free(resolved_codex_path);
     const auth_refresh_response = if (opts.auth_refresh_response_source) |source|
-        try loadSecretCarrierAlloc(allocator, init.io, source)
+        try loadSecretCarrierAlloc(allocator, io, source)
     else
         null;
     defer wipeSecretCarrier(allocator, auth_refresh_response);
     const attestation_response = if (opts.attestation_response_source) |source|
-        try loadSecretCarrierAlloc(allocator, init.io, source)
+        try loadSecretCarrierAlloc(allocator, io, source)
     else
         null;
     defer wipeSecretCarrier(allocator, attestation_response);
@@ -432,8 +424,38 @@ pub fn main(init: std.process.Init) !void {
     );
     validation_options.transport = selected_transport;
     try cas.validateClientOptions(allocator, validation_options);
+    return runInstances(.{
+        .allocator = allocator,
+        .io = io,
+        .opts = opts,
+        .cwd = cwd,
+        .params = params,
+        .codex_path = resolved_codex_path,
+        .transport = selected_transport,
+        .auth_refresh_response = auth_refresh_response,
+        .attestation_response = attestation_response,
+        .code_mode_host = if (code_mode_host) |*host| host else null,
+    });
+}
+
+const InstanceRun = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ParsedArgs,
+    cwd: []const u8,
+    params: []const u8,
+    codex_path: []const u8,
+    transport: cas.app_server_launch.ValidatedTransport,
+    auth_refresh_response: ?[]const u8,
+    attestation_response: ?[]const u8,
+    code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
+};
+
+fn runInstances(ctx: InstanceRun) !void {
+    const allocator = ctx.allocator;
+    const opts = ctx.opts;
     const hook_log_path = if (opts.hook_policy.shouldCaptureNotifications())
-        try cas.hooks.defaultHookLogPathAlloc(allocator, "cas-instance-runner")
+        try cas.hooks.defaultHookLogPathAlloc(allocator, ctx.io, "cas-instance-runner")
     else
         null;
     defer if (hook_log_path) |path| allocator.free(path);
@@ -443,50 +465,101 @@ pub fn main(init: std.process.Init) !void {
         for (captured_notifications.items) |line| allocator.free(line);
         captured_notifications.deinit(allocator);
     }
-    const notification_capture: ?*std.ArrayList([]u8) = if (opts.hook_policy.shouldCaptureNotifications()) &captured_notifications else null;
+    const notification_capture: ?*std.ArrayList([]u8) =
+        if (opts.hook_policy.shouldCaptureNotifications())
+            &captured_notifications
+        else
+            null;
 
-    var slots = try allocator.alloc(?InstanceSlot, opts.instances);
+    const slots = try allocator.alloc(?InstanceSlot, opts.instances);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = null;
+    defer for (slots) |*slot| closeInstanceSlot(allocator, slot);
 
     var start_failures: std.ArrayList(StartFailure) = .empty;
-    defer start_failures.deinit(allocator);
+    defer {
+        for (start_failures.items) |failure| allocator.free(failure.@"error");
+        start_failures.deinit(allocator);
+    }
     var request_results: std.ArrayList(RequestResult) = .empty;
-    defer request_results.deinit(allocator);
+    defer {
+        for (request_results.items) |result| freeRequestResult(allocator, result);
+        request_results.deinit(allocator);
+    }
 
-    const started_at = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
+    const started_at = @divFloor(
+        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        1_000_000,
+    );
 
+    try startSlots(ctx, slots, &start_failures);
+    const after_start = monotonicMillis();
+
+    try requestSlots(ctx, slots, &request_results, notification_capture);
+    const after_requests = monotonicMillis();
+
+    const ok = try reportInstances(
+        ctx,
+        start_failures.items,
+        request_results.items,
+        captured_notifications.items,
+        hook_log_path,
+        @intCast(started_at),
+        after_start,
+        after_requests,
+    );
+    std.process.exit(if (ok) 0 else 1);
+}
+
+fn startSlots(
+    ctx: InstanceRun,
+    slots: []?InstanceSlot,
+    start_failures: *std.ArrayList(StartFailure),
+) !void {
+    const allocator = ctx.allocator;
+    const opts = ctx.opts;
     // Phase 1: start all clients.
     var i: usize = 0;
     while (i < opts.instances) : (i += 1) {
         const instance_num = i + 1;
         const state_file = if (opts.state_file_dir) |dir|
-            try std.fmt.allocPrint(allocator, "{s}/{s}-{d}.json", .{ dir, opts.client_prefix, instance_num })
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}-{d}.json",
+                .{ dir, opts.client_prefix, instance_num },
+            )
         else
             null;
         defer if (state_file) |owned| allocator.free(owned);
 
-        const client_name = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ opts.client_prefix, instance_num });
+        const client_name = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{d}",
+            .{ opts.client_prefix, instance_num },
+        );
         defer allocator.free(client_name);
 
         slots[i] = startInstance(
             allocator,
-            init.io,
+            ctx.io,
             opts,
-            cwd,
-            resolved_codex_path,
-            selected_transport,
+            ctx.cwd,
+            ctx.codex_path,
+            ctx.transport,
             state_file,
             client_name,
-            auth_refresh_response,
-            attestation_response,
-            if (code_mode_host) |*host| host else null,
+            ctx.auth_refresh_response,
+            ctx.attestation_response,
+            ctx.code_mode_host,
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-            try start_failures.append(allocator, .{
+            start_failures.append(allocator, .{
                 .instance = instance_num,
                 .@"error" = msg,
-            });
+            }) catch |append_err| {
+                allocator.free(msg);
+                return append_err;
+            };
             if (opts.verbose) {
                 var stderr_writer = std.Io.File.stderr().writer(
                     std.Io.Threaded.global_single_threaded.io(),
@@ -498,89 +571,108 @@ pub fn main(init: std.process.Init) !void {
             continue;
         };
         if (opts.verbose) {
-            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stderr_writer = std.Io.File.stderr().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stderr = &stderr_writer.interface;
             try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, slots[i].?.transport });
         }
     }
-    const after_start = monotonicMillis();
+}
 
+fn requestSlots(
+    ctx: InstanceRun,
+    slots: []?InstanceSlot,
+    request_results: *std.ArrayList(RequestResult),
+    notification_capture: ?*std.ArrayList([]u8),
+) !void {
+    const allocator = ctx.allocator;
+    const opts = ctx.opts;
     // Phase 2: run requests for started clients.
-    i = 0;
+    var i: usize = 0;
     while (i < opts.instances) : (i += 1) {
         const instance_num = i + 1;
         if (slots[i] == null) continue;
-        var slot = slots[i].?;
-        var client = slot.client;
-        defer {
-            client.close();
-            client.deinit();
-            if (slot.managed_server) |*server| {
-                server.kill();
-                server.deinit(allocator);
-            }
-            slots[i] = null;
-        }
+        const slot = &slots[i].?;
+        const client = &slot.client;
+        defer closeInstanceSlot(allocator, &slots[i]);
 
-        const result_json = client.requestJsonCaptureNotifications(opts.method, params, notification_capture) catch |err| {
+        const result_json = client.requestJsonCaptureNotifications(
+            opts.method,
+            ctx.params,
+            notification_capture,
+        ) catch |err| {
             const summary = if (client.lastError()) |detail|
                 try allocator.dupe(u8, detail)
             else
                 try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-            try request_results.append(allocator, .{
+            try appendRequestResult(allocator, request_results, .{
                 .instance = instance_num,
                 .ok = false,
                 .transport = slot.transport,
                 .@"error" = summary,
             });
-            if (opts.verbose) {
-                var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-                const stderr = &stderr_writer.interface;
-                try stderr.print("[request:{d}] fail ({s}): {s}\n", .{ instance_num, slot.transport, summary });
-            }
+            if (opts.verbose) try logRequestFailure(instance_num, slot.transport, summary);
             continue;
         };
         defer allocator.free(result_json);
 
-        const summary = try summarizeResult(allocator, opts.method, result_json);
-        try request_results.append(allocator, .{
-            .instance = instance_num,
-            .ok = true,
-            .transport = slot.transport,
-            .summary = summary,
-            .raw_result = if (opts.raw_sample) try allocator.dupe(u8, result_json) else null,
-        });
+        try appendRequestResult(allocator, request_results, try successfulRequestResult(
+            ctx,
+            instance_num,
+            slot.transport,
+            result_json,
+        ));
         if (opts.verbose) {
-            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stderr_writer = std.Io.File.stderr().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stderr = &stderr_writer.interface;
             try stderr.print("[request:{d}] ok ({s})\n", .{ instance_num, slot.transport });
         }
     }
-    const after_requests = monotonicMillis();
+}
 
-    const requests_ok = countRequestSuccess(request_results.items);
-    const requests_failed = request_results.items.len - requests_ok;
-    const managed_websocket_count = countTransport(request_results.items, "managed_websocket");
-    const websocket_count = countTransport(request_results.items, "websocket");
-    const unix_socket_count = countTransport(request_results.items, "unix_socket");
-    const stdio_count = countTransport(request_results.items, "stdio");
-    const instances_started = request_results.items.len;
-    const sample_results = request_results.items[0..@min(opts.sample, request_results.items.len)];
-    var hook_accumulator = cas.hooks.HookAccumulator.init(opts.hook_policy, hook_log_path);
-    try hook_accumulator.absorbLines(allocator, captured_notifications.items);
+fn reportInstances(
+    ctx: InstanceRun,
+    start_failures: []const StartFailure,
+    request_results: []const RequestResult,
+    captured_notifications: []const []u8,
+    hook_log_path: ?[]const u8,
+    started_at: i64,
+    after_start: i64,
+    after_requests: i64,
+) !bool {
+    const allocator = ctx.allocator;
+    const opts = ctx.opts;
+    const requests_ok = countRequestSuccess(request_results);
+    const requests_failed = request_results.len - requests_ok;
+    const managed_websocket_count = countTransport(request_results, "managed_websocket");
+    const websocket_count = countTransport(request_results, "websocket");
+    const unix_socket_count = countTransport(request_results, "unix_socket");
+    const stdio_count = countTransport(request_results, "stdio");
+    const instances_started = request_results.len;
+    const sample_results = request_results[0..@min(opts.sample, request_results.len)];
+    var hook_accumulator = cas.hooks.HookAccumulator.init(
+        opts.hook_policy,
+        if (hook_log_path) |path| .{ .io = ctx.io, .path = path } else null,
+    );
+    try hook_accumulator.absorbLines(allocator, captured_notifications);
     const hook_summary = hook_accumulator.summary();
     var code_mode_digest_buffer: [64]u8 = undefined;
-    const code_mode_identity: ?CodeModeIdentity = if (code_mode_host) |*host| .{
+    const code_mode_identity: ?CodeModeIdentity = if (ctx.code_mode_host) |host| .{
         .endpoint = host.redacted_origin,
         .digest = host.digestHex(&code_mode_digest_buffer),
     } else null;
 
     const payload = .{
         .demo = "cas-instance-runner",
-        .cwd = cwd,
+        .cwd = ctx.cwd,
         .state_file_dir = opts.state_file_dir,
         .method = opts.method,
-        .params = params,
+        .params = ctx.params,
         .requested_transport = transportName(opts.requested_transport),
         .code_mode_host = code_mode_identity,
         .requestedMultiAgentMode = @as(?[]const u8, null),
@@ -589,7 +681,7 @@ pub fn main(init: std.process.Init) !void {
         .multiAgentModeMetricEligible = false,
         .instances_requested = opts.instances,
         .instances_started = instances_started,
-        .start_failures = start_failures.items,
+        .start_failures = start_failures,
         .requests_ok = requests_ok,
         .requests_failed = requests_failed,
         .transport_counts = .{
@@ -607,44 +699,55 @@ pub fn main(init: std.process.Init) !void {
         .sample_results = sample_results,
     };
 
+    try writeRunReport(opts, payload);
+    return requests_failed == 0 and start_failures.len == 0 and hook_summary.failureCode == null;
+}
+
+fn writeRunReport(opts: ParsedArgs, payload: anytype) !void {
     if (opts.json) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try std.json.Stringify.value(payload, .{ .whitespace = .indent_2 }, stdout);
         try stdout.writeAll("\n");
     } else {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_instance_runner summary\n", .{});
-        try stdout.print("cwd: {s}\n", .{cwd});
-        try stdout.print("method: {s}\n", .{opts.method});
-        try stdout.print("instances requested: {d}\n", .{opts.instances});
-        try stdout.print("instances started:   {d}\n", .{instances_started});
-        try stdout.print("requests ok:      {d}\n", .{requests_ok});
-        try stdout.print("requests failed:  {d}\n", .{requests_failed});
+        try stdout.print("cwd: {s}\n", .{payload.cwd});
+        try stdout.print("method: {s}\n", .{payload.method});
+        try stdout.print("instances requested: {d}\n", .{payload.instances_requested});
+        try stdout.print("instances started:   {d}\n", .{payload.instances_started});
+        try stdout.print("requests ok:      {d}\n", .{payload.requests_ok});
+        try stdout.print("requests failed:  {d}\n", .{payload.requests_failed});
         try stdout.print(
             "transport counts: managed_websocket={d}, websocket={d}, " ++
                 "unix_socket={d}, stdio={d}\n",
             .{
-                managed_websocket_count,
-                websocket_count,
-                unix_socket_count,
-                stdio_count,
+                payload.transport_counts.managed_websocket,
+                payload.transport_counts.websocket,
+                payload.transport_counts.unix_socket,
+                payload.transport_counts.stdio,
             },
         );
         try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
-            hook_summary.policy,
-            hook_summary.observed,
-            hook_summary.failureCode orelse "none",
+            payload.hookSummary.policy,
+            payload.hookSummary.observed,
+            payload.hookSummary.failureCode orelse "none",
         });
         try stdout.print("timing ms: start={d}, request={d}, total={d}\n", .{
-            after_start - started_at,
-            after_requests - after_start,
-            after_requests - started_at,
+            payload.timing_ms.start_all_clients,
+            payload.timing_ms.run_all_requests,
+            payload.timing_ms.total,
         });
-        if (sample_results.len > 0) {
+        if (payload.sample_results.len > 0) {
             try stdout.writeAll("sample results:\n");
-            for (sample_results) |sample| {
+            for (payload.sample_results) |sample| {
                 if (sample.ok) {
                     try stdout.print("- instance {d}: ok ({s}) {s}\n", .{
                         sample.instance,
@@ -661,187 +764,25 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-
-    const ok = requests_failed == 0 and start_failures.items.len == 0 and hook_summary.failureCode == null;
-    std.process.exit(if (ok) 0 else 1);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var methods: std.ArrayList([]const u8) = .empty;
     errdefer methods.deinit(allocator);
-
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (core_cli.isHelpArg(arg)) {
-            out.show_help = true;
-            continue;
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            out.show_version = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--read-only")) {
-            out.read_only = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--json")) {
-            out.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--verbose")) {
-            out.verbose = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--raw-sample")) {
-            out.raw_sample = true;
-            continue;
-        }
-
+        if (parseFlag(&out, arg)) continue;
         i += 1;
         if (i >= argv.len) return error.MissingValue;
         const value = argv[i];
-
-        if (std.mem.eql(u8, arg, "--cwd")) {
-            out.cwd = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--instances")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidInstances;
-            out.instances = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--method")) {
-            out.method = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--params-json")) {
-            out.params_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--params-file")) {
-            out.params_file = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--multi-agent-mode")) {
-            out.multi_agent_mode = cas.MultiAgentMode.parse(value) orelse return error.InvalidMultiAgentMode;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--state-file-dir")) {
-            out.state_file_dir = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--request-timeout-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidTimeout;
-            out.request_timeout_ms = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--server-request-timeout-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed < 0) return error.InvalidServerTimeout;
-            out.server_request_timeout_ms = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--exec-approval")) {
-            out.exec_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--file-approval")) {
-            out.file_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--permissions-approval")) {
-            out.permissions_approval = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--request-user-input-response-json")) {
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
-            defer parsed_json.deinit();
-            out.request_user_input_response_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--elicitation-action")) {
-            out.elicitation_action = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--elicitation-content-json")) {
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
-            defer parsed_json.deinit();
-            out.elicitation_content_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--elicitation-response-json")) {
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
-            defer parsed_json.deinit();
-            out.elicitation_response_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--dynamic-tool-response-json")) {
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
-            defer parsed_json.deinit();
-            out.dynamic_tool_response_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--auth-refresh-response-file")) {
-            out.auth_refresh_response_source = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--attestation-response-file")) {
-            out.attestation_response_source = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--experimental-api")) {
-            out.experimental_api = parseBool(value) orelse return error.InvalidBoolean;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--init-capabilities-json")) {
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
-            defer parsed_json.deinit();
-            if (parsed_json.value != .object) return error.InvalidInitializeCapabilities;
-            out.additional_initialize_capabilities_json = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--codex-path")) {
-            out.codex_path = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--app-server-transport")) {
-            out.requested_transport = cas.app_server_launch.RequestedTransport.parse(value) orelse
-                return error.InvalidTransport;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--app-server-endpoint")) {
-            out.transport_endpoint = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--code-mode-host")) {
-            out.code_mode_host = value;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--hooks")) {
-            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--client-prefix")) {
-            out.client_prefix = value;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--sample")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed < 0) return error.InvalidSample;
-            out.sample = @intCast(parsed);
-            continue;
-        }
-        return error.UnknownArg;
+        try parseValueArg(allocator, &out, arg, value);
     }
-
     if (out.params_json != null and out.params_file != null) return error.DuplicateParamsSource;
     if (out.multi_agent_mode != null) return error.MultiAgentModeRemoved;
     if (std.mem.eql(u8, out.auth_refresh_response_source orelse "", "-") and
@@ -855,6 +796,128 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     );
     out.opt_out_methods = try methods.toOwnedSlice(allocator);
     return out;
+}
+
+fn parseFlag(out: *ParsedArgs, arg: []const u8) bool {
+    if (core_cli.isHelpArg(arg)) {
+        out.show_help = true;
+        return true;
+    }
+    if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+        out.show_version = true;
+        return true;
+    }
+    inline for (.{
+        .{ "--read-only", "read_only" },
+        .{ "--json", "json" },
+        .{ "--verbose", "verbose" },
+        .{ "--raw-sample", "raw_sample" },
+    }) |option| {
+        if (std.mem.eql(u8, arg, option[0])) {
+            @field(out, option[1]) = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseStringArg(out: *ParsedArgs, arg: []const u8, value: []const u8) bool {
+    inline for (.{
+        .{ "--cwd", "cwd" },
+        .{ "--method", "method" },
+        .{ "--params-json", "params_json" },
+        .{ "--params-file", "params_file" },
+        .{ "--state-file-dir", "state_file_dir" },
+        .{ "--exec-approval", "exec_approval" },
+        .{ "--file-approval", "file_approval" },
+        .{ "--permissions-approval", "permissions_approval" },
+        .{ "--elicitation-action", "elicitation_action" },
+        .{ "--auth-refresh-response-file", "auth_refresh_response_source" },
+        .{ "--attestation-response-file", "attestation_response_source" },
+        .{ "--codex-path", "codex_path" },
+        .{ "--app-server-endpoint", "transport_endpoint" },
+        .{ "--code-mode-host", "code_mode_host" },
+        .{ "--client-prefix", "client_prefix" },
+    }) |option| {
+        if (std.mem.eql(u8, arg, option[0])) {
+            @field(out, option[1]) = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseJsonArg(
+    allocator: std.mem.Allocator,
+    out: *ParsedArgs,
+    arg: []const u8,
+    value: []const u8,
+) !bool {
+    inline for (.{
+        .{ "--request-user-input-response-json", "request_user_input_response_json" },
+        .{ "--elicitation-content-json", "elicitation_content_json" },
+        .{ "--elicitation-response-json", "elicitation_response_json" },
+        .{ "--dynamic-tool-response-json", "dynamic_tool_response_json" },
+        .{ "--init-capabilities-json", "additional_initialize_capabilities_json" },
+    }) |option| {
+        if (std.mem.eql(u8, arg, option[0])) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed.deinit();
+            if (comptime std.mem.eql(u8, option[0], "--init-capabilities-json")) {
+                if (parsed.value != .object) return error.InvalidInitializeCapabilities;
+            }
+            @field(out, option[1]) = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseNumericArg(out: *ParsedArgs, arg: []const u8, value: []const u8) !bool {
+    inline for (.{
+        .{ "--instances", "instances", @as(i64, 1), error.InvalidInstances },
+        .{ "--request-timeout-ms", "request_timeout_ms", @as(i64, 1), error.InvalidTimeout },
+        .{ "--server-request-timeout-ms", "server_request_timeout_ms", @as(
+            i64,
+            0,
+        ), error.InvalidServerTimeout },
+        .{ "--sample", "sample", @as(i64, 0), error.InvalidSample },
+    }) |option| {
+        if (std.mem.eql(u8, arg, option[0])) {
+            const parsed = try std.fmt.parseInt(i64, value, 10);
+            if (parsed < option[2]) return option[3];
+            const Field = @TypeOf(@field(out, option[1]));
+            const Integer = switch (@typeInfo(Field)) {
+                .optional => |optional| optional.child,
+                else => Field,
+            };
+            @field(out, option[1]) = std.math.cast(Integer, parsed) orelse return option[3];
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseValueArg(
+    allocator: std.mem.Allocator,
+    out: *ParsedArgs,
+    arg: []const u8,
+    value: []const u8,
+) !void {
+    if (parseStringArg(out, arg, value)) return;
+    if (try parseNumericArg(out, arg, value)) return;
+    if (try parseJsonArg(allocator, out, arg, value)) return;
+    if (std.mem.eql(u8, arg, "--multi-agent-mode")) {
+        out.multi_agent_mode = cas.MultiAgentMode.parse(value) orelse
+            return error.InvalidMultiAgentMode;
+    } else if (std.mem.eql(u8, arg, "--experimental-api")) {
+        out.experimental_api = parseBool(value) orelse return error.InvalidBoolean;
+    } else if (std.mem.eql(u8, arg, "--app-server-transport")) {
+        out.requested_transport = cas.app_server_launch.RequestedTransport.parse(value) orelse
+            return error.InvalidTransport;
+    } else if (std.mem.eql(u8, arg, "--hooks")) {
+        out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
+    } else return error.UnknownArg;
 }
 
 fn parseBool(raw: []const u8) ?bool {
@@ -896,7 +959,12 @@ fn buildParamsJson(
         return allocator.dupe(u8, raw);
     }
     if (params_file) |path| {
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(4 * 1024 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+            allocator,
+            .limited(4 * 1024 * 1024),
+        );
         var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed_json.deinit();
         return raw;
@@ -907,7 +975,11 @@ fn buildParamsJson(
     return allocator.dupe(u8, "{}");
 }
 
-fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json: []const u8) ![]u8 {
+fn summarizeResult(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    result_json: []const u8,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer parsed.deinit();
 
@@ -916,97 +988,17 @@ fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json
         else => return std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{result_json}),
     };
 
-    if (std.mem.eql(u8, method, "thread/list")) {
-        const data_val = root_obj.get("data") orelse return allocator.dupe(u8, "{\"firstThreadId\":null,\"rows\":0}");
-        const arr = switch (data_val) {
-            .array => |a| a,
-            else => return allocator.dupe(u8, "{\"firstThreadId\":null,\"rows\":0}"),
-        };
-        var first_thread_id: ?[]const u8 = null;
-        if (arr.items.len > 0) {
-            switch (arr.items[0]) {
-                .object => |first_obj| {
-                    if (first_obj.get("id")) |id_val| {
-                        first_thread_id = switch (id_val) {
-                            .string => |s| s,
-                            else => null,
-                        };
-                    }
-                },
-                else => {},
-            }
-        }
-        return stringifyAnyAlloc(allocator, .{
-            .firstThreadId = first_thread_id,
-            .rows = arr.items.len,
-        });
-    }
+    if (std.mem.eql(u8, method, "thread/list")) return summarizeThreadList(allocator, root_obj);
 
-    if (std.mem.eql(u8, method, "thread/read")) {
-        const thread_val = root_obj.get("thread") orelse return allocator.dupe(u8, "{\"threadId\":null,\"turns\":null}");
-        const thread_obj = switch (thread_val) {
-            .object => |o| o,
-            else => return allocator.dupe(u8, "{\"threadId\":null,\"turns\":null}"),
-        };
-        const thread_id = if (thread_obj.get("id")) |id_val|
-            switch (id_val) {
-                .string => |s| s,
-                else => null,
-            }
-        else
-            null;
-        const turns_count = if (thread_obj.get("turns")) |turns_val|
-            switch (turns_val) {
-                .array => |arr| @as(?usize, arr.items.len),
-                else => null,
-            }
-        else
-            null;
-        return stringifyAnyAlloc(allocator, .{
-            .threadId = thread_id,
-            .turns = turns_count,
-        });
-    }
+    if (std.mem.eql(u8, method, "thread/read")) return summarizeThreadRead(allocator, root_obj);
 
-    if (std.mem.eql(u8, method, "thread/unsubscribe")) {
-        const status = if (root_obj.get("status")) |status_val|
-            switch (status_val) {
-                .string => |s| s,
-                else => null,
-            }
-        else
-            null;
-        return stringifyAnyAlloc(allocator, .{
-            .status = status,
-        });
-    }
+    if (std.mem.eql(
+        u8,
+        method,
+        "thread/unsubscribe",
+    )) return summarizeThreadUnsubscribe(allocator, root_obj);
 
-    if (std.mem.eql(u8, method, "turn/start")) {
-        const turn_val = root_obj.get("turn") orelse return allocator.dupe(u8, "{\"turnId\":null,\"status\":null}");
-        const turn_obj = switch (turn_val) {
-            .object => |o| o,
-            else => return allocator.dupe(u8, "{\"turnId\":null,\"status\":null}"),
-        };
-        const turn_id = if (turn_obj.get("id")) |id_val|
-            switch (id_val) {
-                .string => |s| s,
-                else => null,
-            }
-        else
-            null;
-        const status = if (turn_obj.get("status")) |status_val|
-            switch (status_val) {
-                .string => |s| s,
-                else => null,
-            }
-        else
-            null;
-        return stringifyAnyAlloc(allocator, .{
-            .turnId = turn_id,
-            .status = status,
-        });
-    }
-
+    if (std.mem.eql(u8, method, "turn/start")) return summarizeTurnStart(allocator, root_obj);
     // Generic object summary: first 8 keys.
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -1021,6 +1013,106 @@ fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json
     }
     try out.writer.writeAll("]}");
     return out.toOwnedSlice();
+}
+
+fn summarizeThreadList(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) ![]u8 {
+    const data_val = root_obj.get("data") orelse return allocator.dupe(
+        u8,
+        "{\"firstThreadId\":null,\"rows\":0}",
+    );
+    const arr = switch (data_val) {
+        .array => |a| a,
+        else => return allocator.dupe(u8, "{\"firstThreadId\":null,\"rows\":0}"),
+    };
+    var first_thread_id: ?[]const u8 = null;
+    if (arr.items.len > 0) {
+        switch (arr.items[0]) {
+            .object => |first_obj| {
+                if (first_obj.get("id")) |id_val| {
+                    first_thread_id = switch (id_val) {
+                        .string => |s| s,
+                        else => null,
+                    };
+                }
+            },
+            else => {},
+        }
+    }
+    return stringifyAnyAlloc(allocator, .{
+        .firstThreadId = first_thread_id,
+        .rows = arr.items.len,
+    });
+}
+
+fn summarizeThreadRead(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) ![]u8 {
+    const thread_val = root_obj.get("thread") orelse return allocator.dupe(
+        u8,
+        "{\"threadId\":null,\"turns\":null}",
+    );
+    const thread_obj = switch (thread_val) {
+        .object => |o| o,
+        else => return allocator.dupe(u8, "{\"threadId\":null,\"turns\":null}"),
+    };
+    const thread_id = if (thread_obj.get("id")) |id_val|
+        switch (id_val) {
+            .string => |s| s,
+            else => null,
+        }
+    else
+        null;
+    const turns_count = if (thread_obj.get("turns")) |turns_val|
+        switch (turns_val) {
+            .array => |arr| @as(?usize, arr.items.len),
+            else => null,
+        }
+    else
+        null;
+    return stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .turns = turns_count,
+    });
+}
+
+fn summarizeThreadUnsubscribe(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) ![]u8 {
+    const status = if (root_obj.get("status")) |status_val|
+        switch (status_val) {
+            .string => |s| s,
+            else => null,
+        }
+    else
+        null;
+    return stringifyAnyAlloc(allocator, .{
+        .status = status,
+    });
+}
+
+fn summarizeTurnStart(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) ![]u8 {
+    const turn_val = root_obj.get("turn") orelse return allocator.dupe(
+        u8,
+        "{\"turnId\":null,\"status\":null}",
+    );
+    const turn_obj = switch (turn_val) {
+        .object => |o| o,
+        else => return allocator.dupe(u8, "{\"turnId\":null,\"status\":null}"),
+    };
+    const turn_id = if (turn_obj.get("id")) |id_val|
+        switch (id_val) {
+            .string => |s| s,
+            else => null,
+        }
+    else
+        null;
+    const status = if (turn_obj.get("status")) |status_val|
+        switch (status_val) {
+            .string => |s| s,
+            else => null,
+        }
+    else
+        null;
+    return stringifyAnyAlloc(allocator, .{
+        .turnId = turn_id,
+        .status = status,
+    });
 }
 
 fn monotonicMillis() i64 {
@@ -1102,10 +1194,22 @@ test "parseArgs accepts extended server request controls" {
     defer std.testing.allocator.free(parsed.opt_out_methods);
 
     try std.testing.expectEqual(@as(?[]const u8, "grant-session"), parsed.permissions_approval);
-    try std.testing.expectEqual(@as(?[]const u8, "{\"answers\":{\"mode\":{\"answers\":[\"fast\"]}}}"), parsed.request_user_input_response_json);
+    try std.testing.expectEqual(
+        @as(?[]const u8, "{\"answers\":{\"mode\":{\"answers\":[\"fast\"]}}}"),
+        parsed.request_user_input_response_json,
+    );
     try std.testing.expectEqual(@as(?[]const u8, "accept"), parsed.elicitation_action);
-    try std.testing.expectEqual(@as(?[]const u8, "{\"confirmed\":true}"), parsed.elicitation_content_json);
-    try std.testing.expectEqual(@as(?[]const u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}],\"success\":true}"), parsed.dynamic_tool_response_json);
+    try std.testing.expectEqual(
+        @as(?[]const u8, "{\"confirmed\":true}"),
+        parsed.elicitation_content_json,
+    );
+    try std.testing.expectEqual(
+        @as(
+            ?[]const u8,
+            "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}],\"success\":true}",
+        ),
+        parsed.dynamic_tool_response_json,
+    );
 }
 
 test "parseArgs accepts typed transport initialization and secret sources" {
@@ -1217,7 +1321,10 @@ test "parseArgs rejects duplicate parameter sources" {
         "params.json",
     };
 
-    try std.testing.expectError(error.DuplicateParamsSource, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(
+        error.DuplicateParamsSource,
+        parseArgs(std.testing.allocator, &argv),
+    );
 }
 
 test "parseArgs rejects removed multi-agent mode for turn start" {
@@ -1231,7 +1338,10 @@ test "parseArgs rejects removed multi-agent mode for turn start" {
         "proactive",
     };
 
-    try std.testing.expectError(error.MultiAgentModeRemoved, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(
+        error.MultiAgentModeRemoved,
+        parseArgs(std.testing.allocator, &argv),
+    );
 }
 
 test "parseArgs rejects removed multi-agent mode for thread list" {
@@ -1245,7 +1355,10 @@ test "parseArgs rejects removed multi-agent mode for thread list" {
         "proactive",
     };
 
-    try std.testing.expectError(error.MultiAgentModeRemoved, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(
+        error.MultiAgentModeRemoved,
+        parseArgs(std.testing.allocator, &argv),
+    );
 }
 
 test "buildParamsJson preserves caller-owned raw parameters" {
@@ -1290,7 +1403,10 @@ test "summarizeResult returns thread/list compact summary" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
     try std.testing.expectEqual(@as(?i64, 2), cas.intField(parsed.value.object, "rows"));
-    try std.testing.expectEqualStrings("thr_1", cas.stringField(parsed.value.object, "firstThreadId").?);
+    try std.testing.expectEqualStrings(
+        "thr_1",
+        cas.stringField(parsed.value.object, "firstThreadId").?,
+    );
 }
 
 test "summarizeResult returns turn/start compact summary" {
@@ -1305,5 +1421,72 @@ test "summarizeResult returns turn/start compact summary" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
     try std.testing.expectEqualStrings("turn_1", cas.stringField(parsed.value.object, "turnId").?);
-    try std.testing.expectEqualStrings("inProgress", cas.stringField(parsed.value.object, "status").?);
+    try std.testing.expectEqualStrings(
+        "inProgress",
+        cas.stringField(parsed.value.object, "status").?,
+    );
+}
+
+fn logRequestFailure(instance_num: usize, transport: []const u8, summary: []const u8) !void {
+    var stderr_writer = std.Io.File.stderr().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
+    const stderr = &stderr_writer.interface;
+    try stderr.print(
+        "[request:{d}] fail ({s}): {s}\n",
+        .{ instance_num, transport, summary },
+    );
+}
+
+fn closeInstanceSlot(allocator: std.mem.Allocator, slot: *?InstanceSlot) void {
+    const owned = if (slot.*) |*value| value else return;
+    owned.client.close();
+    owned.client.deinit();
+    if (owned.managed_server) |*server| {
+        server.kill();
+        server.deinit(allocator);
+    }
+    slot.* = null;
+}
+
+fn freeRequestResult(allocator: std.mem.Allocator, result: RequestResult) void {
+    if (result.summary) |value| allocator.free(value);
+    if (result.raw_result) |value| allocator.free(value);
+    if (result.@"error") |value| allocator.free(value);
+}
+
+fn appendRequestResult(
+    allocator: std.mem.Allocator,
+    results: *std.ArrayList(RequestResult),
+    result: RequestResult,
+) !void {
+    errdefer freeRequestResult(allocator, result);
+    try results.append(allocator, result);
+}
+
+fn successfulRequestResult(
+    ctx: InstanceRun,
+    instance: usize,
+    transport: []const u8,
+    json: []const u8,
+) !RequestResult {
+    const summary = try summarizeResult(ctx.allocator, ctx.opts.method, json);
+    errdefer ctx.allocator.free(summary);
+    return .{
+        .instance = instance,
+        .ok = true,
+        .transport = transport,
+        .summary = summary,
+        .raw_result = if (ctx.opts.raw_sample) try ctx.allocator.dupe(u8, json) else null,
+    };
+}
+
+test "parseArgs rejects timeout values outside the client integer domain" {
+    try std.testing.expectError(error.InvalidTimeout, parseArgs(std.testing.allocator, &.{
+        "cas_instance_runner", "--request-timeout-ms", "4294967296",
+    }));
+    try std.testing.expectError(error.InvalidServerTimeout, parseArgs(std.testing.allocator, &.{
+        "cas_instance_runner", "--server-request-timeout-ms", "4294967296",
+    }));
 }

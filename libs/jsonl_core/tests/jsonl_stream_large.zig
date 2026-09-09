@@ -7,10 +7,11 @@ const RepeatingReader = struct {
     pattern_pos: usize = 0,
     interface: std.Io.Reader,
 
-    fn init(pattern: []const u8, repeat_count: usize) RepeatingReader {
+    fn init(pattern: []const u8, repeat_count: usize) !RepeatingReader {
+        std.debug.assert(pattern.len > 0);
         return .{
             .pattern = pattern,
-            .remaining = pattern.len * repeat_count,
+            .remaining = try std.math.mul(usize, pattern.len, repeat_count),
             .interface = .{
                 .vtable = &.{ .stream = stream },
                 .buffer = &.{},
@@ -20,7 +21,11 @@ const RepeatingReader = struct {
         };
     }
 
-    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *RepeatingReader = @fieldParentPtr("interface", reader);
         if (self.remaining == 0) return error.EndOfStream;
 
@@ -29,7 +34,8 @@ const RepeatingReader = struct {
         while (allowed > 0) {
             const available = self.pattern.len - self.pattern_pos;
             const requested = @min(available, allowed);
-            const n = try writer.write(self.pattern[self.pattern_pos .. self.pattern_pos + requested]);
+            const bytes = self.pattern[self.pattern_pos .. self.pattern_pos + requested];
+            const n = try writer.write(bytes);
             self.pattern_pos = (self.pattern_pos + n) % self.pattern.len;
             self.remaining -= n;
             allowed -= n;
@@ -46,7 +52,7 @@ test "stream has no aggregate source-size ceiling" {
     pattern[pattern.len - 1] = '\n';
     const repeat_count = (old_aggregate_limit / pattern.len) + 1;
 
-    var source = RepeatingReader.init(&pattern, repeat_count);
+    var source = try RepeatingReader.init(&pattern, repeat_count);
     var records = try jsonl_stream.Stream.init(std.testing.allocator, &source.interface, .{});
     defer records.deinit();
 

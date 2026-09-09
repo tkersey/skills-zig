@@ -217,9 +217,10 @@ pub fn selectDueAutomations(
     allocator: std.mem.Allocator,
     db: *store.Db,
     now: i64,
-    limit: usize,
+    limit: i64,
     automation_id: ?[]const u8,
 ) !std.ArrayList(store.AutomationRow) {
+    if (limit < 1) return userErrorFmt("--limit must be >= 1", .{});
     var rows = std.ArrayList(store.AutomationRow).empty;
 
     if (automation_id) |id_value| {
@@ -254,7 +255,7 @@ pub fn selectDueAutomations(
     var stmt = try db.prepare(allocator, select_due_sql);
     defer stmt.deinit();
 
-    try stmt.bindAll(&.{ .{ .int = now }, .{ .int = @intCast(limit) } });
+    try stmt.bindAll(&.{ .{ .int = now }, .{ .int = limit } });
 
     while (true) { // tiger: event-loop -- SQLite ends the row stream with `.done`.
         switch (try stmt.step()) {

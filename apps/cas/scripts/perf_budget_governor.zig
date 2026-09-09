@@ -106,8 +106,18 @@ pub fn main(init: std.process.Init) !void {
     const config = loadConfig(allocator, cli.config_path) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), cli.config_path);
     };
-    if (config.rounds < 3) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidRounds", cli.config_path);
-    if (config.iterations < 100) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidIterations", cli.config_path);
+    if (config.rounds < 3) core_cli.exitUsageFailure(
+        HelpSurface,
+        Version,
+        "InvalidRounds",
+        cli.config_path,
+    );
+    if (config.iterations < 100) core_cli.exitUsageFailure(
+        HelpSurface,
+        Version,
+        "InvalidIterations",
+        cli.config_path,
+    );
 
     const summary = try benchmarkGovernor(allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
@@ -116,7 +126,10 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(
+        std.Io.Threaded.global_single_threaded.io(),
+        &.{},
+    );
     const stdout = &stdout_writer.interface;
     try stdout.print("rounds={d}\n", .{summary.rounds});
     try stdout.print("eval_count={d}\n", .{summary.eval_count});
@@ -125,13 +138,17 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("p50_alloc_calls_per_eval={d}\n", .{summary.p50_alloc_calls_per_eval});
     if (previous_artifact) |artifact| {
         try stdout.print("trend_previous_p95_ns_per_eval={d}\n", .{artifact.p95_ns_per_eval});
-        try stdout.print("trend_previous_p50_alloc_calls_per_eval={d}\n", .{artifact.p50_alloc_calls_per_eval});
+        try stdout.print(
+            "trend_previous_p50_alloc_calls_per_eval={d}\n",
+            .{artifact.p50_alloc_calls_per_eval},
+        );
         try stdout.print("trend_tolerance_pct={d:.2}\n", .{trend_tolerance_pct});
     }
 
     if (!cli.report_only) {
         if (summary.p95_ns_per_eval > config.max_p95_ns_per_eval) return error.PerfGateFailed;
-        if (summary.p50_alloc_calls_per_eval > config.max_p50_alloc_calls_per_eval) return error.AllocGateFailed;
+        if (summary.p50_alloc_calls_per_eval > config.max_p50_alloc_calls_per_eval)
+            return error.AllocGateFailed;
         if (previous_artifact) |artifact| {
             try enforceTrendGate(summary, artifact, trend_tolerance_pct);
         }
@@ -152,13 +169,19 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(
+                std.Io.Threaded.global_single_threaded.io(),
+                &.{},
+            );
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
@@ -203,7 +226,12 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
 }
 
 fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(1 * 1024 * 1024),
+    );
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -217,9 +245,12 @@ fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
     var out = PerfConfig{};
     if (root.get("iterations")) |v| out.iterations = try core_perf.intFieldToUsize(v);
     if (root.get("rounds")) |v| out.rounds = try core_perf.intFieldToUsize(v);
-    if (root.get("max_p95_ns_per_eval")) |v| out.max_p95_ns_per_eval = try core_perf.intFieldToU64(v);
-    if (root.get("max_p50_alloc_calls_per_eval")) |v| out.max_p50_alloc_calls_per_eval = try core_perf.intFieldToU64(v);
-    if (root.get("trend_tolerance_pct")) |v| out.trend_tolerance_pct = try core_perf.floatFieldToF64(v);
+    if (root.get("max_p95_ns_per_eval")) |v|
+        out.max_p95_ns_per_eval = try core_perf.intFieldToU64(v);
+    if (root.get("max_p50_alloc_calls_per_eval")) |v|
+        out.max_p50_alloc_calls_per_eval = try core_perf.intFieldToU64(v);
+    if (root.get("trend_tolerance_pct")) |v|
+        out.trend_tolerance_pct = try core_perf.floatFieldToF64(v);
     return out;
 }
 
@@ -244,25 +275,34 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
         .eval_count = eval_count orelse 0,
         .p50_ns_per_eval = try core_perf.percentileU64(allocator, ns_per_eval_samples, 50),
         .p95_ns_per_eval = try core_perf.percentileU64(allocator, ns_per_eval_samples, 95),
-        .p50_alloc_calls_per_eval = try core_perf.percentileU64(allocator, alloc_calls_per_eval_samples, 50),
+        .p50_alloc_calls_per_eval = try core_perf.percentileU64(
+            allocator,
+            alloc_calls_per_eval_samples,
+            50,
+        ),
     };
 }
 
 fn runRound(iterations: usize) !RoundStats {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
+    defer std.debug.assert(gpa_state.deinit() == .ok);
 
     var counting = CountingAllocator.init(gpa_state.allocator());
     const alloc = counting.allocator();
 
-    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+    const start_ns =
+        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     var ok_count: usize = 0;
     for (0..iterations) |i| {
         const payload = sample_payloads[i % sample_payloads.len];
-        const out = try governor.computeBudgetGovernorFromSlice(alloc, payload, 1_700_000_000);
-        if (out.ok) ok_count += 1;
+        var out = try governor.computeBudgetGovernorFromSlice(alloc, payload, 1_700_000_000);
+        defer out.deinit();
+        if (out.value.ok) ok_count += 1;
     }
-    const elapsed_ns: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
+    const elapsed_ns: u64 = @intCast(@max(
+        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns,
+        1,
+    ));
     if (ok_count == 0) return error.AllEvaluationsFailed;
 
     return .{
@@ -273,11 +313,18 @@ fn runRound(iterations: usize) !RoundStats {
 }
 
 fn enforceTrendGate(summary: PerfSummary, previous: BenchmarkArtifact, tolerance_pct: f64) !void {
-    const max_p95_ns_per_eval = core_perf.allowedUpperBoundWithTolerance(previous.p95_ns_per_eval, tolerance_pct);
-    const max_p50_alloc_calls_per_eval = core_perf.allowedUpperBoundWithTolerance(previous.p50_alloc_calls_per_eval, tolerance_pct);
+    const max_p95_ns_per_eval = core_perf.allowedUpperBoundWithTolerance(
+        previous.p95_ns_per_eval,
+        tolerance_pct,
+    );
+    const max_p50_alloc_calls_per_eval = core_perf.allowedUpperBoundWithTolerance(
+        previous.p50_alloc_calls_per_eval,
+        tolerance_pct,
+    );
 
     if (summary.p95_ns_per_eval > max_p95_ns_per_eval) return error.TrendRegression;
-    if (summary.p50_alloc_calls_per_eval > max_p50_alloc_calls_per_eval) return error.TrendRegression;
+    if (summary.p50_alloc_calls_per_eval > max_p50_alloc_calls_per_eval)
+        return error.TrendRegression;
 }
 
 fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
@@ -321,9 +368,16 @@ fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
     var writer = file.writer(io, &.{});
     const out = &writer.interface;
     try out.print(
-        "{{\n  \"captured_unix_s\": {d},\n  \"p95_ns_per_eval\": {d},\n  \"p50_alloc_calls_per_eval\": {d}\n}}\n",
+        "{{\n  \"captured_unix_s\": {d},\n  \"p95_ns_per_eval\": {d},\n  \"" ++
+            "p50_alloc_calls_per_eval\": {d}\n}}\n",
         .{
-            @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))),
+            @as(
+                i64,
+                @intCast(@divFloor(
+                    std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+                    1_000_000_000,
+                )),
+            ),
             summary.p95_ns_per_eval,
             summary.p50_alloc_calls_per_eval,
         },

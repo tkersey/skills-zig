@@ -1,3 +1,4 @@
+const core_calendar = @import("core_calendar");
 const app_meta = @import("app_meta");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
@@ -236,7 +237,7 @@ fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
     };
     try validateCommon(root);
     try validatePayload(extension, kind, root);
-    try rejectSensitiveKeys(parsed.value);
+    try rejectSensitiveKeys(allocator, parsed.value);
 
     const fingerprint = try fingerprintInputAlloc(allocator, extension, kind, input);
     defer allocator.free(fingerprint);
@@ -249,7 +250,15 @@ fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
     defer allocator.free(slug);
     const filename = try filenameAlloc(allocator, now, kind, slug, fp16);
     defer allocator.free(filename);
-    const note = try renderEnvelopeAlloc(allocator, id, now, extension, kind, fingerprint, parsed.value);
+    const note = try renderEnvelopeAlloc(
+        allocator,
+        id,
+        now,
+        extension,
+        kind,
+        fingerprint,
+        parsed.value,
+    );
     defer allocator.free(note);
     if (note.len > MaxNoteBytes) return error.OutputTooLarge;
 
@@ -285,7 +294,12 @@ fn cmdList(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     try validateExtension(extension);
     const notes_dir = try notesDirAlloc(allocator, env, args.codex_home, extension);
     defer allocator.free(notes_dir);
-    const names = durable_store.listSortedRegularFilesNoSymlink(allocator, notes_dir, MaxFiles, MaxNoteBytes) catch |err| switch (err) {
+    const names = durable_store.listSortedRegularFilesNoSymlink(
+        allocator,
+        notes_dir,
+        MaxFiles,
+        MaxNoteBytes,
+    ) catch |err| switch (err) {
         error.FileNotFound => &[_][]u8{},
         else => return err,
     };
@@ -305,7 +319,10 @@ fn cmdList(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
         defer allocator.free(path);
         const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
         defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
         defer parsed.deinit();
         const note = parseNoteSummary(parsed.value) catch continue;
         if (args.kind) |wanted| {
@@ -328,16 +345,25 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     try validateExtension(extension);
     const notes_dir = try notesDirAlloc(allocator, env, args.codex_home, extension);
     defer allocator.free(notes_dir);
-    const names = try durable_store.listSortedRegularFilesNoSymlink(allocator, notes_dir, MaxFiles, MaxNoteBytes);
+    const names = try durable_store.listSortedRegularFilesNoSymlink(
+        allocator,
+        notes_dir,
+        MaxFiles,
+        MaxNoteBytes,
+    );
     defer durable_store.freeStringList(allocator, names);
 
     var found: ?[]u8 = null;
+    defer if (found) |owned| allocator.free(owned);
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
         defer allocator.free(path);
         const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
         defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
         defer parsed.deinit();
         const note = parseNoteSummary(parsed.value) catch continue;
         if (std.mem.eql(u8, note.id, id)) {
@@ -346,7 +372,6 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
         }
     }
     const payload = found orelse return error.NotFound;
-    defer allocator.free(payload);
     if (std.mem.eql(u8, args.format, "raw") or std.mem.eql(u8, args.format, "json")) {
         try writeStdoutBytes(payload);
         try writeStdoutBytes("\n");
@@ -380,14 +405,20 @@ fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
             try writeDoctorFailureJson(w, err, diagnostic);
             continue;
         };
-        const names = try durable_store.listSortedRegularFilesNoSymlink(allocator, notes_dir, MaxFiles, MaxNoteBytes);
+        const names = try durable_store.listSortedRegularFilesNoSymlink(
+            allocator,
+            notes_dir,
+            MaxFiles,
+            MaxNoteBytes,
+        );
         defer durable_store.freeStringList(allocator, names);
         for (names) |name| {
             const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
             defer allocator.free(path);
             const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
             defer allocator.free(raw);
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 issues += 1;
                 continue;
             };
@@ -430,13 +461,46 @@ fn validateExtension(extension: []const u8) !void {
 fn validateExtensionKind(extension: []const u8, kind: []const u8) !void {
     try validateExtension(extension);
     if (std.mem.eql(u8, extension, "harness")) {
-        if (oneOf(kind, &.{ "harness-rule", "harness-confirmation", "harness-supersession", "harness-retraction" })) return;
+        if (oneOf(
+            kind,
+            &.{
+                "harness-rule",
+                "harness-confirmation",
+                "harness-supersession",
+                "harness-retraction",
+            },
+        )) return;
     } else if (std.mem.eql(u8, extension, "learnings")) {
-        if (oneOf(kind, &.{ "learning-admission", "learning-confirmation", "learning-supersession", "learning-withdrawal" })) return;
+        if (oneOf(
+            kind,
+            &.{
+                "learning-admission",
+                "learning-confirmation",
+                "learning-supersession",
+                "learning-withdrawal",
+            },
+        )) return;
     } else if (std.mem.eql(u8, extension, "negative-ledger")) {
-        if (oneOf(kind, &.{ "ledger-projection", "ledger-status-transition", "ledger-supersession", "ledger-retraction" })) return;
+        if (oneOf(
+            kind,
+            &.{
+                "ledger-projection",
+                "ledger-status-transition",
+                "ledger-supersession",
+                "ledger-retraction",
+            },
+        )) return;
     } else if (std.mem.eql(u8, extension, "synesthesia")) {
-        if (oneOf(kind, &.{ "mapping-endorsement", "mapping-correction", "mapping-rejection", "activation-boundary", "boundary-retraction" })) return;
+        if (oneOf(
+            kind,
+            &.{
+                "mapping-endorsement",
+                "mapping-correction",
+                "mapping-rejection",
+                "activation-boundary",
+                "boundary-retraction",
+            },
+        )) return;
     }
     return error.InvalidKind;
 }
@@ -459,6 +523,49 @@ fn validateCommon(root: std.json.ObjectMap) !void {
     if (payload != .object or payload.object.count() == 0) return error.InvalidJson;
 }
 
+const HarnessPayloadFields = &.{
+    "harness_rule",
+    "trigger",
+    "preferred_behavior",
+    "failure_avoided",
+    "verification_cue",
+};
+
+const LearningPayloadFields = &.{
+    "learning_id",
+    "learning_status",
+    "repo",
+    "source_path",
+    "decision_delta",
+    "future_behavior",
+    "verification",
+};
+
+const NegativePayloadFields = &.{
+    "neg_id",
+    "record_version",
+    "ledger_path",
+    "projection_fingerprint",
+    "status",
+    "kind",
+    "artifact_state_id",
+    "hypothesis",
+    "attempted_change",
+    "observed_outcome",
+    "failure_class",
+    "exclusion_scope",
+    "confidence",
+    "next_search_hint",
+};
+
+const MappingPayloadFields = &.{
+    "sensory_phrase",
+    "activation_boundary",
+    "scope",
+    "endorsement_type",
+    "verification",
+};
+
 fn validatePayload(extension: []const u8, kind: []const u8, root: std.json.ObjectMap) !void {
     const payload_value = root.get("payload") orelse return error.InvalidJson;
     const payload = switch (payload_value) {
@@ -466,16 +573,42 @@ fn validatePayload(extension: []const u8, kind: []const u8, root: std.json.Objec
         else => return error.InvalidJson,
     };
     if (std.mem.eql(u8, extension, "harness") and std.mem.eql(u8, kind, "harness-rule")) {
-        try requirePayloadStrings(payload, &.{ "harness_rule", "trigger", "preferred_behavior", "failure_avoided", "verification_cue" });
+        try requirePayloadStrings(
+            payload,
+            HarnessPayloadFields,
+        );
         if (payload.get("evidence_count") == null) return error.InvalidPayload;
-    } else if (std.mem.eql(u8, extension, "learnings") and std.mem.eql(u8, kind, "learning-admission")) {
-        try requirePayloadStrings(payload, &.{ "learning_id", "learning_status", "repo", "source_path", "decision_delta", "future_behavior", "verification" });
+    } else if (std.mem.eql(u8, extension, "learnings") and std.mem.eql(
+        u8,
+        kind,
+        "learning-admission",
+    )) {
+        try requirePayloadStrings(
+            payload,
+            LearningPayloadFields,
+        );
         if (payload.get("evidence_snapshot") == null) return error.InvalidPayload;
-    } else if (std.mem.eql(u8, extension, "negative-ledger") and std.mem.eql(u8, kind, "ledger-projection")) {
-        try requirePayloadStrings(payload, &.{ "neg_id", "record_version", "ledger_path", "projection_fingerprint", "status", "kind", "artifact_state_id", "hypothesis", "attempted_change", "observed_outcome", "failure_class", "exclusion_scope", "confidence", "next_search_hint" });
-    } else if (std.mem.eql(u8, extension, "synesthesia") and std.mem.startsWith(u8, kind, "mapping-")) {
-        try requirePayloadStrings(payload, &.{ "sensory_phrase", "activation_boundary", "scope", "endorsement_type", "verification" });
-        if (!std.mem.eql(u8, kind, "mapping-rejection")) _ = stringField(payload, "engineering_translation") orelse return error.InvalidPayload;
+    } else if (std.mem.eql(
+        u8,
+        extension,
+        "negative-ledger",
+    ) and std.mem.eql(u8, kind, "ledger-projection")) {
+        try requirePayloadStrings(
+            payload,
+            NegativePayloadFields,
+        );
+    } else if (std.mem.eql(u8, extension, "synesthesia") and
+        std.mem.startsWith(u8, kind, "mapping-"))
+    {
+        try requirePayloadStrings(
+            payload,
+            MappingPayloadFields,
+        );
+        if (!std.mem.eql(
+            u8,
+            kind,
+            "mapping-rejection",
+        )) _ = stringField(payload, "engineering_translation") orelse return error.InvalidPayload;
     }
 }
 
@@ -485,22 +618,64 @@ fn requirePayloadStrings(payload: std.json.ObjectMap, comptime fields: []const [
     }
 }
 
-fn rejectSensitiveKeys(value: std.json.Value) !void {
-    switch (value) {
-        .object => |object| {
-            var iter = object.iterator();
-            while (iter.next()) |entry| {
-                if (isSensitiveKey(entry.key_ptr.*)) return error.SensitiveKey;
-                try rejectSensitiveKeys(entry.value_ptr.*);
-            }
-        },
-        .array => |array| for (array.items) |item| try rejectSensitiveKeys(item),
-        else => {},
+const SensitiveFrame = struct {
+    value: std.json.Value,
+    next: usize = 0,
+};
+
+fn rejectSensitiveKeys(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    var stack: std.ArrayList(SensitiveFrame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .value = value });
+    // Every node requires at least one input byte; every parent requires two delimiters.
+    // Heap frames borrow the parsed owner only for this call and preserve depth-first order.
+    var visited: usize = 1;
+    while (stack.items.len > 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        const child: std.json.Value = switch (frame.value) {
+            .object => |object| blk: {
+                if (frame.next == object.count()) {
+                    _ = stack.pop();
+                    continue;
+                }
+                if (isSensitiveKey(object.keys()[frame.next])) return error.SensitiveKey;
+                break :blk object.values()[frame.next];
+            },
+            .array => |array| blk: {
+                if (frame.next == array.items.len) {
+                    _ = stack.pop();
+                    continue;
+                }
+                break :blk array.items[frame.next];
+            },
+            else => {
+                _ = stack.pop();
+                continue;
+            },
+        };
+        frame.next += 1;
+        if (visited == MaxInputBytes) return error.InputTooLarge;
+        visited += 1;
+        if (stack.items.len == MaxInputBytes / 2 + 1) return error.InputTooLarge;
+        try stack.append(allocator, .{ .value = child });
     }
 }
 
 fn isSensitiveKey(key: []const u8) bool {
-    return oneOfAsciiLower(key, &.{ "password", "passwd", "secret", "api_key", "apikey", "access_token", "refresh_token", "private_key", "client_secret" });
+    return oneOfAsciiLower(
+        key,
+        &.{
+            "password",
+            "passwd",
+            "secret",
+            "api_key",
+            "apikey",
+            "access_token",
+            "refresh_token",
+            "private_key",
+            "client_secret",
+        },
+    );
 }
 
 fn oneOfAsciiLower(value: []const u8, comptime values: []const []const u8) bool {
@@ -518,26 +693,43 @@ fn readJsonInput(allocator: std.mem.Allocator, json_path: []const u8) ![]u8 {
     return durable_store.readFileAlloc(allocator, json_path, MaxInputBytes + 1);
 }
 
-fn codexHomeAlloc(allocator: std.mem.Allocator, env: *std.process.Environ.Map, override: ?[]const u8) ![]u8 {
+fn codexHomeAlloc(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    override: ?[]const u8,
+) ![]u8 {
     if (override) |path| return allocator.dupe(u8, path);
     if (env.get("CODEX_HOME")) |path| return allocator.dupe(u8, path);
     if (env.get("HOME")) |home| return std.fs.path.join(allocator, &.{ home, ".codex" });
     return error.MissingCodexHome;
 }
 
-fn notesDirAlloc(allocator: std.mem.Allocator, env: *std.process.Environ.Map, override: ?[]const u8, extension: []const u8) ![]u8 {
+fn notesDirAlloc(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    override: ?[]const u8,
+    extension: []const u8,
+) ![]u8 {
     const home = try codexHomeAlloc(allocator, env, override);
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, "memories", "extensions", extension, "notes" });
 }
 
-fn doctorPathDiagnosticAlloc(allocator: std.mem.Allocator, checked_path: []const u8, issue: anyerror) !DoctorPathDiagnostic {
+fn doctorPathDiagnosticAlloc(
+    allocator: std.mem.Allocator,
+    checked_path: []const u8,
+    issue: anyerror,
+) !DoctorPathDiagnostic {
     var diagnostic = DoctorPathDiagnostic{ .checked_path = checked_path };
     errdefer diagnostic.deinit(allocator);
 
     var it = std.fs.path.componentIterator(checked_path);
     while (it.next()) |component| {
-        const stat = std.Io.Dir.cwd().statFile(Io.io(), component.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const stat = std.Io.Dir.cwd().statFile(
+            Io.io(),
+            component.path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return diagnostic,
         };
@@ -555,7 +747,12 @@ fn doctorPathDiagnosticAlloc(allocator: std.mem.Allocator, checked_path: []const
     return diagnostic;
 }
 
-fn memoryNoteLockPathAlloc(allocator: std.mem.Allocator, env: *std.process.Environ.Map, override: ?[]const u8, extension: []const u8) ![]u8 {
+fn memoryNoteLockPathAlloc(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    override: ?[]const u8,
+    extension: []const u8,
+) ![]u8 {
     const home = try codexHomeAlloc(allocator, env, override);
     defer allocator.free(home);
     const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{extension});
@@ -563,7 +760,12 @@ fn memoryNoteLockPathAlloc(allocator: std.mem.Allocator, env: *std.process.Envir
     return std.fs.path.join(allocator, &.{ home, ".memory-note", "locks", lock_name });
 }
 
-fn fingerprintInputAlloc(allocator: std.mem.Allocator, extension: []const u8, kind: []const u8, input: []const u8) ![]u8 {
+fn fingerprintInputAlloc(
+    allocator: std.mem.Allocator,
+    extension: []const u8,
+    kind: []const u8,
+    input: []const u8,
+) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(extension);
     hasher.update("\n");
@@ -577,14 +779,42 @@ fn fingerprintInputAlloc(allocator: std.mem.Allocator, extension: []const u8, ki
 }
 
 fn noteIdAlloc(allocator: std.mem.Allocator, iso: []const u8, fp16: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "MSN-{s}{s}{s}T{s}{s}{s}Z-{s}", .{ iso[0..4], iso[5..7], iso[8..10], iso[11..13], iso[14..16], iso[17..19], fp16 });
+    return std.fmt.allocPrint(
+        allocator,
+        "MSN-{s}{s}{s}T{s}{s}{s}Z-{s}",
+        .{ iso[0..4], iso[5..7], iso[8..10], iso[11..13], iso[14..16], iso[17..19], fp16 },
+    );
 }
 
-fn filenameAlloc(allocator: std.mem.Allocator, iso: []const u8, kind: []const u8, slug: []const u8, fp16: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}T{s}-{s}-{s}-{s}-{s}-{s}.md", .{ iso[0..4], iso[5..7], iso[8..10], iso[11..13], iso[14..16], iso[17..19], kind, if (slug.len > 0) slug else "note", fp16 });
+fn filenameAlloc(
+    allocator: std.mem.Allocator,
+    iso: []const u8,
+    kind: []const u8,
+    slug: []const u8,
+    fp16: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}-{s}T{s}-{s}-{s}-{s}-{s}-{s}.md",
+        .{
+            iso[0..4],
+            iso[5..7],
+            iso[8..10],
+            iso[11..13],
+            iso[14..16],
+            iso[17..19],
+            kind,
+            if (slug.len > 0) slug else "note",
+            fp16,
+        },
+    );
 }
 
-fn slugAlloc(allocator: std.mem.Allocator, slug_value: ?std.json.Value, summary_value: ?std.json.Value) ![]u8 {
+fn slugAlloc(
+    allocator: std.mem.Allocator,
+    slug_value: ?std.json.Value,
+    summary_value: ?std.json.Value,
+) ![]u8 {
     if (slug_value) |value| {
         if (value == .string) return sanitizeSlugAlloc(allocator, value.string);
     }
@@ -614,7 +844,15 @@ fn sanitizeSlugAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn renderEnvelopeAlloc(allocator: std.mem.Allocator, id: []const u8, captured_at: []const u8, extension: []const u8, kind: []const u8, fingerprint: []const u8, input: std.json.Value) ![]u8 {
+fn renderEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    captured_at: []const u8,
+    extension: []const u8,
+    kind: []const u8,
+    fingerprint: []const u8,
+    input: std.json.Value,
+) ![]u8 {
     const root = input.object;
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -633,9 +871,15 @@ fn renderEnvelopeAlloc(allocator: std.mem.Allocator, id: []const u8, captured_at
     try copyField(w, root, "scope");
     try copyField(w, root, "source_refs");
     try w.writeAll(",\"related_ids\":");
-    if (root.get("related_ids")) |v| try std.json.Stringify.value(v, .{}, w) else try w.writeAll("[]");
+    if (root.get("related_ids")) |v|
+        try std.json.Stringify.value(v, .{}, w)
+    else
+        try w.writeAll("[]");
     try w.writeAll(",\"supersedes_id\":");
-    if (root.get("supersedes_id")) |v| try std.json.Stringify.value(v, .{}, w) else try w.writeAll("null");
+    if (root.get("supersedes_id")) |v|
+        try std.json.Stringify.value(v, .{}, w)
+    else
+        try w.writeAll("null");
     try w.writeAll(",\"fingerprint\":");
     try writeJsonString(w, fingerprint);
     try copyField(w, root, "payload");
@@ -656,8 +900,17 @@ const ExistingFingerprint = struct {
     path: []u8,
 };
 
-fn findFingerprint(allocator: std.mem.Allocator, notes_dir: []const u8, fingerprint: []const u8) !?ExistingFingerprint {
-    const names = durable_store.listSortedRegularFilesNoSymlink(allocator, notes_dir, MaxFiles, MaxNoteBytes) catch |err| switch (err) {
+fn findFingerprint(
+    allocator: std.mem.Allocator,
+    notes_dir: []const u8,
+    fingerprint: []const u8,
+) !?ExistingFingerprint {
+    const names = durable_store.listSortedRegularFilesNoSymlink(
+        allocator,
+        notes_dir,
+        MaxFiles,
+        MaxNoteBytes,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -665,13 +918,22 @@ fn findFingerprint(allocator: std.mem.Allocator, notes_dir: []const u8, fingerpr
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
         defer allocator.free(path);
-        const raw = durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes) catch continue;
+        const raw = try durable_store.readRegularFileNoSymlink(
+            allocator,
+            path,
+            MaxNoteBytes,
+        );
         defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
         defer parsed.deinit();
         const note = parseNoteSummary(parsed.value) catch continue;
         if (std.mem.eql(u8, note.fingerprint, fingerprint)) {
-            return .{ .id = try allocator.dupe(u8, note.id), .path = try allocator.dupe(u8, path) };
+            const id = try allocator.dupe(u8, note.id);
+            errdefer allocator.free(id);
+            return .{ .id = id, .path = try allocator.dupe(u8, path) };
         }
     }
     return null;
@@ -701,7 +963,14 @@ fn stringField(root: std.json.ObjectMap, field: []const u8) ?[]const u8 {
     };
 }
 
-fn writeCreated(allocator: std.mem.Allocator, id: []const u8, extension: []const u8, kind: []const u8, fingerprint: []const u8, path: []const u8) !void {
+fn writeCreated(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    extension: []const u8,
+    kind: []const u8,
+    fingerprint: []const u8,
+    path: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
@@ -719,7 +988,14 @@ fn writeCreated(allocator: std.mem.Allocator, id: []const u8, extension: []const
     try writeStdoutAlloc(allocator, &out);
 }
 
-fn writeDuplicateSkip(allocator: std.mem.Allocator, extension: []const u8, kind: []const u8, id: []const u8, fingerprint: []const u8, path: []const u8) !void {
+fn writeDuplicateSkip(
+    allocator: std.mem.Allocator,
+    extension: []const u8,
+    kind: []const u8,
+    id: []const u8,
+    fingerprint: []const u8,
+    path: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
@@ -737,7 +1013,15 @@ fn writeDuplicateSkip(allocator: std.mem.Allocator, extension: []const u8, kind:
     try writeStdoutAlloc(allocator, &out);
 }
 
-fn writeDryRun(allocator: std.mem.Allocator, id: []const u8, extension: []const u8, kind: []const u8, fingerprint: []const u8, path: []const u8, note: []const u8) !void {
+fn writeDryRun(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    extension: []const u8,
+    kind: []const u8,
+    fingerprint: []const u8,
+    path: []const u8,
+    note: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
@@ -775,7 +1059,11 @@ fn writeNoteSummaryJson(w: *std.Io.Writer, note: ParsedNote, path: []const u8) !
     try w.writeByte('}');
 }
 
-fn writeDoctorFailureJson(w: *std.Io.Writer, issue: anyerror, diagnostic: DoctorPathDiagnostic) !void {
+fn writeDoctorFailureJson(
+    w: *std.Io.Writer,
+    issue: anyerror,
+    diagnostic: DoctorPathDiagnostic,
+) !void {
     try w.writeAll(",\"status\":\"failed\",\"issue\":");
     try writeJsonString(w, @errorName(issue));
     try w.writeAll(",\"checked_path\":");
@@ -806,18 +1094,35 @@ fn writeStdoutBytes(bytes: []const u8) !void {
 
 fn exitCodeForError(err: anyerror) u8 {
     return switch (err) {
-        error.UnknownCommand, error.UnknownOption, error.MissingCommand, error.MissingValue, error.MissingExtension, error.MissingKind, error.MissingJson, error.MissingId => 2,
+        error.UnknownCommand,
+        error.UnknownOption,
+        error.MissingCommand,
+        error.MissingValue,
+        error.MissingExtension,
+        error.MissingKind,
+        error.MissingJson,
+        error.MissingId,
+        => 2,
         error.InvalidJson => 3,
         error.InvalidExtension, error.InvalidKind, error.InvalidPayload, error.SensitiveKey => 4,
         error.SymlinkComponent, error.NotDir, error.NotFile, error.InvalidPath => 5,
         error.PathAlreadyExists, error.DuplicateId => 6,
-        error.FileNotFound, error.NotFound, error.InputTooLarge, error.OutputTooLarge, error.FileTooBig, error.TooManyFiles => 7,
+        error.FileNotFound,
+        error.NotFound,
+        error.InputTooLarge,
+        error.OutputTooLarge,
+        error.FileTooBig,
+        error.TooManyFiles,
+        => 7,
         else => 9,
     };
 }
 
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(Io.io()).nanoseconds, 1_000_000_000));
+    const now_sec: i64 = @intCast(@divFloor(
+        std.Io.Clock.real.now(Io.io()).nanoseconds,
+        1_000_000_000,
+    ));
     var days = @divFloor(now_sec, 86_400);
     var seconds_of_day = now_sec - days * 86_400;
     if (seconds_of_day < 0) {
@@ -839,31 +1144,34 @@ fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn civilFromDays(days_since_unix_epoch: i64) Date {
-    const z = days_since_unix_epoch + 719_468;
-    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
-    var y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
-    var m = mp + 3;
-    if (m > 12) m -= 12;
-    if (m <= 2) y += 1;
-    return .{ .year = y, .month = m, .day = d };
+    const date = core_calendar.civilFromDays(days_since_unix_epoch, .legacy_negative_era);
+    return .{
+        .year = @intCast(date.year),
+        .month = @intCast(date.month),
+        .day = @intCast(date.day),
+    };
 }
 
 test "validates extension kind matrix" {
     try validateExtensionKind("harness", "harness-rule");
-    try std.testing.expectError(error.InvalidExtension, validateExtensionKind("ad_hoc", "harness-rule"));
-    try std.testing.expectError(error.InvalidKind, validateExtensionKind("harness", "ledger-projection"));
+    try std.testing.expectError(
+        error.InvalidExtension,
+        validateExtensionKind("ad_hoc", "harness-rule"),
+    );
+    try std.testing.expectError(
+        error.InvalidKind,
+        validateExtensionKind("harness", "ledger-projection"),
+    );
 }
 
 test "rejects sensitive keys recursively" {
     const raw = "{\"payload\":{\"nested\":{\"api_key\":\"x\"}}}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    try std.testing.expectError(error.SensitiveKey, rejectSensitiveKeys(parsed.value));
+    try std.testing.expectError(
+        error.SensitiveKey,
+        rejectSensitiveKeys(std.testing.allocator, parsed.value),
+    );
 }
 
 test "renders envelope with generated fields" {
@@ -874,9 +1182,21 @@ test "renders envelope with generated fields" {
     defer parsed.deinit();
     try validateCommon(parsed.value.object);
     try validatePayload("harness", "harness-rule", parsed.value.object);
-    const note = try renderEnvelopeAlloc(std.testing.allocator, "MSN-20260620T183000Z-0123456789abcdef", "2026-06-20T18:30:00Z", "harness", "harness-rule", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", parsed.value);
+    const note = try renderEnvelopeAlloc(
+        std.testing.allocator,
+        "MSN-20260620T183000Z-0123456789abcdef",
+        "2026-06-20T18:30:00Z",
+        "harness",
+        "harness-rule",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        parsed.value,
+    );
     defer std.testing.allocator.free(note);
-    try std.testing.expect(std.mem.indexOf(u8, note, "\"schema\":\"memory-source-note/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        note,
+        "\"schema\":\"memory-source-note/v1\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "\"extension\":\"harness\"") != null);
 }
 
@@ -888,12 +1208,19 @@ test "doctor path diagnostic reports symlink component" {
 
     try tmp.dir.createDir(Io.io(), "real", .default_dir);
     try tmp.dir.symLink(Io.io(), "real", "link", .{ .is_directory = true });
-    const checked_path = try std.fs.path.join(std.testing.allocator, &.{ root, "link", "harness", "notes" });
+    const checked_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "link", "harness", "notes" },
+    );
     defer std.testing.allocator.free(checked_path);
     const offending = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
     defer std.testing.allocator.free(offending);
 
-    var diagnostic = try doctorPathDiagnosticAlloc(std.testing.allocator, checked_path, error.SymlinkComponent);
+    var diagnostic = try doctorPathDiagnosticAlloc(
+        std.testing.allocator,
+        checked_path,
+        error.SymlinkComponent,
+    );
     defer diagnostic.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(checked_path, diagnostic.checked_path);
     try std.testing.expectEqualStrings("symlink", diagnostic.component_kind);
@@ -913,7 +1240,11 @@ test "doctor path diagnostic reports not-dir component" {
     const offending = try std.fs.path.join(std.testing.allocator, &.{ root, "file" });
     defer std.testing.allocator.free(offending);
 
-    var diagnostic = try doctorPathDiagnosticAlloc(std.testing.allocator, checked_path, error.NotDir);
+    var diagnostic = try doctorPathDiagnosticAlloc(
+        std.testing.allocator,
+        checked_path,
+        error.NotDir,
+    );
     defer diagnostic.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(checked_path, diagnostic.checked_path);
     try std.testing.expectEqualStrings("not_dir", diagnostic.component_kind);
@@ -940,7 +1271,116 @@ test "doctor failure json includes path diagnostic fields" {
     defer std.testing.allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"issue\":\"SymlinkComponent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"checked_path\":\"/tmp/codex/memories/extensions/harness/notes\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"offending_component\":\"/tmp/codex/memories/extensions\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        payload,
+        "\"checked_path\":\"/tmp/codex/memories/extensions/harness/notes\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        payload,
+        "\"offending_component\":\"/tmp/codex/memories/extensions\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"component_kind\":\"symlink\"") != null);
+}
+
+fn nestedJsonAlloc(allocator: std.mem.Allocator, depth: usize, leaf: []const u8) ![]u8 {
+    std.debug.assert(depth <= (MaxInputBytes - leaf.len) / 2);
+    const raw = try allocator.alloc(u8, depth * 2 + leaf.len);
+    @memset(raw[0..depth], '[');
+    @memcpy(raw[depth..][0..leaf.len], leaf);
+    @memset(raw[depth + leaf.len ..], ']');
+    return raw;
+}
+
+test "sensitive-key traversal handles deep arrays and preserves case-insensitive rejection" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { leaf: []const u8, sensitive: bool }{
+        .{ .leaf = "null", .sensitive = false },
+        .{ .leaf = "{\"safe\":[1,2],\"CLIENT_SECRET\":\"x\"}", .sensitive = true },
+    };
+    for (cases) |case| {
+        const raw = try nestedJsonAlloc(allocator, 8192, case.leaf);
+        defer allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        if (case.sensitive) {
+            try std.testing.expectError(
+                error.SensitiveKey,
+                rejectSensitiveKeys(allocator, parsed.value),
+            );
+        } else {
+            try rejectSensitiveKeys(allocator, parsed.value);
+        }
+    }
+}
+
+fn scanSensitiveWithAllocator(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    rejectSensitiveKeys(allocator, value) catch |err| {
+        if (err == error.SensitiveKey) return;
+        return err;
+    };
+    return error.MissingSensitiveKey;
+}
+
+test "sensitive-key traversal releases every frame allocation on failure" {
+    const allocator = std.testing.allocator;
+    const raw = try nestedJsonAlloc(allocator, 64, "{\"secret\":\"x\"}");
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        scanSensitiveWithAllocator,
+        .{parsed.value},
+    );
+}
+
+const LookupNoteFixture =
+    "{\"id\":\"same\",\"captured_at\":\"2026-09-07T00:00:00Z\"," ++
+    "\"extension\":\"harness\",\"kind\":\"harness-rule\",\"operation\":\"assert\"," ++
+    "\"summary\":\"test\",\"fingerprint\":\"fixture-fingerprint\"}";
+
+fn lookupFingerprintWithAllocator(allocator: std.mem.Allocator, notes_dir: []const u8) !void {
+    const found = try findFingerprint(allocator, notes_dir, "fixture-fingerprint") orelse
+        return error.MissingFingerprint;
+    defer allocator.free(found.id);
+    defer allocator.free(found.path);
+    try std.testing.expectEqualStrings("same", found.id);
+}
+
+test "fingerprint lookup propagates allocation failure without losing the duplicate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(Io.io(), .{ .sub_path = "one.json", .data = LookupNoteFixture });
+    const path = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(path);
+    try std.testing.checkAllAllocationFailures(allocator, lookupFingerprintWithAllocator, .{path});
+}
+
+test "show releases a retained matching note when a later duplicate is rejected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const notes_path = "memories/extensions/harness/notes";
+    try tmp.dir.createDirPath(Io.io(), notes_path);
+    try tmp.dir.writeFile(Io.io(), .{
+        .sub_path = notes_path ++ "/one.json",
+        .data = LookupNoteFixture,
+    });
+    try tmp.dir.writeFile(Io.io(), .{
+        .sub_path = notes_path ++ "/two.json",
+        .data = LookupNoteFixture,
+    });
+    const home = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(home);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.DuplicateId, cmdShow(allocator, &env, .{
+        .command = .show,
+        .codex_home = home,
+        .extension = "harness",
+        .id = "same",
+    }));
 }

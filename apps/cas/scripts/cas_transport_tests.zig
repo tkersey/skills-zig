@@ -728,13 +728,11 @@ test "unix websocket performs RFC6455 upgrade on slash localhost" {
         const state = fixture.ready.load(.acquire);
         if (state == 1) break;
         if (state == 2) return error.UnixFixtureFailed;
-        std.Io.sleep(
+        try std.Io.sleep(
             std.Io.Threaded.global_single_threaded.io(),
             .fromMilliseconds(10),
             .awake,
-        ) catch |err| switch (err) {
-            else => {},
-        };
+        );
     } else return error.UnixFixtureTimeout;
     var connection = try websocket.Connection.connectUnix(
         std.testing.allocator,

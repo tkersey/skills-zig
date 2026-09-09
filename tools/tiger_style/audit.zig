@@ -31,6 +31,8 @@ const FunctionState = struct {
     body_started: bool = false,
     brace_depth: i32 = 0,
     name: ?[]const u8 = null,
+    receiver: ?[]const u8 = null,
+    first_parameter_seen: bool = false,
     recursion_reported: bool = false,
     start_line: u32 = 0,
 };
@@ -187,6 +189,17 @@ fn functionLine(
 ) !void {
     if (!function.active) function.* = functionStart(source_line, line_number) orelse return;
 
+    if (!function.body_started and !function.first_parameter_seen) {
+        const parameters = if (line_number == function.start_line)
+            lex.codeAfter(source_line, "(") orelse ""
+        else
+            source_line;
+        if (lex.parameterName(parameters)) |parameter| {
+            function.first_parameter_seen = true;
+            if (std.mem.eql(u8, parameter, "self")) function.receiver = parameter;
+        }
+    }
+
     const delta = lex.braceDelta(source_line);
     function.brace_depth += @as(i32, @intCast(delta.open));
     function.brace_depth -= @as(i32, @intCast(delta.close));
@@ -255,7 +268,7 @@ fn recursion(
         lex.codeAfter(source_line, "{") orelse return
     else
         source_line;
-    if (!lex.codeCallsFunction(body_line, name)) return;
+    if (!lex.codeCallsFunctionOnReceiver(body_line, name, function.receiver)) return;
 
     try audit.record(
         writer,
@@ -339,5 +352,46 @@ test "full file audit rejects long functions and direct recursion" {
     defer output.deinit();
     var result = Audit{};
     try source(&output.writer, "invalid.zig", input.written(), &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
+
+test "receiver recursion is rejected across multiline declarations and calls" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result = Audit{};
+    try source(&output.writer, "receiver.zig",
+        \\fn visit(
+        \\    self: *Builder,
+        \\    child: Child,
+        \\) !void {
+        \\    try self.visit(
+        \\        child,
+        \\    );
+        \\}
+        \\fn run(self: *Runner) void { other.run(); }
+        \\fn get(map: *Map) void { map.get(); }
+        \\fn run(other: *Other, self: *Runner) void { self.run(); }
+    , &result);
+    try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
+}
+
+test "receiver recursion is rejected with comptime and noalias parameters" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result = Audit{};
+    try source(&output.writer, "modifiers.zig",
+        \\fn visit(comptime self: Builder) void { self.visit(); }
+        \\fn walk(
+        \\    noalias self: *Builder,
+        \\) void {
+        \\    self.walk();
+        \\}
+        \\fn run(
+        \\    comptime T: type,
+        \\    self: *Runner,
+        \\) void {
+        \\    self.run();
+        \\}
+    , &result);
     try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
 }

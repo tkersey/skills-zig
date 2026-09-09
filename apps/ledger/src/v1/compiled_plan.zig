@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const source_cache = definition_core.source_cache;
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const materialization = @import("materialization.zig");
@@ -64,7 +65,7 @@ pub const PlanSet = struct {
     pub fn deinit(self: *PlanSet, allocator: std.mem.Allocator) void {
         if (self.cache_arena) |arena_value| {
             var arena = arena_value;
-            self.deinitPlans(arena.allocator());
+            // Decoders allocate every retained plan, including nested arenas, from this owner.
             arena.deinit();
         } else {
             self.deinitPlans(allocator);
@@ -84,28 +85,7 @@ pub const PlanSet = struct {
     }
 };
 
-const SourceManifestFile = struct {
-    path: []u8,
-    source_digest: [32]u8,
-    source_bytes: usize,
-
-    fn deinit(self: *SourceManifestFile, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        self.* = undefined;
-    }
-};
-
-const Locator = struct {
-    plan_key: [32]u8,
-    closure_digest: [71]u8,
-    files: []SourceManifestFile,
-
-    fn deinit(self: *Locator, allocator: std.mem.Allocator) void {
-        for (self.files) |*file| file.deinit(allocator);
-        allocator.free(self.files);
-        self.* = undefined;
-    }
-};
+const Locator = source_cache.Locator;
 
 const VerifiedLocator = struct {
     value: Locator,
@@ -747,16 +727,8 @@ fn encodeClosure(
     include_sources: bool,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeFixed(&closure.digest);
-    try encoder.writeUsize(closure.total_definition_bytes);
-    try encoder.writeCount(closure.files.len);
-    if (!include_sources) return;
-    for (closure.files) |file| {
-        try encoder.writeBytes(file.path);
-        try encoder.writeBytes(file.canonical_json);
-        try encoder.writeFixed(&file.source_digest);
-        try encoder.writeUsize(file.source_bytes);
-    }
+    try source_cache.encodeClosureHeader(closure, encoder);
+    if (include_sources) try source_cache.encodeClosureFiles(closure, encoder);
 }
 
 fn decodeClosure(
@@ -775,51 +747,20 @@ fn decodeClosure(
             .total_definition_bytes = header.total_definition_bytes,
         };
     }
-    var closure = definition_core.Closure{
-        .files = try decodeClosureFiles(
-            allocator,
-            decoder,
-            limits,
-            header.file_count,
-        ),
-        .digest = header.digest,
-        .total_definition_bytes = header.total_definition_bytes,
-    };
-    errdefer closure.deinit(allocator);
-    try definition_core.closure.validateCached(
-        allocator,
-        &closure,
-        entry_path,
-        limits,
-    );
-    return closure;
+    return source_cache.decodeFullClosure(allocator, decoder, header, entry_path, limits);
 }
-
-const ClosureHeader = struct {
-    digest: [71]u8,
-    total_definition_bytes: usize,
-    file_count: usize,
-};
 
 fn decodeClosureHeader(
     decoder: *definition_core.cache.Decoder,
     limits: definition_core.closure.Limits,
-) !ClosureHeader {
-    var digest: [71]u8 = undefined;
-    @memcpy(&digest, try decoder.readFixed(digest.len));
-    try definition_core.json.digest(&digest);
-    const total_definition_bytes = try decoder.readUsize();
-    const count = try decoder.readCount(limits.max_files);
-    if (count == 0 or total_definition_bytes == 0 or
-        total_definition_bytes > limits.max_total_bytes)
+) !source_cache.ClosureHeader {
+    const header = try source_cache.decodeClosureHeader(decoder, limits);
+    if (header.file_count == 0 or header.total_definition_bytes == 0 or
+        header.total_definition_bytes > limits.max_total_bytes)
     {
         return error.CacheClosureManifestInvalid;
     }
-    return .{
-        .digest = digest,
-        .total_definition_bytes = total_definition_bytes,
-        .file_count = count,
-    };
+    return header;
 }
 
 fn emptyClosureFiles(
@@ -851,56 +792,13 @@ fn emptyClosureFiles(
     return files;
 }
 
-fn decodeClosureFiles(
-    allocator: std.mem.Allocator,
-    decoder: *definition_core.cache.Decoder,
-    limits: definition_core.closure.Limits,
-    count: usize,
-) ![]definition_core.ClosureFile {
-    const files = try allocator.alloc(definition_core.ClosureFile, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (files[0..initialized]) |file| {
-            allocator.free(file.path);
-            allocator.free(file.canonical_json);
-        }
-        allocator.free(files);
-    }
-    for (files) |*file| {
-        const path = try decoder.readBytesAlloc(allocator, limits.max_file_bytes);
-        errdefer allocator.free(path);
-        const canonical_json = try decoder.readBytesAlloc(
-            allocator,
-            limits.max_file_bytes,
-        );
-        errdefer allocator.free(canonical_json);
-        var source_digest: [32]u8 = undefined;
-        @memcpy(&source_digest, try decoder.readFixed(source_digest.len));
-        file.* = .{
-            .path = path,
-            .canonical_json = canonical_json,
-            .source_digest = source_digest,
-            .source_bytes = try decoder.readUsize(),
-        };
-        initialized += 1;
-    }
-    return files;
-}
-
 fn encodeLocator(
     plan_set: *const PlanSet,
     plan_key: [32]u8,
     encoder: *definition_core.cache.Encoder,
 ) !void {
     try encoder.writeU16(locator_version);
-    try encoder.writeFixed(&plan_key);
-    try encoder.writeFixed(&plan_set.closure.digest);
-    try encoder.writeCount(plan_set.closure.files.len);
-    for (plan_set.closure.files) |file| {
-        try encoder.writeBytes(file.path);
-        try encoder.writeFixed(&file.source_digest);
-        try encoder.writeUsize(file.source_bytes);
-    }
+    try source_cache.encodeLocatorBody(&plan_set.closure, plan_key, encoder);
 }
 
 fn decodeLocator(
@@ -911,42 +809,7 @@ fn decodeLocator(
     if (try decoder.readU16() != locator_version) {
         return error.LedgerCacheLocatorVersionMismatch;
     }
-    var plan_key: [32]u8 = undefined;
-    @memcpy(&plan_key, try decoder.readFixed(plan_key.len));
-    var closure_digest: [71]u8 = undefined;
-    @memcpy(
-        &closure_digest,
-        try decoder.readFixed(closure_digest.len),
-    );
-    try definition_core.json.digest(&closure_digest);
-    const count = try decoder.readCount(128);
-    const files = try allocator.alloc(SourceManifestFile, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (files[0..initialized]) |*file| file.deinit(allocator);
-        allocator.free(files);
-    }
-    for (files) |*file| {
-        const path = try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024);
-        errdefer allocator.free(path);
-        var source_digest: [32]u8 = undefined;
-        @memcpy(
-            &source_digest,
-            try decoder.readFixed(source_digest.len),
-        );
-        file.* = .{
-            .path = path,
-            .source_digest = source_digest,
-            .source_bytes = try decoder.readUsize(),
-        };
-        initialized += 1;
-    }
-    try decoder.finish();
-    return .{
-        .plan_key = plan_key,
-        .closure_digest = closure_digest,
-        .files = files,
-    };
+    return source_cache.decodeLocatorBody(allocator, &decoder, .{});
 }
 
 fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {

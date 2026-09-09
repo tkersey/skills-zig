@@ -111,7 +111,8 @@ pub fn writeManifestJson(
         for (manifest.cases, 0..) |case_desc, case_idx| {
             if (case_idx > 0) try writer.writeByte(',');
             try writer.print(
-                "{{\"case_id\":\"{s}\",\"binary\":\"{s}\",\"family\":\"{s}\",\"case_kind\":\"{s}\",\"measurement_mode\":\"{s}\",\"compat_case\":{s}}}",
+                "{{\"case_id\":\"{s}\",\"binary\":\"{s}\",\"family\":\"{s}\"," ++
+                    "\"case_kind\":\"{s}\",\"measurement_mode\":\"{s}\",\"compat_case\":{s}}}",
                 .{
                     case_desc.case_id,
                     case_desc.binary,

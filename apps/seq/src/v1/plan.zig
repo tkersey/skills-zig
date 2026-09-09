@@ -1846,6 +1846,16 @@ fn validateCacheStage(
         )
     else
         null;
+    try validateCachedOperation(native_plan, definition_plan, stage, step, source_schema);
+}
+
+fn validateCachedOperation(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+    step: definition.Step,
+    source_schema: ?SourceSchema,
+) !void {
     switch (step.operator) {
         .scan => try validateCachedScan(definition_plan, stage),
         .filter => try validateCachedFilter(

@@ -105,7 +105,14 @@ pub fn collect(
 ) !Corpus {
     var empty_environment = std.process.Environ.Map.init(allocator);
     defer empty_environment.deinit();
-    return collectWithEnvironment(allocator, process_io, &empty_environment, source, include, exclude);
+    return collectWithEnvironment(
+        allocator,
+        process_io,
+        &empty_environment,
+        source,
+        include,
+        exclude,
+    );
 }
 
 pub fn collectWithEnvironment(
@@ -126,7 +133,10 @@ pub fn collectWithEnvironment(
 
 fn collectStdin(allocator: std.mem.Allocator) !Corpus {
     var reader = std.Io.File.stdin().reader(defaultIo(), &.{});
-    const text = reader.interface.allocRemaining(allocator, .limited(max_total_bytes + 1)) catch |err| switch (err) {
+    const text = reader.interface.allocRemaining(
+        allocator,
+        .limited(max_total_bytes + 1),
+    ) catch |err| switch (err) {
         error.StreamTooLong => return error.InputTooLarge,
         else => return err,
     };
@@ -191,7 +201,13 @@ const PathCollector = struct {
     }
 
     fn labelFor(self: *PathCollector, abs_path: []const u8) ![]u8 {
-        const rel = try std.fs.path.relative(self.allocator, self.cwd_abs, null, self.cwd_abs, abs_path);
+        const rel = try std.fs.path.relative(
+            self.allocator,
+            self.cwd_abs,
+            null,
+            self.cwd_abs,
+            abs_path,
+        );
         defer self.allocator.free(rel);
         const normalized = try normalizeSlashesAlloc(self.allocator, rel);
         if (!std.unicode.utf8ValidateSlice(normalized)) {
@@ -204,7 +220,7 @@ const PathCollector = struct {
     fn addFile(self: *PathCollector, abs_path: []const u8, recursive: bool) !void {
         const label = try self.labelFor(abs_path);
         errdefer self.allocator.free(label);
-        if (!shouldInclude(label, self.include, self.exclude)) {
+        if (!try shouldInclude(self.allocator, label, self.include, self.exclude)) {
             self.allocator.free(label);
             return;
         }
@@ -260,7 +276,9 @@ fn collectPaths(
         try appendHeader(&text, allocator, candidate.label);
         try text.appendSlice(allocator, content);
         if (text.items.len > max_total_bytes) return error.InputTooLarge;
-        try files.append(allocator, try allocator.dupe(u8, candidate.label));
+        const label = try allocator.dupe(u8, candidate.label);
+        errdefer allocator.free(label);
+        try files.append(allocator, label);
     }
     if (files.items.len == 0) return error.EmptyInput;
 
@@ -270,9 +288,11 @@ fn collectPaths(
         for (warnings) |warning| allocator.free(warning.path);
         allocator.free(warnings);
     }
+    const owned_text = try text.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_text);
     return .{
         .kind = .paths,
-        .text = try text.toOwnedSlice(allocator),
+        .text = owned_text,
         .files = try files.toOwnedSlice(allocator),
         .warnings = warnings,
         .source_bytes = source_bytes,
@@ -280,15 +300,33 @@ fn collectPaths(
 }
 
 fn collectExplicitTarget(collector: *PathCollector, target: []const u8) !void {
-    const stat = std.Io.Dir.cwd().statFile(defaultIo(), target, .{ .follow_symlinks = false }) catch return error.TargetUnavailable;
+    const stat = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        target,
+        .{ .follow_symlinks = false },
+    ) catch return error.TargetUnavailable;
     switch (stat.kind) {
         .file => {
-            const abs = std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), target, collector.allocator) catch return error.TargetUnavailable;
+            const abs = std.Io.Dir.cwd().realPathFileAlloc(
+                defaultIo(),
+                target,
+                collector.allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.TargetUnavailable,
+            };
             defer collector.allocator.free(abs);
             try collector.addFile(abs, false);
         },
         .directory => {
-            const abs = std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), target, collector.allocator) catch return error.TargetUnavailable;
+            const abs = std.Io.Dir.cwd().realPathFileAlloc(
+                defaultIo(),
+                target,
+                collector.allocator,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.TargetUnavailable,
+            };
             defer collector.allocator.free(abs);
             try walkDirectory(collector, abs);
         },
@@ -297,113 +335,257 @@ fn collectExplicitTarget(collector: *PathCollector, target: []const u8) !void {
     }
 }
 
-fn walkDirectory(collector: *PathCollector, dir_abs: []const u8) !void {
-    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), dir_abs, .{ .iterate = true, .follow_symlinks = false }) catch {
-        const label = collector.labelFor(dir_abs) catch dir_abs;
-        defer if (label.ptr != dir_abs.ptr) collector.allocator.free(label);
-        try collector.warn(.inaccessible, label);
-        return;
+const DirectoryFrame = struct {
+    absolute: []u8,
+    dir: std.Io.Dir,
+    iterator: std.Io.Dir.Iterator,
+
+    fn deinit(self: *DirectoryFrame, allocator: std.mem.Allocator) void {
+        self.dir.close(defaultIo());
+        allocator.free(self.absolute);
+    }
+};
+
+fn warnPath(collector: *PathCollector, kind: WarningKind, absolute: []const u8) !void {
+    const label = collector.labelFor(absolute) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return collector.warn(kind, absolute),
     };
-    defer dir.close(defaultIo());
-    var it = dir.iterate();
-    while (it.next(defaultIo()) catch {
-        const label = collector.labelFor(dir_abs) catch dir_abs;
-        defer if (label.ptr != dir_abs.ptr) collector.allocator.free(label);
-        try collector.warn(.inaccessible, label);
-        return;
-    }) |entry| {
+    defer collector.allocator.free(label);
+    try collector.warn(kind, label);
+}
+
+fn pushDirectory(
+    collector: *PathCollector,
+    stack: *std.ArrayList(DirectoryFrame),
+    absolute: []const u8,
+) !void {
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), absolute, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return warnPath(collector, .inaccessible, absolute);
+    errdefer dir.close(defaultIo());
+    const owned = try collector.allocator.dupe(u8, absolute);
+    errdefer collector.allocator.free(owned);
+    try stack.append(collector.allocator, .{
+        .absolute = owned,
+        .dir = dir,
+        .iterator = dir.iterate(),
+    });
+}
+
+fn walkDirectory(collector: *PathCollector, dir_abs: []const u8) !void {
+    var stack: std.ArrayList(DirectoryFrame) = .empty;
+    defer {
+        for (stack.items) |*frame| frame.deinit(collector.allocator);
+        stack.deinit(collector.allocator);
+    }
+    try pushDirectory(collector, &stack, dir_abs);
+    // One frame per open ancestor; no symlinks or directory hard links are followed.
+    // Each iterator advances through its directory, and OS path limits bound depth.
+    while (stack.items.len > 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        const next = frame.iterator.next(defaultIo()) catch blk: {
+            try warnPath(collector, .inaccessible, frame.absolute);
+            break :blk null;
+        };
+        const entry = next orelse {
+            var finished = stack.pop().?;
+            finished.deinit(collector.allocator);
+            continue;
+        };
         if (entry.kind == .directory and shouldSkipDirectory(entry.name)) continue;
-        const child = try std.fs.path.join(collector.allocator, &.{ dir_abs, entry.name });
+        const child = try std.fs.path.join(collector.allocator, &.{ frame.absolute, entry.name });
         defer collector.allocator.free(child);
         const kind = if (entry.kind == .unknown)
-            (dir.statFile(defaultIo(), entry.name, .{ .follow_symlinks = false }) catch {
-                const label = collector.labelFor(child) catch entry.name;
-                defer if (label.ptr != entry.name.ptr) collector.allocator.free(label);
-                try collector.warn(.inaccessible, label);
+            (frame.dir.statFile(defaultIo(), entry.name, .{ .follow_symlinks = false }) catch {
+                try warnPath(collector, .inaccessible, child);
                 continue;
             }).kind
         else
             entry.kind;
         switch (kind) {
             .file => try collector.addFile(child, true),
-            .directory => try walkDirectory(collector, child),
-            .sym_link => {
-                const label = collector.labelFor(child) catch entry.name;
-                defer if (label.ptr != entry.name.ptr) collector.allocator.free(label);
-                try collector.warn(.symlink, label);
-            },
-            else => {
-                const label = collector.labelFor(child) catch entry.name;
-                defer if (label.ptr != entry.name.ptr) collector.allocator.free(label);
-                try collector.warn(.unsupported, label);
-            },
+            .directory => try pushDirectory(collector, &stack, child),
+            .sym_link => try warnPath(collector, .symlink, child),
+            else => try warnPath(collector, .unsupported, child),
         }
     }
 }
 
 const RecursiveSkip = error{RecursiveSkip};
 
-fn readCandidate(allocator: std.mem.Allocator, collector: *PathCollector, candidate: Candidate) ![]u8 {
-    const stat = std.Io.Dir.cwd().statFile(defaultIo(), candidate.abs_path, .{ .follow_symlinks = false }) catch {
-        if (candidate.recursive) {
-            try collector.warn(.inaccessible, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return error.TargetUnavailable;
+fn skipCandidate(
+    collector: *PathCollector,
+    candidate: Candidate,
+    warning: WarningKind,
+) ![]u8 {
+    if (candidate.recursive) {
+        try collector.warn(warning, candidate.label);
+        return RecursiveSkip.RecursiveSkip;
+    }
+    return switch (warning) {
+        .inaccessible => error.TargetUnavailable,
+        .oversized => error.ExplicitOversized,
+        .binary => error.ExplicitBinary,
+        .invalid_utf8 => error.ExplicitInvalidUtf8,
+        .symlink => error.ExplicitSymlink,
+        .unsupported => error.ExplicitUnsupported,
     };
+}
+
+fn readCandidate(
+    allocator: std.mem.Allocator,
+    collector: *PathCollector,
+    candidate: Candidate,
+) ![]u8 {
+    const stat = std.Io.Dir.cwd().statFile(defaultIo(), candidate.abs_path, .{
+        .follow_symlinks = false,
+    }) catch return skipCandidate(collector, candidate, .inaccessible);
     if (stat.kind != .file) {
-        if (candidate.recursive) {
-            try collector.warn(if (stat.kind == .sym_link) .symlink else .unsupported, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return if (stat.kind == .sym_link) error.ExplicitSymlink else error.ExplicitUnsupported;
+        const warning: WarningKind = if (stat.kind == .sym_link) .symlink else .unsupported;
+        return skipCandidate(collector, candidate, warning);
     }
-    if (stat.size > max_file_bytes) {
-        if (candidate.recursive) {
-            try collector.warn(.oversized, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return error.ExplicitOversized;
-    }
-    const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), candidate.abs_path, allocator, .limited(max_file_bytes + 1)) catch |err| switch (err) {
-        error.StreamTooLong => {
-            if (candidate.recursive) {
-                try collector.warn(.oversized, candidate.label);
-                return RecursiveSkip.RecursiveSkip;
-            }
-            return error.ExplicitOversized;
-        },
-        else => {
-            if (candidate.recursive) {
-                try collector.warn(.inaccessible, candidate.label);
-                return RecursiveSkip.RecursiveSkip;
-            }
-            return error.TargetUnavailable;
-        },
+    if (stat.size > max_file_bytes) return skipCandidate(collector, candidate, .oversized);
+    const content = std.Io.Dir.cwd().readFileAlloc(
+        defaultIo(),
+        candidate.abs_path,
+        allocator,
+        .limited(max_file_bytes + 1),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.StreamTooLong => return skipCandidate(collector, candidate, .oversized),
+        else => return skipCandidate(collector, candidate, .inaccessible),
     };
     errdefer allocator.free(content);
-    if (content.len > max_file_bytes) {
-        if (candidate.recursive) {
-            try collector.warn(.oversized, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return error.ExplicitOversized;
-    }
-    if (std.mem.indexOfScalar(u8, content[0..@min(content.len, binary_sniff_bytes)], 0) != null) {
-        if (candidate.recursive) {
-            try collector.warn(.binary, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return error.ExplicitBinary;
+    if (content.len > max_file_bytes) return skipCandidate(collector, candidate, .oversized);
+    const sniff = content[0..@min(content.len, binary_sniff_bytes)];
+    if (std.mem.indexOfScalar(u8, sniff, 0) != null) {
+        return skipCandidate(collector, candidate, .binary);
     }
     if (!std.unicode.utf8ValidateSlice(content)) {
-        if (candidate.recursive) {
-            try collector.warn(.invalid_utf8, candidate.label);
-            return RecursiveSkip.RecursiveSkip;
-        }
-        return error.ExplicitInvalidUtf8;
+        return skipCandidate(collector, candidate, .invalid_utf8);
     }
     return content;
+}
+
+const GitCollector = struct {
+    allocator: std.mem.Allocator,
+    repo_dir: std.Io.Dir,
+    cwd_abs: []const u8,
+    repo_abs: []const u8,
+    text: std.ArrayList(u8) = .empty,
+    files: std.ArrayList([]u8) = .empty,
+    warnings: std.ArrayList(Warning) = .empty,
+    source_bytes: usize = 0,
+
+    fn deinit(self: *GitCollector) void {
+        self.text.deinit(self.allocator);
+        for (self.files.items) |path| self.allocator.free(path);
+        self.files.deinit(self.allocator);
+        for (self.warnings.items) |warning| self.allocator.free(warning.path);
+        self.warnings.deinit(self.allocator);
+    }
+
+    fn warn(self: *GitCollector, kind: WarningKind, label: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned);
+        try self.warnings.append(self.allocator, .{ .kind = kind, .path = owned });
+    }
+
+    fn finish(self: *GitCollector, kind: Kind) !Corpus {
+        if (self.text.items.len == 0) return error.EmptyInput;
+        std.mem.sort(Warning, self.warnings.items, {}, warningLessThan);
+        const text = try self.text.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(text);
+        const files = try self.files.toOwnedSlice(self.allocator);
+        errdefer {
+            for (files) |path| self.allocator.free(path);
+            self.allocator.free(files);
+        }
+        return .{
+            .kind = kind,
+            .text = text,
+            .files = files,
+            .warnings = try self.warnings.toOwnedSlice(self.allocator),
+            .source_bytes = self.source_bytes,
+        };
+    }
+
+    fn collectNames(self: *GitCollector, raw_names: []const u8) !void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        var pos: usize = 0;
+        while (pos < raw_names.len) {
+            const nul = std.mem.indexOfScalarPos(u8, raw_names, pos, 0) orelse
+                return error.InvalidGitPath;
+            const name = raw_names[pos..nul];
+            pos = nul + 1;
+            if (name.len == 0 or std.fs.path.isAbsolute(name) or
+                !std.unicode.utf8ValidateSlice(name)) return error.InvalidGitPath;
+            try names.append(self.allocator, name);
+        }
+        std.mem.sort([]const u8, names.items, {}, stringLessThan);
+        var previous: ?[]const u8 = null;
+        for (names.items) |name| {
+            if (previous) |value| if (std.mem.eql(u8, value, name)) continue;
+            previous = name;
+            try self.collectName(name);
+        }
+    }
+
+    fn collectName(self: *GitCollector, name: []const u8) !void {
+        const label = try gitLabelAlloc(self.allocator, self.cwd_abs, self.repo_abs, name);
+        defer self.allocator.free(label);
+        if (hasUnsafeComponent(name) or try pathContainsSymlink(self.repo_dir, name)) {
+            return self.warn(.symlink, label);
+        }
+        const stat = self.repo_dir.statFile(defaultIo(), name, .{ .follow_symlinks = false }) catch
+            return self.warn(.inaccessible, label);
+        if (stat.kind != .file) {
+            return self.warn(if (stat.kind == .sym_link) .symlink else .unsupported, label);
+        }
+        if (stat.size > max_file_bytes) return self.warn(.oversized, label);
+        const content = self.repo_dir.readFileAlloc(
+            defaultIo(),
+            name,
+            self.allocator,
+            .limited(max_file_bytes + 1),
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return self.warn(.inaccessible, label),
+        };
+        defer self.allocator.free(content);
+        if (content.len > max_file_bytes) return self.warn(.oversized, label);
+        const sniff = content[0..@min(content.len, binary_sniff_bytes)];
+        if (std.mem.indexOfScalar(u8, sniff, 0) != null) return self.warn(.binary, label);
+        if (!std.unicode.utf8ValidateSlice(content)) return self.warn(.invalid_utf8, label);
+        if (self.source_bytes + content.len > max_total_bytes) return error.InputTooLarge;
+        self.source_bytes += content.len;
+        try self.text.append(self.allocator, '\n');
+        try appendHeader(&self.text, self.allocator, label);
+        try self.text.appendSlice(self.allocator, content);
+        if (self.text.items.len > max_total_bytes) return error.InputTooLarge;
+        const owned = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned);
+        try self.files.append(self.allocator, owned);
+    }
+};
+
+fn gitDiff(
+    allocator: std.mem.Allocator,
+    process_io: std.Io,
+    environment: *const std.process.Environ.Map,
+    repo: []const u8,
+    ref: []const u8,
+) ![]u8 {
+    return runGit(allocator, process_io, environment, repo, &.{
+        "git",                    "-c",                     "core.quotePath=true",   "diff",
+        "--no-ext-diff",          "--no-textconv",          "--no-color",            "--no-renames",
+        "--full-index",           "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3",
+        "--inter-hunk-context=0", "--src-prefix=a/",        "--dst-prefix=b/",       ref,
+        "--",
+    }, max_total_bytes + 1);
 }
 
 fn collectGit(
@@ -413,123 +595,44 @@ fn collectGit(
     repo_arg: ?[]const u8,
     diff_ref: ?[]const u8,
 ) !Corpus {
-    var git_environment = try sanitizedGitEnvironment(allocator, parent_environment);
-    defer git_environment.deinit();
-    const repo_input = repo_arg orelse ".";
-    const repo_abs = std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), repo_input, allocator) catch return error.TargetUnavailable;
+    var environment = try sanitizedGitEnvironment(allocator, parent_environment);
+    defer environment.deinit();
+    const repo_abs = std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        repo_arg orelse ".",
+        allocator,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.TargetUnavailable,
+    };
     defer allocator.free(repo_abs);
-    var repo_dir = std.Io.Dir.openDirAbsolute(defaultIo(), repo_abs, .{ .follow_symlinks = false }) catch return error.TargetUnavailable;
+    var repo_dir = std.Io.Dir.openDirAbsolute(defaultIo(), repo_abs, .{
+        .follow_symlinks = false,
+    }) catch return error.TargetUnavailable;
     defer repo_dir.close(defaultIo());
     const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), ".", allocator);
     defer allocator.free(cwd_abs);
-
-    const diff = if (diff_ref) |ref|
-        try runGit(allocator, process_io, &git_environment, repo_abs, &.{
-            "git",                    "-c",                     "core.quotePath=true",   "diff",
-            "--no-ext-diff",          "--no-textconv",          "--no-color",            "--no-renames",
-            "--full-index",           "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3",
-            "--inter-hunk-context=0", "--src-prefix=a/",        "--dst-prefix=b/",       ref,
-            "--",
-        }, max_total_bytes + 1)
-    else
-        try runGit(allocator, process_io, &git_environment, repo_abs, &.{
-            "git",                    "-c",                     "core.quotePath=true",   "diff",
-            "--no-ext-diff",          "--no-textconv",          "--no-color",            "--no-renames",
-            "--full-index",           "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3",
-            "--inter-hunk-context=0", "--src-prefix=a/",        "--dst-prefix=b/",       "HEAD",
-            "--",
-        }, max_total_bytes + 1);
+    const diff = try gitDiff(allocator, process_io, &environment, repo_abs, diff_ref orelse "HEAD");
     defer allocator.free(diff);
     if (diff.len > max_total_bytes) return error.InputTooLarge;
     if (!std.unicode.utf8ValidateSlice(diff)) return error.InvalidUtf8;
-
-    var text: std.ArrayList(u8) = .empty;
-    errdefer text.deinit(allocator);
-    try text.appendSlice(allocator, diff);
-    var source_bytes = text.items.len;
-    var files: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (files.items) |path| allocator.free(path);
-        files.deinit(allocator);
-    }
-    var warnings: std.ArrayList(Warning) = .empty;
-    errdefer {
-        for (warnings.items) |warning| allocator.free(warning.path);
-        warnings.deinit(allocator);
-    }
-
-    if (diff_ref == null) {
-        const raw_names = try runGit(allocator, process_io, &git_environment, repo_abs, &.{ "git", "ls-files", "-z", "--others", "--exclude-standard" }, max_total_bytes + 1);
-        defer allocator.free(raw_names);
-        var names: std.ArrayList([]const u8) = .empty;
-        defer names.deinit(allocator);
-        var pos: usize = 0;
-        while (pos < raw_names.len) {
-            const nul = std.mem.indexOfScalarPos(u8, raw_names, pos, 0) orelse return error.InvalidGitPath;
-            const name = raw_names[pos..nul];
-            pos = nul + 1;
-            if (name.len == 0 or std.fs.path.isAbsolute(name) or !std.unicode.utf8ValidateSlice(name)) return error.InvalidGitPath;
-            try names.append(allocator, name);
-        }
-        std.mem.sort([]const u8, names.items, {}, stringLessThan);
-        var previous: ?[]const u8 = null;
-        for (names.items) |name| {
-            if (previous) |value| if (std.mem.eql(u8, value, name)) continue;
-            previous = name;
-            if (hasUnsafeComponent(name) or try pathContainsSymlink(repo_dir, name)) {
-                const label = try gitLabelAlloc(allocator, cwd_abs, repo_abs, name);
-                try warnings.append(allocator, .{ .kind = .symlink, .path = label });
-                continue;
-            }
-            const stat = repo_dir.statFile(defaultIo(), name, .{ .follow_symlinks = false }) catch {
-                const label = try gitLabelAlloc(allocator, cwd_abs, repo_abs, name);
-                try warnings.append(allocator, .{ .kind = .inaccessible, .path = label });
-                continue;
-            };
-            const label = try gitLabelAlloc(allocator, cwd_abs, repo_abs, name);
-            if (stat.kind != .file) {
-                try warnings.append(allocator, .{ .kind = if (stat.kind == .sym_link) .symlink else .unsupported, .path = label });
-                continue;
-            }
-            if (stat.size > max_file_bytes) {
-                try warnings.append(allocator, .{ .kind = .oversized, .path = label });
-                continue;
-            }
-            const content = repo_dir.readFileAlloc(defaultIo(), name, allocator, .limited(max_file_bytes + 1)) catch {
-                try warnings.append(allocator, .{ .kind = .inaccessible, .path = label });
-                continue;
-            };
-            defer allocator.free(content);
-            if (content.len > max_file_bytes) {
-                try warnings.append(allocator, .{ .kind = .oversized, .path = label });
-                continue;
-            }
-            if (std.mem.indexOfScalar(u8, content[0..@min(content.len, binary_sniff_bytes)], 0) != null) {
-                try warnings.append(allocator, .{ .kind = .binary, .path = label });
-                continue;
-            }
-            if (!std.unicode.utf8ValidateSlice(content)) {
-                try warnings.append(allocator, .{ .kind = .invalid_utf8, .path = label });
-                continue;
-            }
-            if (source_bytes + content.len > max_total_bytes) return error.InputTooLarge;
-            source_bytes += content.len;
-            try text.append(allocator, '\n');
-            try appendHeader(&text, allocator, label);
-            try text.appendSlice(allocator, content);
-            if (text.items.len > max_total_bytes) return error.InputTooLarge;
-            try files.append(allocator, label);
-        }
-    }
-    if (text.items.len == 0) return error.EmptyInput;
-    std.mem.sort(Warning, warnings.items, {}, warningLessThan);
-    return .{
-        .kind = if (diff_ref == null) .git else .diff,
-        .text = try text.toOwnedSlice(allocator),
-        .files = try files.toOwnedSlice(allocator),
-        .warnings = try warnings.toOwnedSlice(allocator),
-        .source_bytes = source_bytes,
+    var collector = GitCollector{
+        .allocator = allocator,
+        .repo_dir = repo_dir,
+        .repo_abs = repo_abs,
+        .cwd_abs = cwd_abs,
+        .source_bytes = diff.len,
     };
+    defer collector.deinit();
+    try collector.text.appendSlice(allocator, diff);
+    if (diff_ref == null) {
+        const names = try runGit(allocator, process_io, &environment, repo_abs, &.{
+            "git", "ls-files", "-z", "--others", "--exclude-standard",
+        }, max_total_bytes + 1);
+        defer allocator.free(names);
+        try collector.collectNames(names);
+    }
+    return collector.finish(if (diff_ref == null) .git else .diff);
 }
 
 fn runGit(
@@ -582,7 +685,11 @@ fn pathContainsSymlink(root: std.Io.Dir, path: []const u8) !bool {
     while (component_end < path.len) {
         component_end = std.mem.indexOfScalarPos(u8, path, component_end, '/') orelse path.len;
         if (component_end > 0) {
-            const stat = root.statFile(defaultIo(), path[0..component_end], .{ .follow_symlinks = false }) catch return true;
+            const stat = root.statFile(
+                defaultIo(),
+                path[0..component_end],
+                .{ .follow_symlinks = false },
+            ) catch return true;
             if (stat.kind == .sym_link) return true;
         }
         if (component_end == path.len) break;
@@ -594,12 +701,21 @@ fn pathContainsSymlink(root: std.Io.Dir, path: []const u8) !bool {
 fn hasUnsafeComponent(path: []const u8) bool {
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return true;
+        if (component.len == 0 or std.mem.eql(
+            u8,
+            component,
+            ".",
+        ) or std.mem.eql(u8, component, "..")) return true;
     }
     return false;
 }
 
-fn gitLabelAlloc(allocator: std.mem.Allocator, cwd_abs: []const u8, repo_abs: []const u8, rel: []const u8) ![]u8 {
+fn gitLabelAlloc(
+    allocator: std.mem.Allocator,
+    cwd_abs: []const u8,
+    repo_abs: []const u8,
+    rel: []const u8,
+) ![]u8 {
     const abs = try std.fs.path.join(allocator, &.{ repo_abs, rel });
     defer allocator.free(abs);
     const cwd_rel = try std.fs.path.relative(allocator, cwd_abs, null, cwd_abs, abs);
@@ -630,21 +746,27 @@ fn shouldSkipDirectory(name: []const u8) bool {
     return false;
 }
 
-pub fn shouldInclude(path: []const u8, include: []const []const u8, exclude: []const []const u8) bool {
-    for (exclude) |pattern| if (matchGlob(pattern, path)) return false;
+pub fn shouldInclude(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    include: []const []const u8,
+    exclude: []const []const u8,
+) !bool {
+    for (exclude) |pattern| if (try matchGlob(allocator, pattern, path)) return false;
     if (include.len == 0) return true;
-    for (include) |pattern| if (matchGlob(pattern, path)) return true;
+    for (include) |pattern| if (try matchGlob(allocator, pattern, path)) return true;
     return false;
 }
 
-pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
+pub fn matchGlob(allocator: std.mem.Allocator, pattern: []const u8, path: []const u8) !bool {
     const normalized_path = stripOneNormalizedDotSlash(path);
     const target = if (!containsNormalizedSeparator(pattern))
         normalizedBasename(normalized_path)
     else
         normalized_path;
-    var budget: usize = 1_000_000;
-    return globMatch(pattern, .{}, target, .{}, &budget);
+    var search = GlobSearch{ .pattern = pattern, .value = target };
+    defer search.stars.deinit(allocator);
+    return search.run(allocator);
 }
 
 const GlobCursor = struct {
@@ -657,51 +779,83 @@ const GlobStep = struct {
     next: GlobCursor,
 };
 
-fn globMatch(pattern: []const u8, pi: GlobCursor, value: []const u8, vi: GlobCursor, budget: *usize) bool {
-    if (budget.* == 0) return false;
-    budget.* -= 1;
-    const pattern_step = utf16Step(pattern, pi) orelse return utf16Step(value, vi) == null;
-    const pc = normalizedGlobUnit(pattern_step.unit);
-    if (pc == '*') {
-        const second = utf16Step(pattern, pattern_step.next);
-        if (second != null and normalizedGlobUnit(second.?.unit) == '*') {
-            var next = second.?.next;
-            if (utf16Step(pattern, next)) |slash| {
-                if (normalizedGlobUnit(slash.unit) == '/') {
-                    next = slash.next;
-                    if (globMatch(pattern, next, value, vi, budget)) return true;
-                    var cursor = vi;
-                    while (utf16Step(value, cursor)) |step| {
-                        cursor = step.next;
-                        if (normalizedGlobUnit(step.unit) == '/' and globMatch(pattern, next, value, cursor, budget)) return true;
-                    }
-                    return false;
+const GlobStar = struct {
+    pattern: GlobCursor,
+    value: GlobCursor,
+    mode: enum { component, any, directory },
+};
+
+const GlobSearch = struct {
+    pattern: []const u8,
+    value: []const u8,
+    pi: GlobCursor = .{},
+    vi: GlobCursor = .{},
+    stars: std.ArrayList(GlobStar) = .empty,
+
+    fn run(self: *GlobSearch, allocator: std.mem.Allocator) !bool {
+        // The former recursive search spent one unit per call. Literal transitions
+        // and star retries keep that exact budget and DFS order, with at most one
+        // owned frame per star reached during these one million transitions.
+        var budget: usize = 1_000_000;
+        while (budget > 0) : (budget -= 1) {
+            const step = utf16Step(self.pattern, self.pi) orelse {
+                if (utf16Step(self.value, self.vi) == null) return true;
+                if (!self.retryStar()) return false;
+                continue;
+            };
+            const unit = normalizedGlobUnit(step.unit);
+            if (unit == '*') {
+                try self.enterStar(allocator, step.next);
+                continue;
+            }
+            if (utf16Step(self.value, self.vi)) |value_step| {
+                const value_unit = normalizedGlobUnit(value_step.unit);
+                if (if (unit == '?') value_unit != '/' else unit == value_unit) {
+                    self.pi = step.next;
+                    self.vi = value_step.next;
+                    continue;
                 }
             }
-            if (globMatch(pattern, next, value, vi, budget)) return true;
-            var cursor = vi;
-            while (utf16Step(value, cursor)) |step| {
-                cursor = step.next;
-                if (globMatch(pattern, next, value, cursor, budget)) return true;
-            }
-            return false;
-        }
-        if (globMatch(pattern, pattern_step.next, value, vi, budget)) return true;
-        var cursor = vi;
-        while (utf16Step(value, cursor)) |step| {
-            if (normalizedGlobUnit(step.unit) == '/') break;
-            cursor = step.next;
-            if (globMatch(pattern, pattern_step.next, value, cursor, budget)) return true;
+            if (!self.retryStar()) return false;
         }
         return false;
     }
-    if (pc == '?') {
-        const value_step = utf16Step(value, vi) orelse return false;
-        return normalizedGlobUnit(value_step.unit) != '/' and globMatch(pattern, pattern_step.next, value, value_step.next, budget);
+
+    fn enterStar(self: *GlobSearch, allocator: std.mem.Allocator, after: GlobCursor) !void {
+        var frame = GlobStar{ .pattern = after, .value = self.vi, .mode = .component };
+        if (utf16Step(self.pattern, after)) |second| {
+            if (normalizedGlobUnit(second.unit) == '*') {
+                frame.pattern = second.next;
+                frame.mode = .any;
+                if (utf16Step(self.pattern, second.next)) |slash| {
+                    if (normalizedGlobUnit(slash.unit) == '/') {
+                        frame.pattern = slash.next;
+                        frame.mode = .directory;
+                    }
+                }
+            }
+        }
+        try self.stars.append(allocator, frame);
+        self.pi = frame.pattern;
     }
-    const value_step = utf16Step(value, vi) orelse return false;
-    return pc == normalizedGlobUnit(value_step.unit) and globMatch(pattern, pattern_step.next, value, value_step.next, budget);
-}
+
+    fn retryStar(self: *GlobSearch) bool {
+        while (self.stars.items.len > 0) {
+            const frame = &self.stars.items[self.stars.items.len - 1];
+            while (utf16Step(self.value, frame.value)) |step| {
+                frame.value = step.next;
+                const unit = normalizedGlobUnit(step.unit);
+                if (frame.mode == .component and unit == '/') break;
+                if (frame.mode == .directory and unit != '/') continue;
+                self.pi = frame.pattern;
+                self.vi = frame.value;
+                return true;
+            }
+            _ = self.stars.pop();
+        }
+        return false;
+    }
+};
 
 fn normalizedSeparator(c: u8) u8 {
     return if (c == '\\') '/' else c;
@@ -717,7 +871,9 @@ fn containsNormalizedSeparator(value: []const u8) bool {
 }
 
 fn stripOneNormalizedDotSlash(value: []const u8) []const u8 {
-    if (value.len >= 2 and value[0] == '.' and normalizedSeparator(value[1]) == '/') return value[2..];
+    if (value.len >= 2 and value[0] == '.' and normalizedSeparator(value[1]) == '/') {
+        return value[2..];
+    }
     return value;
 }
 
@@ -759,7 +915,9 @@ const GlobScalar = struct {
 
 fn decodeGlobScalar(value: []const u8, byte_index: usize) GlobScalar {
     const byte_len: usize = std.unicode.utf8ByteSequenceLength(value[byte_index]) catch 1;
-    if (byte_index + byte_len > value.len) return .{ .codepoint = value[byte_index], .byte_len = 1 };
+    if (byte_index + byte_len > value.len) {
+        return .{ .codepoint = value[byte_index], .byte_len = 1 };
+    }
     const codepoint = std.unicode.utf8Decode(value[byte_index..][0..byte_len]) catch
         return .{ .codepoint = value[byte_index], .byte_len = 1 };
     return .{ .codepoint = codepoint, .byte_len = byte_len };
@@ -796,27 +954,29 @@ fn defaultIo() std.Io {
 }
 
 test "glob matching preserves pxpipe wildcard semantics" {
-    try std.testing.expect(matchGlob("*.ts", "src/core/foo.ts"));
-    try std.testing.expect(!matchGlob("*.ts", "src/core/foo.js"));
-    try std.testing.expect(matchGlob("**/*.ts", "foo.ts"));
-    try std.testing.expect(matchGlob("**/*.ts", "src/core/foo.ts"));
-    try std.testing.expect(matchGlob("src/**", "src/core/foo.ts"));
-    try std.testing.expect(matchGlob("foo?.ts", "foo1.ts"));
-    try std.testing.expect(!matchGlob("foo?.ts", "foo12.ts"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "*.ts", "src/core/foo.ts"));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, "*.ts", "src/core/foo.js"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "**/*.ts", "foo.ts"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "**/*.ts", "src/core/foo.ts"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "src/**", "src/core/foo.ts"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "foo?.ts", "foo1.ts"));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, "foo?.ts", "foo12.ts"));
 }
 
 test "glob normalization precedes basename selection and strips one dot slash" {
-    try std.testing.expect(matchGlob("*.ts", "src\\core\\foo.ts"));
-    try std.testing.expect(matchGlob("src\\**\\*.ts", ".\\src\\core\\foo.ts"));
-    try std.testing.expect(matchGlob("./src/foo.ts", "././src/foo.ts"));
-    try std.testing.expect(!matchGlob("src/foo.ts", "././src/foo.ts"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "*.ts", "src\\core\\foo.ts"));
+    try std.testing.expect(
+        try matchGlob(std.testing.allocator, "src\\**\\*.ts", ".\\src\\core\\foo.ts"),
+    );
+    try std.testing.expect(try matchGlob(std.testing.allocator, "./src/foo.ts", "././src/foo.ts"));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, "src/foo.ts", "././src/foo.ts"));
 }
 
 test "glob question mark consumes one UTF-16 code unit" {
-    try std.testing.expect(matchGlob("?.txt", "é.txt"));
-    try std.testing.expect(!matchGlob("?.txt", "😀.txt"));
-    try std.testing.expect(matchGlob("??.txt", "😀.txt"));
-    try std.testing.expect(!matchGlob("??.txt", "é.txt"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "?.txt", "é.txt"));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, "?.txt", "😀.txt"));
+    try std.testing.expect(try matchGlob(std.testing.allocator, "??.txt", "😀.txt"));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, "??.txt", "é.txt"));
 }
 
 test "git child environment removes every Git-prefixed variable" {
@@ -927,4 +1087,88 @@ fn writeTestFile(repo: []const u8, name: []const u8, content: []const u8) !void 
     var file = try dir.createFile(defaultIo(), name, .{ .truncate = true });
     defer file.close(defaultIo());
     try file.writeStreamingAll(defaultIo(), content);
+}
+
+test "glob backtracking preserves component, directory, and UTF-16 choices" {
+    const Case = struct { pattern: []const u8, value: []const u8, matches: bool };
+    const cases = [_]Case{
+        .{ .pattern = "*a*b", .value = "aaab", .matches = true },
+        .{ .pattern = "a/*/b", .value = "a/x/y/b", .matches = false },
+        .{ .pattern = "a/**/b", .value = "a/b", .matches = true },
+        .{ .pattern = "a/**/b", .value = "a/x/y/b", .matches = true },
+        .{ .pattern = "**/a*/**/b", .value = "x/aa/y/b", .matches = true },
+        .{ .pattern = "**/a*/**/b", .value = "x/aa/y/b/c", .matches = false },
+        .{ .pattern = "x/?*/z", .value = "x/😀/z", .matches = true },
+        .{ .pattern = "x/*?/z", .value = "x/😀/z", .matches = true },
+        .{ .pattern = "a***b", .value = "axxb", .matches = true },
+        .{ .pattern = "a***b", .value = "a/x/b", .matches = false },
+        .{ .pattern = "x/a***b", .value = "x/a/y/b", .matches = true },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.matches,
+            try matchGlob(std.testing.allocator, case.pattern, case.value),
+        );
+    }
+}
+
+test "glob transition budget retains its exact terminal-call boundary" {
+    const text = try std.testing.allocator.alloc(u8, 1_000_000);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'a');
+    try std.testing.expect(try matchGlob(
+        std.testing.allocator,
+        text[0..999_999],
+        text[0..999_999],
+    ));
+    try std.testing.expect(!try matchGlob(std.testing.allocator, text, text));
+}
+
+fn globAllocationProbe(allocator: std.mem.Allocator) !void {
+    try std.testing.expect(try matchGlob(allocator, "*a/**/b?.txt", "aa/nested/b1.txt"));
+}
+
+test "glob frames release every allocation and report allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, globAllocationProbe, .{});
+}
+
+fn pathAllocationProbe(allocator: std.mem.Allocator, root: []const u8) !void {
+    var corpus = try collectPaths(allocator, &.{root}, &.{"*.txt"}, &.{});
+    defer corpus.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), corpus.files.len);
+    try std.testing.expectEqual(@as(usize, 1), corpus.warnings.len);
+}
+
+test "directory collection preserves all owners at every allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "nested", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/b.txt", .data = "b" });
+    try tmp.dir.symLink(std.testing.io, "a.txt", "link.txt", .{});
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pathAllocationProbe, .{root});
+}
+
+test "directory walk uses bounded ancestor frames and skips symlink cycles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(std.testing.allocator);
+    for (0..48) |_| {
+        try path.appendSlice(std.testing.allocator, "d/");
+        try tmp.dir.createDirPath(std.testing.io, path.items);
+    }
+    try path.appendSlice(std.testing.allocator, "leaf.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path.items, .data = "deep" });
+    try tmp.dir.symLink(std.testing.io, ".", "cycle", .{});
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var corpus = try collectPaths(std.testing.allocator, &.{root}, &.{}, &.{});
+    defer corpus.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), corpus.files.len);
+    try std.testing.expect(std.mem.endsWith(u8, corpus.files[0], path.items));
+    try std.testing.expectEqual(@as(usize, 1), corpus.warnings.len);
+    try std.testing.expectEqual(WarningKind.symlink, corpus.warnings[0].kind);
 }
