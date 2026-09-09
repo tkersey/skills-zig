@@ -12,7 +12,7 @@ const UsageText =
     \\Compute normalized budget governor state from account/rateLimits/read JSON.
     \\
     \\Usage:
-    \\  zig run codex/skills/cas/scripts/budget_governor.zig -- [options] < input.json
+    \\  budget_governor [options] < input.json
     \\
     \\Options:
     \\  --now-sec N   Override "now" (unix epoch seconds)
@@ -124,7 +124,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const input = try std.Io.File.stdin().readToEndAlloc(allocator, 16 * 1024 * 1024);
+    var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &.{});
+    // allocRemaining rejects at its limit; the extra byte preserves an inclusive 16 MiB ceiling.
+    const input = try stdin_reader.interface.allocRemaining(
+        allocator,
+        .limited(16 * 1024 * 1024 + 1),
+    );
     defer allocator.free(input);
 
     var owned = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);

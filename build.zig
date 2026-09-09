@@ -861,6 +861,7 @@ fn addCasAdminTests(
         "test-cas-budget-governor",
         "Run budget_governor tests",
     );
+    run_cas_budget_governor_tests.step.dependOn(&addCasBudgetGovernorSmoke(b, admin.budget).step);
     tests.dependOn(&run_cas_budget_governor_tests.step);
     const run_cas_app_server_preflight_tests = addTestStepWithOptions(
         b,
@@ -898,6 +899,42 @@ fn addCasAdminTests(
     oracle.step.dependOn(&artifacts.automation.install.step);
     oracle.expectStdOutMatch("cron-0.2.13 automation oracle: pass");
     tests.dependOn(&oracle.step);
+}
+
+fn addCasBudgetGovernorSmoke(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+) *std.Build.Step.Run {
+    const exe = addExecutable(b, "cas-budget-governor-smoke", root_module);
+    const smoke = b.addRunArtifact(exe);
+    smoke.addArgs(&.{ "--now-sec", "1000" });
+    smoke.setStdIn(.{
+        .bytes = "{\"rateLimits\":{\"limitId\":\"smoke\",\"primary\":{\"usedPercent\":50," ++
+            "\"resetsAt\":2800,\"windowDurationMins\":60}}}",
+    });
+    smoke.stdio_limit = .limited(4096);
+    smoke.expectStdOutEqual(
+        "{\"ok\":true,\"bucketSource\":\"single_bucket\",\"bucketKey\":null," ++
+            "\"limitId\":\"smoke\"," ++
+            "\"limitName\":null,\"planType\":null,\"windowKind\":\"primary\",\"nowSec\":1000," ++
+            "\"usedPercent\":50,\"resetsAt\":2800,\"windowDurationMins\":60," ++
+            "\"remainingMins\":30," ++
+            "\"elapsedPercent\":50,\"deltaPercent\":0,\"tier\":\"on_track\"," ++
+            "\"tierReason\":\"delta_lt_10\",\"pacingOk\":true,\"pacingReason\":\"ok\"," ++
+            "\"effectiveTier\":\"on_track\",\"primary\":{\"usedPercent\":50,\"resetsAt\":2800," ++
+            "\"windowDurationMins\":60,\"remainingMins\":30,\"elapsedPercent\":50," ++
+            "\"deltaPercent\":0,\"tier\":\"on_track\",\"tierReason\":\"delta_lt_10\"," ++
+            "\"pacingOk\":true,\"pacingReason\":\"ok\",\"effectiveTier\":\"on_track\"}," ++
+            "\"secondary\":null}\n",
+    );
+    smoke.expectStdErrEqual("");
+    const help = b.addRunArtifact(exe);
+    help.addArg("--help");
+    help.stdio_limit = .limited(4096);
+    help.expectStdOutMatch("budget_governor [options] < input.json");
+    help.expectStdErrEqual("");
+    smoke.step.dependOn(&help.step);
+    return smoke;
 }
 
 fn addCasDispatcherTest(ctx: BuildContext, artifacts: CasArtifacts, tests: *std.Build.Step) void {
