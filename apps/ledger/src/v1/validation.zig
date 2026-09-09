@@ -3123,7 +3123,9 @@ fn validateRuleGraph(
     root_rules: []const CompiledRule,
     definition_plan: *const definition.Plan,
 ) !void {
-    const allocator = std.heap.page_allocator;
+    const scratch_bytes = 4 * 1024;
+    var scratch = std.heap.stackFallback(scratch_bytes, std.heap.page_allocator);
+    const allocator = scratch.get();
     var tasks: std.ArrayList(CacheRuleTask) = .empty;
     defer tasks.deinit(allocator);
     try appendCacheRuleTasks(&tasks, allocator, root_rules, definition_plan);
