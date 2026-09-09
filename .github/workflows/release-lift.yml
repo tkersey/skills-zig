@@ -28,8 +28,10 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
+            zig_target: x86_64-linux
             runs_on: ubuntu-latest
           - target: darwin-arm64
+            zig_target: aarch64-macos
             runs_on: macos-14
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -47,7 +49,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Build lift binaries
-        run: zig build build-lift -Doptimize=ReleaseFast
+        run: zig build build-lift -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Package lift artifact
         run: |
           mkdir -p dist/lift
