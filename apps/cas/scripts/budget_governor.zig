@@ -160,10 +160,10 @@ pub fn main(init: std.process.Init) !void {
 
 pub const OwnedGovernor = struct {
     value: GovernorOut,
-    parsed: std.json.Parsed(std.json.Value),
+    arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *OwnedGovernor) void {
-        self.parsed.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -175,15 +175,16 @@ pub fn computeBudgetGovernorFromSlice(
     input: []const u8,
     now_sec_opt: ?i64,
 ) !OwnedGovernor {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{
         .allocate = .alloc_always,
     });
-    errdefer parsed.deinit();
-    const root = switch (parsed.value) {
+    const root = switch (parsed) {
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-    return .{ .value = computeBudgetGovernor(root, now_sec_opt), .parsed = parsed };
+    return .{ .value = computeBudgetGovernor(root, now_sec_opt), .arena = arena };
 }
 
 const ParsedArgs = struct {
