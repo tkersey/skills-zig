@@ -11,7 +11,7 @@ git init -q
 git config user.email test@example.invalid
 git config user.name release-apps-test
 
-apps=(seq lift cas ledger memory-note)
+apps=(seq lift cas ledger memory-note typesafe)
 for app in "${apps[@]}"; do
   mkdir -p "apps/$app"
   printf '1.0.0\n' >"apps/$app/VERSION"
@@ -77,6 +77,15 @@ write_seq() {
 write_ledger() {
   mkdir -p apps/ledger/src
   printf 'ledger\n' >apps/ledger/src/main.zig
+}
+
+write_typesafe() {
+  mkdir -p apps/typesafe/src
+  printf 'typesafe\n' >apps/typesafe/src/main.zig
+}
+
+write_typesafe_build() {
+  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nfn buildTypeSafe() void {\n  _ = "apps/typesafe/src/main.zig";\n}\n' >build.zig
 }
 
 write_definition_core() {
@@ -258,8 +267,10 @@ assert_affected cas write_cas_runtime
 assert_affected cas write_cas_hook_policy_source
 assert_affected cas write_cas_launch_source
 assert_affected seq,cas,ledger,memory-note write_store_core
+assert_affected typesafe write_typesafe
+assert_affected typesafe write_typesafe_build
 assert_affected seq,cas,ledger,memory-note write_jsonl_core
-assert_affected seq,lift,cas,ledger,memory-note change_shared_perf_contract
+assert_affected seq,lift,cas,ledger,memory-note,typesafe change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "" write_perf_hub_build
@@ -267,28 +278,28 @@ assert_affected seq write_seq_build
 assert_affected cas write_cas_control_plane_build
 assert_affected cas write_cas_runtime_only_build
 assert_affected cas write_cas_hook_policy_only_build
-assert_affected seq,lift,cas,ledger,memory-note write_unknown_bare_identifier_build
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_bare_identifier_build
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_ledger_filtered_test_build
 assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected lift move_build_line
-assert_affected seq,lift,cas,ledger,memory-note write_mixed_seq_unknown_build
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_mixed_seq_unknown_build
 assert_affected seq,cas,ledger write_definition_package_path
 assert_affected ledger write_ledger_package_path
 assert_affected ledger write_learnings_package_path
 assert_affected ledger write_synesthesia_package_path
-assert_affected seq,lift,cas,ledger,memory-note write_unknown_package_change
-assert_affected seq,lift,cas,ledger,memory-note write_build_only
-assert_affected seq,lift,cas,ledger,memory-note write_unknown_app
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_package_change
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_build_only
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_app
 assert_affected "" write_readme
 assert_affected seq write_durable_store_perf
 assert_ci_affected seq,cas,ledger write_definition_guard
 assert_ci_affected cas write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
-assert_ci_affected seq,lift,cas,ledger,memory-note write_ci_helper
+assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_ci_helper
 
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.

@@ -9,6 +9,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and Codex automation)
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
+- `typesafe` (document review triage with the TypeSafe API)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 Codex automation is owned by CAS 0.4 and is invoked through `cas automation`;
@@ -22,6 +23,7 @@ separate compatibility alias.
 - `apps/cas`
 - `apps/ledger`
 - `apps/memory-note`
+- `apps/typesafe`
 - `libs/core`
 - `libs/definition_core`
 - `libs/durable_store`
@@ -51,6 +53,7 @@ zig build build-lift -Doptimize=ReleaseFast
 zig build build-cas -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
+zig build build-typesafe -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -101,6 +104,7 @@ Per-app VERSION files are the source of truth:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
+- `apps/typesafe/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that

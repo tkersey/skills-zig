@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note)
+apps=(seq lift cas ledger memory-note typesafe)
 
 resolve_ref() {
   local ref=$1
@@ -105,6 +105,10 @@ case "$mode" in
       # Do not let the imported module's name classify the consuming product.
       if [[ "$dependency_import" -eq 1 ]]; then
         return "$matched"
+      fi
+      if grep -Eq '(^|[^[:alnum:]_])buildTypeSafe\(' <<<"$raw"; then
+        mark_app typesafe
+        matched=0
       fi
       for app in "${apps[@]}"; do
         token=${app//-/_}
@@ -222,6 +226,9 @@ case "$mode" in
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
+        .github/workflows/release-typesafe.yml)
+          mark_app typesafe
+          ;;
         apps/*)
           matched=0
           for app in "${apps[@]}"; do
@@ -262,6 +269,10 @@ case "$mode" in
         local retired_app_deletion=0
         local has_addition=0
         hunk_text=$(printf '%s\n' "${build_hunk[@]}")
+        if grep -Eq '^fn buildTypeSafe\(' <<<"$hunk_text"; then
+          mark_app typesafe
+          return
+        fi
         for change in "${build_changed_lines[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then

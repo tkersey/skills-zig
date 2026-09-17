@@ -5,3 +5,5 @@
 zig-pkg/
 zig-out/
 dist/
+.env
+.env.*
