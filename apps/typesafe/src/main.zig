@@ -93,7 +93,10 @@ pub fn main(init: std.process.Init) !void {
         var out: std.Io.Writer.Allocating = .init(allocator);
         try std.json.Stringify.value(report, .{}, &out.writer);
         try out.writer.writeByte('\n');
-        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), out.written());
+        std.Io.File.stdout().writeStreamingAll(core_io.defaultIo(), out.written()) catch |err| {
+            if (err == error.BrokenPipe) return;
+            return err;
+        };
     }
 }
 

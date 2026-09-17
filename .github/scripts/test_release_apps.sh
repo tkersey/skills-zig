@@ -88,6 +88,10 @@ write_typesafe_build() {
   printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nfn buildTypeSafe() void {\n  _ = "apps/typesafe/src/main.zig";\n}\n' >build.zig
 }
 
+write_mixed_memory_note_typesafe_build() {
+  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nconst memory_note_tests = .{ .path = "apps/memory-note", .test_deps = &.{} };\nfn buildTypeSafe() void {\n  _ = "apps/typesafe/src/main.zig";\n}\n' >build.zig
+}
+
 write_definition_core() {
   mkdir -p libs/definition_core
   printf 'definition\n' >libs/definition_core/root.zig
@@ -269,6 +273,7 @@ assert_affected cas write_cas_launch_source
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected typesafe write_typesafe
 assert_affected typesafe write_typesafe_build
+assert_affected memory-note,typesafe write_mixed_memory_note_typesafe_build
 assert_affected seq,cas,ledger,memory-note write_jsonl_core
 assert_affected seq,lift,cas,ledger,memory-note,typesafe change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools

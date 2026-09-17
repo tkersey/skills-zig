@@ -269,11 +269,45 @@ case "$mode" in
         local retired_app_deletion=0
         local has_addition=0
         hunk_text=$(printf '%s\n' "${build_hunk[@]}")
-        if grep -Eq '^fn buildTypeSafe\(' <<<"$hunk_text"; then
-          mark_app typesafe
+        # Attribute a newly added constructor to TypeSafe, then keep classifying
+        # other changes in the same hunk under their own owners.
+        local in_new_typesafe=0
+        local added_typesafe=0
+        local remaining_changes=()
+        for change in "${build_changed_lines[@]}"; do
+          if [[ "$change" == '+fn buildTypeSafe('* ]]; then
+            mark_app typesafe
+            added_typesafe=1
+            in_new_typesafe=1
+            continue
+          fi
+          if [[ "$in_new_typesafe" -eq 1 ]]; then
+            if [[ "$change" == '+}' ]]; then
+              in_new_typesafe=0
+            elif [[ "${change:0:1}" == '-' ]]; then
+              remaining_changes+=("$change")
+            fi
+            continue
+          fi
+          remaining_changes+=("$change")
+        done
+        if [[ "$in_new_typesafe" -eq 1 ]]; then
+          mark_all
           return
         fi
-        for change in "${build_changed_lines[@]}"; do
+        if [[ "$added_typesafe" -eq 1 ]]; then
+          local substantive_remaining=0
+          for change in "${remaining_changes[@]}"; do
+            if [[ "$change" != '+' ]]; then
+              substantive_remaining=1
+              break
+            fi
+          done
+          if [[ "$substantive_remaining" -eq 0 ]]; then
+            return
+          fi
+        fi
+        for change in "${remaining_changes[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1

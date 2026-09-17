@@ -17,6 +17,7 @@ env:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: release-typesafe-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
