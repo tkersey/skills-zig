@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note)
+apps=(seq lift cas ledger memory-note typesafe)
 
 resolve_ref() {
   local ref=$1
@@ -105,6 +105,10 @@ case "$mode" in
       # Do not let the imported module's name classify the consuming product.
       if [[ "$dependency_import" -eq 1 ]]; then
         return "$matched"
+      fi
+      if grep -Eq '(^|[^[:alnum:]_])buildTypeSafe\(' <<<"$raw"; then
+        mark_app typesafe
+        matched=0
       fi
       for app in "${apps[@]}"; do
         token=${app//-/_}
@@ -222,6 +226,9 @@ case "$mode" in
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
+        .github/workflows/release-typesafe.yml)
+          mark_app typesafe
+          ;;
         apps/*)
           matched=0
           for app in "${apps[@]}"; do
@@ -262,7 +269,45 @@ case "$mode" in
         local retired_app_deletion=0
         local has_addition=0
         hunk_text=$(printf '%s\n' "${build_hunk[@]}")
+        # Attribute a newly added constructor to TypeSafe, then keep classifying
+        # other changes in the same hunk under their own owners.
+        local in_new_typesafe=0
+        local added_typesafe=0
+        local remaining_changes=()
         for change in "${build_changed_lines[@]}"; do
+          if [[ "$change" == '+fn buildTypeSafe('* ]]; then
+            mark_app typesafe
+            added_typesafe=1
+            in_new_typesafe=1
+            continue
+          fi
+          if [[ "$in_new_typesafe" -eq 1 ]]; then
+            if [[ "$change" == '+}' ]]; then
+              in_new_typesafe=0
+            elif [[ "${change:0:1}" == '-' ]]; then
+              remaining_changes+=("$change")
+            fi
+            continue
+          fi
+          remaining_changes+=("$change")
+        done
+        if [[ "$in_new_typesafe" -eq 1 ]]; then
+          mark_all
+          return
+        fi
+        if [[ "$added_typesafe" -eq 1 ]]; then
+          local substantive_remaining=0
+          for change in "${remaining_changes[@]}"; do
+            if [[ "$change" != '+' ]]; then
+              substantive_remaining=1
+              break
+            fi
+          done
+          if [[ "$substantive_remaining" -eq 0 ]]; then
+            return
+          fi
+        fi
+        for change in "${remaining_changes[@]}"; do
           raw=${change:1}
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1

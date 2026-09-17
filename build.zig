@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
         cas.surface,
         ledger.surface,
         buildMemoryNote(ctx, shared),
+        buildTypeSafe(ctx, shared),
     };
     for (surfaces) |surface| {
         _ = addGroupedStep(
@@ -315,6 +316,25 @@ fn buildMemoryNote(ctx: BuildContext, shared: SharedModules) AppSurface {
         .build_description = "Build memory-note binary",
         .build_deps = &.{&memory_note.install.step},
         .test_deps = &.{&run_memory_note_tests.step},
+    });
+}
+
+fn buildTypeSafe(ctx: BuildContext, shared: SharedModules) AppSurface {
+    const b = ctx.b;
+    const meta = addVersionModule(b, @embedFile("apps/typesafe/VERSION"));
+    const root = ctx.module("apps/typesafe/src/main.zig", &.{
+        .{ .name = "core_io", .module = shared.io },
+        .{ .name = "app_meta", .module = meta },
+    });
+    const cli = addInstalledExecutable(b, "typesafe", root);
+    const tests = addTestStep(b, root, "test-typesafe", "Run TypeSafe CLI tests");
+    addRunStep(b, cli.exe, "run-typesafe", "Run TypeSafe CLI", &.{"--help"});
+    return appSurface(b, .{
+        .path = b.path("apps/typesafe"),
+        .build_step_name = "build-typesafe",
+        .build_description = "Build typesafe binary",
+        .build_deps = &.{&cli.install.step},
+        .test_deps = &.{&tests.step},
     });
 }
 

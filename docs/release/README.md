@@ -7,6 +7,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
+- `typesafe`: `.github/workflows/release-typesafe.yml` on tag `typesafe-v*`
 
 Codex automation is part of CAS 0.4 and is invoked through `cas automation`.
 It uses the CAS build, version, tag, release archives, and tap formula; there is
@@ -19,6 +20,7 @@ Per-app VERSION files:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
+- `apps/typesafe/VERSION`
 
 Release contract:
 
@@ -44,6 +46,7 @@ Release tags must match file versions:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
+- `typesafe-v<version>` where `<version>` equals `apps/typesafe/VERSION`
 
 Each workflow publishes two release archives for its independently versioned CLI. CAS neither bundles nor executes Ledger; caller workflows validate inquiry carriers before handing them to CAS.
 
@@ -62,6 +65,8 @@ Examples:
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
+- `typesafe-v1.2.3-linux-x86_64.tar.gz`
+- `typesafe-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 

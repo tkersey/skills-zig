@@ -11,6 +11,7 @@ on:
       - "apps/cas/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
+      - "apps/typesafe/**"
       - "libs/core/**"
       - "libs/cas_runtime/**"
       - "libs/definition_core/**"
@@ -44,6 +45,7 @@ jobs:
       cas: ${{ steps.classify.outputs.cas }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
+      typesafe: ${{ steps.classify.outputs.typesafe }}
       perf: ${{ steps.classify.outputs.perf }}
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +70,7 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas ledger memory-note; do
+          for app in seq lift cas ledger memory-note typesafe; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -489,3 +491,17 @@ jobs:
         run: zig build build-memory-note -Doptimize=ReleaseFast
       - name: Test memory-note
         run: zig build test-memory-note
+
+  typesafe:
+    needs: changes
+    if: needs.changes.outputs.typesafe == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build typesafe
+        run: zig build build-typesafe -Doptimize=ReleaseFast
+      - name: Test typesafe
+        run: zig build test-typesafe
