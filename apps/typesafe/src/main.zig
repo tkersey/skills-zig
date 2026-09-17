@@ -71,7 +71,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const opts = parseArgs(argv) catch |err| return fail(err);
-    const api_key = init.environ_map.get("TYPESAFE_API_KEY") orelse return fail(error.MissingApiKey);
+    const api_key = init.environ_map.get("TYPESAFE_API_KEY") orelse
+        return fail(error.MissingApiKey);
     if (api_key.len == 0 or std.mem.indexOfAny(u8, api_key, "\r\n") != null)
         return fail(error.InvalidApiKey);
     const rubric = if (opts.rubric_path) |path| loadRubric(allocator, path) catch |err|
@@ -109,7 +110,8 @@ const usage =
 
 fn fail(err: anyerror) noreturn {
     var stderr_writer = std.Io.File.stderr().writer(core_io.defaultIo(), &.{});
-    stderr_writer.interface.print("typesafe: {s}\n", .{@errorName(err)}) catch {};
+    stderr_writer.interface.print("typesafe: {s}\n", .{@errorName(err)}) catch
+        std.process.exit(1);
     std.process.exit(1);
 }
 
@@ -188,7 +190,8 @@ fn makeRequest(
         };
         var value_writer: std.Io.Writer.Allocating = .init(allocator);
         try std.json.Stringify.value(question, .{}, &value_writer.writer);
-        const value = try std.json.parseFromSlice(std.json.Value, allocator, value_writer.written(), .{});
+        const raw_question = value_writer.written();
+        const value = try std.json.parseFromSlice(std.json.Value, allocator, raw_question, .{});
         try questions.put(allocator, dimension.id, value.value);
     }
     const payload = .{
@@ -261,14 +264,16 @@ fn parseResponse(
     const results = try allocator.alloc(DimensionResult, rubric.dimensions.len);
     var needs_review = false;
     for (rubric.dimensions, 0..) |dimension, i| {
-        const answer = object(answers.get(dimension.id) orelse return error.InvalidApiResponse) orelse
+        const answer_value = answers.get(dimension.id) orelse return error.InvalidApiResponse;
+        const answer = object(answer_value) orelse
             return error.InvalidApiResponse;
         const answer_type = string(answer.get("type") orelse return error.InvalidApiResponse) orelse
             return error.InvalidApiResponse;
         if (!std.mem.eql(u8, answer_type, "score")) return error.InvalidApiResponse;
         const score = number(answer.get("score") orelse return error.InvalidApiResponse) orelse
             return error.InvalidApiResponse;
-        const confidence = number(answer.get("confidence") orelse return error.InvalidApiResponse) orelse
+        const confidence_value = answer.get("confidence") orelse return error.InvalidApiResponse;
+        const confidence = number(confidence_value) orelse
             return error.InvalidApiResponse;
         const probabilities = answer.get("probabilities") orelse return error.InvalidApiResponse;
         const probability_map = object(probabilities) orelse return error.InvalidApiResponse;
