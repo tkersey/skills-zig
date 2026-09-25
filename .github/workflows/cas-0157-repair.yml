@@ -1,0 +1,131 @@
+name: CAS 0.157 scoped repair
+
+on:
+  push:
+    branches: [cas-codex-0.157.0]
+    paths: [.github/workflows/cas-0157-repair.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.repository == 'tkersey/skills-zig'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Apply exact-source corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          def original(revision, path):
+              return subprocess.check_output(['git', 'show', f'{revision}:{path}']).decode()
+
+          def replace_once(text, old, new):
+              if text.count(old) != 1:
+                  raise SystemExit(f'Expected exactly one match for {old[:100]!r}')
+              return text.replace(old, new, 1)
+
+          contract_path = 'apps/cas/contracts/codex-app-server-capabilities-v2.json'
+          contract = original('bf6bf5e52896528e24b9991a853c754eac6d2c57', contract_path)
+          contract = replace_once(contract,
+              '"id":"config-windows-private-desktop","profiles":["full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ConfigRequirements/properties/windowsSandboxPrivateDesktop","kind":"boolean","nullable":true',
+              '"id":"config-windows-sandbox-implementations","profiles":["full"],"document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ConfigRequirements/properties/allowedWindowsSandboxImplementations","kind":"array","nullable":true')
+          parsed = json.loads(contract)
+          assert 'threadSection/delete' in parsed['stable']['requiredClientMethods']
+          assert 'thread/rollback' not in parsed['stable']['requiredClientMethods']
+          assert set(parsed['stable']['requiredClientMethods']) <= set(parsed['experimental']['requiredClientMethods'])
+          pathlib.Path(contract_path).write_text(contract)
+
+          source_path = 'apps/cas/scripts/cas_app_server_contract.zig'
+          current = subprocess.check_output(['git', 'rev-parse', f'HEAD:{source_path}']).decode().strip()
+          assert current == 'e1813a55076a4e8391c64ee6e3f594a0b6ccb956', current
+          source = pathlib.Path(source_path).read_text()
+          source = replace_once(source,
+              '"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}',
+              '"allowedWindowsSandboxImplementations":{"type":["array","null"]}')
+          source = replace_once(source,
+              '    if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {',
+              '    try requireArraySubset(method_sets[0], method_sets[3]);\n' +
+              '    if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {')
+          source = replace_once(source,
+              '        .{ .json = "[\\\" \\t\\\"]", .expected = error.SyntaxError },',
+              '        .{ .json = "[\\\" \\\\t\\\"]", .expected = error.InvalidContract },')
+          source = replace_once(source,
+              '        var methods = std.json.parseFromSlice(std.json.Value, allocator, case.json, .{}) catch |err| {\n' +
+              '            try std.testing.expectEqual(case.expected, err);\n' +
+              '            continue;\n' +
+              '        };',
+              '        var methods = try std.json.parseFromSlice(\n' +
+              '            std.json.Value, allocator, case.json, .{},\n' +
+              '        );')
+          tests = r'''
+          test "inquiry still requires revert when rollback is absent" {
+              var baseline = try parseBaseline(std.testing.allocator);
+              defer baseline.deinit();
+              const stable = try objectField(baseline.value, "stable");
+              const methods = try arrayField(stable, "requiredClientMethods");
+              try std.testing.expect(!jsonArrayContains(methods, "thread/rollback"));
+              try expectMethodDriftProfiles(
+                  &baseline.value,
+                  .stable_client,
+                  "thread/revert",
+                  &.{ .session_inquiry, .full },
+              );
+          }
+
+          test "current Windows implementation policy remains a nullable array" {
+              const allocator = std.testing.allocator;
+              var baseline = try parseBaseline(allocator);
+              defer baseline.deinit();
+              var bundles = try makeTestBundles(allocator, baseline.value);
+              defer bundles.deinit(allocator);
+              const needle = "\"allowedWindowsSandboxImplementations\":{\"type\":[\"array\",\"null\"]}";
+              try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, stable_shapes, needle));
+              const drifted = try std.mem.replaceOwned(
+                  u8, allocator, stable_shapes, needle,
+                  "\"allowedWindowsSandboxImplementations\":{\"type\":[\"boolean\",\"null\"]}",
+              );
+              defer allocator.free(drifted);
+              var report = try inspectTestBundles(
+                  allocator, &baseline.value, &bundles, drifted, experimental_shapes,
+              );
+              defer report.deinit(allocator);
+              try std.testing.expectEqual(Status.incompatible, report.status);
+              try std.testing.expect(contains(
+                  report.shape_failures.items, "config-windows-sandbox-implementations",
+              ));
+          }
+          '''
+          source += tests
+          pathlib.Path(source_path).write_text(source)
+          PY
+      - name: Format and audit corrected source
+        run: |
+          zig fmt apps/cas/scripts/cas_app_server_contract.zig
+          zig run tools/tiger_style/main.zig -- audit-files apps/cas/scripts/cas_app_server_contract.zig
+          git diff --check
+      - name: Test CAS surfaces
+        run: zig build test-cas --summary all
+      - name: Publish only the reviewed repair paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add apps/cas/contracts/codex-app-server-capabilities-v2.json apps/cas/scripts/cas_app_server_contract.zig
+          git diff --cached --stat
+          git commit -m 'fix(cas): validate current sandbox shapes and bounded capability invariants'
+          git push origin HEAD:refs/heads/cas-codex-0.157.0
