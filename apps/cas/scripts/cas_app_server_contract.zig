@@ -1322,17 +1322,17 @@ fn validateBaselineMethodSets(
     stable: std.json.Value,
     experimental: std.json.Value,
 ) !void {
-    if ((try arrayField(stable, "requiredClientMethods")).items.len != 98) {
-        return error.InvalidContract;
-    }
-    if ((try arrayField(stable, "requiredServerRequests")).items.len != 10) {
-        return error.InvalidContract;
-    }
-    if ((try arrayField(stable, "requiredNotifications")).items.len != 79) {
-        return error.InvalidContract;
-    }
-    if ((try arrayField(experimental, "requiredClientMethods")).items.len != 154) {
-        return error.InvalidContract;
+    // The manifest owns capability membership; release-specific cardinalities
+    // are not protocol invariants. Keep resource bounds and set validation.
+    const method_sets = [_]std.json.Array{
+        try arrayField(stable, "requiredClientMethods"),
+        try arrayField(stable, "requiredServerRequests"),
+        try arrayField(stable, "requiredNotifications"),
+        try arrayField(experimental, "requiredClientMethods"),
+    };
+    for (method_sets) |methods| {
+        if (methods.items.len == 0) return error.InvalidContract;
+        try validateStringArray(methods);
     }
     if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {
         return error.ContractTooLarge;
@@ -1340,10 +1340,6 @@ fn validateBaselineMethodSets(
     if ((try arrayField(experimental, "requiredShapes")).items.len > max_shapes) {
         return error.ContractTooLarge;
     }
-    try validateStringArray(try arrayField(stable, "requiredClientMethods"));
-    try validateStringArray(try arrayField(stable, "requiredServerRequests"));
-    try validateStringArray(try arrayField(stable, "requiredNotifications"));
-    try validateStringArray(try arrayField(experimental, "requiredClientMethods"));
     try validateShapeProfiles(try arrayField(stable, "requiredShapes"));
     try validateShapeProfiles(try arrayField(experimental, "requiredShapes"));
 }
@@ -2376,6 +2372,7 @@ fn validateStringArray(array: std.json.Array) !void {
             .string => |value| value,
             else => return error.InvalidContract,
         };
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.InvalidContract;
         for (array.items[0..index]) |prior| if (switch (prior) {
             .string => |value| std.mem.eql(u8, text, value),
             else => false,
@@ -2612,7 +2609,7 @@ fn mergeDefinitionsIntoMethodSchema(
     );
 }
 
-test "baseline method-set cardinalities and exact compatible bundles" {
+test "baseline capabilities and exact compatible bundles" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
     var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
@@ -2627,6 +2624,52 @@ test "baseline method-set cardinalities and exact compatible bundles" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.compatible, report.status);
     try std.testing.expectEqual(@as(usize, 0), report.additive_server_requests.items.len);
+}
+
+test "baseline admits bounded capability additions and retirements" {
+    const allocator = std.testing.allocator;
+    const needle = "\"thread/metadata/update\",";
+    try std.testing.expect(std.mem.count(u8, baseline_json, needle) != 0);
+    for ([_][]const u8{
+        "",
+        "\"thread/metadata/update\",\"future/client\",",
+    }) |replacement| {
+        const changed = try std.mem.replaceOwned(u8, allocator, baseline_json, needle, replacement);
+        defer allocator.free(changed);
+        var baseline = try std.json.parseFromSlice(std.json.Value, allocator, changed, .{});
+        defer baseline.deinit();
+        try validateBaseline(baseline.value);
+    }
+}
+
+test "baseline method sets reject empty duplicate malformed and oversized requirements" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, expected: anyerror }{
+        .{ .json = "[]", .expected = error.InvalidContract },
+        .{ .json = "[\"initialize\",\"initialize\"]", .expected = error.InvalidContract },
+        .{ .json = "[\" \t\"]", .expected = error.SyntaxError },
+        .{ .json = "[\"\"]", .expected = error.InvalidContract },
+        .{ .json = "[42]", .expected = error.InvalidContract },
+        .{
+            .json = "[" ++ "\"method\"," ** max_methods ++ "\"method\"]",
+            .expected = error.ContractTooLarge,
+        },
+    };
+    for (cases) |case| {
+        var baseline = try parseBaseline(allocator);
+        defer baseline.deinit();
+        var methods = std.json.parseFromSlice(std.json.Value, allocator, case.json, .{}) catch |err| {
+            try std.testing.expectEqual(case.expected, err);
+            continue;
+        };
+        defer methods.deinit();
+        const stable = baseline.value.object.getPtr("stable").?;
+        stable.object.getPtr("requiredClientMethods").?.* = methods.value;
+        try std.testing.expectError(
+            case.expected,
+            validateBaselineMethodSets(stable.*, try objectField(baseline.value, "experimental")),
+        );
+    }
 }
 
 test "PathUri round trips opaquely without native path normalization" {
