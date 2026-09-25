@@ -1334,6 +1334,7 @@ fn validateBaselineMethodSets(
         if (methods.items.len == 0) return error.InvalidContract;
         try validateStringArray(methods);
     }
+    try requireArraySubset(method_sets[0], method_sets[3]);
     if ((try arrayField(stable, "requiredShapes")).items.len > max_shapes) {
         return error.ContractTooLarge;
     }
@@ -2403,7 +2404,7 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"ThreadSection":{"type":"object"},"ThreadHistoryMode":{"type":"string"},"Thread":{"properties":{"section":{"anyOf":[{"$ref":"#/definitions/ThreadSection"},{"type":"null"}]},"sectionEnteredAt":{"type":["integer","null"]},"path":{"type":["string","null"]},"historyMode":{"$ref":"#/definitions/ThreadHistoryMode"}}},"ThreadSectionMoveParams":{"type":"object","required":["threadId","sectionId"]},"ThreadSectionListParams":{"type":"object"},"ThreadSectionCreateParams":{"type":"object","required":["name"]},"ThreadSectionUpdateParams":{"type":"object","required":["sectionId","name"]},"ThreadSectionDeleteParams":{"type":"object","required":["sectionId"]},"ThreadListParams":{"properties":{"sectionId":{"type":["string","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"}}},"ThreadResumeParams":{"type":"object","required":["threadId"],"properties":{"excludeTurns":{"type":"boolean"}}},"ThreadResumeResponse":{"properties":{"turnsBackwardsCursor":{"type":["string","null"]},"itemsBackwardsCursor":{"type":["string","null"]}}},"ThreadRevertParams":{"type":"object","required":["threadId","beforeTurnId"]},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"type":"object","required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"TurnStatus":{"type":"string","enum":["completed","interrupted","failed","inProgress"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"FunctionCallOutputBody":{"type":"object"},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}},{"type":"object","required":["id","name","output","type"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{"$ref":"#/definitions/FunctionCallOutputBody"},"type":{"type":"string","enum":["functionCallOutput"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"BrowserUseRequirements":{"type":"object"},"FeedbackRequirements":{"type":"object"},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"CodexErrorInfo":{"oneOf":[{"type":"string","enum":["usageLimitExceeded","rateLimitExceeded"]}]},"MisalignmentErrorDetails":{"type":"object"},"TurnError":{"properties":{"misalignment":{"anyOf":[{"$ref":"#/definitions/MisalignmentErrorDetails"},{"type":"null"}]}}},"ResponseUsageMetadata":{"type":"object"},"RawResponseCompletedNotification":{"properties":{"usageMetadata":{"anyOf":[{"$ref":"#/definitions/ResponseUsageMetadata"},{"type":"null"}]}}},"TurnToolOutput":{"type":"object"},"TurnStartParams":{"properties":{"serviceTierForTurn":{"type":["string","null"]},"toolOutput":{"anyOf":[{"$ref":"#/definitions/TurnToolOutput"},{"type":"null"}]},"turnTrigger":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"},"requestAttestation":{"type":"boolean"}}},"ThreadSection":{"type":"object"},"ThreadHistoryMode":{"type":"string"},"Thread":{"properties":{"section":{"anyOf":[{"$ref":"#/definitions/ThreadSection"},{"type":"null"}]},"sectionEnteredAt":{"type":["integer","null"]},"path":{"type":["string","null"]},"historyMode":{"$ref":"#/definitions/ThreadHistoryMode"}}},"ThreadSectionMoveParams":{"type":"object","required":["threadId","sectionId"]},"ThreadSectionListParams":{"type":"object"},"ThreadSectionCreateParams":{"type":"object","required":["name"]},"ThreadSectionUpdateParams":{"type":"object","required":["sectionId","name"]},"ThreadSectionDeleteParams":{"type":"object","required":["sectionId"]},"ThreadListParams":{"properties":{"sectionId":{"type":["string","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"}}},"ThreadResumeParams":{"type":"object","required":["threadId"],"properties":{"excludeTurns":{"type":"boolean"}}},"ThreadResumeResponse":{"properties":{"turnsBackwardsCursor":{"type":["string","null"]},"itemsBackwardsCursor":{"type":["string","null"]}}},"ThreadRevertParams":{"type":"object","required":["threadId","beforeTurnId"]},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]},"ReviewDelivery":{"type":"string","enum":["inline","detached"]},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"TurnCompletedNotification":{"type":"object","required":["threadId","turn"],"properties":{"threadId":{"type":"string"},"turn":{"$ref":"#/definitions/Turn"}}},"Turn":{"type":"object","required":["id","status"],"properties":{"id":{"type":"string"},"status":{"$ref":"#/definitions/TurnStatus"}}},"TurnStatus":{"type":"string","enum":["completed","interrupted","failed","inProgress"]},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}},{"type":"object","required":["type","instructions"],"properties":{"instructions":{"type":"string"},"type":{"type":"string","enum":["custom"]}}}]},"FunctionCallOutputBody":{"type":"object"},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}},{"type":"object","required":["id","name","output","type"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{"$ref":"#/definitions/FunctionCallOutputBody"},"type":{"type":"string","enum":["functionCallOutput"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"BrowserUseRequirements":{"type":"object"},"FeedbackRequirements":{"type":"object"},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"allowedWindowsSandboxImplementations":{"type":["array","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"CodexErrorInfo":{"oneOf":[{"type":"string","enum":["usageLimitExceeded","rateLimitExceeded"]}]},"MisalignmentErrorDetails":{"type":"object"},"TurnError":{"properties":{"misalignment":{"anyOf":[{"$ref":"#/definitions/MisalignmentErrorDetails"},{"type":"null"}]}}},"ResponseUsageMetadata":{"type":"object"},"RawResponseCompletedNotification":{"properties":{"usageMetadata":{"anyOf":[{"$ref":"#/definitions/ResponseUsageMetadata"},{"type":"null"}]}}},"TurnToolOutput":{"type":"object"},"TurnStartParams":{"properties":{"serviceTierForTurn":{"type":["string","null"]},"toolOutput":{"anyOf":[{"$ref":"#/definitions/TurnToolOutput"},{"type":"null"}]},"turnTrigger":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const stable_profile_shapes =
@@ -2647,7 +2648,7 @@ test "baseline method sets reject empty duplicate malformed and oversized requir
     const cases = [_]struct { json: []const u8, expected: anyerror }{
         .{ .json = "[]", .expected = error.InvalidContract },
         .{ .json = "[\"initialize\",\"initialize\"]", .expected = error.InvalidContract },
-        .{ .json = "[\" \t\"]", .expected = error.SyntaxError },
+        .{ .json = "[\" \\t\"]", .expected = error.InvalidContract },
         .{ .json = "[\"\"]", .expected = error.InvalidContract },
         .{ .json = "[42]", .expected = error.InvalidContract },
         .{
@@ -2658,10 +2659,12 @@ test "baseline method sets reject empty duplicate malformed and oversized requir
     for (cases) |case| {
         var baseline = try parseBaseline(allocator);
         defer baseline.deinit();
-        var methods = std.json.parseFromSlice(std.json.Value, allocator, case.json, .{}) catch |err| {
-            try std.testing.expectEqual(case.expected, err);
-            continue;
-        };
+        var methods = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            case.json,
+            .{},
+        );
         defer methods.deinit();
         const stable = baseline.value.object.getPtr("stable").?;
         stable.object.getPtr("requiredClientMethods").?.* = methods.value;
@@ -3685,4 +3688,49 @@ fn referenceKeysAllowed(schema_object: std.json.ObjectMap) bool {
         if (!allowed) return false;
     }
     return true;
+}
+
+test "inquiry still requires revert when rollback is absent" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+    const stable = try objectField(baseline.value, "stable");
+    const methods = try arrayField(stable, "requiredClientMethods");
+    try std.testing.expect(!jsonArrayContains(methods, "thread/rollback"));
+    try expectMethodDriftProfiles(
+        &baseline.value,
+        .stable_client,
+        "thread/revert",
+        &.{ .session_inquiry, .full },
+    );
+}
+
+test "current Windows implementation policy remains a nullable array" {
+    const allocator = std.testing.allocator;
+    var baseline = try parseBaseline(allocator);
+    defer baseline.deinit();
+    var bundles = try makeTestBundles(allocator, baseline.value);
+    defer bundles.deinit(allocator);
+    const needle = "\"allowedWindowsSandboxImplementations\":{\"type\":[\"array\",\"null\"]}";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, stable_shapes, needle));
+    const drifted = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        stable_shapes,
+        needle,
+        "\"allowedWindowsSandboxImplementations\":{\"type\":[\"boolean\",\"null\"]}",
+    );
+    defer allocator.free(drifted);
+    var report = try inspectTestBundles(
+        allocator,
+        &baseline.value,
+        &bundles,
+        drifted,
+        experimental_shapes,
+    );
+    defer report.deinit(allocator);
+    try std.testing.expectEqual(Status.incompatible, report.status);
+    try std.testing.expect(contains(
+        report.shape_failures.items,
+        "config-windows-sandbox-implementations",
+    ));
 }
