@@ -267,7 +267,8 @@ test "duplicate marker identity fields are rejected" {
     try tmp.dir.createDir(std.testing.io, ".ledger", .default_dir);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = marker_name,
-        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"example\",\"store_id\":\"other\"}",
+        .data = "{\"schema\":\"ledger-storage-root/v1\"," ++
+            "\"store_id\":\"example\",\"store_id\":\"other\"}",
     });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
