@@ -230,16 +230,7 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "test-ledger-core",
         "Run Ledger 1.1 artifact-definition compiler tests",
     );
-    const ledger_cli_smoke_cmd = b.addSystemCommand(&.{
-        "bash",
-        "scripts/test-ledger-cli.sh",
-    });
-    ledger_cli_smoke_cmd.addArtifactArg(ledger.exe);
-    const run_ledger_cli_smoke = b.step(
-        "test-ledger-cli-smoke",
-        "Run Ledger 1.1 definition, validation, and materialization smoke tests",
-    );
-    run_ledger_cli_smoke.dependOn(&ledger_cli_smoke_cmd.step);
+    const run_ledger_cli_smoke = addLedgerCliSmoke(b, ledger.exe);
     const test_ledger = b.step("test-ledger", "Run ledger tests");
     test_ledger.dependOn(&run_ledger_tests.step);
     test_ledger.dependOn(&run_storage_root_tests.step);
@@ -260,7 +251,9 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
             .build_description = "Build ledger binary",
             .build_deps = &.{&ledger.install.step},
             .test_deps = &.{
-                &run_ledger_tests.step, &run_ledger_core_tests.step, run_ledger_cli_smoke,
+                &run_ledger_tests.step,      &run_storage_root_tests.step,
+                &run_ledger_core_tests.step, run_ledger_cli_smoke,
+                ledger_anchor_probe_step,
             },
         }),
     };
@@ -316,6 +309,17 @@ fn addLedgerRootAnchorProbe(
         "Verify managed custody remains pinned after a root swap",
     );
     step.dependOn(&run_probe.step);
+    return step;
+}
+
+fn addLedgerCliSmoke(b: *std.Build, ledger: *std.Build.Step.Compile) *std.Build.Step {
+    const smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-ledger-cli.sh" });
+    smoke_cmd.addArtifactArg(ledger);
+    const step = b.step(
+        "test-ledger-cli-smoke",
+        "Run Ledger 1.1 definition, validation, and materialization smoke tests",
+    );
+    step.dependOn(&smoke_cmd.step);
     return step;
 }
 

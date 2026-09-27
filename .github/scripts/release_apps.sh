@@ -339,8 +339,14 @@ case "$mode" in
         for index in "${!remaining_changes[@]}"; do
           change=${remaining_changes[index]}
           raw=${change:1}
+          local owner_matched=0
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
+            if ! contextual_build_line "$raw" &&
+               classify_build_owner "$(build_addition_owner "${remaining_positions[index]}")"; then
+              changed_matched=1
+              owner_matched=1
+            fi
           fi
           if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
             retired_app_deletion=1
@@ -352,9 +358,7 @@ case "$mode" in
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1
           elif [[ "${change:0:1}" == "+" ]] && ! contextual_build_line "$raw"; then
-            if classify_build_owner "$(build_addition_owner "${remaining_positions[index]}")"; then
-              changed_matched=1
-            else
+            if [[ "$owner_matched" -ne 1 ]]; then
               substantive_unknown=1
             fi
           fi
