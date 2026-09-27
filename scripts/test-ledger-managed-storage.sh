@@ -7,6 +7,7 @@ definition="$root_dir/apps/ledger/src/v1/fixtures/plain-event-definition.json"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tmp=$(cd "$tmp" && pwd -P)
+trap 'status=$?; printf "managed custody failure at line %s (exit %s)\n" "$LINENO" "$status" >&2; for result in "$tmp"/*.json; do test ! -f "$result" || { printf "%s\n" "$result" >&2; cat "$result" >&2; }; done; exit "$status"' ERR
 store="$tmp/durable store"
 mkdir -p "$store/.ledger" "$tmp/repo"
 id=0123456789abcdef0123456789abcdef
@@ -21,7 +22,7 @@ printf '{"kind":"created","value":{"id":"two","revision":1}}\n' > "$tmp/two.json
 (cd "$tmp/worktree-a"; "$bin" transact --definition "$definition" --operation append "${root_args[@]}" --input "event=$tmp/one.json" --format json) > "$tmp/one-result.json"
 (cd "$tmp/worktree-b"; "$bin" transact --definition "$definition" --operation append "${root_args[@]}" --input "event=$tmp/two.json" --format json) > "$tmp/two-result.json"
 for result in one two; do
-  jq -e '.valid == true and .storage_mutated == true and .authority_granted == false' "$tmp/$result-result.json" >/dev/null
+  jq -e '.valid == true and .storage_mutated == true and .semantic_authority_granted == false' "$tmp/$result-result.json" >/dev/null
 done
 "$bin" project --definition "$definition" --projection current "${root_args[@]}" --payload-only --format json > "$tmp/projection.json"
 jq -e '.. | objects | select(.id? == "one")' "$tmp/projection.json" >/dev/null

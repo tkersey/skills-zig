@@ -17,7 +17,8 @@ pub const Selection = struct {
 
 pub fn hasSelector(argv: []const []const u8) bool {
     for (argv) |arg| {
-        if (std.mem.eql(u8, arg, "--store-root") or std.mem.eql(u8, arg, "--store-id")) return true;
+        if (std.mem.eql(u8, arg, "--store-root") or
+            std.mem.eql(u8, arg, "--store-id")) return true;
     }
     return false;
 }
@@ -30,7 +31,9 @@ pub fn prepare(
     argv: []const []const u8,
 ) !Selection {
     if (!hasSelector(argv)) return .{ .argv = try allocator.dupe([]const u8, argv) };
-    if (argv.len < 2 or !isDurableCommand(argv[1])) return error.StorageRootRequiresDurableCommand;
+    if (argv.len < 2 or !isDurableCommand(argv[1])) {
+        return error.StorageRootRequiresDurableCommand;
+    }
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
     var root_arg: ?[]const u8 = null;
@@ -75,7 +78,13 @@ pub fn prepare(
 }
 
 fn isDurableCommand(command: []const u8) bool {
-    for ([_][]const u8{ "transact", "project", "doctor", "migrate-segmented", "recovery" }) |name| {
+    for ([_][]const u8{
+        "transact",
+        "project",
+        "doctor",
+        "migrate-segmented",
+        "recovery",
+    }) |name| {
         if (std.mem.eql(u8, command, name)) return true;
     }
     return false;
@@ -83,8 +92,16 @@ fn isDurableCommand(command: []const u8) bool {
 
 fn takesValue(arg: []const u8) bool {
     for ([_][]const u8{
-        "--definition", "--operation", "--projection", "--input", "--param",
-        "--format", "--transaction", "--resource", "--lock-id", "--fencing-token",
+        "--definition",
+        "--operation",
+        "--projection",
+        "--input",
+        "--param",
+        "--format",
+        "--transaction",
+        "--resource",
+        "--lock-id",
+        "--fencing-token",
     }) |name| {
         if (std.mem.eql(u8, arg, name)) return true;
     }
@@ -100,33 +117,61 @@ fn checkedRoot(
     if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     if (expected_id.len == 0 or expected_id.len > 256) return error.InvalidStoreIdentity;
     try durable_store.rejectSymlinkComponents(supplied_root);
-    const root = std.Io.Dir.cwd().realPathFileAlloc(io, supplied_root, allocator) catch |err| switch (err) {
+    const root = std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        supplied_root,
+        allocator,
+    ) catch |err| switch (err) {
         error.FileNotFound => return error.StorageRootMissing,
         else => return err,
     };
     errdefer allocator.free(root);
-    const marker_path = try std.fs.path.join(allocator, &.{ root, marker_name });
-    defer allocator.free(marker_path);
-    try durable_store.rejectSymlinkComponents(marker_path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(4096)) catch |err| switch (err) {
-        error.FileNotFound => return error.StorageRootUnregistered,
-        else => return err,
-    };
-    defer allocator.free(bytes);
-    const Marker = struct { schema: []const u8, store_id: []const u8 };
-    var marker = std.json.parseFromSlice(Marker, allocator, bytes, .{}) catch return error.InvalidStorageRootMarker;
-    defer marker.deinit();
-    if (!std.mem.eql(u8, marker.value.schema, marker_schema)) return error.InvalidStorageRootMarker;
-    if (!std.mem.eql(u8, marker.value.store_id, expected_id)) return error.StorageRootIdentityMismatch;
+    try checkMarker(allocator, io, root, expected_id);
     const control_path = try std.fs.path.join(allocator, &.{ root, ".ledger" });
     defer allocator.free(control_path);
     try durable_store.rejectSymlinkComponents(control_path);
-    const stat = std.Io.Dir.cwd().statFile(io, control_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const stat = std.Io.Dir.cwd().statFile(
+        io,
+        control_path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
         error.FileNotFound => return error.StorageRootMissing,
         else => return err,
     };
     if (stat.kind != .directory) return error.StorageRootNotDirectory;
     return root;
+}
+
+fn checkMarker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    expected_id: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, marker_name });
+    defer allocator.free(path);
+    try durable_store.rejectSymlinkComponents(path);
+    const stat = std.Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.StorageRootUnregistered,
+        else => return err,
+    };
+    if (stat.kind != .file or stat.size > 4096) return error.InvalidStorageRootMarker;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096));
+    defer allocator.free(bytes);
+    const Marker = struct { schema: []const u8, store_id: []const u8 };
+    var marker = std.json.parseFromSlice(Marker, allocator, bytes, .{}) catch
+        return error.InvalidStorageRootMarker;
+    defer marker.deinit();
+    if (!std.mem.eql(u8, marker.value.schema, marker_schema)) {
+        return error.InvalidStorageRootMarker;
+    }
+    if (!std.mem.eql(u8, marker.value.store_id, expected_id)) {
+        return error.StorageRootIdentityMismatch;
+    }
 }
 
 test "legacy custody arguments remain unchanged" {
@@ -138,15 +183,18 @@ test "legacy custody arguments remain unchanged" {
 
 test "managed roots reject ambiguous selectors before accessing storage" {
     try std.testing.expectError(error.ConflictingStorageRoots, prepare(
-        std.testing.allocator, std.testing.io,
+        std.testing.allocator,
+        std.testing.io,
         &.{ "ledger", "doctor", "--repo", ".", "--store-root", "/tmp/a", "--store-id", "a" },
     ));
     try std.testing.expectError(error.MissingStoreIdentity, prepare(
-        std.testing.allocator, std.testing.io,
+        std.testing.allocator,
+        std.testing.io,
         &.{ "ledger", "doctor", "--store-root", "/tmp/a" },
     ));
     try std.testing.expectError(error.StorageRootRequiresDurableCommand, prepare(
-        std.testing.allocator, std.testing.io,
+        std.testing.allocator,
+        std.testing.io,
         &.{ "ledger", "validate", "--store-root", "/tmp/a", "--store-id", "a" },
     ));
 }
@@ -162,15 +210,24 @@ test "managed root verifies identity and preserves native argument values" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     var selected = try prepare(std.testing.allocator, std.testing.io, &.{
-        "ledger", "project", "--store-root", root, "--store-id", "example",
-        "--param", "query=two words", "--projection", "recent",
+        "ledger",
+        "project",
+        "--store-root",
+        root,
+        "--store-id",
+        "example",
+        "--param",
+        "query=two words",
+        "--projection",
+        "recent",
     });
     defer selected.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("--repo", selected.argv[2]);
     try std.testing.expectEqualStrings(root, selected.argv[3]);
     try std.testing.expectEqualStrings("query=two words", selected.argv[5]);
     try std.testing.expectError(error.StorageRootIdentityMismatch, prepare(
-        std.testing.allocator, std.testing.io,
+        std.testing.allocator,
+        std.testing.io,
         &.{ "ledger", "doctor", "--store-root", root, "--store-id", "different" },
     ));
 }
@@ -181,7 +238,8 @@ test "existing directory cannot masquerade as an initialized managed store" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     try std.testing.expectError(error.StorageRootUnregistered, prepare(
-        std.testing.allocator, std.testing.io,
+        std.testing.allocator,
+        std.testing.io,
         &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },
     ));
 }
