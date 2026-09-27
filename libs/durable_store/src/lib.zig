@@ -6,6 +6,13 @@ const GitCheckOutputLimit = 4 * 1024;
 // Bound raw syscall retries under persistent signal interruption.
 const host_syscall_attempts_max: usize = 64;
 threadlocal var runtime_io: ?std.Io = null;
+threadlocal var relative_path_anchor: bool = false;
+
+/// Enables path identity checks against the caller's pinned `Dir.cwd()` handle.
+/// The caller must install a stable directory handle before enabling this mode.
+pub fn setRelativePathAnchor(enabled: bool) void {
+    relative_path_anchor = enabled;
+}
 
 /// Installs the process-owned I/O implementation used by default persistent
 /// store constructors reached through composed CLI subcommands.
@@ -2365,11 +2372,18 @@ const TransactionTarget = struct {
     fn init(control_root: []const u8, path: []const u8) !TransactionTarget {
         const relative = try pathRelativeToControlRoot(control_root, path);
         const parent = std.fs.path.dirname(relative) orelse "";
-        var dir = try std.Io.Dir.openDirAbsolute(
-            Io.io(),
-            control_root,
-            .{ .follow_symlinks = false },
-        );
+        var dir = if (std.fs.path.isAbsolute(control_root))
+            try std.Io.Dir.openDirAbsolute(
+                Io.io(),
+                control_root,
+                .{ .follow_symlinks = false },
+            )
+        else
+            try std.Io.Dir.cwd().openDir(
+                Io.io(),
+                control_root,
+                .{ .follow_symlinks = false },
+            );
         errdefer dir.close(Io.io());
         if (parent.len != 0) {
             var components = std.fs.path.componentIterator(parent);
@@ -2426,8 +2440,7 @@ fn pathRelativeToControlRoot(
     control_root: []const u8,
     path: []const u8,
 ) ![]const u8 {
-    if (!std.fs.path.isAbsolute(control_root) or
-        !std.fs.path.isAbsolute(path) or
+    if (std.fs.path.isAbsolute(control_root) != std.fs.path.isAbsolute(path) or
         path.len <= control_root.len or
         !std.mem.eql(u8, path[0..control_root.len], control_root) or
         !std.fs.path.isSep(path[control_root.len]))
@@ -5063,7 +5076,9 @@ const HostPathIdentityContext = struct {
             parent,
             std.fs.path.basename(resolved),
         );
-        if (containsNonAscii(std.fs.path.basename(resolved))) {
+        if (containsNonAscii(std.fs.path.basename(resolved)) and
+            !(relative_path_anchor and !std.fs.path.isAbsolute(resolved)))
+        {
             const host_canonical = std.Io.Dir.cwd().realPathFileAlloc(
                 Io.io(),
                 resolved,
@@ -6842,7 +6857,16 @@ fn canonicalProspectivePathAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
-    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    if (relative_path_anchor and !std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
+    const resolved = if (std.fs.path.isAbsolute(path))
+        try std.fs.path.resolve(allocator, &.{path})
+    else blk: {
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(Io.io(), ".", allocator);
+        defer allocator.free(cwd);
+        break :blk try std.fs.path.resolve(allocator, &.{ cwd, path });
+    };
     defer allocator.free(resolved);
     var candidate = try allocator.dupe(u8, resolved);
     defer allocator.free(candidate);
@@ -7920,6 +7944,29 @@ fn nearestExistingPathAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![:0]u8 {
+    if (relative_path_anchor and !std.fs.path.isAbsolute(path)) {
+        var candidate = try std.fs.path.resolve(allocator, &.{path});
+        defer allocator.free(candidate);
+        for (0..path.len + 1) |_| {
+            _ = std.Io.Dir.cwd().statFile(
+                Io.io(),
+                candidate,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (std.mem.eql(u8, candidate, ".")) return err;
+                    const parent = std.fs.path.dirname(candidate) orelse ".";
+                    const next = try allocator.dupe(u8, parent);
+                    allocator.free(candidate);
+                    candidate = next;
+                    continue;
+                },
+                else => return err,
+            };
+            return allocator.dupeZ(u8, candidate);
+        }
+        return error.FileNotFound;
+    }
     var candidate = try std.fs.path.resolve(allocator, &.{path});
     defer allocator.free(candidate);
     while (candidate.len != 0) {
@@ -8619,14 +8666,17 @@ fn eventStoreIdentityBasenameAlloc(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) ![:0]u8 {
-    const identity_path = std.Io.Dir.cwd().realPathFileAlloc(
-        Io.io(),
-        store_path,
-        allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => try allocator.dupeZ(u8, store_path),
-        else => return err,
-    };
+    const identity_path = if (relative_path_anchor and !std.fs.path.isAbsolute(store_path))
+        try allocator.dupeZ(u8, store_path)
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(
+            Io.io(),
+            store_path,
+            allocator,
+        ) catch |err| switch (err) {
+            error.FileNotFound => try allocator.dupeZ(u8, store_path),
+            else => return err,
+        };
     defer allocator.free(identity_path);
     const basename = std.fs.path.basename(identity_path);
     const identity = try allocator.dupeZ(u8, basename);

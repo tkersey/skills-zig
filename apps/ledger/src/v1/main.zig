@@ -1,10 +1,11 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const ledger = @import("ledger_v1_core");
-const storage_root = @import("storage_root.zig");
+const storage_root = @import("storage_root");
 
 pub const panic = cli.panic;
 pub const std_options = cli.std_options;
+pub const std_options_cwd = storage_root.currentCwd;
 
 const storage_help =
     \\Managed custody roots:
@@ -28,6 +29,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(rootFailureCode(argv));
     };
     defer selection.deinit(init.gpa);
+    storage_root.install(&selection);
+    defer storage_root.uninstall();
     const code = cli.runWithArgv(init.gpa, init.environ_map, selection.argv) catch |err| blk: {
         try cli.emitCommandError(err);
         break :blk @as(u8, 2);
@@ -56,6 +59,8 @@ fn runManaged(
 ) !u8 {
     var selection = try storage_root.prepare(allocator, io, argv);
     defer selection.deinit(allocator);
+    storage_root.install(&selection);
+    defer storage_root.uninstall();
     return cli.runWithArgv(allocator, environment, selection.argv);
 }
 

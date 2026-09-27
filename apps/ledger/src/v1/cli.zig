@@ -4,6 +4,7 @@ const app_meta = @import("app_meta");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const ledger = @import("ledger_v1_core");
+const storage_root = @import("storage_root");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const max_projection_table_columns: usize = 1024;
@@ -162,16 +163,11 @@ const RecoveryPaths = struct {
         repo_path: []const u8,
         transaction_id: []const u8,
     ) !RecoveryPaths {
-        try durable_store.rejectSymlinkComponents(repo_path);
-        const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
-            defaultIo(),
-            repo_path,
-            allocator,
-        );
+        const repo_root = try resolveRepoRoot(allocator, repo_path);
         defer allocator.free(repo_root);
         const ledger_root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, ".ledger" },
+            &.{ repo_root, storage_root.controlComponent() },
         );
         defer allocator.free(ledger_root);
         const transaction_dir = try std.fs.path.join(
@@ -198,6 +194,15 @@ const RecoveryPaths = struct {
         self.* = undefined;
     }
 };
+
+fn resolveRepoRoot(allocator: std.mem.Allocator, repo_path: []const u8) ![:0]u8 {
+    if (storage_root.isActive()) {
+        if (!std.mem.eql(u8, repo_path, ".")) return error.InvalidManagedRoot;
+        return allocator.dupeZ(u8, ".");
+    }
+    try durable_store.rejectSymlinkComponents(repo_path);
+    return std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), repo_path, allocator);
+}
 
 const DefinitionContext = ledger.compiled_plan.PlanSet;
 
@@ -364,6 +369,8 @@ fn runRecoveryCommand(
     const reclaim = std.mem.eql(u8, argv[0], "reclaim");
     const args = try parseRecoveryArgs(argv[1..], reclaim);
     try validateRecoveryTransactionId(args.transaction_id);
+    const anchored = try storage_root.enterControl();
+    defer if (anchored) storage_root.leaveControl();
     var paths = try RecoveryPaths.init(
         allocator,
         args.repo_path,
@@ -456,12 +463,9 @@ fn runTransact(
     defer deinitDocuments(allocator, owned_documents);
     const documents = try documentViews(allocator, owned_documents);
     defer allocator.free(documents);
-    try durable_store.rejectSymlinkComponents(args.repo_path);
-    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
-        args.repo_path,
-        allocator,
-    );
+    const anchored = try storage_root.enterControl();
+    defer if (anchored) storage_root.leaveControl();
+    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = ledger.transaction.transact(
         allocator,
@@ -515,12 +519,9 @@ fn runDoctor(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    try durable_store.rejectSymlinkComponents(args.repo_path);
-    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
-        args.repo_path,
-        allocator,
-    );
+    const anchored = try storage_root.enterControl();
+    defer if (anchored) storage_root.leaveControl();
+    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = try ledger.doctor.execute(
         allocator,
@@ -555,12 +556,9 @@ fn runSegmentedMigration(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    try durable_store.rejectSymlinkComponents(args.repo_path);
-    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
-        args.repo_path,
-        allocator,
-    );
+    const anchored = try storage_root.enterControl();
+    defer if (anchored) storage_root.leaveControl();
+    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = ledger.migration.execute(
         allocator,
@@ -606,12 +604,9 @@ fn runProject(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    try durable_store.rejectSymlinkComponents(args.repo_path);
-    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
-        args.repo_path,
-        allocator,
-    );
+    const anchored = try storage_root.enterControl();
+    defer if (anchored) storage_root.leaveControl();
+    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
     defer allocator.free(repo_root);
     const compiled_projection = context.projection_plan.?.find(
         args.projection,

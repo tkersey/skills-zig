@@ -6,14 +6,62 @@ const marker_schema = "ledger-storage-root/v1";
 
 pub const Selection = struct {
     argv: []const []const u8,
-    root: ?[]u8 = null,
+    control: ?std.Io.Dir = null,
+    io: ?std.Io = null,
 
     pub fn deinit(self: *Selection, allocator: std.mem.Allocator) void {
         allocator.free(self.argv);
-        if (self.root) |root| allocator.free(root);
+        if (self.control) |control| control.close(self.io.?);
         self.* = undefined;
     }
 };
+
+threadlocal var pending_control: ?std.Io.Dir = null;
+threadlocal var active_control: ?std.Io.Dir = null;
+
+pub fn install(selection: *const Selection) void {
+    pending_control = selection.control;
+}
+
+pub fn uninstall() void {
+    durable_store.setRelativePathAnchor(false);
+    active_control = null;
+    pending_control = null;
+}
+
+pub fn enterControl() !bool {
+    active_control = pending_control;
+    if (active_control) |control| {
+        if (std.Io.Dir.cwd().handle != control.handle) {
+            active_control = null;
+            return error.ManagedRootNotAnchored;
+        }
+    }
+    durable_store.setRelativePathAnchor(active_control != null);
+    return active_control != null;
+}
+
+pub fn leaveControl() void {
+    durable_store.setRelativePathAnchor(false);
+    active_control = null;
+}
+
+pub fn currentCwd() std.Io.Dir {
+    return active_control orelse .{ .handle = std.posix.AT.FDCWD };
+}
+
+pub fn controlComponent() []const u8 {
+    return if (active_control != null) "." else ".ledger";
+}
+
+pub fn isActive() bool {
+    return active_control != null;
+}
+
+pub fn validRepoRoot(path: []const u8) bool {
+    return std.fs.path.isAbsolute(path) or
+        (active_control != null and std.mem.eql(u8, path, "."));
+}
 
 pub fn hasSelector(argv: []const []const u8) bool {
     var index: usize = 0;
@@ -69,15 +117,19 @@ pub fn prepare(
             }
         }
     }
-    const root = try checkedRoot(
+    const control = try checkedRoot(
         allocator,
         io,
         root_arg orelse return error.MissingStorageRoot,
         expected_id orelse return error.MissingStoreIdentity,
     );
-    errdefer allocator.free(root);
-    args.items[root_index.?] = root;
-    return .{ .argv = try args.toOwnedSlice(allocator), .root = root };
+    errdefer control.close(io);
+    args.items[root_index.?] = ".";
+    return .{
+        .argv = try args.toOwnedSlice(allocator),
+        .control = control,
+        .io = io,
+    };
 }
 
 fn isDurableCommand(command: []const u8) bool {
@@ -117,54 +169,61 @@ fn checkedRoot(
     io: std.Io,
     supplied_root: []const u8,
     expected_id: []const u8,
-) ![]u8 {
+) !std.Io.Dir {
     if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     if (expected_id.len == 0 or expected_id.len > 256) return error.InvalidStoreIdentity;
-    try durable_store.rejectSymlinkComponents(supplied_root);
-    const root = std.Io.Dir.cwd().realPathFileAlloc(
-        io,
-        supplied_root,
-        allocator,
-    ) catch |err| switch (err) {
+    var root_dir = try std.Io.Dir.openDirAbsolute(io, "/", .{
+        .follow_symlinks = false,
+    });
+    defer root_dir.close(io);
+    var components = std.fs.path.componentIterator(supplied_root);
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component.name, ".") or
+            std.mem.eql(u8, component.name, ".."))
+        {
+            return error.InvalidStorageRootPath;
+        }
+        const next = root_dir.openDir(io, component.name, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return error.StorageRootMissing,
+            error.NotDir => return error.StorageRootNotDirectory,
+            error.SymLinkLoop => return error.SymlinkComponent,
+            else => return err,
+        };
+        root_dir.close(io);
+        root_dir = next;
+    }
+    const control = root_dir.openDir(io, ".ledger", .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
         error.FileNotFound => return error.StorageRootMissing,
+        error.NotDir => return error.StorageRootNotDirectory,
+        error.SymLinkLoop => return error.SymlinkComponent,
         else => return err,
     };
-    errdefer allocator.free(root);
-    try checkMarker(allocator, io, root, expected_id);
-    const control_path = try std.fs.path.join(allocator, &.{ root, ".ledger" });
-    defer allocator.free(control_path);
-    try durable_store.rejectSymlinkComponents(control_path);
-    const stat = std.Io.Dir.cwd().statFile(
-        io,
-        control_path,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.StorageRootMissing,
-        else => return err,
-    };
-    if (stat.kind != .directory) return error.StorageRootNotDirectory;
-    return root;
+    errdefer control.close(io);
+    try checkMarker(allocator, io, root_dir, expected_id);
+    return control;
 }
 
 fn checkMarker(
     allocator: std.mem.Allocator,
     io: std.Io,
-    root: []const u8,
+    root: std.Io.Dir,
     expected_id: []const u8,
 ) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, marker_name });
-    defer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
-    const stat = std.Io.Dir.cwd().statFile(
-        io,
-        path,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
+    var file = root.openFile(io, marker_name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
         error.FileNotFound => return error.StorageRootUnregistered,
         else => return err,
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
     if (stat.kind != .file or stat.size > 4096) return error.InvalidStorageRootMarker;
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096));
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(4096));
     defer allocator.free(bytes);
     const Marker = struct { schema: []const u8, store_id: []const u8 };
     var marker = std.json.parseFromSlice(Marker, allocator, bytes, .{
@@ -240,8 +299,12 @@ test "managed root verifies identity and preserves native argument values" {
     });
     defer selected.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("--repo", selected.argv[2]);
-    try std.testing.expectEqualStrings(root, selected.argv[3]);
+    try std.testing.expectEqualStrings(".", selected.argv[3]);
+    try std.testing.expect(selected.control != null);
     try std.testing.expectEqualStrings("query=two words", selected.argv[5]);
+    install(&selected);
+    defer uninstall();
+    try std.testing.expectError(error.ManagedRootNotAnchored, enterControl());
     try std.testing.expectError(error.StorageRootIdentityMismatch, prepare(
         std.testing.allocator,
         std.testing.io,

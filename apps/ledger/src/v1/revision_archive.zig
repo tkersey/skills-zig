@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 
@@ -19,7 +20,7 @@ pub fn prepare(
     content: []const u8,
     max_bytes: usize,
 ) !Candidate {
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (content.len > max_bytes) return error.RevisionArchiveTooLarge;
@@ -62,7 +63,7 @@ pub fn load(
     revision: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     try definition_core.json.digest(revision);
@@ -102,7 +103,7 @@ pub fn pathAlloc(
     defer allocator.free(file_name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".revisions", file_name },
+        &.{ repo_root, storage_root.controlComponent(), ".revisions", file_name },
     );
 }
 
@@ -117,7 +118,7 @@ test "revision archive is immutable and content addressed" {
     defer std.testing.allocator.free(root);
     const archive_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, ".ledger", ".revisions" },
+        &.{ root, storage_root.controlComponent(), ".revisions" },
     );
     defer std.testing.allocator.free(archive_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(archive_dir);

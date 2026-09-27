@@ -156,7 +156,7 @@ case "$mode" in
         mark_app cas
         matched=0
       fi
-      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
+      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]|Ledger[A-Z]' <<<"$raw"; then
         mark_ledger
         matched=0
       fi
@@ -165,6 +165,10 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
+      if [[ -z "${raw//[[:space:]]/}" ]] ||
+         grep -Eq '^[[:space:]]*[{}(),.;&]+[[:space:]]*$' <<<"$raw"; then
+        return 0
+      fi
       grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
@@ -269,6 +273,13 @@ case "$mode" in
         local retired_app_deletion=0
         local has_addition=0
         hunk_text=$(printf '%s\n' "${build_hunk[@]}")
+        local ledger_scoped=0
+        if grep -Eq '^(fn [[:alnum:]_]*Ledger[[:alnum:]_]*\(|const Ledger[[:alnum:]_]* = struct)' <<<"$hunk_text" &&
+           ! grep -E '^(fn|pub fn|const) ' <<<"$hunk_text" |
+             grep -Ev '^(fn [[:alnum:]_]*Ledger[[:alnum:]_]*\(|const Ledger[[:alnum:]_]* = struct)' |
+             grep -q .; then
+          ledger_scoped=1
+        fi
         # Attribute a newly added constructor to TypeSafe, then keep classifying
         # other changes in the same hunk under their own owners.
         local in_new_typesafe=0
@@ -322,7 +333,12 @@ case "$mode" in
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1
           elif [[ "${change:0:1}" == "+" ]] && ! contextual_build_line "$raw"; then
-            substantive_unknown=1
+            if [[ "$ledger_scoped" -eq 1 ]]; then
+              mark_ledger
+              changed_matched=1
+            else
+              substantive_unknown=1
+            fi
           fi
         done
         if [[ "$substantive_unknown" -eq 1 ]]; then
@@ -341,7 +357,11 @@ case "$mode" in
           fi
         done
         if [[ "$context_matched" -eq 0 ]]; then
-          mark_all
+          if [[ "$ledger_scoped" -eq 1 ]]; then
+            mark_ledger
+          else
+            mark_all
+          fi
         fi
       }
 

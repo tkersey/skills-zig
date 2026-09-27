@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const checkpoint = @import("checkpoint.zig");
@@ -630,7 +631,7 @@ pub const Paths = struct {
         repo_root: []const u8,
         logical_path: []const u8,
     ) !Paths {
-        if (!std.fs.path.isAbsolute(repo_root)) {
+        if (!storage_root.validRepoRoot(repo_root)) {
             return error.RepositoryRootNotAbsolute;
         }
         const digest = try definition_core.canonical_json.digestBytesAlloc(
@@ -640,7 +641,7 @@ pub const Paths = struct {
         defer allocator.free(digest);
         const root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, ".ledger", ".segments", digest[7..] },
+            &.{ repo_root, storage_root.controlComponent(), ".segments", digest[7..] },
         );
         errdefer allocator.free(root);
         const manifest = try std.fs.path.join(
@@ -662,7 +663,7 @@ pub const Paths = struct {
         errdefer allocator.free(checkpoints);
         const legacy_event = try std.fs.path.join(
             allocator,
-            &.{ repo_root, ".ledger", logical_path },
+            &.{ repo_root, storage_root.controlComponent(), logical_path },
         );
         errdefer allocator.free(legacy_event);
         const legacy_binding = try custody.bindingPathAlloc(
@@ -1003,7 +1004,7 @@ pub fn requireMigratedCustody(
 ) !void {
     const event_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", logical_path },
+        &.{ repo_root, storage_root.controlComponent(), logical_path },
     );
     defer allocator.free(event_path);
     const binding_path = try custody.bindingPathAlloc(
@@ -1311,10 +1312,16 @@ fn rejectFutureSegmentFiles(
     extension: []const u8,
 ) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var dir = std.Io.Dir.openDirAbsolute(io, directory, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
+    var dir = (if (std.fs.path.isAbsolute(directory))
+        std.Io.Dir.openDirAbsolute(io, directory, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        })
+    else
+        std.Io.Dir.cwd().openDir(io, directory, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        })) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -1744,7 +1751,7 @@ test "segmented snapshot reads only the active bounded files" {
     defer allocator.free(binding_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".transactions" },
+        &.{ root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     const writes = [_]durable_store.TransactionMutation{
@@ -1802,7 +1809,7 @@ test "segmented snapshot counts persistent active-file sidecars" {
     defer allocator.free(checkpoint_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".transactions" },
+        &.{ root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     const writes = [_]durable_store.TransactionMutation{
@@ -1866,7 +1873,7 @@ test "oversized legacy log routes to explicit migration" {
     const logical_path = "actuation/legacy/events.jsonl";
     const event_path = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", logical_path },
+        &.{ root, storage_root.controlComponent(), logical_path },
     );
     defer allocator.free(event_path);
     try durable_store.ensureDirectoryPathNoSymlinks(
@@ -2013,7 +2020,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     defer allocator.free(binding_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".transactions" },
+        &.{ root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     var predecessor = try Head.init(allocator, logical_path);
@@ -2201,7 +2208,7 @@ fn writeHistoryFixture(
     };
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     var receipt = try durable_store.commitTextTransaction(

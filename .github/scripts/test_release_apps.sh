@@ -186,6 +186,10 @@ write_ledger_filtered_test_build() {
   printf 'const ledger_v1_core = b.createModule(.{});\nconst lift_meta = "apps/lift/VERSION";\npub fn build() void {\n  const run_ledger_segmented_tests = addTestStepWithOptions(\n    b,\n    ledger_v1_core,\n    "test-ledger-segmented",\n    "Run Ledger segmented event-log tests",\n    .{ .filters = &.{"segmented"} },\n  );\n  _ = run_ledger_segmented_tests;\n}\n' >build.zig
 }
 
+write_mixed_unknown_before_ledger_build() {
+  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nfn buildSeq() void { @panic("changed"); }\nfn buildLedger() void {}\n' >build.zig
+}
+
 write_universalist_build() {
   printf 'const universalist_plan = b.createModule(.{});\nconst lift_meta = "apps/lift/VERSION";\npub fn build() void {}\n' >build.zig
 }
@@ -287,6 +291,7 @@ assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_bare_iden
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_ledger_filtered_test_build
+assert_affected seq,lift,cas,ledger,memory-note,typesafe write_mixed_unknown_before_ledger_build
 assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected lift move_build_line

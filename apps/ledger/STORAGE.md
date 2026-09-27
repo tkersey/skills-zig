@@ -21,6 +21,13 @@ operation. Managed root failures on projections exit 3, never 0; other managed
 root selection failures exit 2. They emit `ledger-storage-root-error/v1` with
 `storage_mutated: false` and `authority_granted: false`.
 
+Ledger opens the registered root and its `.ledger/` directory during admission.
+The marker is read from the opened root, and all managed custody paths are
+resolved relative to the opened `.ledger/` handle for the command's lifetime.
+Renaming or replacing the external root or `.ledger/` pathname after admission
+does not redirect that command to a replacement history. Definitions and input
+files retain their own explicit path semantics.
+
 No Git discovery, home-directory default, repository registration, fallback,
 automatic binding, or migration occurs in the native CLI. The caller owns those
 policies. In the Codex skills integration, the Ledger skill is the single owner

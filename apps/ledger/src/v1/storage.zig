@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
@@ -5251,13 +5252,13 @@ pub fn enumerateMatchingPathsAlloc(
     slot: Slot,
     max_paths: usize,
 ) ![][]u8 {
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (max_paths == 0) return error.StoragePathEnumerationBoundsExceeded;
     const ledger_root = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger" },
+        &.{ repo_root, storage_root.controlComponent() },
     );
     defer allocator.free(ledger_root);
     var paths: std.ArrayList([]u8) = .empty;
@@ -5396,11 +5397,18 @@ fn advanceReadyPathEnumeration(
 ) !void {
     const segment = segments[frame.segment_index];
     if (segment.kind == .parameter) {
-        var directory = std.Io.Dir.openDirAbsolute(
-            storageIo(),
-            frame.absolute_parent,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch |err| switch (err) {
+        var directory = (if (std.fs.path.isAbsolute(frame.absolute_parent))
+            std.Io.Dir.openDirAbsolute(
+                storageIo(),
+                frame.absolute_parent,
+                .{ .iterate = true, .follow_symlinks = false },
+            )
+        else
+            std.Io.Dir.cwd().openDir(
+                storageIo(),
+                frame.absolute_parent,
+                .{ .iterate = true, .follow_symlinks = false },
+            )) catch |err| switch (err) {
             error.FileNotFound => {
                 frame.deinit(allocator);
                 frame_count.* -= 1;

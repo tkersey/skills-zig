@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
@@ -190,12 +191,12 @@ pub fn readReplaySlotOrMissing(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
 ) !ReplaySlot {
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     const path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
     );
     errdefer allocator.free(path);
     try durable_store.rejectSymlinkComponents(path);
@@ -343,10 +344,10 @@ fn readSlotInternal(
     slot: storage.ResolvedSlot,
     allow_missing: bool,
 ) !SlotSnapshot {
-    if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
     const path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
     );
     errdefer allocator.free(path);
     try durable_store.rejectSymlinkComponents(path);
@@ -1255,7 +1256,7 @@ pub fn bindingPathAlloc(
     defer allocator.free(file_name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".bindings", file_name },
+        &.{ repo_root, storage_root.controlComponent(), ".bindings", file_name },
     );
 }
 
@@ -1399,7 +1400,7 @@ fn writeTestBoundSlot(
     defer std.testing.allocator.free(revision);
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, ".ledger", slot.relative_path },
+        &.{ root, storage_root.controlComponent(), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -1513,7 +1514,7 @@ test "idle custody sidecars preserve stable missing slots" {
     };
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, ".ledger", slot.relative_path },
+        &.{ root, storage_root.controlComponent(), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
     const binding_path = try bindingPathAlloc(
@@ -1566,7 +1567,7 @@ test "existing slot without a binding fails custody integrity" {
     };
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, ".ledger", slot.relative_path },
+        &.{ root, storage_root.controlComponent(), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{

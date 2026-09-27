@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const checkpoint = @import("checkpoint.zig");
@@ -37,7 +38,7 @@ pub fn execute(
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     transaction.resetMutationState();
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (!std.mem.eql(
@@ -167,11 +168,10 @@ fn migrateLegacyFile(
     const event_bytes = std.math.cast(usize, event_stat.size) orelse
         return error.FileTooBig;
     if (event_bytes == 0) return error.InvalidLegacySegmentSource;
-    var event_file = try std.Io.Dir.openFileAbsolute(
-        io,
-        legacy.path,
-        .{},
-    );
+    var event_file = if (std.fs.path.isAbsolute(legacy.path))
+        try std.Io.Dir.openFileAbsolute(io, legacy.path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, legacy.path, .{});
     defer event_file.close(io);
     var event_map = try std.Io.File.MemoryMap.create(io, event_file, .{
         .len = event_bytes,
@@ -502,12 +502,12 @@ fn installTombstones(
     transaction.markStorageMutationUnknown();
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     const counter = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".fencing.counter" },
+        &.{ repo_root, storage_root.controlComponent(), ".fencing.counter" },
     );
     defer allocator.free(counter);
     const mutations = [_]durable_store.TransactionMutation{
@@ -664,12 +664,12 @@ fn commitMigration(
     defer owned.deinit(allocator);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     const counter = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".fencing.counter" },
+        &.{ repo_root, storage_root.controlComponent(), ".fencing.counter" },
     );
     defer allocator.free(counter);
     var commit = try durable_store.commitTextTransaction(
@@ -701,7 +701,7 @@ fn ensureMigrationDirectories(
     try durable_store.ensureDirectoryPathNoSymlinks(target.paths.checkpoints);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     try durable_store.ensureDirectoryPathNoSymlinks(transactions);
