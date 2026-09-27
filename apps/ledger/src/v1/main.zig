@@ -25,14 +25,20 @@ pub fn main(init: std.process.Init) !void {
     }
     ledger.transaction.installRuntimeIo(init.io);
     var selection = storage_root.prepare(init.gpa, init.io, argv) catch |err| {
-        try emitRootError(init.io, err);
+        emitRootError(init.io, err) catch |write_err| {
+            if (cli.isClosedPipe(write_err)) return;
+            return write_err;
+        };
         std.process.exit(rootFailureCode(argv));
     };
     defer selection.deinit(init.gpa);
     storage_root.install(&selection);
     defer storage_root.uninstall();
     const code = cli.runWithArgv(init.gpa, init.environ_map, selection.argv) catch |err| blk: {
-        try cli.emitCommandError(err);
+        cli.emitCommandError(err) catch |write_err| {
+            if (cli.isClosedPipe(write_err)) return;
+            return write_err;
+        };
         break :blk @as(u8, 2);
     };
     if (code != 0) std.process.exit(code);

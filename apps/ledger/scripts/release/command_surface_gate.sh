@@ -50,7 +50,8 @@ jq -e --arg version "$version" \
     .features.segmented_event_log_v1 == true and
     .features.segmented_migration_v1 == true and
     .cache_format != null and
-    (.result_schemas | type == "array" and length > 0)
+    (.result_schemas | type == "array" and length > 0) and
+    (.result_schemas | index("ledger-storage-root-error/v1")) != null
   ' \
   <<<"$capabilities" >/dev/null
 

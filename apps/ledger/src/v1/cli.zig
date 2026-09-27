@@ -2309,6 +2309,7 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"max_projection_table_columns\":{d}}}," ++
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
+            "\"ledger-storage-root-error/v1\"," ++
             "\"ledger-definition-check-result/v1\"," ++
             "\"ledger-definition-description/v1\"," ++
             "\"ledger-doctor-result/v1\"," ++
@@ -2482,7 +2483,7 @@ fn writeStdout(bytes: []const u8) !void {
     try stdout_writer.interface.writeAll(bytes);
 }
 
-fn isClosedPipe(err: anyerror) bool {
+pub fn isClosedPipe(err: anyerror) bool {
     return err == error.WriteFailed or err == error.BrokenPipe;
 }
 
