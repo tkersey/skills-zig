@@ -62,6 +62,12 @@ const Help =
     \\  ledger capabilities [--format json|text]
     \\  ledger version
     \\
+    \\Managed custody roots:
+    \\  Durable commands also accept --store-root <absolute-directory> --store-id <id>
+    \\  instead of --repo. The caller selects and initializes the root; Ledger verifies
+    \\  its identity marker and keeps all logical slots beneath its .ledger directory.
+    \\  No Git discovery, default location, registration, migration, or fallback occurs.
+    \\
     \\Definitions are passive JSON. Ledger grants no semantic authority and does not read sessions.
     \\
 ;

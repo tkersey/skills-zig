@@ -7,20 +7,10 @@ pub const panic = cli.panic;
 pub const std_options = cli.std_options;
 pub const std_options_cwd = storage_root.currentCwd;
 
-const storage_help =
-    \\Managed custody roots:
-    \\  Durable commands also accept --store-root <absolute-directory> --store-id <id>
-    \\  instead of --repo. The caller selects and initializes the root; Ledger verifies
-    \\  its identity marker and keeps all logical slots beneath its .ledger directory.
-    \\  No Git discovery, default location, registration, migration, or fallback occurs.
-    \\
-;
-
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     // Preserve the established native entry point for all legacy invocations.
     if (!storage_root.hasSelector(argv)) {
-        if (isHelp(argv)) try write(init.io, storage_help);
         return cli.main(init);
     }
     ledger.transaction.installRuntimeIo(init.io);
@@ -73,19 +63,6 @@ fn runManaged(
 fn rootFailureCode(argv: []const []const u8) u8 {
     // An unavailable managed root must never look like a clear route gate.
     return if (argv.len > 1 and std.mem.eql(u8, argv[1], "project")) 3 else 2;
-}
-
-fn isHelp(argv: []const []const u8) bool {
-    if (argv.len < 2) return false;
-    for (argv[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
-    }
-    return false;
-}
-
-fn write(io: std.Io, bytes: []const u8) !void {
-    var writer = std.Io.File.stdout().writer(io, &.{});
-    try writer.interface.writeAll(bytes);
 }
 
 fn emitRootError(io: std.Io, err: anyerror) !void {
