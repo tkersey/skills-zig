@@ -2336,7 +2336,7 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
     );
 }
 
-fn emitCommandError(err: anyerror) !void {
+pub fn emitCommandError(err: anyerror) !void {
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     try stdout_writer.interface.writeAll(
         "{\"schema\":\"ledger-command-error/v1\",\"code\":",

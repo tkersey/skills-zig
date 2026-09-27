@@ -42,6 +42,10 @@ expect_failure() {
 }
 expect_failure 3 "$bin" project --definition "$definition" --projection current --store-root "$store" --store-id wrong --format json
 jq -e '.error == "StorageRootIdentityMismatch"' "$tmp/failure.json" >/dev/null
+status=0
+"$bin" project --definition "$tmp/missing-definition.json" --projection current "${root_args[@]}" --format json > "$tmp/command-failure.json" || status=$?
+test "$status" -eq 2
+jq -e '.schema == "ledger-command-error/v1" and .storage_mutated == false' "$tmp/command-failure.json" >/dev/null
 expect_failure 2 "$bin" doctor --definition "$definition" "${root_args[@]}" --repo "$tmp/repo" --format json
 ln -s "$store" "$tmp/alias"
 expect_failure 2 "$bin" doctor --definition "$definition" --store-root "$tmp/alias" --store-id "$id" --format json

@@ -16,9 +16,12 @@ pub const Selection = struct {
 };
 
 pub fn hasSelector(argv: []const []const u8) bool {
-    for (argv) |arg| {
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const arg = argv[index];
         if (std.mem.eql(u8, arg, "--store-root") or
             std.mem.eql(u8, arg, "--store-id")) return true;
+        if (takesValue(arg)) index += 1;
     }
     return false;
 }
@@ -92,6 +95,7 @@ fn isDurableCommand(command: []const u8) bool {
 
 fn takesValue(arg: []const u8) bool {
     for ([_][]const u8{
+        "--repo",
         "--definition",
         "--operation",
         "--projection",
@@ -163,7 +167,9 @@ fn checkMarker(
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096));
     defer allocator.free(bytes);
     const Marker = struct { schema: []const u8, store_id: []const u8 };
-    var marker = std.json.parseFromSlice(Marker, allocator, bytes, .{}) catch
+    var marker = std.json.parseFromSlice(Marker, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch
         return error.InvalidStorageRootMarker;
     defer marker.deinit();
     if (!std.mem.eql(u8, marker.value.schema, marker_schema)) {
@@ -176,6 +182,17 @@ fn checkMarker(
 
 test "legacy custody arguments remain unchanged" {
     const argv = [_][]const u8{ "ledger", "doctor", "--repo", "relative" };
+    var selection = try prepare(std.testing.allocator, std.testing.io, &argv);
+    defer selection.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices([]const u8, &argv, selection.argv);
+}
+
+test "selector words in native option values do not select managed mode" {
+    const argv = [_][]const u8{
+        "ledger",       "project",    "--repo", "relative", "--projection", "--store-root",
+        "--definition", "--store-id",
+    };
+    try std.testing.expect(!hasSelector(&argv));
     var selection = try prepare(std.testing.allocator, std.testing.io, &argv);
     defer selection.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices([]const u8, &argv, selection.argv);
@@ -238,6 +255,23 @@ test "existing directory cannot masquerade as an initialized managed store" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     try std.testing.expectError(error.StorageRootUnregistered, prepare(
+        std.testing.allocator,
+        std.testing.io,
+        &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },
+    ));
+}
+
+test "duplicate marker identity fields are rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".ledger", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = marker_name,
+        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"example\",\"store_id\":\"other\"}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expectError(error.InvalidStorageRootMarker, prepare(
         std.testing.allocator,
         std.testing.io,
         &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },

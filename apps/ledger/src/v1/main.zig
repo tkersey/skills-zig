@@ -23,9 +23,14 @@ pub fn main(init: std.process.Init) !void {
         return cli.main(init);
     }
     ledger.transaction.installRuntimeIo(init.io);
-    const code = runManaged(init.gpa, init.io, init.environ_map, argv) catch |err| {
+    var selection = storage_root.prepare(init.gpa, init.io, argv) catch |err| {
         try emitRootError(init.io, err);
         std.process.exit(rootFailureCode(argv));
+    };
+    defer selection.deinit(init.gpa);
+    const code = cli.runWithArgv(init.gpa, init.environ_map, selection.argv) catch |err| blk: {
+        try cli.emitCommandError(err);
+        break :blk @as(u8, 2);
     };
     if (code != 0) std.process.exit(code);
 }
