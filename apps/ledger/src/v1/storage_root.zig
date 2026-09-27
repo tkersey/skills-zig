@@ -216,11 +216,19 @@ fn checkMarker(
     root: std.Io.Dir,
     expected_id: []const u8,
 ) !void {
-    var file = root.openFile(io, marker_name, .{
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
+    const marker_fd = std.posix.openat(root.handle, marker_name, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| switch (err) {
         error.FileNotFound => return error.StorageRootUnregistered,
+        error.SymLinkLoop => return error.SymlinkComponent,
         else => return err,
+    };
+    var file: std.Io.File = .{
+        .handle = marker_fd,
+        .flags = .{ .nonblocking = true },
     };
     defer file.close(io);
     const stat = try file.stat(io);

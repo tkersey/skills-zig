@@ -291,7 +291,7 @@ assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_bare_iden
 assert_affected ledger write_ledger_build
 assert_affected ledger write_ledger_module_build
 assert_affected ledger write_ledger_filtered_test_build
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_mixed_unknown_before_ledger_build
+assert_affected seq,ledger write_mixed_unknown_before_ledger_build
 assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected lift move_build_line
@@ -310,6 +310,29 @@ assert_ci_affected cas write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_ci_helper
+
+# Hunk context can mention Ledger while the added line still belongs to Seq.
+git reset --hard -q "$base"
+cat >build.zig <<'ZIG'
+fn buildSeq() void {
+  const first = 1;
+  _ = first;
+  const second = 2;
+  _ = second;
+  const third = 3;
+  _ = third;
+}
+fn buildLedger() void {}
+ZIG
+git add build.zig
+git commit -qm adjacent-functions-base
+adjacent_base=$(git rev-parse HEAD)
+awk '{ print; if ($0 ~ /_ = third;/) print "  _ = shared.unknown_release_setting;" }' \
+  build.zig >build.next
+mv build.next build.zig
+git add build.zig
+git commit -qm seq-change-next-to-ledger
+test "$(bash "$classifier" affected "$adjacent_base" HEAD)" = seq
 
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.

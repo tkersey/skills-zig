@@ -49,6 +49,30 @@ jq -e '.schema == "ledger-command-error/v1" and .storage_mutated == false' "$tmp
 expect_failure 2 "$bin" doctor --definition "$definition" "${root_args[@]}" --repo "$tmp/repo" --format json
 ln -s "$store" "$tmp/alias"
 expect_failure 2 "$bin" doctor --definition "$definition" --store-root "$tmp/alias" --store-id "$id" --format json
+mv "$store/.ledger-root.json" "$tmp/valid-marker.json"
+mkfifo "$store/.ledger-root.json"
+fifo_status=0
+"$bin" doctor --definition "$definition" "${root_args[@]}" --format json > "$tmp/fifo-result.json" 2> "$tmp/fifo.stderr" &
+fifo_pid=$!
+fifo_finished=0
+for _ in {1..50}; do
+  if ! kill -0 "$fifo_pid" 2>/dev/null; then
+    fifo_finished=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$fifo_finished" -ne 1 ]; then
+  kill "$fifo_pid" 2>/dev/null || true
+  wait "$fifo_pid" 2>/dev/null || true
+  echo 'managed marker FIFO blocked admission' >&2
+  exit 1
+fi
+wait "$fifo_pid" || fifo_status=$?
+test "$fifo_status" -eq 2
+jq -e '.schema == "ledger-storage-root-error/v1" and .error == "InvalidStorageRootMarker"' "$tmp/fifo-result.json" >/dev/null
+rm "$store/.ledger-root.json"
+mv "$tmp/valid-marker.json" "$store/.ledger-root.json"
 mv "$store" "$tmp/temporarily unavailable"
 expect_failure 3 "$bin" project --definition "$definition" --projection current "${root_args[@]}" --format json
 test ! -e "$store"
