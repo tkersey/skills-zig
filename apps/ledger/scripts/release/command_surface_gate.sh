@@ -30,7 +30,7 @@ actual=$(
 )
 
 if [[ "$actual" != "$expected" ]]; then
-  echo "Ledger 1.1 command surface mismatch" >&2
+  echo "Ledger command surface mismatch" >&2
   diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
   exit 1
 fi
@@ -64,9 +64,10 @@ for forbidden in \
   source-memory-checkpoint
 do
   if grep -F -- "$forbidden" <<<"$help_output$capabilities" >/dev/null; then
-    echo "Ledger 1.0 exposes domain vocabulary: $forbidden" >&2
+    echo "Ledger exposes domain vocabulary: $forbidden" >&2
     exit 1
   fi
 done
 
-echo "Ledger 1.1 command-surface gate passed for $bin_path"
+"$root_dir/scripts/test-ledger-managed-storage.sh" "$bin_path"
+echo "Ledger command-surface gate passed for $bin_path"
