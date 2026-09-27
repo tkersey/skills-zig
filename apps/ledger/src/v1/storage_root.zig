@@ -196,11 +196,14 @@ fn checkedRoot(
     }
     const control = root_dir.openDir(io, ".ledger", .{
         .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.StorageRootMissing,
-        error.NotDir => return error.StorageRootNotDirectory,
-        error.SymLinkLoop => return error.SymlinkComponent,
-        else => return err,
+    }) catch |err| {
+        try checkMarker(allocator, io, root_dir, expected_id);
+        return switch (err) {
+            error.FileNotFound => error.StorageRootMissing,
+            error.NotDir => error.StorageRootNotDirectory,
+            error.SymLinkLoop => error.SymlinkComponent,
+            else => err,
+        };
     };
     errdefer control.close(io);
     try checkMarker(allocator, io, root_dir, expected_id);
@@ -318,6 +321,22 @@ test "existing directory cannot masquerade as an initialized managed store" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     try std.testing.expectError(error.StorageRootUnregistered, prepare(
+        std.testing.allocator,
+        std.testing.io,
+        &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },
+    ));
+}
+
+test "registered managed root requires its control directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = marker_name,
+        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"example\"}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expectError(error.StorageRootMissing, prepare(
         std.testing.allocator,
         std.testing.io,
         &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },
