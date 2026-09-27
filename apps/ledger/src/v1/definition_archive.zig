@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
@@ -38,7 +39,7 @@ pub fn prepare(
     entry_path: []const u8,
     closure: *const definition_core.Closure,
 ) !Candidate {
-    if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
     if (closure.find(entry_path) == null) return error.EntryDefinitionMissing;
     const path = try pathAlloc(allocator, repo_root, closure.digestSlice());
     errdefer allocator.free(path);
@@ -81,7 +82,7 @@ pub fn pathAlloc(
     defer allocator.free(name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".definitions", name },
+        &.{ repo_root, storage_root.controlComponent(), ".definitions", name },
     );
 }
 

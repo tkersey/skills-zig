@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const checkpoint = @import("checkpoint.zig");
@@ -165,7 +166,7 @@ pub fn transact(
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     last_mutation_state = false;
-    if (!std.fs.path.isAbsolute(repo_root)) {
+    if (!storage_root.validRepoRoot(repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (!std.mem.eql(
@@ -297,7 +298,7 @@ const TransactionPaths = struct {
     ) !TransactionPaths {
         const ledger_root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, ".ledger" },
+            &.{ repo_root, storage_root.controlComponent() },
         );
         errdefer allocator.free(ledger_root);
         const paths: TransactionPaths = .{
@@ -474,7 +475,7 @@ test "transaction startup retries transient recovery lock contention" {
     defer allocator.free(root);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".transactions" },
+        &.{ root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     try durable_store.ensureDirectoryPathNoSymlinks(transactions);
@@ -555,7 +556,7 @@ test "created control paths survive later recovery uncertainty" {
     defer allocator.free(root);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".transactions" },
+        &.{ root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions);
     try durable_store.ensureDirectoryPathNoSymlinks(transactions);
@@ -596,7 +597,7 @@ test "created control paths survive later recovery uncertainty" {
     try std.testing.expect(lastMutationState().?);
     const bindings = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger", ".bindings" },
+        &.{ root, storage_root.controlComponent(), ".bindings" },
     );
     defer allocator.free(bindings);
     try std.testing.expect(directoryExists(bindings));
@@ -614,7 +615,7 @@ test "failed control path creation remains uncertain" {
     defer allocator.free(root);
     const ledger_root = try std.fs.path.join(
         allocator,
-        &.{ root, ".ledger" },
+        &.{ root, storage_root.controlComponent() },
     );
     defer allocator.free(ledger_root);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -1310,7 +1311,7 @@ fn readExistingBindingSource(
 ) !ExistingBindingSource {
     const slot_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
     );
     errdefer allocator.free(slot_path);
     try durable_store.rejectSymlinkComponents(slot_path);
@@ -1388,7 +1389,10 @@ fn readExistingContent(
         const bytes = try allocator.alloc(u8, 0);
         return .{ .bytes = bytes, .owned = bytes };
     }
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     var memory_map = try std.Io.File.MemoryMap.create(io, file, .{
         .len = length,
@@ -2587,7 +2591,7 @@ const EffectSlotSource = struct {
     ) !EffectSlotSource {
         const slot_path = try std.fs.path.join(
             allocator,
-            &.{ repo_root, ".ledger", slot.relative_path },
+            &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
         );
         errdefer allocator.free(slot_path);
         const binding_path = try custody.bindingPathAlloc(
@@ -4453,7 +4457,7 @@ fn documentIdentityPathExists(
     defer allocator.free(relative_path);
     const absolute_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", relative_path },
+        &.{ repo_root, storage_root.controlComponent(), relative_path },
     );
     defer allocator.free(absolute_path);
     const stat = std.Io.Dir.cwd().statFile(
@@ -4890,7 +4894,7 @@ fn expectBasicEventBytesAndDuplicate(
 ) !void {
     const event_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, ".ledger", "example", "events.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(), "example", "events.jsonl" },
     );
     defer std.testing.allocator.free(event_path);
     const events = try durable_store.readRegularFileNoSymlink(
@@ -4907,7 +4911,7 @@ fn expectBasicEventBytesAndDuplicate(
         std.testing.allocator,
         &.{
             plans.repo_root,
-            ".ledger",
+            storage_root.controlComponent(),
             ".transactions",
             results.second.transaction_id.?,
             "commit.json",
@@ -5012,7 +5016,7 @@ fn expectBasicPendingRecovery(
 ) !void {
     const transactions_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, ".ledger", ".transactions" },
+        &.{ plans.repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer std.testing.allocator.free(transactions_dir);
     const pending_path = try std.fs.path.join(
@@ -5530,7 +5534,7 @@ fn expectPlainExistingBinding(
     defer std.testing.allocator.free(binding_root);
     const event_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ binding_root, ".ledger", "example" },
+        &.{ binding_root, storage_root.controlComponent(), "example" },
     );
     defer std.testing.allocator.free(event_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(event_dir);
@@ -6672,7 +6676,7 @@ test "append falls back to materialized replay after an event-log replacement" {
     try std.testing.expect(appended.storage_mutated);
     const store_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, ".ledger", "example", "replaced-log.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(), "example", "replaced-log.jsonl" },
     );
     defer std.testing.allocator.free(store_path);
     const content = try durable_store.readRegularFileNoSymlink(
@@ -6712,7 +6716,7 @@ test "transaction fails closed for an unbound existing store" {
     defer parameters.deinit(std.testing.allocator);
     const event_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, ".ledger", "example", "events.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(), "example", "events.jsonl" },
     );
     defer std.testing.allocator.free(event_path);
     try durable_store.writeTextAtomic(
@@ -6834,7 +6838,7 @@ fn expectLegacyContentBinding(
         std.testing.allocator,
         &.{
             legacy_root,
-            ".ledger",
+            storage_root.controlComponent(),
             "example",
             "content-idempotency.jsonl",
         },
@@ -6930,7 +6934,7 @@ fn expectContentEventCount(
         std.testing.allocator,
         &.{
             plans.repo_root,
-            ".ledger",
+            storage_root.controlComponent(),
             "example",
             "content-idempotency.jsonl",
         },

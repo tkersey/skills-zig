@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const custody = @import("custody.zig");
@@ -61,10 +62,10 @@ pub fn execute(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
     const transactions_dir = try std.fs.path.join(
         allocator,
-        &.{ repo_root, ".ledger", ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
     );
     defer allocator.free(transactions_dir);
     const pending_transactions = try durable_store.countPendingTransactions(

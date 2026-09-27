@@ -198,25 +198,31 @@ fn buildSeq(ctx: BuildContext, shared: SharedModules) DefinitionApp {
 
 fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
     const b = ctx.b;
-    const ledger_v1_core = ctx.module("apps/ledger/src/v1/root.zig", &.{
-        .{ .name = "core_calendar", .module = shared.calendar },
-        .{ .name = "definition_core", .module = shared.definitions },
-        .{ .name = "durable_store", .module = shared.durable },
-    });
-    const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
-    const ledger_root = ctx.module("apps/ledger/src/v1/main.zig", &.{
-        .{ .name = "app_meta", .module = ledger_meta },
-        .{ .name = "definition_core", .module = shared.definitions },
-        .{ .name = "durable_store", .module = shared.durable },
-        .{ .name = "ledger_v1_core", .module = ledger_v1_core },
-    });
+    const modules = createLedgerModules(ctx, shared);
+    const ledger_storage_root = modules.storage_root;
+    const ledger_v1_core = modules.core;
+    const ledger_meta = modules.meta;
+    const ledger_root = modules.root;
     ledger_root.strip = ctx.optimize == .ReleaseFast;
     const ledger = addInstalledExecutable(b, "ledger", ledger_root);
+    const ledger_anchor_probe_step = addLedgerRootAnchorProbe(
+        ctx,
+        shared,
+        ledger_meta,
+        ledger_v1_core,
+        ledger_storage_root,
+    );
     const run_ledger_tests = addTestStep(
         b,
         ledger_root,
         "test-ledger-cli",
         "Run Ledger 1.0 command and artifact tests",
+    );
+    const run_storage_root_tests = addTestStep(
+        b,
+        ledger_storage_root,
+        "test-ledger-storage-root",
+        "Run managed Ledger root admission tests",
     );
     const run_ledger_core_tests = addTestStep(
         b,
@@ -224,22 +230,17 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "test-ledger-core",
         "Run Ledger 1.1 artifact-definition compiler tests",
     );
-    const ledger_cli_smoke_cmd = b.addSystemCommand(&.{
-        "bash",
-        "scripts/test-ledger-cli.sh",
-    });
-    ledger_cli_smoke_cmd.addArtifactArg(ledger.exe);
-    const run_ledger_cli_smoke = b.step(
-        "test-ledger-cli-smoke",
-        "Run Ledger 1.1 definition, validation, and materialization smoke tests",
-    );
-    run_ledger_cli_smoke.dependOn(&ledger_cli_smoke_cmd.step);
+    const run_ledger_cli_smoke = addLedgerCliSmoke(b, ledger.exe);
     const test_ledger = b.step("test-ledger", "Run ledger tests");
     test_ledger.dependOn(&run_ledger_tests.step);
+    test_ledger.dependOn(&run_storage_root_tests.step);
     test_ledger.dependOn(&run_ledger_core_tests.step);
     test_ledger.dependOn(run_ledger_cli_smoke);
+    test_ledger.dependOn(ledger_anchor_probe_step);
     addLedgerReleaseGate(ctx, ledger, ledger_v1_core, &.{
-        &run_ledger_tests.step, &run_ledger_core_tests.step, run_ledger_cli_smoke,
+        &run_ledger_tests.step,      &run_storage_root_tests.step,
+        &run_ledger_core_tests.step, run_ledger_cli_smoke,
+        ledger_anchor_probe_step,
     });
     addRunStep(b, ledger.exe, "run-ledger", "Run ledger", &.{"--help"});
     return .{
@@ -250,10 +251,76 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
             .build_description = "Build ledger binary",
             .build_deps = &.{&ledger.install.step},
             .test_deps = &.{
-                &run_ledger_tests.step, &run_ledger_core_tests.step, run_ledger_cli_smoke,
+                &run_ledger_tests.step,      &run_storage_root_tests.step,
+                &run_ledger_core_tests.step, run_ledger_cli_smoke,
+                ledger_anchor_probe_step,
             },
         }),
     };
+}
+
+const LedgerModules = struct {
+    storage_root: *std.Build.Module,
+    core: *std.Build.Module,
+    meta: *std.Build.Module,
+    root: *std.Build.Module,
+};
+
+fn createLedgerModules(ctx: BuildContext, shared: SharedModules) LedgerModules {
+    const storage_root = ctx.module("apps/ledger/src/v1/storage_root.zig", &.{
+        .{ .name = "durable_store", .module = shared.durable },
+    });
+    const core = ctx.module("apps/ledger/src/v1/root.zig", &.{
+        .{ .name = "core_calendar", .module = shared.calendar },
+        .{ .name = "definition_core", .module = shared.definitions },
+        .{ .name = "durable_store", .module = shared.durable },
+        .{ .name = "storage_root", .module = storage_root },
+    });
+    const meta = addVersionModule(ctx.b, @embedFile("apps/ledger/VERSION"));
+    const root = ctx.module("apps/ledger/src/v1/main.zig", &.{
+        .{ .name = "app_meta", .module = meta },
+        .{ .name = "definition_core", .module = shared.definitions },
+        .{ .name = "durable_store", .module = shared.durable },
+        .{ .name = "ledger_v1_core", .module = core },
+        .{ .name = "storage_root", .module = storage_root },
+    });
+    return .{ .storage_root = storage_root, .core = core, .meta = meta, .root = root };
+}
+
+fn addLedgerRootAnchorProbe(
+    ctx: BuildContext,
+    shared: SharedModules,
+    ledger_meta: *std.Build.Module,
+    ledger_v1_core: *std.Build.Module,
+    ledger_storage_root: *std.Build.Module,
+) *std.Build.Step {
+    const b = ctx.b;
+    const probe_root = ctx.module("apps/ledger/src/v1/root_anchor_probe.zig", &.{
+        .{ .name = "app_meta", .module = ledger_meta },
+        .{ .name = "definition_core", .module = shared.definitions },
+        .{ .name = "durable_store", .module = shared.durable },
+        .{ .name = "ledger_v1_core", .module = ledger_v1_core },
+        .{ .name = "storage_root", .module = ledger_storage_root },
+    });
+    const probe = addExecutable(b, "ledger-root-anchor-probe", probe_root);
+    const run_probe = b.addRunArtifact(probe);
+    const step = b.step(
+        "test-ledger-root-anchor",
+        "Verify managed custody remains pinned after a root swap",
+    );
+    step.dependOn(&run_probe.step);
+    return step;
+}
+
+fn addLedgerCliSmoke(b: *std.Build, ledger: *std.Build.Step.Compile) *std.Build.Step {
+    const smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-ledger-cli.sh" });
+    smoke_cmd.addArtifactArg(ledger);
+    const step = b.step(
+        "test-ledger-cli-smoke",
+        "Run Ledger 1.1 definition, validation, and materialization smoke tests",
+    );
+    step.dependOn(&smoke_cmd.step);
+    return step;
 }
 
 fn addLedgerReleaseGate(

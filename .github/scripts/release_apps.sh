@@ -156,7 +156,7 @@ case "$mode" in
         mark_app cas
         matched=0
       fi
-      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
+      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]|Ledger[A-Z]' <<<"$raw"; then
         mark_ledger
         matched=0
       fi
@@ -165,6 +165,10 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
+      if [[ -z "${raw//[[:space:]]/}" ]] ||
+         grep -Eq '^[[:space:]]*[{}(),.;&]+[[:space:]]*$' <<<"$raw"; then
+        return 0
+      fi
       grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
@@ -257,24 +261,50 @@ case "$mode" in
     if [[ "$build_changed" -eq 1 ]]; then
       build_hunk=()
       build_changed_lines=()
+      build_changed_positions=()
+      build_changed_old_positions=()
+
+      build_line_owner() {
+        local ref=$1
+        local line_number=$2
+        git show "${ref}:build.zig" | awk -v stop="$line_number" '
+          NR <= stop && (/^(pub )?(fn|const|var) / ||
+            /^comptime[[:space:]]*\{/ || /^test[[:space:]]/) { owner = $0 }
+          END { print owner }
+        '
+      }
+
+      classify_build_owner() {
+        case "$1" in
+          'fn buildLedger('*|'fn '*Ledger*|'const Ledger'*) mark_ledger ;;
+          'fn buildSeq('*) mark_app seq ;;
+          'fn buildLift('*) mark_app lift ;;
+          'fn buildCas('*) mark_app cas ;;
+          'fn buildMemoryNote('*) mark_app memory-note ;;
+          'fn buildTypeSafe('*) mark_app typesafe ;;
+          *) return 1 ;;
+        esac
+      }
 
       flush_build_hunk() {
         if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
           return
         fi
-        local change hunk_text raw
+        local change raw index
         local changed_matched=0
         local context_matched=0
         local substantive_unknown=0
         local retired_app_deletion=0
         local has_addition=0
-        hunk_text=$(printf '%s\n' "${build_hunk[@]}")
         # Attribute a newly added constructor to TypeSafe, then keep classifying
         # other changes in the same hunk under their own owners.
         local in_new_typesafe=0
         local added_typesafe=0
         local remaining_changes=()
-        for change in "${build_changed_lines[@]}"; do
+        local remaining_positions=()
+        local remaining_old_positions=()
+        for index in "${!build_changed_lines[@]}"; do
+          change=${build_changed_lines[index]}
           if [[ "$change" == '+fn buildTypeSafe('* ]]; then
             mark_app typesafe
             added_typesafe=1
@@ -286,10 +316,14 @@ case "$mode" in
               in_new_typesafe=0
             elif [[ "${change:0:1}" == '-' ]]; then
               remaining_changes+=("$change")
+              remaining_positions+=("${build_changed_positions[index]}")
+              remaining_old_positions+=("${build_changed_old_positions[index]}")
             fi
             continue
           fi
           remaining_changes+=("$change")
+          remaining_positions+=("${build_changed_positions[index]}")
+          remaining_old_positions+=("${build_changed_old_positions[index]}")
         done
         if [[ "$in_new_typesafe" -eq 1 ]]; then
           mark_all
@@ -307,10 +341,23 @@ case "$mode" in
             return
           fi
         fi
-        for change in "${remaining_changes[@]}"; do
+        for index in "${!remaining_changes[@]}"; do
+          change=${remaining_changes[index]}
           raw=${change:1}
+          local owner_matched=0
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
+            if ! contextual_build_line "$raw" &&
+               classify_build_owner "$(build_line_owner "$head" "${remaining_positions[index]}")"; then
+              changed_matched=1
+              owner_matched=1
+            fi
+          elif [[ "${change:0:1}" == "-" ]]; then
+            if ! contextual_build_line "$raw" &&
+               classify_build_owner "$(build_line_owner "$base" "${remaining_old_positions[index]}")"; then
+              changed_matched=1
+              owner_matched=1
+            fi
           fi
           if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
             retired_app_deletion=1
@@ -322,7 +369,9 @@ case "$mode" in
           elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
             retired_app_deletion=1
           elif [[ "${change:0:1}" == "+" ]] && ! contextual_build_line "$raw"; then
-            substantive_unknown=1
+            if [[ "$owner_matched" -ne 1 ]]; then
+              substantive_unknown=1
+            fi
           fi
         done
         if [[ "$substantive_unknown" -eq 1 ]]; then
@@ -352,15 +401,32 @@ case "$mode" in
             flush_build_hunk
             build_hunk=()
             build_changed_lines=()
+            build_changed_positions=()
+            build_changed_old_positions=()
+            if [[ "$line" =~ -([0-9]+) ]]; then
+              hunk_old_line=${BASH_REMATCH[1]}
+            fi
+            if [[ "$line" =~ \+([0-9]+) ]]; then
+              hunk_new_line=${BASH_REMATCH[1]}
+            fi
             continue
             ;;
           "+"*|"-"*)
             raw=${line:1}
             build_hunk+=("$raw")
             build_changed_lines+=("$line")
+            build_changed_positions+=("$hunk_new_line")
+            build_changed_old_positions+=("$hunk_old_line")
+            if [[ "${line:0:1}" == "+" ]]; then
+              hunk_new_line=$((hunk_new_line + 1))
+            else
+              hunk_old_line=$((hunk_old_line + 1))
+            fi
             ;;
           " "*)
             build_hunk+=("${line:1}")
+            hunk_new_line=$((hunk_new_line + 1))
+            hunk_old_line=$((hunk_old_line + 1))
             ;;
           *) continue ;;
         esac
