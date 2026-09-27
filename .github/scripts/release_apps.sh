@@ -262,10 +262,12 @@ case "$mode" in
       build_hunk=()
       build_changed_lines=()
       build_changed_positions=()
+      build_changed_old_positions=()
 
-      build_addition_owner() {
-        local line_number=$1
-        git show "${head}:build.zig" | awk -v stop="$line_number" '
+      build_line_owner() {
+        local ref=$1
+        local line_number=$2
+        git show "${ref}:build.zig" | awk -v stop="$line_number" '
           NR <= stop && (/^(pub )?(fn|const|var) / ||
             /^comptime[[:space:]]*\{/ || /^test[[:space:]]/) { owner = $0 }
           END { print owner }
@@ -300,6 +302,7 @@ case "$mode" in
         local added_typesafe=0
         local remaining_changes=()
         local remaining_positions=()
+        local remaining_old_positions=()
         for index in "${!build_changed_lines[@]}"; do
           change=${build_changed_lines[index]}
           if [[ "$change" == '+fn buildTypeSafe('* ]]; then
@@ -314,11 +317,13 @@ case "$mode" in
             elif [[ "${change:0:1}" == '-' ]]; then
               remaining_changes+=("$change")
               remaining_positions+=("${build_changed_positions[index]}")
+              remaining_old_positions+=("${build_changed_old_positions[index]}")
             fi
             continue
           fi
           remaining_changes+=("$change")
           remaining_positions+=("${build_changed_positions[index]}")
+          remaining_old_positions+=("${build_changed_old_positions[index]}")
         done
         if [[ "$in_new_typesafe" -eq 1 ]]; then
           mark_all
@@ -343,7 +348,13 @@ case "$mode" in
           if [[ "${change:0:1}" == "+" ]]; then
             has_addition=1
             if ! contextual_build_line "$raw" &&
-               classify_build_owner "$(build_addition_owner "${remaining_positions[index]}")"; then
+               classify_build_owner "$(build_line_owner "$head" "${remaining_positions[index]}")"; then
+              changed_matched=1
+              owner_matched=1
+            fi
+          elif [[ "${change:0:1}" == "-" ]]; then
+            if ! contextual_build_line "$raw" &&
+               classify_build_owner "$(build_line_owner "$base" "${remaining_old_positions[index]}")"; then
               changed_matched=1
               owner_matched=1
             fi
@@ -391,6 +402,10 @@ case "$mode" in
             build_hunk=()
             build_changed_lines=()
             build_changed_positions=()
+            build_changed_old_positions=()
+            if [[ "$line" =~ -([0-9]+) ]]; then
+              hunk_old_line=${BASH_REMATCH[1]}
+            fi
             if [[ "$line" =~ \+([0-9]+) ]]; then
               hunk_new_line=${BASH_REMATCH[1]}
             fi
@@ -401,13 +416,17 @@ case "$mode" in
             build_hunk+=("$raw")
             build_changed_lines+=("$line")
             build_changed_positions+=("$hunk_new_line")
+            build_changed_old_positions+=("$hunk_old_line")
             if [[ "${line:0:1}" == "+" ]]; then
               hunk_new_line=$((hunk_new_line + 1))
+            else
+              hunk_old_line=$((hunk_old_line + 1))
             fi
             ;;
           " "*)
             build_hunk+=("${line:1}")
             hunk_new_line=$((hunk_new_line + 1))
+            hunk_old_line=$((hunk_old_line + 1))
             ;;
           *) continue ;;
         esac

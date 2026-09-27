@@ -340,6 +340,12 @@ mv build.next build.zig
 git add build.zig
 git commit -qm seq-reference-to-ledger-helper
 test "$(bash "$classifier" affected "$adjacent_base" HEAD | paste -sd, -)" = seq,ledger
+referencing_base=$(git rev-parse HEAD)
+awk '$0 !~ /_ = addLedgerRootAnchorProbe;/' build.zig >build.next
+mv build.next build.zig
+git add build.zig
+git commit -qm remove-seq-reference-to-ledger-helper
+test "$(bash "$classifier" affected "$referencing_base" HEAD | paste -sd, -)" = seq,ledger
 
 # Replacing a retired build owner with a current CAS owner must classify the
 # surviving owner without retaining a product-specific compatibility branch.
