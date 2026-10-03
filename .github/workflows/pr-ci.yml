@@ -27,6 +27,7 @@ on:
       - "tools/install_guard.zig"
       - "tools/perf_hub.zig"
       - "tools/perf_contract.zig"
+      - "tools/seq_replay_driver.zig"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
 
@@ -81,6 +82,7 @@ jobs:
              grep -Fxq 'build.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths" ||
+             grep -Fxq 'tools/seq_replay_driver.zig' <<<"$changed_paths" ||
              grep -Eq '^scripts/perf/' <<<"$changed_paths"; then
             perf=true
           fi

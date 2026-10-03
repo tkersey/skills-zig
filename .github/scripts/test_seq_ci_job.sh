@@ -115,4 +115,46 @@ if grep -Fq -- '${selected[cron]:-false}' "$workflow"; then
   exit 1
 fi
 
+perf_selector="$(
+  awk '
+    /^          perf=/ { in_perf = 1 }
+    in_perf && /echo "perf=\$perf"/ { exit }
+    in_perf { sub(/^          /, ""); print }
+  ' "$workflow"
+)"
+if [[ -z "$perf_selector" ]]; then
+  echo "Performance CI selector is missing" >&2
+  exit 1
+fi
+
+for changed_path in tools/perf_hub.zig tools/perf_contract.zig tools/seq_replay_driver.zig; do
+  if ! awk '/^    paths:$/ { in_paths = 1; next } in_paths && !/^      / { exit } in_paths { print }' "$workflow" |
+    grep -Fq -- "\"$changed_path\""; then
+    echo "Performance source missing from PR workflow admission: $changed_path" >&2
+    exit 1
+  fi
+done
+
+expect_perf_selection() (
+  local expected="$1"
+  local changed_paths="$2"
+  local perf
+  declare -A selected=()
+  if [[ -n "${3:-}" ]]; then
+    selected["$3"]=true
+  fi
+  eval "$perf_selector"
+  if [[ "$perf" != "$expected" ]]; then
+    echo "Performance CI selection expected $expected for '$changed_paths' (owner '${3:-none}'); got $perf" >&2
+    exit 1
+  fi
+)
+
+for changed_path in build.zig tools/perf_hub.zig tools/perf_contract.zig tools/seq_replay_driver.zig scripts/perf/example.sh; do
+  expect_perf_selection true "$changed_path"
+done
+expect_perf_selection true apps/seq/src/main.zig seq
+expect_perf_selection true apps/cas/src/main.zig cas
+expect_perf_selection false README.md
+
 echo "Seq CI proof matrix is valid."
