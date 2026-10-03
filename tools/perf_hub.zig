@@ -53,6 +53,15 @@ const active_optimization_driver_v1 = DriverSourceIdentity{
     .locator = "tools/optimization_driver.zig",
     .sha256 = &optimization_driver_sha256,
 };
+// Readback-only identity from the pre-migration source at 9c4a5584608e23cfe3b5c125b9b1e1df38b53aa2.
+const legacy_optimization_driver_v1 = DriverSourceIdentity{
+    .revision = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+    .tree = "4eb77ac0c61b57e3d739be6a1d9a5a2f023e28855f06fd78eac94c0a4e9ba9dd",
+    .locator = "tools/optimization_driver.zig",
+    .sha256 = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+};
+const legacy_optimization_build_sha256 =
+    "5eaae873185f3f472269a7dcc1d2c41c61f56fbfbc13542f941acc98ef082769";
 
 fn comptimeDigest(comptime source: []const u8) [64]u8 {
     @setEvalBranchQuota(4_000_000);
@@ -6060,6 +6069,11 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
         {
             return;
         }
+        if (driverSourceMatchesIdentity(source, legacy_optimization_driver_v1) and
+            std.mem.eql(u8, build_file.sha256, "sha256:" ++ legacy_optimization_build_sha256))
+        {
+            return;
+        }
     } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v2) or
         driverSourceMatchesIdentity(source, legacy_seq_replay_driver_v1) or
         driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
@@ -6748,6 +6762,41 @@ fn testOptimizationDriverSource() CapsuleDriverSource {
             .sha256 = "sha256:" ++ optimization_build_sha256,
         },
     };
+}
+
+test "pre-migration optimization evidence retains its exact source and build tuple" {
+    var source = CapsuleDriverSource{
+        .revision = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+        .tree = "4eb77ac0c61b57e3d739be6a1d9a5a2f023e28855f06fd78eac94c0a4e9ba9dd",
+        .path = "tools/optimization_driver.zig",
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+        },
+        .build_file = .{
+            .label = "build.zig",
+            .sha256 = "sha256:5eaae873185f3f472269a7dcc1d2c41c61f56fbfbc13542f941acc98ef082769",
+        },
+    };
+    try validateDriverSourceMetadata(source);
+    const historical = source;
+    source.build_file = testOptimizationDriverSource().build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source = testOptimizationDriverSource();
+    source.build_file = historical.build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source = historical;
+    source.build_file = null;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
 }
 
 test "active Seq driver identity is distinct from immutable historical evidence" {
