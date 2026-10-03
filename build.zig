@@ -1459,7 +1459,9 @@ fn addTestStepWithOptions(
     }
     const run_tests = b.addRunArtifact(tests);
     if (options.cwd) |cwd| run_tests.setCwd(cwd);
-    run_tests.addPassthruArgs();
+    // The test protocol owns its arguments. Zig 0.17's fuzz replay rejects a
+    // passthru entry even when no arguments follow `--`; CLI helpers still
+    // forward arguments normally. Use build flags such as --seed for tests.
     const step = b.step(step_name, description);
     step.dependOn(&run_tests.step);
     return run_tests;
