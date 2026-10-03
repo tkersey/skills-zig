@@ -15,6 +15,27 @@ const DriverSourceIdentity = struct {
     sha256: []const u8,
 };
 const DriverKind = enum { seq_replay, optimization };
+const seq_replay_driver_source = @embedFile("seq_replay_driver.zig");
+const seq_replay_driver_sha256 = comptimeDigest(seq_replay_driver_source);
+const seq_replay_driver_locator = "tools/seq_replay_driver.zig";
+const seq_replay_driver_tree_sha256 = seqReplayDriverTreeDigest();
+const active_seq_replay_driver_v2 = DriverSourceIdentity{
+    .revision = &seq_replay_driver_sha256,
+    .tree = &seq_replay_driver_tree_sha256,
+    .locator = seq_replay_driver_locator,
+    .sha256 = &seq_replay_driver_sha256,
+};
+
+fn seqReplayDriverTreeDigest() [64]u8 {
+    @setEvalBranchQuota(4_000_000);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("seq-replay-driver-tree/v2\x00");
+    hasher.update(seq_replay_driver_locator);
+    hasher.update("\x00");
+    hasher.update(&seq_replay_driver_sha256);
+    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+}
+
 const optimization_driver_source = @embedFile("optimization_driver.zig");
 const optimization_build_source =
     \\pub fn build(b: *std.Build) void {
@@ -50,14 +71,14 @@ fn optimizationSourceTreeDigest() [64]u8 {
 
 fn driverIdentity(kind: DriverKind) DriverSourceIdentity {
     return switch (kind) {
-        .seq_replay => active_seq_replay_driver_v1,
+        .seq_replay => active_seq_replay_driver_v2,
         .optimization => active_optimization_driver_v1,
     };
 }
 
 fn driverSourceBytes(kind: DriverKind) []const u8 {
     return switch (kind) {
-        .seq_replay => sealed_seq_replay_driver_source,
+        .seq_replay => seq_replay_driver_source,
         .optimization => optimization_driver_source,
     };
 }
@@ -77,7 +98,7 @@ const sealed_seq_replay_driver_locator =
     "tools/perf_hub.zig#sealed_seq_replay_driver_source";
 const sealed_seq_replay_driver_sha256 =
     "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053";
-const active_seq_replay_driver_v1 = DriverSourceIdentity{
+const legacy_seq_replay_driver_v1 = DriverSourceIdentity{
     .revision = sealed_seq_replay_driver_sha256,
     .tree = "118e358ab6c6b74bded7dc77d3932c9b8b289a83904604e82e8221109458fe9b",
     .locator = sealed_seq_replay_driver_locator,
@@ -3198,7 +3219,8 @@ fn buildIsolatedSource(
     errdefer archive.deinit(allocator);
     const prefix = try std.fs.path.join(allocator, &.{ snapshot, "zig-out" });
     defer allocator.free(prefix);
-    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "", kind);
+    const zig_path = compiler.approved_path;
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, zig_path, "", kind);
     try requireBuildSourceUnchanged(allocator, root, revision, tree);
     try verifySealedFile(compiler.file);
     try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
@@ -3208,7 +3230,7 @@ fn buildIsolatedSource(
     errdefer ledger.deinit(allocator);
     try overlayReplayDriver(allocator, snapshot, driver_bytes, driver_file);
     if (build_file) |file| try overlayDriverBuild(allocator, snapshot, file);
-    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "driver-", kind);
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, zig_path, "driver-", kind);
     try verifySealedFile(driver_file);
     if (build_file) |file| try verifySealedFile(file);
     try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
@@ -3364,7 +3386,7 @@ fn runIsolatedBuild(
     snapshot: []const u8,
     staging_dir: []const u8,
     prefix: []const u8,
-    compiler: CompilerEvidence,
+    compiler_path: []const u8,
     comptime cache_prefix: []const u8,
     kind: DriverKind,
 ) !void {
@@ -3377,17 +3399,30 @@ fn runIsolatedBuild(
     defer allocator.free(global);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(prefix);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global);
+    const packages = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, cache_prefix ++ "packages" },
+    );
+    defer allocator.free(packages);
+    const global_tmp = try std.fs.path.join(allocator, &.{ global, "tmp" });
+    defer allocator.free(global_tmp);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global_tmp);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(packages);
+    const global_env = try allocator.print("ZIG_GLOBAL_CACHE_DIR={s}", .{global});
+    defer allocator.free(global_env);
+    const packages_env = try allocator.print("ZIG_LOCAL_PKG_DIR={s}", .{packages});
+    defer allocator.free(packages_env);
     const argv = [_][]const u8{
-        compiler.approved_path,
+        "/usr/bin/env",
+        global_env,
+        packages_env,
+        compiler_path,
         "build",
         "-Doptimize=fast",
         "--prefix",
         prefix,
         "--cache-dir",
         cache,
-        "--global-cache-dir",
-        global,
     };
     const driver_argv = argv ++ [_][]const u8{
         "optimization-driver", "-Dtarget=aarch64-macos", "-Dcpu=baseline",
@@ -6025,7 +6060,8 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
         {
             return;
         }
-    } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
+    } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v2) or
+        driverSourceMatchesIdentity(source, legacy_seq_replay_driver_v1) or
         driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
     {
         return;
@@ -6663,12 +6699,12 @@ test "driver source metadata accepts active and legacy tuples only" {
     };
     try validateDriverSourceMetadata(source);
     source = .{
-        .revision = active_seq_replay_driver_v1.revision,
-        .tree = active_seq_replay_driver_v1.tree,
-        .path = active_seq_replay_driver_v1.locator,
+        .revision = legacy_seq_replay_driver_v1.revision,
+        .tree = legacy_seq_replay_driver_v1.tree,
+        .path = legacy_seq_replay_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
-            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+            .sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256,
         },
     };
     try validateDriverSourceMetadata(source);
@@ -6678,19 +6714,19 @@ test "driver source metadata accepts active and legacy tuples only" {
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.revision = active_seq_replay_driver_v1.revision;
+    source.revision = legacy_seq_replay_driver_v1.revision;
     source.tree = legacy_generic_driver_v1.tree;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.tree = active_seq_replay_driver_v1.tree;
+    source.tree = legacy_seq_replay_driver_v1.tree;
     source.path = legacy_generic_driver_v1.locator;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.path = active_seq_replay_driver_v1.locator;
+    source.path = legacy_seq_replay_driver_v1.locator;
     source.file.sha256 = "sha256:" ++ legacy_generic_driver_v1.sha256;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
@@ -6712,6 +6748,88 @@ fn testOptimizationDriverSource() CapsuleDriverSource {
             .sha256 = "sha256:" ++ optimization_build_sha256,
         },
     };
+}
+
+test "active Seq driver identity is distinct from immutable historical evidence" {
+    const active = driverIdentity(.seq_replay);
+    const bytes = driverSourceBytes(.seq_replay);
+    const digest = evidenceDigest(bytes);
+    try std.testing.expectEqualStrings(active.sha256, &digest);
+    try std.testing.expect(!std.mem.eql(u8, bytes, sealed_seq_replay_driver_source));
+    var source = CapsuleDriverSource{
+        .revision = active.revision,
+        .tree = active.tree,
+        .path = active.locator,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++ seq_replay_driver_sha256,
+        },
+    };
+    try validateDriverSourceMetadata(source);
+    var mixed: [4]CapsuleDriverSource = @splat(source);
+    mixed[0].revision = legacy_seq_replay_driver_v1.revision;
+    mixed[1].tree = legacy_seq_replay_driver_v1.tree;
+    mixed[2].path = legacy_seq_replay_driver_v1.locator;
+    mixed[3].file.sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256;
+    for (mixed) |candidate| {
+        try std.testing.expectError(
+            error.PerfEvidenceIdentityMismatch,
+            validateDriverSourceMetadata(candidate),
+        );
+    }
+    source.build_file = testOptimizationDriverSource().build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
+const isolated_build_fixture =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b.standardTargetOptions(.{});
+    \\    _ = b.standardOptimizeOption(.{});
+    \\    const env = b.graph.environ_map;
+    \\    const contents = b.fmt("{s}\n{s}\n", .{
+    \\        env.get("ZIG_GLOBAL_CACHE_DIR") orelse "missing-global-cache",
+    \\        env.get("ZIG_LOCAL_PKG_DIR") orelse "missing-package-cache",
+    \\    });
+    \\    const file = b.addWriteFiles().add("cache-environment", contents);
+    \\    b.getInstallStep().dependOn(&b.addInstallFile(file, "cache-environment").step);
+    \\    b.step("optimization-driver", "Check driver invocation").dependOn(b.getInstallStep());
+    \\}
+;
+
+test "isolated product and driver builds use supported private compiler caches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data = isolated_build_fixture });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const prefix = try std.fs.path.join(allocator, &.{ root, "zig-out" });
+    defer allocator.free(prefix);
+    const configured = try std.testing.environ.getAlloc(allocator, "PERF_TEST_ZIG");
+    defer allocator.free(configured);
+    const observed_path = try std.fs.path.join(allocator, &.{ prefix, "cache-environment" });
+    defer allocator.free(observed_path);
+    inline for (.{ "", "driver-" }) |cache_prefix| {
+        const kind: DriverKind = if (cache_prefix.len == 0) .seq_replay else .optimization;
+        try runIsolatedBuild(allocator, root, root, prefix, configured, cache_prefix, kind);
+        const observed = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            observed_path,
+            allocator,
+            .limited(8192),
+        );
+        defer allocator.free(observed);
+        const expected = try allocator.print("{s}/{s}global-cache\n{s}/{s}packages\n", .{
+            root, cache_prefix, root, cache_prefix,
+        });
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, observed);
+    }
 }
 
 test "optimization driver build requires the exact step target and cpu" {
@@ -6764,10 +6882,10 @@ test "optimization driver source requires the exact build source identity" {
 test "optimization driver source rejects mixed source tuples" {
     const valid = testOptimizationDriverSource();
     var sources = [_]CapsuleDriverSource{ valid, valid, valid, valid };
-    sources[0].revision = active_seq_replay_driver_v1.revision;
-    sources[1].tree = active_seq_replay_driver_v1.tree;
-    sources[2].path = active_seq_replay_driver_v1.locator;
-    sources[3].file.sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256;
+    sources[0].revision = legacy_seq_replay_driver_v1.revision;
+    sources[1].tree = legacy_seq_replay_driver_v1.tree;
+    sources[2].path = legacy_seq_replay_driver_v1.locator;
+    sources[3].file.sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256;
     for (sources) |source| {
         try std.testing.expectError(
             error.PerfEvidenceIdentityMismatch,
@@ -6778,12 +6896,12 @@ test "optimization driver source rejects mixed source tuples" {
 
 test "Seq replay and legacy sources reject optimization build evidence" {
     var source = CapsuleDriverSource{
-        .revision = active_seq_replay_driver_v1.revision,
-        .tree = active_seq_replay_driver_v1.tree,
-        .path = active_seq_replay_driver_v1.locator,
+        .revision = legacy_seq_replay_driver_v1.revision,
+        .tree = legacy_seq_replay_driver_v1.tree,
+        .path = legacy_seq_replay_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
-            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+            .sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256,
         },
         .build_file = testOptimizationDriverSource().build_file,
     };
@@ -6804,16 +6922,16 @@ test "Seq replay and legacy sources reject optimization build evidence" {
 test "sealed Seq replay driver source is capture-only and dependency-minimal" {
     const digest = sealedSeqReplayDriverDigest();
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.sha256,
+        legacy_seq_replay_driver_v1.sha256,
         &digest,
     );
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.revision,
-        active_seq_replay_driver_v1.sha256,
+        legacy_seq_replay_driver_v1.revision,
+        legacy_seq_replay_driver_v1.sha256,
     );
     const tree_digest = sealedSeqReplayDriverTreeDigest();
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.tree,
+        legacy_seq_replay_driver_v1.tree,
         &tree_digest,
     );
     try std.testing.expectEqual(

@@ -1226,6 +1226,16 @@ fn addPerformance(
         "test-perf-hub",
         "Run perf_hub tests",
     );
+    run_perf_hub_tests.setEnvironmentVariable("PERF_TEST_ZIG", b.graph.zig_exe);
+    const replay_driver = b.addExecutable(.{
+        .name = "seq-replay-driver-check",
+        .root_module = ctx.module("tools/seq_replay_driver.zig", &.{
+            .{ .name = "core_perf", .module = shared.perf },
+            .{ .name = "definition_core", .module = shared.definitions },
+            .{ .name = "seq_v1_core", .module = seq_v1_core },
+        }),
+    });
+    run_perf_hub_tests.step.dependOn(&replay_driver.step);
     routine.dependOn(&run_perf_hub_tests.step);
     addDurableStorePerformance(ctx, shared, routine);
     addOptimizationTests(ctx, shared, ledger_v1_core, routine);
