@@ -73,6 +73,7 @@ const Output = union(enum) {
 };
 
 pub fn main(init: std.process.Init) !void {
+    ledger.transaction.installRuntimeIo(init.io);
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len != 4 or !std.mem.eql(u8, argv[2], "--target")) {
@@ -108,11 +109,10 @@ fn prepareFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
 }
 
 fn allocateFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         "{s}/skills-zig-optimization-{d}",
         .{
-            if (builtin.os.tag == .macos) "/private/tmp" else "/tmp",
+            if (builtin.target.os.tag == .macos) "/private/tmp" else "/tmp",
             std.Io.Clock.awake.now(io()).nanoseconds,
         },
     );
@@ -185,8 +185,7 @@ fn prepareLedger(allocator: std.mem.Allocator, fixture: *Fixture) !void {
 }
 
 fn definitionBytes(allocator: std.mem.Allocator, limit: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"schema\":\"ledger-artifact-definition/v1\",\"id\":\"optimization/topk\"," ++
             "\"owner\":\"optimization\",\"requires\":{{\"abi\":\"ledger-artifact-abi/v1\"," ++
             "\"operators\":[\"atomic-transaction\",\"bind-existing\",\"limit\"," ++
@@ -226,7 +225,7 @@ fn score(index: usize) usize {
 }
 
 fn writeRow(writer: *std.Io.Writer, index: usize) !void {
-    const payload = [_]u8{'a'} ** 1024;
+    const payload = @as([1024]u8, @splat('a'));
     try writer.print(
         "{{\"id\":{d},\"score\":{d},\"group\":{d},\"payload\":\"{s}\"}}",
         .{ index, score(index), (index / 4096) % 2, payload },
@@ -258,15 +257,48 @@ fn expectedLedger(allocator: std.mem.Allocator, case: Case) ![]u8 {
 }
 
 fn traceBytes(allocator: std.mem.Allocator, turns: usize) ![]u8 {
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll(
+    // Fixture construction is outside the measured parser. Reserve its exact
+    // size so compiler-specific writer growth does not dominate process RSS.
+    var count: std.Io.Writer.Discarding = .init(&.{});
+    try writeTrace(&count.writer, turns);
+    const length = std.math.cast(usize, count.fullCount()) orelse return error.FixtureTooLarge;
+    if (length > fixture_limit) return error.FixtureTooLarge;
+    const bytes = try allocator.alloc(u8, length);
+    errdefer allocator.free(bytes);
+    var out: std.Io.Writer = .fixed(bytes);
+    try writeTrace(&out, turns);
+    std.debug.assert(out.buffered().len == bytes.len);
+    return bytes;
+}
+
+fn writeTrace(writer: *std.Io.Writer, turns: usize) !void {
+    try writer.writeAll(
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-26T10:00:00Z\"," ++
             "\"payload\":{\"id\":\"optimization-session\",\"model\":\"gpt-test\"," ++
             "\"cwd\":\"/optimization\"}}\n",
     );
-    for (0..turns) |turn| try writeTurn(&out.writer, turn);
-    return out.toOwnedSlice();
+    for (0..turns) |turn| try writeTurn(writer, turn);
+}
+
+test "presized trace fixtures preserve the pre-migration workload bytes" {
+    const allocator = std.testing.allocator;
+    const expected = [_][]const u8{
+        "2d46045a9b9b4eeacfcf6ae18816e15621303da384f651973ca8a8a55eff69c5",
+        "e7533393186f4b8b92cba4cda784bbab91f0171489515bed2f50e8e8f5aa99ed",
+    };
+    for ([_]usize{ 8, 1024 }, expected) |turns, hash| {
+        const bytes = try traceBytes(allocator, turns);
+        defer allocator.free(bytes);
+        const definition = try definitionBytes(allocator, 0);
+        defer allocator.free(definition);
+        const fixture = Fixture{
+            .bytes = bytes,
+            .definition = definition,
+            .expected = &.{},
+            .root = &.{},
+        };
+        try std.testing.expectEqualStrings(hash, &workloadDigest(fixture));
+    }
 }
 
 fn writeTurn(writer: *std.Io.Writer, turn: usize) !void {
@@ -474,7 +506,7 @@ fn writeArtifact(
     );
     defer allocator.free(directory);
     try std.Io.Dir.cwd().createDirPath(io(), directory);
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ directory, case.id });
+    const path = try allocator.print("{s}/{s}.json", .{ directory, case.id });
     defer allocator.free(path);
     const bytes = try std.json.Stringify.valueAlloc(allocator, .{
         .schema_version = 1,
@@ -499,9 +531,9 @@ fn machineName(allocator: std.mem.Allocator) ![]u8 {
     var hostname: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const full = try std.posix.gethostname(&hostname);
     const host = full[0 .. std.mem.indexOfScalar(u8, full, '.') orelse full.len];
-    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}-zig{s}", .{
-        if (builtin.os.tag == .macos) "darwin" else @tagName(builtin.os.tag),
-        if (builtin.cpu.arch == .aarch64) "arm64" else @tagName(builtin.cpu.arch),
+    return allocator.print("{s}-{s}-{s}-zig{s}", .{
+        if (builtin.target.os.tag == .macos) "darwin" else @tagName(builtin.target.os.tag),
+        if (builtin.target.cpu.arch == .aarch64) "arm64" else @tagName(builtin.target.cpu.arch),
         host,
         builtin.zig_version_string,
     });

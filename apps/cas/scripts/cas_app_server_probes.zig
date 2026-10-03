@@ -1114,8 +1114,7 @@ fn paginatedForkBoundaryProbe(
         "active boundary parameters could not be encoded",
     );
     defer allocator.free(active_boundary);
-    const expected_active_error = std.fmt.allocPrint(
-        allocator,
+    const expected_active_error = allocator.print(
         "lastTurnId '{s}' identifies an in-progress turn",
         .{PaginatedForkFixture.active_turn_id},
     ) catch return LiveWitness.failed(
@@ -1656,8 +1655,7 @@ fn clientLastErrorIsThreadNotLoaded(
     thread_id: []const u8,
 ) bool {
     const raw = client.lastError() orelse return false;
-    const expected = std.fmt.allocPrint(
-        allocator,
+    const expected = allocator.print(
         "thread not loaded: {s}",
         .{thread_id},
     ) catch return false;
@@ -1735,7 +1733,7 @@ fn probeHistoryDigestAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical.written(), &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 fn requestFailsWithMessage(
@@ -3145,8 +3143,7 @@ const structured_review_event =
     "\"overall_explanation\":\"intentional\",\"overall_confidence_score\":1}}}";
 
 fn structuredReviewRolloutAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-other\"}}}}\n" ++
             "{s}\n{{\"type\":\"turn_context\",\"payload\":{{" ++
             "\"turn_id\":\"turn-review\"}}}}\n{s}\n",
@@ -3168,8 +3165,7 @@ test "structured review rollout binds turn identity and unique output" {
         rollout,
         "turn-missing",
     ));
-    const duplicate = try std.fmt.allocPrint(
-        allocator,
+    const duplicate = try allocator.print(
         "{s}{s}\n",
         .{ rollout, structured_review_event },
     );
@@ -3214,8 +3210,7 @@ test "structured review terminal read requires completed rollout review output" 
         .sub_path = "review.jsonl",
         .data = rollout,
     });
-    const completed = try std.fmt.allocPrint(
-        allocator,
+    const completed = try allocator.print(
         "{{\"thread\":{{\"path\":\"{s}\",\"turns\":[{{" ++
             "\"id\":\"turn-review\",\"status\":\"completed\",\"items\":[" ++
             "{{\"type\":\"enteredReviewMode\"}}," ++

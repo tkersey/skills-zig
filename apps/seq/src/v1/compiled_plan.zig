@@ -625,8 +625,7 @@ fn cachePathAlloc(
     cache_key: [32]u8,
 ) ![]u8 {
     const hex = definition_core.cache.keyHex(cache_key);
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "{s}.bin",
         .{&hex},
     );
@@ -725,7 +724,7 @@ fn cacheHitKey(
     try encodePlanSet(&cold, &encoder);
     const payload = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(payload);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodePlanSetForAllocationFailure,
         .{ payload, request },

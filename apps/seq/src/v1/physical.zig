@@ -33,8 +33,11 @@ pub const Relation = enum {
     structured_values,
 
     pub fn parse(name: []const u8) !Relation {
-        inline for (@typeInfo(Relation).@"enum".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(Relation).@"enum".field_names,
+            @typeInfo(Relation).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, name, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.UnknownPhysicalRelation;
     }

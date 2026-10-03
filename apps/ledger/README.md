@@ -22,9 +22,9 @@ semantic authority.
 From the repository root:
 
 ```bash
-zig build build-ledger -Doptimize=ReleaseFast
-zig build test-ledger -Doptimize=ReleaseFast
-zig build test-ledger-segmented -Doptimize=ReleaseFast
+zig build build-ledger -Doptimize=fast
+zig build test-ledger -Doptimize=fast
+zig build test-ledger-segmented -Doptimize=fast
 ```
 
 The binary is written to `zig-out/bin/ledger`.

@@ -223,7 +223,7 @@ The packaged `codex-code-mode-host` must be beside `codex` for the integration g
 
 ```bash
 zig build test-cas
-zig build build-cas -Doptimize=ReleaseFast
+zig build build-cas -Doptimize=fast
 .github/scripts/test_cas_app_server_preflight.sh /exact/path/to/codex
 ./zig-out/bin/cas_account --help
 ./zig-out/bin/cas_conformance_suite --help
@@ -237,5 +237,5 @@ bash apps/cas/scripts/perf/budget_governor_gate.sh
 
 # Bounded native fuzz qualification (matches CI behavior).
 .github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor \
-  -Doptimize=ReleaseSafe --fuzz=100K --summary all
+  -Doptimize=safe --fuzz=100K --summary all
 ```

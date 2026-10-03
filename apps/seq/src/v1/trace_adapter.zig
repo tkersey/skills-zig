@@ -592,7 +592,7 @@ const PrefixReader = struct {
             self.prefix_pos += count;
             written += count;
             if (count < selected.len or
-                written == @intFromEnum(limit))
+                written == @backingInt(limit))
             {
                 return written;
             }

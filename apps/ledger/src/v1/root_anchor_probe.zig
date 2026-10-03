@@ -11,8 +11,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var nonce: [12]u8 = undefined;
     try std.Io.randomSecure(io, &nonce);
-    const relative_root = try std.fmt.allocPrint(
-        allocator,
+    const relative_root = try allocator.print(
         "zig-out/root-anchor-probe-{s}",
         .{std.fmt.bytesToHex(nonce, .lower)},
     );
@@ -43,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(definition_path);
     const event_path = try std.fs.path.join(allocator, &.{ temp_root, "event.json" });
     defer allocator.free(event_path);
-    const event_arg = try std.fmt.allocPrint(allocator, "event={s}", .{event_path});
+    const event_arg = try allocator.print("event={s}", .{event_path});
     defer allocator.free(event_arg);
     var selection = try storage_root.prepare(allocator, io, &.{
         "ledger",      "transact", "--definition", definition_path,

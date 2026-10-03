@@ -95,8 +95,7 @@ pub fn pathAlloc(
     revision: []const u8,
 ) ![]u8 {
     try definition_core.json.digest(revision);
-    const file_name = try std.fmt.allocPrint(
-        allocator,
+    const file_name = try allocator.print(
         "{s}.bin",
         .{revision[7..]},
     );

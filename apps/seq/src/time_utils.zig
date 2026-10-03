@@ -1,9 +1,7 @@
 const core_calendar = @import("core_calendar");
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("time.h");
-});
+const c = @import("c_time");
 
 pub const Date = struct {
     year: i32,
@@ -170,7 +168,7 @@ fn formatOffsetMinutesAlloc(allocator: std.mem.Allocator, minutes: i32) ![]u8 {
     const abs_minutes = @abs(minutes);
     const hours = @divFloor(abs_minutes, 60);
     const mins = @mod(abs_minutes, 60);
-    return std.fmt.allocPrint(allocator, "{c}{d:0>2}:{d:0>2}", .{ sign, hours, mins });
+    return allocator.print("{c}{d:0>2}:{d:0>2}", .{ sign, hours, mins });
 }
 
 fn dateFromTimestampMillisWithOffset(ts_ms: i64, offset_minutes: i32) Date {
@@ -180,7 +178,7 @@ fn dateFromTimestampMillisWithOffset(ts_ms: i64, offset_minutes: i32) Date {
 }
 
 fn localDateFromTimestampMillis(ts_ms: i64) ?Date {
-    if (builtin.os.tag == .windows) return null;
+    if (builtin.target.os.tag == .windows) return null;
 
     var seconds: c.time_t = @intCast(@divFloor(ts_ms, 1000));
     var tm_buf: c.struct_tm = undefined;

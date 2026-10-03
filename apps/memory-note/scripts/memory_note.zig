@@ -755,7 +755,7 @@ fn memoryNoteLockPathAlloc(
 ) ![]u8 {
     const home = try codexHomeAlloc(allocator, env, override);
     defer allocator.free(home);
-    const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{extension});
+    const lock_name = try allocator.print("{s}.lock", .{extension});
     defer allocator.free(lock_name);
     return std.fs.path.join(allocator, &.{ home, ".memory-note", "locks", lock_name });
 }
@@ -779,8 +779,7 @@ fn fingerprintInputAlloc(
 }
 
 fn noteIdAlloc(allocator: std.mem.Allocator, iso: []const u8, fp16: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "MSN-{s}{s}{s}T{s}{s}{s}Z-{s}",
         .{ iso[0..4], iso[5..7], iso[8..10], iso[11..13], iso[14..16], iso[17..19], fp16 },
     );
@@ -793,8 +792,7 @@ fn filenameAlloc(
     slug: []const u8,
     fp16: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}-{s}-{s}T{s}-{s}-{s}-{s}-{s}-{s}.md",
         .{
             iso[0..4],
@@ -1133,7 +1131,7 @@ fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
     const hour = @divFloor(seconds_of_day, 3600);
     const minute = @divFloor(seconds_of_day - hour * 3600, 60);
     const second = seconds_of_day - hour * 3600 - minute * 60;
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         @as(u32, @intCast(date.year)),
         @as(u32, @intCast(date.month)),
         @as(u32, @intCast(date.day)),
@@ -1329,7 +1327,7 @@ test "sensitive-key traversal releases every frame allocation on failure" {
     defer allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         allocator,
         scanSensitiveWithAllocator,
         .{parsed.value},
@@ -1356,7 +1354,11 @@ test "fingerprint lookup propagates allocation failure without losing the duplic
     try tmp.dir.writeFile(Io.io(), .{ .sub_path = "one.json", .data = LookupNoteFixture });
     const path = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
     defer allocator.free(path);
-    try std.testing.checkAllAllocationFailures(allocator, lookupFingerprintWithAllocator, .{path});
+    try @import("test_support").checkAllAllocationFailures(
+        allocator,
+        lookupFingerprintWithAllocator,
+        .{path},
+    );
 }
 
 test "show releases a retained matching note when a later duplicate is rejected" {

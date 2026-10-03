@@ -11,8 +11,11 @@ pub const Kind = enum {
     relative_path,
 
     pub fn parse(text: []const u8) !Kind {
-        inline for (@typeInfo(Kind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(Kind).@"enum".field_names,
+            @typeInfo(Kind).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.InvalidScalarKind;
     }

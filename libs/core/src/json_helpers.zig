@@ -59,7 +59,7 @@ test "integer conversion requires finite integral values inside i64" {
 }
 
 test "JSON serialization preserves output and allocator errors" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkStringifyAllocation,
         .{},

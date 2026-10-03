@@ -2422,8 +2422,7 @@ fn resolvedPath(
         return reference.path;
     }
     if (reference.path.len == 0) return inherited.?;
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}{s}",
         .{ inherited.?, reference.path },
     );
@@ -3592,7 +3591,7 @@ fn exerciseLawLoweringAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "law continuations preserve canonical quantifier implication and relation bytes under OOM" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseLawLoweringAllocationFailures,
         .{},

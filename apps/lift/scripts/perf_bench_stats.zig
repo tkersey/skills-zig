@@ -458,7 +458,11 @@ fn parseRepeatedOptions(allocator: std.mem.Allocator) !void {
 }
 
 test "repeated CLI paths preserve ownership under every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseRepeatedOptions, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        parseRepeatedOptions,
+        .{},
+    );
 }
 
 test "invalid CLI option releases previously parsed paths" {

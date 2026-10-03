@@ -272,8 +272,7 @@ pub fn parseHmsFromMs(ms: i64) struct { hour: u8, minute: u8, second: u8, days: 
 pub fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000",
         .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second },
     );
@@ -282,7 +281,7 @@ pub fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
 pub fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
 }
 
 pub fn computeNextRunAt(allocator: std.mem.Allocator, row: anytype, run_started_ms: i64) !i64 {
@@ -426,7 +425,7 @@ fn parseWeeklyWithAllocator(allocator: std.mem.Allocator) !void {
 }
 
 test "recurrence parser releases accumulated days on allocation or shape failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         parseWeeklyWithAllocator,
         .{},

@@ -220,9 +220,6 @@ fn ignoreError(result: anyerror!void) void {
 
 pub const AutomationStatus = automation_store.AutomationStatus;
 const AutomationRow = automation_store.AutomationRow;
-const Day = automation_rrule.Day;
-const Freq = automation_rrule.Freq;
-const RRule = automation_rrule.RRule;
 
 pub const ResolveArgs = automation_store.ResolveArgs;
 pub const CwdsMode = automation_store.CwdsMode;
@@ -244,8 +241,6 @@ const SchedulerInstallArgs = automation_scheduler.SchedulerInstallArgs;
 const SchedulerLabelArgs = automation_scheduler.SchedulerLabelArgs;
 
 const DoctorArgs = automation_store.DoctorArgs;
-
-const RunResult = automation_runner.RunResult;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -927,43 +922,19 @@ fn parsePositiveI64(raw: []const u8, field: []const u8) !i64 {
 const parseUnixTimestampMs = automation_store.parseUnixTimestampMs;
 
 const c = automation_store.c;
-const SqlParam = automation_store.SqlParam;
 const Db = automation_store.Db;
-const Stmt = automation_store.Stmt;
 const StepResult = automation_store.StepResult;
 const DoctorDiagnostics = automation_store.DoctorDiagnostics;
 const nowMs = automation_store.nowMs;
-const alignMsToMinute = automation_rrule.alignMsToMinute;
-const civilFromDays = automation_rrule.civilFromDays;
-const weekdayMon = automation_rrule.weekdayMon;
-const parseHmsFromMs = automation_rrule.parseHmsFromMs;
-const timestampStringUtc = automation_rrule.timestampStringUtc;
-const dateStringUtc = automation_rrule.dateStringUtc;
 const parseAndCanonicalizeRrule = automation_rrule.parseAndCanonicalizeRrule;
 const parseRrule = automation_rrule.parseRrule;
-const renderCanonicalRrule = automation_rrule.renderCanonicalRrule;
-const containsDay = automation_rrule.containsDay;
-const validateAutomationId = automation_store.validateAutomationId;
 const defaultDbPath = automation_store.defaultDbPath;
 const seedPerfDb = automation_store.seedPerfDb;
-const automationDirPath = automation_files.automationDirPath;
-const readPrompt = automation_files.readPrompt;
-const parseCwdsJson = automation_files.parseCwdsJson;
 const freeOwnedStrings = automation_files.freeOwnedStrings;
-const currentPathOwned = automation_store.currentPathOwned;
-const encodeStringArrayJson = automation_store.encodeStringArrayJson;
-const resolveCwdsForCreate = automation_store.resolveCwdsForCreate;
-const resolveCwdsForUpdate = automation_store.resolveCwdsForUpdate;
-const getAutomationByResolve = automation_store.getAutomationByResolve;
 const getAutomationById = automation_store.getAutomationById;
-const getAutomationByName = automation_store.getAutomationByName;
-const readAutomationRow = automation_store.readAutomationRow;
-const syncAutomationFilesAfterCommit = automation_store.syncAutomationFilesAfterCommit;
-const renderAutomationTomlAlloc = automation_files.renderAutomationTomlAlloc;
 const cmdDoctor = automation_store.cmdDoctor;
 const cmdList = automation_store.cmdList;
 const cmdShow = automation_store.cmdShow;
-const cmdShowByIdPlain = automation_store.cmdShowByIdPlain;
 const cmdCreate = automation_store.cmdCreate;
 const cmdUpdate = automation_store.cmdUpdate;
 const cmdEnableDisable = automation_store.cmdEnableDisable;
@@ -971,32 +942,14 @@ const cmdRunNow = automation_store.cmdRunNow;
 const cmdDelete = automation_store.cmdDelete;
 const cmdRunDue = automation_runner.cmdRunDue;
 const selectDueAutomations = automation_runner.selectDueAutomations;
-const validateDueBatch = automation_runner.validateDueBatch;
 const runDueAutomation = automation_runner.runDueAutomation;
 const computeNextRunAt = automation_rrule.computeNextRunAt;
-const nextHourly = automation_rrule.nextHourly;
-const nextDaily = automation_rrule.nextDaily;
 const nextWeekly = automation_rrule.nextWeekly;
-const weekdayAllowed = automation_rrule.weekdayAllowed;
-const closeStaleRunningRows = automation_runner.closeStaleRunningRows;
-const firstLine = automation_runner.firstLine;
-const firstMeaningfulLine = automation_runner.firstMeaningfulLine;
-const summarizeOutput = automation_runner.summarizeOutput;
-const collapseWhitespace = automation_runner.collapseWhitespace;
-const insertRunRow = automation_runner.insertRunRow;
-const updateRunRow = automation_runner.updateRunRow;
-const updateAutomationTimes = automation_runner.updateAutomationTimes;
-const CodexRunResult = automation_runner.CodexRunResult;
-const runCodexExec = automation_runner.runCodexExec;
-const tmpAutomationRunnerDir = automation_runner.tmpAutomationRunnerDir;
-const acquireRunLock = automation_runner.acquireRunLock;
 const acquireExclusiveLockWithStaleRetry = automation_runner.acquireExclusiveLockWithStaleRetry;
 const releaseRunLock = automation_runner.releaseRunLock;
-const resolveExecutable = automation_store.resolveExecutable;
 const cmdSchedulerInstall = automation_scheduler.cmdSchedulerInstall;
 const cmdSchedulerUninstall = automation_scheduler.cmdSchedulerUninstall;
 const cmdSchedulerStatus = automation_scheduler.cmdSchedulerStatus;
-const readSchedulerStatus = automation_scheduler.readSchedulerStatus;
 const renderLaunchdProgramArguments = automation_scheduler.renderLaunchdProgramArguments;
 const parsePlistProgramArguments = automation_scheduler.parsePlistProgramArguments;
 const parseLaunchctlProgramArguments = automation_scheduler.parseLaunchctlProgramArguments;
@@ -1004,14 +957,7 @@ const projectLoadedProgramArguments = automation_scheduler.projectLoadedProgramA
 const schedulerArgumentsMatchCas = automation_scheduler.schedulerArgumentsMatchCas;
 const classifySchedulerSurface = automation_scheduler.classifySchedulerSurface;
 const buildAutomationRowsJsonAlloc = automation_output.buildAutomationRowsJsonAlloc;
-const buildAutomationRowJsonAlloc = automation_output.buildAutomationRowJsonAlloc;
-const printRunResultsJson = automation_output.printRunResultsJson;
-const buildRunResultsJsonAlloc = automation_output.buildRunResultsJsonAlloc;
-const jsonWriteString = automation_output.jsonWriteString;
 const xmlEscapeAlloc = automation_output.xmlEscapeAlloc;
-const writeFileAtomic = automation_output.writeFileAtomic;
-const tomlQuoteAlloc = automation_output.tomlQuoteAlloc;
-const renderTomlStringArray = automation_output.renderTomlStringArray;
 const generateUuidV4 = automation_store.generateUuidV4;
 const userErrorFmt = automation_output.userErrorFmt;
 const createTestSchema = automation_store.createTestSchema;
@@ -1537,7 +1483,8 @@ fn directoryPermissionBlocks(
 }
 
 test "mutation writability checks database owner and automation root without writes" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

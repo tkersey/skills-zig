@@ -124,13 +124,13 @@ pub fn main(init: std.process.Init) !void {
         .sub_path = cfg.output,
         .data = output,
     });
-    const success_message = try std.fmt.allocPrint(allocator, "Wrote {s}\n", .{cfg.output});
+    const success_message = try allocator.print("Wrote {s}\n", .{cfg.output});
     defer allocator.free(success_message);
     try writeToStreamAllowBrokenPipe(std.Io.File.stdout(), success_message);
 }
 
 fn renderReportAlloc(allocator: std.mem.Allocator, cfg: Config, report_date: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
+    return allocator.print(
         \\# Performance Report: {s}
         \\
         \\Date: {s}
@@ -204,7 +204,7 @@ fn currentDateIso(allocator: std.mem.Allocator) ![]u8 {
     const year_u: u64 = @intCast(@max(date.year, 0));
     const month_u: u8 = @intCast(@max(date.month, 0));
     const day_u: u8 = @intCast(@max(date.day, 0));
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, month_u, day_u });
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, month_u, day_u });
 }
 
 const Date = struct {
@@ -250,7 +250,7 @@ fn renderReportWithAllocator(allocator: std.mem.Allocator) !void {
 }
 
 test "CLI report renderer retains its complete header and body under allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         renderReportWithAllocator,
         .{},

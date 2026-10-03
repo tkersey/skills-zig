@@ -534,7 +534,7 @@ test "allocation failures parse governor json" {
         \\  }
         \\}
     ;
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         parseAndComputeWithAlloc,
         .{json},
@@ -611,7 +611,11 @@ test "pacing arithmetic accepts the full timestamp and duration domain" {
 }
 
 test "owned governor preserves escaped fields after freeing its input" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOwnedGovernor, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkOwnedGovernor,
+        .{},
+    );
 }
 
 fn checkOwnedGovernor(allocator: std.mem.Allocator) !void {

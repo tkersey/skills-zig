@@ -58,8 +58,11 @@ const JsonKind = enum {
     null,
 
     fn parse(text: []const u8) !JsonKind {
-        inline for (@typeInfo(JsonKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(JsonKind).@"enum".field_names,
+            @typeInfo(JsonKind).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.UnsupportedJsonKind;
     }
@@ -3124,8 +3127,9 @@ fn validateRuleGraph(
     definition_plan: *const definition.Plan,
 ) !void {
     const scratch_bytes = 4 * 1024;
-    var scratch = std.heap.stackFallback(scratch_bytes, std.heap.page_allocator);
-    const allocator = scratch.get();
+    var scratch_buffer: [scratch_bytes]u8 align(@alignOf(CacheRuleTask)) = undefined;
+    var scratch: std.heap.BufferFirstAllocator = .init(&scratch_buffer, std.heap.page_allocator);
+    const allocator = scratch.allocator();
     var tasks: std.ArrayList(CacheRuleTask) = .empty;
     defer tasks.deinit(allocator);
     try appendCacheRuleTasks(&tasks, allocator, root_rules, definition_plan);
@@ -3546,7 +3550,7 @@ const CacheDecodeMachine = struct {
             );
         }
         var next = frame;
-        next.stage = @enumFromInt(@intFromEnum(frame.stage) + 1);
+        next.stage = @fromBackingInt(@intCast(@backingInt(frame.stage) + 1));
         try self.push(.{ .rule = next });
         switch (frame.stage) {
             .header => frame.rule.* = decodedRuleFromHeader(
@@ -3673,7 +3677,7 @@ const CacheDecodeMachine = struct {
             next.index += 1;
             return self.push(.{ .targets = next });
         }
-        next.stage = @enumFromInt(@intFromEnum(frame.stage) + 1);
+        next.stage = @fromBackingInt(@intCast(@backingInt(frame.stage) + 1));
         try self.push(.{ .targets = next });
         switch (frame.stage) {
             .header => try self.readTargetHeader(output),
@@ -4885,11 +4889,9 @@ fn normalizeParsedNumbers(
     backing_allocator: std.mem.Allocator,
     root: *std.json.Value,
 ) !void {
-    var pending = std.heap.stackFallback(
-        4096,
-        backing_allocator,
-    );
-    const allocator = pending.get();
+    var scratch_buffer: [4096]u8 align(@alignOf(*std.json.Value)) = undefined;
+    var pending: std.heap.BufferFirstAllocator = .init(&scratch_buffer, backing_allocator);
+    const allocator = pending.allocator();
     var values: std.ArrayList(*std.json.Value) = .empty;
     defer values.deinit(allocator);
     try values.append(allocator, root);
@@ -8786,8 +8788,9 @@ const ValuePair = struct {
 };
 
 pub fn valuesEqual(left: std.json.Value, right: std.json.Value) bool {
-    var stack = std.heap.stackFallback(4096, std.heap.page_allocator);
-    const allocator = stack.get();
+    var scratch_buffer: [4096]u8 align(@alignOf(ValuePair)) = undefined;
+    var stack: std.heap.BufferFirstAllocator = .init(&scratch_buffer, std.heap.page_allocator);
+    const allocator = stack.allocator();
     var pending: std.ArrayList(ValuePair) = .empty;
     defer pending.deinit(allocator);
     pending.append(allocator, .{
@@ -10453,12 +10456,12 @@ const ValidationTestPlan = struct {
     }
 
     fn checkAllocationFailures(self: *const ValidationTestPlan) !void {
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             self.allocator,
             compileForAllocationFailure,
             .{&self.definition_plan},
         );
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             self.allocator,
             decodeForAllocationFailure,
             .{self.payload},
@@ -10484,7 +10487,7 @@ const ValidationTestPlan = struct {
         self: *const ValidationTestPlan,
         bytes: []const u8,
     ) !void {
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             self.allocator,
             validateForAllocationFailure,
             .{ &self.definition_plan, &self.plan, bytes },
@@ -10833,8 +10836,7 @@ fn testSha256Digest(parts: []const []const u8) ![]u8 {
     var raw: [32]u8 = undefined;
     hasher.final(&raw);
     const hex = std.fmt.bytesToHex(raw, .lower);
-    return std.fmt.allocPrint(
-        std.testing.allocator,
+    return std.testing.allocator.print(
         "sha256:{s}",
         .{hex},
     );
@@ -10881,8 +10883,7 @@ const ShaTestVectors = struct {
             &.{"example\nrecord\n{}\n"},
         );
         errdefer allocator.free(transport_digest);
-        const valid_bytes = try std.fmt.allocPrint(
-            allocator,
+        const valid_bytes = try allocator.print(
             "{{\"bundle\":{{\"digest\":\"{s}\",\"document_digest\":\"{s}\"," ++
                 "\"owner_id\":\"owner-1\",\"parent_ref\":\"parent-1\"," ++
                 "\"subject_ref\":\"subject-1\"}},\"document\":{{\"digest\":" ++
@@ -11437,8 +11438,7 @@ test "compiled digest representation policy accepts bare hex only when declared"
         },
     };
     for (cases) |case| {
-        const bytes = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const bytes = try std.testing.allocator.print(
             "{{\"strict\":\"{s}\",\"flexible\":\"{s}\"}}",
             .{ case.strict, case.flexible },
         );
@@ -11497,7 +11497,7 @@ test "compiled path scope comparisons preserve hierarchy and bounds" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(!result.valid);
     }
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         validateForAllocationFailure,
         .{
@@ -11816,12 +11816,12 @@ test "definition references preserve transacted validators across caches" {
 
     try checkDefinitionReferenceCases(&test_plan.cached_definition, &test_plan.cached);
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{&test_plan.cached_definition},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{test_plan.payload},
@@ -11833,8 +11833,7 @@ fn checkMultiInputDefinitionReferenceCases(
     contract: []const u8,
     digest: []const u8,
 ) !void {
-    const valid_receipt = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const valid_receipt = try std.testing.allocator.print(
         "{{\"fingerprint\":\"{s}\",\"route\":\"inspect\"," ++
             "\"skill\":\"example\",\"trigger_refs\":[\"review\"]}}",
         .{digest[7..]},
@@ -11843,8 +11842,7 @@ fn checkMultiInputDefinitionReferenceCases(
     const stale_receipt =
         "{\"fingerprint\":\"0000000000000000000000000000000000000000000000000000000000000000\"," ++
         "\"route\":\"inspect\",\"skill\":\"example\",\"trigger_refs\":[\"review\"]}";
-    const unknown_reference = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const unknown_reference = try std.testing.allocator.print(
         "{{\"fingerprint\":\"{s}\",\"route\":\"missing\"," ++
             "\"skill\":\"example\",\"trigger_refs\":[\"unknown\"]}}",
         .{digest[7..]},
@@ -12339,7 +12337,11 @@ test "iterative validation cache frees partial nested owners at every allocation
     const allocator = std.testing.allocator;
     const bytes = try cacheTraversalTestBytes(allocator, 2, 2);
     defer allocator.free(bytes);
-    try std.testing.checkAllAllocationFailures(allocator, decodeForAllocationFailure, .{bytes});
+    try @import("test_support").checkAllAllocationFailures(
+        allocator,
+        decodeForAllocationFailure,
+        .{bytes},
+    );
     for (0..bytes.len) |length| {
         var decoder = definition_core.cache.Decoder.init(bytes[0..length]);
         try std.testing.expectError(error.CachePayloadTruncated, decodeCache(allocator, &decoder));
@@ -12475,7 +12477,7 @@ fn iterativeCompilerNestedRules(item_depth: usize, conditional_depth: usize) ![]
             "[{\"op\":\"optional-field\",\"path\":\"/branch\",\"rules\":"
         else
             "[{\"op\":\"implies\",\"if\":\"/gate\",\"rules\":";
-        const next = try std.fmt.allocPrint(allocator, "{s}{s}}}]", .{ prefix, raw });
+        const next = try allocator.print("{s}{s}}}]", .{ prefix, raw });
         allocator.free(raw);
         raw = next;
     }
@@ -12545,7 +12547,11 @@ test "iterative validation compiler preserves pointer order and partial ownershi
     for (expected, plan.pointers) |raw, pointer| {
         try std.testing.expectEqualStrings(raw, pointer.raw);
     }
-    try std.testing.checkAllAllocationFailures(allocator, iterativeCompilerAllocationFailure, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        allocator,
+        iterativeCompilerAllocationFailure,
+        .{},
+    );
 }
 
 test "iterative validation compiler accepts the full import depth without recursion" {
@@ -12661,7 +12667,7 @@ test "iterative validation evaluator frees all imported continuations on allocat
     var decoder = definition_core.cache.Decoder.init(bytes);
     var plan = try decodeCache(allocator, &decoder);
     defer plan.deinit(allocator);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         allocator,
         iterativeImportedAllocationFailure,
         .{&plan},
@@ -12767,7 +12773,7 @@ test "iterative validation evaluator resumes nested reference predicates and fre
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     try iterativeEvaluatorAllocationFailure(allocator, &plan, &outer, parsed.value);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         allocator,
         iterativeEvaluatorAllocationFailure,
         .{ &plan, &outer, parsed.value },

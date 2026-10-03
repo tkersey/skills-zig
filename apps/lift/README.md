@@ -10,11 +10,11 @@ Zig CLI utilities extracted from dotfiles LIFT skill.
 ## Validation
 
 ```bash
-zig build build-lift -Doptimize=ReleaseFast
+zig build build-lift -Doptimize=fast
 zig build test-lift
 bash apps/lift/scripts/perf/bench_stats_gate.sh
 
 # Bounded native fuzz qualification (matches CI behavior).
 .github/scripts/linux_fuzz_gate.sh -- zig build test-lift-bench-stats \
-  -Doptimize=ReleaseSafe --fuzz=100K --summary all
+  -Doptimize=safe --fuzz=100K --summary all
 ```

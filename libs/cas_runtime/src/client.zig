@@ -497,7 +497,7 @@ pub const Client = struct {
 
         const io = opts.io;
         var child = try spawnStdioChild(allocator, opts, resolved_codex_path);
-        const process_group_id: ?u64 = switch (builtin.os.tag) {
+        const process_group_id: ?u64 = switch (builtin.target.os.tag) {
             .windows, .wasi => null,
             else => @intCast(child.id.?),
         };
@@ -554,7 +554,8 @@ pub const Client = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
-            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+            .pgid = if (builtin.target.os.tag != .windows and
+                builtin.target.os.tag != .wasi) 0 else null,
         });
     }
 
@@ -1312,8 +1313,7 @@ pub const Client = struct {
                     .code = -32603,
                     .message = "attestation provider unavailable",
                 } },
-            .current_time_read => .{ .result_json = try std.fmt.allocPrint(
-                self.allocator,
+            .current_time_read => .{ .result_json = try self.allocator.print(
                 "{{\"currentTimeAt\":{d}}}",
                 .{@as(i64, @intCast(@divFloor(
                     std.Io.Clock.real.now(self.io).nanoseconds,
@@ -1361,8 +1361,7 @@ pub const Client = struct {
         };
         const permissions_json = try core_json.stringifyAlloc(self.allocator, permissions_val);
         defer self.allocator.free(permissions_json);
-        const response_json = try std.fmt.allocPrint(
-            self.allocator,
+        const response_json = try self.allocator.print(
             "{{\"permissions\":{s},\"scope\":\"{s}\"}}",
             .{ permissions_json, switch (mode) {
                 .grant_turn => "turn",
@@ -1390,8 +1389,7 @@ pub const Client = struct {
             false;
         if (!accepts_exact_content) {
             const conservative_action: []const u8 = if (action == .cancel) "cancel" else "decline";
-            return std.fmt.allocPrint(
-                self.allocator,
+            return self.allocator.print(
                 "{{\"action\":\"{s}\",\"content\":null,\"_meta\":null}}",
                 .{conservative_action},
             );
@@ -1399,8 +1397,7 @@ pub const Client = struct {
         if (self.elicitation_response_json) |raw| return self.allocator.dupe(u8, raw);
         const content_json = self.elicitation_content_json orelse "null";
         return switch (action) {
-            .accept => std.fmt.allocPrint(
-                self.allocator,
+            .accept => self.allocator.print(
                 "{{\"action\":\"accept\",\"content\":{s},\"_meta\":null}}",
                 .{content_json},
             ),
@@ -2846,7 +2843,7 @@ fn addCapturedNotificationBytes(current: usize, additional: usize) !usize {
 }
 
 fn waitFileReadableUntil(file: std.Io.File, deadline_ms: i64) !void {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
     try waitFileEventUntil(
         file,
@@ -2856,7 +2853,7 @@ fn waitFileReadableUntil(file: std.Io.File, deadline_ms: i64) !void {
 }
 
 fn waitFileWritableUntil(file: std.Io.File, deadline_ms: i64) !void {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
     try waitFileEventUntil(
         file,
@@ -2884,7 +2881,7 @@ fn waitFileEventUntil(file: std.Io.File, deadline_ms: i64, events: i16) !void {
 }
 
 fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !void {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
 
     // The kernel terminates this EINTR retry with a non-INTR result.
@@ -3179,8 +3176,7 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
         ) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
-        const sibling = try std.fmt.allocPrint(
-            allocator,
+        const sibling = try allocator.print(
             "{s}/{s}",
             .{ dir, value },
         );
@@ -3194,8 +3190,7 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         if (dir.len == 0) continue;
-        const candidate = try std.fmt.allocPrint(
-            allocator,
+        const candidate = try allocator.print(
             "{s}/{s}",
             .{ dir, value },
         );
@@ -3321,8 +3316,7 @@ test "all contracted server request methods and unknown have one typed reply" {
 
     for (cases) |case| {
         try std.testing.expectEqual(case[1], Client.ServerRequestMethod.parse(case[0]));
-        const raw = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const raw = try std.testing.allocator.print(
             "{{\"id\":1,\"method\":\"{s}\",\"params\":{{\"mode\":\"form\",\"permissions\":{{}}}}}}",
             .{case[0]},
         );
@@ -3480,8 +3474,7 @@ test "stdio handshake failure reaps the spawned app-server" {
     defer allocator.free(executable);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "pid" });
     defer allocator.free(pid_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "#!/bin/sh\n" ++
             "set -eu\n" ++
             "printf '%s' \"$$\" > '{s}'\n" ++
@@ -3512,7 +3505,8 @@ test "stdio handshake failure reaps the spawned app-server" {
 }
 
 test "stdio request deadline bounds a silent live app-server and reaps it" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3524,8 +3518,7 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
     defer allocator.free(executable);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "silent.pid" });
     defer allocator.free(pid_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "#!/bin/sh\n" ++
             "set -eu\n" ++
             "sleep 600 &\n" ++
@@ -3548,7 +3541,7 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
         .cwd = root,
         .io = io,
         .codex_path = executable,
-        .request_deadline_ms = started_ms + 100,
+        .request_deadline_ms = started_ms + 500,
     }));
     try std.testing.expect(monotonicMillis() - started_ms < 1_000);
 
@@ -3570,7 +3563,8 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
 }
 
 test "stdio startup deadline includes the hook capability probe" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3590,7 +3584,7 @@ test "stdio startup deadline includes the hook capability probe" {
         .io = io,
         .codex_path = executable,
         .hook_policy = .off,
-        .request_deadline_ms = started_ms + 100,
+        .request_deadline_ms = started_ms + 500,
     }));
     try std.testing.expect(monotonicMillis() - started_ms < 2_000);
     const pid_bytes = try tmp.dir.readFileAlloc(io, "pid", allocator, .limited(64));
@@ -3600,7 +3594,8 @@ test "stdio startup deadline includes the hook capability probe" {
 }
 
 test "stdio hook admission and handshake restore the caller request deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3634,7 +3629,8 @@ test "stdio hook admission and handshake restore the caller request deadline" {
 }
 
 test "stdio request deadline bounds a blocked write and reaps the app-server" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3646,8 +3642,7 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
     defer allocator.free(executable);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "blocked.pid" });
     defer allocator.free(pid_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "#!/bin/sh\n" ++
             "set -eu\n" ++
             "sleep 600 &\n" ++
@@ -3674,7 +3669,7 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
         .io = io,
         .codex_path = executable,
         .client_title = large_title,
-        .request_deadline_ms = started_ms + 200,
+        .request_deadline_ms = started_ms + 500,
     }));
     try std.testing.expect(monotonicMillis() - started_ms < 1_000);
 
@@ -3865,7 +3860,7 @@ test "initialize capability builder has one typed owner and preserves additive f
 }
 
 test "initialize capabilities propagate every validation and writer allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseInitializeCapabilityAllocations,
         .{},
@@ -4249,7 +4244,8 @@ fn retryFakeCodexScriptAlloc(
 }
 
 fn runRetryIntegrationCase(mode: []const u8) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4388,8 +4384,7 @@ fn verifyRetryRequests(
     while (lines.next()) |line| : (index += 1) {
         try std.testing.expect(std.mem.indexOf(u8, line, "\"method\":\"test/retry\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"params\":{\"value\":7}") != null);
-        const expected_id = try std.fmt.allocPrint(
-            allocator,
+        const expected_id = try allocator.print(
             "\"id\":{d}",
             .{index + 1},
         );
@@ -4926,7 +4921,8 @@ const ConcurrentServerRequestProbe = struct {
 };
 
 test "actor falsifier permanent reader correlates concurrent reversed responses and notifications" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "concurrent");
     defer fixture.deinit();
@@ -4954,7 +4950,8 @@ test "actor falsifier permanent reader correlates concurrent reversed responses 
 }
 
 test "actor notification subscriptions can be removed before owner teardown" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "concurrent");
     defer fixture.deinit();
@@ -4987,7 +4984,8 @@ test "actor notification subscriptions can be removed before owner teardown" {
 }
 
 test "callback unsubscription suppresses later handlers in the active dispatch" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "concurrent");
     defer fixture.deinit();
@@ -5023,7 +5021,8 @@ test "callback unsubscription suppresses later handlers in the active dispatch" 
 }
 
 test "actor falsifier dispatches server requests through configured handler and bounded writer" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "server_request");
     defer fixture.deinit();
@@ -5052,7 +5051,8 @@ test "actor falsifier dispatches server requests through configured handler and 
 }
 
 test "actor contains malformed handler output to the originating server request" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "server_request");
     defer fixture.deinit();
@@ -5078,7 +5078,8 @@ test "actor contains malformed handler output to the originating server request"
 }
 
 test "actor serializes calls to one server request handler context" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "concurrent_server_requests");
     defer fixture.deinit();
@@ -5099,7 +5100,8 @@ test "actor serializes calls to one server request handler context" {
 }
 
 test "actor server request deadline cooperatively cancels handler and bounds shutdown" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "server_request");
     defer fixture.deinit();
@@ -5124,7 +5126,8 @@ test "actor server request deadline cooperatively cancels handler and bounds shu
 }
 
 test "actor falsifier notification callbacks may issue nested requests" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "nested_notification");
     defer fixture.deinit();
@@ -5149,7 +5152,8 @@ test "actor falsifier notification callbacks may issue nested requests" {
 }
 
 test "actor teardown waits for an admitted external request" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "deadline");
     defer fixture.deinit();
@@ -5172,7 +5176,8 @@ test "actor teardown waits for an admitted external request" {
 }
 
 test "actor terminal close interrupts a writer blocked by a non-reading peer" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "non_reading");
     defer fixture.deinit();
@@ -5213,7 +5218,8 @@ test "actor terminal close interrupts a writer blocked by a non-reading peer" {
 }
 
 test "actor callback teardown drops notifications admitted behind terminal teardown" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "teardown_notifications");
     defer fixture.deinit();
@@ -5234,7 +5240,8 @@ test "actor callback teardown drops notifications admitted behind terminal teard
 }
 
 test "actor transport terminality drains notifications admitted before disconnect" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "transport_notifications");
     defer fixture.deinit();
@@ -5257,7 +5264,8 @@ test "actor transport terminality drains notifications admitted before disconnec
 }
 
 test "actor falsifier nested request in server handler cannot deadlock permanent reader" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "nested_server_request");
     defer fixture.deinit();
@@ -5288,7 +5296,8 @@ test "actor falsifier nested request in server handler cannot deadlock permanent
 }
 
 test "unsubscribe waits for an active notification callback" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "teardown_notifications");
     defer fixture.deinit();
@@ -5334,7 +5343,8 @@ test "unsubscribe waits for an active notification callback" {
 }
 
 test "actor falsifier retries only structured overload and honors per-request deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var overload_fixture = try ActorFixture.init(allocator, "overload");
     defer overload_fixture.deinit();
@@ -5383,7 +5393,8 @@ test "actor falsifier retries only structured overload and honors per-request de
 }
 
 test "actor falsifier malformed envelope poisons instead of losing correlation" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try ActorFixture.init(allocator, "poison");
     defer fixture.deinit();
@@ -5785,9 +5796,9 @@ test "transport acquisition helpers require an already resolved retry seed" {
     const stdio_info = @typeInfo(@TypeOf(Client.startStdio)).@"fn";
     const websocket_info = @typeInfo(@TypeOf(Client.startWebsocket)).@"fn";
     const unix_info = @typeInfo(@TypeOf(Client.startUnix)).@"fn";
-    try std.testing.expect(stdio_info.params[2].type.? == u64);
-    try std.testing.expect(websocket_info.params[2].type.? == u64);
-    try std.testing.expect(unix_info.params[2].type.? == u64);
+    try std.testing.expect(stdio_info.param_types[2].? == u64);
+    try std.testing.expect(websocket_info.param_types[2].? == u64);
+    try std.testing.expect(unix_info.param_types[2].? == u64);
 }
 
 test "transport kinds preserve unix identity and frame behavior" {
@@ -6023,7 +6034,7 @@ test "notification capture has an aggregate byte bound" {
 }
 
 test "response parsing and notification capture propagate every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseRequestAttemptAllocations,
         .{},
@@ -6067,8 +6078,9 @@ fn exerciseRequestAttemptAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "handshake parsing propagates allocation failure after consuming its response" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseHandshakeAllocations,
         .{},

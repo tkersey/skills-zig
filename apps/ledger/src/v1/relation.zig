@@ -432,7 +432,11 @@ fn allocationProbe(allocator: std.mem.Allocator) !void {
 }
 
 test "relation construction unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProbe, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationProbe,
+        .{},
+    );
 }
 
 test "inactive edges and optional acyclicity preserve valid neighbors" {

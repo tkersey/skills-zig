@@ -180,8 +180,8 @@ pub const Operator = enum {
     }
 
     pub fn parse(text: []const u8) !Operator {
-        inline for (@typeInfo(Operator).@"enum".fields) |field| {
-            const value: Operator = @enumFromInt(field.value);
+        inline for (@typeInfo(Operator).@"enum".field_values) |field_value| {
+            const value: Operator = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, value.id())) return value;
         }
         return error.UnsupportedArtifactOperator;
@@ -219,9 +219,9 @@ pub const Operator = enum {
 
     pub fn supported(self: Operator) bool {
         comptime {
-            const fields = @typeInfo(Operator).@"enum".fields;
+            const fields = @typeInfo(Operator).@"enum".field_names;
             if (fields.len != 89 or
-                !std.mem.eql(u8, fields[46].name, "set_order"))
+                !std.mem.eql(u8, fields[46], "set_order"))
             {
                 @compileError("update the explicit operator admission set");
             }
@@ -236,8 +236,11 @@ pub const Codec = enum {
     text,
 
     pub fn parse(text: []const u8) !Codec {
-        inline for (@typeInfo(Codec).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(Codec).@"enum".field_names,
+            @typeInfo(Codec).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.UnsupportedCodec;
     }
@@ -1195,8 +1198,8 @@ fn decodePlanPrefix(
 
 fn knownOperatorMask() u128 {
     var result: u128 = 0;
-    inline for (@typeInfo(Operator).@"enum".fields) |field| {
-        const operator: Operator = @enumFromInt(field.value);
+    inline for (@typeInfo(Operator).@"enum".field_values) |field_value| {
+        const operator: Operator = @fromBackingInt(@intCast(field_value));
         if (operator.supported()) result |= operatorBit(operator);
     }
     return result;
@@ -1812,7 +1815,7 @@ fn validateJsonPointer(pointer: []const u8) !void {
 }
 
 fn operatorBit(operator: Operator) u128 {
-    return @as(u128, 1) << @intCast(@intFromEnum(operator));
+    return @as(u128, 1) << @intCast(@backingInt(operator));
 }
 
 fn deinitInputs(allocator: std.mem.Allocator, inputs: []Input) void {
@@ -2111,7 +2114,7 @@ test "artifact rule frames preserve traversal order and unwind allocation failur
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, source, .{});
     defer parsed.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileRuleAllocationProbe,
         .{parsed.value},
@@ -2163,7 +2166,7 @@ const ImportTestClosure = struct {
         const files = try allocator.alloc(definition_core.closure.ClosureFile, count);
         var total_bytes: usize = 0;
         for (files, 0..) |*file, index| {
-            file.path = try std.fmt.allocPrint(allocator, "d{d:0>3}.json", .{index});
+            file.path = try allocator.print("d{d:0>3}.json", .{index});
             file.canonical_json = try importTestSource(allocator, index, count, chain);
             file.source_bytes = file.canonical_json.len;
             std.crypto.hash.sha2.Sha256.hash(file.canonical_json, &file.source_digest, .{});
@@ -2199,14 +2202,14 @@ fn importTestSource(
     );
     defer parsed.deinit();
     parsed.value.object.getPtr("id").?.* = .{
-        .string = try std.fmt.allocPrint(allocator, "example/d{d:0>3}", .{index}),
+        .string = try allocator.print("example/d{d:0>3}", .{index}),
     };
     var imports = std.json.Array.init(allocator);
     const first = if (chain) index + 1 else if (index == 0) @as(usize, 1) else count;
     const last = if (chain) @min(first + 1, count) else count;
     for (first..last) |import_index| {
         try imports.append(.{
-            .string = try std.fmt.allocPrint(allocator, "d{d:0>3}.json", .{import_index}),
+            .string = try allocator.print("d{d:0>3}.json", .{import_index}),
         });
     }
     try parsed.value.object.put(allocator, "imports", .{ .array = imports });
@@ -2229,7 +2232,7 @@ fn compileImportAllocationProbe(
 test "artifact import frames and ownership unwind every allocation failure" {
     var fixture = try ImportTestClosure.init(2, true);
     defer fixture.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileImportAllocationProbe,
         .{&fixture.closure},

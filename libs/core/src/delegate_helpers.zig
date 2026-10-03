@@ -141,7 +141,7 @@ pub fn runCommand(io: std.Io, args: []const []const u8) !u8 {
     const term = try child.wait(io);
     return switch (term) {
         .exited => |code| code,
-        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @backingInt(signal), @as(u32, 255))),
         .stopped, .unknown => 1,
     };
 }
@@ -165,8 +165,7 @@ pub fn resolveScriptPath(
         return path;
     }
 
-    const absolute_fallback = try std.fmt.allocPrint(
-        allocator,
+    const absolute_fallback = try allocator.print(
         "{s}/.dotfiles/codex/skills/{s}/scripts/{s}",
         .{ home, skill_name, script_name },
     );
@@ -179,7 +178,7 @@ fn resolveHomePath(
     home: []const u8,
     default_dir: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, default_dir });
+    return allocator.print("{s}/{s}", .{ home, default_dir });
 }
 
 fn buildCandidateIfExists(
@@ -189,8 +188,7 @@ fn buildCandidateIfExists(
     skill_name: []const u8,
     script_name: []const u8,
 ) !?[]u8 {
-    const candidate = try std.fmt.allocPrint(
-        allocator,
+    const candidate = try allocator.print(
         "{s}/skills/{s}/scripts/{s}",
         .{ home_dir, skill_name, script_name },
     );
@@ -282,7 +280,7 @@ test "allocation failures resolving missing script path" {
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         resolveMissingWithAlloc,
         .{ home, "__alloc_missing_skill__", "__alloc_missing_script__.py" },
@@ -346,18 +344,17 @@ test "script lookup preserves home-relative precedence" {
     defer allocator.free(home);
     const roots = [_][]const u8{ ".codex", ".claude", ".dotfiles/codex" };
     for (roots) |root| {
-        const directory = try std.fmt.allocPrint(allocator, "{s}/skills/demo/scripts", .{root});
+        const directory = try allocator.print("{s}/skills/demo/scripts", .{root});
         defer allocator.free(directory);
         try tmp.dir.createDirPath(io, directory);
-        const path = try std.fmt.allocPrint(allocator, "{s}/test.py", .{directory});
+        const path = try allocator.print("{s}/test.py", .{directory});
         defer allocator.free(path);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "pass\n" });
     }
     for (roots) |root| {
         const found = try resolveScriptPath(allocator, io, home, "demo", "test.py");
         defer allocator.free(found);
-        const expected = try std.fmt.allocPrint(
-            allocator,
+        const expected = try allocator.print(
             "{s}/{s}/skills/demo/scripts/test.py",
             .{ home, root },
         );

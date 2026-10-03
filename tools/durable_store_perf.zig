@@ -151,8 +151,7 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const cli = parseCli(argv) catch return error.InvalidArguments;
 
-    const fixture_dir = try std.fmt.allocPrint(
-        allocator,
+    const fixture_dir = try allocator.print(
         ".perf-local/durable-store-{d}",
         .{std.Io.Clock.awake.now(Io.io()).nanoseconds},
     );
@@ -388,7 +387,7 @@ fn writeFixture(path: []const u8, minimum_bytes: usize) !Fixture {
 fn ignoreEvent(_: *anyopaque, _: durable_store.EventRecordView) !void {}
 
 fn measureScan(path: []const u8, fixture_bytes: usize) !Round {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    var debug_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = debug_allocator.deinit();
     var peak = PeakAllocator.init(debug_allocator.allocator());
     const allocator = peak.allocator();
@@ -415,7 +414,7 @@ fn measureScan(path: []const u8, fixture_bytes: usize) !Round {
 }
 
 fn measureAppend(path: []const u8, fixture_bytes: usize) !Round {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    var debug_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = debug_allocator.deinit();
     var peak = PeakAllocator.init(debug_allocator.allocator());
     const allocator = peak.allocator();
@@ -559,8 +558,7 @@ fn baselineJsonAlloc(
     optimize_mode: []const u8,
     fixture_sha256: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
             "\"target\":\"{s}\",\"cpu_model\":\"{s}\",\"zig_version\":\"{s}\"," ++
             "\"optimize_mode\":\"{s}\",\"fixture_sha256\":\"{s}\"," ++

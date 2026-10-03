@@ -562,8 +562,7 @@ fn appendArrayPointer(
     child_index: usize,
     limits: Limits,
 ) ![]const u8 {
-    const pointer = try std.fmt.allocPrint(
-        allocator,
+    const pointer = try allocator.print(
         "{s}/{d}",
         .{ parent, child_index },
     );
@@ -581,7 +580,7 @@ fn ownPrint(
     comptime format: []const u8,
     args: anytype,
 ) ![]const u8 {
-    const text = try std.fmt.allocPrint(allocator, format, args);
+    const text = try allocator.print(format, args);
     return index.retain(allocator, text, limits);
 }
 
@@ -825,7 +824,7 @@ test "structured index canonicalizes and flattens tool result JSON" {
     defer index.deinit(std.testing.allocator);
     try expectStructuredIndex(&index);
     try expectStructuredObservation(&index);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         buildForAllocationFailure,
         .{&trace},

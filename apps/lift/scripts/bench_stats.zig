@@ -625,23 +625,23 @@ fn computePopulationStdDev(values: []const f64, mean: f64) f64 {
 }
 
 fn formatValue(allocator: std.mem.Allocator, value: f64, unit: []const u8) ![]u8 {
-    if (unit.len == 0) return std.fmt.allocPrint(allocator, "{d:.6}", .{value});
-    return std.fmt.allocPrint(allocator, "{d:.6} {s}", .{ value, unit });
+    if (unit.len == 0) return allocator.print("{d:.6}", .{value});
+    return allocator.print("{d:.6} {s}", .{ value, unit });
 }
 
 fn formatDeltaValue(allocator: std.mem.Allocator, value: f64, unit: []const u8) ![]u8 {
     if (value >= 0.0) {
-        if (unit.len == 0) return std.fmt.allocPrint(allocator, "+{d:.6}", .{value});
-        return std.fmt.allocPrint(allocator, "+{d:.6} {s}", .{ value, unit });
+        if (unit.len == 0) return allocator.print("+{d:.6}", .{value});
+        return allocator.print("+{d:.6} {s}", .{ value, unit });
     }
-    if (unit.len == 0) return std.fmt.allocPrint(allocator, "{d:.6}", .{value});
-    return std.fmt.allocPrint(allocator, "{d:.6} {s}", .{ value, unit });
+    if (unit.len == 0) return allocator.print("{d:.6}", .{value});
+    return allocator.print("{d:.6} {s}", .{ value, unit });
 }
 
 fn formatPct(allocator: std.mem.Allocator, value: ?f64) ![]u8 {
     if (value == null) return allocator.dupe(u8, "n/a");
-    if (value.? >= 0.0) return std.fmt.allocPrint(allocator, "+{d:.3}%", .{value.?});
-    return std.fmt.allocPrint(allocator, "{d:.3}%", .{value.?});
+    if (value.? >= 0.0) return allocator.print("+{d:.3}%", .{value.?});
+    return allocator.print("{d:.3}%", .{value.?});
 }
 
 fn printMetric(
@@ -1001,7 +1001,7 @@ test "readFileWithLimitAlloc rejects oversized files" {
     var file = try tmp.dir.createFile(io, "oversized.txt", .{});
     defer file.close(io);
 
-    const chunk = [_]u8{'a'} ** 4096;
+    const chunk = @as([4096]u8, @splat('a'));
     var remaining: usize = MaxInputBytes + 1;
     while (remaining > 0) {
         const to_write = @min(remaining, chunk.len);
@@ -1028,7 +1028,11 @@ fn parseLineWithAlloc(alloc: std.mem.Allocator, line: []const u8) !void {
 
 test "allocation failures parse line" {
     const line = "p50=1.234 p95=2.345 p99=3.456";
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseLineWithAlloc, .{line});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        parseLineWithAlloc,
+        .{line},
+    );
 }
 
 fn fuzzParseLineTarget(_: void, smith: *std.testing.Smith) !void {
@@ -1066,7 +1070,7 @@ fn renderSummaryWithAllocator(allocator: std.mem.Allocator, output_json: bool) !
 
 test "CLI summary renderer publishes its owned bytes in text and JSON modes" {
     for ([_]bool{ false, true }) |output_json| {
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             std.testing.allocator,
             renderSummaryWithAllocator,
             .{output_json},
@@ -1117,7 +1121,7 @@ fn renderComparisonWithAllocator(allocator: std.mem.Allocator, output_json: bool
 
 test "comparison renderer cleans up its output on every allocation failure" {
     for ([_]bool{ false, true }) |output_json| {
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             std.testing.allocator,
             renderComparisonWithAllocator,
             .{output_json},

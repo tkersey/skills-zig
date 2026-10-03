@@ -214,7 +214,7 @@ fn callTypeSafe(
     api_key: []const u8,
     request_body: []const u8,
 ) ![]u8 {
-    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    const auth = try allocator.print("Bearer {s}", .{api_key});
     const buffer = try allocator.alloc(u8, max_response_bytes);
     for (0..3) |attempt| {
         var writer: std.Io.Writer = .fixed(buffer);
@@ -233,7 +233,7 @@ fn callTypeSafe(
             else => return err,
         };
         if (result.status == .ok) return writer.buffered();
-        const code = @intFromEnum(result.status);
+        const code = @backingInt(result.status);
         if ((result.status == .too_many_requests or code == 529) and attempt < 2) {
             const delay_ms: i64 = if (attempt == 0) 250 else 500;
             try std.Io.sleep(client.io, .fromMilliseconds(delay_ms), .awake);
@@ -287,7 +287,7 @@ fn parseResponse(
             return error.InvalidApiResponse;
         var probability_sum: f64 = 0;
         for (dimension.levels, 0..) |_, level| {
-            const key = try std.fmt.allocPrint(allocator, "{d}", .{level});
+            const key = try allocator.print("{d}", .{level});
             const probability = number(probability_map.get(key) orelse
                 return error.InvalidApiResponse) orelse return error.InvalidApiResponse;
             if (!std.math.isFinite(probability) or probability < 0 or probability > 1)

@@ -163,13 +163,6 @@ const PlanCache = struct {
         self.definition_bytes -= archive_bytes;
         removed.deinit(self.allocator);
     }
-
-    fn clear(self: *PlanCache) void {
-        self.indices.clearRetainingCapacity();
-        for (self.plans.items) |*plan| plan.deinit(self.allocator);
-        self.plans.clearRetainingCapacity();
-        self.definition_bytes = 0;
-    }
 };
 
 pub fn validateSegmentedHistoryArchives(
@@ -757,7 +750,7 @@ fn finishEventHashAlloc(
     var digest: [EventHash.digest_length]u8 = undefined;
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+    return allocator.print("sha256:{s}", .{&hex});
 }
 
 fn validateSegmentedSummary(

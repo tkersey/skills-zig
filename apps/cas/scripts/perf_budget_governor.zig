@@ -284,8 +284,8 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
 }
 
 fn runRound(iterations: usize) !RoundStats {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa_state.deinit() == 0);
 
     var counting = CountingAllocator.init(gpa_state.allocator());
     const alloc = counting.allocator();

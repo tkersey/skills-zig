@@ -175,7 +175,7 @@ test "projection value cleanup traverses every variant under allocation failures
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         projectionValueAllocationProbe,
         .{parsed.value},

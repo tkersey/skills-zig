@@ -784,7 +784,7 @@ fn emptyClosureFiles(
         file.* = .{
             .path = path,
             .canonical_json = canonical_json,
-            .source_digest = [_]u8{0} ** 32,
+            .source_digest = @as([32]u8, @splat(0)),
             .source_bytes = 0,
         };
         initialized += 1;
@@ -993,7 +993,7 @@ fn cachePathAlloc(
     cache_key: [32]u8,
 ) ![]u8 {
     const hex = definition_core.cache.keyHex(cache_key);
-    const filename = try std.fmt.allocPrint(allocator, "{s}.bin", .{&hex});
+    const filename = try allocator.print("{s}.bin", .{&hex});
     defer allocator.free(filename);
     return std.fs.path.join(
         allocator,
@@ -1291,7 +1291,7 @@ fn checkFixtureAllocationFailures(fixture: []const u8) !void {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(source_root);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compilePlanSetForAllocationFailure,
         .{source_root},
@@ -1316,7 +1316,7 @@ fn checkFixtureAllocationFailures(fixture: []const u8) !void {
     );
     const payload = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(payload);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodePlanSetForAllocationFailure,
         .{payload},

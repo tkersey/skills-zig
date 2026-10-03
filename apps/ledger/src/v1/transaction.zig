@@ -6844,8 +6844,7 @@ fn expectLegacyContentBinding(
         },
     );
     defer std.testing.allocator.free(event_path);
-    const content = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const content = try std.testing.allocator.print(
         "{s}\n",
         .{expected},
     );

@@ -1248,8 +1248,7 @@ pub fn bindingPathAlloc(
         logical_path,
     );
     defer allocator.free(digest);
-    const file_name = try std.fmt.allocPrint(
-        allocator,
+    const file_name = try allocator.print(
         "{s}.jsonl",
         .{digest[7..]},
     );
@@ -1413,8 +1412,7 @@ fn writeTestBoundSlot(
         slot.relative_path,
     );
     defer std.testing.allocator.free(binding_path);
-    const binding = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const binding = try std.testing.allocator.print(
         "{{\"abi\":\"ledger-artifact-abi/v1\",\"binding_kind\":" ++
             "\"existing-store-binding\",\"canonical_input_digest\":" ++
             "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"," ++
@@ -1440,8 +1438,7 @@ fn writeTestAdvisory(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) !void {
-    const advisory_path = try std.fmt.allocPrint(
-        allocator,
+    const advisory_path = try allocator.print(
         "{s}.cas.lock.advisory",
         .{store_path},
     );

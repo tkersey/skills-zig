@@ -262,9 +262,10 @@ fn helpOutputUntil(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi) 0 else null,
     });
-    const process_group_id: ?u64 = switch (builtin.os.tag) {
+    const process_group_id: ?u64 = switch (builtin.target.os.tag) {
         .windows, .wasi => null,
         else => @intCast(child.id.?),
     };
@@ -322,7 +323,7 @@ pub fn defaultHookLogPathAlloc(
     prefix: []const u8,
 ) ![]u8 {
     const now_ns = std.Io.Clock.real.now(io).nanoseconds;
-    return std.fmt.allocPrint(allocator, "/tmp/{s}-hooks-{d}.ndjson", .{ prefix, now_ns });
+    return allocator.print("/tmp/{s}-hooks-{d}.ndjson", .{ prefix, now_ns });
 }
 
 fn isHookNotificationMethod(method: []const u8) bool {
@@ -366,7 +367,8 @@ test "help policy deadline includes waiting after both output pipes close" {
 
 fn exerciseHangingHelp(close_output: bool) !void {
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -375,8 +377,7 @@ fn exerciseHangingHelp(close_output: bool) !void {
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "codex" });
     defer allocator.free(executable);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "#!/bin/sh\nsleep 600 &\nprintf '%s %s\\n' \"$$\" \"$!\" > '{s}/pid'\n{s}wait\n",
         .{ root, if (close_output) "exec 1>&- 2>&-\n" else "" },
     );
@@ -390,7 +391,7 @@ fn exerciseHangingHelp(close_output: bool) !void {
         executable,
         root,
         .off,
-        started_ms + 100,
+        started_ms + 500,
     ));
     const finished_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     try std.testing.expect(finished_ms - started_ms < 2_000);
@@ -408,7 +409,8 @@ fn exerciseHangingHelp(close_output: bool) !void {
 
 test "help policy probe preserves supported and unsupported launch admission" {
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -493,7 +495,7 @@ test "HookAccumulator require-observed fails closed when no hook notifications a
 }
 
 test "hook parsing propagates allocation failure without changing counters" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseHookAllocations,
         .{},

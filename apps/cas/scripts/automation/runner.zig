@@ -193,7 +193,7 @@ fn appendRunDueResults(
             codex_exe,
             dry_run,
         ) catch |err| {
-            const err_text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+            const err_text = try allocator.print("{s}", .{@errorName(err)});
             const empty_thread = try allocator.dupe(u8, "");
             errdefer allocator.free(empty_thread);
             const empty_cwd = try allocator.dupe(u8, "");
@@ -414,8 +414,7 @@ fn runAutomationCwd(
         row.prompt,
         thread_id,
     ) catch |err| {
-        const summary = try std.fmt.allocPrint(
-            allocator,
+        const summary = try allocator.print(
             "Command failed before completion: {s}",
             .{@errorName(err)},
         );
@@ -430,8 +429,7 @@ fn runAutomationCwd(
             summary,
             store.nowMs(),
         );
-        const failure = try std.fmt.allocPrint(
-            allocator,
+        const failure = try allocator.print(
             "{s} ({s})",
             .{ cwd, @errorName(err) },
         );
@@ -468,8 +466,7 @@ fn persistCodexRunResult(
     var summary = try summarizeOutput(allocator, core_text, 220);
     defer allocator.free(summary);
     if (result.exit_code != 0) {
-        const enriched = try std.fmt.allocPrint(
-            allocator,
+        const enriched = try allocator.print(
             "Command failed (exit {d}): {s}",
             .{ result.exit_code, summary },
         );
@@ -480,8 +477,7 @@ fn persistCodexRunResult(
     var details = try allocator.dupe(u8, core_text);
     defer allocator.free(details);
     if (result.stderr.len > 0 and std.mem.indexOf(u8, details, result.stderr) == null) {
-        const joined = try std.fmt.allocPrint(
-            allocator,
+        const joined = try allocator.print(
             "{s}\n\n--- STDERR ---\n{s}",
             .{ details, result.stderr },
         );
@@ -505,8 +501,7 @@ fn persistCodexRunResult(
         store.nowMs(),
     );
     if (result.exit_code == 0) return null;
-    const failure = try std.fmt.allocPrint(
-        allocator,
+    const failure = try allocator.print(
         "{s} (exit {d})",
         .{ cwd, result.exit_code },
     );
@@ -528,10 +523,9 @@ fn finalizeAutomationRun(
     try store.syncAutomationFilesAfterCommit(allocator, db, row.id);
 
     const summary_text = if (failures_count == 0)
-        try std.fmt.allocPrint(allocator, "Completed {d} run(s)", .{cwds_count})
+        try allocator.print("Completed {d} run(s)", .{cwds_count})
     else
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "Completed with failures in {d}/{d} cwd(s)",
             .{ failures_count, cwds_count },
         );
@@ -539,8 +533,7 @@ fn finalizeAutomationRun(
     try files.writeMemorySummary(allocator, row.id, summary_text, started);
 
     if (failures_count > 0) {
-        const err_text = try std.fmt.allocPrint(
-            allocator,
+        const err_text = try allocator.print(
             "failed cwds: {d}",
             .{failures_count},
         );
@@ -605,7 +598,7 @@ pub fn insertRunRow(
         break :blk try allocator.dupe(u8, row.name);
     };
     defer allocator.free(title);
-    const running_title = try std.fmt.allocPrint(allocator, "{s} running", .{row.name});
+    const running_title = try allocator.print("{s} running", .{row.name});
     defer allocator.free(running_title);
 
     const insert_sql =
@@ -645,9 +638,9 @@ pub fn updateRunRow(
     finished_ms: i64,
 ) !void {
     const inbox_title = if (std.mem.eql(u8, status, "PENDING_REVIEW"))
-        try std.fmt.allocPrint(allocator, "{s} drafted", .{row.name})
+        try allocator.print("{s} drafted", .{row.name})
     else
-        try std.fmt.allocPrint(allocator, "{s} failed", .{row.name});
+        try allocator.print("{s} failed", .{row.name});
     defer allocator.free(inbox_title);
 
     const update_sql =
@@ -704,8 +697,7 @@ pub fn runCodexExec(
         tmp_dir,
     );
 
-    const output_path = try std.fmt.allocPrint(
-        allocator,
+    const output_path = try allocator.print(
         "{s}/{s}.txt",
         .{ tmp_dir, thread_id },
     );
@@ -744,7 +736,7 @@ pub fn runCodexExec(
     const exit_code: u8 = switch (child.term) {
         .exited => |code| code,
         .signal => |signal| @intCast(@min(
-            @as(u32, 128) + @intFromEnum(signal),
+            @as(u32, 128) + @backingInt(signal),
             @as(u32, 255),
         )),
         .stopped, .unknown => 1,
@@ -761,7 +753,7 @@ pub fn runCodexExec(
 
 pub fn tmpAutomationRunnerDir(allocator: std.mem.Allocator) ![]u8 {
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
-    return std.fmt.allocPrint(allocator, "{s}/.codex/tmp/automation-runner", .{home});
+    return allocator.print("{s}/.codex/tmp/automation-runner", .{home});
 }
 
 pub const RunLock = struct {
@@ -773,8 +765,7 @@ pub fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
     const validated_label = try scheduler.validateSchedulerLabel(label);
 
-    const lock_dir = try std.fmt.allocPrint(
-        allocator,
+    const lock_dir = try allocator.print(
         "{s}/Library/Caches/{s}",
         .{ home, validated_label },
     );
@@ -784,7 +775,7 @@ pub fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock
         lock_dir,
     );
 
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}/run.lock", .{lock_dir});
+    const lock_path = try allocator.print("{s}/run.lock", .{lock_dir});
     defer allocator.free(lock_path);
 
     return acquireExclusiveLockWithStaleRetry(allocator, lock_path);

@@ -536,7 +536,7 @@ test "observation result preserves identities provenance limits and no authority
     const rendered = try renderJsonAlloc(std.testing.allocator, envelope);
     defer std.testing.allocator.free(rendered);
     try expectResultEnvelope(rendered);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         renderForAllocationFailure,
         .{testEnvelope(&fixture.plan, &bindings.values_digest, &values, .{})},

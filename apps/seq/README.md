@@ -20,8 +20,8 @@ brew install seq
 ## Build and test
 
 ```bash
-zig build -Doptimize=ReleaseFast
-zig build test -Doptimize=ReleaseFast
+zig build -Doptimize=fast
+zig build test -Doptimize=fast
 ```
 
 The binary is written to `zig-out/bin/seq`.

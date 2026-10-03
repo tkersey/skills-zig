@@ -174,8 +174,8 @@ test "diff options require one base and one head" {
 }
 
 test "revision validation covers the byte boundary" {
-    const at_limit = [_]u8{'a'} ** limits.revision_bytes_max;
-    const above_limit = [_]u8{'a'} ** (limits.revision_bytes_max + 1);
+    const at_limit = @as([limits.revision_bytes_max]u8, @splat('a'));
+    const above_limit = @as([(limits.revision_bytes_max + 1)]u8, @splat('a'));
     try std.testing.expect(revisionValid(&at_limit));
     try std.testing.expect(!revisionValid(&above_limit));
     try std.testing.expect(!revisionValid("has space"));

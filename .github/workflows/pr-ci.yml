@@ -79,7 +79,8 @@ jobs:
           if [[ "${selected[cas]:-false}" == true ]] ||
              grep -Fxq 'build.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
-             grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths"; then
+             grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths" ||
+             grep -Eq '^scripts/perf/' <<<"$changed_paths"; then
             perf=true
           fi
           echo "perf=$perf" >> "$GITHUB_OUTPUT"
@@ -92,22 +93,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
-      - name: Root build rejects custom install prefix
-        run: |
-          set -euo pipefail
-          if zig build build-seq -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/skills-zig-prefix"; then
-            echo "expected root build to reject a custom install prefix" >&2
-            exit 1
-          fi
-      - name: Standalone seq build rejects custom install prefix
-        working-directory: apps/seq
-        run: |
-          set -euo pipefail
-          if zig build -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/seq-prefix"; then
-            echo "expected standalone seq build to reject a custom install prefix" >&2
-            exit 1
-          fi
+          version: 0.17.0
+      - name: Verify cold and cached install destination admission
+        run: scripts/test-install-prefix.sh
 
   release-contract:
     needs: changes
@@ -158,24 +146,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Restore Zig cache
         uses: actions/cache@v4
         with:
           path: |
             .zig-cache
             .zig-cache-global
-          key: zig-seq-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
+          key: zig-seq-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
           restore-keys: |
-            zig-seq-${{ runner.os }}-0.16.0-
+            zig-seq-${{ runner.os }}-0.17.0-
       - name: Build seq integration surface
-        run: zig build build-seq -Doptimize=ReleaseFast --summary all
+        run: zig build build-seq -Doptimize=fast --summary all
       - name: Test Seq 1.0 kernel and command surface
-        run: zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=ReleaseFast --summary all
+        run: zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=fast --summary all
       - name: Test definition core contracts
-        run: zig build test-definition-core test-definition-core-guard -Doptimize=ReleaseFast --summary all
+        run: zig build test-definition-core test-definition-core-guard -Doptimize=fast --summary all
+      - name: Qualify opt-in Linux incremental compilation
+        run: zig build test-definition-core -fincremental --summary all
       - name: Test trace core contracts
-        run: zig build test-trace-core -Doptimize=ReleaseFast --summary all
+        run: zig build test-trace-core -Doptimize=fast --summary all
       - name: Test JSONL core contracts
         run: zig build test-jsonl-core --summary all
       - name: Test durable store contracts
@@ -194,11 +184,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Fuzz passive definition parsing (Linux)
         run: >-
           .github/scripts/linux_fuzz_gate.sh -- zig build test-definition-core
-          -Doptimize=ReleaseSafe --fuzz=100K --summary all
+          -Doptimize=safe --fuzz=100K --summary all
 
   lift:
     needs: changes
@@ -208,9 +198,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build lift binaries
-        run: zig build build-lift -Doptimize=ReleaseFast
+        run: zig build build-lift -Doptimize=fast
       - name: Test lift
         run: zig build test-lift
 
@@ -223,11 +213,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Fuzz lift bench_stats (Linux)
         run: >-
           .github/scripts/linux_fuzz_gate.sh -- zig build test-lift-bench-stats
-          -Doptimize=ReleaseSafe --fuzz=100K --summary all
+          -Doptimize=safe --fuzz=100K --summary all
 
   cas:
     needs: changes
@@ -243,9 +233,9 @@ jobs:
             runner_arch: X64
             codex_asset: codex-package-x86_64-unknown-linux-musl.tar.gz
             codex_archive_sha256: 042f851ea3fc1083c45157520520944fc790632b53ebc580fc98eaca55862a25
-          - os: macos-14
+          - os: macos-15
             platform: macos-aarch64
-            zig_target: aarch64-macos
+            zig_target: aarch64-macos.15.0
             cas_static: false
             runner_arch: ARM64
             codex_asset: codex-package-aarch64-apple-darwin.tar.gz
@@ -255,7 +245,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       # This exact release is a reproducible compatibility fixture, not a
       # minimum supported Codex version or an admission rule.
       - name: Install reproducible Codex compatibility fixture
@@ -369,7 +359,7 @@ jobs:
           zig build build-cas
           -Dtarget=${{ matrix.zig_target }}
           -Dcpu=baseline
-          -Doptimize=ReleaseFast
+          -Doptimize=fast
           -Dcas-static=${{ matrix.cas_static }}
           -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
       - name: Verify pinned SQLite release boundary
@@ -444,11 +434,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Fuzz CAS budget governor (Linux)
         run: >-
           .github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor
-          -Doptimize=ReleaseSafe --fuzz=100K --summary all
+          -Doptimize=safe --fuzz=100K --summary all
 
   perf-hub:
     needs: changes
@@ -458,7 +448,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Test performance hub
         run: zig build test-perf-hub
 
@@ -470,11 +460,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build ledger
-        run: zig build build-ledger -Doptimize=ReleaseFast
+        run: zig build build-ledger -Doptimize=fast
       - name: Test Ledger 1.0 kernel and command surface
-        run: zig build test-ledger test-ledger-core test-ledger-cli-smoke -Doptimize=ReleaseFast --summary all
+        run: zig build test-ledger test-ledger-core test-ledger-cli-smoke -Doptimize=fast --summary all
       - name: Verify Ledger native command surface
         run: apps/ledger/scripts/release/command_surface_gate.sh zig-out/bin/ledger
 
@@ -486,9 +476,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build memory-note
-        run: zig build build-memory-note -Doptimize=ReleaseFast
+        run: zig build build-memory-note -Doptimize=fast
       - name: Test memory-note
         run: zig build test-memory-note
 
@@ -500,8 +490,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build typesafe
-        run: zig build build-typesafe -Doptimize=ReleaseFast
+        run: zig build build-typesafe -Doptimize=fast
       - name: Test typesafe
         run: zig build test-typesafe

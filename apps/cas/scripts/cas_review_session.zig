@@ -1239,7 +1239,7 @@ fn checkWorkflowBindingAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "workflow binding reports allocation failure and releases partial input" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkWorkflowBindingAllocation,
         .{},
@@ -1858,13 +1858,11 @@ const ReviewStart = struct {
         ) catch |err| {
             return try self.terminalStartFailure(workflowOwnedPostStartFailure(err), true);
         };
-        self.event_log_path = try std.fmt.allocPrint(
-            self.allocator,
+        self.event_log_path = try self.allocator.print(
             "{s}/{s}.events.ndjson",
             .{ self.session_dir.?, self.review_thread_id.? },
         );
-        self.record_path = try std.fmt.allocPrint(
-            self.allocator,
+        self.record_path = try self.allocator.print(
             "{s}/{s}.json",
             .{ self.session_dir.?, self.review_thread_id.? },
         );
@@ -4755,7 +4753,7 @@ fn exerciseReviewStatusAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "review status parsing cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseReviewStatusAllocation,
         .{},
@@ -4786,7 +4784,7 @@ fn exerciseCasRerGateAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "CAS-RER gate cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseCasRerGateAllocation,
         .{},
@@ -4827,7 +4825,7 @@ fn exerciseLiveReviewStatusAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "live review status replacement preserves ownership on allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseLiveReviewStatusAllocation,
         .{},
@@ -4894,7 +4892,7 @@ fn dirtyStateDigestAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+    return allocator.print("sha256:{s}", .{&hex});
 }
 
 fn hashUntrackedEntry(
@@ -4964,7 +4962,7 @@ fn canonicalTargetAlloc(
             else
                 return error.InvalidCommitTarget;
             if (selector.len == 0) return error.InvalidCommitTarget;
-            const commit_ref = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{selector});
+            const commit_ref = try allocator.print("{s}^{{commit}}", .{selector});
             defer allocator.free(commit_ref);
             const canonical_sha = try gitOutputAlloc(
                 allocator,
@@ -5000,12 +4998,12 @@ fn computeTargetIdentityAlloc(
     const head_sha = if (target.kind == .commit)
         try allocator.dupe(u8, target.sha.?)
     else if (target.kind == .uncommitted)
-        try std.fmt.allocPrint(allocator, "{s}+dirty:{s}", .{ current_head_sha, dirty_digest.? })
+        try allocator.print("{s}+dirty:{s}", .{ current_head_sha, dirty_digest.? })
     else
         try allocator.dupe(u8, current_head_sha);
     errdefer allocator.free(head_sha);
     const commit_parent_ref = if (target.kind == .commit)
-        try std.fmt.allocPrint(allocator, "{s}^", .{target.sha.?})
+        try allocator.print("{s}^", .{target.sha.?})
     else
         null;
     defer if (commit_parent_ref) |value| allocator.free(value);
@@ -5051,14 +5049,14 @@ fn targetFingerprintAlloc(
     });
     defer allocator.free(target_json);
     return if (dirty_digest) |digest|
-        try std.fmt.allocPrint(allocator, "target={s};head={s};base={s};dirty={s}", .{
+        try allocator.print("target={s};head={s};base={s};dirty={s}", .{
             target_json,
             head_sha,
             base_sha,
             digest,
         })
     else
-        try std.fmt.allocPrint(allocator, "target={s};head={s};base={s}", .{
+        try allocator.print("target={s};head={s};base={s}", .{
             target_json,
             head_sha,
             base_sha,
@@ -5539,8 +5537,7 @@ fn buildReviewStartParamsJson(
     defer allocator.free(target_json);
     const parent_thread_id_json = try quoteJsonStringAlloc(allocator, parent_thread_id);
     defer allocator.free(parent_thread_id_json);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"threadId\":{s},\"delivery\":\"inline\",\"target\":{s}}}",
         .{ parent_thread_id_json, target_json },
     );
@@ -5585,11 +5582,11 @@ fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
     );
     defer allocator.free(start);
     const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
-        error.GitCommandFailed => return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{start}),
+        error.GitCommandFailed => return allocator.print("{s}/.ledger/cas", .{start}),
         else => return err,
     };
     defer allocator.free(repo_root);
-    return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{repo_root});
+    return allocator.print("{s}/.ledger/cas", .{repo_root});
 }
 
 fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
@@ -5609,7 +5606,7 @@ fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8
 fn casStorePathAlloc(allocator: std.mem.Allocator, leaf: []const u8) ![]const u8 {
     const root = try casStoreRootAlloc(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, leaf });
+    return allocator.print("{s}/{s}", .{ root, leaf });
 }
 
 fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
@@ -5828,7 +5825,7 @@ test "stable review JSON comparison propagates allocation failures" {
     const raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer","nested":[{"value":1,"createdAt":"a"}]}
     ;
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkStableReviewJsonAllocation,
         .{raw},
@@ -5931,7 +5928,7 @@ fn writeRawJsonFileExclusiveOrIdenticalAlloc(
     path: []const u8,
     json: []const u8,
 ) !void {
-    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const payload = try allocator.print("{s}\n", .{json});
     defer allocator.free(payload);
     durable_store.writeTextCreateNewAtomic(
         allocator,
@@ -5962,7 +5959,7 @@ fn writeCasRerRecordJsonToLedgerAlloc(
     defer allocator.free(record_id);
     const records_dir = try reviewLedgerRecordsDirAlloc(allocator);
     defer allocator.free(records_dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ records_dir, record_id });
+    const path = try allocator.print("{s}/{s}.json", .{ records_dir, record_id });
     errdefer allocator.free(path);
     try writeRawJsonFileExclusiveOrIdenticalAlloc(allocator, path, record_json);
     return path;
@@ -5985,8 +5982,7 @@ fn parentEventLogPathAlloc(
     session_dir: []const u8,
     parent_thread_id: []const u8,
 ) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/{s}.parent.events.ndjson",
         .{ session_dir, parent_thread_id },
     );
@@ -6272,8 +6268,7 @@ fn loadSessionRecord(
 ) !LoadedSessionRecord {
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
-    const record_path = try std.fmt.allocPrint(
-        allocator,
+    const record_path = try allocator.print(
         "{s}/{s}.json",
         .{ session_dir, review_thread_id },
     );
@@ -6409,20 +6404,17 @@ fn validateCurrentSessionRecordAlloc(
     record: SessionRecord,
 ) !void {
     try validateSessionRecordFields(record);
-    const session_dir = try std.fmt.allocPrint(
-        allocator,
+    const session_dir = try allocator.print(
         "{s}/review_sessions",
         .{record.store_root.?},
     );
     defer allocator.free(session_dir);
-    const expected_record_path = try std.fmt.allocPrint(
-        allocator,
+    const expected_record_path = try allocator.print(
         "{s}/{s}.json",
         .{ session_dir, record.review_thread_id },
     );
     defer allocator.free(expected_record_path);
-    const expected_event_path = try std.fmt.allocPrint(
-        allocator,
+    const expected_event_path = try allocator.print(
         "{s}/{s}.events.ndjson",
         .{ session_dir, record.review_thread_id },
     );
@@ -6489,7 +6481,7 @@ fn latestSessionRecordPathInDirAlloc(
 
     const name = best_name orelse return error.NoReviewSessionRecords;
     defer allocator.free(name);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ session_dir, name });
+    return allocator.print("{s}/{s}", .{ session_dir, name });
 }
 
 fn isReviewSessionRecordName(name: []const u8, kind: std.Io.File.Kind) bool {
@@ -6501,13 +6493,13 @@ fn isReviewSessionRecordName(name: []const u8, kind: std.Io.File.Kind) bool {
 fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: SessionRecord) !void {
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const payload = try allocator.print("{s}\n", .{json});
     defer allocator.free(payload);
     try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
 fn currentProcessId() u64 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => @intCast(std.os.linux.getpid()),
         .plan9 => @intCast(std.os.plan9.getpid()),
         else => @intCast(std.c.getpid()),
@@ -6518,7 +6510,7 @@ fn sha256HexAlloc(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+    return allocator.print("sha256:{s}", .{&hex});
 }
 
 fn sha256HexBareAlloc(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
@@ -6550,11 +6542,11 @@ fn hashedAccountFingerprintAlloc(
     tag: []const u8,
     value: []const u8,
 ) ![]const u8 {
-    const tagged = try std.fmt.allocPrint(allocator, "account.{s}:{s}", .{ tag, value });
+    const tagged = try allocator.print("account.{s}:{s}", .{ tag, value });
     defer allocator.free(tagged);
     const digest = try sha256HexBareAlloc(allocator, tagged);
     defer allocator.free(digest);
-    return std.fmt.allocPrint(allocator, "acct:{s}", .{digest});
+    return allocator.print("acct:{s}", .{digest});
 }
 
 fn accountPrincipalFromJsonAlloc(
@@ -6589,8 +6581,7 @@ fn accountPrincipalFromJsonAlloc(
         }
         if (jsonStringField(account_obj, "type")) |account_type| {
             if (jsonStringField(account_obj, "planType")) |plan_type| {
-                const combined = try std.fmt.allocPrint(
-                    allocator,
+                const combined = try allocator.print(
                     "{s}:{s}",
                     .{ account_type, plan_type },
                 );
@@ -6685,8 +6676,7 @@ fn canonicalReviewTuplePayloadAlloc(
     allocator: std.mem.Allocator,
     tuple: ReviewTupleIdentity,
 ) ![]const u8 {
-    const base_payload = try std.fmt.allocPrint(
-        allocator,
+    const base_payload = try allocator.print(
         "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\n" ++
             "resolved_codex_path={s}\nresolved_codex_version={s}\n" ++
             "codex_binary_digest={s}\napp_server_contract_id={s}\n" ++
@@ -6711,8 +6701,7 @@ fn canonicalReviewTuplePayloadAlloc(
     );
     const workflow_binding_digest = tuple.workflow_binding_digest orelse return base_payload;
     defer allocator.free(base_payload);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}workflow_binding_digest={s}\n",
         .{ base_payload, workflow_binding_digest },
     );
@@ -7100,8 +7089,7 @@ fn persistRecordlessDeadOwnerRecovery(
     defer allocator.free(terminal_json);
     const terminal_digest = try sha256HexAlloc(allocator, terminal_json);
     defer allocator.free(terminal_digest);
-    const predecessor_path = try std.fmt.allocPrint(
-        allocator,
+    const predecessor_path = try allocator.print(
         "{s}.predecessor-{s}",
         .{ lock_path, terminal_digest["sha256:".len..] },
     );
@@ -7194,7 +7182,7 @@ fn normalizeContextFromReviewTuple(tuple: ReviewTupleIdentity) NormalizeContext 
 fn reviewTupleLocksDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
-    const locks_dir = try std.fmt.allocPrint(allocator, "{s}/locks", .{session_dir});
+    const locks_dir = try allocator.print("{s}/locks", .{session_dir});
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), locks_dir);
     return locks_dir;
 }
@@ -7207,21 +7195,21 @@ fn reviewTupleLockPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8
         tuple_hash,
         "sha256:",
     )) tuple_hash["sha256:".len..] else tuple_hash;
-    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ locks_dir, bare_hash });
+    return allocator.print("{s}/{s}.json", .{ locks_dir, bare_hash });
 }
 
 fn reviewTupleLockRewriteLeasePathAlloc(
     allocator: std.mem.Allocator,
     lock_path: []const u8,
 ) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.rewrite-lease", .{lock_path});
+    return allocator.print("{s}.rewrite-lease", .{lock_path});
 }
 
 fn reviewTupleLockLegacyRewriteClaimPathAlloc(
     allocator: std.mem.Allocator,
     lock_path: []const u8,
 ) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
+    return allocator.print("{s}.rewrite-claim", .{lock_path});
 }
 
 fn reviewTupleLockLegacyRewriteClaimExpired(
@@ -7258,7 +7246,7 @@ fn reviewTupleLockLegacyRewriteClaimExpired(
 }
 
 fn reviewOwnerLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.owner-lease", .{lock_path});
+    return allocator.print("{s}.owner-lease", .{lock_path});
 }
 
 const ReviewOwnerLease = struct {
@@ -7602,7 +7590,7 @@ fn writeReviewTupleLock(
 ) !void {
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
-    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const payload = try allocator.print("{s}\n", .{json});
     defer allocator.free(payload);
     try durable_store.writeTextAtomic(allocator, path, payload);
 }
@@ -7614,7 +7602,7 @@ fn writeReviewTupleLockExclusive(
 ) !void {
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
-    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const payload = try allocator.print("{s}\n", .{json});
     defer allocator.free(payload);
     try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
 }
@@ -7635,8 +7623,7 @@ fn tryAcquireLegacyReviewClaim(
     claim_path: []const u8,
     stale_claim_removed: *bool,
 ) !enum { acquired, reclaimed, occupied } {
-    const claim = try std.fmt.allocPrint(
-        allocator,
+    const claim = try allocator.print(
         "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n",
         .{ currentProcessId(), unixSeconds() },
     );
@@ -8918,8 +8905,7 @@ fn appendLogRecord(
     defer allocator.free(direction_json);
     const payload_json_string = try quoteJsonStringAlloc(allocator, payload_json);
     defer allocator.free(payload_json_string);
-    const json_line = try std.fmt.allocPrint(
-        allocator,
+    const json_line = try allocator.print(
         "{{\"recordedAtUnixS\":{d},\"method\":{s},\"direction\":{s},\"payload\":{s}}}",
         .{
             @divFloor(
@@ -10936,23 +10922,29 @@ fn cloneNormalizedReceipt(
     borrowed: NormalizedReceipt,
 ) !NormalizedReceipt {
     var owned = borrowed;
-    inline for (std.meta.fields(NormalizedReceipt)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "principal_strength")) {
-            if (field.type == []const u8) @field(owned, field.name) = "";
-            if (field.type == ?[]const u8) @field(owned, field.name) = null;
+    inline for (
+        @typeInfo(NormalizedReceipt).@"struct".field_names,
+        @typeInfo(NormalizedReceipt).@"struct".field_types,
+    ) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "principal_strength")) {
+            if (field_type == []const u8) @field(owned, field_name) = "";
+            if (field_type == ?[]const u8) @field(owned, field_name) = null;
         }
     }
     errdefer owned.deinit(allocator);
-    inline for (std.meta.fields(NormalizedReceipt)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "principal_strength")) {
-            if (field.type == []const u8) {
-                @field(owned, field.name) = try allocator.dupe(u8, @field(borrowed, field.name));
+    inline for (
+        @typeInfo(NormalizedReceipt).@"struct".field_names,
+        @typeInfo(NormalizedReceipt).@"struct".field_types,
+    ) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "principal_strength")) {
+            if (field_type == []const u8) {
+                @field(owned, field_name) = try allocator.dupe(u8, @field(borrowed, field_name));
             }
-            if (field.type == ?[]const u8) {
+            if (field_type == ?[]const u8) {
                 @field(
                     owned,
-                    field.name,
-                ) = try dupOptional(allocator, @field(borrowed, field.name));
+                    field_name,
+                ) = try dupOptional(allocator, @field(borrowed, field_name));
             }
         }
     }
@@ -11652,8 +11644,7 @@ const CasRerProjectionOptions = struct {
 };
 
 fn casRerTimestampAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "unix-ns:{d}",
         .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
     );
@@ -11792,7 +11783,7 @@ fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
 
 fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
     const review_thread_id = nonEmptyOptional(receipt.review_thread_id) orelse return null;
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{
+    const material = try allocator.print("{s}\x1f{s}", .{
         review_thread_id,
         receipt.review_turn_id orelse "",
     });
@@ -11806,8 +11797,7 @@ fn casRerBaseMaterialAlloc(
     opts: CasRerProjectionOptions,
     target_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "repo_realpath={s}\n" ++
             "resolved_codex_path={s}\n" ++
             "resolved_codex_version={s}\n" ++
@@ -11880,8 +11870,7 @@ fn casRerRecordIdAlloc(
     const base_material = try casRerBaseMaterialAlloc(allocator, receipt, opts, target_json);
     defer allocator.free(base_material);
     const material = if (receipt.workflow_binding_json) |workflow_binding_json|
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "{s}\x1fworkflowBinding\x1f{s}",
             .{ base_material, workflow_binding_json },
         )
@@ -11890,7 +11879,7 @@ fn casRerRecordIdAlloc(
     defer allocator.free(material);
     const digest = try sha256HexBareAlloc(allocator, material);
     defer allocator.free(digest);
-    return std.fmt.allocPrint(allocator, "rer_{s}", .{digest});
+    return allocator.print("rer_{s}", .{digest});
 }
 
 fn writeCasRerCommandObject(
@@ -12277,7 +12266,7 @@ fn appendGateError(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    const message = try allocator.print(fmt, args);
     errdefer allocator.free(message);
     try errors.append(allocator, message);
 }
@@ -12527,7 +12516,7 @@ fn checkNormalizedReceiptAllocationFailures(allocator: std.mem.Allocator) !void 
 }
 
 test "receipt normalization owns parsed fields and cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkNormalizedReceiptAllocationFailures,
         .{},
@@ -13152,8 +13141,7 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
         &.{ store_root, "review_sessions", "thr.events.ndjson" },
     );
     defer std.testing.allocator.free(event_log_path);
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":4,\"cwd\":\"{s}\",\"store_root\":\"{s}\"," ++
             "\"store_scope\":\"repo-local\",\"repo_root\":\"{s}\"," ++
             "\"codex_thread_id\":\"thread\"," ++
@@ -13204,8 +13192,7 @@ test "session record owns and validates workflow binding across reload" {
         &.{ session_dir, "thr.events.ndjson" },
     );
     defer std.testing.allocator.free(event_log_path);
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":4,\"cwd\":\"{s}\",\"store_root\":\"{s}\"," ++
             "\"store_scope\":\"repo-local\",\"repo_root\":\"{s}\"," ++
             "\"codex_thread_id\":\"thread\"," ++
@@ -13257,8 +13244,7 @@ test "session record rejects pre-kernel schema" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":3,\"cwd\":\"{s}\",\"parent_thread_id\":\"parent\"," ++
             "\"review_thread_id\":\"thr\",\"review_turn_id\":\"turn\",\"delivery\":\"review\"," ++
             "\"target\":{{\"type\":\"uncommittedChanges\"}}," ++
@@ -13374,8 +13360,7 @@ test "store root falls back to cwd ledger outside git while repo root stays opti
     defer configured_store_root_override = old_store_root;
     defer configured_store_cwd = old_store_cwd;
 
-    const root = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const root = try std.testing.allocator.print(
         "/tmp/cas-review-session-store-root-test-{d}",
         .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
     );
@@ -13395,7 +13380,7 @@ test "store root falls back to cwd ledger outside git while repo root stays opti
         std.testing.allocator,
     );
     defer std.testing.allocator.free(real_root);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ledger/cas", .{real_root});
+    const expected = try std.testing.allocator.print("{s}/.ledger/cas", .{real_root});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, store_root);
 
@@ -13509,7 +13494,7 @@ test "latestSessionRecordPathInDirAlloc selects newest top-level session record"
     defer std.testing.allocator.free(tmp_path);
     const latest = try latestSessionRecordPathInDirAlloc(std.testing.allocator, tmp_path);
     defer std.testing.allocator.free(latest);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/new.json", .{tmp_path});
+    const expected = try std.testing.allocator.print("{s}/new.json", .{tmp_path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, latest);
 }
@@ -13809,8 +13794,7 @@ test "target selector and custom instructions remain independently bound" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(instruction_path);
-    const instruction_arg = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const instruction_arg = try std.testing.allocator.print(
         "@{s}",
         .{instruction_path},
     );
@@ -14349,8 +14333,7 @@ fn checkIncompleteWorkflowBindingRejected(bound_json: []const u8) !void {
 }
 
 test "CAS-RER binding is source carried validated and identity bearing" {
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"cwd\":\"/tmp/repo\",\"status\":\"clean\"," ++
             "\"target\":{s}," ++
             "\"backendClass\":\"cas-start-wait\",\"clean\":true,\"findingCount\":0," ++
@@ -15305,8 +15288,7 @@ fn testLegacySessionJsonAlloc(
     event_path_json: []const u8,
     tuple_fields: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        std.testing.allocator,
+    return std.testing.allocator.print(
         "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\"," ++
             "\"review_thread_id\":\"{s}\",\"review_turn_id\":\"{s}\"," ++
             "\"delivery\":\"detached\"," ++
@@ -15345,8 +15327,7 @@ test "receipt normalizer rejects pre-kernel stored findings recovery" {
     defer std.testing.allocator.free(notification);
     const notification_json = try quoteJsonStringAlloc(std.testing.allocator, notification);
     defer std.testing.allocator.free(notification_json);
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "{{\"recordedAtUnixS\":1,\"method\":\"item/completed\"," ++
             "\"direction\":\"notification\",\"payload\":{s}}}\n",
         .{notification_json},
@@ -15413,8 +15394,7 @@ test "receipt normalizer rejects pre-kernel stored clean recovery" {
 
     const thread_read_payload_json = try testThreadReadPayloadJsonAlloc("thr_clean", rollout_path);
     defer std.testing.allocator.free(thread_read_payload_json);
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\"," ++
             "\"direction\":\"response\"," ++
             "\"payload\":{s}}}\n{{\"recordedAtUnixS\":2," ++
@@ -15477,8 +15457,7 @@ test "receipt normalizer rejects pre-kernel snake-case stored tuple" {
 
     const thread_read_payload_json = try testThreadReadPayloadJsonAlloc("thr_snake", rollout_path);
     defer std.testing.allocator.free(thread_read_payload_json);
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\"," ++
             "\"direction\":\"response\",\"payload\":{s}}}\n",
         .{thread_read_payload_json},
@@ -16326,8 +16305,7 @@ test "pre-kernel stored account-limit receipt is rejected" {
     defer std.testing.allocator.free(event_path);
     const event_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_path);
     defer std.testing.allocator.free(event_path_json);
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":3,\"cwd\":\"/tmp\"," ++
             "\"parent_thread_id\":\"parent\"," ++
             "\"review_thread_id\":\"thr_account\"," ++
@@ -16371,8 +16349,7 @@ test "pre-kernel stored account exhaustion with tuple is rejected" {
     defer std.testing.allocator.free(event_path);
     const event_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_path);
     defer std.testing.allocator.free(event_path_json);
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":3,\"cwd\":\"/tmp\"," ++
             "\"parent_thread_id\":\"parent\"," ++
             "\"review_thread_id\":\"thr_account\"," ++
@@ -17870,8 +17847,7 @@ test "review tuple lock write and load roundtrip" {
     const tuple = testTupleIdentity("acct:a");
     const tuple_hash = try reviewTupleHashAlloc(std.testing.allocator, tuple);
     defer std.testing.allocator.free(tuple_hash);
-    const path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const path = try std.testing.allocator.print(
         "{s}/{s}.json",
         .{ tmp_root, tuple_hash["sha256:".len..] },
     );
@@ -17943,8 +17919,7 @@ test "recordless dead owner recovery terminalizes the exact lock" {
     const tuple = testTupleIdentity("acct:a");
     const tuple_hash = try reviewTupleHashAlloc(std.testing.allocator, tuple);
     defer std.testing.allocator.free(tuple_hash);
-    const lock_path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const lock_path = try std.testing.allocator.print(
         "{s}/{s}.json",
         .{ root, tuple_hash["sha256:".len..] },
     );
@@ -18028,7 +18003,7 @@ fn testPredecessorLock(process_id: u64, receipt_path: []const u8) ReviewTupleLoc
 }
 
 fn checkPredecessorCompatibility(lock: ReviewTupleLock, process_id: u64) !void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const boot_id = try cas_websocket.currentBootIdAlloc(std.testing.allocator);
         defer std.testing.allocator.free(boot_id);
         var current_lock = lock;
@@ -18080,7 +18055,7 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         io,
     );
     defer child.kill(io);
-    const process_id: u64 = switch (builtin.os.tag) {
+    const process_id: u64 = switch (builtin.target.os.tag) {
         .windows => @intCast(@intFromPtr(child.id.?)),
         .wasi => 0,
         else => @intCast(child.id.?),
@@ -18168,8 +18143,7 @@ test "review tuple lock load rejects path and complete-tuple mismatches" {
         loadReviewTupleLock(std.testing.allocator, wrong_path),
     );
 
-    const correct_path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const correct_path = try std.testing.allocator.print(
         "{s}/{s}.json",
         .{ root, tuple_hash["sha256:".len..] },
     );
@@ -18704,14 +18678,12 @@ test "terminal timeout session replays only through its exact tuple lock" {
     defer configured_store_root_override = old_store_root;
     const session_dir = try sessionDirAlloc(std.testing.allocator);
     defer std.testing.allocator.free(session_dir);
-    const record_path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const record_path = try std.testing.allocator.print(
         "{s}/thr.json",
         .{session_dir},
     );
     defer std.testing.allocator.free(record_path);
-    const event_path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const event_path = try std.testing.allocator.print(
         "{s}/thr.events.ndjson",
         .{session_dir},
     );
@@ -18786,7 +18758,7 @@ test "review tuple lock load reports malformed lock" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
+    const path = try std.testing.allocator.print("{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
 
     try tmp.dir.writeFile(
@@ -18809,7 +18781,7 @@ test "review tuple lock exclusive write rejects duplicate first claim" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
+    const path = try std.testing.allocator.print("{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
 
     const lock = ReviewTupleLock{
@@ -18854,8 +18826,7 @@ fn checkCleanTransportLockUpdate(
     };
     const tuple_hash = try reviewTupleHashAlloc(allocator, tuple);
     defer allocator.free(tuple_hash);
-    const lock_path = try std.fmt.allocPrint(
-        allocator,
+    const lock_path = try allocator.print(
         "{s}/review_sessions/locks/{s}.json",
         .{ tmp_root, tuple_hash["sha256:".len..] },
     );
@@ -18940,14 +18911,12 @@ test "terminal clean receipt preserves transport lock" {
         allocator.free(tmp_root);
     }
 
-    const record_path = try std.fmt.allocPrint(
-        allocator,
+    const record_path = try allocator.print(
         "{s}/review_sessions/thr_clean.json",
         .{tmp_root},
     );
     defer allocator.free(record_path);
-    const event_path = try std.fmt.allocPrint(
-        allocator,
+    const event_path = try allocator.print(
         "{s}/review_sessions/thr_clean.events.ndjson",
         .{tmp_root},
     );
@@ -18968,7 +18937,7 @@ test "review tuple lock rewrite lease is exclusive and kernel released" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
+    const path = try std.testing.allocator.print("{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
 
     var lease = try acquireReviewTupleLockRewriteLeaseWithin(
@@ -19008,7 +18977,7 @@ test "review tuple lock rewrite lease ignores orphaned sidecar content" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
+    const path = try std.testing.allocator.print("{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
     const lease_path = try reviewTupleLockRewriteLeasePathAlloc(std.testing.allocator, path);
     defer std.testing.allocator.free(lease_path);
@@ -19037,8 +19006,7 @@ test "v2 rewrite bridge reclaims an expired legacy claim" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const path = try std.testing.allocator.print(
         "{s}/lock.json",
         .{tmp_root},
     );
@@ -19070,7 +19038,7 @@ test "review runtime gate requires live managed structured-review preflight" {
     const valid =
         \\{"schema":"cas-app-server-preflight/v1","action":"preflight","profile":"review","status":"compatible","contractId":"codex-app-server-capabilities-v2","codex":{"path":"/tmp/codex","version":"development build","banner":"custom Codex development build","binaryDigest":"sha256:binary"},"schemas":{"stableDigest":"sha256:stable","experimentalDigest":"sha256:experimental"},"methods":{"missingRequired":[]},"handlerCoverage":{"status":"passed"},"shapeChecks":{"status":"passed"},"transport":{"selected":"managed-ws"},"behavioralProbes":[{"id":"initialize-lifecycle","requirement":"required","status":"passed"},{"id":"managed-websocket-transport","requirement":"required","status":"passed"},{"id":"server-request-coverage","requirement":"required","status":"passed"},{"id":"bounded-overload-retry","requirement":"required","status":"passed"},{"id":"structured-review","requirement":"required","status":"passed"}]}
     ;
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         allocator,
         checkReviewRuntimeGateAllocation,
         .{valid},

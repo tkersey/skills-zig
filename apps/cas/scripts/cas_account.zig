@@ -802,7 +802,11 @@ test "usage search preserves key priority and depth-first order" {
 }
 
 test "usage search bounds explicit frames and propagates allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUsageSearch, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkUsageSearch,
+        .{},
+    );
 }
 
 fn checkUsageSearch(allocator: std.mem.Allocator) !void {

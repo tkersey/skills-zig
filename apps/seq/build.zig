@@ -1,7 +1,8 @@
 const std = @import("std");
+const build_support = @import("build_support.zig");
 
 pub fn build(b: *std.Build) void {
-    enforceRepoLocalInstallOnly(b);
+    _ = build_support.installGuard(b, b.path("../../tools/install_guard.zig"));
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -12,9 +13,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/v1/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = optimize == .fast,
         .imports = &.{
             .{ .name = "app_meta", .module = seq_meta },
+            .{ .name = "test_support", .module = modules.test_support },
             .{ .name = "definition_core", .module = modules.definition_core },
             .{ .name = "seq_v1_core", .module = modules.seq_core },
         },
@@ -24,11 +26,13 @@ pub fn build(b: *std.Build) void {
         .name = "seq",
         .root_module = root_module,
     });
-    b.installArtifact(exe);
+    const install = b.addInstallArtifact(exe, .{});
+    build_support.guardInstall(b, install);
+    b.getInstallStep().dependOn(&install.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run Seq");
     run_step.dependOn(&run_cmd.step);
 
@@ -43,12 +47,13 @@ pub fn build(b: *std.Build) void {
 const CoreModules = struct {
     definition_core: *std.Build.Module,
     seq_core: *std.Build.Module,
+    test_support: *std.Build.Module,
 };
 
 fn createCoreModules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) CoreModules {
     const jsonl_core = b.createModule(.{
         .root_source_file = b.path("../../libs/jsonl_core/src/lib.zig"),
@@ -84,17 +89,7 @@ fn createCoreModules(
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
-    const calendar = b.createModule(.{
-        .root_source_file = b.path("../../libs/core/src/calendar.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const seq_time = b.createModule(.{
-        .root_source_file = b.path("src/time_utils.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "core_calendar", .module = calendar }},
-    });
+    const seq_time = createTimeModule(b, target, optimize);
     const seq_core = b.createModule(.{
         .root_source_file = b.path("src/v1/root.zig"),
         .target = target,
@@ -107,34 +102,49 @@ fn createCoreModules(
             .{ .name = "seq_time", .module = seq_time },
         },
     });
-    return .{ .definition_core = definition_core, .seq_core = seq_core };
+    const test_support = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/testing_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_]*std.Build.Module{
+        definition_core, seq_core, durable_store, jsonl_core, trace_core,
+    }) |module| module.addImport("test_support", test_support);
+    return .{
+        .definition_core = definition_core,
+        .seq_core = seq_core,
+        .test_support = test_support,
+    };
+}
+
+fn createTimeModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) *std.Build.Module {
+    const calendar = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/calendar.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_time = @import("translate_c").Translator.init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/time.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    return b.createModule(.{
+        .root_source_file = b.path("src/time_utils.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_calendar", .module = calendar },
+            .{ .name = "c_time", .module = c_time.mod },
+        },
+    });
 }
 
 fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
     const options = b.addOptions();
     options.addOption([]const u8, "version", std.mem.trim(u8, raw_version, " \t\r\n"));
     return options.createModule();
-}
-
-fn enforceRepoLocalInstallOnly(b: *std.Build) void {
-    const expected_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
-    defer b.allocator.free(expected_prefix);
-
-    const expected_exe_dir = b.pathJoin(&.{ expected_prefix, "bin" });
-    defer b.allocator.free(expected_exe_dir);
-
-    if (b.dest_dir != null or
-        !std.mem.eql(u8, b.install_prefix, expected_prefix) or
-        !std.mem.eql(u8, b.install_path, expected_prefix) or
-        !std.mem.eql(u8, b.exe_dir, expected_exe_dir))
-    {
-        std.debug.panic(
-            "skills-zig forbids external installs; ship" ++
-                " CLIs via the Homebrew tap release flow on" ++
-                "ly. " ++
-                "expected install_prefix={s} exe_dir={s}; " ++
-                "got install_prefix={s} exe_dir={s} dest_dir={?s}",
-            .{ expected_prefix, expected_exe_dir, b.install_prefix, b.exe_dir, b.dest_dir },
-        );
-    }
 }

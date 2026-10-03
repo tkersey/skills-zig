@@ -60,8 +60,7 @@ pub fn renderAutomationTomlAlloc(allocator: std.mem.Allocator, row: anytype) ![]
     const rrule_toml = try output.tomlQuoteAlloc(allocator, row.rrule);
     defer allocator.free(rrule_toml);
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "version = 1\n" ++
             "id = {s}\n" ++
             "name = {s}\n" ++
@@ -87,14 +86,14 @@ pub fn renderAutomationTomlAlloc(allocator: std.mem.Allocator, row: anytype) ![]
 pub fn defaultAutomationsDir(allocator: std.mem.Allocator) ![]u8 {
     if (automation_root_override) |override| return allocator.dupe(u8, override);
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
-    return std.fmt.allocPrint(allocator, "{s}/.codex/automations", .{home});
+    return allocator.print("{s}/.codex/automations", .{home});
 }
 
 pub fn automationDirPath(allocator: std.mem.Allocator, automation_id: []const u8) ![]u8 {
     const base = try defaultAutomationsDir(allocator);
     defer allocator.free(base);
     const safe_id = try validateAutomationId(automation_id);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, safe_id });
+    return allocator.print("{s}/{s}", .{ base, safe_id });
 }
 
 pub fn readPrompt(
@@ -156,11 +155,11 @@ pub fn writeAutomationFilesForRow(allocator: std.mem.Allocator, row: anytype) !v
 
     const toml_text = try renderAutomationTomlAlloc(allocator, row);
     defer allocator.free(toml_text);
-    const automation_toml = try std.fmt.allocPrint(allocator, "{s}/automation.toml", .{target_dir});
+    const automation_toml = try allocator.print("{s}/automation.toml", .{target_dir});
     defer allocator.free(automation_toml);
     try output.writeFileAtomic(allocator, automation_toml, toml_text);
 
-    const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
+    const memory_path = try allocator.print("{s}/memory.md", .{target_dir});
     defer allocator.free(memory_path);
     try createMemoryFileIfMissing(memory_path);
 }
@@ -217,7 +216,7 @@ pub fn writeMemorySummary(
     defer allocator.free(folder);
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), folder);
 
-    const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{folder});
+    const memory_path = try allocator.print("{s}/memory.md", .{folder});
     defer allocator.free(memory_path);
 
     const existing = try readExistingMemory(allocator, memory_path);
@@ -228,8 +227,7 @@ pub fn writeMemorySummary(
     const ts = try timestampStringUtc(allocator, started_ms);
     defer allocator.free(ts);
 
-    const block = try std.fmt.allocPrint(
-        allocator,
+    const block = try allocator.print(
         "Last run summary ({s}): {s}\nRun time: {s}\n",
         .{ date, summary, ts },
     );
@@ -238,8 +236,7 @@ pub fn writeMemorySummary(
     const merged = if (existing.len == 0)
         try allocator.dupe(u8, block)
     else
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "{s}\n\n{s}",
             .{ std.mem.trim(u8, existing, "\n"), block },
         );
@@ -308,8 +305,7 @@ fn parseHmsFromMs(ms: i64) struct { hour: u8, minute: u8, second: u8, days: i64 
 fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +0000",
         .{ d.year, d.month, d.day, parts.hour, parts.minute, parts.second },
     );
@@ -318,7 +314,7 @@ fn timestampStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
 fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     const parts = parseHmsFromMs(ms);
     const d = civilFromDays(parts.days);
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
 }
 
 fn envString(key: [:0]const u8) ?[]const u8 {
@@ -418,7 +414,11 @@ fn parseCwdsWithAllocator(allocator: std.mem.Allocator) !void {
 }
 
 test "cwd JSON releases partially built output under allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseCwdsWithAllocator, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        parseCwdsWithAllocator,
+        .{},
+    );
 }
 
 test "cwd JSON rejects a malformed later element without leaking prior strings" {

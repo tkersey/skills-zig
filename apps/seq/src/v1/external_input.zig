@@ -513,7 +513,7 @@ test "external immutable relations validate schema fields and canonical json" {
         "b",
         result.rows().row(1)[0].string,
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         parseForAllocationFailure,
         .{ &fixture.plan, external_input_document },

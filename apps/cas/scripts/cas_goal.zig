@@ -307,8 +307,7 @@ fn latestThreadTarget(
 fn createThread(allocator: std.mem.Allocator, client: *cas.Client, cwd: []const u8) ![]u8 {
     const quoted_cwd = try goal_core.jsonStringAlloc(allocator, cwd);
     defer allocator.free(quoted_cwd);
-    const params = try std.fmt.allocPrint(
-        allocator,
+    const params = try allocator.print(
         "{{\"cwd\":{s},\"experimentalRawEvents\":false}}",
         .{quoted_cwd},
     );
@@ -432,8 +431,7 @@ fn emitTarget(
         method,
     ) else try allocator.dupe(u8, "null");
     defer allocator.free(method_json);
-    const output = try std.fmt.allocPrint(
-        allocator,
+    const output = try allocator.print(
         "{{\"ok\":true,\"command\":\"{s}\",\"dryRun\":{},\"threadId\":{s}," ++
             "\"selectedBy\":{s},\"createdThread\":{},\"wouldCreateThread\":{}," ++
             "\"requestMethod\":{s}}}\n",
@@ -470,8 +468,7 @@ fn emitGoal(
         status,
     ) else try allocator.dupe(u8, "null");
     defer allocator.free(status_json);
-    const output = try std.fmt.allocPrint(
-        allocator,
+    const output = try allocator.print(
         "{{\"ok\":{},\"command\":\"{s}\",\"threadId\":{s},\"selectedBy\":{" ++
             "s},\"createdThread\":{},\"status\":{s},\"exitReason\":{s},\"goal\"" ++
             ":{s}}}\n",
@@ -501,8 +498,7 @@ fn emitClear(
     defer allocator.free(thread_id_json);
     const selected_by_json = try goal_core.jsonStringAlloc(allocator, target.selected_by);
     defer allocator.free(selected_by_json);
-    const output = try std.fmt.allocPrint(
-        allocator,
+    const output = try allocator.print(
         "{{\"ok\":true,\"command\":\"{s}\",\"threadId\":{s},\"selectedBy\"" ++
             ":{s},\"cleared\":{},\"exitReason\":\"ok\"}}\n",
         .{ opts.command.text(), thread_id_json, selected_by_json, cleared },
@@ -526,8 +522,7 @@ fn fail(
             raw,
         ) else try allocator.dupe(u8, "null");
         defer allocator.free(detail_json);
-        const output = try std.fmt.allocPrint(
-            allocator,
+        const output = try allocator.print(
             "{{\"ok\":false,\"command\":\"{s}\",\"exitReason\":{s},\"detail\":{s}}}\n",
             .{ opts.command.text(), code_json, detail_json },
         );

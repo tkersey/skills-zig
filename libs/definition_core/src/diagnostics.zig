@@ -115,7 +115,7 @@ fn addForAllocationFailure(allocator: std.mem.Allocator) !void {
 }
 
 test "diagnostic admission remains unchanged and leak free after allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         addForAllocationFailure,
         .{},

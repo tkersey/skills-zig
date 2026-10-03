@@ -890,7 +890,7 @@ fn stringMatch(
         else => false,
     };
     return switch (operator) {
-        .contains => std.ascii.indexOfIgnoreCase(a, b) != null,
+        .contains => std.ascii.findIgnoreCase(a, b) != null,
         .prefix => a.len >= b.len and std.ascii.eqlIgnoreCase(a[0..b.len], b),
         .suffix => a.len >= b.len and std.ascii.eqlIgnoreCase(a[a.len - b.len ..], b),
         else => false,
@@ -3189,7 +3189,7 @@ test "streaming lineage lowering is selected from non-token topology" {
 
 const expression_test_bindings: definition_core.parameters.Bindings = .{
     .items = &.{},
-    .values_digest = .{0} ** 71,
+    .values_digest = @as([71]u8, @splat(0)),
 };
 const expression_test_schema: plan.Schema = .{ .columns = &.{} };
 
@@ -3293,7 +3293,7 @@ fn exerciseExpressionAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "expression workspace releases active frames at each allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseExpressionAllocationFailures,
         .{},
@@ -3380,11 +3380,11 @@ const graph_test_projection = [_]definition.Projection{
 };
 const graph_test_definition: definition.Plan = .{
     .id = @constCast("test/graph"),
-    .closure_digest = .{0} ** 71,
+    .closure_digest = @as([71]u8, @splat(0)),
     .operator_mask = 0,
     .parameter_declarations = .{
         .items = &.{},
-        .shape_digest = .{0} ** 71,
+        .shape_digest = @as([71]u8, @splat(0)),
     },
     .selector_mask = 0,
     .relations = &.{},
@@ -3447,12 +3447,12 @@ fn exerciseGraphAllocationFailures(allocator: std.mem.Allocator, max_rows: usize
 }
 
 test "graph ownership cleans up sorted intermediates and every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseGraphAllocationFailures,
         .{@as(usize, 3)},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseGraphAllocationFailures,
         .{@as(usize, 2)},

@@ -57,7 +57,7 @@ pub const ManagedServer = struct {
 
     pub fn processId(self: *const ManagedServer) u64 {
         const child_id = self.child.id orelse return 0;
-        return switch (builtin.os.tag) {
+        return switch (builtin.target.os.tag) {
             .windows => @intCast(@intFromPtr(child_id)),
             .wasi => 0,
             else => @intCast(child_id),
@@ -630,13 +630,12 @@ fn startOwnerLivedServer(
     requested_listen_url: []const u8,
     io: std.Io,
 ) !ManagedServer {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.OwnerLivedManagedServerUnsupported;
     }
     const owner_receipt_dir = receipt_dir orelse return error.MissingOwnerLivedReceiptDirectory;
     try std.Io.Dir.cwd().createDirPath(io, owner_receipt_dir);
-    const capture_path = try std.fmt.allocPrint(
-        allocator,
+    const capture_path = try allocator.print(
         "{s}/cas-app-server-startup-{d}.log",
         .{ owner_receipt_dir, std.Io.Clock.real.now(io).nanoseconds },
     );
@@ -694,9 +693,10 @@ fn startOrdinaryServer(
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi) 0 else null,
     });
-    const process_group_id: ?u64 = switch (builtin.os.tag) {
+    const process_group_id: ?u64 = switch (builtin.target.os.tag) {
         .windows, .wasi => null,
         else => if (child.id) |value| @intCast(value) else null,
     };
@@ -920,14 +920,12 @@ fn spawnOwnerPipeManagedServer(
     var receipt_random: [16]u8 = undefined;
     io.random(&receipt_random);
     const receipt_hex = std.fmt.bytesToHex(receipt_random, .lower);
-    const shutdown_receipt_token = try std.fmt.allocPrint(
-        allocator,
+    const shutdown_receipt_token = try allocator.print(
         "{s}",
         .{&receipt_hex},
     );
     errdefer allocator.free(shutdown_receipt_token);
-    const shutdown_receipt_path = try std.fmt.allocPrint(
-        allocator,
+    const shutdown_receipt_path = try allocator.print(
         "{s}/{s}.json",
         .{ receipt_dir, &receipt_hex },
     );
@@ -970,7 +968,7 @@ fn spawnOwnerPipeWithReceipt(
     });
     try watchdog_argv.appendSlice(allocator, server_argv);
 
-    if (builtin.os.tag == .macos and builtin.link_libc) {
+    if (builtin.target.os.tag == .macos and builtin.link_libc) {
         return spawnOwnerPipeManagedServerPosix(
             allocator,
             cwd,
@@ -988,7 +986,8 @@ fn spawnOwnerPipeWithReceipt(
         .stdin = .pipe,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi) 0 else null,
     });
     const owner_control = child.stdin orelse {
         child.kill(io);
@@ -1001,7 +1000,7 @@ fn spawnOwnerPipeWithReceipt(
         .owner_control = owner_control,
         .shutdown_receipt_path = shutdown_receipt_path,
         .shutdown_receipt_token = shutdown_receipt_token,
-        .process_group_id = switch (builtin.os.tag) {
+        .process_group_id = switch (builtin.target.os.tag) {
             .windows, .wasi => null,
             else => if (child.id) |value| @intCast(value) else null,
         },
@@ -1088,7 +1087,7 @@ fn configureSpawnActions(
     pipe_fds: [2]std.c.fd_t,
     actions: *std.c.posix_spawn_file_actions_t,
 ) !void {
-    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    const cwd_storage = try allocator.dupeSentinel(u8, cwd, 0);
     defer allocator.free(cwd_storage);
     if (std.c.posix_spawn_file_actions_addchdir_np(actions, cwd_storage.ptr) != 0) {
         return error.SpawnFileActionsFailed;
@@ -1127,7 +1126,7 @@ fn posixSpawnArgv(
         allocator.free(storage);
     }
     for (source_argv, 0..) |arg, index| {
-        storage[index] = try allocator.dupeZ(u8, arg);
+        storage[index] = try allocator.dupeSentinel(u8, arg, 0);
         count += 1;
         argv[index] = storage[index].ptr;
     }
@@ -1149,7 +1148,7 @@ pub fn spawnDetachedProcess(
     argv: []const []const u8,
     io: std.Io,
 ) !std.process.Child {
-    if (builtin.os.tag == .macos and builtin.link_libc) {
+    if (builtin.target.os.tag == .macos and builtin.link_libc) {
         return spawnManagedServerPosix(allocator, cwd, argv);
     }
     return std.process.spawn(io, .{
@@ -1158,7 +1157,8 @@ pub fn spawnDetachedProcess(
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi) 0 else null,
     });
 }
 
@@ -1173,7 +1173,7 @@ fn spawnManagedServerPosix(
     if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
     defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
 
-    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    const cwd_storage = try allocator.dupeSentinel(u8, cwd, 0);
     defer allocator.free(cwd_storage);
     if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) {
         return error.SpawnFileActionsFailed;
@@ -1196,7 +1196,7 @@ fn spawnManagedServerPosix(
         allocator.free(arg_storage);
     }
     for (argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_storage[i] = try allocator.dupeSentinel(u8, arg, 0);
         arg_count += 1;
         argv_buf[i] = arg_storage[i].ptr;
     }
@@ -1220,7 +1220,7 @@ fn spawnManagedServerPosix(
 }
 
 fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
     return switch (err) {
         .NOMEM, .@"2BIG" => error.SystemResources,
         .MFILE => error.ProcessFdQuotaExceeded,
@@ -1236,13 +1236,13 @@ fn posixSpawnError(rc: c_int) anyerror {
 }
 
 pub fn processAlive(process_id: u64) bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => true,
         .wasi => false,
         else => blk: {
             const pid = std.math.cast(std.posix.pid_t, process_id) orelse
                 break :blk true;
-            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
             };
@@ -1252,12 +1252,12 @@ pub fn processAlive(process_id: u64) bool {
 }
 
 pub fn processGroupAlive(process_group_id: u64) bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows, .wasi => true,
         else => blk: {
             const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse
                 break :blk true;
-            std.posix.kill(-positive, @enumFromInt(0)) catch |err| switch (err) {
+            std.posix.kill(-positive, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
             };
@@ -1286,7 +1286,7 @@ pub fn waitForProcessGroupExit(process_group_id: u64, timeout_ms: u32) bool {
 }
 
 fn retireProcessGroup(process_group_id: u64) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows, .wasi => return,
         else => {
             const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse return;
@@ -1304,7 +1304,7 @@ fn retireProcessGroup(process_group_id: u64) void {
 }
 
 pub fn forceKillProcessGroup(process_group_id: u64) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows, .wasi => return,
         else => {
             const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse return;
@@ -1316,7 +1316,7 @@ pub fn forceKillProcessGroup(process_group_id: u64) void {
 }
 
 pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => blk: {
             if (!builtin.link_libc) return error.SystemBootIdentityUnsupported;
             var boot_time: std.c.timeval = undefined;
@@ -1330,8 +1330,7 @@ pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
             ) != 0 or boot_time_len != @sizeOf(std.c.timeval)) {
                 return error.SystemBootIdentityUnavailable;
             }
-            break :blk try std.fmt.allocPrint(
-                allocator,
+            break :blk try allocator.print(
                 "darwin:{d}:{d}",
                 .{ boot_time.sec, boot_time.usec },
             );
@@ -1375,7 +1374,7 @@ pub fn waitForProcessExit(process_id: u64, timeout_ms: u32) bool {
 }
 
 pub fn terminateProcess(process_id: u64) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows, .wasi => {},
         else => {
             const pid: std.posix.pid_t = @intCast(process_id);
@@ -1468,10 +1467,9 @@ fn handshakeRequestAlloc(
     const host_line = if (port == 0)
         try allocator.dupe(u8, host)
     else
-        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+        try allocator.print("{s}:{d}", .{ host, port });
     defer allocator.free(host_line);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -2058,7 +2056,7 @@ test "websocket write deadline expires before a frame crosses the socket" {
 }
 
 test "owner-lived watchdog retires its exact server when owner control closes" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const allocator = std.testing.allocator;
@@ -2181,7 +2179,8 @@ fn verifyShutdownReceipt(
 }
 
 test "ordinary managed teardown retires its process group descendants" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2250,7 +2249,8 @@ test "ordinary managed teardown retires its process group descendants" {
 }
 
 test "ordinary managed startup failure retires its process group descendants" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2261,8 +2261,7 @@ test "ordinary managed startup failure retires its process group descendants" {
     defer allocator.free(executable);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "malformed.pid" });
     defer allocator.free(pid_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "#!/bin/sh\n" ++
             "set -eu\n" ++
             "sleep 600 & descendant=$!\n" ++

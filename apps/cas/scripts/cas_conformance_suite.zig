@@ -340,7 +340,7 @@ fn resolveExecutable(
     ) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
-        const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, fallback_name });
+        const sibling = try allocator.print("{s}/{s}", .{ dir, fallback_name });
         if (pathExists(sibling)) return sibling;
         allocator.free(sibling);
     }
@@ -370,7 +370,7 @@ fn runCommandCapture(
     cwd: ?[]const u8,
     argv: []const []const u8,
 ) !CommandCapture {
-    if (builtin.os.tag == .macos) return runCommandCapturePosixSpawn(allocator, cwd, argv);
+    if (builtin.target.os.tag == .macos) return runCommandCapturePosixSpawn(allocator, cwd, argv);
 
     const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = argv,
@@ -382,7 +382,7 @@ fn runCommandCapture(
     return .{
         .exit_code = switch (result.term) {
             .exited => |code| code,
-            .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+            .signal => |signal| @intCast(@min(@as(u32, 128) + @backingInt(signal), @as(u32, 255))),
             .stopped, .unknown => 1,
         },
         .stdout = result.stdout,
@@ -437,7 +437,7 @@ fn runCommandCapturePosixSpawn(
 }
 
 fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
     return switch (err) {
         .NOMEM, .@"2BIG" => error.SystemResources,
         .MFILE => error.ProcessFdQuotaExceeded,
@@ -455,7 +455,7 @@ fn posixSpawnError(rc: c_int) anyerror {
 fn statusToExitCode(status: u32) u8 {
     if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
     if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        const signal: u32 = @backingInt(std.posix.W.TERMSIG(status));
         return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
     }
     return 1;
@@ -492,8 +492,7 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
             .status = "fail",
             .ok = false,
             .exit_code = 1,
-            .detail = try std.fmt.allocPrint(
-                allocator,
+            .detail = try allocator.print(
                 "unable to start cas_smoke_check: {s}",
                 .{@errorName(err)},
             ),
@@ -536,14 +535,12 @@ fn parseSmokeCapture(allocator: std.mem.Allocator, capture: CommandCapture) !Smo
                     }
                 else
                     0;
-                detail = try std.fmt.allocPrint(
-                    allocator,
+                detail = try allocator.print(
                     "smoke_check {s} (checks={d}{s})",
                     .{
                         if (ok) "pass" else "fail",
                         checks_len,
-                        if (thread_id) |id| try std.fmt.allocPrint(
-                            allocator,
+                        if (thread_id) |id| try allocator.print(
                             ", threadId={s}",
                             .{id},
                         ) else "",
@@ -629,8 +626,7 @@ fn scenarioAppServerFeatures(allocator: std.mem.Allocator, ctx: Context) !Scenar
         .name = Scenario.app_server_features.asString(),
         .mode = Scenario.app_server_features.mode(),
         .ok = summary.passed == app_server_feature_probe_ids.len and summary.missing == 0,
-        .detail = try std.fmt.allocPrint(
-            allocator,
+        .detail = try allocator.print(
             "live preflight feature probes {d}/{d} passed (full_status={s}, exit={d})",
             .{ summary.passed, app_server_feature_probe_ids.len, full_status, capture.exit_code },
         ),
@@ -790,9 +786,9 @@ fn runProductionRetryCase(
     mode: []const u8,
     policy: cas_proxy_client.OverloadRetryPolicy,
 ) !RetryCaseProof {
-    const executable = try std.fmt.allocPrint(allocator, "{s}/fake-codex-{s}", .{ root, mode });
+    const executable = try allocator.print("{s}/fake-codex-{s}", .{ root, mode });
     defer allocator.free(executable);
-    const log_path = try std.fmt.allocPrint(allocator, "{s}/requests-{s}.jsonl", .{ root, mode });
+    const log_path = try allocator.print("{s}/requests-{s}.jsonl", .{ root, mode });
     defer allocator.free(log_path);
     const script = try retryFixtureScriptAlloc(allocator, mode, log_path);
     defer allocator.free(script);
@@ -853,27 +849,24 @@ fn commandSummary(allocator: std.mem.Allocator, capture: CommandCapture) ![]cons
     const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
     const stderr_trimmed = std.mem.trim(u8, capture.stderr, " \t\r\n");
     if (stderr_trimmed.len > 0 and stdout_trimmed.len > 0) {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "exit={d} stderr={s}; stdout={s}",
             .{ capture.exit_code, stderr_trimmed, stdout_trimmed },
         );
     }
     if (stderr_trimmed.len > 0) {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "exit={d} stderr={s}",
             .{ capture.exit_code, stderr_trimmed },
         );
     }
     if (stdout_trimmed.len > 0) {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "exit={d} stdout={s}",
             .{ capture.exit_code, stdout_trimmed },
         );
     }
-    return std.fmt.allocPrint(allocator, "exit={d}", .{capture.exit_code});
+    return allocator.print("exit={d}", .{capture.exit_code});
 }
 
 fn boolField(obj: core_json.ObjectMap, key: []const u8) ?bool {
@@ -888,8 +881,7 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
     const base = "/tmp";
     var attempt: usize = 0;
     while (attempt < 32) : (attempt += 1) {
-        const candidate = try std.fmt.allocPrint(
-            allocator,
+        const candidate = try allocator.print(
             "{s}/{s}-{d}-{d}",
             .{ base, prefix, @divFloor(
                 std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
@@ -899,7 +891,7 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
         std.Io.Dir.createDirAbsolute(
             std.Io.Threaded.global_single_threaded.io(),
             candidate,
-            @enumFromInt(0o700),
+            @fromBackingInt(@intCast(0o700)),
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(candidate);
@@ -1037,7 +1029,8 @@ test "overload classification delegates to structured proxy policy" {
 }
 
 test "overload scenario route drives production proxy retry integration" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const ctx = Context{
         .io = std.testing.io,
         .cwd = "/tmp",
@@ -1117,7 +1110,7 @@ fn spawnCapturedCommand(
     var cwd_storage: ?[:0]u8 = null;
     defer if (cwd_storage) |path| allocator.free(path);
     if (cwd) |path| {
-        cwd_storage = try allocator.dupeZ(u8, path);
+        cwd_storage = try allocator.dupeSentinel(u8, path, 0);
         if (std.c.posix_spawn_file_actions_addchdir_np(
             &actions,
             cwd_storage.?.ptr,
@@ -1133,7 +1126,7 @@ fn spawnCapturedCommand(
         allocator.free(arg_storage);
     }
     for (argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_storage[i] = try allocator.dupeSentinel(u8, arg, 0);
         arg_count += 1;
         argv_buf[i] = arg_storage[i].ptr;
     }

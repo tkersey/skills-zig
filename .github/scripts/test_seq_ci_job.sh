@@ -73,12 +73,12 @@ expect_count() {
   fi
 }
 
-expect_count 1 "zig build build-seq -Doptimize=ReleaseFast --summary all"
-expect_count 0 "zig build build-seq -Doptimize=Debug"
+expect_count 1 "zig build build-seq -Doptimize=fast --summary all"
+expect_count 0 "zig build build-seq -Doptimize=debug"
 expect_count 0 "working-directory: apps/seq"
-expect_count 1 "zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=ReleaseFast --summary all"
-expect_count 1 "zig build test-definition-core test-definition-core-guard -Doptimize=ReleaseFast --summary all"
-expect_count 1 "zig build test-trace-core -Doptimize=ReleaseFast --summary all"
+expect_count 1 "zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=fast --summary all"
+expect_count 1 "zig build test-definition-core test-definition-core-guard -Doptimize=fast --summary all"
+expect_count 1 "zig build test-trace-core -Doptimize=fast --summary all"
 expect_count 1 "zig build test-jsonl-core --summary all"
 expect_count 1 "zig build test-durable-store --summary all"
 expect_count 1 "zig build test-durable-store-perf --summary all"
@@ -87,7 +87,7 @@ expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq
 for token in \
   'Fuzz passive definition parsing (Linux)' \
   'linux_fuzz_gate.sh -- zig build test-definition-core' \
-  '-Doptimize=ReleaseSafe --fuzz=100K --summary all'; do
+  '-Doptimize=safe --fuzz=100K --summary all'; do
   if ! grep -Fq -- "$token" <<<"$seq_fuzz_job"; then
     echo "Seq fuzz proof token missing: $token" >&2
     exit 1

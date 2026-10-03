@@ -189,7 +189,7 @@ fn runSelectedTarget(allocator: std.mem.Allocator, io: std.Io, argv: []const []c
         ) catch null;
         if (exe_dir) |dir| {
             defer allocator.free(dir);
-            break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target_name });
+            break :blk try allocator.print("{s}/{s}", .{ dir, target_name });
         }
         break :blk try allocator.dupe(u8, target_name);
     };
@@ -258,7 +258,7 @@ fn appendAppServerDelegateArgs(
 }
 
 fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
-    if (builtin.os.tag == .macos) return runCommandPosixSpawn(allocator, args);
+    if (builtin.target.os.tag == .macos) return runCommandPosixSpawn(allocator, args);
 
     var child = try std.process.spawn(io, .{
         .argv = args,
@@ -269,7 +269,7 @@ fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     const term = try child.wait(io);
     return switch (term) {
         .exited => |code| code,
-        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @backingInt(signal), @as(u32, 255))),
         .stopped, .unknown => 1,
     };
 }
@@ -288,7 +288,7 @@ fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) 
     }
 
     for (args, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_storage[i] = try allocator.dupeSentinel(u8, arg, 0);
         arg_count += 1;
         argv_buf[i] = arg_storage[i].ptr;
     }
@@ -314,7 +314,7 @@ fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) 
 }
 
 fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
     return switch (err) {
         .NOMEM, .@"2BIG" => error.SystemResources,
         .MFILE => error.ProcessFdQuotaExceeded,
@@ -332,7 +332,7 @@ fn posixSpawnError(rc: c_int) anyerror {
 fn statusToExitCode(status: u32) u8 {
     if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
     if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        const signal: u32 = @backingInt(std.posix.W.TERMSIG(status));
         return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
     }
     return 1;

@@ -1,12 +1,21 @@
 const std = @import("std");
+const build_support = @import("apps/seq/build_support.zig");
 const cas_build = @import("apps/cas/build_support.zig");
 
 pub fn build(b: *std.Build) void {
-    enforceRepoLocalInstallOnly(b);
+    _ = build_support.installGuard(b, b.path("tools/install_guard.zig"));
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const test_support = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/testing_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const ctx: BuildContext = .{
         .b = b,
-        .target = b.standardTargetOptions(.{}),
-        .optimize = b.standardOptimizeOption(.{}),
+        .target = target,
+        .optimize = optimize,
+        .test_support = test_support,
     };
     const cas_release = cas_build.Options.init(b);
     const shared = SharedModules.init(ctx);
@@ -37,6 +46,13 @@ pub fn build(b: *std.Build) void {
     full.dependOn(routine);
     addSharedTests(ctx, shared, routine);
     addCoreTests(ctx, shared, routine);
+    const install_guard_tests = addTestStep(
+        b,
+        ctx.module("tools/install_guard.zig", &.{}),
+        "test-install-guard",
+        "Test development install admission",
+    );
+    routine.dependOn(&install_guard_tests.step);
     addSlowTests(ctx, shared, full);
     addPerformance(ctx, shared, seq.core, ledger.core, cas.automation, routine);
     addLint(ctx, &surfaces);
@@ -45,24 +61,27 @@ pub fn build(b: *std.Build) void {
 const BuildContext = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
+    test_support: *std.Build.Module,
 
     fn module(
         self: BuildContext,
         path: []const u8,
         imports: []const std.Build.Module.Import,
     ) *std.Build.Module {
-        return self.b.createModule(.{
+        const result = self.b.createModule(.{
             .root_source_file = self.b.path(path),
             .target = self.target,
             .optimize = self.optimize,
             .imports = imports,
         });
+        result.addImport("test_support", self.test_support);
+        return result;
     }
 
     fn fast(self: BuildContext) BuildContext {
         var result = self;
-        result.optimize = .ReleaseFast;
+        result.optimize = .fast;
         return result;
     }
 };
@@ -143,8 +162,14 @@ const DefinitionApp = struct {
 
 fn buildSeq(ctx: BuildContext, shared: SharedModules) DefinitionApp {
     const b = ctx.b;
+    const c_time = @import("translate_c").Translator.init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("apps/seq/src/time.h"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
     const seq_time = ctx.module("apps/seq/src/time_utils.zig", &.{
         .{ .name = "core_calendar", .module = shared.calendar },
+        .{ .name = "c_time", .module = c_time.mod },
     });
     const seq_v1_core = ctx.module("apps/seq/src/v1/root.zig", &.{
         .{ .name = "definition_core", .module = shared.definitions },
@@ -159,7 +184,7 @@ fn buildSeq(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         .{ .name = "definition_core", .module = shared.definitions },
         .{ .name = "seq_v1_core", .module = seq_v1_core },
     });
-    seq_root.strip = ctx.optimize == .ReleaseFast;
+    seq_root.strip = ctx.optimize == .fast;
     const seq = addInstalledExecutable(b, "seq", seq_root);
     const run_seq_tests = addTestStep(
         b,
@@ -167,6 +192,11 @@ fn buildSeq(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "test-seq",
         "Run Seq 1.0 command and observation tests",
     );
+    const timezone_tests = addTestStep(b, ctx.module("apps/seq/src/timezone_tests.zig", &.{
+        .{ .name = "seq_time", .module = seq_time },
+    }), "test-seq-time-local", "Verify translated local timezone semantics");
+    timezone_tests.setEnvironmentVariable("TZ", "America/Los_Angeles");
+    run_seq_tests.step.dependOn(&timezone_tests.step);
     const run_seq_core_tests = addTestStep(
         b,
         seq_v1_core,
@@ -183,7 +213,7 @@ fn buildSeq(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "Run Seq 1.0 definition and observation smoke tests",
     );
     run_seq_cli_smoke.dependOn(&seq_cli_smoke_cmd.step);
-    addRunStep(b, seq.exe, "run-seq", "Run seq", &.{});
+    addRunStep(b, seq.exe, "run-seq", "Run seq");
     return .{
         .core = seq_v1_core,
         .surface = appSurface(b, .{
@@ -203,7 +233,7 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
     const ledger_v1_core = modules.core;
     const ledger_meta = modules.meta;
     const ledger_root = modules.root;
-    ledger_root.strip = ctx.optimize == .ReleaseFast;
+    ledger_root.strip = ctx.optimize == .fast;
     const ledger = addInstalledExecutable(b, "ledger", ledger_root);
     const ledger_anchor_probe_step = addLedgerRootAnchorProbe(
         ctx,
@@ -218,6 +248,7 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "test-ledger-cli",
         "Run Ledger 1.0 command and artifact tests",
     );
+    run_ledger_tests.step.dependOn(addLedgerPanicProbe(ctx, ledger_root));
     const run_storage_root_tests = addTestStep(
         b,
         ledger_storage_root,
@@ -242,7 +273,7 @@ fn buildLedger(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         &run_ledger_core_tests.step, run_ledger_cli_smoke,
         ledger_anchor_probe_step,
     });
-    addRunStep(b, ledger.exe, "run-ledger", "Run ledger", &.{"--help"});
+    addRunStep(b, ledger.exe, "run-ledger", "Run ledger");
     return .{
         .core = ledger_v1_core,
         .surface = appSurface(b, .{
@@ -265,6 +296,24 @@ const LedgerModules = struct {
     meta: *std.Build.Module,
     root: *std.Build.Module,
 };
+
+fn addLedgerPanicProbe(ctx: BuildContext, product: *std.Build.Module) *std.Build.Step {
+    const b = ctx.b;
+    const root = ctx.fast().module("apps/ledger/src/v1/panic_probe.zig", &.{});
+    var imports = product.import_table.iterator();
+    while (imports.next()) |entry| root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const executable = addExecutable(b, "ledger-panic-probe", root);
+    const run = b.addRunArtifact(executable);
+    run.addCheck(.{ .expect_term = .{ .signal = switch (ctx.target.result.cpu.arch) {
+        .aarch64 => .TRAP,
+        else => .ILL,
+    } } });
+    run.expectStdErrEqual("ledger panic probe");
+    run.expectStdOutEqual("");
+    const step = b.step("test-ledger-panic", "Exercise the shipped panic callback");
+    step.dependOn(&run.step);
+    return step;
+}
 
 fn createLedgerModules(ctx: BuildContext, shared: SharedModules) LedgerModules {
     const storage_root = ctx.module("apps/ledger/src/v1/storage_root.zig", &.{
@@ -376,7 +425,7 @@ fn buildMemoryNote(ctx: BuildContext, shared: SharedModules) AppSurface {
         "test-memory-note",
         "Run memory-note tests",
     );
-    addRunStep(b, memory_note.exe, "run-memory-note", "Run memory-note", &.{"--help"});
+    addRunStep(b, memory_note.exe, "run-memory-note", "Run memory-note");
     return appSurface(b, .{
         .path = b.path("apps/memory-note"),
         .build_step_name = "build-memory-note",
@@ -395,7 +444,7 @@ fn buildTypeSafe(ctx: BuildContext, shared: SharedModules) AppSurface {
     });
     const cli = addInstalledExecutable(b, "typesafe", root);
     const tests = addTestStep(b, root, "test-typesafe", "Run TypeSafe CLI tests");
-    addRunStep(b, cli.exe, "run-typesafe", "Run TypeSafe CLI", &.{"--help"});
+    addRunStep(b, cli.exe, "run-typesafe", "Run TypeSafe CLI");
     return appSurface(b, .{
         .path = b.path("apps/typesafe"),
         .build_step_name = "build-typesafe",
@@ -439,7 +488,7 @@ fn buildLift(ctx: BuildContext, shared: SharedModules) AppSurface {
         "Run bench_stats performance harness",
     );
     const test_lift = addLiftTests(b, lift_bench_root, lift_report_root, lift_bench_perf_root);
-    addRunStep(b, bench_stats.exe, "run-bench-stats", "Run bench_stats", &.{"--help"});
+    addRunStep(b, bench_stats.exe, "run-bench-stats", "Run bench_stats");
     return appSurface(b, .{
         .path = b.path("apps/lift"),
         .build_step_name = "build-lift",
@@ -999,7 +1048,8 @@ fn addCasDispatcherTest(ctx: BuildContext, artifacts: CasArtifacts, tests: *std.
     const b = ctx.b;
     // This lane is intentionally absent off native Linux.
     if (b.graph.host.result.os.tag != .linux or ctx.target.result.os.tag != .linux) return;
-    const run = b.addSystemCommand(&.{ b.getInstallPath(.bin, "cas"), "review", "--help" });
+    const run = b.addRunFile(b.graph.path(.install_bin, "cas"));
+    run.addArgs(&.{ "review", "--help" });
     run.step.dependOn(&artifacts.dispatcher.install.step);
     run.step.dependOn(&artifacts.review.install.step);
     run.expectStdOutMatch("cas review");
@@ -1012,23 +1062,21 @@ fn addCasDispatcherTest(ctx: BuildContext, artifacts: CasArtifacts, tests: *std.
 }
 
 fn addCasRunSteps(b: *std.Build, artifacts: CasArtifacts) void {
-    addRunStep(b, artifacts.smoke.exe, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
+    addRunStep(b, artifacts.smoke.exe, "run-cas-smoke-check", "Run cas_smoke_check");
     addRunStep(
         b,
         artifacts.conformance.exe,
         "run-cas-conformance-suite",
         "Run cas_conformance_suite",
-        &.{"--help"},
     );
     addRunStep(
         b,
         artifacts.inquiry.exe,
         "run-cas-session-inquiry",
         "Run cas_session_inquiry",
-        &.{"--help"},
     );
-    addRunStep(b, artifacts.goal.exe, "run-cas-goal", "Run cas_goal", &.{"--help"});
-    addRunStep(b, artifacts.account.exe, "run-cas-account", "Run cas_account", &.{"--help"});
+    addRunStep(b, artifacts.goal.exe, "run-cas-goal", "Run cas_goal");
+    addRunStep(b, artifacts.account.exe, "run-cas-account", "Run cas_account");
 }
 
 fn addSharedTests(ctx: BuildContext, shared: SharedModules, routine: *std.Build.Step) void {
@@ -1076,6 +1124,12 @@ fn addSharedTests(ctx: BuildContext, shared: SharedModules, routine: *std.Build.
 fn addCoreTests(ctx: BuildContext, shared: SharedModules, routine: *std.Build.Step) void {
     const b = ctx.b;
     const core = b.step("test-core", "Run shared core helper tests");
+    core.dependOn(&addTestStep(
+        b,
+        ctx.test_support,
+        "test-core-testing",
+        "Verify deterministic allocation fault injection",
+    ).step);
     const run_calendar_tests = addTestStep(
         b,
         shared.calendar,
@@ -1137,6 +1191,7 @@ fn addSlowTests(ctx: BuildContext, shared: SharedModules, full: *std.Build.Step)
         "Run the greater-than-256-MiB streaming regression in ReleaseFast",
     );
     test_jsonl_stream_large.dependOn(&run_jsonl_large_tests.step);
+    full.dependOn(test_jsonl_stream_large);
     const run_canonical_json_corpus_tests = addTestStep(
         b,
         canonical_json_corpus_tests_root,
@@ -1269,12 +1324,11 @@ fn addLint(ctx: BuildContext, app_surfaces: []const AppSurface) void {
         lint_step.dependOn(buildLintStep(b, ctx.target, app_surfaces));
     } else {
         const lint_cmd = b.addSystemCommand(
-            &.{ "zig", "build", "lint", "-Doptimize=ReleaseFast", "-Denable_zlinter=true" },
+            &.{
+                b.graph.zig_exe, "build", "lint", "-Doptimize=fast", "-Denable_zlinter=true", "--",
+            },
         );
-        if (b.args) |args| {
-            lint_cmd.addArg("--");
-            lint_cmd.addArgs(args);
-        }
+        lint_cmd.addPassthruArgs();
         lint_step.dependOn(&lint_cmd.step);
     }
 }
@@ -1303,6 +1357,7 @@ fn addInstalledExecutable(
 ) InstalledExecutable {
     const exe = addExecutable(b, name, root);
     const install = b.addInstallArtifact(exe, .{});
+    build_support.guardInstall(b, install);
     b.getInstallStep().dependOn(&install.step);
     return .{ .exe = exe, .install = install };
 }
@@ -1312,15 +1367,10 @@ fn addRunStep(
     exe: *std.Build.Step.Compile,
     step_name: []const u8,
     description: []const u8,
-    default_args: []const []const u8,
 ) void {
     const run_cmd = b.addRunArtifact(exe);
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    } else if (default_args.len > 0) {
-        run_cmd.addArgs(default_args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step(step_name, description);
     run_step.dependOn(&run_cmd.step);
@@ -1335,7 +1385,7 @@ fn addRunStepPrefixed(
 ) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.addArgs(fixed_args);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step(step_name, description);
     run_step.dependOn(&run_cmd.step);
 }
@@ -1347,7 +1397,7 @@ fn addBenchStep(
     description: []const u8,
 ) void {
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const step = b.step(step_name, description);
     step.dependOn(&run_cmd.step);
 }
@@ -1409,7 +1459,7 @@ fn addTestStepWithOptions(
     }
     const run_tests = b.addRunArtifact(tests);
     if (options.cwd) |cwd| run_tests.setCwd(cwd);
-    if (b.args) |args| run_tests.addArgs(args);
+    run_tests.addPassthruArgs();
     const step = b.step(step_name, description);
     step.dependOn(&run_tests.step);
     return run_tests;
@@ -1421,27 +1471,6 @@ fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
     return options.createModule();
 }
 
-fn enforceRepoLocalInstallOnly(b: *std.Build) void {
-    const expected_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
-    defer b.allocator.free(expected_prefix);
-
-    const expected_exe_dir = b.pathJoin(&.{ expected_prefix, "bin" });
-    defer b.allocator.free(expected_exe_dir);
-
-    if (b.dest_dir != null or
-        !std.mem.eql(u8, b.install_prefix, expected_prefix) or
-        !std.mem.eql(u8, b.install_path, expected_prefix) or
-        !std.mem.eql(u8, b.exe_dir, expected_exe_dir))
-    {
-        std.debug.panic(
-            "skills-zig forbids external installs; ship CLIs via the Homebrew tap release flow " ++
-                "only. expected install_prefix={s} exe_dir={s}; got install_prefix={s} " ++
-                "exe_dir={s} dest_dir={?s}",
-            .{ expected_prefix, expected_exe_dir, b.install_prefix, b.exe_dir, b.dest_dir },
-        );
-    }
-}
-
 fn buildLintStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1450,25 +1479,20 @@ fn buildLintStep(
     const zlinter = @import("zlinter");
     var lint_builder = zlinter.builder(b, .{
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     for (app_surfaces) |surface| {
-        lint_builder.addPaths(.{ .include = &.{surface.path} });
+        lint_builder.addPaths(.{ .include_dirs = &.{surface.path} });
     }
     lint_builder.addPaths(.{
-        .include = &.{
-            b.path("libs/core"),
-            b.path("libs/jsonl_core"),
-            b.path("libs/trace_core"),
-            b.path("build.zig"),
+        .include_dirs = &.{
+            b.path("libs"),
             b.path("tools"),
         },
-        // `zlinter` routes `@cImport` files through `zls` translate-c, which
-        // currently emits spurious stderr for this one seq helper on 0.16.
-        .exclude = &.{
-            b.path("apps/seq/src/time_utils.zig"),
-        },
     });
+    lint_builder.addPaths(.{ .include_files = &.{b.path("build.zig")} });
     lint_builder.addRule(.{ .builtin = .no_unused }, .{});
-    return lint_builder.build();
+    const step = lint_builder.build();
+    @import("tools/zlinter_compat.zig").apply(b, step);
+    return step;
 }

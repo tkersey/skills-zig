@@ -705,7 +705,7 @@ fn runObserve(
         args.projection,
     ) orelse return error.UnknownObservationProjection;
     const json_renderer_bit = @as(u8, 1) <<
-        @intCast(@intFromEnum(seq.definition.Renderer.json));
+        @intCast(@backingInt(seq.definition.Renderer.json));
     if ((projection.renderer_mask & json_renderer_bit) == 0) {
         return error.ObservationRendererNotDeclared;
     }
@@ -1391,7 +1391,7 @@ fn runStreamingParseTasks(
 ) !void {
     const prefetch = 3;
     defer for (tasks) |*task| task.deinit();
-    var threads = [_]?std.Thread{null} ** prefetch;
+    var threads = @as([prefetch]?std.Thread, @splat(null));
     // Parsed results may be released only after this barrier, including spawn/parse failures.
     defer for (&threads) |*thread| if (thread.*) |running| running.join();
     for (0..@min(prefetch, tasks.len)) |index| {
@@ -2674,7 +2674,7 @@ fn selectorAllowed(
     plan: *const seq.definition.Plan,
     selector: seq.definition.Selector,
 ) bool {
-    const bit = @as(u8, 1) << @intCast(@intFromEnum(selector));
+    const bit = @as(u8, 1) << @intCast(@backingInt(selector));
     return (plan.selector_mask & bit) != 0;
 }
 
@@ -2951,7 +2951,7 @@ test "failed first parse joins and releases prefetched successful results" {
     });
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, "rollout.jsonl", allocator);
     defer allocator.free(path);
-    const missing = try std.fmt.allocPrint(allocator, "{s}.missing", .{path});
+    const missing = try allocator.print("{s}.missing", .{path});
     defer allocator.free(missing);
     var tasks = [_]StreamingParseTask{
         .{
@@ -2996,14 +2996,14 @@ fn exerciseRetainedGraphResultFailure(allocator: std.mem.Allocator) !void {
     const result = try graph.retainResult(
         .{ .table = .{ .values = source, .width = 1 }, .source_rows = 1, .materialized_rows = 1 },
         .{},
-        [_]u8{'0'} ** 71,
+        @as([71]u8, @splat('0')),
     );
     try std.testing.expectEqual(42, result.result.values[0].integer);
     try std.testing.expectEqual(1, result.result.row_count);
 }
 
 test "graph result retention releases the source table on every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseRetainedGraphResultFailure,
         .{},
