@@ -29,6 +29,7 @@ Release contract:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - `build.zig` and `build.zig.zon` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
+   - shared install admission (`apps/seq/build_support.zig` and `tools/install_guard.zig`) counts for every shipped CLI, regardless of its source directory.
    - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
    - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
    - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.

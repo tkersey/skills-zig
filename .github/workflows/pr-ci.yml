@@ -24,6 +24,7 @@ on:
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
       - "tools/durable_store_perf.zig"
+      - "tools/install_guard.zig"
       - "tools/perf_hub.zig"
       - "tools/perf_contract.zig"
       - "docs/release/**"

@@ -47,8 +47,8 @@ is retained; managed-root admission adds focused unit tests.
 ## Qualification
 
 ```sh
-zig build build-ledger test-ledger -Doptimize=ReleaseFast --summary all
-zig build test-ledger-segmented -Doptimize=ReleaseFast --summary all
+zig build build-ledger test-ledger -Doptimize=fast --summary all
+zig build test-ledger-segmented -Doptimize=fast --summary all
 ```
 
 Storage relocation must preserve the original history and validate destination

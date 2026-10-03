@@ -12,6 +12,7 @@ git config user.email test@example.invalid
 git config user.name release-apps-test
 
 apps=(seq lift cas ledger memory-note typesafe)
+shared_build_paths=(apps/seq/build_support.zig tools/install_guard.zig)
 for app in "${apps[@]}"; do
   mkdir -p "apps/$app"
   printf '1.0.0\n' >"apps/$app/VERSION"
@@ -72,6 +73,11 @@ assert_ci_affected() {
 write_seq() {
   mkdir -p apps/seq/src
   printf 'seq\n' >apps/seq/src/main.zig
+}
+
+write_shared_build_helper() {
+  mkdir -p "$(dirname "$1")"
+  printf '// shared install admission\n' >"$1"
 }
 
 write_ledger() {
@@ -266,6 +272,10 @@ write_frozen_cas_automation_fixture() {
 }
 
 assert_affected seq write_seq
+for helper_path in "${shared_build_paths[@]}"; do
+  assert_affected seq,lift,cas,ledger,memory-note,typesafe write_shared_build_helper "$helper_path"
+  assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_shared_build_helper "$helper_path"
+done
 assert_affected ledger write_ledger
 assert_affected cas write_frozen_cas_automation_fixture
 assert_affected seq,cas,ledger write_definition_core
@@ -390,30 +400,35 @@ for retired_argument in ctx cas.surface; do
   fi
 done
 
-auto_release_paths=()
-while IFS= read -r trigger_path; do
-  auto_release_paths+=("$trigger_path")
-done < <(
-  sed -n \
-    '/^    paths:/,/^[^ ]/s/^      - "\(.*\)"$/\1/p' \
-    "$repo_root/.github/workflows/auto-release.yml"
-)
-while IFS= read -r release_path; do
-  covered=0
-  for trigger_path in "${auto_release_paths[@]}"; do
-    if [[ "$release_path" == $trigger_path ]]; then
-      covered=1
-      break
+assert_workflow_coverage() {
+  local workflow="$1" trigger_path release_path covered
+  local trigger_paths=()
+  while IFS= read -r trigger_path; do
+    trigger_paths+=("$trigger_path")
+  done < <(
+    sed -n '/^    paths:/,/^[^ ]/s/^      - "\(.*\)"$/\1/p' "$workflow"
+  )
+  while IFS= read -r release_path; do
+    covered=0
+    for trigger_path in "${trigger_paths[@]}"; do
+      # GitHub workflow path filters are glob patterns.
+      # shellcheck disable=SC2053
+      if [[ "$release_path" == $trigger_path ]]; then
+        covered=1
+        break
+      fi
+    done
+    if [[ "$covered" -ne 1 ]]; then
+      echo "$workflow paths omit classifier fixture $release_path" >&2
+      return 1
     fi
   done
-  if [[ "$covered" -ne 1 ]]; then
-    echo "auto-release paths omit classifier fixture $release_path" >&2
-    exit 1
-  fi
-done < <(
-  printf '%s\n' "${!release_fixture_paths[@]}" |
-    LC_ALL=C sort
-)
+}
+
+printf '%s\n' "${!release_fixture_paths[@]}" | LC_ALL=C sort |
+  assert_workflow_coverage "$repo_root/.github/workflows/auto-release.yml"
+printf '%s\n' "${shared_build_paths[@]}" |
+  assert_workflow_coverage "$repo_root/.github/workflows/pr-ci.yml"
 
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION
