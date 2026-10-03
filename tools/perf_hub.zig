@@ -368,6 +368,7 @@ const ratio_scale: u64 = 1_000_000;
 const resource_tolerance_pct: f64 = 2.0;
 const git_binary = "/usr/bin/git";
 var process_environment: ?*const std.process.Environ.Map = null;
+var process_io: ?std.Io = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
     .help_text = UsageText,
@@ -1102,6 +1103,7 @@ const ParsedArgs = struct {
 
 pub fn main(init: std.process.Init) !void {
     process_environment = init.environ_map;
+    process_io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
@@ -5156,7 +5158,9 @@ fn runChildCapture(
         return runChildCapturePosixSpawn(allocator, cwd, argv, false);
     }
 
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+    const io = if (builtin.is_test) std.testing.io else process_io orelse
+        return error.ProcessIoRequired;
+    const result = try std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(8 * 1024 * 1024),
