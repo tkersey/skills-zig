@@ -15,8 +15,35 @@ const DriverSourceIdentity = struct {
     sha256: []const u8,
 };
 const DriverKind = enum { seq_replay, optimization };
+const seq_replay_driver_source = @embedFile("seq_replay_driver.zig");
+const seq_replay_driver_sha256 = comptimeDigest(seq_replay_driver_source);
+const seq_replay_driver_locator = "tools/seq_replay_driver.zig";
+const seq_replay_driver_tree_sha256 = seqReplayDriverTreeDigest();
+const active_seq_replay_driver_v2 = DriverSourceIdentity{
+    .revision = &seq_replay_driver_sha256,
+    .tree = &seq_replay_driver_tree_sha256,
+    .locator = seq_replay_driver_locator,
+    .sha256 = &seq_replay_driver_sha256,
+};
+
+fn seqReplayDriverTreeDigest() [64]u8 {
+    @setEvalBranchQuota(4_000_000);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("seq-replay-driver-tree/v2\x00");
+    hasher.update(seq_replay_driver_locator);
+    hasher.update("\x00");
+    hasher.update(&seq_replay_driver_sha256);
+    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+}
+
 const optimization_driver_source = @embedFile("optimization_driver.zig");
-const optimization_build_source = @embedFile("optimization_build.zig");
+const optimization_build_source =
+    \\pub fn build(b: *std.Build) void {
+    \\    @import("build_product.zig").build(b);
+    \\    addOptimizationDriver(b);
+    \\}
+    \\
+++ @embedFile("optimization_build.zig");
 const optimization_driver_sha256 = comptimeDigest(optimization_driver_source);
 const optimization_build_sha256 = comptimeDigest(optimization_build_source);
 const optimization_source_tree_sha256 = optimizationSourceTreeDigest();
@@ -26,6 +53,15 @@ const active_optimization_driver_v1 = DriverSourceIdentity{
     .locator = "tools/optimization_driver.zig",
     .sha256 = &optimization_driver_sha256,
 };
+// Readback-only identity from the pre-migration source at 9c4a5584608e23cfe3b5c125b9b1e1df38b53aa2.
+const legacy_optimization_driver_v1 = DriverSourceIdentity{
+    .revision = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+    .tree = "4eb77ac0c61b57e3d739be6a1d9a5a2f023e28855f06fd78eac94c0a4e9ba9dd",
+    .locator = "tools/optimization_driver.zig",
+    .sha256 = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+};
+const legacy_optimization_build_sha256 =
+    "5eaae873185f3f472269a7dcc1d2c41c61f56fbfbc13542f941acc98ef082769";
 
 fn comptimeDigest(comptime source: []const u8) [64]u8 {
     @setEvalBranchQuota(4_000_000);
@@ -44,14 +80,14 @@ fn optimizationSourceTreeDigest() [64]u8 {
 
 fn driverIdentity(kind: DriverKind) DriverSourceIdentity {
     return switch (kind) {
-        .seq_replay => active_seq_replay_driver_v1,
+        .seq_replay => active_seq_replay_driver_v2,
         .optimization => active_optimization_driver_v1,
     };
 }
 
 fn driverSourceBytes(kind: DriverKind) []const u8 {
     return switch (kind) {
-        .seq_replay => sealed_seq_replay_driver_source,
+        .seq_replay => seq_replay_driver_source,
         .optimization => optimization_driver_source,
     };
 }
@@ -71,7 +107,7 @@ const sealed_seq_replay_driver_locator =
     "tools/perf_hub.zig#sealed_seq_replay_driver_source";
 const sealed_seq_replay_driver_sha256 =
     "e5d06b290c19f23af281213ba04b43c7c68962b0906b4c1658c981e624b24053";
-const active_seq_replay_driver_v1 = DriverSourceIdentity{
+const legacy_seq_replay_driver_v1 = DriverSourceIdentity{
     .revision = sealed_seq_replay_driver_sha256,
     .tree = "118e358ab6c6b74bded7dc77d3932c9b8b289a83904604e82e8221109458fe9b",
     .locator = sealed_seq_replay_driver_locator,
@@ -332,6 +368,7 @@ const ratio_scale: u64 = 1_000_000;
 const resource_tolerance_pct: f64 = 2.0;
 const git_binary = "/usr/bin/git";
 var process_environment: ?*const std.process.Environ.Map = null;
+var process_io: ?std.Io = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
     .help_text = UsageText,
@@ -1066,6 +1103,7 @@ const ParsedArgs = struct {
 
 pub fn main(init: std.process.Init) !void {
     process_environment = init.environ_map;
+    process_io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
@@ -1183,7 +1221,7 @@ const SealedFile = struct {
 
     fn clone(self: SealedFile, allocator: std.mem.Allocator) !SealedFile {
         return .{
-            .path = try allocator.dupeZ(u8, self.path),
+            .path = try allocator.dupeSentinel(u8, self.path, 0),
             .sha256 = self.sha256,
         };
     }
@@ -1200,7 +1238,7 @@ const CompilerEvidence = struct {
     version: []u8,
 
     fn clone(self: CompilerEvidence, allocator: std.mem.Allocator) !CompilerEvidence {
-        const approved_path = try allocator.dupeZ(u8, self.approved_path);
+        const approved_path = try allocator.dupeSentinel(u8, self.approved_path, 0);
         errdefer allocator.free(approved_path);
         var file = try self.file.clone(allocator);
         errdefer file.deinit(allocator);
@@ -2166,7 +2204,7 @@ fn sealEvidenceBytes(
     );
     defer allocator.free(real_path);
     return .{
-        .path = try allocator.dupeZ(u8, real_path),
+        .path = try allocator.dupeSentinel(u8, real_path, 0),
         .sha256 = digest,
     };
 }
@@ -2960,7 +2998,7 @@ fn runOptimizationMeasurements(
     baseline_driver: DriverEvidence,
     candidate_driver: DriverEvidence,
 ) !PairedMetrics {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+    if (builtin.target.os.tag != .macos or builtin.target.cpu.arch != .aarch64) {
         return error.UnsupportedOptimizationMeasurement;
     }
     const baseline = try optimizationOracle(
@@ -3127,8 +3165,7 @@ fn ensureSourceBuilt(
     kind: DriverKind,
 ) !*const BuiltSource {
     if (!validFullRevision(expected_source_sha)) return error.DriverSourceRevisionMismatch;
-    const key = try std.fmt.allocPrint(
-        allocator,
+    const key = try allocator.print(
         "{s}:isolated-source:{s}",
         .{ source_root, @tagName(kind) },
     );
@@ -3193,7 +3230,8 @@ fn buildIsolatedSource(
     errdefer archive.deinit(allocator);
     const prefix = try std.fs.path.join(allocator, &.{ snapshot, "zig-out" });
     defer allocator.free(prefix);
-    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "", kind);
+    const zig_path = compiler.approved_path;
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, zig_path, "", kind);
     try requireBuildSourceUnchanged(allocator, root, revision, tree);
     try verifySealedFile(compiler.file);
     try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
@@ -3203,7 +3241,7 @@ fn buildIsolatedSource(
     errdefer ledger.deinit(allocator);
     try overlayReplayDriver(allocator, snapshot, driver_bytes, driver_file);
     if (build_file) |file| try overlayDriverBuild(allocator, snapshot, file);
-    try runIsolatedBuild(allocator, snapshot, staging, prefix, compiler, "driver-", kind);
+    try runIsolatedBuild(allocator, snapshot, staging, prefix, zig_path, "driver-", kind);
     try verifySealedFile(driver_file);
     if (build_file) |file| try verifySealedFile(file);
     try requireCompilerDigestAtPath(compiler.approved_path, &compiler.file.sha256);
@@ -3300,8 +3338,7 @@ fn sourceStagingDir(
     defer allocator.free(root);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(root);
     const now = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
-    const staging = try std.fmt.allocPrint(
-        allocator,
+    const staging = try allocator.print(
         "{s}/.build-{s}-{d}",
         .{ root, source_sha[0..@min(source_sha.len, 12)], now },
     );
@@ -3360,7 +3397,7 @@ fn runIsolatedBuild(
     snapshot: []const u8,
     staging_dir: []const u8,
     prefix: []const u8,
-    compiler: CompilerEvidence,
+    compiler_path: []const u8,
     comptime cache_prefix: []const u8,
     kind: DriverKind,
 ) !void {
@@ -3373,17 +3410,30 @@ fn runIsolatedBuild(
     defer allocator.free(global);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(prefix);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global);
+    const packages = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, cache_prefix ++ "packages" },
+    );
+    defer allocator.free(packages);
+    const global_tmp = try std.fs.path.join(allocator, &.{ global, "tmp" });
+    defer allocator.free(global_tmp);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(global_tmp);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(packages);
+    const global_env = try allocator.print("ZIG_GLOBAL_CACHE_DIR={s}", .{global});
+    defer allocator.free(global_env);
+    const packages_env = try allocator.print("ZIG_LOCAL_PKG_DIR={s}", .{packages});
+    defer allocator.free(packages_env);
     const argv = [_][]const u8{
-        compiler.approved_path,
+        "/usr/bin/env",
+        global_env,
+        packages_env,
+        compiler_path,
         "build",
-        "-Doptimize=ReleaseFast",
+        "-Doptimize=fast",
         "--prefix",
         prefix,
         "--cache-dir",
         cache,
-        "--global-cache-dir",
-        global,
     };
     const driver_argv = argv ++ [_][]const u8{
         "optimization-driver", "-Dtarget=aarch64-macos", "-Dcpu=baseline",
@@ -3490,8 +3540,7 @@ fn revisionTreeShaForRootAlloc(
     source_root: []const u8,
     revision: []const u8,
 ) ![]u8 {
-    const tree_revision = try std.fmt.allocPrint(
-        allocator,
+    const tree_revision = try allocator.print(
         "{s}^{{tree}}",
         .{revision},
     );
@@ -3661,8 +3710,7 @@ fn sourceDeepArtifactPath(
 ) ![]u8 {
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
-    const artifact_name = try std.fmt.allocPrint(
-        allocator,
+    const artifact_name = try allocator.print(
         "{s}.json",
         .{case_cfg.descriptor.case_id},
     );
@@ -3685,8 +3733,7 @@ fn validateCaptureAcknowledgment(
     raw: []const u8,
     case_id: []const u8,
 ) !void {
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "PASS\t{s}\tcaptured",
         .{case_id},
     );
@@ -4210,8 +4257,7 @@ fn compareMeasuredMetrics(
     if (candidate.p95_rss_bytes > allowed_rss) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "paired p95_rss_bytes candidate={d} base={d} allowed={d}",
                 .{
                     candidate.p95_rss_bytes,
@@ -4226,8 +4272,7 @@ fn compareMeasuredMetrics(
     if (candidate.p50_ns > allowed_p50) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "paired p50 candidate={d} base={d} allowed={d}",
                 .{ candidate.p50_ns, baseline.p50_ns, allowed_p50 },
             ),
@@ -4236,8 +4281,7 @@ fn compareMeasuredMetrics(
     if (candidate.p95_ns > allowed_p95) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "paired p95 candidate={d} base={d} allowed={d}",
                 .{ candidate.p95_ns, baseline.p95_ns, allowed_p95 },
             ),
@@ -4251,8 +4295,7 @@ fn compareMeasuredMetrics(
         if (candidate.p50_alloc_calls > allowed_alloc) {
             return .{
                 .status = "FAIL",
-                .detail = try std.fmt.allocPrint(
-                    std.heap.page_allocator,
+                .detail = try std.heap.page_allocator.print(
                     "paired p50_alloc_calls candidate={d} base={d} allowed={d}",
                     .{
                         candidate.p50_alloc_calls,
@@ -4269,7 +4312,7 @@ fn compareMeasuredMetrics(
 fn observableRssUpperBound(base: u64, tolerance_pct: f64) !u64 {
     const raw = allowedUpperBoundWithTolerance(base, tolerance_pct);
     const page_size: u64 = @intCast(C.sysconf(
-        @intFromEnum(std.c._SC.PAGESIZE),
+        @backingInt(std.c._SC.PAGESIZE),
     ));
     if (page_size == 0 or !std.math.isPowerOfTwo(page_size)) {
         return error.UnsupportedPeakRss;
@@ -4356,8 +4399,7 @@ fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDeta
     if (ratios.p50 > allowed_p50) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "balanced round p50 ratio_ppm={d} > {d}",
                 .{ ratios.p50, allowed_p50 },
             ),
@@ -4366,8 +4408,7 @@ fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDeta
     if (ratios.p95 > allowed_ratio) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "balanced round p95 ratio_ppm={d} > {d}",
                 .{ ratios.p95, allowed_ratio },
             ),
@@ -4376,8 +4417,7 @@ fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDeta
     if (ratios.allocations > allowed_allocations) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "balanced round allocation ratio_ppm={d} > {d}",
                 .{ ratios.allocations, allowed_allocations },
             ),
@@ -4390,8 +4430,7 @@ fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDeta
     if (ratios.rss > allowed_rss_ratio) {
         return .{
             .status = "FAIL",
-            .detail = try std.fmt.allocPrint(
-                std.heap.page_allocator,
+            .detail = try std.heap.page_allocator.print(
                 "balanced round rss ratio_ppm={d} > {d}",
                 .{ ratios.rss, allowed_rss_ratio },
             ),
@@ -4399,8 +4438,7 @@ fn compareBalancedRatios(case_cfg: DeepCase, ratios: BalancedRatios) !StatusDeta
     }
     return .{
         .status = "PASS",
-        .detail = try std.fmt.allocPrint(
-            std.heap.page_allocator,
+        .detail = try std.heap.page_allocator.print(
             "balanced round ratios p50_ppm={d} p95_ppm={d} " ++
                 "allocation_ppm={d} rss_ppm={d}",
             .{ ratios.p50, ratios.p95, ratios.allocations, ratios.rss },
@@ -4758,20 +4796,17 @@ fn prepareLedgerPerfDefinition(allocator: std.mem.Allocator, temp_root: []const 
         .limited(64 * 1024),
     );
     defer allocator.free(source);
-    const store_bytes = try std.fmt.allocPrint(
-        allocator,
+    const store_bytes = try allocator.print(
         "\"max_bytes\":{d}",
         .{ledger_perf_max_store_bytes},
     );
     defer allocator.free(store_bytes);
-    const max_store_bytes = try std.fmt.allocPrint(
-        allocator,
+    const max_store_bytes = try allocator.print(
         "\"max_store_bytes\":{d}",
         .{ledger_perf_max_store_bytes},
     );
     defer allocator.free(max_store_bytes);
-    const max_records = try std.fmt.allocPrint(
-        allocator,
+    const max_records = try allocator.print(
         "\"max_records\":{d}",
         .{ledger_perf_max_records},
     );
@@ -5101,7 +5136,7 @@ fn appendCasAutomationListArgs(
 ) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const stamp_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
-    const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{stamp_ms});
+    const db_name = try allocator.print("codex-dev-{d}.db", .{stamp_ms});
     const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
     try seedCasAutomationDb(allocator, db_path);
     try args.appendSlice(allocator, &.{ binary_path, "automation", "--db", db_path, "list" });
@@ -5119,11 +5154,13 @@ fn runChildCapture(
     cwd: []const u8,
     argv: []const []const u8,
 ) !ChildResult {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         return runChildCapturePosixSpawn(allocator, cwd, argv, false);
     }
 
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+    const io = if (builtin.is_test) std.testing.io else process_io orelse
+        return error.ProcessIoRequired;
+    const result = try std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(8 * 1024 * 1024),
@@ -5145,7 +5182,7 @@ fn runChildCaptureOutput(
     cwd: []const u8,
     argv: []const []const u8,
 ) !ChildResult {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         return runChildCapturePosixSpawn(allocator, cwd, argv, true);
     }
     return runChildCapture(allocator, cwd, argv);
@@ -5160,7 +5197,7 @@ fn runChildCapturePosixSpawn(
     if (argv.len == 0) return error.FileNotFound;
     var arguments = try SpawnArguments.init(allocator, argv);
     defer arguments.deinit(allocator);
-    const cwd_z = try allocator.dupeZ(u8, cwd);
+    const cwd_z = try allocator.dupeSentinel(u8, cwd, 0);
     defer allocator.free(cwd_z);
     var actions: std.c.posix_spawn_file_actions_t = undefined;
     const init_rc = std.c.posix_spawn_file_actions_init(&actions);
@@ -5177,7 +5214,7 @@ fn runChildCapturePosixSpawn(
         null;
     defer if (capture_path) |path| allocator.free(path);
     const capture_path_z = if (capture_path) |path|
-        try allocator.dupeZ(u8, path)
+        try allocator.dupeSentinel(u8, path, 0)
     else
         null;
     defer if (capture_path_z) |path| allocator.free(path);
@@ -5210,7 +5247,7 @@ const SpawnArguments = struct {
         var result = SpawnArguments{ .pointers = pointers, .storage = storage };
         errdefer for (storage[0..result.count]) |arg| allocator.free(arg);
         for (argv, 0..) |arg, idx| {
-            storage[idx] = try allocator.dupeZ(u8, arg);
+            storage[idx] = try allocator.dupeSentinel(u8, arg, 0);
             result.count += 1;
             pointers[idx] = storage[idx].ptr;
         }
@@ -5298,7 +5335,7 @@ fn waitForCapturedChild(
 }
 
 fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
     return switch (err) {
         .NOMEM, .@"2BIG" => error.SystemResources,
         .MFILE => error.ProcessFdQuotaExceeded,
@@ -5316,7 +5353,7 @@ fn posixSpawnError(rc: c_int) anyerror {
 fn statusToExitCode(status: u32) u8 {
     if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
     if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        const signal: u32 = @backingInt(std.posix.W.TERMSIG(status));
         return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
     }
     return 1;
@@ -5329,8 +5366,7 @@ fn makeTempRoot(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
     );
     defer allocator.free(cwd);
     const stamp = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
-    const base = try std.fmt.allocPrint(
-        allocator,
+    const base = try allocator.print(
         "{s}/.zig-cache/perf-hub/{d}-{s}",
         .{ cwd, stamp, label },
     );
@@ -5361,7 +5397,10 @@ fn makeExecutable(path: []const u8) !void {
         .{ .mode = .read_write },
     );
     defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.setPermissions(std.Io.Threaded.global_single_threaded.io(), @enumFromInt(0o755));
+    try file.setPermissions(
+        std.Io.Threaded.global_single_threaded.io(),
+        @fromBackingInt(@intCast(0o755)),
+    );
 }
 
 fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -5375,7 +5414,7 @@ fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![
 }
 
 fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
-    const db_path_z = try allocator.dupeZ(u8, db_path);
+    const db_path_z = try allocator.dupeSentinel(u8, db_path, 0);
     defer allocator.free(db_path_z);
     var db_opt: ?*Sqlite.sqlite3 = null;
     const open_rc = Sqlite.sqlite3_open(db_path_z, &db_opt);
@@ -5414,7 +5453,7 @@ fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void 
         \\);
         \\insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values ('cron-001', 'Daily Summary', 'Summarize recent runs', 'ACTIVE', null, null, '[]', 'RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15', 1772469600000, 1772469600000);
     ;
-    const schema_z = try allocator.dupeZ(u8, schema);
+    const schema_z = try allocator.dupeSentinel(u8, schema, 0);
     defer allocator.free(schema_z);
     var err_msg: ?[*:0]u8 = null;
     defer if (err_msg) |message| Sqlite.sqlite3_free(@ptrCast(message));
@@ -5923,8 +5962,7 @@ fn validateRetainedDeepWorkload(
             "apps/seq/src/v1/fixtures/message-observation.json",
             "apps/seq/src/v1/fixtures/rollout.jsonl",
         }) |path| {
-            const object = try std.fmt.allocPrint(
-                allocator,
+            const object = try allocator.print(
                 "{s}:{s}",
                 .{ revision, path },
             );
@@ -6035,7 +6073,13 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
         {
             return;
         }
-    } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v1) or
+        if (driverSourceMatchesIdentity(source, legacy_optimization_driver_v1) and
+            std.mem.eql(u8, build_file.sha256, "sha256:" ++ legacy_optimization_build_sha256))
+        {
+            return;
+        }
+    } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v2) or
+        driverSourceMatchesIdentity(source, legacy_seq_replay_driver_v1) or
         driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
     {
         return;
@@ -6316,7 +6360,7 @@ fn capsuleSealedFile(allocator: std.mem.Allocator, file: CapsuleFile) !SealedFil
     const digest = try digestBytes(file.sha256);
     const path = try std.fs.path.join(allocator, &.{ blobs_root, &digest, file.label });
     defer allocator.free(path);
-    return .{ .path = try allocator.dupeZ(u8, path), .sha256 = digest };
+    return .{ .path = try allocator.dupeSentinel(u8, path, 0), .sha256 = digest };
 }
 
 fn requireCutoverReportTuple(
@@ -6343,7 +6387,7 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const host_full = try std.posix.gethostname(&host_buf);
     const host = host_full[0 .. std.mem.indexOfScalar(u8, host_full, '.') orelse host_full.len];
-    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}-zig{s}", .{
+    return allocator.print("{s}-{s}-{s}-zig{s}", .{
         switch (builtin.target.os.tag) {
             .macos => "darwin",
             else => @tagName(builtin.target.os.tag),
@@ -6423,8 +6467,7 @@ fn writeEvidenceFileAtomic(
         try std.Io.Dir.cwd().openDir(io, parent, .{ .follow_symlinks = false });
     defer dir.close(io);
     const tag = std.Io.Clock.awake.now(io).nanoseconds;
-    const temp_name = try std.fmt.allocPrint(
-        allocator,
+    const temp_name = try allocator.print(
         ".{s}.{d}.tmp",
         .{ base, tag },
     );
@@ -6549,8 +6592,7 @@ test "capsule files are digest-addressed beneath the current machine root" {
         0o600,
     );
     defer sealed.deinit(allocator);
-    const identity = try std.fmt.allocPrint(
-        allocator,
+    const identity = try allocator.print(
         "sha256:{s}",
         .{sealed.sha256},
     );
@@ -6618,8 +6660,7 @@ fn expectCapsuleRejectsLinkedBlob(machine_dir: []const u8, tmp_root: []const u8)
         0o600,
     );
     defer symlinked.deinit(allocator);
-    const symlink_identity = try std.fmt.allocPrint(
-        allocator,
+    const symlink_identity = try allocator.print(
         "sha256:{s}",
         .{symlinked.sha256},
     );
@@ -6676,12 +6717,12 @@ test "driver source metadata accepts active and legacy tuples only" {
     };
     try validateDriverSourceMetadata(source);
     source = .{
-        .revision = active_seq_replay_driver_v1.revision,
-        .tree = active_seq_replay_driver_v1.tree,
-        .path = active_seq_replay_driver_v1.locator,
+        .revision = legacy_seq_replay_driver_v1.revision,
+        .tree = legacy_seq_replay_driver_v1.tree,
+        .path = legacy_seq_replay_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
-            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+            .sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256,
         },
     };
     try validateDriverSourceMetadata(source);
@@ -6691,19 +6732,19 @@ test "driver source metadata accepts active and legacy tuples only" {
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.revision = active_seq_replay_driver_v1.revision;
+    source.revision = legacy_seq_replay_driver_v1.revision;
     source.tree = legacy_generic_driver_v1.tree;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.tree = active_seq_replay_driver_v1.tree;
+    source.tree = legacy_seq_replay_driver_v1.tree;
     source.path = legacy_generic_driver_v1.locator;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
         validateDriverSourceMetadata(source),
     );
-    source.path = active_seq_replay_driver_v1.locator;
+    source.path = legacy_seq_replay_driver_v1.locator;
     source.file.sha256 = "sha256:" ++ legacy_generic_driver_v1.sha256;
     try std.testing.expectError(
         error.PerfEvidenceIdentityMismatch,
@@ -6725,6 +6766,123 @@ fn testOptimizationDriverSource() CapsuleDriverSource {
             .sha256 = "sha256:" ++ optimization_build_sha256,
         },
     };
+}
+
+test "pre-migration optimization evidence retains its exact source and build tuple" {
+    var source = CapsuleDriverSource{
+        .revision = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+        .tree = "4eb77ac0c61b57e3d739be6a1d9a5a2f023e28855f06fd78eac94c0a4e9ba9dd",
+        .path = "tools/optimization_driver.zig",
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
+        },
+        .build_file = .{
+            .label = "build.zig",
+            .sha256 = "sha256:5eaae873185f3f472269a7dcc1d2c41c61f56fbfbc13542f941acc98ef082769",
+        },
+    };
+    try validateDriverSourceMetadata(source);
+    const historical = source;
+    source.build_file = testOptimizationDriverSource().build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source = testOptimizationDriverSource();
+    source.build_file = historical.build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+    source = historical;
+    source.build_file = null;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
+test "active Seq driver identity is distinct from immutable historical evidence" {
+    const active = driverIdentity(.seq_replay);
+    const bytes = driverSourceBytes(.seq_replay);
+    const digest = evidenceDigest(bytes);
+    try std.testing.expectEqualStrings(active.sha256, &digest);
+    try std.testing.expect(!std.mem.eql(u8, bytes, sealed_seq_replay_driver_source));
+    var source = CapsuleDriverSource{
+        .revision = active.revision,
+        .tree = active.tree,
+        .path = active.locator,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++ seq_replay_driver_sha256,
+        },
+    };
+    try validateDriverSourceMetadata(source);
+    var mixed: [4]CapsuleDriverSource = @splat(source);
+    mixed[0].revision = legacy_seq_replay_driver_v1.revision;
+    mixed[1].tree = legacy_seq_replay_driver_v1.tree;
+    mixed[2].path = legacy_seq_replay_driver_v1.locator;
+    mixed[3].file.sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256;
+    for (mixed) |candidate| {
+        try std.testing.expectError(
+            error.PerfEvidenceIdentityMismatch,
+            validateDriverSourceMetadata(candidate),
+        );
+    }
+    source.build_file = testOptimizationDriverSource().build_file;
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
+const isolated_build_fixture =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b.standardTargetOptions(.{});
+    \\    _ = b.standardOptimizeOption(.{});
+    \\    const env = b.graph.environ_map;
+    \\    const contents = b.fmt("{s}\n{s}\n", .{
+    \\        env.get("ZIG_GLOBAL_CACHE_DIR") orelse "missing-global-cache",
+    \\        env.get("ZIG_LOCAL_PKG_DIR") orelse "missing-package-cache",
+    \\    });
+    \\    const file = b.addWriteFiles().add("cache-environment", contents);
+    \\    b.getInstallStep().dependOn(&b.addInstallFile(file, "cache-environment").step);
+    \\    b.step("optimization-driver", "Check driver invocation").dependOn(b.getInstallStep());
+    \\}
+;
+
+test "isolated product and driver builds use supported private compiler caches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data = isolated_build_fixture });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const prefix = try std.fs.path.join(allocator, &.{ root, "zig-out" });
+    defer allocator.free(prefix);
+    const configured = try std.testing.environ.getAlloc(allocator, "PERF_TEST_ZIG");
+    defer allocator.free(configured);
+    const observed_path = try std.fs.path.join(allocator, &.{ prefix, "cache-environment" });
+    defer allocator.free(observed_path);
+    inline for (.{ "", "driver-" }) |cache_prefix| {
+        const kind: DriverKind = if (cache_prefix.len == 0) .seq_replay else .optimization;
+        try runIsolatedBuild(allocator, root, root, prefix, configured, cache_prefix, kind);
+        const observed = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            observed_path,
+            allocator,
+            .limited(8192),
+        );
+        defer allocator.free(observed);
+        const expected = try allocator.print("{s}/{s}global-cache\n{s}/{s}packages\n", .{
+            root, cache_prefix, root, cache_prefix,
+        });
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, observed);
+    }
 }
 
 test "optimization driver build requires the exact step target and cpu" {
@@ -6762,7 +6920,7 @@ test "optimization driver source requires the exact build source identity" {
     );
     for ([_][]const u8{
         "",
-        "sha256:" ++ "0" ** 64,
+        "sha256:" ++ &@as([64]u8, @splat('0')),
         "sha257:" ++ optimization_build_sha256,
         "sha256:" ++ optimization_build_sha256 ++ "0",
     }) |wrong_digest| {
@@ -6777,10 +6935,10 @@ test "optimization driver source requires the exact build source identity" {
 test "optimization driver source rejects mixed source tuples" {
     const valid = testOptimizationDriverSource();
     var sources = [_]CapsuleDriverSource{ valid, valid, valid, valid };
-    sources[0].revision = active_seq_replay_driver_v1.revision;
-    sources[1].tree = active_seq_replay_driver_v1.tree;
-    sources[2].path = active_seq_replay_driver_v1.locator;
-    sources[3].file.sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256;
+    sources[0].revision = legacy_seq_replay_driver_v1.revision;
+    sources[1].tree = legacy_seq_replay_driver_v1.tree;
+    sources[2].path = legacy_seq_replay_driver_v1.locator;
+    sources[3].file.sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256;
     for (sources) |source| {
         try std.testing.expectError(
             error.PerfEvidenceIdentityMismatch,
@@ -6791,12 +6949,12 @@ test "optimization driver source rejects mixed source tuples" {
 
 test "Seq replay and legacy sources reject optimization build evidence" {
     var source = CapsuleDriverSource{
-        .revision = active_seq_replay_driver_v1.revision,
-        .tree = active_seq_replay_driver_v1.tree,
-        .path = active_seq_replay_driver_v1.locator,
+        .revision = legacy_seq_replay_driver_v1.revision,
+        .tree = legacy_seq_replay_driver_v1.tree,
+        .path = legacy_seq_replay_driver_v1.locator,
         .file = .{
             .label = "perf_hub.zig",
-            .sha256 = "sha256:" ++ active_seq_replay_driver_v1.sha256,
+            .sha256 = "sha256:" ++ legacy_seq_replay_driver_v1.sha256,
         },
         .build_file = testOptimizationDriverSource().build_file,
     };
@@ -6817,16 +6975,16 @@ test "Seq replay and legacy sources reject optimization build evidence" {
 test "sealed Seq replay driver source is capture-only and dependency-minimal" {
     const digest = sealedSeqReplayDriverDigest();
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.sha256,
+        legacy_seq_replay_driver_v1.sha256,
         &digest,
     );
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.revision,
-        active_seq_replay_driver_v1.sha256,
+        legacy_seq_replay_driver_v1.revision,
+        legacy_seq_replay_driver_v1.sha256,
     );
     const tree_digest = sealedSeqReplayDriverTreeDigest();
     try std.testing.expectEqualStrings(
-        active_seq_replay_driver_v1.tree,
+        legacy_seq_replay_driver_v1.tree,
         &tree_digest,
     );
     try std.testing.expectEqual(
@@ -6913,7 +7071,7 @@ test "report errors clearly when compare summary is missing" {
 
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
-    const reports_path = try std.fmt.allocPrint(alloc, ".perf-local/{s}/reports", .{current_name});
+    const reports_path = try alloc.print(".perf-local/{s}/reports", .{current_name});
     defer alloc.free(reports_path);
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), reports_path);
 
@@ -7025,8 +7183,7 @@ test "report rejects malformed rows in a verified capsule" {
 
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
-    const reports_path = try std.fmt.allocPrint(
-        alloc,
+    const reports_path = try alloc.print(
         ".perf-local/{s}/reports",
         .{current_name},
     );
@@ -7275,15 +7432,14 @@ test "rss tolerance rounds only to the observable page quantum" {
     const allowed = try observableRssUpperBound(2_637_824, 2.0);
     try std.testing.expect(allowed >= 2_690_581);
     const page_size: u64 = @intCast(C.sysconf(
-        @intFromEnum(std.c._SC.PAGESIZE),
+        @backingInt(std.c._SC.PAGESIZE),
     ));
     try std.testing.expect(allowed - 2_690_581 < page_size);
 }
 
 test "shared deep artifact identity is exact" {
     const case_cfg = DeepCases[0];
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "{{\"schema_version\":1,\"case_id\":\"{s}\",\"binary\":\"{s}\"," ++
             "\"git_sha\":\"unknown\"}}",
         .{
@@ -7375,8 +7531,7 @@ test "deep semantic evidence verifies local identity before relocation normaliza
         );
         defer allocator.free(fixture_path);
         const identity = expectedSourceEventId(fixture_path, 3, 2);
-        const rendered = try std.fmt.allocPrint(
-            allocator,
+        const rendered = try allocator.print(
             "{{\"data\":{{\"schema\":\"example-message-rows/v1\"," ++
                 "\"rows\":[{{\"session_id\":\"fixture-session\"," ++
                 "\"role\":\"assistant\",\"text\":\"Observed FAILURE evidence\"," ++
@@ -7406,8 +7561,7 @@ test "deep semantic evidence verifies local identity before relocation normaliza
     );
     defer allocator.free(wrong_fixture);
     const wrong_identity = expectedSourceEventId(wrong_fixture, 3, 2);
-    const wrong_rendered = try std.fmt.allocPrint(
-        allocator,
+    const wrong_rendered = try allocator.print(
         "{{\"data\":{{\"rows\":[{{\"source_event_id\":\"{s}\"}}]}}}}",
         .{wrong_identity},
     );
@@ -7478,7 +7632,7 @@ test "sealed evidence rejects content substitution" {
     );
     defer std.testing.allocator.free(real_path);
     var file: SealedFile = .{
-        .path = try std.testing.allocator.dupeZ(u8, real_path),
+        .path = try std.testing.allocator.dupeSentinel(u8, real_path, 0),
         .sha256 = try sha256File(real_path),
     };
     defer file.deinit(std.testing.allocator);
@@ -7506,9 +7660,9 @@ test "temp-root release deletes storage before freeing its path" {
 
 test "compiler evidence retains sentinel path ownership" {
     const allocator = std.testing.allocator;
-    const approved_path = try allocator.dupeZ(u8, "/tmp/zig");
+    const approved_path = try allocator.dupeSentinel(u8, "/tmp/zig", 0);
     errdefer allocator.free(approved_path);
-    const file_path = try allocator.dupeZ(u8, "/tmp/sealed-zig");
+    const file_path = try allocator.dupeSentinel(u8, "/tmp/sealed-zig", 0);
     errdefer allocator.free(file_path);
     const version = try allocator.dupe(u8, "0.16.0");
     var evidence = CompilerEvidence{
@@ -7697,7 +7851,7 @@ test "semantic normalization traverses deep arrays and preserves error precedenc
 }
 
 test "semantic normalization propagates allocation failure without leaking" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectDeepSemanticNormalization,
         .{},
@@ -7731,7 +7885,7 @@ fn expectDeepSemanticNormalization(allocator: std.mem.Allocator) !void {
 }
 
 test "metric sample ownership transfers only after all percentile allocations succeed" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectMetricSampleTransfer,
         .{},
@@ -7807,9 +7961,9 @@ test "optimization primary and secondary budgets reject each over-budget metric"
     for ([_][]const u8{ "ledger-topk-16384-k100", "trace-full-1024" }) |id| {
         const primary = deepCaseForId(id).?;
         try expectBalancedStatus(primary, limit, "PASS");
-        inline for (std.meta.fields(BalancedRatios)) |field| {
+        inline for (@typeInfo(BalancedRatios).@"struct".field_names) |field_name| {
             var exceeded = limit;
-            @field(exceeded, field.name) += 1;
+            @field(exceeded, field_name) += 1;
             try expectBalancedStatus(primary, exceeded, "FAIL");
         }
     }
@@ -7834,9 +7988,9 @@ fn expectBalancedStatus(case: DeepCase, ratios: BalancedRatios, expected: []cons
 }
 
 test "optimization readback recomputes workload and output identities" {
-    const workload = "sha256:" ++ "a" ** 64;
-    const output = "sha256:" ++ "b" ** 64;
-    const changed = "sha256:" ++ "c" ** 64;
+    const workload = "sha256:" ++ &@as([64]u8, @splat('a'));
+    const output = "sha256:" ++ &@as([64]u8, @splat('b'));
+    const changed = "sha256:" ++ &@as([64]u8, @splat('c'));
     const output_digest = try digestBytes(output);
     const oracle = OptimizationOracle{
         .workload_digest = try digestBytes(workload),

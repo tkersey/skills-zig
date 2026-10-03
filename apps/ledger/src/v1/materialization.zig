@@ -1330,8 +1330,7 @@ fn contentAddressFromDigestAlloc(
     if (!std.mem.startsWith(u8, digest, "sha256:")) {
         return error.InvalidContentAddressDigest;
     }
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}{s}",
         .{ replacement, digest["sha256:".len..] },
     );
@@ -1898,7 +1897,7 @@ fn compileTestPlansMode(
 test "materialization reuses validation parse and derives content address" {
     var plans = try compileTestPlans(materialized_definition_json);
     defer plans.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{plans.cache_payload},
@@ -1948,7 +1947,7 @@ test "claimed content address mismatch fails structural materialization" {
 test "content address supports bounded recursive omission and a static prefix" {
     var plans = try compileTestPlans(prefixed_definition_json);
     defer plans.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{plans.cache_payload},
@@ -1960,14 +1959,12 @@ test "content address supports bounded recursive omission and a static prefix" {
         basis,
     );
     defer std.testing.allocator.free(digest);
-    const expected_id = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_id = try std.testing.allocator.print(
         "OBJ-{s}",
         .{digest["sha256:".len..]},
     );
     defer std.testing.allocator.free(expected_id);
-    const expected_canonical = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_canonical = try std.testing.allocator.print(
         "{{\"envelope\":{{\"record_id\":\"{s}\",\"value\":1}}}}",
         .{expected_id},
     );
@@ -2063,12 +2060,12 @@ fn expectNestedDraftRejection(
 test "nested draft content address materializes and verifies canonical identity" {
     var plans = try compileTestPlans(nested_draft_definition_json);
     defer plans.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{&plans.artifact},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{plans.cache_payload},
@@ -2091,8 +2088,7 @@ test "nested draft content address materializes and verifies canonical identity"
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.validation_result.valid);
     try std.testing.expectEqualStrings(expected_id, result.artifact_id.?);
-    const expected_canonical = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_canonical = try std.testing.allocator.print(
         "{{\"artifact\":{{\"artifact_id\":\"{s}\",\"value\":1}}}}",
         .{expected_id},
     );
@@ -2108,12 +2104,12 @@ test "nested draft content address materializes and verifies canonical identity"
 test "compiled composite identity derives bounded scalar identity" {
     var plans = try compileTestPlans(composite_definition_json);
     defer plans.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{&plans.artifact},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{plans.cache_payload},

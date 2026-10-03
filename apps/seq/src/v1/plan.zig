@@ -32,9 +32,12 @@ pub const ColumnKind = enum {
     json,
 
     pub fn parse(raw: []const u8) !ColumnKind {
-        inline for (@typeInfo(ColumnKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, raw, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(ColumnKind).@"enum".field_names,
+            @typeInfo(ColumnKind).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, raw, field_name)) {
+                return @fromBackingInt(@intCast(field_value));
             }
         }
         return error.InvalidObservationColumnType;
@@ -213,9 +216,12 @@ pub const FilterMode = enum {
     any,
 
     fn parse(raw: []const u8) !FilterMode {
-        inline for (@typeInfo(FilterMode).@"enum".fields) |field| {
-            if (std.mem.eql(u8, raw, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(FilterMode).@"enum".field_names,
+            @typeInfo(FilterMode).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, raw, field_name)) {
+                return @fromBackingInt(@intCast(field_value));
             }
         }
         return error.InvalidFilterMode;
@@ -239,9 +245,12 @@ pub const AggregateFunction = enum {
     average,
 
     fn parse(raw: []const u8) !AggregateFunction {
-        inline for (@typeInfo(AggregateFunction).@"enum".fields) |field| {
-            if (std.mem.eql(u8, raw, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(AggregateFunction).@"enum".field_names,
+            @typeInfo(AggregateFunction).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, raw, field_name)) {
+                return @fromBackingInt(@intCast(field_value));
             }
         }
         if (std.mem.eql(u8, raw, "avg")) return .average;
@@ -2886,7 +2895,7 @@ fn expectPlanCacheRoundTrip(
             definition_plan,
         ),
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeCacheForAllocationFailure,
         .{ payload, definition_plan },
@@ -2973,7 +2982,7 @@ test "observation steps compile field names and parameters to native indices" {
         plan.stages[3].operation.limit.fixed,
     );
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{&definition_plan},

@@ -132,7 +132,7 @@ fn relativeWithin(path: []const u8, root: []const u8) []const u8 {
 pub const ClosureFile = struct {
     path: []u8,
     canonical_json: []u8,
-    source_digest: [32]u8 = [_]u8{0} ** 32,
+    source_digest: [32]u8 = @as([32]u8, @splat(0)),
     source_bytes: usize = 0,
 
     fn deinit(self: *ClosureFile, allocator: std.mem.Allocator) void {
@@ -1280,13 +1280,12 @@ fn chainFixture(allocator: std.mem.Allocator, count: usize) !Closure {
     }
     var total: usize = 0;
     for (files, 0..) |*file, index| {
-        const path = try std.fmt.allocPrint(allocator, "f{d:0>3}.json", .{index});
+        const path = try allocator.print("f{d:0>3}.json", .{index});
         errdefer allocator.free(path);
         const bytes = if (index + 1 == count)
             try allocator.dupe(u8, "{}")
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{{\"imports\":[\"f{d:0>3}.json\"]}}",
                 .{index + 1},
             );
@@ -1345,7 +1344,7 @@ test "import depth precedes cycles and cycles precede new-file admission" {
     const files = [_]ClosureFile{.{
         .path = @constCast("a.json"),
         .canonical_json = @constCast(bytes),
-        .source_digest = [_]u8{0} ** 32,
+        .source_digest = @as([32]u8, @splat(0)),
         .source_bytes = bytes.len,
     }};
     const shallow: Limits = .{ .max_import_depth = 1, .max_files = 1 };
@@ -1409,12 +1408,12 @@ test "import frames free pending siblings at every failed allocation" {
             .data = file.canonical_json,
         });
     }
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         loadChainForAllocationFailure,
         .{&tmp.dir},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         canonicalChainForAllocationFailure,
         .{source.files},

@@ -2,11 +2,15 @@
     .name = .skills_zig,
     .version = "0.0.0",
     .fingerprint = 0xcfd557cc7567edb9,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zlinter = .{
-            .url = "git+https://github.com/kurtwagner/zlinter?ref=0.16.x#9b4d67b9725e7137ac876cc628fe5dd2ca5a2681",
-            .hash = "zlinter-0.0.1-OjQ08c7oCwDIwhlde7eDKMACNTsqAhGXy5vB7GdfGobG",
+            .url = "git+https://github.com/kurtwagner/zlinter#4937a301d9bc06e013cf2f9fb3ee1fdc8793df1f",
+            .hash = "zlinter-0.0.1-OjQ08YxkFQBQNP_aoK_07mQdcOfv6eho-IPexfuOC4eh",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",
+            .hash = "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
         },
     },
     .paths = .{

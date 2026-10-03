@@ -430,7 +430,7 @@ fn parseOptions(command: Command, argv: []const []const u8) !Options {
     }
     while (index < argv.len) : (index += 1) {
         const option = try NativeOption.parse(argv[index]);
-        const option_bit = @as(u32, 1) << @intFromEnum(option);
+        const option_bit = @as(u32, 1) << @backingInt(option);
         if (seen_options & option_bit != 0) {
             return error.DuplicateNativeOption;
         }
@@ -805,17 +805,17 @@ fn runFindSession(
 
 fn runDatasets(writer: *std.Io.Writer, options: Options) !void {
     if (options.format == .text) {
-        inline for (@typeInfo(physical.Relation).@"enum".fields) |field| {
-            try writer.print("{s}\n", .{field.name});
+        inline for (@typeInfo(physical.Relation).@"enum".field_names) |field_name| {
+            try writer.print("{s}\n", .{field_name});
         }
         return;
     }
     if (options.format != .json) return error.UnsupportedNativeFormat;
     try writer.writeByte('[');
-    inline for (@typeInfo(physical.Relation).@"enum".fields, 0..) |field, index| {
+    inline for (@typeInfo(physical.Relation).@"enum".field_names, 0..) |field_name, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"dataset\":");
-        try definition_core.canonical_json.writeCanonicalString(writer, field.name);
+        try definition_core.canonical_json.writeCanonicalString(writer, field_name);
         try writer.writeAll(",\"description\":\"canonical physical execution relation\"}");
     }
     try writer.writeAll("]\n");

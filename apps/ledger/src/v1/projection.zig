@@ -309,7 +309,7 @@ const FoldHistoryEntry = struct {
     key_bytes: [256]u8 = undefined,
     key_len: u16,
     event_kind_counts: [max_fold_event_kind_counts]usize =
-        [_]usize{0} ** max_fold_event_kind_counts,
+        @as([max_fold_event_kind_counts]usize, @splat(0)),
     event_chain: [64]u8 = undefined,
     has_event_chain: bool = false,
     snapshot: [64]u8 = undefined,
@@ -1148,6 +1148,26 @@ const SortedAccumulator = struct {
             value,
         );
         return result;
+    }
+
+    fn reserveOutput(
+        self: *const SortedAccumulator,
+        output: *std.Io.Writer.Allocating,
+        limit: usize,
+        max_output_bytes: usize,
+    ) !void {
+        // Bounded retention has no post-sort exclusions or diversity filtering:
+        // every retained row is emitted. Sorting cannot change the byte count.
+        if (self.projection.single or self.retained_limit == null or
+            self.rows.items.len > limit) return;
+        std.debug.assert(output.written().len == 0);
+        var bytes: usize = 2 + (self.rows.items.len -| 1);
+        for (self.rows.items) |row| {
+            bytes = std.math.add(usize, bytes, row.payload.len) catch
+                return error.ProjectionOutputBoundsExceeded;
+        }
+        if (bytes > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
+        try output.ensureTotalCapacityPrecise(bytes);
     }
 
     fn write(
@@ -5389,6 +5409,7 @@ fn writeStreamProjection(
         if (accumulator.records_seen != replay_stats.records_validated) {
             return error.StreamProjectionRecordCountMismatch;
         }
+        try accumulator.reserveOutput(output, effective_limit, max_output_bytes);
         try accumulator.write(
             &output.writer,
             effective_limit,
@@ -8567,7 +8588,7 @@ test "relation rows preserve opaque numbers and unwind every allocation failure"
     defer index.deinit(std.testing.allocator);
     var marks: [2]bool = undefined;
     try std.testing.expectEqual(@as(usize, 1), try index.unmatched("A", &.{"satisfied"}, &marks));
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         relationRowAllocationProbe,
         .{ keyed, &index, &marks },
@@ -8603,7 +8624,7 @@ fn relationRowAllocationProbe(
 
 const topk_empty_bindings: definition_core.parameters.Bindings = .{
     .items = &.{},
-    .values_digest = [_]u8{0} ** 71,
+    .values_digest = @as([71]u8, @splat(0)),
 };
 
 const TopkTestKeys = struct {
@@ -8664,6 +8685,43 @@ fn topkRenderedAlloc(accumulator: *SortedAccumulator, limit: usize) ![]u8 {
     var stats: Stats = .{ .records_scanned = 0, .records_matched = 0, .records_emitted = 0 };
     try accumulator.write(&output.writer, limit, &stats);
     return output.toOwnedSlice();
+}
+
+test "top-k reserves its exact output and rejects an undersized output bound" {
+    const allocator = std.testing.allocator;
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    const projection = topkTestProjection(&keys.keys);
+    var accumulator = try SortedAccumulator.init(
+        allocator,
+        &projection,
+        &topk_empty_bindings,
+        2,
+    );
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, "{\"n\":3,\"tag\":\"c\"}");
+    try topkObserveText(&accumulator, "{\"n\":1,\"tag\":\"a\"}");
+    try topkObserveText(&accumulator, "{\"n\":2,\"tag\":\"b\"}");
+    const expected = try topkRenderedAlloc(&accumulator, 2);
+    defer allocator.free(expected);
+    var failing = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    var output: std.Io.Writer.Allocating = .init(failing.allocator());
+    defer output.deinit();
+    try accumulator.reserveOutput(&output, 2, expected.len);
+    try std.testing.expectEqual(expected.len, output.writer.buffer.len);
+    var stats: Stats = .{ .records_scanned = 3, .records_matched = 0, .records_emitted = 0 };
+    try accumulator.write(&output.writer, 2, &stats);
+    try std.testing.expectEqualStrings(expected, output.written());
+    try std.testing.expect(!failing.has_induced_failure);
+    var denied: std.Io.Writer.Allocating = .init(std.testing.failing_allocator);
+    defer denied.deinit();
+    try std.testing.expectError(
+        error.ProjectionOutputBoundsExceeded,
+        accumulator.reserveOutput(&denied, 2, expected.len - 1),
+    );
 }
 
 fn topkObserveGenerated(heap: *SortedAccumulator, oracle: *SortedAccumulator) !void {
@@ -8784,7 +8842,7 @@ test "top-K validates losing projection and sort fields before discarding rows" 
 fn topkQueryBindings(
     items: []definition_core.parameters.Binding,
 ) definition_core.parameters.Bindings {
-    return .{ .items = items, .values_digest = [_]u8{0} ** 71 };
+    return .{ .items = items, .values_digest = @as([71]u8, @splat(0)) };
 }
 
 test "top-K rejects nonobject scored output even when the row loses admission" {
@@ -8885,7 +8943,7 @@ fn topkRankedPlan() !ranked_relevance.Plan {
     };
     const declared: definition_core.parameters.Declarations = .{
         .items = &declarations,
-        .shape_digest = [_]u8{0} ** 71,
+        .shape_digest = @as([71]u8, @splat(0)),
     };
     return ranked_relevance.compile(std.testing.allocator, parsed.value, &declared);
 }

@@ -1550,8 +1550,7 @@ fn segmentPathAlloc(
     index: u64,
     extension: []const u8,
 ) ![]u8 {
-    const name = try std.fmt.allocPrint(
-        allocator,
+    const name = try allocator.print(
         "{d:0>16}{s}",
         .{ index, extension },
     );
@@ -1842,8 +1841,7 @@ test "segmented snapshot counts persistent active-file sidecars" {
     const binding_path = try paths.bindingSegmentAlloc(allocator, 1);
     defer allocator.free(binding_path);
     for ([_][]const u8{ event_path, binding_path }) |path| {
-        const sidecar = try std.fmt.allocPrint(
-            allocator,
+        const sidecar = try allocator.print(
             "{s}.cas.lock.advisory",
             .{path},
         );
@@ -2079,8 +2077,7 @@ test "segmented snapshot accepts an absent head with stale advisory custody" {
         "actuation/initial-writer/events.jsonl",
     );
     defer paths.deinit(allocator);
-    const advisory_path = try std.fmt.allocPrint(
-        allocator,
+    const advisory_path = try allocator.print(
         "{s}.cas.lock.advisory",
         .{paths.manifest},
     );

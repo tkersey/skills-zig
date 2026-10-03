@@ -1736,8 +1736,8 @@ fn compareIntegerFloat(left: i64, right: f64) std.math.Order {
 
 fn compareValueTags(left: Value, right: Value) std.math.Order {
     return std.math.order(
-        @intFromEnum(std.meta.activeTag(left)),
-        @intFromEnum(std.meta.activeTag(right)),
+        @backingInt(std.meta.activeTag(left)),
+        @backingInt(std.meta.activeTag(right)),
     );
 }
 
@@ -2389,7 +2389,7 @@ test "compiled execution filters projects and limits without intermediate rows" 
     try std.testing.expectEqualStrings("fail two", result.rows().row(1)[1].string);
 
     try expectStreamingFilterResult(program, &source, result);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{
@@ -2541,7 +2541,7 @@ test "compiled sort and distinct preserve stable bounded semantics" {
         result.rows().row(2)[0].string,
     );
     try std.testing.expect(result.rows().row(2)[1] == .null);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         executeBlockingForAllocationFailure,
         .{ program, &source },
@@ -2594,10 +2594,10 @@ test "top-k retains only its bounded native working set" {
     );
     defer fixture.deinit();
     const source = [_]Value{
-        .{ .string = "a" ** 128 }, .{ .integer = 2 },
-        .{ .string = "b" ** 128 }, .{ .integer = 4 },
-        .{ .string = "c" ** 128 }, .{ .integer = 4 },
-        .{ .string = "d" ** 128 }, .{ .integer = 1 },
+        .{ .string = &@as([128]u8, @splat('a')) }, .{ .integer = 2 },
+        .{ .string = &@as([128]u8, @splat('b')) }, .{ .integer = 4 },
+        .{ .string = &@as([128]u8, @splat('c')) }, .{ .integer = 4 },
+        .{ .string = &@as([128]u8, @splat('d')) }, .{ .integer = 1 },
     };
     var output: [2]Value = undefined;
     var runner = try Runner.initOwnedAllocBounded(
@@ -2616,11 +2616,11 @@ test "top-k retains only its bounded native working set" {
     try std.testing.expectEqual(@as(usize, 2), result.materialized_row_count);
     try std.testing.expectEqual(@as(usize, 256), runner.owned_value_bytes);
     try std.testing.expectEqualStrings(
-        "b" ** 128,
+        &@as([128]u8, @splat('b')),
         result.rows().row(0)[0].string,
     );
     try std.testing.expectEqualStrings(
-        "c" ** 128,
+        &@as([128]u8, @splat('c')),
         result.rows().row(1)[0].string,
     );
 }

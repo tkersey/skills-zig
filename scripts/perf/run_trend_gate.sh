@@ -19,7 +19,7 @@ else
   rm -f "$trend_artifact"
 fi
 
-zig build "$zig_step" -Doptimize="${PERF_OPTIMIZE_MODE:-ReleaseFast}" -- \
+zig build "$zig_step" -Doptimize="${PERF_OPTIMIZE_MODE:-fast}" -- \
   --config "$config_path" \
   --artifact "$trend_artifact" \
   "$@"

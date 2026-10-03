@@ -178,7 +178,7 @@ pub const Encoder = struct {
     }
 
     pub fn writeEnum(self: *Encoder, value: anytype) !void {
-        const tag = @intFromEnum(value);
+        const tag = @backingInt(value);
         try self.writeU16(std.math.cast(u16, tag) orelse
             return error.CacheEnumOutOfRange);
     }
@@ -283,8 +283,8 @@ pub const Decoder = struct {
             @compileError("cache enum decoder requires an enum type");
         }
         const raw = try self.readU16();
-        inline for (@typeInfo(Enum).@"enum".fields) |field| {
-            if (field.value == raw) return @enumFromInt(raw);
+        inline for (@typeInfo(Enum).@"enum".field_values) |field_value| {
+            if (field_value == raw) return @fromBackingInt(@intCast(raw));
         }
         return error.CacheEnumInvalid;
     }

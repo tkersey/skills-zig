@@ -78,7 +78,7 @@ pub fn pathAlloc(
     digest: []const u8,
 ) ![]u8 {
     try definition_core.json.digest(digest);
-    const name = try std.fmt.allocPrint(allocator, "{s}.json", .{digest[7..]});
+    const name = try allocator.print("{s}.json", .{digest[7..]});
     defer allocator.free(name);
     return std.fs.path.join(
         allocator,

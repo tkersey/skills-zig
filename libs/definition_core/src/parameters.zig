@@ -545,12 +545,12 @@ test "parameter value digest scratch uses the caller allocator and cleans up on 
     defer parsed.deinit();
     var declarations = try compile(std.testing.allocator, parsed.value);
     defer declarations.deinit(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         bindForAllocationFailure,
         .{&declarations},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         restoreForAllocationFailure,
         .{&declarations},

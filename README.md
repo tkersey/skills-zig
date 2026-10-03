@@ -41,25 +41,33 @@ None of these shared libraries contains skill or workflow semantics.
 
 ## Build
 
+Use Zig **0.17.0**. Shipped macOS binaries require macOS **15 or newer**;
+release builds explicitly target `aarch64-macos.15.0` and the baseline CPU.
+Linux release targets retain their existing ABI, including static musl for CAS.
+
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 ```
+
+The standard optimization modes are `debug`, `safe`, `fast`, and `small`.
+For the migration rationale and compatibility checks, see
+[Zig 0.17 migration](docs/engineering/ZIG_017.md).
 
 Targeted build steps:
 
 ```bash
-zig build build-seq -Doptimize=ReleaseFast
-zig build build-lift -Doptimize=ReleaseFast
-zig build build-cas -Doptimize=ReleaseFast
-zig build build-ledger -Doptimize=ReleaseFast
-zig build build-memory-note -Doptimize=ReleaseFast
-zig build build-typesafe -Doptimize=ReleaseFast
+zig build build-seq -Doptimize=fast
+zig build build-lift -Doptimize=fast
+zig build build-cas -Doptimize=fast
+zig build build-ledger -Doptimize=fast
+zig build build-memory-note -Doptimize=fast
+zig build build-typesafe -Doptimize=fast
 ```
 
 Run helpers:
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 ./zig-out/bin/seq --help
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/cas_smoke_check --help

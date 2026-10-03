@@ -168,7 +168,7 @@ const StagingPaths = struct {
         cache_path: []const u8,
         nonce: i128,
     ) !StagingPaths {
-        const root = try std.fmt.allocPrint(allocator, "{s}.staging.{d}", .{ cache_path, nonce });
+        const root = try allocator.print("{s}.staging.{d}", .{ cache_path, nonce });
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().deleteTree(io, root);
         errdefer std.Io.Dir.cwd().deleteTree(io, root) catch |err| logCacheRecoveryFailure(err);
@@ -666,7 +666,7 @@ fn digestAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 fn digestBytesAlloc(allocator: std.mem.Allocator, digest: *const [32]u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "sha256:{x}", .{digest.*});
+    return allocator.print("sha256:{x}", .{digest.*});
 }
 
 fn acquireCacheLock(io: std.Io, path: []const u8, limits: CacheLimits) !std.Io.File {
@@ -972,7 +972,7 @@ fn promoteCacheDirectory(
     target: []const u8,
     nonce: i128,
 ) !void {
-    const backup = try std.fmt.allocPrint(allocator, "{s}.rollback.{d}", .{ target, nonce });
+    const backup = try allocator.print("{s}.rollback.{d}", .{ target, nonce });
     defer allocator.free(backup);
     try std.Io.Dir.cwd().deleteTree(io, backup);
     var had_target = true;
@@ -2587,8 +2587,7 @@ fn mergeDefinitionDocuments(
     if (!std.mem.startsWith(u8, base, prefix) or !std.mem.endsWith(u8, base, "}}") or
         !std.mem.startsWith(u8, supplement, prefix) or !std.mem.endsWith(u8, supplement, "}}"))
         return error.InvalidJsonShape;
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"definitions\":{{{s},{s}}}}}",
         .{
             base[prefix.len .. base.len - 2],
@@ -2603,8 +2602,7 @@ fn mergeDefinitionsIntoMethodSchema(
     definitions: []const u8,
 ) ![]u8 {
     if (methods.len < 2 or definitions.len < 2) return error.InvalidJsonShape;
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"definitions\":{s},\"oneOf\":{s}",
         .{ definitions[15 .. definitions.len - 1], methods[9..] },
     );
@@ -2645,6 +2643,14 @@ test "baseline admits bounded capability additions and retirements" {
 
 test "baseline method sets reject empty duplicate malformed and oversized requirements" {
     const allocator = std.testing.allocator;
+    const repeated_methods = comptime blk: {
+        const method = "\"method\",";
+        var bytes: [method.len * max_methods]u8 = undefined;
+        for (0..max_methods) |index| {
+            @memcpy(bytes[index * method.len ..][0..method.len], method);
+        }
+        break :blk bytes;
+    };
     const cases = [_]struct { json: []const u8, expected: anyerror }{
         .{ .json = "[]", .expected = error.InvalidContract },
         .{ .json = "[\"initialize\",\"initialize\"]", .expected = error.InvalidContract },
@@ -2652,7 +2658,7 @@ test "baseline method sets reject empty duplicate malformed and oversized requir
         .{ .json = "[\"\"]", .expected = error.InvalidContract },
         .{ .json = "[42]", .expected = error.InvalidContract },
         .{
-            .json = "[" ++ "\"method\"," ** max_methods ++ "\"method\"]",
+            .json = "[" ++ repeated_methods ++ "\"method\"]",
             .expected = error.ContractTooLarge,
         },
     };
@@ -3255,15 +3261,14 @@ test "schema cache admission is independent of Codex version and release channel
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5", "dev-build" }, 0..) |version_text, index| {
-        const executable = try std.fmt.allocPrint(
-            allocator,
+        const executable = try allocator.print(
             "{s}/fake-codex-{d}",
             .{ root, index },
         );
         defer allocator.free(executable);
-        const log_path = try std.fmt.allocPrint(allocator, "{s}/log-{d}", .{ root, index });
+        const log_path = try allocator.print("{s}/log-{d}", .{ root, index });
         defer allocator.free(log_path);
-        const cache_root = try std.fmt.allocPrint(allocator, "{s}/cache-{d}", .{ root, index });
+        const cache_root = try allocator.print("{s}/cache-{d}", .{ root, index });
         defer allocator.free(cache_root);
         const script = try fakeCodexScriptVersionAlloc(
             allocator,
@@ -3638,8 +3643,7 @@ fn fakeCodexScriptVersionAlloc(
     noisy: bool,
     version: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{s}'\n" ++
             "if [ \"$1\" = \"--version\" ]; then\n  {s}\n  {s}\n" ++
             "  printf 'codex-cli {s}\\n'\n  exit 0\nfi\n" ++

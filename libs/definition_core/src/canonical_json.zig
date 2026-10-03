@@ -304,7 +304,8 @@ pub fn writeCanonicalString(writer: *std.Io.Writer, text: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
     try writer.writeByte('"');
     var start: usize = 0;
-    for (text, 0..) |byte, index| {
+    while (nextStringEscape(text, start)) |index| {
+        const byte = text[index];
         const escape: ?[]const u8 = switch (byte) {
             '"' => "\\\"",
             '\\' => "\\\\",
@@ -314,7 +315,7 @@ pub fn writeCanonicalString(writer: *std.Io.Writer, text: []const u8) !void {
             0x0c => "\\f",
             0x0d => "\\r",
             0x00...0x07, 0x0b, 0x0e...0x1f => null,
-            else => continue,
+            else => unreachable,
         };
         try writer.writeAll(text[start..index]);
         if (escape) |escaped| {
@@ -331,6 +332,72 @@ pub fn writeCanonicalString(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
 }
 
+fn nextStringEscape(text: []const u8, start: usize) ?usize {
+    std.debug.assert(start <= text.len);
+    const width = std.simd.suggestVectorLength(u8) orelse 1;
+    var index = start;
+    if (width > 1) {
+        const Bytes = @Vector(width, u8);
+        while (text.len - index >= width) : (index += width) {
+            const bytes: Bytes = text[index..][0..width].*;
+            const special = (bytes < @as(Bytes, @splat(0x20))) |
+                (bytes == @as(Bytes, @splat('"'))) |
+                (bytes == @as(Bytes, @splat('\\')));
+            if (std.simd.firstTrue(special)) |offset| return index + offset;
+        }
+    }
+    while (index < text.len) : (index += 1) {
+        const byte = text[index];
+        if (byte < 0x20 or byte == '"' or byte == '\\') return index;
+    }
+    return null;
+}
+
+test "canonical string scan preserves ASCII at every vector and tail boundary" {
+    var bytes: [130]u8 = @splat('a');
+    for (0..128) |value| {
+        for (0..bytes.len) |index| {
+            bytes[index] = @intCast(value);
+            try expectCanonicalStringMatchesJson(&bytes);
+            bytes[index] = 'a';
+        }
+    }
+    for ([_][]const u8{ "", "é漢字😀", "quote\"\\\n\x00", "a/b" }) |text| {
+        try expectCanonicalStringMatchesJson(text);
+    }
+}
+
+fn expectCanonicalStringMatchesJson(text: []const u8) !void {
+    var actual_buffer: [1024]u8 = undefined;
+    var expected_buffer: [1024]u8 = undefined;
+    var actual: std.Io.Writer = .fixed(&actual_buffer);
+    var expected: std.Io.Writer = .fixed(&expected_buffer);
+    try writeCanonicalString(&actual, text);
+    try std.json.Stringify.encodeJsonString(text, .{
+        .escape_unicode = false,
+        .emit_strings_as_arrays = false,
+    }, &expected);
+    try std.testing.expectEqualStrings(expected.buffered(), actual.buffered());
+}
+
+test "canonical string scan rejects invalid UTF8 and propagates writer exhaustion" {
+    var buffer: [128]u8 = undefined;
+    for (128..256) |value| {
+        var writer: std.Io.Writer = .fixed(&buffer);
+        const byte = [_]u8{@intCast(value)};
+        try std.testing.expectError(error.InvalidUtf8, writeCanonicalString(&writer, &byte));
+        try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    }
+    const text = "\x00\"line\n";
+    var expected: std.Io.Writer = .fixed(&buffer);
+    try writeCanonicalString(&expected, text);
+    for (0..expected.buffered().len) |capacity| {
+        var output: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(output[0..capacity]);
+        try std.testing.expectError(error.WriteFailed, writeCanonicalString(&writer, text));
+    }
+}
+
 fn sortKeys(keys: [][]const u8) void {
     std.sort.heap([]const u8, keys, {}, struct {
         fn lessThan(_: void, left: []const u8, right: []const u8) bool {
@@ -343,7 +410,7 @@ pub fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 pub fn digestValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -531,12 +598,14 @@ test "canonical JSON preserves the exact nesting boundary without recursive call
             .items = values[index + 1 .. index + 2],
             .capacity = 1,
             .allocator = std.testing.allocator,
+            .pointer_stability = .{},
         } };
     }
     const bytes = try canonicalJsonAlloc(std.testing.allocator, values[1]);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings(
-        "[" ** max_nesting_depth ++ "null" ++ "]" ** max_nesting_depth,
+        &@as([max_nesting_depth]u8, @splat('[')) ++ "null" ++
+            &@as([max_nesting_depth]u8, @splat(']')),
         bytes,
     );
     try std.testing.expectError(
@@ -561,7 +630,7 @@ test "canonical traversal releases all live frame keys on allocation failure" {
         .{},
     );
     defer parsed.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         canonicalizeForAllocationFailure,
         .{parsed.value},
@@ -614,8 +683,10 @@ test "fuzz canonical JSON preserves parse and canonicalization closure" {
         canonicalFuzzSeed("{\"é\":\"\\u0000\\n\\t\\\"\\\\\",\"a\":\"\\ud83d\\ude00\"}"),
         canonicalFuzzSeed("[9007199254740992.1,9007199254740992.2,1.2300e+2,-0.0000001]"),
         canonicalFuzzSeed("[1e9223372036854775807,1e-9223372036854775808]"),
-        canonicalFuzzSeed("[" ** max_nesting_depth ++ "null" ++ "]" ** max_nesting_depth),
-        canonicalFuzzSeed("[" ** (max_nesting_depth + 1) ++ "0" ++ "]" ** (max_nesting_depth + 1)),
+        canonicalFuzzSeed(&@as([max_nesting_depth]u8, @splat('[')) ++ "null" ++
+            &@as([max_nesting_depth]u8, @splat(']'))),
+        canonicalFuzzSeed(&@as([(max_nesting_depth + 1)]u8, @splat('[')) ++ "0" ++
+            &@as([(max_nesting_depth + 1)]u8, @splat(']'))),
         canonicalFuzzSeed("{\"duplicate\":0,\"duplicate\":1}"),
         canonicalFuzzSeed("\xff[invalid"),
     } });

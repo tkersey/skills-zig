@@ -1,9 +1,8 @@
 const std = @import("std");
 
-/// This sealed overlay uses each archived product's own module graph.
-/// The product build file is copied byte-for-byte to build_product.zig first.
-pub fn build(b: *std.Build) void {
-    @import("build_product.zig").build(b);
+/// Add the capture driver after the archived product has constructed its graph.
+/// The snapshot generator owns loading that product's unmodified build script.
+pub fn addOptimizationDriver(b: *std.Build) void {
     const seq = installed(b, "seq");
     const ledger = installed(b, "ledger");
     const driver = installed(b, "perf_hub");

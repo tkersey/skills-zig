@@ -683,8 +683,7 @@ fn appendMalformedWarning(
     trace: *CanonicalSessionTrace,
     line_number: usize,
 ) !void {
-    const warning = try std.fmt.allocPrint(
-        allocator,
+    const warning = try allocator.print(
         "{s}:{d}: malformed JSONL skipped",
         .{ trace.session.path, line_number },
     );
@@ -1785,7 +1784,7 @@ fn deriveDateGroup(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
             std.ascii.isDigit(path[i + 6]) and path[i + 7] == '/' and
             std.ascii.isDigit(path[i + 8]) and std.ascii.isDigit(path[i + 9]))
         {
-            return try std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{
+            return try allocator.print("{s}-{s}-{s}", .{
                 path[i .. i + 4],
                 path[i + 5 .. i + 7],
                 path[i + 8 .. i + 10],
@@ -1862,8 +1861,7 @@ fn applyPrimarySessionMeta(
     const later_id = stringField(meta, "id") orelse return;
     const primary_id = trace.session.session_id orelse return;
     if (!std.mem.eql(u8, later_id, primary_id)) {
-        const warning = try std.fmt.allocPrint(
-            allocator,
+        const warning = try allocator.print(
             "{s}:{d}: conflicting later session_meta {s} preserved as an occurrence; " ++
                 "primary session {s} remains authoritative",
             .{ trace.session.path, line_number, later_id, primary_id },
@@ -1905,7 +1903,7 @@ fn startTurn(
     var owned_id: ?[]u8 = null;
     defer if (owned_id) |v| allocator.free(v);
     const turn_id = turn_id_opt orelse blk: {
-        owned_id = try std.fmt.allocPrint(allocator, "turn-{d}", .{trace.turns.items.len + 1});
+        owned_id = try allocator.print("turn-{d}", .{trace.turns.items.len + 1});
         break :blk owned_id.?;
     };
     var turn = TurnRecord{
@@ -1933,7 +1931,7 @@ fn startSyntheticTurn(
     timestamp: ?[]const u8,
 ) !usize {
     synthetic_turns.* += 1;
-    const turn_id = try std.fmt.allocPrint(allocator, "turn-{d}", .{synthetic_turns.*});
+    const turn_id = try allocator.print("turn-{d}", .{synthetic_turns.*});
     defer allocator.free(turn_id);
     return startTurn(allocator, trace, path, current_turn_index, turn_id, timestamp);
 }
@@ -2043,7 +2041,7 @@ test "numeric fields ignore unrepresentable integer values" {
 }
 
 test "message replacements preserve allocation ownership at every failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkMessageReplacementAllocationFailures,
         .{},
@@ -2398,8 +2396,7 @@ fn normalizeTimestampAlloc(
     timestamp: []const u8,
 ) ![]u8 {
     if (timestamp.len > 0 and timestamp[timestamp.len - 1] == 'Z') {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "{s}+00:00",
             .{timestamp[0 .. timestamp.len - 1]},
         );
@@ -2497,7 +2494,7 @@ fn appendMessageTextPart(
 }
 
 test "message text parts retain one owner across allocation failures" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkMessagePartAllocationFailures,
         .{},
@@ -2600,7 +2597,7 @@ fn sha256Prefixed(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 test "retained trace digest changes with observed tool payload" {
@@ -3456,7 +3453,7 @@ const allocation_trace =
 ;
 
 test "full trace propagates allocation failure and cleans every partial result" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkFullTraceAllocation,
         .{},
@@ -3477,7 +3474,11 @@ fn checkFullTraceAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "summary trace propagates allocation failure and cleans every partial result" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSummaryAllocation, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkSummaryAllocation,
+        .{},
+    );
 }
 
 fn checkSummaryAllocation(allocator: std.mem.Allocator) !void {
@@ -3489,7 +3490,11 @@ fn checkSummaryAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "raw event propagates allocation failure and cleans every acquired field" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRawEventAllocation, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRawEventAllocation,
+        .{},
+    );
 }
 
 fn checkRawEventAllocation(allocator: std.mem.Allocator) !void {
@@ -3592,7 +3597,7 @@ test "tool lookup borrows stable row keys across growth and keeps latest matchin
 }
 
 test "tool lookup promotes without losing earlier rows or exposing partial state on OOM" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseToolLookupPromotion,
         .{},

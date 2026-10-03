@@ -19,6 +19,7 @@ on:
       - "scripts/test-ledger-cli.sh"
       - "scripts/test-seq-cli.sh"
       - "tools/durable_store_perf.zig"
+      - "tools/install_guard.zig"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"

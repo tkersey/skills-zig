@@ -32,8 +32,8 @@ Consolidate `seq`, `lift`, and `cas` into one source monorepo to share Zig inter
 
 ## Validation baseline
 
-- `zig build build-seq -Doptimize=ReleaseFast`
-- `zig build build-lift -Doptimize=ReleaseFast`
-- `zig build build-cas -Doptimize=ReleaseFast`
+- `zig build build-seq -Doptimize=fast`
+- `zig build build-lift -Doptimize=fast`
+- `zig build build-cas -Doptimize=fast`
 - `cd apps/seq && zig build test`
 - workflow YAML parse check with `PyYAML`

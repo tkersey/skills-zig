@@ -523,8 +523,7 @@ fn startSlots(
     while (i < opts.instances) : (i += 1) {
         const instance_num = i + 1;
         const state_file = if (opts.state_file_dir) |dir|
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s}/{s}-{d}.json",
                 .{ dir, opts.client_prefix, instance_num },
             )
@@ -532,8 +531,7 @@ fn startSlots(
             null;
         defer if (state_file) |owned| allocator.free(owned);
 
-        const client_name = try std.fmt.allocPrint(
-            allocator,
+        const client_name = try allocator.print(
             "{s}-{d}",
             .{ opts.client_prefix, instance_num },
         );
@@ -552,7 +550,7 @@ fn startSlots(
             ctx.attestation_response,
             ctx.code_mode_host,
         ) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+            const msg = try allocator.print("{s}", .{@errorName(err)});
             start_failures.append(allocator, .{
                 .instance = instance_num,
                 .@"error" = msg,
@@ -606,7 +604,7 @@ fn requestSlots(
             const summary = if (client.lastError()) |detail|
                 try allocator.dupe(u8, detail)
             else
-                try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+                try allocator.print("{s}", .{@errorName(err)});
             try appendRequestResult(allocator, request_results, .{
                 .instance = instance_num,
                 .ok = false,
@@ -985,7 +983,7 @@ fn summarizeResult(
 
     const root_obj = switch (parsed.value) {
         .object => |obj| obj,
-        else => return std.fmt.allocPrint(allocator, "{{\"value\":{s}}}", .{result_json}),
+        else => return allocator.print("{{\"value\":{s}}}", .{result_json}),
     };
 
     if (std.mem.eql(u8, method, "thread/list")) return summarizeThreadList(allocator, root_obj);

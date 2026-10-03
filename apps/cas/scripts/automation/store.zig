@@ -174,7 +174,7 @@ pub const Db = struct {
             return userErrorFmt("db not found: {s}", .{db_path});
         };
 
-        const path_z = try allocator.dupeZ(u8, db_path);
+        const path_z = try allocator.dupeSentinel(u8, db_path, 0);
         defer allocator.free(path_z);
 
         var raw: ?*c.sqlite3 = null;
@@ -390,7 +390,7 @@ pub const DoctorDiagnostics = struct {
         try self.rows.append(allocator, .{
             .code = code,
             .severity = severity,
-            .detail = try std.fmt.allocPrint(allocator, fmt, args),
+            .detail = try allocator.print(fmt, args),
         });
     }
 
@@ -472,7 +472,7 @@ pub fn inspectStoreSchema(
     diagnostics: *DoctorDiagnostics,
 ) !void {
     for (required_tables) |table| {
-        const sql = try std.fmt.allocPrint(allocator, "pragma table_info('{s}')", .{table.name});
+        const sql = try allocator.print("pragma table_info('{s}')", .{table.name});
         defer allocator.free(sql);
         var stmt = try db.prepare(allocator, sql);
         defer stmt.deinit();
@@ -581,7 +581,7 @@ pub fn defaultDbPath(allocator: std.mem.Allocator) ![]u8 {
     const home = envString("HOME") orelse {
         return userErrorFmt("HOME is not set", .{});
     };
-    return std.fmt.allocPrint(allocator, "{s}/.codex/sqlite/codex-dev.db", .{home});
+    return allocator.print("{s}/.codex/sqlite/codex-dev.db", .{home});
 }
 
 fn recreatePerfDbFile(db_path: []const u8) !void {
@@ -1918,7 +1918,7 @@ pub fn resolveExecutable(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         if (dir.len == 0) continue;
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
+        const candidate = try allocator.print("{s}/{s}", .{ dir, value });
         errdefer allocator.free(candidate);
         if (std.Io.Dir.cwd().access(
             std.Io.Threaded.global_single_threaded.io(),
@@ -1942,8 +1942,7 @@ pub fn generateUuidV4(allocator: std.mem.Allocator) ![]u8 {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-" ++
             "{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-" ++
             "{x:0>2}{x:0>2}-{x:0>2}{x:0>2}" ++

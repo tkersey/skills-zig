@@ -93,7 +93,7 @@ pub fn writeFileAtomic(
     const timestamp = std.Io.Clock.awake.now(
         std.Io.Threaded.global_single_threaded.io(),
     ).nanoseconds;
-    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, timestamp });
+    const tmp = try allocator.print("{s}.tmp.{d}", .{ path, timestamp });
     defer allocator.free(tmp);
 
     {

@@ -7,6 +7,9 @@ changed in this repository.
 
 It adapts, rather than copies, TigerBeetle's
 [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+Upstream was reviewed at `ba8d4b347cbb29057fd52243d2909b7a830f9336`
+(2026-07-16); that revision corrects an example's `length` to `count`.
+Zig 0.17 does not require replacing the CLI-specific policies below.
 The shared priority is:
 
 1. Safety.
@@ -69,6 +72,12 @@ function boundaries. Do not acquire a convenient global capability when the
 caller already owns the correct one. Pass library options explicitly when a
 default could change semantics.
 
+An `ArrayList` element pointer is a borrow, not stable ownership. Keep the borrow
+short, or reserve capacity before acquiring it. Where the lifetime spans calls
+that could invalidate it, use `lockPointers` with a paired `defer unlockPointers`
+as a diagnostic check. This is not a synchronization primitive or a substitute
+for proving the borrow valid when runtime safety is disabled.
+
 The process-owned `std.process.Init.io` is the default carrier for process
 creation. A global single-threaded I/O instance is not a substitute for an
 owned process capability.
@@ -108,6 +117,12 @@ The permission is narrow:
 - Arenas are preferred for request-lifetime graphs.
 - Long-lived stores retain only data required by their contract.
 
+`BufferFirstAllocator` borrows its explicit backing buffer. Keep the buffer,
+allocator state, and every resulting allocation within the same valid lifetime;
+choose buffer alignment for the contained values. `SafeAllocator.deinit` returns
+a leak count. Treat a nonzero count as a failed ownership check where leak
+freedom is part of the verifier.
+
 Trace parsing preserves the supported unbounded aggregate JSONL input range.
 Its returned turns, occurrences, tools, and warnings may grow with the consumed
 source. This is an explicit compatibility exception to a fixed aggregate result
@@ -143,6 +158,15 @@ reason; the pull request body does not replace commit history.
 
 Prefer Zig for repository tooling. A new dependency requires a written safety,
 performance, maintenance, and supply-chain justification.
+
+Build configuration must declare any files or directories it reads. Resolve
+execution arguments and installation destinations at make time. Prefer tracked
+dependencies and lazy paths to poisoning the configure cache; never force a
+cache hit over untracked observations. A successful cached build must remain
+sensitive to changes in its real inputs.
+
+`zig fmt --complexity` can help compare edits, but token and AST counts do not
+measure correctness or replace this document's limits.
 
 ## Mechanical ratchet
 

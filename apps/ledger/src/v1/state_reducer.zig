@@ -4615,7 +4615,7 @@ test "retained keyed upserts preserve lineage and stable fields atomically" {
         item_index,
         before_invalid,
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         applyUpsertForAllocationFailure,
         .{
@@ -4652,17 +4652,17 @@ test "retained state follows carrier names across definition plans" {
         apply(std.testing.allocator, &second.reducer, &state, updated.value),
     );
     try expectRetainedStatus(&second.reducer, &state, "closed");
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{ &second.artifact, second.rule(), @as(usize, 4096) },
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
         .{second.cache_payload},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         applyEvolutionForAllocationFailure,
         .{

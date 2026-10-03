@@ -4,6 +4,9 @@ Read [TigerStyle for skills-zig](docs/engineering/TIGER_STYLE.md) before making
 Zig changes. It is the normative engineering contract for new and materially
 changed code.
 
+Use Zig 0.17.0. See the [migration notes](docs/engineering/ZIG_017.md) for
+the supported platforms, build modes, and dependency qualification.
+
 Before opening a pull request, run the relevant application tests and these
 repository checks:
 

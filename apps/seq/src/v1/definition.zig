@@ -54,8 +54,8 @@ pub const Operator = enum {
     }
 
     pub fn parse(text: []const u8) !Operator {
-        inline for (@typeInfo(Operator).@"enum".fields) |field| {
-            const value: Operator = @enumFromInt(field.value);
+        inline for (@typeInfo(Operator).@"enum".field_values) |field_value| {
+            const value: Operator = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, value.id())) return value;
         }
         return error.UnsupportedObservationOperator;
@@ -87,8 +87,8 @@ pub const Selector = enum {
     }
 
     fn parse(text: []const u8) !Selector {
-        inline for (@typeInfo(Selector).@"enum".fields) |field| {
-            const value: Selector = @enumFromInt(field.value);
+        inline for (@typeInfo(Selector).@"enum".field_values) |field_value| {
+            const value: Selector = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, value.id())) return value;
         }
         return error.UnsupportedSelector;
@@ -105,8 +105,11 @@ pub const Renderer = enum {
     dot,
 
     pub fn parse(text: []const u8) !Renderer {
-        inline for (@typeInfo(Renderer).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(Renderer).@"enum".field_names,
+            @typeInfo(Renderer).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.UnsupportedRenderer;
     }
@@ -120,8 +123,11 @@ pub const ExternalScalarKind = enum {
     json,
 
     fn parse(text: []const u8) !ExternalScalarKind {
-        inline for (@typeInfo(ExternalScalarKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (
+            @typeInfo(ExternalScalarKind).@"enum".field_names,
+            @typeInfo(ExternalScalarKind).@"enum".field_values,
+        ) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.InvalidExternalFieldType;
     }
@@ -417,7 +423,7 @@ fn parseSelectors(items: std.json.Array) !u8 {
     var mask: u8 = 0;
     for (items.items) |item| {
         const selector = try Selector.parse(try definition_core.json.string(item));
-        const bit: u8 = @as(u8, 1) << @intCast(@intFromEnum(selector));
+        const bit: u8 = @as(u8, 1) << @intCast(@backingInt(selector));
         if ((mask & bit) != 0) return error.DuplicateSelector;
         mask |= bit;
     }
@@ -462,7 +468,7 @@ fn parseRelations(
     }
     std.mem.sort(RelationRequirement, out.items, {}, struct {
         fn lessThan(_: void, left: RelationRequirement, right: RelationRequirement) bool {
-            return @intFromEnum(left.relation) < @intFromEnum(right.relation);
+            return @backingInt(left.relation) < @backingInt(right.relation);
         }
     }.lessThan);
     return out.toOwnedSlice(allocator);
@@ -851,7 +857,7 @@ fn parseRenderers(items: std.json.Array) !u8 {
     var mask: u8 = 0;
     for (items.items) |item| {
         const renderer = try Renderer.parse(try definition_core.json.string(item));
-        const bit: u8 = @as(u8, 1) << @intCast(@intFromEnum(renderer));
+        const bit: u8 = @as(u8, 1) << @intCast(@backingInt(renderer));
         if ((mask & bit) != 0) return error.DuplicateRenderer;
         mask |= bit;
     }
@@ -1038,8 +1044,8 @@ fn decodeOperatorMask(
 ) !u32 {
     const operator_mask = try decoder.readU32();
     var known_operator_mask: u32 = 0;
-    inline for (@typeInfo(Operator).@"enum".fields) |field| {
-        known_operator_mask |= operatorBit(@enumFromInt(field.value));
+    inline for (@typeInfo(Operator).@"enum".field_values) |field_value| {
+        known_operator_mask |= operatorBit(@fromBackingInt(@intCast(field_value)));
     }
     if ((operator_mask & ~known_operator_mask) != 0) {
         return error.CacheObservationOperatorInvalid;
@@ -1052,8 +1058,8 @@ fn decodeSelectorMask(
 ) !u8 {
     const selector_mask = try decoder.readByte();
     var known_selector_mask: u8 = 0;
-    inline for (@typeInfo(Selector).@"enum".fields) |field| {
-        known_selector_mask |= @as(u8, 1) << @intCast(field.value);
+    inline for (@typeInfo(Selector).@"enum".field_values) |field_value| {
+        known_selector_mask |= @as(u8, 1) << @intCast(field_value);
     }
     if ((selector_mask & ~known_selector_mask) != 0) {
         return error.CacheObservationSelectorInvalid;
@@ -1082,7 +1088,7 @@ fn decodeCacheRelations(
     decoder: *definition_core.cache.Decoder,
 ) ![]RelationRequirement {
     const count = try decoder.readCount(
-        @typeInfo(physical.Relation).@"enum".fields.len,
+        @typeInfo(physical.Relation).@"enum".field_names.len,
     );
     const relations = try allocator.alloc(RelationRequirement, count);
     var initialized: usize = 0;
@@ -1095,8 +1101,8 @@ fn decodeCacheRelations(
     for (relations, 0..) |*relation, index| {
         const relation_kind = try decoder.readEnum(physical.Relation);
         if (index != 0 and
-            @intFromEnum(relations[index - 1].relation) >=
-                @intFromEnum(relation_kind))
+            @backingInt(relations[index - 1].relation) >=
+                @backingInt(relation_kind))
         {
             return error.CachePhysicalRelationsNotSorted;
         }
@@ -1374,7 +1380,7 @@ fn decodeCacheProjections(
         errdefer deinitStrings(allocator, fields);
         const renderer_mask = try decoder.readByte();
         const known_renderers = (@as(u8, 1) <<
-            @typeInfo(Renderer).@"enum".fields.len) - 1;
+            @typeInfo(Renderer).@"enum".field_names.len) - 1;
         if (renderer_mask == 0 or
             (renderer_mask & ~known_renderers) != 0)
         {
@@ -1459,7 +1465,7 @@ fn parseOwnedStringArray(
 }
 
 fn operatorBit(operator: Operator) u32 {
-    return @as(u32, 1) << @intCast(@intFromEnum(operator));
+    return @as(u32, 1) << @intCast(@backingInt(operator));
 }
 
 fn deinitRelations(allocator: std.mem.Allocator, items: []RelationRequirement) void {
@@ -1530,7 +1536,7 @@ fn expectDefinitionCacheRoundTrip(plan: *const Plan) !void {
         plan.projections[0].schema_id,
         cached.projections[0].schema_id,
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeCacheForAllocationFailure,
         .{payload},

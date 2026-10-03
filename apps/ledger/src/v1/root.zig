@@ -232,8 +232,7 @@ fn appendPlainCreatedEventFor(
     repo_root: []const u8,
     id: []const u8,
 ) !void {
-    const bytes = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const bytes = try std.testing.allocator.print(
         "{{\"kind\":\"created\",\"value\":{{" ++
             "\"id\":\"{s}\",\"revision\":1}}}}",
         .{id},

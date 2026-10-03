@@ -403,7 +403,7 @@ fn acquireClient(
             else
                 try launch.defaultUnixPathAlloc(allocator);
             defer allocator.free(path);
-            const endpoint_identity = try std.fmt.allocPrint(allocator, "unix://{s}", .{path});
+            const endpoint_identity = try allocator.print("unix://{s}", .{path});
             errdefer allocator.free(endpoint_identity);
             var options = baseClientOptions(io, cwd, parsed);
             options.transport = .{ .unix_socket = path };
@@ -573,7 +573,7 @@ fn extractTurnId(allocator: std.mem.Allocator, result_json: []const u8) !?[]cons
 
 fn errorSummary(allocator: std.mem.Allocator, client: *cas.Client, err: anyerror) ![]const u8 {
     if (client.lastError()) |detail| return detail;
-    return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+    return allocator.print("{s}", .{@errorName(err)});
 }
 
 fn hasCapturedCompletedHookNotification(allocator: std.mem.Allocator, lines: []const []u8) bool {
@@ -789,9 +789,9 @@ const SmokeContext = struct {
                 .json = null,
                 .ok = !unavailable,
                 .detail = if (unavailable)
-                    try std.fmt.allocPrint(self.allocator, "method unavailable: {s}", .{summary})
+                    try self.allocator.print("method unavailable: {s}", .{summary})
                 else
-                    try std.fmt.allocPrint(self.allocator, rejection_format, .{summary}),
+                    try self.allocator.print(rejection_format, .{summary}),
             };
         };
         return .{ .json = json };
@@ -812,14 +812,14 @@ fn checkFeatureList(ctx: SmokeContext) !CheckResult {
     defer allocator.free(json);
     const rows = try countDataRows(allocator, json);
     const rows_text = if (rows) |count|
-        try std.fmt.allocPrint(allocator, "{d}", .{count})
+        try allocator.print("{d}", .{count})
     else
         "unknown";
     defer if (rows != null) allocator.free(rows_text);
     return .{
         .name = "experimentalFeature/list",
         .ok = true,
-        .detail = try std.fmt.allocPrint(allocator, "ok (rows={s})", .{rows_text}),
+        .detail = try allocator.print("ok (rows={s})", .{rows_text}),
     };
 }
 
@@ -855,8 +855,7 @@ fn checkResume(ctx: SmokeContext, cwd: []const u8, thread_id: *?[]const u8) !Che
             if (!std.mem.eql(u8, resumed_id, id)) return .{
                 .name = "thread/resume",
                 .ok = false,
-                .detail = try std.fmt.allocPrint(
-                    allocator,
+                .detail = try allocator.print(
                     "thread/resume returned unexpected thread id: {s}",
                     .{resumed_id},
                 ),
@@ -942,7 +941,7 @@ fn checkSteer(ctx: SmokeContext, thread_id: ?[]const u8) !CheckResult {
         .ok = false,
         .detail = "no threadId available for turn/steer check",
     };
-    const expected_turn_id = try std.fmt.allocPrint(ctx.allocator, "cas-smoke-{d}", .{@divFloor(
+    const expected_turn_id = try ctx.allocator.print("cas-smoke-{d}", .{@divFloor(
         std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
         1_000_000_000,
     )});

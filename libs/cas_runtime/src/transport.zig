@@ -187,7 +187,7 @@ pub const CodeModeHost = struct {
         }
         const raw_owned = try allocator.dupe(u8, raw);
         errdefer allocator.free(raw_owned);
-        const origin = try std.fmt.allocPrint(allocator, "{s}://{s}", .{
+        const origin = try allocator.print("{s}://{s}", .{
             if (authority.secure) "https" else "http",
             authority.authority,
         });

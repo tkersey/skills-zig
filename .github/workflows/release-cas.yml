@@ -32,9 +32,9 @@ jobs:
             cas_static: true
             runs_on: ubuntu-latest
           - target: darwin-arm64
-            zig_target: aarch64-macos
+            zig_target: aarch64-macos.15.0
             cas_static: false
-            runs_on: macos-14
+            runs_on: macos-15
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +49,7 @@ jobs:
           fi
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Fetch pinned SQLite amalgamation
         shell: bash
         run: |
@@ -74,7 +74,7 @@ jobs:
           zig build build-cas
           -Dtarget=${{ matrix.zig_target }}
           -Dcpu=baseline
-          -Doptimize=ReleaseFast
+          -Doptimize=fast
           -Dcas-static=${{ matrix.cas_static }}
           -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
       - name: Verify pinned SQLite release boundary
@@ -121,7 +121,7 @@ jobs:
           zig build test-cas-dispatch-runtime-linux
           -Dtarget=${{ matrix.zig_target }}
           -Dcpu=baseline
-          -Doptimize=ReleaseFast
+          -Doptimize=fast
           -Dcas-static=${{ matrix.cas_static }}
           -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
           --summary all

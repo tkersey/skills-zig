@@ -14,13 +14,12 @@ threadlocal var runtime_io: ?std.Io = null;
 pub const panic = if (builtin.is_test)
     std.debug.FullPanic(std.debug.defaultPanic)
 else
-    std.debug.simple_panic;
+    // Zig 0.17.0 simple_panic.unexpectedErrorCode discards an error value.
+    // Keep its minimal output/trap callback with the supported panic interface.
+    std.debug.FullPanic(std.debug.simple_panic.call);
 
 pub const std_options: std.Options = .{
-    .signal_stack_size = switch (builtin.mode) {
-        .ReleaseFast, .ReleaseSmall => null,
-        .Debug, .ReleaseSafe => 1 << 18,
-    },
+    .signal_stack_size = if (builtin.mode.runtimeSafety()) 1 << 18 else null,
 };
 
 const Help =
@@ -204,7 +203,7 @@ const RecoveryPaths = struct {
 fn resolveRepoRoot(allocator: std.mem.Allocator, repo_path: []const u8) ![:0]u8 {
     if (storage_root.isActive()) {
         if (!std.mem.eql(u8, repo_path, ".")) return error.InvalidManagedRoot;
-        return allocator.dupeZ(u8, ".");
+        return allocator.dupeSentinel(u8, ".", 0);
     }
     try durable_store.rejectSymlinkComponents(repo_path);
     return std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), repo_path, allocator);

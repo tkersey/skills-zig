@@ -216,8 +216,7 @@ pub fn parseLatestThreadTarget(
 pub fn buildThreadListParamsJson(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
     const quoted_cwd = try jsonStringAlloc(allocator, cwd);
     defer allocator.free(quoted_cwd);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"cursor\":null,\"limit\":20,\"sortKey\":\"updated_at\",\"sortD" ++
             "irection\":\"desc\",\"archived\":false,\"cwd\":{s}}}",
         .{quoted_cwd},
@@ -227,7 +226,7 @@ pub fn buildThreadListParamsJson(allocator: std.mem.Allocator, cwd: []const u8) 
 pub fn buildThreadIdParamsJson(allocator: std.mem.Allocator, thread_id: []const u8) ![]u8 {
     const quoted_thread_id = try jsonStringAlloc(allocator, thread_id);
     defer allocator.free(quoted_thread_id);
-    return std.fmt.allocPrint(allocator, "{{\"threadId\":{s}}}", .{quoted_thread_id});
+    return allocator.print("{{\"threadId\":{s}}}", .{quoted_thread_id});
 }
 
 pub fn buildGoalSetParamsJson(

@@ -29,7 +29,7 @@ const RepeatingReader = struct {
         const self: *RepeatingReader = @fieldParentPtr("interface", reader);
         if (self.remaining == 0) return error.EndOfStream;
 
-        var allowed = @min(@as(usize, @intFromEnum(limit)), self.remaining);
+        var allowed = @min(@as(usize, @backingInt(limit)), self.remaining);
         var written: usize = 0;
         while (allowed > 0) {
             const available = self.pattern.len - self.pattern_pos;

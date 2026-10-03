@@ -19,7 +19,7 @@ fn serveCodeModeHostFixture(
     var listener = try listen_address.listen(io, .{ .mode = .stream });
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
-    const url = try std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}/", .{port});
+    const url = try allocator.print("ws://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ready_path, .data = url });
 
@@ -53,8 +53,7 @@ fn serveCodeModeHostFixture(
     sha1.final(&digest);
     var accept_buf: [28]u8 = undefined;
     const accept = std.base64.standard.Encoder.encode(&accept_buf, &digest);
-    const response = try std.fmt.allocPrint(
-        allocator,
+    const response = try allocator.print(
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
@@ -447,8 +446,7 @@ const UnixFixture = struct {
         sha1.final(&digest);
         var accept_buf: [28]u8 = undefined;
         const accept = std.base64.standard.Encoder.encode(&accept_buf, &digest);
-        const response = try std.fmt.allocPrint(
-            std.heap.page_allocator,
+        const response = try std.heap.page_allocator.print(
             "HTTP/1.1 101 Switching Protocols\r\n" ++
                 "Upgrade: websocket\r\n" ++
                 "Connection: Upgrade\r\n" ++
@@ -809,8 +807,7 @@ fn providerRequestFakeCodexScriptAlloc(
     method: []const u8,
     evidence_path: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "#!/bin/sh\n" ++
             "set -eu\n" ++
             "evidence='{s}'\n" ++

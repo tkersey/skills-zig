@@ -94,8 +94,7 @@ pub fn validateSchedulerLabel(raw: []const u8) ![]const u8 {
 }
 
 pub fn renderLaunchdProgramArguments(allocator: std.mem.Allocator, cas_path_xml: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "  <key>ProgramArguments</key>\n" ++
             "  <array>\n" ++
             "    <string>{s}</string>\n" ++
@@ -568,23 +567,21 @@ pub fn cmdSchedulerInstall(
     io: std.Io,
     args: SchedulerInstallArgs,
 ) !void {
-    if (builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .macos) {
         return userErrorFmt("scheduler commands are supported on macOS only", .{});
     }
 
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
 
-    const launch_agents = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents", .{home});
+    const launch_agents = try allocator.print("{s}/Library/LaunchAgents", .{home});
     defer allocator.free(launch_agents);
-    const log_dir = try std.fmt.allocPrint(
-        allocator,
+    const log_dir = try allocator.print(
         "{s}/Library/Logs/codex-automation-runner",
         .{home},
     );
     defer allocator.free(log_dir);
 
-    const plist_path = try std.fmt.allocPrint(
-        allocator,
+    const plist_path = try allocator.print(
         "{s}/{s}.plist",
         .{ launch_agents, args.label },
     );
@@ -604,9 +601,9 @@ pub fn cmdSchedulerInstall(
     defer allocator.free(plist);
 
     const uid = std.c.getuid();
-    const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
+    const target = try allocator.print("gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
-    const domain = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
+    const domain = try allocator.print("gui/{d}", .{uid});
     defer allocator.free(domain);
 
     try installSchedulerAtPaths(
@@ -740,8 +737,7 @@ fn buildSchedulerPlist(
     const path_xml = try output.xmlEscapeAlloc(scratch, args.path_value);
     const codex_bin_xml = try output.xmlEscapeAlloc(scratch, args.codex_bin);
     const program_arguments_xml = try renderLaunchdProgramArguments(scratch, cas_path_xml);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         SchedulerPlistTemplate,
         .{
             label_xml,
@@ -850,20 +846,19 @@ pub fn cmdSchedulerUninstall(
     io: std.Io,
     args: SchedulerLabelArgs,
 ) !void {
-    if (builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .macos) {
         return userErrorFmt("scheduler commands are supported on macOS only", .{});
     }
 
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
-    const plist = try std.fmt.allocPrint(
-        allocator,
+    const plist = try allocator.print(
         "{s}/Library/LaunchAgents/{s}.plist",
         .{ home, args.label },
     );
     defer allocator.free(plist);
 
     const uid = std.c.getuid();
-    const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
+    const target = try allocator.print("gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
 
     const existed = try uninstallSchedulerAtPath(
@@ -965,7 +960,7 @@ pub fn cmdSchedulerStatus(
     io: std.Io,
     args: SchedulerLabelArgs,
 ) !void {
-    if (builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .macos) {
         return userErrorFmt("scheduler commands are supported on macOS only", .{});
     }
 
@@ -1003,9 +998,9 @@ pub fn readSchedulerStatus(
     defer allocator.free(plist_path);
     var target: ?[]u8 = null;
     defer if (target) |value| allocator.free(value);
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         const uid = std.c.getuid();
-        target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, label });
+        target = try allocator.print("gui/{d}/{s}", .{ uid, label });
     }
     return readSchedulerStatusAtPath(
         allocator,
@@ -1023,8 +1018,7 @@ fn schedulerPlistPath(
     label: []const u8,
 ) ![]u8 {
     const value = home orelse return userErrorFmt("HOME is not set", .{});
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/Library/LaunchAgents/{s}.plist",
         .{ value, label },
     );
@@ -1068,7 +1062,7 @@ fn runSystemCommandCapture(
     const exit_code: u8 = switch (child.term) {
         .exited => |code| code,
         .signal => |signal| @intCast(@min(
-            @as(u32, 128) + @intFromEnum(signal),
+            @as(u32, 128) + @backingInt(signal),
             @as(u32, 255),
         )),
         .stopped, .unknown => 1,
@@ -1894,7 +1888,7 @@ const ArgumentParserCase = enum { plist, launchctl, json };
 
 test "scheduler argument parsers preserve owned prefixes on allocation failure" {
     inline for (.{ ArgumentParserCase.plist, .launchctl, .json }) |case| {
-        try std.testing.checkAllAllocationFailures(
+        try @import("test_support").checkAllAllocationFailures(
             std.testing.allocator,
             checkArgumentParserAllocations,
             .{case},

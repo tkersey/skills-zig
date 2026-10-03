@@ -191,7 +191,7 @@ const fixture_count = "\x00\x00\x00\x01";
 const fixture_path = "\x00\x00\x00\x06a.json";
 const closure_wire = fixture_digest ++ fixture_size ++ fixture_count ++ fixture_path ++
     "\x00\x00\x00\x02{}" ++ fixture_source_digest ++ fixture_size;
-const locator_wire = "k" ** 32 ++ fixture_digest ++ fixture_count ++ fixture_path ++
+const locator_wire = &@as([32]u8, @splat('k')) ++ fixture_digest ++ fixture_count ++ fixture_path ++
     fixture_source_digest ++ fixture_size;
 
 fn fixtureClosure(files: *[1]closure.ClosureFile) closure.Closure {
@@ -213,7 +213,7 @@ test "source cache encoders preserve the fixed closure and locator wire formats"
     try std.testing.expectEqualStrings(closure_wire, encoded.written());
     var locator = cache.Encoder.init(std.testing.allocator, 1024);
     defer locator.deinit();
-    try encodeLocatorBody(&source, [_]u8{'k'} ** 32, &locator);
+    try encodeLocatorBody(&source, @as([32]u8, @splat('k')), &locator);
     try std.testing.expectEqualStrings(locator_wire, locator.written());
 }
 
@@ -266,12 +266,12 @@ test "source cache decoders release every allocation on truncation and allocatio
             decodeLocatorFixture(std.testing.allocator, locator_wire[0..end]),
         );
     }
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeClosureFixture,
         .{closure_wire},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         decodeLocatorFixture,
         .{locator_wire},
@@ -304,7 +304,7 @@ test "full source cache decoding rejects corrupted authoritative fields" {
 }
 
 test "locator minimum file policy remains caller selected before trailing validation" {
-    const empty = "k" ** 32 ++ fixture_digest ++ "\x00\x00\x00\x00";
+    const empty = &@as([32]u8, @splat('k')) ++ fixture_digest ++ "\x00\x00\x00\x00";
     try decodeLocatorFixture(std.testing.allocator, empty);
     var decoder = cache.Decoder.init(empty ++ "extra");
     try std.testing.expectError(

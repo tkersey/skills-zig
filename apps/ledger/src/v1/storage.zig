@@ -5935,7 +5935,7 @@ test "storage path parameters compile once and resolve as safe components" {
         &parameters,
         resolved.slot(0).relative_path,
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         resolveForAllocationFailure,
         .{ &test_plan.plan, &parameters },

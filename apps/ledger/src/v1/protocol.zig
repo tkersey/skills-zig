@@ -137,8 +137,8 @@ pub const ReplayState = struct {
     previous_digest: [71]u8 = undefined,
     has_previous_digest: bool = false,
     kind_counts: [max_event_kinds]usize =
-        [_]usize{0} ** max_event_kinds,
-    event_kinds_digest: [32]u8 = [_]u8{0} ** 32,
+        @as([max_event_kinds]usize, @splat(0)),
+    event_kinds_digest: [32]u8 = @as([32]u8, @splat(0)),
     has_event_kinds_digest: bool = false,
     records: usize = 0,
     reducer_state: reducer.State = .{},
@@ -391,7 +391,7 @@ test "segmented checkpoint identity reads only the bounded header" {
     defer encoder.deinit();
     try encoder.writeBytes(checkpoint_schema_v2);
     try encoder.writeBytes(digest);
-    try encoder.writeBytes(&([_]u8{0} ** 32));
+    try encoder.writeBytes(&(@as([32]u8, @splat(0))));
     const encoded = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(encoded);
     const actual = try checkpointDefinitionDigest(encoded);
@@ -2279,8 +2279,7 @@ fn validateSequenceText(
     const replay_state = state orelse
         return error.PlainEventRequiresProtocolState;
     const actual = try definition_core.json.string(value);
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "{s}{d}",
         .{ prefix, replay_state.next_sequence },
     );
@@ -2564,7 +2563,7 @@ fn deriveEventSha1Alloc(
     const hex = std.fmt.bytesToHex(raw, .lower);
     const encoded = switch (config.encoding) {
         .hex => try allocator.dupe(u8, &hex),
-        .digest => try std.fmt.allocPrint(allocator, "sha1:{s}", .{hex}),
+        .digest => try allocator.print("sha1:{s}", .{hex}),
     };
     return truncateEventDigestAlloc(allocator, encoded, config.prefix_bytes);
 }
@@ -2602,7 +2601,7 @@ fn deriveEventSha256Alloc(
     const hex = std.fmt.bytesToHex(raw, .lower);
     const encoded = switch (config.encoding) {
         .hex => try allocator.dupe(u8, &hex),
-        .digest => try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex}),
+        .digest => try allocator.print("sha256:{s}", .{hex}),
     };
     return truncateEventDigestAlloc(allocator, encoded, config.prefix_bytes);
 }
@@ -2820,8 +2819,7 @@ fn formatEventTimestampAlloc(
     const minute = @divFloor(seconds_of_day - hour * 3600, 60);
     const second = seconds_of_day - hour * 3600 - minute * 60;
     return switch (format) {
-        .rfc3339_seconds => std.fmt.allocPrint(
-            allocator,
+        .rfc3339_seconds => allocator.print(
             "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
             .{
                 @as(u32, @intCast(civil.year)),
@@ -4226,8 +4224,7 @@ fn writeMaterializedField(
         },
         .literal => |literal| try writer.writeAll(literal),
         .sequence_text_prefix => |prefix| {
-            const value = try std.fmt.allocPrint(
-                allocator,
+            const value = try allocator.print(
                 "{s}{d}",
                 .{ prefix, sequence },
             );
@@ -5124,7 +5121,7 @@ fn findInput(
 }
 
 fn operatorBit(operator: definition.Operator) u128 {
-    return @as(u128, 1) << @intFromEnum(operator);
+    return @as(u128, 1) << @backingInt(operator);
 }
 
 fn eventAlloc(

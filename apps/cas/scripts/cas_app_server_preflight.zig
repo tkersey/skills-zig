@@ -512,8 +512,7 @@ fn codeModeHostOwnerProbeFallible(
         "CAS_CODE_MODE_PROBE_{x}",
         .{now},
     );
-    const probe_root = try std.fmt.allocPrint(
-        allocator,
+    const probe_root = try allocator.print(
         "{s}/code-mode-owner-{x}",
         .{ cache_root, now },
     );
@@ -743,8 +742,7 @@ fn createCodeModeOwnerProbeConfig(
 ) !void {
     const path = try std.fs.path.join(allocator, &.{ codex_home, "config.toml" });
     defer allocator.free(path);
-    const contents = try std.fmt.allocPrint(
-        allocator,
+    const contents = try allocator.print(
         "model = \"gpt-5.4\"\n" ++
             "model_provider = \"cas_code_mode_probe\"\n" ++
             "\n" ++
@@ -864,8 +862,7 @@ fn serveInternalModelFixture(
     var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try listen_address.listen(io, .{ .mode = .stream });
     defer listener.deinit(io);
-    const base_url = try std.fmt.allocPrint(
-        allocator,
+    const base_url = try allocator.print(
         "http://127.0.0.1:{d}/v1",
         .{listener.socket.address.getPort()},
     );
@@ -1043,8 +1040,7 @@ fn writeHttpResponse(
     content_type: []const u8,
     body: []const u8,
 ) !void {
-    const headers = try std.fmt.allocPrint(
-        allocator,
+    const headers = try allocator.print(
         "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
@@ -1071,7 +1067,7 @@ fn firstModelSseAlloc(allocator: std.mem.Allocator, nonce: []const u8) ![]u8 {
             "\"item\":{\"type\":\"custom_tool_call\"," ++
             "\"call_id\":\"cas-code-mode-call\",\"name\":\"exec\",\"input\":",
     );
-    const source = try std.fmt.allocPrint(allocator, "text(\"{s}\");", .{nonce});
+    const source = try allocator.print("text(\"{s}\");", .{nonce});
     defer allocator.free(source);
     try std.json.Stringify.value(source, .{}, writer);
     try writer.writeAll(
@@ -1227,7 +1223,7 @@ fn writeAtomicFileAlloc(
     path: []const u8,
     bytes: []const u8,
 ) !void {
-    const staging = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    const staging = try allocator.print("{s}.tmp", .{path});
     defer allocator.free(staging);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = bytes });
     try std.Io.Dir.renameAbsolute(staging, path, io);
@@ -1566,8 +1562,7 @@ fn startUnixLifecycle(
     else
         try proxy.app_server_launch.defaultUnixPathAlloc(allocator);
     defer allocator.free(resolved_path);
-    const endpoint_identity = try std.fmt.allocPrint(
-        allocator,
+    const endpoint_identity = try allocator.print(
         "unix://{s}",
         .{resolved_path},
     );
@@ -1706,8 +1701,7 @@ fn runIsolatedFullProbes(
     profile: contract.Profile,
 ) !FeatureWitnesses {
     const nonce: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    const requested_codex_home = try std.fmt.allocPrint(
-        allocator,
+    const requested_codex_home = try allocator.print(
         "{s}/probe-{x}",
         .{ cache_root, nonce },
     );
@@ -1931,8 +1925,7 @@ fn createIsolatedProbeConfig(
 ) !void {
     const path = try std.fs.path.join(allocator, &.{ codex_home, "config.toml" });
     defer allocator.free(path);
-    const contents = try std.fmt.allocPrint(
-        allocator,
+    const contents = try allocator.print(
         "model = \"cas-preflight-probe\"\n" ++
             "model_provider = \"cas_preflight\"\n" ++
             "\n" ++
@@ -1979,13 +1972,13 @@ fn createPinningProbeRollout(
     codex_home: []const u8,
     cwd: []const u8,
 ) !void {
-    const sessions = try std.fmt.allocPrint(allocator, "{s}/sessions", .{codex_home});
+    const sessions = try allocator.print("{s}/sessions", .{codex_home});
     defer allocator.free(sessions);
-    const year = try std.fmt.allocPrint(allocator, "{s}/2026", .{sessions});
+    const year = try allocator.print("{s}/2026", .{sessions});
     defer allocator.free(year);
-    const month = try std.fmt.allocPrint(allocator, "{s}/08", .{year});
+    const month = try allocator.print("{s}/08", .{year});
     defer allocator.free(month);
-    const day = try std.fmt.allocPrint(allocator, "{s}/04", .{month});
+    const day = try allocator.print("{s}/04", .{month});
     defer allocator.free(day);
     try std.Io.Dir.cwd().createDir(io, sessions, .default_dir);
     try std.Io.Dir.cwd().createDir(io, year, .default_dir);
@@ -2017,14 +2010,12 @@ fn createPinningProbeRollout(
         "{\"timestamp\":\"2026-08-04T00:00:00Z\",\"type\":\"event_msg\"," ++
         "\"payload\":{\"type\":\"user_message\"," ++
         "\"message\":\"CAS section conformance fixture\",\"kind\":\"plain\"}}";
-    const contents = try std.fmt.allocPrint(
-        allocator,
+    const contents = try allocator.print(
         "{s}\n{s}\n{s}\n",
         .{ meta, response_item, event },
     );
     defer allocator.free(contents);
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/rollout-2026-08-04T00-00-00-{s}.jsonl",
         .{ day, section_probe_thread_id },
     );
@@ -2038,7 +2029,7 @@ fn createPaginatedForkProbeRollout(
     codex_home: []const u8,
     cwd: []const u8,
 ) !void {
-    const sessions = try std.fmt.allocPrint(allocator, "{s}/sessions/2026/08/04", .{codex_home});
+    const sessions = try allocator.print("{s}/sessions/2026/08/04", .{codex_home});
     defer allocator.free(sessions);
     try std.Io.Dir.cwd().createDirPath(io, sessions);
 
@@ -2048,8 +2039,7 @@ fn createPaginatedForkProbeRollout(
     try writePaginatedProbeHeader(&contents.writer, timestamp, cwd);
     try writePaginatedProbeTurns(&contents.writer, timestamp);
 
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/rollout-2026-08-04T00-00-01-{s}.jsonl",
         .{ sessions, probes.PaginatedForkFixture.thread_id },
     );

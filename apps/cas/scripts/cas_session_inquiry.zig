@@ -651,8 +651,11 @@ fn parsePolicyOption(
 }
 
 fn parseCommand(raw: []const u8) ?Command {
-    inline for (@typeInfo(Command).@"enum".fields) |field| {
-        if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+    inline for (
+        @typeInfo(Command).@"enum".field_names,
+        @typeInfo(Command).@"enum".field_values,
+    ) |field_name, field_value| {
+        if (std.mem.eql(u8, raw, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -918,8 +921,8 @@ fn runInquiryOrRecordFailure(
             .state = @tagName(InquiryState.failed),
             .receipt_dir = receipt_dir,
             .state_ref = try stateRecordPath(allocator, options.home, rip.inquiry_id),
-            .events_ref = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir}),
-            .summary_ref = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir}),
+            .events_ref = try allocator.print("{s}/events.jsonl", .{receipt_dir}),
+            .summary_ref = try allocator.print("{s}/summary.json", .{receipt_dir}),
             .failure_code = (failed.failure_code orelse FailureCode.receipt_invalid).asString(),
             .failure_hint = failed.hint,
         };
@@ -1196,8 +1199,7 @@ fn cmdReceipt(allocator: std.mem.Allocator, options: Options) !void {
 fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !PreflightResult {
     var shared = try runSharedSessionInquiryPreflight(allocator, io, options);
     defer shared.deinit(allocator);
-    const fingerprint_source = try std.fmt.allocPrint(
-        allocator,
+    const fingerprint_source = try allocator.print(
         "cas-session-inquiry-schema-fingerprint/v1\x00{s}\x00{s}",
         .{ shared.stable_schema_digest, shared.experimental_schema_digest },
     );
@@ -1522,7 +1524,7 @@ fn sharedPreflightHostIdentity(
             );
             const digest = try requiredString(identity, "sha256");
             if (!isLowerSha256Hex(digest)) return error.InvalidAppServerPreflightReceipt;
-            code_mode_host_digest = try std.fmt.allocPrint(allocator, "sha256:{s}", .{digest});
+            code_mode_host_digest = try allocator.print("sha256:{s}", .{digest});
         },
         else => return error.InvalidAppServerPreflightReceipt,
     };
@@ -1541,7 +1543,7 @@ fn allocateSharedPreflight(
     const version_banner = if (std.mem.startsWith(u8, version, "codex-cli "))
         try allocator.dupe(u8, version)
     else
-        try std.fmt.allocPrint(allocator, "codex-cli {s}", .{version});
+        try allocator.print("codex-cli {s}", .{version});
     errdefer allocator.free(version_banner);
     const codex_path = try allocator.dupe(u8, try requiredString(facts.codex, "path"));
     errdefer allocator.free(codex_path);
@@ -1978,8 +1980,7 @@ fn verifyDcpContentIdentity(
     defer allocator.free(canonical);
     const digest = try sha256HexAlloc(allocator, canonical);
     defer allocator.free(digest);
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "DCP-{s}",
         .{digest["sha256:".len..]},
     );
@@ -2176,26 +2177,34 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
 fn cloneDcpSourceStrings(allocator: std.mem.Allocator, source: Dcp) !Dcp {
     var result = source;
     var copied: usize = 0;
-    errdefer inline for (std.meta.fields(Dcp), 0..) |field, index| {
+    errdefer inline for (
+        @typeInfo(Dcp).@"struct".field_names,
+        @typeInfo(Dcp).@"struct".field_types,
+        0..,
+    ) |field_name, field_type, index| {
         if (index < copied) {
-            if (comptime field.type == []const u8) {
-                allocator.free(@field(result, field.name));
-            } else if (comptime field.type == ?[]const u8 and
-                !std.mem.eql(u8, field.name, "source_episode_id"))
+            if (comptime field_type == []const u8) {
+                allocator.free(@field(result, field_name));
+            } else if (comptime field_type == ?[]const u8 and
+                !std.mem.eql(u8, field_name, "source_episode_id"))
             {
-                if (@field(result, field.name)) |value| allocator.free(value);
+                if (@field(result, field_name)) |value| allocator.free(value);
             }
         }
     };
-    inline for (std.meta.fields(Dcp), 0..) |field, index| {
-        if (comptime field.type == []const u8) {
-            @field(result, field.name) = try allocator.dupe(u8, @field(source, field.name));
-        } else if (comptime field.type == ?[]const u8 and
-            !std.mem.eql(u8, field.name, "source_episode_id"))
+    inline for (
+        @typeInfo(Dcp).@"struct".field_names,
+        @typeInfo(Dcp).@"struct".field_types,
+        0..,
+    ) |field_name, field_type, index| {
+        if (comptime field_type == []const u8) {
+            @field(result, field_name) = try allocator.dupe(u8, @field(source, field_name));
+        } else if (comptime field_type == ?[]const u8 and
+            !std.mem.eql(u8, field_name, "source_episode_id"))
         {
-            @field(result, field.name) = try dupeOptionalString(
+            @field(result, field_name) = try dupeOptionalString(
                 allocator,
-                @field(source, field.name),
+                @field(source, field_name),
             );
         }
         copied = index + 1;
@@ -2246,8 +2255,7 @@ fn sourceEpisodeIdFromDcpAlloc(
     const session_id = optionalString(source, "session_id") orelse return null;
     const turn_id = optionalString(turns, "decision_turn_id") orelse return null;
     if (session_id.len == 0 or turn_id.len == 0) return null;
-    return @as(?[]u8, try std.fmt.allocPrint(
-        allocator,
+    return @as(?[]u8, try allocator.print(
         "session:{s}#turn:{s}",
         .{ session_id, turn_id },
     ));
@@ -2373,14 +2381,22 @@ fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
 fn cloneRipSourceStrings(allocator: std.mem.Allocator, source: Rip) !Rip {
     var result = source;
     var copied: usize = 0;
-    errdefer inline for (std.meta.fields(Rip), 0..) |field, index| {
-        if (comptime field.type == []const u8) {
-            if (index < copied) allocator.free(@field(result, field.name));
+    errdefer inline for (
+        @typeInfo(Rip).@"struct".field_names,
+        @typeInfo(Rip).@"struct".field_types,
+        0..,
+    ) |field_name, field_type, index| {
+        if (comptime field_type == []const u8) {
+            if (index < copied) allocator.free(@field(result, field_name));
         }
     };
-    inline for (std.meta.fields(Rip), 0..) |field, index| {
-        if (comptime field.type == []const u8) {
-            @field(result, field.name) = try allocator.dupe(u8, @field(source, field.name));
+    inline for (
+        @typeInfo(Rip).@"struct".field_names,
+        @typeInfo(Rip).@"struct".field_types,
+        0..,
+    ) |field_name, field_type, index| {
+        if (comptime field_type == []const u8) {
+            @field(result, field_name) = try allocator.dupe(u8, @field(source, field_name));
         }
         copied = index + 1;
     }
@@ -2739,14 +2755,14 @@ fn executeLiveInquiry(
 ) !RunOutput {
     if (detached) return error.InquiryTransportLost;
     try ensureDir(receipt_dir);
-    const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_dir});
+    const lanes_dir = try allocator.print("{s}/lanes", .{receipt_dir});
     defer allocator.free(lanes_dir);
     try ensureDir(lanes_dir);
     try persistInputCopies(allocator, options, rip.inquiry_id);
     const inquiry_cwd = try inquiryWorkspaceCwdAlloc(allocator, options, rip);
     defer allocator.free(inquiry_cwd);
-    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir});
-    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
+    const events_path = try allocator.print("{s}/events.jsonl", .{receipt_dir});
+    const summary_path = try allocator.print("{s}/summary.json", .{receipt_dir});
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
     const run = InquiryExecution{
         .allocator = allocator,
@@ -2856,7 +2872,7 @@ fn startDetachedInquiry(
 ) !RunOutput {
     try ensureDir(receipt_dir);
     const receipt_root = try absoluteDirPathAlloc(allocator, receipt_dir);
-    const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_root});
+    const lanes_dir = try allocator.print("{s}/lanes", .{receipt_root});
     defer allocator.free(lanes_dir);
     try ensureDir(lanes_dir);
     const state_lanes_dir = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, "lanes");
@@ -2865,8 +2881,8 @@ fn startDetachedInquiry(
     try persistInputCopies(allocator, options, rip.inquiry_id);
     const inquiry_cwd = try inquiryWorkspaceCwdAlloc(allocator, options, rip);
     defer allocator.free(inquiry_cwd);
-    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_root});
-    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_root});
+    const events_path = try allocator.print("{s}/events.jsonl", .{receipt_root});
+    const summary_path = try allocator.print("{s}/summary.json", .{receipt_root});
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
 
     const run = InquiryExecution{
@@ -3198,7 +3214,7 @@ fn spawnDetachedWaitWorker(
     else
         try resolveExecutablePathAlloc(allocator, "cas_session_inquiry", options.path_env);
     defer allocator.free(self_exe);
-    const timeout_text = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
+    const timeout_text = try allocator.print("{d}", .{timeout_ms});
     defer allocator.free(timeout_text);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -3262,9 +3278,9 @@ fn loadPersistedInquiryInput(
     definition_id: []const u8,
     input_name: []const u8,
 ) !ValidatedInput {
-    const input_leaf = try std.fmt.allocPrint(allocator, "{s}.json", .{stem});
+    const input_leaf = try allocator.print("{s}.json", .{stem});
     defer allocator.free(input_leaf);
-    const receipt_leaf = try std.fmt.allocPrint(allocator, "{s}.validation.json", .{stem});
+    const receipt_leaf = try allocator.print("{s}.validation.json", .{stem});
     defer allocator.free(receipt_leaf);
     const input_path = try inquiryPathJoin(allocator, options.home, inquiry_id, input_leaf);
     defer allocator.free(input_path);
@@ -3981,37 +3997,32 @@ const LanePaths = struct {
     fn init(start: LaneStart, receipt_dir: []const u8, attempt: u64) !LanePaths {
         const allocator = start.allocator;
         const stem = if (attempt == 0)
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s}-{d}",
                 .{ start.lane.lane_id, start.ordinal + 1 },
             )
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s}-{d}-attempt-{d}",
                 .{ start.lane.lane_id, start.ordinal + 1, attempt + 1 },
             );
         defer allocator.free(stem);
-        const events = try std.fmt.allocPrint(
-            allocator,
+        const events = try allocator.print(
             "{s}/lanes/{s}.events.jsonl",
             .{ receipt_dir, stem },
         );
         errdefer allocator.free(events);
-        const final = try std.fmt.allocPrint(
-            allocator,
+        const final = try allocator.print(
             "{s}/lanes/{s}.final.txt",
             .{ receipt_dir, stem },
         );
         errdefer allocator.free(final);
-        const receipt = try std.fmt.allocPrint(
-            allocator,
+        const receipt = try allocator.print(
             "{s}/lanes/{s}.json",
             .{ receipt_dir, stem },
         );
         errdefer allocator.free(receipt);
-        const leaf = try std.fmt.allocPrint(allocator, "lanes/{s}.json", .{stem});
+        const leaf = try allocator.print("lanes/{s}.json", .{stem});
         defer allocator.free(leaf);
         const state = try inquiryPathJoin(
             allocator,
@@ -4295,8 +4306,7 @@ fn startLaneTurn(
     cleanup_on_failure: bool,
 ) !LaneStartedTurn {
     const allocator = start.allocator;
-    const client_msg_id = try std.fmt.allocPrint(
-        allocator,
+    const client_msg_id = try allocator.print(
         "cas-{s}-{s}-{d}",
         .{ start.rip.inquiry_id, start.lane.lane_id, start.ordinal + 1 },
     );
@@ -4478,18 +4488,26 @@ fn cloneLaneHandle(allocator: std.mem.Allocator, source: LaneHandle) !LaneHandle
     var result = source;
     var copied_fields: usize = 0;
     errdefer {
-        inline for (std.meta.fields(LaneHandle), 0..) |field, index| {
-            if (comptime field.type == []const u8) {
-                if (index < copied_fields) allocator.free(@field(result, field.name));
+        inline for (
+            @typeInfo(LaneHandle).@"struct".field_names,
+            @typeInfo(LaneHandle).@"struct".field_types,
+            0..,
+        ) |field_name, field_type, index| {
+            if (comptime field_type == []const u8) {
+                if (index < copied_fields) allocator.free(@field(result, field_name));
             }
         }
     }
-    inline for (std.meta.fields(LaneHandle), 0..) |field, index| {
-        if (comptime field.type == []const u8) {
-            @field(result, field.name) = try allocator.dupe(u8, @field(source, field.name));
+    inline for (
+        @typeInfo(LaneHandle).@"struct".field_names,
+        @typeInfo(LaneHandle).@"struct".field_types,
+        0..,
+    ) |field_name, field_type, index| {
+        if (comptime field_type == []const u8) {
+            @field(result, field_name) = try allocator.dupe(u8, @field(source, field_name));
         } else {
             comptime std.debug.assert(
-                field.type == u64 or field.type == bool or field.type == ForkPolicyProof,
+                field_type == u64 or field_type == bool or field_type == ForkPolicyProof,
             );
         }
         copied_fields = index + 1;
@@ -4498,7 +4516,7 @@ fn cloneLaneHandle(allocator: std.mem.Allocator, source: LaneHandle) !LaneHandle
 }
 
 test "lane handle clone owns every string and releases failed partial copies" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectOwnedLaneHandleClone,
         .{},
@@ -4540,10 +4558,13 @@ fn expectOwnedLaneHandleClone(allocator: std.mem.Allocator) !void {
     const actual = try cloneLaneHandle(allocator, expected);
     defer freeLaneHandle(allocator, actual);
     try std.testing.expectEqualDeep(expected, actual);
-    inline for (std.meta.fields(LaneHandle)) |field| {
-        if (comptime field.type == []const u8) {
+    inline for (
+        @typeInfo(LaneHandle).@"struct".field_names,
+        @typeInfo(LaneHandle).@"struct".field_types,
+    ) |field_name, field_type| {
+        if (comptime field_type == []const u8) {
             try std.testing.expect(
-                @field(expected, field.name).ptr != @field(actual, field.name).ptr,
+                @field(expected, field_name).ptr != @field(actual, field_name).ptr,
             );
         }
     }
@@ -4887,8 +4908,7 @@ fn collectLaneFork(
     defer completion.deinit(allocator);
     var completed_handle = handle;
     completed_handle.fork_cleaned = completion.cleanup_valid;
-    const receipt_id = try std.fmt.allocPrint(
-        allocator,
+    const receipt_id = try allocator.print(
         "FIR-{s}-{d}",
         .{ handle.lane_id, handle.ordinal },
     );
@@ -4901,7 +4921,7 @@ fn collectLaneFork(
     };
     const receipt_json = try receipt.jsonAlloc(allocator, receipt_id);
     defer allocator.free(receipt_json);
-    const receipt_file = try std.fmt.allocPrint(allocator, "{s}\n", .{receipt_json});
+    const receipt_file = try allocator.print("{s}\n", .{receipt_json});
     defer allocator.free(receipt_file);
     try durable_store.writeTextAtomic(allocator, handle.lane_receipt, receipt_file);
     try writeLaneHandle(
@@ -5047,7 +5067,7 @@ fn buildInquiryPromptAlloc(allocator: std.mem.Allocator, rip: Rip, lane: Lane) !
         lane.temporal_horizon,
         "outcome_aware",
     )) "true" else "false";
-    return std.fmt.allocPrint(allocator,
+    return allocator.print(
         \\fork_inquiry_request:
         \\  objective: {s}
         \\  lane_id: {s}
@@ -5435,13 +5455,16 @@ fn allocateFiaAnswer(
         .unsupported_claims = &.{},
     };
     errdefer deinitFiaAnswer(allocator, result);
-    inline for (std.meta.fields(FiaAnswer)) |field| {
-        if (comptime field.type == []const u8) {
-            @field(result, field.name) = try dupeRequiredField(allocator, answer, field.name);
-        } else if (comptime field.type == []const []const u8) {
-            @field(result, field.name) = try stringListAlloc(allocator, answer, field.name);
+    inline for (
+        @typeInfo(FiaAnswer).@"struct".field_names,
+        @typeInfo(FiaAnswer).@"struct".field_types,
+    ) |field_name, field_type| {
+        if (comptime field_type == []const u8) {
+            @field(result, field_name) = try dupeRequiredField(allocator, answer, field_name);
+        } else if (comptime field_type == []const []const u8) {
+            @field(result, field_name) = try stringListAlloc(allocator, answer, field_name);
         } else {
-            comptime std.debug.assert(field.type == bool);
+            comptime std.debug.assert(field_type == bool);
         }
     }
     return result;
@@ -5980,8 +6003,7 @@ fn clientLastErrorIsThreadNotLoaded(
     thread_id: []const u8,
 ) bool {
     const raw = client.lastError() orelse return false;
-    const expected = std.fmt.allocPrint(
-        allocator,
+    const expected = allocator.print(
         "thread not loaded: {s}",
         .{thread_id},
     ) catch return false;
@@ -6383,7 +6405,7 @@ fn persistInvalidRunArtifacts(
 ) !void {
     try ensureDir(receipt_dir);
     try persistInputCopies(allocator, options, rip.inquiry_id);
-    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir});
+    const events_path = try allocator.print("{s}/events.jsonl", .{receipt_dir});
     defer allocator.free(events_path);
     const gate_event = try stringifyAnyAlloc(allocator, .{
         .event = "gate_failed",
@@ -6392,7 +6414,7 @@ fn persistInvalidRunArtifacts(
     });
     defer allocator.free(gate_event);
     try appendLine(events_path, gate_event);
-    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
+    const summary_path = try allocator.print("{s}/summary.json", .{receipt_dir});
     defer allocator.free(summary_path);
     try writeSummary(
         allocator,
@@ -6629,12 +6651,12 @@ fn resolveExecutablePathAlloc(
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, codex_path });
+        const candidate = try allocator.print("{s}/{s}", .{ dir, codex_path });
         if (fileExists(candidate)) return candidate;
         allocator.free(candidate);
     }
     for ([_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin" }) |dir| {
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, codex_path });
+        const candidate = try allocator.print("{s}/{s}", .{ dir, codex_path });
         if (fileExists(candidate)) return candidate;
         allocator.free(candidate);
     }
@@ -6660,11 +6682,11 @@ fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
     );
     defer allocator.free(start);
     const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
-        error.GitCommandFailed => return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{start}),
+        error.GitCommandFailed => return allocator.print("{s}/.ledger/cas", .{start}),
         else => return err,
     };
     defer allocator.free(repo_root);
-    return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{repo_root});
+    return allocator.print("{s}/.ledger/cas", .{repo_root});
 }
 
 fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
@@ -6691,7 +6713,7 @@ fn stateRecordPath(
     defer allocator.free(safe);
     const root = try casStoreRootAlloc(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/session_inquiries/{s}.json", .{ root, safe });
+    return allocator.print("{s}/session_inquiries/{s}.json", .{ root, safe });
 }
 
 fn inquiryPathJoin(
@@ -6705,7 +6727,7 @@ fn inquiryPathJoin(
     defer allocator.free(safe);
     const root = try casStoreRootAlloc(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/session_inquiries/{s}/{s}", .{ root, safe, leaf });
+    return allocator.print("{s}/session_inquiries/{s}/{s}", .{ root, safe, leaf });
 }
 
 fn sanitizeInquiryIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -6967,8 +6989,8 @@ fn dirExists(path: []const u8) bool {
 
 fn joinPathAlloc(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![]const u8 {
     if (std.mem.eql(u8, parent, ".")) return allocator.dupe(u8, child);
-    if (std.mem.eql(u8, parent, "/")) return std.fmt.allocPrint(allocator, "/{s}", .{child});
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, child });
+    if (std.mem.eql(u8, parent, "/")) return allocator.print("/{s}", .{child});
+    return allocator.print("{s}/{s}", .{ parent, child });
 }
 
 fn readFirReceiptValid(allocator: std.mem.Allocator, path: []const u8) !bool {
@@ -7133,8 +7155,7 @@ test "casStoreRootAlloc falls back to cwd ledger outside git" {
     defer configured_store_root_override = old_store_root;
     defer configured_store_cwd = old_store_cwd;
 
-    const root = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const root = try std.testing.allocator.print(
         "/tmp/cas-session-inquiry-store-root-test-{d}",
         .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
     );
@@ -7154,7 +7175,7 @@ test "casStoreRootAlloc falls back to cwd ledger outside git" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(real_root);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ledger/cas", .{real_root});
+    const expected = try std.testing.allocator.print("{s}/.ledger/cas", .{real_root});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, store_root);
 }
@@ -7657,7 +7678,7 @@ test "expandSimpleGlobAlloc supports wildcard directories" {
         allocator,
     );
     defer allocator.free(tmp_path);
-    const pattern = try std.fmt.allocPrint(allocator, "{s}/*/lanes/*.json", .{tmp_path});
+    const pattern = try allocator.print("{s}/*/lanes/*.json", .{tmp_path});
     defer allocator.free(pattern);
     const matches = try expandSimpleGlobAlloc(allocator, pattern);
     defer freeStringList(allocator, matches);
@@ -7748,8 +7769,7 @@ fn inquiryTestLedgerReceiptAlloc(
     allocator: std.mem.Allocator,
     input_digest: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"schema\":\"ledger-validation-result/v1\"," ++
             "\"definition\":{{\"id\":\"retrace/decision-context-packet\"," ++
             "\"digest\":\"sha256:" ++
@@ -8104,15 +8124,15 @@ test "detached lane handle round-trips persisted fork turn handle" {
     );
     defer allocator.free(tmp_path);
 
-    const path = try std.fmt.allocPrint(allocator, "{s}/lane.json", .{tmp_path});
+    const path = try allocator.print("{s}/lane.json", .{tmp_path});
     defer allocator.free(path);
-    const lane_events = try std.fmt.allocPrint(allocator, "{s}/lane.events.jsonl", .{tmp_path});
+    const lane_events = try allocator.print("{s}/lane.events.jsonl", .{tmp_path});
     defer allocator.free(lane_events);
-    const lane_final = try std.fmt.allocPrint(allocator, "{s}/lane.final.txt", .{tmp_path});
+    const lane_final = try allocator.print("{s}/lane.final.txt", .{tmp_path});
     defer allocator.free(lane_final);
-    const lane_receipt = try std.fmt.allocPrint(allocator, "{s}/lane-receipt.json", .{tmp_path});
+    const lane_receipt = try allocator.print("{s}/lane-receipt.json", .{tmp_path});
     defer allocator.free(lane_receipt);
-    const workspace_cwd = try std.fmt.allocPrint(allocator, "{s}/work", .{tmp_path});
+    const workspace_cwd = try allocator.print("{s}/work", .{tmp_path});
     defer allocator.free(workspace_cwd);
 
     const handle = LaneHandle{
@@ -8303,12 +8323,12 @@ test "DCP-v2 canonical writer sorts nested containers and omits every packet id"
     const retained = "{\"a\":{\"empty\":{\"packet_id\":\"only\"}," ++
         "\"keep\":\"text\",\"packet_id\":\"nested\"},\"packet_id\":\"root\"," ++
         "\"z\":[{\"a\":1,\"b\":[null,true,{\"a\":2,\"z\":3}],\"packet_id\":\"inner\"},[]]}";
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectDcpCanonicalBytes,
         .{ parsed.value, omitted, true },
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectDcpCanonicalBytes,
         .{ parsed.value, retained, false },
@@ -8338,7 +8358,7 @@ test "DCP-v2 canonical writer handles 1024 nested arrays without recursive seria
 }
 
 test "turn observation replacements and merge keep only owned latest buffers" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectObservationOwnership,
         .{},
@@ -8372,7 +8392,7 @@ fn expectObservationOwnership(allocator: std.mem.Allocator) !void {
 }
 
 test "turn observation parsing and notification replacements release every allocation" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectObservationNotifications,
         .{},
@@ -8411,7 +8431,7 @@ fn expectObservationNotifications(allocator: std.mem.Allocator) !void {
 }
 
 test "history accumulator transfers snapshot ownership and cleans every failure" {
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectHistorySnapshotOwnership,
         .{},
@@ -8515,7 +8535,7 @@ test "DCP constructor owns optional source strings and cleans partial allocation
             "\"source_codex_version\":\"version\"",
     );
     defer std.testing.allocator.free(raw);
-    try std.testing.checkAllAllocationFailures(
+    try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         expectDcpConstruction,
         .{raw},
@@ -8542,7 +8562,11 @@ fn expectDcpConstruction(allocator: std.mem.Allocator, raw: []const u8) !void {
 }
 
 test "RIP constructor transfers validated lanes and cleans partial allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectRipConstruction, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        expectRipConstruction,
+        .{},
+    );
 }
 
 fn expectRipConstruction(allocator: std.mem.Allocator) !void {
@@ -8566,7 +8590,11 @@ fn expectRipConstruction(allocator: std.mem.Allocator) !void {
 }
 
 test "FIA constructor owns structured answer lists and cleans partial allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectFiaConstruction, .{});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        expectFiaConstruction,
+        .{},
+    );
 }
 
 fn expectFiaConstruction(allocator: std.mem.Allocator) !void {
@@ -8593,8 +8621,7 @@ test "anchor counts preserve admitted large integers and reject out-of-domain in
         .{ .drop = "18446744073709551615", .expected = error.MissingRequiredInteger },
     };
     for (cases) |case| {
-        const raw = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const raw = try std.testing.allocator.print(
             "{{\"pre_decision\":{{\"available\":true,\"keep_through_turn_index\":1," ++
                 "\"drop_last_n_turns\":{s},\"anchor_digest\":\"sha256:test\"}}}}",
             .{case.drop},

@@ -1097,8 +1097,7 @@ pub fn pathComponentAlloc(
     document_id: []const u8,
 ) ![]u8 {
     if (identity.path_name == null) return allocator.dupe(u8, document_id);
-    const component = try std.fmt.allocPrint(
-        allocator,
+    const component = try allocator.print(
         "{s}{s}{s}",
         .{ identity.path_prefix, document_id, identity.path_suffix },
     );
@@ -1116,8 +1115,7 @@ pub fn rfc3339NanosecondTimestampAlloc(
 ) ![]u8 {
     const stamp = try compactNanosecondTimestampAlloc(allocator, now_ns);
     defer allocator.free(stamp);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}-{s}-{s}T{s}:{s}:{s}.{s}Z",
         .{
             stamp[0..4],
@@ -1157,8 +1155,7 @@ fn compactNanosecondTimestampAlloc(
     const second = seconds_of_day -
         hour * std.time.s_per_hour -
         minute * std.time.s_per_min;
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}{d:0>9}Z",
         .{
             @as(u32, @intCast(date.year)),

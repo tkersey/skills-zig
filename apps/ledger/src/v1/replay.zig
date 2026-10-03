@@ -163,13 +163,6 @@ const PlanCache = struct {
         self.definition_bytes -= archive_bytes;
         removed.deinit(self.allocator);
     }
-
-    fn clear(self: *PlanCache) void {
-        self.indices.clearRetainingCapacity();
-        for (self.plans.items) |*plan| plan.deinit(self.allocator);
-        self.plans.clearRetainingCapacity();
-        self.definition_bytes = 0;
-    }
 };
 
 pub fn validateSegmentedHistoryArchives(
@@ -757,7 +750,7 @@ fn finishEventHashAlloc(
     var digest: [EventHash.digest_length]u8 = undefined;
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+    return allocator.print("sha256:{s}", .{&hex});
 }
 
 fn validateSegmentedSummary(
@@ -2189,7 +2182,9 @@ fn archiveReplayTestDefinitions(
 }
 
 fn archiveInsertionAllocationCount(repo_root: []const u8, digest: []const u8) !usize {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
     var cache: PlanCache = .{
         .allocator = failing.allocator(),
         .repo_root = repo_root,
@@ -2204,9 +2199,11 @@ fn expectArchiveInsertionAllocationFailure(repo_root: []const u8, digest: []cons
     const allocation_count = try archiveInsertionAllocationCount(repo_root, digest);
     try std.testing.expect(allocation_count >= 2);
     // On an empty cache the final two allocations reserve its row and index owners.
+    // Match the counting trial's relocation policy, independent of heap history.
     for (1..3) |offset| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
             .fail_index = allocation_count - offset,
+            .resize_fail_index = 0,
         });
         var cache: PlanCache = .{
             .allocator = failing.allocator(),
