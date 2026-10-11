@@ -967,16 +967,26 @@ const ReviewThreadIdSelectorHint =
 const MultiAgentModeRemovedHint =
     "Request-scoped multiAgentMode is retired; configure [agents] in " ++
     "config.toml and use the current Codex reasoning-effort controls instead.";
+const ThreadStartInstructionsHint =
+    "set the exact review instructions with --custom-instructions";
+const EphemeralReviewThreadHint =
+    "CAS review requires a durable thread for terminal evidence and later wait";
+const ThreadStartActionHint =
+    "set launch options on run/start; wait observes the existing configured attempt";
+const ThreadStartParamsHint =
+    "pass a thread/start JSON object or @file; stdin is reserved for review instructions";
 
 fn usageDetailForParseError(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.InvalidReviewThreadId => ReviewThreadIdSelectorHint,
         error.MultiAgentModeRemoved => MultiAgentModeRemovedHint,
         error.ThreadStartCwdOwnedByCas => "set the reviewed repository with --cwd",
-        error.ThreadStartDeveloperInstructionsOwnedByCas => "set the exact review instructions with --custom-instructions",
-        error.EphemeralReviewThreadUnsupported => "CAS review requires a durable thread for terminal evidence and later wait",
-        error.ThreadStartParamsUnsupportedAction => "set launch options on run/start; wait observes the existing configured attempt",
-        error.ThreadStartOptionsExpectedObject, error.InvalidThreadStartParams => "pass a thread/start JSON object or @file; stdin is reserved for review instructions",
+        error.ThreadStartDeveloperInstructionsOwnedByCas => ThreadStartInstructionsHint,
+        error.EphemeralReviewThreadUnsupported => EphemeralReviewThreadHint,
+        error.ThreadStartParamsUnsupportedAction => ThreadStartActionHint,
+        error.ThreadStartOptionsExpectedObject,
+        error.InvalidThreadStartParams,
+        => ThreadStartParamsHint,
         else => null,
     };
 }
@@ -1113,10 +1123,7 @@ fn reviewPreflightExecutableAlloc(allocator: std.mem.Allocator, io: std.Io) ![]u
     return std.fs.path.join(allocator, &.{ parent, "cas_app_server_preflight" });
 }
 
-fn parseReviewRuntimeGateAlloc(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-) !ReviewRuntimeGate {
+fn parseReviewRuntimeGateAlloc(allocator: std.mem.Allocator, raw: []const u8) !ReviewRuntimeGate {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -1174,19 +1181,15 @@ fn parseReviewRuntimeGateAlloc(
     {
         return error.InvalidReviewPreflightReceipt;
     }
-    var gate = try copyReviewRuntimeGateAlloc(
+    return copyReviewRuntimeGateAlloc(
         allocator,
         path,
         banner,
         binary_digest,
         stable_digest,
         experimental_digest,
+        jsonStringField(schemas, "experimentalPath"),
     );
-    errdefer gate.deinit(allocator);
-    if (jsonStringField(schemas, "experimentalPath")) |schema_path| {
-        gate.experimental_schema_path = try allocator.dupe(u8, schema_path);
-    }
-    return gate;
 }
 
 fn copyReviewRuntimeGateAlloc(
@@ -1196,6 +1199,7 @@ fn copyReviewRuntimeGateAlloc(
     binary_digest: []const u8,
     stable_digest: []const u8,
     experimental_digest: []const u8,
+    experimental_schema_path: ?[]const u8,
 ) !ReviewRuntimeGate {
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
@@ -1205,12 +1209,18 @@ fn copyReviewRuntimeGateAlloc(
     errdefer allocator.free(owned_binary);
     const owned_stable = try allocator.dupe(u8, stable_digest);
     errdefer allocator.free(owned_stable);
+    const owned_experimental = try allocator.dupe(u8, experimental_digest);
+    errdefer allocator.free(owned_experimental);
     return .{
         .resolved_path = owned_path,
         .version = owned_banner,
         .binary_digest = owned_binary,
         .stable_schema_digest = owned_stable,
-        .experimental_schema_digest = try allocator.dupe(u8, experimental_digest),
+        .experimental_schema_digest = owned_experimental,
+        .experimental_schema_path = if (experimental_schema_path) |schema_path|
+            try allocator.dupe(u8, schema_path)
+        else
+            null,
     };
 }
 
@@ -5565,7 +5575,13 @@ fn startParentThreadAlloc(
                 .paramsRedacted = true,
             });
             defer allocator.free(summary);
-            try appendLogRecord(allocator, parent_event_log_path, "thread/start", "redacted", summary);
+            try appendLogRecord(
+                allocator,
+                parent_event_log_path,
+                "thread/start",
+                "redacted",
+                summary,
+            );
             return parent_thread_id;
         }
     }
@@ -5580,7 +5596,12 @@ fn buildThreadStartParamsJson(
     developer_instructions: ?[]const u8,
     options: ?review_options.ThreadStartOptions,
 ) ![]u8 {
-    return review_options.buildThreadStartParamsAlloc(allocator, cwd, developer_instructions, options);
+    return review_options.buildThreadStartParamsAlloc(
+        allocator,
+        cwd,
+        developer_instructions,
+        options,
+    );
 }
 
 fn buildThreadResumeParamsJson(
@@ -6469,7 +6490,11 @@ fn validateSessionRecordFields(record: SessionRecord) !void {
         }
         const fingerprint = record.target_fingerprint.?;
         if (!std.mem.endsWith(u8, fingerprint, digest) or
-            !std.mem.endsWith(u8, fingerprint[0 .. fingerprint.len - digest.len], ";thread_start_params_digest="))
+            !std.mem.endsWith(
+                u8,
+                fingerprint[0 .. fingerprint.len - digest.len],
+                ";thread_start_params_digest=",
+            ))
         {
             return error.InvalidSessionRecord;
         }
@@ -9378,8 +9403,7 @@ fn casRunSyntheticReceiptJsonAlloc(
     } else {
         try writer.writeAll("null");
     }
-    try writeReceiptNextField(writer, "developerInstructions", receipt.developer_instructions);
-    try writeReceiptNextField(writer, "threadStartParamsDigest", receipt.thread_start_params_digest);
+    try writeReceiptReviewConfiguration(writer, receipt);
     try writeReceiptNextField(
         writer,
         "principalStrength",
@@ -9391,6 +9415,15 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writer.writeAll(review_verdict_json);
     try writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn writeReceiptReviewConfiguration(writer: *std.Io.Writer, receipt: OutputReceipt) !void {
+    try writeReceiptNextField(writer, "developerInstructions", receipt.developer_instructions);
+    try writeReceiptNextField(
+        writer,
+        "threadStartParamsDigest",
+        receipt.thread_start_params_digest,
+    );
 }
 
 fn startShadowReceiptPayloadJsonAlloc(
@@ -13665,22 +13698,37 @@ test "review starters accept thread options while wait and duplicate options fai
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "run", "start" }) |action| {
         const argv = [_][]const u8{
-            "cas_review_session",         action,                        "--cwd", "/repo", "--uncommitted",
-            "--thread-start-params-json", "{\"sandbox\":\"read-only\"}",
+            "cas_review_session",
+            action,
+            "--cwd",
+            "/repo",
+            "--uncommitted",
+            "--thread-start-params-json",
+            "{\"sandbox\":\"read-only\"}",
         };
         const parsed = try parseArgs(allocator, &argv);
         defer parsed.deinit(allocator);
         try std.testing.expect(threadStartParamsDigest(parsed) != null);
     }
     const duplicate = [_][]const u8{
-        "cas_review_session",         "start", "--cwd",                      "/repo", "--uncommitted",
-        "--thread-start-params-json", "{}",    "--thread-start-params-json", "{}",
+        "cas_review_session",
+        "start",
+        "--cwd",
+        "/repo",
+        "--uncommitted",
+        "--thread-start-params-json",
+        "{}",
+        "--thread-start-params-json",
+        "{}",
     };
     try std.testing.expectError(error.DuplicateThreadStartParams, parseArgs(allocator, &duplicate));
     const wait = [_][]const u8{
         "cas_review_session", "wait", "--latest", "--thread-start-params-json", "{}",
     };
-    try std.testing.expectError(error.ThreadStartParamsUnsupportedAction, parseArgs(allocator, &wait));
+    try std.testing.expectError(
+        error.ThreadStartParamsUnsupportedAction,
+        parseArgs(allocator, &wait),
+    );
 }
 
 test "review thread options freeze file contents before preflight" {
@@ -13690,7 +13738,9 @@ test "review thread options freeze file contents before preflight" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{
         .sub_path = "options.json",
-        .data = "{\"config\":{\"shell_environment_policy.set\":{\"ZIG_LOCAL_CACHE_DIR\":\"/chosen/cache\"}},\"serviceTier\":null}",
+        .data =
+        \\{"config":{"shell_environment_policy.set":{"ZIG_LOCAL_CACHE_DIR":"/chosen/cache"}},"serviceTier":null}
+        ,
     });
     const path = try tmp.dir.realPathFileAlloc(io, "options.json", allocator);
     defer allocator.free(path);
@@ -13703,33 +13753,69 @@ test "review thread options freeze file contents before preflight" {
     const parsed = try parseArgs(allocator, &argv);
     defer parsed.deinit(allocator);
     try tmp.dir.deleteFile(io, "options.json");
-    const params = try buildThreadStartParamsJson(allocator, "/repo", null, parsed.thread_start_options);
+    const params = try buildThreadStartParamsJson(
+        allocator,
+        "/repo",
+        null,
+        parsed.thread_start_options,
+    );
     defer allocator.free(params);
     try std.testing.expect(std.mem.indexOf(u8, params, "/chosen/cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, params, "\"serviceTier\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, params, "\"sandbox\"") == null);
 }
 
-test "review identity and stored receipt bind caller configuration without retaining values" {
+test "review identity binds caller configuration without retaining values" {
     const allocator = std.testing.allocator;
-    const first = try review_options.ThreadStartOptions.init(allocator, "{\"sandbox\":\"read-only\",\"config\":{\"secret_setting\":\"private-sentinel\"}}");
+    const first = try review_options.ThreadStartOptions.init(allocator,
+        \\{"sandbox":"read-only","config":{"secret_setting":"private-sentinel"}}
+    );
     defer first.deinit();
-    const equivalent = try review_options.ThreadStartOptions.init(allocator, "{ \"config\":{\"secret_setting\":\"private-sentinel\"}, \"sandbox\":\"read-only\" }");
+    const equivalent = try review_options.ThreadStartOptions.init(allocator,
+        \\{ "config":{"secret_setting":"private-sentinel"}, "sandbox":"read-only" }
+    );
     defer equivalent.deinit();
-    const changed = try review_options.ThreadStartOptions.init(allocator, "{\"sandbox\":\"workspace-write\",\"config\":{\"secret_setting\":\"private-sentinel\"}}");
+    const changed = try review_options.ThreadStartOptions.init(allocator,
+        \\{"sandbox":"workspace-write","config":{"secret_setting":"private-sentinel"}}
+    );
     defer changed.deinit();
     const target = TargetConfig{ .kind = .uncommitted };
     const legacy = try targetFingerprintAlloc(allocator, target, null, "head", "base", null, null);
     defer allocator.free(legacy);
     try std.testing.expectEqualStrings(
-        "target={\"target\":{\"type\":\"uncommittedChanges\",\"branch\":null,\"sha\":null,\"title\":null},\"developerInstructions\":null};head=head;base=base",
+        \\target={"target":{"type":"uncommittedChanges","branch":null,"sha":null,"title":null},"developerInstructions":null};head=head;base=base
+    ,
         legacy,
     );
-    const configured = try targetFingerprintAlloc(allocator, target, null, "head", "base", null, first.digest);
+    const configured = try targetFingerprintAlloc(
+        allocator,
+        target,
+        null,
+        "head",
+        "base",
+        null,
+        first.digest,
+    );
     defer allocator.free(configured);
-    const same = try targetFingerprintAlloc(allocator, target, null, "head", "base", null, equivalent.digest);
+    const same = try targetFingerprintAlloc(
+        allocator,
+        target,
+        null,
+        "head",
+        "base",
+        null,
+        equivalent.digest,
+    );
     defer allocator.free(same);
-    const different = try targetFingerprintAlloc(allocator, target, null, "head", "base", null, changed.digest);
+    const different = try targetFingerprintAlloc(
+        allocator,
+        target,
+        null,
+        "head",
+        "base",
+        null,
+        changed.digest,
+    );
     defer allocator.free(different);
     try std.testing.expectEqualStrings(configured, same);
     try std.testing.expect(!std.mem.eql(u8, legacy, configured));
@@ -13743,6 +13829,28 @@ test "review identity and stored receipt bind caller configuration without retai
     const changed_hash = try reviewTupleHashAlloc(allocator, tuple);
     defer allocator.free(changed_hash);
     try std.testing.expect(!std.mem.eql(u8, first_hash, changed_hash));
+}
+
+test "review stored receipt binds caller configuration without retaining values" {
+    const allocator = std.testing.allocator;
+    const first = try review_options.ThreadStartOptions.init(allocator,
+        \\{"sandbox":"read-only","config":{"secret_setting":"private-sentinel"}}
+    );
+    defer first.deinit();
+    const changed = try review_options.ThreadStartOptions.init(allocator,
+        \\{"sandbox":"workspace-write","config":{"secret_setting":"private-sentinel"}}
+    );
+    defer changed.deinit();
+    const configured = try targetFingerprintAlloc(
+        allocator,
+        .{ .kind = .uncommitted },
+        null,
+        "head",
+        "base",
+        null,
+        first.digest,
+    );
+    defer allocator.free(configured);
     var record = testCurrentSessionRecord();
     record.thread_start_params_digest = first.digest;
     record.target_fingerprint = configured;
@@ -13751,7 +13859,10 @@ test "review identity and stored receipt bind caller configuration without retai
     var decoded = try std.json.parseFromSlice(SessionRecord, allocator, stored, .{});
     defer decoded.deinit();
     try std.testing.expectEqualStrings(first.digest.?, decoded.value.thread_start_params_digest.?);
-    try std.testing.expectEqualStrings(first.digest.?, withRecordMultiAgentMode(.{}, decoded.value).thread_start_params_digest.?);
+    try std.testing.expectEqualStrings(
+        first.digest.?,
+        withRecordMultiAgentMode(.{}, decoded.value).thread_start_params_digest.?,
+    );
     try std.testing.expect(std.mem.indexOf(u8, stored, "private-sentinel") == null);
     try validateSessionRecordFields(record);
     record.thread_start_params_digest = "malformed-digest";
@@ -13770,6 +13881,56 @@ test "configured parent start sends caller options over RPC and redacts its even
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "codex-fixture" });
     defer allocator.free(executable);
+    try writeReviewThreadStartPeerFixture(io, tmp.dir);
+    var client = try cas.Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .request_deadline_ms = monotonicMilliseconds(io) + 2_000,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+    const options = try review_options.ThreadStartOptions.init(allocator,
+        \\{"sandbox":"read-only","config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel"}},"serviceTier":null}
+    );
+    defer options.deinit();
+    const thread_id = try startParentThreadAlloc(
+        allocator,
+        &client,
+        root,
+        root,
+        "exact rubric",
+        options,
+    );
+    defer allocator.free(thread_id);
+    try std.testing.expectEqualStrings("fixture-thread", thread_id);
+    const request = try tmp.dir.readFileAlloc(io, "request.json", allocator, .limited(16 * 1024));
+    defer allocator.free(request);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings("read-only", params.get("sandbox").?.string);
+    try std.testing.expectEqualStrings(
+        "exact rubric",
+        params.get("developerInstructions").?.string,
+    );
+    try std.testing.expect(params.get("serviceTier").? == .null);
+    const environment = params.get("config").?.object.get("shell_environment_policy.set").?.object;
+    try std.testing.expectEqualStrings(
+        "private-cache-sentinel",
+        environment.get("ZIG_GLOBAL_CACHE_DIR").?.string,
+    );
+    const log_path = try parentEventLogPathAlloc(allocator, root, thread_id);
+    defer allocator.free(log_path);
+    const log = try durable_store.readRegularFileNoSymlink(allocator, log_path, 16 * 1024);
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "private-cache-sentinel") == null);
+    try std.testing.expect(std.mem.indexOf(u8, log, options.digest.?) != null);
+}
+
+fn writeReviewThreadStartPeerFixture(io: std.Io, dir: std.Io.Dir) !void {
     // A local protocol peer captures the real request. It cannot execute a model turn.
     const script =
         \\#!/bin/sh
@@ -13788,39 +13949,13 @@ test "configured parent start sends caller options over RPC and redacts its even
         \\done
         \\
     ;
-    try tmp.dir.writeFile(io, .{ .sub_path = "codex-fixture", .data = script });
-    try tmp.dir.setFilePermissions(io, "codex-fixture", std.Io.File.Permissions.fromMode(0o755), .{});
-    var client = try cas.Client.start(allocator, .{
-        .cwd = root,
-        .io = io,
-        .codex_path = executable,
-        .request_deadline_ms = monotonicMilliseconds(io) + 2_000,
-    });
-    defer {
-        client.close();
-        client.deinit();
-    }
-    const options = try review_options.ThreadStartOptions.init(allocator, "{\"sandbox\":\"read-only\",\"config\":{\"shell_environment_policy.set\":{\"ZIG_GLOBAL_CACHE_DIR\":\"private-cache-sentinel\"}},\"serviceTier\":null}");
-    defer options.deinit();
-    const thread_id = try startParentThreadAlloc(allocator, &client, root, root, "exact rubric", options);
-    defer allocator.free(thread_id);
-    try std.testing.expectEqualStrings("fixture-thread", thread_id);
-    const request = try tmp.dir.readFileAlloc(io, "request.json", allocator, .limited(16 * 1024));
-    defer allocator.free(request);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
-    defer parsed.deinit();
-    const params = parsed.value.object.get("params").?.object;
-    try std.testing.expectEqualStrings("read-only", params.get("sandbox").?.string);
-    try std.testing.expectEqualStrings("exact rubric", params.get("developerInstructions").?.string);
-    try std.testing.expect(params.get("serviceTier").? == .null);
-    const environment = params.get("config").?.object.get("shell_environment_policy.set").?.object;
-    try std.testing.expectEqualStrings("private-cache-sentinel", environment.get("ZIG_GLOBAL_CACHE_DIR").?.string);
-    const log_path = try parentEventLogPathAlloc(allocator, root, thread_id);
-    defer allocator.free(log_path);
-    const log = try durable_store.readRegularFileNoSymlink(allocator, log_path, 16 * 1024);
-    defer allocator.free(log);
-    try std.testing.expect(std.mem.indexOf(u8, log, "private-cache-sentinel") == null);
-    try std.testing.expect(std.mem.indexOf(u8, log, options.digest.?) != null);
+    try dir.writeFile(io, .{ .sub_path = "codex-fixture", .data = script });
+    try dir.setFilePermissions(
+        io,
+        "codex-fixture",
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
 }
 
 test "thread resume emits only fields admitted by the selected contract" {

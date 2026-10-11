@@ -102,7 +102,9 @@ pub fn buildThreadStartParamsAlloc(
         .null);
     if (options) |caller| {
         var entries = caller.parsed.value.object.iterator();
-        while (entries.next()) |entry| try params.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+        while (entries.next()) |entry| {
+            try params.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
     }
     return canonical.canonicalJsonAlloc(allocator, .{ .object = params });
 }

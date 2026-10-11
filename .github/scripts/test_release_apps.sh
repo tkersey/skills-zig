@@ -321,6 +321,58 @@ assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_ci_helper
 
+# A dotted dependency import inherits the consuming CAS module's hunk context.
+# It does not change every consumer of the imported shared library.
+git reset --hard -q "$base"
+cat >build.zig <<'ZIG'
+const CasRuntimeModules = struct {
+    fn init() void {
+        const cas_review_session_root = ctx.module(
+            "apps/cas/scripts/cas_review_session.zig",
+            &.{
+                .{ .name = "core_json", .module = shared.json },
+            },
+        );
+    }
+};
+ZIG
+git add build.zig
+git commit -qm cas-dotted-dependency-base
+dotted_dependency_base=$(git rev-parse HEAD)
+awk '/\.name = "core_json"/ {
+  print "                .{ .name = \"definition_core\", .module = shared.definitions },"
+} { print }' build.zig >build.next
+mv build.next build.zig
+git add build.zig
+git commit -qm cas-dotted-dependency-import
+test "$(bash "$classifier" affected "$dotted_dependency_base" HEAD)" = cas
+test "$(bash "$classifier" ci-affected "$dotted_dependency_base" HEAD)" = cas
+
+# The same dotted import without an app owner still fails closed.
+git reset --hard -q "$base"
+cat >build.zig <<'ZIG'
+pub fn build() void {
+    const shared_modules = .{
+        .imports = &.{
+            .{ .name = "core_json", .module = shared.json },
+        },
+    };
+}
+ZIG
+git add build.zig
+git commit -qm unowned-dotted-dependency-base
+unowned_dependency_base=$(git rev-parse HEAD)
+awk '/\.name = "core_json"/ {
+  print "            .{ .name = \"definition_core\", .module = shared.definitions },"
+} { print }' build.zig >build.next
+mv build.next build.zig
+git add build.zig
+git commit -qm unowned-dotted-dependency-import
+test "$(bash "$classifier" affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
+  seq,lift,cas,ledger,memory-note,typesafe
+test "$(bash "$classifier" ci-affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
+  seq,lift,cas,ledger,memory-note,typesafe
+
 # Hunk context can mention Ledger while the added line still belongs to Seq.
 git reset --hard -q "$base"
 cat >build.zig <<'ZIG'
