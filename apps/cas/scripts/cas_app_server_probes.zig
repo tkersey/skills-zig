@@ -1,4 +1,5 @@
 const std = @import("std");
+const review_options = @import("cas_review_options.zig");
 const contract = @import("cas_app_server_contract");
 const proxy = @import("cas_proxy_client");
 const inquiry_anchor = @import("cas_session_inquiry_anchor");
@@ -480,11 +481,14 @@ pub fn structuredReviewProbe(
     client: *proxy.Client,
     cwd: []const u8,
 ) LiveWitness {
-    const thread_params = stringifyAnyAlloc(allocator, .{
-        .cwd = cwd,
-        .experimentalRawEvents = false,
-        .developerInstructions = @as(?[]const u8, null),
-    }) catch return LiveWitness.failed(
+    // The capability fixture uses the production envelope, with its own local
+    // provider. Caller overrides belong only on the actual review thread.
+    const thread_params = review_options.buildThreadStartParamsAlloc(
+        allocator,
+        cwd,
+        null,
+        null,
+    ) catch return LiveWitness.failed(
         "structured_review_thread_encode_failed",
         "production thread/start parameters could not be encoded",
     );

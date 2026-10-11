@@ -572,6 +572,7 @@ const CasRuntimeModules = struct {
         const cas_app_server_probes_root = ctx.module(
             "apps/cas/scripts/cas_app_server_probes.zig",
             &.{
+                .{ .name = "definition_core", .module = shared.definitions },
                 .{ .name = "cas_app_server_contract", .module = cas_app_server_contract_root },
                 .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
                 .{
@@ -623,10 +624,13 @@ const CasCommandModules = struct {
             .{ .name = "cas_runtime", .module = runtime.runtime },
         });
         const cas_review_session_root = ctx.module("apps/cas/scripts/cas_review_session.zig", &.{
+            .{ .name = "cas_proxy_client", .module = runtime.proxy },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "core_path", .module = shared.path },
             .{ .name = "durable_store", .module = shared.durable },
+            .{ .name = "definition_core", .module = shared.definitions },
+            .{ .name = "cas_app_server_contract", .module = runtime.contract },
             .{ .name = "app_meta", .module = cas_meta },
             .{ .name = "cas_runtime", .module = runtime.runtime },
         });

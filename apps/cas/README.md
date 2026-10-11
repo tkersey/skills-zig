@@ -33,7 +33,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas_conformance_suite` verifies bounded overload retry behavior and selected exact-runtime app-server feature probes.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and prefers a CAS-managed loopback WebSocket app-server per instance. `auto` may use stdio only when managed startup fails before request-capable initialization; a handshake or later protocol failure never triggers a second transport. Result rows and summaries report the selected transport.
-- `cas_instance_runner` and `cas review` reject the retired `--multi-agent-mode` option. CAS no longer transmits a request-scoped multi-agent field or grants it effectiveness or metric credit. Configure canonical `[agents]` settings and current Codex reasoning effort instead. Generic `--params-json` remains caller-owned and receives no CAS mode certification.
+- `cas_instance_runner` and `cas review` reject the retired `--multi-agent-mode` option. CAS no longer synthesizes a request-scoped multi-agent field or grants it effectiveness or metric credit. Configure canonical `[agents]` settings and current Codex reasoning effort instead. Generic `--params-json` and review `--thread-start-params-json` remain caller-owned and receive no CAS mode certification.
 - `cas_smoke_check`, `cas_instance_runner`, `cas review`, and `cas_conformance_suite` accept `--hooks inherit|off|require-observed`. `inherit` is the default, `off` starts CAS-owned app-servers with `--disable codex_hooks`, and `require-observed` fails with `hook_not_observed` when no `hook/started` or `hook/completed` notifications were captured.
 - JSON outputs include `hookSummary` on hook-aware lanes. Bad observed hook statuses fail closed with precedence `hook_blocked`, then `hook_failed`, then `hook_stopped`; unsupported hook-capable runtime surfaces fail with `hooks_unsupported`.
 - `cas_instance_runner` supports native responses for:
@@ -50,6 +50,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - Non-blocking structured findings remain findings when Codex reports `patch is correct`; they are neither rejected as malformed nor credited as clean.
 - `cas review run` and `start` accept an optional `--workflow-binding-json JSON|@FILE` containing caller-owned `requestId` and `requestFingerprint` strings. CAS validates the opaque binding, binds it to the attempt identity, and returns it unchanged. A workflow-bound `start` is admitted only with `--wait`, so one CAS process owns the notification channel from `review/start` through terminal evidence. Without `--wait`, CAS returns `workflow_bound_review_requires_owner_lived_wait` before Codex resolution, app-server launch, tuple locking, session persistence, or `review/start`; this path cannot consume attempt or recovery credit. Unbound detached starts and historical `wait` remain available for diagnostics and compatibility.
 - `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied text as fresh-parent `developerInstructions` and sends the Git selector separately as `review/start.target`; the selector remains the source of base/head/fingerprint identity.
+- `cas review run|start --thread-start-params-json JSON|@FILE` passes caller-selected `thread/start` options, including arbitrary nested `config`, through the actual review launch. See [Review configuration](#review-configuration).
 - Review waits default to `2700000` ms. Unbound detached `start` defaults to `300000` ms unless `--wait` is supplied. Workflow-bound starts require `--wait`. An explicit positive `--timeout-ms` value always wins.
 - `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It consumes caller-supplied Ledger validation receipts for DCP-v2/RIP-v1 inputs, binds them to the exact carrier bytes, independently verifies content identity and inquiry invariants, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. CAS does not execute or bundle Ledger. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` and history-mode-specific anchoring: exact completed `lastTurnId` for paginated history, rollback only for a legacy runtime that actually exposes it. Codex 0.157.0 does not expose `thread/rollback`, so the full capability contract no longer requires that retired endpoint. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
@@ -57,6 +58,81 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` consumes the live `session-inquiry` app-server profile, derives its route-specific fork shapes from the shared cache under `~/.cache/cas/app-server-schema/<resolved-path-fingerprint>/<codex-version>/`, and reports both `thread_fork_replay` and `rollout_transcript_replay` support. A thread-backed inquiry requires the exact paginated-fork witness; transcript support cannot admit that lineage.
 - `cas capabilities --json` includes compiled feature flags for the current implementation, including `cas_app_server_contract_v2`, `cas_app_server_schema_probe_v1`, and `cas_structured_review_v1`. These describe CAS capabilities, not a required Codex version.
+
+## Review configuration
+
+CAS 0.7.1 adds one generic `thread/start` parameter object to `review run` and
+`review start`, including `start --wait`:
+
+```bash
+cas review start --wait --cwd /path/to/repo --base main \
+  --custom-instructions @review-prompt.txt \
+  --thread-start-params-json @review-runtime.json --json
+```
+
+For example, the caller can place this in `review-runtime.json`:
+
+```json
+{
+  "config": {
+    "model_reasoning_effort": "high",
+    "shell_environment_policy.set": {
+      "ZIG_LOCAL_CACHE_DIR": "/absolute/permitted/zig-local",
+      "ZIG_GLOBAL_CACHE_DIR": "/absolute/permitted/zig-global"
+    }
+  }
+}
+```
+
+Choose cache paths inside the actual granted write area. Environment variables
+select locations; they do not grant write access or establish that a particular
+cache failure has been fixed. CAS supplies no Zig-specific paths or permissions.
+
+Top-level names come from the selected executable's generated experimental
+`ThreadStartParams` schema, so newly advertised fields do not require new CAS
+flags. Unsupported names fail explicitly instead of being silently ignored.
+Codex validates values, combinations, and managed requirements; `config` remains
+an open map. CAS preserves explicit nulls, false, empty arrays, nested objects,
+and exact JSON numbers. Omission keeps the existing defaults. Use one JSON object
+or one `@file`, loaded once before preflight; `wait` cannot change launch options.
+
+CAS retains these existing review obligations:
+
+| Field | Caller interface / behavior |
+| --- | --- |
+| `cwd` | Select the canonical repository with `--cwd`; a second JSON value is rejected. |
+| `developerInstructions` | Supply the exact rubric with `--custom-instructions`; a second JSON value is rejected. |
+| `ephemeral` | `true` is incompatible with durable review evidence and recovery; omitted, null, or false remain available. |
+| Review `threadId`, `target`, `delivery` | CAS creates a fresh thread and invokes the selected Git review inline. |
+
+All other schema-advertised thread parameters remain caller-selectable, including
+model/provider, sandbox or named permissions, approval settings, environments,
+workspace roots, service tier, and history mode. Setting a thread option does not
+override the app server's built-in reviewer: released Codex 0.162.1 forces inline
+review approvals to `Never`, replaces base instructions, and selects
+`config.review_model` ahead of the ordinary model. See the
+[released review implementation](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tasks/review.rs).
+
+The built-in preflight qualifies protocol behavior with its controlled local
+provider; caller options cannot replace that fixture's model/provider. CAS checks
+requested property names against that runtime's schema, then the real review's
+`thread/start` performs configuration admission. A compatible preflight is not
+proof that a reviewer can write a particular cache directory.
+
+CAS binds a canonical `threadStartParamsDigest` into the review target fingerprint
+and stores that digest for later `wait` and reuse. Different settings therefore
+cannot reuse the same configured attempt; reordered keys and whitespace retain
+the same identity. An omitted or empty object retains legacy identity. Configured
+thread-start event logs contain an explicitly redacted digest summary rather than
+raw parameter or response bodies; records and receipts also retain only the
+configuration digest. Codex owns its own configuration persistence and logging.
+The digest identifies supplied settings and is not an effective-permissions report
+or a replayable configuration snapshot. Historical `wait` observes the recorded
+attempt; it does not replay arbitrary overrides into a new execution.
+
+This option covers thread creation. Existing raw `cas app-server session` and
+`cas instance_runner --method ... --params-json ...` remain the interfaces for
+process startup and arbitrary app-server RPCs.
 
 ## API Examples
 
