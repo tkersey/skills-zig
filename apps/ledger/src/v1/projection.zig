@@ -1737,18 +1737,30 @@ fn validateCachedFields(projection: Projection) !void {
     }
 }
 
+fn supportsKeyedOrdering(fold: ?Fold) bool {
+    const selected = fold orelse return false;
+    return selected == .keyed and selected.keyed.relation_query == null;
+}
+
 fn validateCachedFold(
     projection: Projection,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
 ) !void {
     const fold = projection.fold orelse return;
-    if (projection.fields.len != 0 or
+    const ordered = projection.sort_keys.len != 0;
+    if ((projection.fields.len != 0 and !ordered) or
         projection.value_path != null or
         projection.latest != null or
         !definition_plan.requires(.fold) or
         event_protocol == null or
         event_protocol.?.target_slot_index != projection.slot_index)
+    {
+        return error.CacheProjectionPlanMismatch;
+    }
+    if (ordered and (!supportsKeyedOrdering(projection.fold) or
+        projection.fields.len == 0 or projection.single or projection.raw or
+        projection.constructed_value != null))
     {
         return error.CacheProjectionPlanMismatch;
     }
@@ -1819,7 +1831,7 @@ fn validateCachedKeyedFold(
     if (projection.constructed_value != null) {
         return validateConstructedKeyedFold(projection, keyed);
     }
-    if (composed and
+    if (composed and projection.sort_keys.len == 0 and
         (projection.raw or
             projection.value_path != null or
             projection.fields.len != 0))
@@ -2834,7 +2846,8 @@ const ProjectionCompiler = struct {
         step: std.json.ObjectMap,
     ) !void {
         if (self.selection_seen or self.latest != null or
-            self.limit != null or self.fold != null or self.single or
+            self.limit != null or
+            (self.fold != null and !supportsKeyedOrdering(self.fold)) or self.single or
             self.sort_keys.len != 0 or self.relevance != null)
         {
             return error.InvalidProjectionOperatorOrder;
@@ -2851,7 +2864,8 @@ const ProjectionCompiler = struct {
         step: std.json.ObjectMap,
     ) !void {
         if (self.selection_seen or self.latest != null or
-            self.limit != null or self.fold != null or self.single or
+            self.limit != null or
+            (self.fold != null and !supportsKeyedOrdering(self.fold)) or self.single or
             self.sort_keys.len != 0)
         {
             return error.InvalidProjectionOperatorOrder;
@@ -2871,7 +2885,7 @@ const ProjectionCompiler = struct {
     ) !void {
         if (self.selection_seen or self.predicates.items.len != 0 or
             self.latest != null or self.limit != null or self.fold != null or
-            self.sort_keys.len != 0)
+            self.relevance != null or self.sort_keys.len != 0)
         {
             return error.InvalidProjectionOperatorOrder;
         }
@@ -3079,7 +3093,11 @@ const ProjectionCompiler = struct {
         if (self.selection_seen or self.limit != null) {
             return error.InvalidProjectionOperatorOrder;
         }
-        if (self.fold) |compiled_fold| switch (compiled_fold) {
+        const ordered_fold = self.sort_keys.len != 0 and supportsKeyedOrdering(self.fold);
+        if (ordered_fold and step.get("fields") == null) {
+            return error.SortedFoldRequiresStructuredFields;
+        }
+        if (!ordered_fold) if (self.fold) |compiled_fold| switch (compiled_fold) {
             .keyed => if (!self.single or self.predicates.items.len != 1) {
                 return error.InvalidProjectionOperatorOrder;
             },
@@ -3087,7 +3105,7 @@ const ProjectionCompiler = struct {
                 return error.InvalidProjectionOperatorOrder;
             },
         };
-        if (self.fold != null and step.get("value") == null) {
+        if (self.fold != null and !ordered_fold and step.get("value") == null) {
             return error.FoldExportRequiresConstructedValue;
         }
         if (step.get("fields")) |field_values| {
@@ -3208,6 +3226,15 @@ const ProjectionCompiler = struct {
 
     fn validateFold(self: *const ProjectionCompiler) !void {
         const fold = self.fold orelse return;
+        if (self.sort_keys.len != 0) {
+            if (!supportsKeyedOrdering(self.fold) or self.fields.len == 0 or
+                self.single or self.raw_export or self.value_path != null or
+                self.constructed_value != null)
+            {
+                return error.InvalidFoldProjectionComposition;
+            }
+            return;
+        }
         if (fold == .keyed and fold.keyed.relation_query != null and
             self.constructed_value != null)
         {
@@ -5675,6 +5702,50 @@ fn executeKeyedFoldProjection(
     stats: *Stats,
     records_validated: usize,
 ) !void {
+    if (compiled.sort_keys.len != 0) {
+        return writeSortedKeyedFold(
+            allocator,
+            output,
+            compiled,
+            keyed,
+            &replay_state.reducer_state,
+            fold_history,
+            parameters,
+            effective_limit,
+            max_output_bytes,
+            stats,
+        );
+    }
+    return executeUnorderedKeyedFoldProjection(
+        allocator,
+        compiled,
+        keyed,
+        event_plan,
+        replay_state,
+        fold_history,
+        parameters,
+        effective_limit,
+        max_output_bytes,
+        output,
+        stats,
+        records_validated,
+    );
+}
+
+fn executeUnorderedKeyedFoldProjection(
+    allocator: std.mem.Allocator,
+    compiled: *const Projection,
+    keyed: *const KeyedFold,
+    event_plan: *const protocol.Plan,
+    replay_state: *protocol.ReplayState,
+    fold_history: ?*FoldHistoryAccumulator,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    max_output_bytes: usize,
+    output: *std.Io.Writer.Allocating,
+    stats: *Stats,
+    records_validated: usize,
+) !void {
     if (keyed.relation_query) |*query| {
         const counts = try writeRelationFold(
             allocator,
@@ -6410,6 +6481,54 @@ const FilteredFoldCounts = struct {
         stats.records_emitted = self.emitted;
     }
 };
+
+fn writeSortedKeyedFold(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    projection: *const Projection,
+    keyed: *const KeyedFold,
+    reducer_state: *reducer.State,
+    history_accumulator: ?*const FoldHistoryAccumulator,
+    parameters: *const definition_core.parameters.Bindings,
+    limit: usize,
+    max_output_bytes: usize,
+    stats: *Stats,
+) !void {
+    var sorted = try SortedAccumulator.init(allocator, projection, parameters, limit);
+    defer sorted.deinit();
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    const fields = keyedHistoryFields(&field_storage, keyed);
+    const views = try reducer_state.sortedViewsAlloc(allocator);
+    defer allocator.free(views);
+    // Rank one current reducer row per identity, after all lifecycle events.
+    // Reuse the fold renderer so retained unwrapping and history fields agree
+    // with ordinary current-record projections; never rank obsolete captures.
+    for (views) |view| {
+        const history = if (history_accumulator) |configured|
+            configured.get(view.key) orelse return error.FoldHistoryReducerStateMismatch
+        else
+            null;
+        var row: std.Io.Writer.Allocating = .init(allocator);
+        defer row.deinit();
+        try writeKeyedHistoryRow(
+            allocator,
+            &row.writer,
+            fields,
+            view,
+            history,
+            if (keyed.retained_unwrap_path) |*pointer| pointer else null,
+        );
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.written(), .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        });
+        defer parsed.deinit();
+        try sorted.observe(parsed.value);
+    }
+    try sorted.reserveOutput(output, limit, max_output_bytes);
+    try sorted.write(&output.writer, limit, stats);
+    if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
+}
 
 fn writeFilteredKeyedFold(
     allocator: std.mem.Allocator,
@@ -7858,6 +7977,25 @@ const gate_projection_definition =
     "\"unmatched\":0,\"failure\":3}}}," ++
     test_bounds_4;
 
+const ordered_fold_definition =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/ordered-current","owner":"example",
+    \\ "requires":{"abi":"ledger-artifact-abi/v1","operators":["append-only-log","compare-and-append","event-kinds","export","fold","limit","reducer","relevance","replay","sort","transition-table"]},
+    \\ "parameters":{"query":{"type":"string","required":true}},
+    \\ "inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},
+    \\ "constraints":{"laws":[["append-only-log",{"input":"event"}],["event-kinds",{"values":["capture","status"]}],
+    \\ ["reducer",{"key":"/id","on":"/status","event_kind":"/kind","retain_latest":"/record"}],
+    \\ ["transition-table",{"states":["active","inactive"],"transitions":[{"from":null,"on":"active","to":"active"},{"from":"active","on":"inactive","to":"inactive"}]}]]},
+    \\ "identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+    \\ "operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},
+    \\ "projections":{"current-search":{"slot":"events","pipeline":[
+    \\ {"op":"fold","key_field":"id","state_field":"status","retained_field":"record","retained_unwrap_path":"/payload"},
+    \\ {"op":"relevance","paths":["/record/text"],"param":"query","mode":"tokens","score_field":"score"},
+    \\ {"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"ascending"}]},
+    \\ {"op":"export","fields":[{"name":"id","path":"/id"},{"name":"status","path":"/status"},{"name":"record","path":"/record"}]},
+    \\ {"op":"limit","count":8}]}},
+    \\ "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+;
+
 const exact_projection_definition =
     test_definition_schema ++
     "\"id\":\"example/exact-export\"," ++
@@ -8329,6 +8467,86 @@ fn applyGateEvents(
         );
     }
 }
+
+test "projection ranks current keyed state without reviving obsolete captures" {
+    var plans = try ProjectionTestPlans.init(ordered_fold_definition);
+    defer plans.deinit();
+    const protocol_plan = &plans.protocol_plan.?;
+    var state = protocol.ReplayState.init(protocol_plan);
+    defer state.deinit(std.testing.allocator);
+    const events = [_][]const u8{
+        \\{"kind":"capture","id":"a","status":"active","record":{"payload":{"text":"obsolete component repeated admission"}}}
+        ,
+        \\{"kind":"status","id":"a","status":"inactive","record":{"payload":{"text":"current memoized projection"}}}
+        ,
+        \\{"kind":"capture","id":"b","status":"active","record":{"payload":{"text":"component repeated admission"}}}
+        ,
+        \\{"kind":"capture","id":"c","status":"active","record":{"payload":{"text":"admission for another artifact"}}}
+        ,
+    };
+    for (events) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer parsed.deinit();
+        try protocol.applyValue(std.testing.allocator, protocol_plan, &state, parsed.value);
+    }
+    const best = try orderedFoldOutput(&plans, &state, "component repeated admission", 1, 4096);
+    defer std.testing.allocator.free(best);
+    try std.testing.expectEqualStrings(
+        "[{\"score\":3,\"id\":\"b\",\"status\":\"active\"," ++
+            "\"record\":{\"text\":\"component repeated admission\"}}]",
+        best,
+    );
+    const obsolete = try orderedFoldOutput(&plans, &state, "obsolete", 8, 4096);
+    defer std.testing.allocator.free(obsolete);
+    try std.testing.expectEqualStrings("[]", obsolete);
+    const current = try orderedFoldOutput(&plans, &state, "memoized", 8, 4096);
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings(
+        "[{\"score\":1,\"id\":\"a\",\"status\":\"inactive\"," ++
+            "\"record\":{\"text\":\"current memoized projection\"}}]",
+        current,
+    );
+    try std.testing.expectError(
+        error.ProjectionOutputBoundsExceeded,
+        orderedFoldOutput(&plans, &state, "admission", 1, 1),
+    );
+}
+
+fn orderedFoldOutput(
+    plans: *ProjectionTestPlans,
+    state: *protocol.ReplayState,
+    query: []const u8,
+    limit: usize,
+    max_output_bytes: usize,
+) ![]u8 {
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &plans.definition_plan.parameter_declarations,
+        &.{.{ .name = "query", .raw_value = query }},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    // Exercise the decoded, validated plan too; warm reads must obey the same law.
+    const selected = plans.cached.find("current-search").?;
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{ .records_scanned = 4, .records_matched = 0, .records_emitted = 0 };
+    try executeKeyedFoldProjection(
+        std.testing.allocator,
+        selected,
+        &selected.fold.?.keyed,
+        &plans.protocol_plan.?,
+        state,
+        null,
+        &bindings,
+        limit,
+        max_output_bytes,
+        &output,
+        &stats,
+        4,
+    );
+    return output.toOwnedSlice();
+}
+
 test "exact lookup emits one definition-ordered or raw payload" {
     var plans = try ProjectionTestPlans.init(exact_projection_definition);
     defer plans.deinit();

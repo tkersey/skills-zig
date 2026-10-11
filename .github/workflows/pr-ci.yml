@@ -474,7 +474,11 @@ jobs:
   memory-note:
     needs: changes
     if: needs.changes.outputs.memory_note == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -484,6 +488,8 @@ jobs:
         run: zig build build-memory-note -Doptimize=fast
       - name: Test memory-note
         run: zig build test-memory-note
+      - name: Verify memory-note selected layout and immutable migration
+        run: bash apps/memory-note/scripts/test-cli.sh zig-out/bin/memory-note
 
   typesafe:
     needs: changes
