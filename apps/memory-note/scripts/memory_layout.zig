@@ -178,8 +178,11 @@ fn versionFromResponse(response: std.json.Value) !Version {
     const result = try objectField(response, "result");
     const config = try objectField(result, "config");
     const memories = config.object.get("memories") orelse return .v1;
+    // Codex 0.162.1 config/read serializes optional TOML settings as JSON null.
+    if (memories == .null) return .v1;
     if (memories != .object) return error.InvalidCodexConfigResponse;
     const version = memories.object.get("version") orelse return .v1;
+    if (version == .null) return .v1;
     if (version != .string) return error.InvalidCodexConfigResponse;
     return Version.parse(version.string);
 }
@@ -211,7 +214,9 @@ pub fn validateDirectory(io: std.Io, path: []const u8) !void {
 test "effective memory version accepts both layouts and Codex's default" {
     const cases = .{
         .{ "{\"result\":{\"config\":{}}}", Version.v1 },
+        .{ "{\"result\":{\"config\":{\"memories\":null}}}", Version.v1 },
         .{ "{\"result\":{\"config\":{\"memories\":{}}}}", Version.v1 },
+        .{ "{\"result\":{\"config\":{\"memories\":{\"version\":null}}}}", Version.v1 },
         .{ "{\"result\":{\"config\":{\"memories\":{\"version\":\"v1\"}}}}", Version.v1 },
         .{ "{\"result\":{\"config\":{\"memories\":{\"version\":\"v2\"}}}}", Version.v2 },
     };
@@ -232,7 +237,8 @@ test "missing or malformed configuration never guesses a memory root" {
         "{}",
         "{\"result\":{}}",
         "{\"result\":{\"config\":null}}",
-        "{\"result\":{\"config\":{\"memories\":null}}}",
+        "{\"result\":{\"config\":{\"memories\":false}}}",
+        "{\"result\":{\"config\":{\"memories\":[]}}}",
         "{\"result\":{\"config\":{\"memories\":{\"version\":2}}}}",
     };
     for (cases) |case| {

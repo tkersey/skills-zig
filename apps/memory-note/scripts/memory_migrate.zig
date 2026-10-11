@@ -5,7 +5,6 @@ const memory_storage = @import("memory_storage.zig");
 
 const note_bytes_max = 1024 * 1024;
 const note_count_max = 10_000;
-const inventory_bytes_max = 64 * 1024 * 1024;
 const identity_bytes_max = 128;
 
 pub const Result = struct {
@@ -49,10 +48,9 @@ pub fn copy(
     extension: []const u8,
     dry_run: bool,
 ) !Result {
-    var bytes: usize = 0;
-    var prior = try inventory(allocator, io, source, extension, &bytes);
+    var prior = try inventory(allocator, io, source, extension);
     defer prior.deinit(allocator);
-    var current = try inventory(allocator, io, destination, extension, &bytes);
+    var current = try inventory(allocator, io, destination, extension);
     defer current.deinit(allocator);
     var result = try preflight(prior, current);
     if (dry_run) return result;
@@ -91,6 +89,8 @@ fn preflight(source: Inventory, destination: Inventory) !Result {
             result.duplicate_skip += 1;
         } else result.planned += 1;
     }
+    if (destination.entries.items.len + result.planned > note_count_max)
+        return error.TooManyFiles;
     return result;
 }
 
@@ -99,7 +99,6 @@ fn inventory(
     io: std.Io,
     directory: []const u8,
     extension: []const u8,
-    bytes: *usize,
 ) !Inventory {
     try layout.validateDirectory(io, directory);
     const names = durable_store.listSortedRegularFilesNoSymlink(
@@ -119,8 +118,6 @@ fn inventory(
         defer allocator.free(path);
         const raw = try durable_store.readRegularFileNoSymlink(allocator, path, note_bytes_max);
         defer allocator.free(raw);
-        if (raw.len > inventory_bytes_max - bytes.*) return error.MigrationInventoryTooLarge;
-        bytes.* += raw.len;
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
         const id = try storedIdentity(parsed.value, extension);
@@ -233,4 +230,24 @@ test "migration rejects changed bytes under a stored id and filename collisions"
         error.DuplicateId,
         insertEntry(allocator, &source, "duplicate.md", "MSN-one", "original"),
     );
+}
+
+test "migration union stays readable and duplicates at the limit remain valid" {
+    const allocator = std.testing.allocator;
+    var source: Inventory = .{};
+    defer source.deinit(allocator);
+    var destination: Inventory = .{};
+    defer destination.deinit(allocator);
+    for (0..note_count_max) |index| {
+        const id = try allocator.print("MSN-{d:0>5}", .{index});
+        defer allocator.free(id);
+        try insertEntry(allocator, &destination, id, id, id);
+    }
+    const existing = destination.entries.items[0];
+    try insertEntry(allocator, &source, existing.name, existing.id, existing.id);
+    const duplicate = try preflight(source, destination);
+    try std.testing.expectEqual(@as(u32, 0), duplicate.planned);
+    try std.testing.expectEqual(@as(u32, 1), duplicate.duplicate_skip);
+    try insertEntry(allocator, &source, "new.md", "MSN-new", "new envelope");
+    try std.testing.expectError(error.TooManyFiles, preflight(source, destination));
 }

@@ -26,7 +26,7 @@ const HelpText =
     \\  list     List notes for an extension
     \\  show     Show one note by --id
     \\  doctor   Validate controlled memory-source layout
-    \\  path     Resolve the selected memory layout (JSON; --format text for notes path)
+    \\  path     Print the selected notes path (--format json for the full layout)
     \\  migrate  Copy existing immutable notes from another version without recapturing
     \\  version  Show version
     \\
@@ -63,7 +63,7 @@ const Args = struct {
     from_memory_version: ?memory_layout.Version = null,
     dry_run: bool = false,
     limit: usize = 100,
-    format: []const u8 = "json",
+    format: ?[]const u8 = null,
 };
 
 const ParsedNote = struct {
@@ -427,7 +427,8 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
         }
     }
     const payload = found orelse return error.NotFound;
-    if (std.mem.eql(u8, args.format, "raw") or std.mem.eql(u8, args.format, "json")) {
+    const format = args.format orelse "json";
+    if (std.mem.eql(u8, format, "raw") or std.mem.eql(u8, format, "json")) {
         try writeStdoutBytes(payload);
         return 0;
     }
@@ -516,9 +517,10 @@ fn cmdPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     try memory_layout.validateDirectory(Io.io(), notes_dir);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    if (std.mem.eql(u8, args.format, "text")) {
+    const format = args.format orelse "text";
+    if (std.mem.eql(u8, format, "text")) {
         try out.writer.print("{s}\n", .{notes_dir});
-    } else if (std.mem.eql(u8, args.format, "json")) {
+    } else if (std.mem.eql(u8, format, "json")) {
         try std.json.Stringify.value(.{
             .schema = "memory-note-layout/v1",
             .codex_home = home,

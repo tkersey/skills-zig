@@ -24,17 +24,36 @@ IFS= read -r ready || exit 7
 [ "$ready" = '{"method":"initialized"}' ] || exit 8
 IFS= read -r request || exit 9
 case "$request" in *'"method":"config/read"'*'"cwd":"/'*) ;; *) exit 10 ;; esac
-printf '{"id":2,"result":{"config":{"memories":{"version":"%s"}}}}\n' "$FAKE_VERSION"
+case "$FAKE_VERSION" in
+  absent) printf '%s\n' '{"id":2,"result":{"config":{}}}' ;;
+  null) printf '%s\n' '{"id":2,"result":{"config":{"memories":null}}}' ;;
+  null-version) printf '%s\n' '{"id":2,"result":{"config":{"memories":{"version":null}}}}' ;;
+  *) printf '{"id":2,"result":{"config":{"memories":{"version":"%s"}}}}\n' "$FAKE_VERSION" ;;
+esac
 IFS= read -r unused
 SH
 chmod 700 "$tmp/codex"
 export CODEX_BIN="$tmp/codex" EXPECTED_HOME="$note_home" FAKE_VERSION=v2
 
-"$bin" path --codex-home "$note_home" --extension harness > "$tmp/layout.json"
+"$bin" path --codex-home "$note_home" --extension harness --format json > "$tmp/layout.json"
 "$json" -e --arg root "$note_home/memories_v2" '
   .schema == "memory-note-layout/v1" and .memory_version == "v2" and
   .memory_root == $root and .notes_dir == ($root + "/extensions/harness/notes")
 ' "$tmp/layout.json" >/dev/null
+"$bin" path --codex-home "$note_home" --extension harness > "$tmp/path.txt"
+printf '%s\n' "$note_home/memories_v2/extensions/harness/notes" > "$tmp/expected-path.txt"
+cmp "$tmp/expected-path.txt" "$tmp/path.txt"
+"$bin" path --codex-home "$note_home" --extension harness --format text > "$tmp/explicit-path.txt"
+cmp "$tmp/path.txt" "$tmp/explicit-path.txt"
+test ! -e "$note_home"
+
+# Codex 0.162.1 ConfigToml/ApiConfig preserve absent Option fields as JSON null.
+for shape in absent null null-version; do
+  FAKE_VERSION="$shape" "$bin" path --codex-home "$note_home" \
+    --extension harness --format json > "$tmp/default-layout.json"
+  "$json" -e --arg root "$note_home/memories" \
+    '.memory_version == "v1" and .memory_root == $root' "$tmp/default-layout.json" >/dev/null
+done
 test ! -e "$note_home"
 "$bin" doctor --codex-home "$note_home" > "$tmp/doctor.json"
 "$json" -e '.issues == 0 and .checked == 0 and .storage_mutated == false' \
@@ -125,4 +144,5 @@ fi
 test ! -e "$note_home/memories_v2/memory_summary.md"
 test ! -e "$note_home/memories_v2/MEMORY.md"
 python3 "$repo_root/apps/memory-note/scripts/test_cli_recovery.py" "$bin"
+python3 "$repo_root/apps/memory-note/scripts/test_cli_upgrade.py" "$bin"
 printf '%s\n' 'memory-note selected-layout, immutable migration, and read-only diagnostics: pass'

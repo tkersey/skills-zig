@@ -39,7 +39,11 @@ configuration layering and project trust. No thread, turn, tool, or model reques
 is made. `CODEX_BIN` can name an explicit Codex executable.
 
 `memories.version = "v1"` selects `memories`; `"v2"` selects `memories_v2`.
-An absent version uses Codex's v1 default. Missing Codex, rejected or malformed
+An absent or null version uses Codex's v1 default, as does an absent or null
+`memories` setting. Codex 0.162.1 serializes these optional TOML settings as JSON
+null; see its pinned [configuration types](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/config/src/types.rs)
+and [config/read implementation](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/app-server/src/config_manager_service.rs).
+Missing Codex, rejected or malformed
 configuration, an unknown version, and a timed-out response are errors; existing
 directories never decide which version is active.
 
@@ -56,11 +60,12 @@ The CLI writes immutable JSON note envelopes under the selected root:
 <codex-home>/<memories-or-memories_v2>/extensions/<extension>/notes/
 ```
 
-`path --extension NAME --format json` (the default) returns
+`path --extension NAME` prints only `notes_dir`, preserving the 0.2.0 text
+interface. `path --extension NAME --format json` returns
 `schema: "memory-note-layout/v1"`, `codex_home`, `memory_version`, `memory_root`,
 `extension_root`, `notes_dir`, `instructions_path`, and `resources_dir`. Adapters,
 instruction deployment, and diagnostics should consume that result and pin its
-home/version on subsequent commands. `--format text` returns only `notes_dir`.
+home/version on subsequent commands. `--format text` also returns only `notes_dir`.
 The resolver and doctor do not create memory directories. The native Codex
 configuration process may perform its own normal initialization.
 
@@ -105,8 +110,12 @@ An interrupted writer can leave partial control files in staging; ordinary reads
 and migration inventories never treat them as admissions. Rerunning does not
 require deleting those files or a recognized lock marker.
 
-Migration bounds are 10,000 notes per directory, 1 MiB per note, and 64 MiB across
-the two inventories. Dry runs create no notes or lock files. `copied` counts
+Migration bounds are 10,000 notes per directory and 1 MiB per note. Inventories
+retain filenames, IDs of at most 128 bytes, and digests; raw and parsed envelopes
+are released after each file. There is no aggregate history-byte limit that
+shrinks when source copies are retained. Preflight rejects a planned destination
+over 10,000 distinct IDs before copying; duplicates at that limit remain valid.
+Dry runs create no notes or lock files. `copied` counts
 published admissions; `storage_mutated` also includes first creation of the
 persistent lock marker, so an empty first migration can report a control change
 with zero copied notes.
@@ -115,6 +124,70 @@ Deploy regular `instructions.md` files to the selected extension roots through
 the source-memory owner. Do not copy old compiled outputs or symlink memory roots.
 Existing threads can retain their prior selected version; use a fresh thread to
 verify a configuration cutover.
+
+## Upgrade existing 0.2.0 use
+
+The `memory-source-note/v1` envelope format and fingerprint computation are
+unchanged. Existing regular files retain their IDs and relationships. Keep using
+the old v1 location without moving anything by pinning the new executable:
+
+```sh
+memory-note path --extension learnings --memory-version v1
+memory-note list --extension learnings --memory-version v1
+```
+
+An explicit version does not start Codex and works offline even when no Codex
+executable is installed. Without that pin, fresh configuration can select v2;
+ordinary commands then inspect v2 only. A v1 note becoming absent from that
+selected view does not mean it was deleted. Use the explicit migration above
+for each extension with retained admissions, and deploy its instructions to the
+same selected root. Neither installation nor a routine append imports v1 notes.
+
+Finish existing 0.2.0 writes before the first 0.3.0 write or real migration, and
+upgrade every writer using that home. Old and new binaries are not safe
+concurrent writers. A live old writer owns an empty sentinel; let it finish and
+retry. A leftover old sentinel requires checking that no old writer is running
+before explicitly retiring that specific file. Once a new persistent marker
+exists, 0.2.0 writers fail `PathAlreadyExists`; old v1 readers still understand
+the retained envelopes. Do not remove the marker to make mixed writers proceed.
+
+Migration compares exact bytes. The 0.2.0 `show --format raw` output added a
+newline, so a file produced by redirecting that output can differ from the
+original stored file even though both parse to the same JSON. Such a mirror,
+any other differing bytes under one ID, and conflicting filenames require
+explicit review. Preserve both copies outside the migration destination while
+identifying the authoritative stored bytes; do not recapture, rewrite an ID, or
+silently normalize either admission. Copy original files when preparing a
+migration. The new `show` returns the exact stored bytes.
+
+Memory roots, extension directories, and note files must be regular paths with
+no symlink ancestors. The old append contract already rejected symlink traversal;
+the new read and duplicate paths enforce the same boundary. Select the actual
+Codex home and prepare regular copies under its selected layout when replacing
+a legacy symlink arrangement; migration does not follow symlinked source roots.
+
+### Return to a v1 layout
+
+Keep the new executable, stop admissions while changing the selected layout, and
+copy any v2-only admissions back with the same immutable migration:
+
+```sh
+memory-note migrate --extension learnings --from-memory-version v2 --memory-version v1 --dry-run
+memory-note migrate --extension learnings --from-memory-version v2 --memory-version v1
+memory-note list --extension learnings --memory-version v1
+```
+
+Repeat for each used extension. Select v1 for both the writer and the Codex
+reader, deploy v1 extension instructions, and verify from a fresh thread. Keep
+source copies; compiled outputs are not rollback input. No lock-marker removal
+is needed when using the new binary in v1 mode.
+
+An actual executable downgrade to 0.2.0 additionally requires all new writers
+to remain stopped. Complete and verify reverse migration with 0.3.0 first, then
+retire only the recognized `memory-note-extension-lock/v1` marker files for the
+known home and extensions before starting the old writers. Do not delete unknown
+lock files or remove markers while any writer can run. The persistent marker
+intentionally prevents an uncoordinated binary downgrade from bypassing the lock.
 
 ## Append input
 
@@ -177,5 +250,9 @@ fixture. It checks v2 write/list/show agreement, redirected readback, explicit v
 pinning, immutable migration and retry, conflicting histories, unknown versions,
 noncreating diagnostics, a killed migration followed by exact-byte recovery,
 partial staging isolation, lock contention, and duplicate-path symlink rejection.
-The recovery fixture uses Python 3's standard library on Linux and macOS. These
-checks do not claim an installed Codex compiler run.
+It also reads exact [0.2.0-produced envelopes](fixtures/legacy-v0.2.0/README.md),
+checks offline v1 access and reverse migration, and retries a source exceeding
+64 MiB while retaining both copies. The Python fixtures use only the standard
+library on Linux and macOS. The configuration cases replay the nullable shapes
+from the pinned Codex 0.162.1 source; they do not run that released executable.
+These checks do not claim an installed Codex compiler run.
