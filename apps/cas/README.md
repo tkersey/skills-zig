@@ -93,7 +93,10 @@ Top-level names come from the selected executable's generated experimental
 flags. Unsupported names fail explicitly instead of being silently ignored.
 Codex validates values, combinations, and managed requirements; `config` remains
 an open map. CAS preserves explicit nulls, false, empty arrays, nested objects,
-and exact JSON numbers. Omission keeps the existing defaults. Use one JSON object
+and exact JSON numbers. Object-key order and whitespace are normalized for the
+configuration digest; numeric spellings remain distinct because Codex can
+interpret `1` and `1.0` as different configuration types.
+Omission keeps the existing defaults. Use one JSON object
 or one `@file`, loaded once before preflight; `wait` cannot change launch options.
 
 CAS retains these existing review obligations:

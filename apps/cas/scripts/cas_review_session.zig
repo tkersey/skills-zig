@@ -13895,7 +13895,7 @@ test "configured parent start sends caller options over RPC and redacts its even
     const options = try review_options.ThreadStartOptions.init(allocator,
         \\{"sandbox":"read-only","serviceTier":null,
         \\"config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel"},
-        \\"numbers":[9007199254740992.1,1e-400,1e400,9223372036854775808]}}
+        \\"numbers":[128000.0,128000,1e0,-0,0,9007199254740992.1,1e-400,1e400,9223372036854775808]}}
     );
     defer options.deinit();
     const thread_id = try startParentThreadAlloc(
@@ -13916,10 +13916,8 @@ test "configured parent start sends caller options over RPC and redacts its even
     defer parsed.deinit();
     const params = parsed.value.object.get("params").?.object;
     try std.testing.expectEqualStrings("read-only", params.get("sandbox").?.string);
-    try std.testing.expectEqualStrings(
-        "exact rubric",
-        params.get("developerInstructions").?.string,
-    );
+    const rubric = params.get("developerInstructions").?.string;
+    try std.testing.expectEqualStrings("exact rubric", rubric);
     try std.testing.expect(params.get("serviceTier").? == .null);
     const environment = params.get("config").?.object.get("shell_environment_policy.set").?.object;
     try std.testing.expectEqualStrings(
@@ -13928,7 +13926,8 @@ test "configured parent start sends caller options over RPC and redacts its even
     );
     const numbers = params.get("config").?.object.get("numbers").?.array.items;
     const expected_numbers = [_][]const u8{
-        "9007199254740992.1", "1e-400", "1e+400", "9223372036854775808",
+        "128000.0",           "128000", "1e0",   "-0",                  "0",
+        "9007199254740992.1", "1e-400", "1e400", "9223372036854775808",
     };
     try std.testing.expectEqual(expected_numbers.len, numbers.len);
     for (expected_numbers, numbers) |expected, actual| {

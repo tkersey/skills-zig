@@ -30,7 +30,8 @@ pub const ThreadStartOptions = struct {
         if (object.get("ephemeral")) |value| {
             if (value == .bool and value.bool) return error.EphemeralReviewThreadUnsupported;
         }
-        const canonical_json = try canonical.canonicalJsonAlloc(allocator, parsed.value);
+        try sortJsonObjectKeys(&parsed.value);
+        const canonical_json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
         errdefer allocator.free(canonical_json);
         const digest = if (object.count() == 0)
             null
@@ -106,7 +107,48 @@ pub fn buildThreadStartParamsAlloc(
             try params.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
-    return canonical.canonicalJsonAlloc(allocator, .{ .object = params });
+    // Caller children are already ordered. Only mutate the new root map.
+    params.sort(ObjectKeyOrder{ .keys = params.keys() });
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = params }, .{});
+}
+
+const ObjectKeyOrder = struct {
+    keys: []const []const u8,
+
+    pub fn lessThan(self: ObjectKeyOrder, a: usize, b: usize) bool {
+        return std.mem.order(u8, self.keys[a], self.keys[b]) == .lt;
+    }
+};
+
+/// Normalize order without interpreting numbers: Codex distinguishes integer
+/// and floating point JSON forms when it converts configuration to TOML.
+fn sortJsonObjectKeys(value: *std.json.Value) !void {
+    const Frame = struct { children: []std.json.Value, next: usize = 0 };
+    // Root depth zero plus 256 admitted child levels, independent of breadth.
+    var frames: [257]Frame = undefined;
+    frames[0] = .{ .children = value[0..1] };
+    var count: usize = 1;
+    while (count != 0) {
+        const frame = &frames[count - 1];
+        if (frame.next == frame.children.len) {
+            count -= 1;
+            continue;
+        }
+        const child = &frame.children[frame.next];
+        frame.next += 1;
+        const children = switch (child.*) {
+            .object => |*object| children: {
+                object.sort(ObjectKeyOrder{ .keys = object.keys() });
+                break :children object.values();
+            },
+            .array => |*array| array.items,
+            else => continue,
+        };
+        if (children.len == 0) continue;
+        if (count == frames.len) return error.JsonNestingExceeded;
+        frames[count] = .{ .children = children };
+        count += 1;
+    }
 }
 
 fn clientRequestSchemaBytes(bundle: contract.SchemaBundle) ![]const u8 {
@@ -287,7 +329,7 @@ test "review options digest is canonical and configuration sensitive" {
     defer first.deinit();
     const equivalent = try ThreadStartOptions.init(
         std.testing.allocator,
-        " { \"config\": {\"a\": [1,2], \"z\": 1}, \"sandbox\": \"read-only\" } ",
+        " { \"config\": {\"a\": [1,2], \"z\": 1.00}, \"sandbox\": \"read-only\" } ",
     );
     defer equivalent.deinit();
     try std.testing.expectEqualStrings(first.canonical_json, equivalent.canonical_json);
@@ -299,6 +341,45 @@ test "review options digest is canonical and configuration sensitive" {
     );
     defer different.deinit();
     try std.testing.expect(!std.mem.eql(u8, first.digest.?, different.digest.?));
+}
+
+test "review options distinguish integer and floating point configuration" {
+    const integer = try ThreadStartOptions.init(
+        std.testing.allocator,
+        "{\"config\":{\"model_context_window\":128000}}",
+    );
+    defer integer.deinit();
+    const float = try ThreadStartOptions.init(
+        std.testing.allocator,
+        "{\"config\":{\"model_context_window\":128000.0}}",
+    );
+    defer float.deinit();
+    // Codex converts these forms to different TOML types before validating config.
+    try std.testing.expect(!std.mem.eql(u8, integer.digest.?, float.digest.?));
+    const request = try float.buildParamsAlloc(std.testing.allocator, "/repo", null);
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "128000.0") != null);
+}
+
+test "review options retain the JSON nesting bound" {
+    for ([_]usize{ 255, 256 }) |arrays| {
+        var raw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer raw.deinit();
+        try raw.writer.writeAll("{\"config\":");
+        for (0..arrays) |_| try raw.writer.writeByte('[');
+        try raw.writer.writeAll("null");
+        for (0..arrays) |_| try raw.writer.writeByte(']');
+        try raw.writer.writeByte('}');
+        if (arrays == 255) {
+            const options = try ThreadStartOptions.init(std.testing.allocator, raw.written());
+            defer options.deinit();
+        } else {
+            try std.testing.expectError(
+                error.JsonNestingExceeded,
+                ThreadStartOptions.init(std.testing.allocator, raw.written()),
+            );
+        }
+    }
 }
 
 fn exerciseReviewOptionsAllocation(allocator: std.mem.Allocator) !void {
