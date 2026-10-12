@@ -124,7 +124,7 @@ const ObjectKeyOrder = struct {
 /// and floating point JSON forms when it converts configuration to TOML.
 fn sortJsonObjectKeys(value: *std.json.Value) !void {
     const Frame = struct { children: []std.json.Value, next: usize = 0 };
-    // Root depth zero plus 256 admitted child levels, independent of breadth.
+    // A sentinel frame plus 256 container frames, matching Stringify's limit.
     var frames: [257]Frame = undefined;
     frames[0] = .{ .children = value[0..1] };
     var count: usize = 1;
@@ -144,8 +144,8 @@ fn sortJsonObjectKeys(value: *std.json.Value) !void {
             .array => |*array| array.items,
             else => continue,
         };
-        if (children.len == 0) continue;
         if (count == frames.len) return error.JsonNestingExceeded;
+        if (children.len == 0) continue;
         frames[count] = .{ .children = children };
         count += 1;
     }
@@ -362,22 +362,36 @@ test "review options distinguish integer and floating point configuration" {
 }
 
 test "review options retain the JSON nesting bound" {
-    for ([_]usize{ 255, 256 }) |arrays| {
-        var raw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer raw.deinit();
-        try raw.writer.writeAll("{\"config\":");
-        for (0..arrays) |_| try raw.writer.writeByte('[');
-        try raw.writer.writeAll("null");
-        for (0..arrays) |_| try raw.writer.writeByte(']');
-        try raw.writer.writeByte('}');
-        if (arrays == 255) {
-            const options = try ThreadStartOptions.init(std.testing.allocator, raw.written());
-            defer options.deinit();
-        } else {
-            try std.testing.expectError(
-                error.JsonNestingExceeded,
-                ThreadStartOptions.init(std.testing.allocator, raw.written()),
-            );
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |objects| {
+        for ([_]usize{ 254, 255, 256 }) |wrappers| {
+            for ([_][]const u8{ "null", "[]", "{}", "[null]", "{\"value\":null}" }) |leaf| {
+                var raw: std.Io.Writer.Allocating = .init(allocator);
+                defer raw.deinit();
+                try raw.writer.writeAll("{\"config\":");
+                for (0..wrappers) |_| {
+                    try raw.writer.writeAll(if (objects) "{\"item\":" else "[");
+                }
+                try raw.writer.writeAll(leaf);
+                for (0..wrappers) |_| try raw.writer.writeByte(if (objects) '}' else ']');
+                try raw.writer.writeByte('}');
+                // Stringify counts every container, including an empty leaf.
+                const depth = 1 + wrappers + @intFromBool(leaf[0] == '[' or leaf[0] == '{');
+                if (depth > 256) {
+                    try std.testing.expectError(
+                        error.JsonNestingExceeded,
+                        ThreadStartOptions.init(allocator, raw.written()),
+                    );
+                    continue;
+                }
+                const options = try ThreadStartOptions.init(allocator, raw.written());
+                defer options.deinit();
+                try std.testing.expectEqualStrings(raw.written(), options.canonical_json);
+                const request = try options.buildParamsAlloc(allocator, "/repo", null);
+                defer allocator.free(request);
+                const fields = raw.written()[0 .. raw.written().len - 1];
+                try std.testing.expect(std.mem.startsWith(u8, request, fields));
+            }
         }
     }
 }
