@@ -38,7 +38,9 @@ def interrupted_migration(binary, home):
             "captured_at": "2026-10-11T00:00:00Z", "extension": "harness",
             "kind": "harness-rule", "operation": "assert", "summary": "fixture",
             "fingerprint": str(index), "authority": "test-fixture",
-            "scope": {}, "source_refs": [], "related_ids": [],
+            "scope": {"kind": "global", "repo": None, "paths": []},
+            "source_refs": [{"kind": "test", "ref": "recovery", "summary": "fixture"}],
+            "related_ids": [],
             "supersedes_id": None, "payload": {"evidence": "x" * 2048},
         }
         (source / f"{index:04d}.md").write_text(json.dumps(envelope) + "\n")
@@ -48,7 +50,9 @@ def interrupted_migration(binary, home):
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise AssertionError("migration finished before the interruption witness")
+                stdout, stderr = process.communicate()
+                raise AssertionError(("migration finished before the interruption witness",
+                                      process.returncode, stdout, stderr))
             if target.exists() and next(target.glob("*.md"), None) is not None:
                 process.send_signal(signal.SIGSTOP)
                 _, status = os.waitpid(process.pid, os.WUNTRACED)

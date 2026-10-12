@@ -385,10 +385,11 @@ fn notifyObserver(
     value: std.json.Value,
     raw: []const u8,
     replay_state: ?*const protocol.ReplayState,
+    historical_plan: ?*const protocol.Plan,
 ) !void {
     const Observer = @TypeOf(observer.*);
     if (@hasDecl(Observer, "observeReplay")) {
-        try observer.observeReplay(value, raw, replay_state);
+        try observer.observeReplay(value, raw, replay_state, historical_plan);
     } else {
         try observer.observe(value);
     }
@@ -848,6 +849,7 @@ const ReplayObserver = struct {
         value: std.json.Value,
         raw: []const u8,
         replay_state: ?*const protocol.ReplayState,
+        historical_plan: ?*const protocol.Plan,
     ) anyerror!void,
 
     pub fn observeReplay(
@@ -855,8 +857,9 @@ const ReplayObserver = struct {
         value: std.json.Value,
         raw: []const u8,
         replay_state: ?*const protocol.ReplayState,
+        historical_plan: ?*const protocol.Plan,
     ) !void {
-        try self.observe_fn(self.context, value, raw, replay_state);
+        try self.observe_fn(self.context, value, raw, replay_state, historical_plan);
     }
 };
 
@@ -868,10 +871,11 @@ fn eraseReplayObserver(observer: anytype) ReplayObserver {
             value: std.json.Value,
             raw: []const u8,
             replay_state: ?*const protocol.ReplayState,
+            historical_plan: ?*const protocol.Plan,
         ) !void {
             const concrete: *Observer = @ptrCast(@alignCast(context));
             if (@hasDecl(Observer, "observeReplay")) {
-                try concrete.observeReplay(value, raw, replay_state);
+                try concrete.observeReplay(value, raw, replay_state, historical_plan);
             } else {
                 try concrete.observe(value);
             }
@@ -1974,6 +1978,7 @@ fn validateMaterializedEvent(
         parsed.value,
         bytes,
         if (protocol_state.*) |*state| state else null,
+        historical_plan,
     );
 }
 
@@ -2112,9 +2117,10 @@ fn validateRawEvent(
             event,
             bytes,
             if (protocol_state.*) |*state| state else null,
+            historical_plan,
         );
     } else if (execution.inputJson(resolved.effect.input_index)) |event| {
-        try notifyObserver(observer, event, bytes, null);
+        try notifyObserver(observer, event, bytes, null, null);
     }
 }
 

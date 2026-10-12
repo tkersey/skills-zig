@@ -400,19 +400,16 @@ const FoldHistoryEntry = struct {
 const FoldHistoryAccumulator = struct {
     allocator: std.mem.Allocator,
     keyed: *const KeyedFold,
-    reducer_plan: *const reducer.Plan,
     entries: std.AutoHashMapUnmanaged([32]u8, FoldHistoryEntry) = .empty,
     records_seen: usize = 0,
 
     fn init(
         allocator: std.mem.Allocator,
         keyed: *const KeyedFold,
-        reducer_plan: *const reducer.Plan,
     ) FoldHistoryAccumulator {
         return .{
             .allocator = allocator,
             .keyed = keyed,
-            .reducer_plan = reducer_plan,
         };
     }
 
@@ -430,9 +427,15 @@ const FoldHistoryAccumulator = struct {
         event: std.json.Value,
         raw: []const u8,
         replay_state: ?*const protocol.ReplayState,
+        historical_plan: ?*const protocol.Plan,
     ) !void {
+        const event_plan = historical_plan orelse return error.FoldReplayPlanMissing;
+        const reducer_plan = if (event_plan.reducer_plan) |*value|
+            value
+        else
+            return error.FoldReducerPlanMissing;
         const context = try foldHistoryContext(
-            self.reducer_plan,
+            reducer_plan,
             event,
             replay_state,
         );
@@ -441,7 +444,7 @@ const FoldHistoryAccumulator = struct {
             try updateFoldHistory(
                 self.keyed,
                 history_entry,
-                try foldEventKind(self.reducer_plan, event),
+                try foldEventKind(reducer_plan, event),
                 context.view,
                 raw,
             );
@@ -859,6 +862,7 @@ const SortedAccumulator = struct {
         value: std.json.Value,
         raw: []const u8,
         _: ?*const protocol.ReplayState,
+        _: ?*const protocol.Plan,
     ) !void {
         return self.observeRaw(value, raw);
     }
@@ -885,11 +889,26 @@ const SortedAccumulator = struct {
         raw: ?[]const u8,
         record_index: usize,
     ) !void {
+        return self.observeFilteredAtRecordIndex(
+            value,
+            raw,
+            record_index,
+            matches(self.projection, value, self.parameters),
+        );
+    }
+
+    fn observeFilteredAtRecordIndex(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: ?[]const u8,
+        record_index: usize,
+        filter_matches: bool,
+    ) !void {
         const next_seen = std.math.add(usize, self.records_seen, 1) catch
             return error.ProjectionRecordBoundsExceeded;
         const reference = try self.prepareReference(value);
         errdefer if (reference) |bytes| self.allocator.free(bytes);
-        const matched = try self.observeMatched(value, raw, record_index);
+        const matched = filter_matches and try self.observeMatched(value, raw, record_index);
         // Capacity and owned rows are prepared before this non-fallible commit.
         if (reference) |bytes| self.referenced_ids.putAssumeCapacityNoClobber(bytes, {});
         self.records_seen = next_seen;
@@ -902,7 +921,6 @@ const SortedAccumulator = struct {
         raw: ?[]const u8,
         record_index: usize,
     ) !bool {
-        if (!matches(self.projection, value, self.parameters)) return false;
         const relevance_score = (try self.score(value)) orelse return false;
         const keys = try self.sortKeys(
             value,
@@ -5611,15 +5629,8 @@ fn initFoldHistory(
             if (!keyed.history.active() and compiled.sort_keys.len == 0) return null;
             const event_plan = event_protocol orelse
                 return error.FoldReplayPlanMissing;
-            const reducer_plan = if (event_plan.reducer_plan) |*value|
-                value
-            else
-                return error.FoldReducerPlanMissing;
-            return FoldHistoryAccumulator.init(
-                allocator,
-                keyed,
-                reducer_plan,
-            );
+            if (event_plan.reducer_plan == null) return error.FoldReducerPlanMissing;
+            return FoldHistoryAccumulator.init(allocator, keyed);
         },
     }
 }
@@ -6566,6 +6577,16 @@ fn writeSortedKeyedFold(
     for (views) |view| {
         const history = history_accumulator.get(view.key) orelse
             return error.FoldHistoryReducerStateMismatch;
+        // Predicates inspect the retained value, as in unordered folds. Ranking
+        // and export inspect the rendered row after retained-value unwrapping.
+        const filter_matches = try matchesKeyedFold(
+            allocator,
+            projection,
+            fields,
+            view,
+            history,
+            parameters,
+        );
         var row: std.Io.Writer.Allocating = .init(allocator);
         defer row.deinit();
         try writeKeyedHistoryRow(
@@ -6583,7 +6604,12 @@ fn writeSortedKeyedFold(
         defer parsed.deinit();
         // Key-sorted reducer views are a canonical rendering order, not the
         // event-log order. Later lifecycle updates keep an identity's position.
-        try sorted.observeAtRecordIndex(parsed.value, null, history.first_record_index);
+        try sorted.observeFilteredAtRecordIndex(
+            parsed.value,
+            null,
+            history.first_record_index,
+            filter_matches,
+        );
     }
     try sorted.reserveOutput(output, limit, max_output_bytes);
     try sorted.write(&output.writer, limit, stats);
@@ -8340,12 +8366,7 @@ fn verifyKeyedHistory(
     keyed: *const KeyedFold,
 ) !void {
     const protocol_plan = &plans.protocol_plan.?;
-    const reducer_plan = &protocol_plan.reducer_plan.?;
-    var accumulator = FoldHistoryAccumulator.init(
-        std.testing.allocator,
-        keyed,
-        reducer_plan,
-    );
+    var accumulator = FoldHistoryAccumulator.init(std.testing.allocator, keyed);
     defer accumulator.deinit();
     var replay_state = protocol.ReplayState.init(protocol_plan);
     defer replay_state.deinit(std.testing.allocator);
@@ -8382,6 +8403,7 @@ fn applyHistoryEvents(
             parsed.value,
             raw,
             replay_state,
+            protocol_plan,
         );
     }
 }
@@ -8559,7 +8581,7 @@ test "projection ranks current keyed state without reviving obsolete captures" {
         );
         defer parsed.deinit();
         try protocol.applyValue(std.testing.allocator, protocol_plan, &state, parsed.value);
-        try history.observeReplay(parsed.value, raw, &state);
+        try history.observeReplay(parsed.value, raw, &state, protocol_plan);
     }
     const best = try orderedFoldOutput(
         &plans,
@@ -8591,6 +8613,53 @@ test "projection ranks current keyed state without reviving obsolete captures" {
     );
 }
 
+test "sorted keyed fold filters retained data before output unwrapping" {
+    const allocator = std.testing.allocator;
+    const with_filter = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        ordered_fold_definition,
+        "\"fold\",\"limit\"",
+        "\"filter\",\"fold\",\"limit\"",
+    );
+    defer allocator.free(with_filter);
+    const definition_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        with_filter,
+        "{\"op\":\"relevance\"",
+        "{\"op\":\"filter\",\"path\":\"/record/payload/text\",\"equals\":\"shared\"}," ++
+            "{\"op\":\"relevance\"",
+    );
+    defer allocator.free(definition_bytes);
+    var plans = try ProjectionTestPlans.init(definition_bytes);
+    defer plans.deinit();
+    const protocol_plan = &plans.protocol_plan.?;
+    var state = protocol.ReplayState.init(protocol_plan);
+    defer state.deinit(allocator);
+    const selected = plans.cached.find("current-search").?;
+    var history = (try initFoldHistory(allocator, selected, protocol_plan)).?;
+    defer history.deinit();
+    const events = [_][]const u8{
+        \\{"kind":"capture","id":"z","status":"active","record":{"payload":{"text":"shared"}}}
+        ,
+        \\{"kind":"capture","id":"a","status":"active","record":{"payload":{"text":"shared extra"}}}
+        ,
+    };
+    for (events) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try protocol.applyValue(allocator, protocol_plan, &state, parsed.value);
+        try history.observeReplay(parsed.value, raw, &state, protocol_plan);
+    }
+    const result = try orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "[{\"score\":1,\"id\":\"z\",\"status\":\"active\",\"record\":{\"text\":\"shared\"}}]",
+        result,
+    );
+}
+
 test "sorted keyed fold preserves first source position across updates and key order" {
     var plans = try ProjectionTestPlans.init(ordered_fold_definition);
     defer plans.deinit();
@@ -8617,7 +8686,7 @@ test "sorted keyed fold preserves first source position across updates and key o
         );
         defer parsed.deinit();
         try protocol.applyValue(std.testing.allocator, protocol_plan, &state, parsed.value);
-        try history.observeReplay(parsed.value, raw, &state);
+        try history.observeReplay(parsed.value, raw, &state, protocol_plan);
     }
     for ([_]SortOrder{ .ascending, .descending }) |order| {
         selected.sort_keys[1].order = order;

@@ -6,6 +6,7 @@ const std = @import("std");
 const memory_layout = @import("memory_layout.zig");
 const memory_migrate = @import("memory_migrate.zig");
 const memory_storage = @import("memory_storage.zig");
+const memory_envelope = @import("memory_envelope.zig");
 
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -271,7 +272,7 @@ fn validatedAppendInput(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidJson;
-    try validateCommon(parsed.value.object);
+    try memory_envelope.validateCommon(parsed.value.object);
     try validatePayload(extension, kind, parsed.value.object);
     try rejectSensitiveKeys(allocator, parsed.value);
     return parsed;
@@ -648,17 +649,6 @@ fn oneOf(value: []const u8, comptime values: []const []const u8) bool {
         if (std.mem.eql(u8, value, candidate)) return true;
     }
     return false;
-}
-
-fn validateCommon(root: std.json.ObjectMap) !void {
-    _ = stringField(root, "operation") orelse return error.InvalidJson;
-    _ = stringField(root, "authority") orelse return error.InvalidJson;
-    _ = stringField(root, "summary") orelse return error.InvalidJson;
-    if (root.get("scope") == null) return error.InvalidJson;
-    const source_refs = root.get("source_refs") orelse return error.InvalidJson;
-    if (source_refs != .array or source_refs.array.items.len == 0) return error.InvalidJson;
-    const payload = root.get("payload") orelse return error.InvalidJson;
-    if (payload != .object or payload.object.count() == 0) return error.InvalidJson;
 }
 
 const HarnessPayloadFields = &.{
@@ -1335,7 +1325,7 @@ test "renders envelope with generated fields" {
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
-    try validateCommon(parsed.value.object);
+    try memory_envelope.validateCommon(parsed.value.object);
     try validatePayload("harness", "harness-rule", parsed.value.object);
     const note = try renderEnvelopeAlloc(
         std.testing.allocator,

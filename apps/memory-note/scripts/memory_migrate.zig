@@ -2,10 +2,10 @@ const std = @import("std");
 const durable_store = @import("durable_store");
 const layout = @import("memory_layout.zig");
 const memory_storage = @import("memory_storage.zig");
+const memory_envelope = @import("memory_envelope.zig");
 
 const note_bytes_max = 1024 * 1024;
 const note_count_max = 10_000;
-const identity_bytes_max = 128;
 
 pub const Result = struct {
     source_notes: u32 = 0,
@@ -120,7 +120,7 @@ fn inventory(
         defer allocator.free(raw);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
-        const id = try storedIdentity(parsed.value, extension);
+        const id = try memory_envelope.storedIdentity(parsed.value, extension);
         try insertEntry(allocator, &result, name, id, raw);
     }
     return result;
@@ -148,30 +148,45 @@ fn insertEntry(
     result.entries.appendAssumeCapacity(.{ .name = owned_name, .id = owned_id, .digest = digest });
 }
 
-fn storedIdentity(value: std.json.Value, extension: []const u8) ![]const u8 {
-    if (value != .object) return error.InvalidStoredNote;
-    const schema = try string(value, "schema");
-    if (!std.mem.eql(u8, schema, "memory-source-note/v1")) return error.InvalidStoredNote;
-    const owner = try string(value, "extension");
-    if (!std.mem.eql(u8, owner, extension)) return error.InvalidStoredNote;
-    const id = try string(value, "id");
-    if (!std.mem.startsWith(u8, id, "MSN-") or id.len <= 4 or id.len > identity_bytes_max)
-        return error.InvalidStoredNote;
-    // Migration transports stored evidence; it does not recapture or reinterpret it.
-    for ([_][]const u8{ "captured_at", "kind", "operation", "summary", "fingerprint" }) |key|
-        _ = try string(value, key);
-    return id;
-}
-
-fn string(parent: std.json.Value, key: []const u8) ![]const u8 {
-    const value = parent.object.get(key) orelse return error.InvalidStoredNote;
-    if (value != .string) return error.InvalidStoredNote;
-    return value.string;
-}
-
 const fixture =
-    \\{"schema":"memory-source-note/v1","id":"MSN-one","extension":"learnings","captured_at":"2026-10-11T12:00:00Z","kind":"learning-admission","operation":"assert","summary":"fixture","fingerprint":"same-transport-fingerprint","related_ids":[],"supersedes_id":null,"payload":{}}
+    \\{"schema":"memory-source-note/v1","id":"MSN-one","extension":"learnings","captured_at":"2026-10-11T12:00:00Z","kind":"learning-admission","operation":"assert","authority":"source-admission","summary":"fixture","scope":{"kind":"global","repo":null,"paths":[]},"source_refs":[{"kind":"test","ref":"fixture","summary":"fixture"}],"fingerprint":"same-transport-fingerprint","related_ids":[],"supersedes_id":null,"payload":{"evidence":"retained"}}
 ;
+
+test "migration rejects incomplete stored envelopes before publishing any note" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "old");
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    const source = try std.fs.path.join(allocator, &.{ home, "old" });
+    defer allocator.free(source);
+    const destination = try std.fs.path.join(allocator, &.{ home, "new" });
+    defer allocator.free(destination);
+    const required = [_][]const u8{
+        "authority", "scope", "source_refs", "related_ids", "supersedes_id", "payload",
+    };
+    for (required) |field| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.swapRemove(field));
+        const incomplete = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+        defer allocator.free(incomplete);
+        try tmp.dir.writeFile(io, .{ .sub_path = "old/incomplete.md", .data = incomplete });
+        for ([_]bool{ true, false }) |dry_run| {
+            try std.testing.expectError(error.InvalidStoredNote, copy(
+                allocator,
+                io,
+                source,
+                destination,
+                "learnings",
+                dry_run,
+            ));
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "new", .{}));
+        }
+    }
+}
 
 test "migration preserves exact bytes and filenames and retry skips the same identity" {
     const allocator = std.testing.allocator;

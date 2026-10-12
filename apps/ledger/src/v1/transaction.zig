@@ -3111,6 +3111,7 @@ const DerivedMatchObserver = struct {
         value: std.json.Value,
         raw: []const u8,
         _: ?*const protocol.ReplayState,
+        _: ?*const protocol.Plan,
     ) !void {
         if (self.match != null) return;
         const event = self.event orelse return;
