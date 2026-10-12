@@ -437,13 +437,15 @@ const FoldHistoryAccumulator = struct {
             replay_state,
         );
         const history_entry = try self.ensureEntry(context.key, context.view);
-        try updateFoldHistory(
-            self.keyed,
-            history_entry,
-            context.event_kind,
-            context.view,
-            raw,
-        );
+        if (self.keyed.history.active()) {
+            try updateFoldHistory(
+                self.keyed,
+                history_entry,
+                try foldEventKind(self.reducer_plan, event),
+                context.view,
+                raw,
+            );
+        }
         if (self.records_seen == std.math.maxInt(usize)) {
             return error.FoldHistoryRecordCountOverflow;
         }
@@ -498,7 +500,6 @@ const FoldHistoryAccumulator = struct {
 
 const FoldHistoryContext = struct {
     key: []const u8,
-    event_kind: []const u8,
     view: reducer.EntryView,
 };
 
@@ -515,17 +516,20 @@ fn foldHistoryContext(
             plan.key,
         ) orelse return error.FoldHistoryKeyMissing,
     );
+    const view = state.reducer_state.get(key) orelse
+        return error.FoldHistoryReducerStateMissing;
+    return .{ .key = key, .view = view };
+}
+
+fn foldEventKind(plan: *const reducer.Plan, event: std.json.Value) ![]const u8 {
     const event_kind_pointer = plan.event_kind orelse
         return error.FoldHistoryEventKindMissing;
-    const event_kind = try definition_core.json.string(
+    return definition_core.json.string(
         definition_core.json_pointer.lookup(
             event,
             event_kind_pointer,
         ) orelse return error.FoldHistoryEventKindMissing,
     );
-    const view = state.reducer_state.get(key) orelse
-        return error.FoldHistoryReducerStateMissing;
-    return .{ .key = key, .event_kind = event_kind, .view = view };
 }
 
 fn updateFoldHistory(
