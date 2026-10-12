@@ -114,6 +114,18 @@ an existing stale binding, atomically replaces only Ledger's binding metadata,
 and leaves the store bytes unchanged. It rejects invalid stores, missing
 bindings, and already-current bindings.
 
+Event materialization verifies that derived values survive replay before it
+commits an event. Replay can recover a canonically ordered source when the
+declared event layout erased that ordering, but every derived value must match
+the same reconstructed input and the stored layout must remain unchanged.
+This preserves existing event bytes and identities under their archived
+definitions.
+
+Use `canonical_input` derivation fragments for identities that should be
+independent of JSON object field order. `input_json` preserves source
+serialization choices; a materialization that loses an unreconstructible
+choice fails before appending an event.
+
 Use `ledger project --payload-only` only for explicit structural piping. Normal
 JSON projections preserve the `ledger-projection-result/v1` envelope and its
 definition/store identity.

@@ -621,3 +621,38 @@ test -z "$(find "$invalid_repo/.ledger/.definitions" -type f -print -quit)"
 
 # Exercise relational admission and derived folds through the real CLI.
 bash scripts/test-ledger-relations.sh "$binary"
+
+# A derived identity must survive the actual archive/replay path. A source
+# ordering that cannot be reconstructed must fail before changing the store.
+derived_definition=apps/ledger/src/v1/fixtures/derived-layout-definition.json
+derived_repo="$repo_dir/derived-layout"
+mkdir -p "$derived_repo"
+printf '%s\n' '{"record":{"subject":{"a":1,"b":2,"c":3}}}' >"$repo_dir/derived-input.json"
+"$binary" transact --definition "$derived_definition" --operation capture \
+  --repo "$derived_repo" --input "submission=$repo_dir/derived-input.json" \
+  --format json >"$repo_dir/derived-capture.json"
+derived_fingerprint=e6a3385fb77c287a712e7f406a451727f0625041823ecf23bea7ef39b2e39805
+grep -Fq "$derived_fingerprint" "$repo_dir/derived-capture.json"
+"$binary" project --definition "$derived_definition" --projection records \
+  --repo "$derived_repo" --format json >"$repo_dir/derived-projection.json"
+grep -Fq "$derived_fingerprint" "$repo_dir/derived-projection.json"
+"$binary" doctor --definition "$derived_definition" --repo "$derived_repo" \
+  --format json >"$repo_dir/derived-before.json"
+grep -Fq '"healthy":true' "$repo_dir/derived-before.json"
+grep -Fq '"binding_rows":1' "$repo_dir/derived-before.json"
+printf '%s\n' '{"record":{"subject":{"b":2,"a":1,"c":3}}}' >"$repo_dir/derived-input.json"
+set +e
+"$binary" transact --definition "$derived_definition" --operation capture \
+  --repo "$derived_repo" --input "submission=$repo_dir/derived-input.json" \
+  --format json >"$repo_dir/derived-rejected.json"
+derived_status=$?
+set -e
+test "$derived_status" -eq 2
+grep -Fq '"code":"EventDerivedValueMismatch"' "$repo_dir/derived-rejected.json"
+"$binary" doctor --definition "$derived_definition" --repo "$derived_repo" \
+  --format json >"$repo_dir/derived-after.json"
+# Cache timing is not part of store health; compare the complete slot report.
+json_cli=$(command -v jaq || command -v jq)
+"$json_cli" -S '.slots' "$repo_dir/derived-before.json" >"$repo_dir/derived-slots-before.json"
+"$json_cli" -S '.slots' "$repo_dir/derived-after.json" >"$repo_dir/derived-slots-after.json"
+cmp -s "$repo_dir/derived-slots-before.json" "$repo_dir/derived-slots-after.json"
