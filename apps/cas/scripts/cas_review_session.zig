@@ -5626,9 +5626,11 @@ fn buildThreadResumeParamsJson(
     return stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
 }
 
-/// Admit the execution-owned repository before exposing an id to review/start.
+/// Admit the reported directory selection before exposing an id to review/start.
 /// Codex's top-level cwd is only a fallback: any selected environment can become
 /// primary as connections become ready. A remote path is not a local Git witness.
+/// This checks reported directory selection. Caller-owned shell configuration
+/// retains app-server semantics and can change the Git environment independently.
 fn admitStartedReviewThreadIdAlloc(
     allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -13937,7 +13939,8 @@ test "configured parent start sends caller options over RPC and redacts its even
     }
     const options = try review_options.ThreadStartOptions.init(allocator,
         \\{"sandbox":"read-only","serviceTier":null,
-        \\"config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel"},
+        \\"config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel",
+        \\"GIT_DIR":"/caller/repo/.git","GIT_WORK_TREE":"/caller/repo"},
         \\"numbers":[128000.0,128000,1e0,-0,0,9007199254740992.1,1e-400,1e400,9223372036854775808]}}
     );
     defer options.deinit();
@@ -13958,6 +13961,17 @@ test "configured parent start sends caller options over RPC and redacts its even
     });
     defer parsed.deinit();
     const params = parsed.value.object.get("params").?.object;
+    try expectConfiguredThreadStartParams(params);
+    const log_path = try parentEventLogPathAlloc(allocator, root, thread_id);
+    defer allocator.free(log_path);
+    const log = try durable_store.readRegularFileNoSymlink(allocator, log_path, 16 * 1024);
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "private-cache-sentinel") == null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "/caller/repo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, log, options.digest.?) != null);
+}
+
+fn expectConfiguredThreadStartParams(params: std.json.ObjectMap) !void {
     try std.testing.expectEqualStrings("read-only", params.get("sandbox").?.string);
     const rubric = params.get("developerInstructions").?.string;
     try std.testing.expectEqualStrings("exact rubric", rubric);
@@ -13967,6 +13981,8 @@ test "configured parent start sends caller options over RPC and redacts its even
         "private-cache-sentinel",
         environment.get("ZIG_GLOBAL_CACHE_DIR").?.string,
     );
+    try std.testing.expectEqualStrings("/caller/repo/.git", environment.get("GIT_DIR").?.string);
+    try std.testing.expectEqualStrings("/caller/repo", environment.get("GIT_WORK_TREE").?.string);
     const numbers = params.get("config").?.object.get("numbers").?.array.items;
     const expected_numbers = [_][]const u8{
         "128000.0",           "128000", "1e0",   "-0",                  "0",
@@ -13976,12 +13992,6 @@ test "configured parent start sends caller options over RPC and redacts its even
     for (expected_numbers, numbers) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual.number_string);
     }
-    const log_path = try parentEventLogPathAlloc(allocator, root, thread_id);
-    defer allocator.free(log_path);
-    const log = try durable_store.readRegularFileNoSymlink(allocator, log_path, 16 * 1024);
-    defer allocator.free(log);
-    try std.testing.expect(std.mem.indexOf(u8, log, "private-cache-sentinel") == null);
-    try std.testing.expect(std.mem.indexOf(u8, log, options.digest.?) != null);
 }
 
 test "review thread admission requires observable local repository selection" {

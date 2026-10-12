@@ -121,11 +121,20 @@ The built-in preflight qualifies protocol behavior with its controlled local
 provider; caller options cannot replace that fixture's model/provider. CAS checks
 requested property names against that runtime's schema, then the real review's
 `thread/start` performs configuration admission. Before `review/start`, CAS checks
-that the returned thread cwd and every selected environment bind to its local
-repository. A different repository, a remote environment, or an unavailable
+that the returned thread cwd and every selected local environment cwd equal its
+canonical `--cwd`. A different cwd, a remote environment, or an unavailable
 selection fails before a review attempt is created. This also checks selections
-produced by runtime defaults; CAS does not rewrite caller settings. A compatible
-preflight is not proof that a reviewer can write a particular cache directory.
+produced by runtime defaults; CAS does not rewrite caller settings.
+
+These checks cover the reported directory selection, not the effective repository
+of every reviewer command. CAS preserves app-server configuration semantics,
+including `shell_environment_policy.set` overrides such as `GIT_DIR` and
+`GIT_WORK_TREE`. Those overrides can redirect Git while the reported cwd stays
+unchanged. Callers are responsible for keeping their configuration consistent
+with the requested review repository. CAS fingerprints its local Git target and
+the supplied options; that identity does not attest the reviewer's effective Git
+environment. A compatible preflight also does not prove that a reviewer can write
+a particular cache directory.
 
 CAS binds a canonical `threadStartParamsDigest` into the review target fingerprint
 and stores that digest for later `wait` and reuse. Different settings therefore
