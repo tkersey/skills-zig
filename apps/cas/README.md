@@ -105,11 +105,12 @@ CAS retains these existing review obligations:
 | --- | --- |
 | `cwd` | Select the canonical repository with `--cwd`; a second JSON value is rejected. |
 | `developerInstructions` | Supply the exact rubric with `--custom-instructions`; a second JSON value is rejected. |
+| `environments` | Each selected environment must be local and use the canonical `--cwd`. Empty disables environment access and retains that cwd. |
 | `ephemeral` | `true` is incompatible with durable review evidence and recovery; omitted, null, or false remain available. |
 | Review `threadId`, `target`, `delivery` | CAS creates a fresh thread and invokes the selected Git review inline. |
 
 All other schema-advertised thread parameters remain caller-selectable, including
-model/provider, sandbox or named permissions, approval settings, environments,
+model/provider, sandbox or named permissions, approval settings,
 workspace roots, service tier, and history mode. Setting a thread option does not
 override the app server's built-in reviewer: released Codex 0.162.1 forces inline
 review approvals to `Never`, replaces base instructions, and selects
@@ -119,8 +120,12 @@ review approvals to `Never`, replaces base instructions, and selects
 The built-in preflight qualifies protocol behavior with its controlled local
 provider; caller options cannot replace that fixture's model/provider. CAS checks
 requested property names against that runtime's schema, then the real review's
-`thread/start` performs configuration admission. A compatible preflight is not
-proof that a reviewer can write a particular cache directory.
+`thread/start` performs configuration admission. Before `review/start`, CAS checks
+that the returned thread cwd and every selected environment bind to its local
+repository. A different repository, a remote environment, or an unavailable
+selection fails before a review attempt is created. This also checks selections
+produced by runtime defaults; CAS does not rewrite caller settings. A compatible
+preflight is not proof that a reviewer can write a particular cache directory.
 
 CAS binds a canonical `threadStartParamsDigest` into the review target fingerprint
 and stores that digest for later `wait` and reuse. Different settings therefore

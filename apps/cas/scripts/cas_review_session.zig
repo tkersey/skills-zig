@@ -1781,13 +1781,28 @@ const ReviewStart = struct {
             self.parsed.custom_instructions,
             self.parsed.thread_start_options,
         ) catch |err| {
-            const failure = serverRequestProviderFailure(err) orelse FailureInfo{
-                .code = "pre_review_start_failed",
-                .hint = "the owner-lived review failed before review/start; the exact " ++
-                    "request may start one fresh attempt",
+            const failure: FailureInfo = switch (err) {
+                error.ReviewThreadRepositoryMismatch => .{
+                    .code = "review_repository_mismatch",
+                    .hint = "Codex selected a different review repository or a non-local " ++
+                        "environment; select local environments at the canonical --cwd",
+                },
+                error.ReviewThreadRepositoryUnverifiable => .{
+                    .code = "review_repository_unverifiable",
+                    .hint = "Codex did not report the loaded thread's working directory " ++
+                        "and environment selection; CAS cannot bind a review to --cwd",
+                },
+                else => serverRequestProviderFailure(err) orelse .{
+                    .code = "pre_review_start_failed",
+                    .hint = "the owner-lived review failed before review/start; the exact " ++
+                        "request may start one fresh attempt",
+                },
             };
             self.updateLock("pre_review_start_failed", failure.code);
-            if (self.workflow_binding != null) {
+            if (self.workflow_binding != null or
+                err == error.ReviewThreadRepositoryMismatch or
+                err == error.ReviewThreadRepositoryUnverifiable)
+            {
                 self.managed_server.?.kill();
                 self.markPreStart();
                 try self.renderFailure("review/start", @errorName(err), failure);
@@ -5558,7 +5573,7 @@ fn startParentThreadAlloc(
     defer allocator.free(params_json);
     const result_json = try client.requestJson("thread/start", params_json);
     defer allocator.free(result_json);
-    const parent_thread_id = try extractStartedThreadIdAlloc(allocator, result_json);
+    const parent_thread_id = try admitStartedReviewThreadIdAlloc(allocator, cwd, result_json);
     errdefer allocator.free(parent_thread_id);
     const parent_event_log_path = try parentEventLogPathAlloc(
         allocator,
@@ -5611,12 +5626,40 @@ fn buildThreadResumeParamsJson(
     return stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
 }
 
-fn extractStartedThreadIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+/// Admit the execution-owned repository before exposing an id to review/start.
+/// Codex's top-level cwd is only a fallback: any selected environment can become
+/// primary as connections become ready. A remote path is not a local Git witness.
+fn admitStartedReviewThreadIdAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    raw_json: []const u8,
+) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+    });
     defer parsed.deinit();
-    const root_obj = parsed.value.object;
-    const thread_obj = core_json.objectField(root_obj, "thread") orelse return error.MissingThread;
-    const id = core_json.stringField(thread_obj, "id") orelse return error.MissingThreadId;
+    if (parsed.value != .object) return error.ReviewThreadRepositoryUnverifiable;
+    const thread = core_json.objectField(parsed.value.object, "thread") orelse
+        return error.ReviewThreadRepositoryUnverifiable;
+    const actual_cwd = core_json.stringField(thread, "cwd") orelse
+        return error.ReviewThreadRepositoryUnverifiable;
+    if (!std.mem.eql(u8, cwd, actual_cwd)) return error.ReviewThreadRepositoryMismatch;
+    const environments = thread.get("environments") orelse
+        return error.ReviewThreadRepositoryUnverifiable;
+    if (environments != .array) return error.ReviewThreadRepositoryUnverifiable;
+    for (environments.array.items) |environment| {
+        if (environment != .object) return error.ReviewThreadRepositoryUnverifiable;
+        const id = core_json.stringField(environment.object, "environmentId") orelse
+            return error.ReviewThreadRepositoryUnverifiable;
+        if (!std.mem.eql(u8, id, "local")) return error.ReviewThreadRepositoryMismatch;
+        const environment_cwd = core_json.stringField(environment.object, "cwd") orelse
+            return error.ReviewThreadRepositoryUnverifiable;
+        // Keep the canonical path itself: a separately resolved symlink could be
+        // retargeted without changing the repository CAS later fingerprints.
+        if (!std.mem.eql(u8, cwd, environment_cwd)) return error.ReviewThreadRepositoryMismatch;
+    }
+    const id = core_json.stringField(thread, "id") orelse return error.MissingThreadId;
     return allocator.dupe(u8, id);
 }
 
@@ -13881,7 +13924,7 @@ test "configured parent start sends caller options over RPC and redacts its even
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "codex-fixture" });
     defer allocator.free(executable);
-    try writeReviewThreadStartPeerFixture(io, tmp.dir);
+    try writeReviewThreadStartPeerFixture(io, tmp.dir, root, root);
     var client = try cas.Client.start(allocator, .{
         .cwd = root,
         .io = io,
@@ -13941,7 +13984,128 @@ test "configured parent start sends caller options over RPC and redacts its even
     try std.testing.expect(std.mem.indexOf(u8, log, options.digest.?) != null);
 }
 
-fn writeReviewThreadStartPeerFixture(io: std.Io, dir: std.Io.Dir) !void {
+test "review thread admission requires observable local repository selection" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, expected: ?anyerror }{
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[]}}
+        , .expected = null },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[{"environmentId":"local","cwd":"/repo"}]}}
+        , .expected = null },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[{"environmentId":"remote","cwd":"/repo"}]}}
+        , .expected = error.ReviewThreadRepositoryMismatch },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[{"environmentId":"local","cwd":"/repo"},{"environmentId":"remote","cwd":"/repo"}]}}
+        , .expected = error.ReviewThreadRepositoryMismatch },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"relative","environments":[]}}
+        , .expected = error.ReviewThreadRepositoryMismatch },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo"}}
+        , .expected = error.ReviewThreadRepositoryUnverifiable },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":null}}
+        , .expected = error.ReviewThreadRepositoryUnverifiable },
+        .{ .body =
+        \\{"thread":{"id":"t","environments":[]}}
+        , .expected = error.ReviewThreadRepositoryUnverifiable },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[{}]}}
+        , .expected = error.ReviewThreadRepositoryUnverifiable },
+        .{ .body =
+        \\{"thread":{"id":"t","cwd":"/repo","environments":[false]}}
+        , .expected = error.ReviewThreadRepositoryUnverifiable },
+    };
+    for (cases) |case| {
+        const result = admitStartedReviewThreadIdAlloc(allocator, "/repo", case.body);
+        if (case.expected) |expected| {
+            try std.testing.expectError(expected, result);
+        } else {
+            const id = try result;
+            defer allocator.free(id);
+            try std.testing.expectEqualStrings("t", id);
+        }
+    }
+}
+
+test "review repository admission rejects an independently retargetable directory alias" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.symLink(io, root, "alias", .{ .is_directory = true });
+    const alias = try std.fs.path.join(allocator, &.{ root, "alias" });
+    defer allocator.free(alias);
+    const resolved = try tmp.dir.realPathFileAlloc(io, "alias", allocator);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(root, resolved);
+    const response = try stringifyAnyAlloc(allocator, .{ .thread = .{
+        .id = "t",
+        .cwd = root,
+        .environments = .{.{ .environmentId = "local", .cwd = alias }},
+    } });
+    defer allocator.free(response);
+    try std.testing.expectError(
+        error.ReviewThreadRepositoryMismatch,
+        admitStartedReviewThreadIdAlloc(allocator, root, response),
+    );
+}
+
+test "parent start rejects an environment that changes the reviewed repository" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(io, "other", .default_dir);
+    const other = try tmp.dir.realPathFileAlloc(io, "other", allocator);
+    defer allocator.free(other);
+    const executable = try std.fs.path.join(allocator, &.{ root, "codex-fixture" });
+    defer allocator.free(executable);
+    try writeReviewThreadStartPeerFixture(io, tmp.dir, root, other);
+    var client = try cas.Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .request_deadline_ms = monotonicMilliseconds(io) + 2_000,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+    const raw_options = try stringifyAnyAlloc(allocator, .{
+        .environments = .{.{ .environmentId = "local", .cwd = other }},
+    });
+    defer allocator.free(raw_options);
+    const options = try review_options.ThreadStartOptions.init(allocator, raw_options);
+    defer options.deinit();
+    try std.testing.expectError(
+        error.ReviewThreadRepositoryMismatch,
+        startParentThreadAlloc(allocator, &client, root, root, null, options),
+    );
+}
+
+fn writeReviewThreadStartPeerFixture(
+    io: std.Io,
+    dir: std.Io.Dir,
+    cwd: []const u8,
+    environment_cwd: []const u8,
+) !void {
+    // Codex reports its fallback cwd separately from the turn's environment cwd.
+    const response = try stringifyAnyAlloc(std.testing.allocator, .{ .thread = .{
+        .id = "fixture-thread",
+        .cwd = cwd,
+        .environments = .{.{ .environmentId = "local", .cwd = environment_cwd }},
+    } });
+    defer std.testing.allocator.free(response);
+    try dir.writeFile(io, .{ .sub_path = "thread-result.json", .data = response });
     // A local protocol peer captures the real request. It cannot execute a model turn.
     const script =
         \\#!/bin/sh
@@ -13953,7 +14117,7 @@ fn writeReviewThreadStartPeerFixture(io: std.Io, dir: std.Io.Dir) !void {
         \\    *'"method":"thread/start"'*)
         \\      printf '%s\n' "$line" > request.json
         \\      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-        \\      printf '{"id":%s,"result":{"thread":{"id":"fixture-thread"}}}\n' "$id"
+        \\      printf '{"id":%s,"result":%s}\n' "$id" "$(cat thread-result.json)"
         \\      ;;
         \\    *) exit 7 ;;
         \\  esac
