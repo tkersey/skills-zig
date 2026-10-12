@@ -133,6 +133,48 @@ def duplicate_append_rejects_symlink(binary, root):
     assert not (alias / ".memory-note").exists()
 
 
+def invalid_home_doctor_is_structured(binary, root):
+    root.mkdir()
+    marker = root / "codex-invoked"
+    codex = root / "codex"
+    codex.write_text(f"#!{sys.executable}\nfrom pathlib import Path\n"
+                    f"Path({str(marker)!r}).touch()\n")
+    codex.chmod(0o700)
+    env = {**os.environ, "CODEX_BIN": str(codex)}
+    real = root / "real"
+    real.mkdir()
+    for kind, issue in (("symlink", "SymlinkComponent"), ("not_dir", "NotDir")):
+        component = root / kind
+        if kind == "symlink":
+            component.symlink_to(real, target_is_directory=True)
+        else:
+            component.write_text("file")
+        for home in (component, component / "child"):
+            for version in ("v1", "v2", None):
+                options = ["--memory-version", version] if version else []
+                argv = [str(binary), "doctor", "--codex-home", str(home),
+                        "--extension", "harness", *options]
+                result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=10)
+                assert result.returncode == 8, result
+                report = json.loads(result.stdout)
+                assert report["checked"] == 0 and report["issues"] == 1, report
+                assert not report["storage_mutated"], report
+                entry = report["extensions"][0]
+                checked = home
+                if version:
+                    layout = "memories" if version == "v1" else "memories_v2"
+                    checked = home / layout / "extensions/harness/notes"
+                assert entry["issue"] == issue, entry
+                assert entry["checked_path"] == str(checked), entry
+                assert entry["offending_component"] == str(component), entry
+                assert entry["component_kind"] == kind, entry
+                argv[1] = "path"
+                rejected = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=10)
+                assert rejected.returncode == 5 and issue in rejected.stderr, rejected
+                assert not marker.exists()
+    assert not list(real.iterdir())
+
+
 def config_cleanup_is_bounded(binary, root):
     root.mkdir()
     child = root / "codex"
@@ -198,6 +240,7 @@ def main():
         legacy_lock_is_not_stolen(binary, root / "legacy")
         empty_migration_reports_control_creation(binary, root / "empty")
         duplicate_append_rejects_symlink(binary, root / "duplicate")
+        invalid_home_doctor_is_structured(binary, root / "invalid-home")
         config_cleanup_is_bounded(binary, root / "config")
     print("memory-note interrupted publication, kernel lock recovery, and path safety: pass")
 

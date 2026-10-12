@@ -430,24 +430,22 @@ const FoldHistoryAccumulator = struct {
         historical_plan: ?*const protocol.Plan,
     ) !void {
         const event_plan = historical_plan orelse return error.FoldReplayPlanMissing;
-        const reducer_plan = if (event_plan.reducer_plan) |*value|
-            value
-        else
-            return error.FoldReducerPlanMissing;
-        const context = try foldHistoryContext(
-            reducer_plan,
-            event,
-            replay_state,
-        );
-        const history_entry = try self.ensureEntry(context.key, context.view);
-        if (self.keyed.history.active()) {
-            try updateFoldHistory(
-                self.keyed,
-                history_entry,
-                try foldEventKind(reducer_plan, event),
-                context.view,
-                raw,
+        if (event_plan.reducer_plan) |*reducer_plan| {
+            const context = try foldHistoryContext(
+                reducer_plan,
+                event,
+                replay_state,
             );
+            const history_entry = try self.ensureEntry(context.key, context.view);
+            if (self.keyed.history.active()) {
+                try updateFoldHistory(
+                    self.keyed,
+                    history_entry,
+                    try foldEventKind(reducer_plan, event),
+                    context.view,
+                    raw,
+                );
+            }
         }
         if (self.records_seen == std.math.maxInt(usize)) {
             return error.FoldHistoryRecordCountOverflow;
@@ -8777,6 +8775,85 @@ test "sorted fold skips excluded missing retention but keeps global references" 
         error.ReducerRetainedValueMissing,
         orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096),
     );
+}
+
+fn chainedDefinitionWithoutKeyedReducer() ![]u8 {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        @embedFile("fixtures/chained-event-definition.json"),
+        .{},
+    );
+    defer parsed.deinit();
+    const laws = &parsed.value.object.getPtr("constraints").?.object.getPtr("laws").?.array;
+    var index: usize = 0;
+    while (index < laws.items.len) {
+        const name = laws.items[index].array.items[0].string;
+        if (std.mem.eql(u8, name, "reducer") or std.mem.eql(u8, name, "transition-table")) {
+            _ = laws.orderedRemove(index);
+        } else {
+            index += 1;
+        }
+    }
+    const operators = &parsed.value.object.getPtr("requires").?.object.getPtr("operators").?.array;
+    index = 0;
+    while (index < operators.items.len) {
+        const name = operators.items[index].string;
+        if (std.mem.eql(u8, name, "reducer") or std.mem.eql(u8, name, "transition-table")) {
+            _ = operators.orderedRemove(index);
+        } else {
+            index += 1;
+        }
+    }
+    const projections = &parsed.value.object.getPtr("projections").?.object;
+    _ = projections.swapRemove("current");
+    _ = projections.swapRemove("ordered-current");
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+test "sorted fold counts chained history before the first keyed reducer" {
+    const allocator = std.testing.allocator;
+    const old_bytes = try chainedDefinitionWithoutKeyedReducer();
+    defer allocator.free(old_bytes);
+    var old = try ProjectionTestPlans.init(old_bytes);
+    defer old.deinit();
+    const current_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        @embedFile("fixtures/chained-event-definition.json"),
+        "{\"from\":null,\"on\":\"created\",\"to\":\"open\"}",
+        "{\"from\":null,\"on\":\"created\",\"to\":\"open\"}," ++
+            "{\"from\":null,\"on\":\"updated\",\"to\":\"closed\"}",
+    );
+    defer allocator.free(current_bytes);
+    var current = try ProjectionTestPlans.init(current_bytes);
+    defer current.deinit();
+    const current_plan = &current.protocol_plan.?;
+    var state = protocol.ReplayState.init(current_plan);
+    defer state.deinit(allocator);
+    const selected = current.cached.find("ordered-current").?;
+    var history = (try initFoldHistory(allocator, selected, current_plan)).?;
+    defer history.deinit();
+    const events = [_][]const u8{
+        @embedFile("fixtures/chained-event-one.json"),
+        @embedFile("fixtures/chained-event-two.json"),
+    };
+    for (events, 0..) |raw, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const historical = if (index == 0) &old.protocol_plan.? else current_plan;
+        try protocol.applyValue(allocator, historical, &state, parsed.value);
+        try history.observeReplay(parsed.value, raw, &state, historical);
+        try std.testing.expectEqual(index + 1, history.records_seen);
+        try std.testing.expectEqual(index, history.entries.count());
+        try std.testing.expectError(
+            error.FoldReplayPlanMissing,
+            history.observeReplay(parsed.value, raw, &state, null),
+        );
+    }
+    var entries = history.entries.valueIterator();
+    try std.testing.expectEqual(@as(usize, 1), entries.next().?.first_record_index);
 }
 
 test "sorted keyed fold preserves first source position across updates and key order" {

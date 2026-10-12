@@ -22,6 +22,7 @@ pub const Version = enum {
     }
 };
 
+/// The caller validates the home directory before querying Codex configuration.
 pub fn selectedVersion(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -30,7 +31,6 @@ pub fn selectedVersion(
     explicit_version: ?Version,
 ) !Version {
     if (!std.fs.path.isAbsolute(home)) return error.InvalidCodexHome;
-    try validateDirectory(io, home);
     if (explicit_version) |version| return version;
     var child_env = try env.clone(allocator);
     defer child_env.deinit();

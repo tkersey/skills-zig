@@ -242,6 +242,11 @@ fn run(
     }
     const home = try codexHomeAlloc(allocator, env, args.codex_home);
     defer allocator.free(home);
+    if (!std.fs.path.isAbsolute(home)) return error.InvalidCodexHome;
+    memory_layout.validateDirectory(process_io, home) catch |err| {
+        if (args.command == .doctor) return cmdDoctor(allocator, env, args, err);
+        return err;
+    };
     args.memory_version = try memory_layout.selectedVersion(
         allocator,
         process_io,
@@ -253,7 +258,7 @@ fn run(
         .append => try cmdAppend(allocator, env, args),
         .list => try cmdList(allocator, env, args),
         .show => try cmdShow(allocator, env, args),
-        .doctor => try cmdDoctor(allocator, env, args),
+        .doctor => try cmdDoctor(allocator, env, args, null),
         .path => try cmdPath(allocator, env, args),
         .migrate => try cmdMigrate(allocator, env, args),
         .version => {
@@ -439,7 +444,13 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     return error.InvalidFormat;
 }
 
-fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdDoctor(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    args: Args,
+    home_issue: ?anyerror,
+) !u8 {
+    std.debug.assert(args.memory_version != null or home_issue != null);
     if (args.extension) |extension| try validateExtension(extension);
     var issues: usize = 0;
     var checked: usize = 0;
@@ -456,15 +467,24 @@ fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
         emitted_extension = true;
         try w.writeAll("{\"extension\":");
         try writeJsonString(w, extension);
-        const notes_dir = try notesDirAlloc(allocator, env, args, extension);
+        const notes_dir = if (args.memory_version != null)
+            try notesDirAlloc(allocator, env, args, extension)
+        else
+            try codexHomeAlloc(allocator, env, args.codex_home);
         defer allocator.free(notes_dir);
-        memory_layout.validateDirectory(Io.io(), notes_dir) catch |err| {
+        var path_issue = home_issue;
+        if (path_issue == null) {
+            memory_layout.validateDirectory(Io.io(), notes_dir) catch |err| {
+                path_issue = err;
+            };
+        }
+        if (path_issue) |err| {
             issues += 1;
             var diagnostic = try doctorPathDiagnosticAlloc(allocator, notes_dir, err);
             defer diagnostic.deinit(allocator);
             try writeDoctorFailureJson(w, err, diagnostic);
             continue;
-        };
+        }
         const names = durable_store.listSortedRegularFilesNoSymlink(
             allocator,
             notes_dir,
@@ -475,24 +495,9 @@ fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
             else => return err,
         };
         defer durable_store.freeStringList(allocator, names);
-        for (names) |name| {
-            const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
-            defer allocator.free(path);
-            const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
-            defer allocator.free(raw);
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                issues += 1;
-                continue;
-            };
-            defer parsed.deinit();
-            const note = parseNoteSummary(parsed.value) catch {
-                issues += 1;
-                continue;
-            };
-            if (!std.mem.eql(u8, note.extension, extension)) issues += 1;
-            checked += 1;
-        }
+        const counts = try doctorNoteCounts(allocator, notes_dir, names, extension);
+        checked += counts.checked;
+        issues += counts.issues;
         try w.print(",\"status\":\"ok\",\"notes\":{d}}}", .{names.len});
     }
     try w.print("],\"checked\":{d},\"issues\":{d},\"storage_mutated\":false}}\n", .{
@@ -500,6 +505,35 @@ fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
     });
     try writeStdoutAlloc(allocator, &out);
     return if (issues == 0) 0 else 8;
+}
+
+fn doctorNoteCounts(
+    allocator: std.mem.Allocator,
+    notes_dir: []const u8,
+    names: []const []const u8,
+    extension: []const u8,
+) !struct { checked: usize, issues: usize } {
+    var checked: usize = 0;
+    var issues: usize = 0;
+    for (names) |name| {
+        const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
+        defer allocator.free(path);
+        const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
+        defer allocator.free(raw);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            issues += 1;
+            continue;
+        };
+        defer parsed.deinit();
+        const note = parseNoteSummary(parsed.value) catch {
+            issues += 1;
+            continue;
+        };
+        if (!std.mem.eql(u8, note.extension, extension)) issues += 1;
+        checked += 1;
+    }
+    return .{ .checked = checked, .issues = issues };
 }
 
 fn cmdPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {

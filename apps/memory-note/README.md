@@ -25,7 +25,8 @@ memory-note version
 layout issues. Failed extension entries include:
 
 - `issue`: stable machine-readable error name, such as `SymlinkComponent`;
-- `checked_path`: full notes directory path that was checked;
+- `checked_path`: full notes directory path, or the Codex home when its invalid
+  layout prevents implicit version selection;
 - `offending_component`: path component that caused the issue, when it can be
   reproduced during diagnosis;
 - `component_kind`: `symlink`, `not_dir`, or `unknown`.
