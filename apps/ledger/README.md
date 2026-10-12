@@ -168,6 +168,18 @@ ledger version
 operators, codecs, storage adapters, cache format, generic bounds, and result
 schemas. Every result keeps structural claims distinct from semantic authority.
 
+## Ranked current state (Ledger 1.5)
+
+A keyed `fold` can compose with filters, relevance, sort, structured-field export,
+and limits. Ranking sees one current row per identity after lifecycle replay.
+The `record-order` sort key uses the identity's first event position; later
+updates do not move that position. Equal explicit sort keys also retain this
+source order. Unsorted folds keep their canonical key order.
+
+Sorted keyed folds reconstruct positions from validated history, including sealed
+segments. They therefore read full history even when a checkpoint can supply the
+current reducer state. Existing checkpoint bytes and migration formats are unchanged.
+
 ## Directed relations (Ledger 1.2)
 
 Keyed reducers may declare one bounded directed relation over their retained

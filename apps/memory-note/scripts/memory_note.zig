@@ -322,8 +322,11 @@ fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
 
     const lock_path = try memoryNoteLockPathAlloc(allocator, env, args.codex_home, extension);
     defer allocator.free(lock_path);
-    var lock = try memory_storage.acquireExtensionLock(allocator, lock_path);
-    defer lock.release();
+    var lock = if (args.dry_run)
+        null
+    else
+        try memory_storage.acquireExtensionLock(allocator, lock_path);
+    defer if (lock) |*held| held.release();
 
     if (try findFingerprint(allocator, notes_dir, fingerprint)) |existing| {
         defer allocator.free(existing.id);

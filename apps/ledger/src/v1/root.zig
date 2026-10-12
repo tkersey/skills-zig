@@ -305,6 +305,70 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try expectPlainProjection(&plans, repo_root);
 }
 
+test "segmented sorted fold preserves source order through checkpoint and append" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try appendPlainCreatedEventFor(&plans, repo_root, "z");
+    try appendPlainCreatedEvent(&plans, repo_root);
+    try expectOrderedPlainId(&plans, repo_root, "first", "z");
+    try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
+    plans.store.slots[0].layout = .segmented;
+    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.store,
+        &plans.protocol,
+        repo_root,
+        &plans.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try expectOrderedPlainId(&plans, repo_root, "first", "z");
+    try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
+    try appendPlainEvent(&plans, repo_root);
+    try appendPlainCreatedEventFor(&plans, repo_root, "a");
+    try expectOrderedPlainId(&plans, repo_root, "first", "z");
+    try expectOrderedPlainId(&plans, repo_root, "last", "a");
+}
+
+fn expectOrderedPlainId(
+    plans: *const PlainPlans,
+    repo_root: []const u8,
+    name: []const u8,
+    id: []const u8,
+) !void {
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        name,
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        result.payload,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings(id, parsed.value.array.items[0].object.get("id").?.string);
+}
+
 test "segmented bind existing bootstraps explicit migration" {
     var plans = try compilePlainPlans();
     defer plans.deinit();

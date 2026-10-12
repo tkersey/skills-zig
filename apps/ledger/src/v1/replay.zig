@@ -219,6 +219,30 @@ pub fn validateSegmentedHistory(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !void {
+    var observer: IgnoreRecords = .{};
+    var stats = try validateSegmentedHistoryObserved(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        protocol_required,
+        &observer,
+    );
+    defer stats.deinit(allocator);
+}
+
+pub fn validateSegmentedHistoryObserved(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    observer: anytype,
+) !Stats {
     if (!snapshot.head.checkpoint_exists) {
         return error.SegmentedReplayCheckpointMissing;
     }
@@ -244,7 +268,6 @@ pub fn validateSegmentedHistory(
         genesis_revision,
     );
     defer rows.deinit();
-    var observer: IgnoreRecords = .{};
     var validator = StreamEventValidator{
         .allocator = allocator,
         .cache = &cache,
@@ -254,13 +277,24 @@ pub fn validateSegmentedHistory(
         .protocol_required = protocol_required,
         .lifetime_protocol = true,
         .max_records = std.math.maxInt(usize),
-        .observer = eraseReplayObserver(&observer),
+        .observer = eraseReplayObserver(observer),
         .checkpoint_records = std.math.cast(
             usize,
             snapshot.head.checkpoint_event_records,
         ) orelse return error.CurrentStoreRecordBoundsExceeded,
         .checkpoint_bytes = snapshot.checkpoint_bytes,
     };
+    return finishSegmentedHistory(allocator, slot, snapshot, &rows, &validator, &cache);
+}
+
+fn finishSegmentedHistory(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    rows: *HistoryRowCursor,
+    validator: *StreamEventValidator,
+    cache: *PlanCache,
+) !Stats {
     defer if (validator.historical_parameters) |*bindings| {
         bindings.deinit(allocator);
     };
@@ -268,7 +302,7 @@ pub fn validateSegmentedHistory(
     if (validator.checkpoint_records.? == 0) {
         try validator.verifyCheckpoint();
     }
-    try replaySegmentedEvents(allocator, slot.relative_path, snapshot, &validator);
+    try replaySegmentedEvents(allocator, slot.relative_path, snapshot, validator);
     try rows.finish();
     if (validator.record_offset != snapshot.head.total_event_records or
         validator.raw_bytes_observed != snapshot.head.total_event_bytes or
@@ -276,6 +310,14 @@ pub fn validateSegmentedHistory(
     {
         return error.SegmentedHistoryMismatch;
     }
+    const state = validator.protocol_state;
+    validator.protocol_state = null;
+    return .{
+        .records_validated = validator.record_offset,
+        .definition_versions = cache.plans.items.len,
+        .protocol_state = state,
+        .append_context = null,
+    };
 }
 
 fn replaySegmentedEvents(

@@ -308,6 +308,7 @@ const KeyedFold = struct {
 const FoldHistoryEntry = struct {
     key_bytes: [256]u8 = undefined,
     key_len: u16,
+    first_record_index: usize = 0,
     event_kind_counts: [max_fold_event_kind_counts]usize =
         @as([max_fold_event_kind_counts]usize, @splat(0)),
     event_chain: [64]u8 = undefined,
@@ -467,6 +468,7 @@ const FoldHistoryAccumulator = struct {
             self.keyed,
             view,
         );
+        initialized.first_record_index = self.records_seen;
         var owned = true;
         defer if (owned) initialized.deinit(self.allocator);
         const result = try self.entries.getOrPut(
@@ -870,8 +872,16 @@ const SortedAccumulator = struct {
         value: std.json.Value,
         raw: ?[]const u8,
     ) !void {
-        const record_index = self.records_seen;
-        const next_seen = std.math.add(usize, record_index, 1) catch
+        return self.observeAtRecordIndex(value, raw, self.records_seen);
+    }
+
+    fn observeAtRecordIndex(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: ?[]const u8,
+        record_index: usize,
+    ) !void {
+        const next_seen = std.math.add(usize, self.records_seen, 1) catch
             return error.ProjectionRecordBoundsExceeded;
         const reference = try self.prepareReference(value);
         errdefer if (reference) |bytes| self.allocator.free(bytes);
@@ -4942,12 +4952,9 @@ fn executeSegmentedProjection(
     }
     var fold_history = try initFoldHistory(allocator, compiled, event_protocol);
     defer if (fold_history) |*history| history.deinit();
-    if (fold_history != null) {
-        return error.SegmentedProjectionHistoryRequiresFullReplay;
-    }
     const revision = try snapshot.head.revisionAlloc(allocator);
     defer allocator.free(revision);
-    var replay_stats = try segmentedProjectionReplay(
+    var replay_stats = try segmentedFoldReplay(
         allocator,
         definition_plan,
         event_protocol,
@@ -4956,6 +4963,7 @@ fn executeSegmentedProjection(
         parameters,
         &snapshot,
         revision,
+        if (fold_history) |*history| history else null,
     );
     defer replay_stats.deinit(allocator);
     return renderSegmentedFold(
@@ -4969,7 +4977,50 @@ fn executeSegmentedProjection(
         parameters,
         revision,
         &replay_stats,
+        if (fold_history) |*history| history else null,
     );
+}
+
+fn segmentedFoldReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    snapshot: *const segmented_event_log.Snapshot,
+    revision: []const u8,
+    history: ?*FoldHistoryAccumulator,
+) !replay.Stats {
+    const observer = history orelse return segmentedProjectionReplay(
+        allocator,
+        definition_plan,
+        event_protocol,
+        repo_root,
+        slot,
+        parameters,
+        snapshot,
+        revision,
+    );
+    const event_plan = event_protocol orelse return error.SegmentedProjectionRequiresProtocol;
+    if (!snapshot.head_exists) return .{
+        .records_validated = 0,
+        .definition_versions = 0,
+        .protocol_state = protocol.ReplayState.init(event_plan),
+    };
+    var observed = try replay.validateSegmentedHistoryObserved(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        snapshot,
+        parameters,
+        true,
+        observer,
+    );
+    errdefer observed.deinit(allocator);
+    try protocol.activateCheckpoint(allocator, event_plan, &observed.protocol_state.?);
+    return observed;
 }
 
 fn executeValidatedSegmentedHistory(
@@ -5176,6 +5227,7 @@ fn renderSegmentedFold(
     parameters: *const definition_core.parameters.Bindings,
     revision: []const u8,
     replay_stats: *replay.Stats,
+    fold_history: ?*FoldHistoryAccumulator,
 ) !Result {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -5189,7 +5241,7 @@ fn renderSegmentedFold(
         event_protocol,
         compiled,
         replay_stats,
-        null,
+        fold_history,
         parameters,
         try resolveLimit(compiled.limit, parameters, plan.max_records),
         plan.max_output_bytes,
@@ -5552,7 +5604,7 @@ fn initFoldHistory(
     switch (fold.*) {
         .retained => return null,
         .keyed => |*keyed| {
-            if (!keyed.history.active()) return null;
+            if (!keyed.history.active() and compiled.sort_keys.len == 0) return null;
             const event_plan = event_protocol orelse
                 return error.FoldReplayPlanMissing;
             const reducer_plan = if (event_plan.reducer_plan) |*value|
@@ -5703,13 +5755,17 @@ fn executeKeyedFoldProjection(
     records_validated: usize,
 ) !void {
     if (compiled.sort_keys.len != 0) {
+        const history = fold_history orelse return error.FoldHistoryAccumulatorMissing;
+        if (history.records_seen != records_validated) {
+            return error.FoldHistoryRecordCountMismatch;
+        }
         return writeSortedKeyedFold(
             allocator,
             output,
             compiled,
             keyed,
             &replay_state.reducer_state,
-            fold_history,
+            history,
             parameters,
             effective_limit,
             max_output_bytes,
@@ -6488,7 +6544,7 @@ fn writeSortedKeyedFold(
     projection: *const Projection,
     keyed: *const KeyedFold,
     reducer_state: *reducer.State,
-    history_accumulator: ?*const FoldHistoryAccumulator,
+    history_accumulator: *const FoldHistoryAccumulator,
     parameters: *const definition_core.parameters.Bindings,
     limit: usize,
     max_output_bytes: usize,
@@ -6504,10 +6560,8 @@ fn writeSortedKeyedFold(
     // Reuse the fold renderer so retained unwrapping and history fields agree
     // with ordinary current-record projections; never rank obsolete captures.
     for (views) |view| {
-        const history = if (history_accumulator) |configured|
-            configured.get(view.key) orelse return error.FoldHistoryReducerStateMismatch
-        else
-            null;
+        const history = history_accumulator.get(view.key) orelse
+            return error.FoldHistoryReducerStateMismatch;
         var row: std.Io.Writer.Allocating = .init(allocator);
         defer row.deinit();
         try writeKeyedHistoryRow(
@@ -6523,7 +6577,9 @@ fn writeSortedKeyedFold(
             .parse_numbers = false,
         });
         defer parsed.deinit();
-        try sorted.observe(parsed.value);
+        // Key-sorted reducer views are a canonical rendering order, not the
+        // event-log order. Later lifecycle updates keep an identity's position.
+        try sorted.observeAtRecordIndex(parsed.value, null, history.first_record_index);
     }
     try sorted.reserveOutput(output, limit, max_output_bytes);
     try sorted.write(&output.writer, limit, stats);
@@ -8474,6 +8530,12 @@ test "projection ranks current keyed state without reviving obsolete captures" {
     const protocol_plan = &plans.protocol_plan.?;
     var state = protocol.ReplayState.init(protocol_plan);
     defer state.deinit(std.testing.allocator);
+    var history = (try initFoldHistory(
+        std.testing.allocator,
+        plans.cached.find("current-search").?,
+        protocol_plan,
+    )).?;
+    defer history.deinit();
     const events = [_][]const u8{
         \\{"kind":"capture","id":"a","status":"active","record":{"payload":{"text":"obsolete component repeated admission"}}}
         ,
@@ -8485,21 +8547,34 @@ test "projection ranks current keyed state without reviving obsolete captures" {
         ,
     };
     for (events) |raw| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            raw,
+            .{},
+        );
         defer parsed.deinit();
         try protocol.applyValue(std.testing.allocator, protocol_plan, &state, parsed.value);
+        try history.observeReplay(parsed.value, raw, &state);
     }
-    const best = try orderedFoldOutput(&plans, &state, "component repeated admission", 1, 4096);
+    const best = try orderedFoldOutput(
+        &plans,
+        &state,
+        &history,
+        "component repeated admission",
+        1,
+        4096,
+    );
     defer std.testing.allocator.free(best);
     try std.testing.expectEqualStrings(
         "[{\"score\":3,\"id\":\"b\",\"status\":\"active\"," ++
             "\"record\":{\"text\":\"component repeated admission\"}}]",
         best,
     );
-    const obsolete = try orderedFoldOutput(&plans, &state, "obsolete", 8, 4096);
+    const obsolete = try orderedFoldOutput(&plans, &state, &history, "obsolete", 8, 4096);
     defer std.testing.allocator.free(obsolete);
     try std.testing.expectEqualStrings("[]", obsolete);
-    const current = try orderedFoldOutput(&plans, &state, "memoized", 8, 4096);
+    const current = try orderedFoldOutput(&plans, &state, &history, "memoized", 8, 4096);
     defer std.testing.allocator.free(current);
     try std.testing.expectEqualStrings(
         "[{\"score\":1,\"id\":\"a\",\"status\":\"inactive\"," ++
@@ -8508,13 +8583,62 @@ test "projection ranks current keyed state without reviving obsolete captures" {
     );
     try std.testing.expectError(
         error.ProjectionOutputBoundsExceeded,
-        orderedFoldOutput(&plans, &state, "admission", 1, 1),
+        orderedFoldOutput(&plans, &state, &history, "admission", 1, 1),
     );
+}
+
+test "sorted keyed fold preserves first source position across updates and key order" {
+    var plans = try ProjectionTestPlans.init(ordered_fold_definition);
+    defer plans.deinit();
+    const protocol_plan = &plans.protocol_plan.?;
+    var state = protocol.ReplayState.init(protocol_plan);
+    defer state.deinit(std.testing.allocator);
+    const selected = plans.cached.find("current-search").?;
+    var history = (try initFoldHistory(std.testing.allocator, selected, protocol_plan)).?;
+    defer history.deinit();
+    const events = [_][]const u8{
+        \\{"kind":"capture","id":"z","status":"active","record":{"payload":{"text":"shared"}}}
+        ,
+        \\{"kind":"capture","id":"a","status":"active","record":{"payload":{"text":"shared"}}}
+        ,
+        \\{"kind":"status","id":"z","status":"inactive","record":{"payload":{"text":"shared"}}}
+        ,
+    };
+    for (events) |raw| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            raw,
+            .{},
+        );
+        defer parsed.deinit();
+        try protocol.applyValue(std.testing.allocator, protocol_plan, &state, parsed.value);
+        try history.observeReplay(parsed.value, raw, &state);
+    }
+    for ([_]SortOrder{ .ascending, .descending }) |order| {
+        selected.sort_keys[1].order = order;
+        const result = try orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096);
+        defer std.testing.allocator.free(result);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            result,
+            .{},
+        );
+        defer parsed.deinit();
+        const rows = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings(
+            if (order == .ascending) "z" else "a",
+            rows[0].object.get("id").?.string,
+        );
+    }
 }
 
 fn orderedFoldOutput(
     plans: *ProjectionTestPlans,
     state: *protocol.ReplayState,
+    history: *FoldHistoryAccumulator,
     query: []const u8,
     limit: usize,
     max_output_bytes: usize,
@@ -8536,13 +8660,13 @@ fn orderedFoldOutput(
         &selected.fold.?.keyed,
         &plans.protocol_plan.?,
         state,
-        null,
+        history,
         &bindings,
         limit,
         max_output_bytes,
         &output,
         &stats,
-        4,
+        history.records_seen,
     );
     return output.toOwnedSlice();
 }

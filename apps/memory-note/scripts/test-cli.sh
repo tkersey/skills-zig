@@ -61,11 +61,20 @@ test ! -e "$note_home"
 test ! -e "$note_home"
 
 "$bin" append --codex-home "$note_home" --extension harness \
+  --kind harness-rule --json "$fixture" --dry-run > "$tmp/dry-run.json"
+"$json" -e '.status == "valid_dry_run"' "$tmp/dry-run.json" >/dev/null
+test ! -e "$note_home"
+
+"$bin" append --codex-home "$note_home" --extension harness \
   --kind harness-rule --json "$fixture" > "$tmp/created.json"
 "$json" -e '.status == "created"' "$tmp/created.json" >/dev/null
 first_id=$("$json" -r '.id' "$tmp/created.json")
 first_path=$("$json" -r '.path' "$tmp/created.json")
 test -f "$first_path"
+"$bin" append --codex-home "$note_home" --extension harness \
+  --kind harness-rule --json "$fixture" --dry-run > "$tmp/dry-duplicate.json"
+"$json" -e --arg id "$first_id" '.status == "duplicate_skip" and .id == $id' \
+  "$tmp/dry-duplicate.json" >/dev/null
 test ! -e "$note_home/memories"
 "$bin" list --codex-home "$note_home" --extension harness > "$tmp/list.json"
 "$json" -e --arg id "$first_id" '.notes | length == 1 and .[0].id == $id' \
