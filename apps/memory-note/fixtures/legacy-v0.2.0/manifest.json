@@ -1,0 +1,43 @@
+{
+  "source_commit": "a8bce33dc948192475abbf3eb9daabbe8c4787e2",
+  "source_blob": "e1e7a9be364fc4e1c62c97476c0b798488b55a30",
+  "binary_version": "0.2.0",
+  "notes": [
+    {
+      "extension": "harness",
+      "kind": "harness-rule",
+      "fixture": "harness.md",
+      "filename": "2026-10-11T20-46-54-harness-rule-proceed-with-useful-grounded-work-when-ambiguity-is-non-blocking-c37afa545c012999.md",
+      "id": "MSN-20261011T204654Z-c37afa545c012999",
+      "sha256": "e111a3b3acd5c02c07d07634aa8ce01a965a07e10bd0c47bd312efd5df8214c3",
+      "input": "{\n  \"operation\": \"assert\",\n  \"authority\": \"explicit-user-correction\",\n  \"summary\": \"Proceed with useful grounded work when ambiguity is non-blocking.\",\n  \"scope\": {\n    \"kind\": \"global\",\n    \"repo\": null,\n    \"paths\": []\n  },\n  \"source_refs\": [\n    {\n      \"kind\": \"user-correction\",\n      \"ref\": \"rollout:019-example\",\n      \"summary\": \"User corrected a low-value clarification stall\"\n    }\n  ],\n  \"related_ids\": [],\n  \"supersedes_id\": null,\n  \"payload\": {\n    \"harness_rule\": \"When requirements have minor non-blocking gaps, state assumptions and produce the useful grounded portion.\",\n    \"trigger\": \"Minor ambiguity that does not block useful progress\",\n    \"preferred_behavior\": \"Proceed with explicit assumptions\",\n    \"failure_avoided\": \"Unnecessary clarification and stalled delivery\",\n    \"verification_cue\": \"The response contains useful work and names material assumptions\",\n    \"evidence_count\": 1,\n    \"repetition_count\": 1\n  }\n}\n"
+    },
+    {
+      "extension": "learnings",
+      "kind": "learning-admission",
+      "fixture": "learnings.md",
+      "filename": "2026-10-11T20-46-54-learning-admission-proceed-with-useful-grounded-work-when-ambiguity-is-non-blocking-6d45f2bc26cef777.md",
+      "id": "MSN-20261011T204654Z-6d45f2bc26cef777",
+      "sha256": "8164b5e70104973995ed48a2a68c476b52c05754ab44b6d67b1830304a73a644",
+      "input": "{\"operation\":\"assert\",\"authority\":\"explicit-user-correction\",\"summary\":\"Proceed with useful grounded work when ambiguity is non-blocking.\",\"scope\":{\"kind\":\"global\",\"repo\":null,\"paths\":[]},\"source_refs\":[{\"kind\":\"user-correction\",\"ref\":\"rollout:019-example\",\"summary\":\"User corrected a low-value clarification stall\"}],\"related_ids\":[],\"supersedes_id\":null,\"payload\":{\"learning_id\":\"legacy fixture\",\"learning_status\":\"legacy fixture\",\"repo\":\"legacy fixture\",\"source_path\":\"legacy fixture\",\"decision_delta\":\"legacy fixture\",\"future_behavior\":\"legacy fixture\",\"verification\":\"legacy fixture\",\"evidence_snapshot\":{\"fixture\":true}}}\n"
+    },
+    {
+      "extension": "negative-ledger",
+      "kind": "ledger-projection",
+      "fixture": "negative-ledger.md",
+      "filename": "2026-10-11T20-46-54-ledger-projection-neg-000001-active-same-leaf-batching-exclusion-1ce42244e821a480.md",
+      "id": "MSN-20261011T204654Z-1ce42244e821a480",
+      "sha256": "dac469b1621aebe32940735fde5aaa781444ba9eb5765686d352175603a1ef30",
+      "input": "{\n  \"operation\": \"assert\",\n  \"authority\": \"ledger-cli\",\n  \"summary\": \"NEG-000001 active same-leaf batching exclusion.\",\n  \"scope\": {\n    \"kind\": \"repo\",\n    \"repo\": \"owner/repo\",\n    \"paths\": [\"src/mvcc\", \"src/btree\"]\n  },\n  \"source_refs\": [\n    {\n      \"kind\": \"negative-ledger\",\n      \"ref\": \".ledger/negative-ledger.jsonl#NEG-000001\",\n      \"summary\": \"Canonical full ledger projection\"\n    }\n  ],\n  \"related_ids\": [],\n  \"supersedes_id\": null,\n  \"payload\": {\n    \"neg_id\": \"NEG-000001\",\n    \"record_version\": \"NER-v2\",\n    \"ledger_path\": \".ledger/negative-ledger.jsonl\",\n    \"projection_fingerprint\": \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n    \"status\": \"active\",\n    \"kind\": \"realization_route\",\n    \"route_or_model_id\": \"same-leaf-batching\",\n    \"route_id\": \"same-leaf-batching\",\n    \"cluster_id\": \"mvcc-small-write\",\n    \"artifact_state_id\": \"HEAD\",\n    \"hypothesis\": \"Same-leaf batching improves small-write throughput.\",\n    \"attempted_change\": \"Prototype same-leaf mutation bookkeeping batching.\",\n    \"observed_outcome\": \"Representative small-N write loop regressed 7 percent.\",\n    \"failure_class\": \"local-regression\",\n    \"source_refs\": [\n      {\n        \"kind\": \"benchmark\",\n        \"ref\": \"zig build bench -- write-small-n\"\n      }\n    ],\n    \"falsifying_evidence\": [\n      \"write-small-n regressed 7 percent versus baseline\"\n    ],\n    \"exclusion_scope\": \"route_family\",\n    \"exclusion_rule\": \"Do not retry this same batching route while the old bookkeeping path and benchmark surface still apply.\",\n    \"applicability_conditions\": [\n      \"same bookkeeping path\",\n      \"same representative benchmark surface\"\n    ],\n    \"reopening_criteria\": [\n      \"bookkeeping path structurally replaced\",\n      \"fixture changed and current proof rerun\"\n    ],\n    \"confidence\": \"high\",\n    \"next_search_hint\": \"Investigate adjacent cursor-open or changed-path costs.\",\n    \"source_event_count\": 1\n  }\n}\n"
+    },
+    {
+      "extension": "synesthesia",
+      "kind": "mapping-endorsement",
+      "fixture": "synesthesia.md",
+      "filename": "2026-10-11T20-46-54-mapping-endorsement-proceed-with-useful-grounded-work-when-ambiguity-is-non-blocking-8474389ecf44daea.md",
+      "id": "MSN-20261011T204654Z-8474389ecf44daea",
+      "sha256": "4f2336a930d204b8580305ee82b2dd11e6e1ca53582775bbe3903164c8272567",
+      "input": "{\"operation\":\"assert\",\"authority\":\"explicit-user-correction\",\"summary\":\"Proceed with useful grounded work when ambiguity is non-blocking.\",\"scope\":{\"kind\":\"global\",\"repo\":null,\"paths\":[]},\"source_refs\":[{\"kind\":\"user-correction\",\"ref\":\"rollout:019-example\",\"summary\":\"User corrected a low-value clarification stall\"}],\"related_ids\":[],\"supersedes_id\":null,\"payload\":{\"sensory_phrase\":\"legacy fixture\",\"activation_boundary\":\"legacy fixture\",\"scope\":\"legacy fixture\",\"endorsement_type\":\"legacy fixture\",\"verification\":\"legacy fixture\",\"engineering_translation\":\"legacy fixture\"}}\n"
+    }
+  ]
+}

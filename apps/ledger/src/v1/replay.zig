@@ -219,6 +219,30 @@ pub fn validateSegmentedHistory(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !void {
+    var observer: IgnoreRecords = .{};
+    var stats = try validateSegmentedHistoryObserved(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        protocol_required,
+        &observer,
+    );
+    defer stats.deinit(allocator);
+}
+
+pub fn validateSegmentedHistoryObserved(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    observer: anytype,
+) !Stats {
     if (!snapshot.head.checkpoint_exists) {
         return error.SegmentedReplayCheckpointMissing;
     }
@@ -244,7 +268,6 @@ pub fn validateSegmentedHistory(
         genesis_revision,
     );
     defer rows.deinit();
-    var observer: IgnoreRecords = .{};
     var validator = StreamEventValidator{
         .allocator = allocator,
         .cache = &cache,
@@ -254,13 +277,24 @@ pub fn validateSegmentedHistory(
         .protocol_required = protocol_required,
         .lifetime_protocol = true,
         .max_records = std.math.maxInt(usize),
-        .observer = eraseReplayObserver(&observer),
+        .observer = eraseReplayObserver(observer),
         .checkpoint_records = std.math.cast(
             usize,
             snapshot.head.checkpoint_event_records,
         ) orelse return error.CurrentStoreRecordBoundsExceeded,
         .checkpoint_bytes = snapshot.checkpoint_bytes,
     };
+    return finishSegmentedHistory(allocator, slot, snapshot, &rows, &validator, &cache);
+}
+
+fn finishSegmentedHistory(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    snapshot: *const segmented_event_log.Snapshot,
+    rows: *HistoryRowCursor,
+    validator: *StreamEventValidator,
+    cache: *PlanCache,
+) !Stats {
     defer if (validator.historical_parameters) |*bindings| {
         bindings.deinit(allocator);
     };
@@ -268,7 +302,7 @@ pub fn validateSegmentedHistory(
     if (validator.checkpoint_records.? == 0) {
         try validator.verifyCheckpoint();
     }
-    try replaySegmentedEvents(allocator, slot.relative_path, snapshot, &validator);
+    try replaySegmentedEvents(allocator, slot.relative_path, snapshot, validator);
     try rows.finish();
     if (validator.record_offset != snapshot.head.total_event_records or
         validator.raw_bytes_observed != snapshot.head.total_event_bytes or
@@ -276,6 +310,14 @@ pub fn validateSegmentedHistory(
     {
         return error.SegmentedHistoryMismatch;
     }
+    const state = validator.protocol_state;
+    validator.protocol_state = null;
+    return .{
+        .records_validated = validator.record_offset,
+        .definition_versions = cache.plans.items.len,
+        .protocol_state = state,
+        .append_context = null,
+    };
 }
 
 fn replaySegmentedEvents(
@@ -343,10 +385,11 @@ fn notifyObserver(
     value: std.json.Value,
     raw: []const u8,
     replay_state: ?*const protocol.ReplayState,
+    historical_plan: ?*const protocol.Plan,
 ) !void {
     const Observer = @TypeOf(observer.*);
     if (@hasDecl(Observer, "observeReplay")) {
-        try observer.observeReplay(value, raw, replay_state);
+        try observer.observeReplay(value, raw, replay_state, historical_plan);
     } else {
         try observer.observe(value);
     }
@@ -806,6 +849,7 @@ const ReplayObserver = struct {
         value: std.json.Value,
         raw: []const u8,
         replay_state: ?*const protocol.ReplayState,
+        historical_plan: ?*const protocol.Plan,
     ) anyerror!void,
 
     pub fn observeReplay(
@@ -813,8 +857,9 @@ const ReplayObserver = struct {
         value: std.json.Value,
         raw: []const u8,
         replay_state: ?*const protocol.ReplayState,
+        historical_plan: ?*const protocol.Plan,
     ) !void {
-        try self.observe_fn(self.context, value, raw, replay_state);
+        try self.observe_fn(self.context, value, raw, replay_state, historical_plan);
     }
 };
 
@@ -826,10 +871,11 @@ fn eraseReplayObserver(observer: anytype) ReplayObserver {
             value: std.json.Value,
             raw: []const u8,
             replay_state: ?*const protocol.ReplayState,
+            historical_plan: ?*const protocol.Plan,
         ) !void {
             const concrete: *Observer = @ptrCast(@alignCast(context));
             if (@hasDecl(Observer, "observeReplay")) {
-                try concrete.observeReplay(value, raw, replay_state);
+                try concrete.observeReplay(value, raw, replay_state, historical_plan);
             } else {
                 try concrete.observe(value);
             }
@@ -1932,6 +1978,7 @@ fn validateMaterializedEvent(
         parsed.value,
         bytes,
         if (protocol_state.*) |*state| state else null,
+        historical_plan,
     );
 }
 
@@ -2070,9 +2117,10 @@ fn validateRawEvent(
             event,
             bytes,
             if (protocol_state.*) |*state| state else null,
+            historical_plan,
         );
     } else if (execution.inputJson(resolved.effect.input_index)) |event| {
-        try notifyObserver(observer, event, bytes, null);
+        try notifyObserver(observer, event, bytes, null, null);
     }
 }
 

@@ -94,11 +94,36 @@ fn roundTripPlainProtocol(compiled: *const protocol.Plan) !protocol.Plan {
 }
 
 fn compilePlainPlans() !PlainPlans {
+    return compilePlainPlansFrom(@embedFile("fixtures/plain-event-definition.json"));
+}
+
+fn compileSegmentedPlainPlansFrom(bytes: []const u8) !PlainPlans {
+    const allocator = std.testing.allocator;
+    const segmented = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        bytes,
+        "\"codec\":\"jsonl\",\"max_bytes\":65536",
+        "\"codec\":\"jsonl\",\"layout\":\"segmented\",\"max_bytes\":67108864",
+    );
+    defer allocator.free(segmented);
+    const bounded = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        segmented,
+        "\"max_store_bytes\":65536",
+        "\"max_store_bytes\":67108864",
+    );
+    defer allocator.free(bounded);
+    return compilePlainPlansFrom(bounded);
+}
+
+fn compilePlainPlansFrom(bytes: []const u8) !PlainPlans {
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
     try definition_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "plain.json",
-        .data = @embedFile("fixtures/plain-event-definition.json"),
+        .data = bytes,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -238,6 +263,10 @@ fn appendPlainCreatedEventFor(
         .{id},
     );
     defer std.testing.allocator.free(bytes);
+    try appendPlainRawEvent(plans, repo_root, bytes);
+}
+
+fn appendPlainRawEvent(plans: *const PlainPlans, repo_root: []const u8, bytes: []const u8) !void {
     var appended = try transaction.transact(
         std.testing.allocator,
         &plans.artifact,
@@ -303,6 +332,184 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try std.testing.expectEqualStrings(original, after_binding);
     try appendPlainEvent(&plans, repo_root);
     try expectPlainProjection(&plans, repo_root);
+}
+
+test "segmented sorted fold preserves source order through checkpoint and append" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    try appendPlainCreatedEventFor(&plans, repo_root, "z");
+    try appendPlainCreatedEvent(&plans, repo_root);
+    try expectOrderedPlainId(&plans, repo_root, "first", "z");
+    try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
+    var segmented = try compileSegmentedPlainPlansFrom(
+        @embedFile("fixtures/plain-event-definition.json"),
+    );
+    defer segmented.deinit();
+    var migrated = try migration.execute(
+        std.testing.allocator,
+        &segmented.artifact,
+        &segmented.closure,
+        "plain.json",
+        &segmented.store,
+        &segmented.protocol,
+        repo_root,
+        &segmented.parameters,
+    );
+    defer migrated.deinit(std.testing.allocator);
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "item-1");
+    try appendPlainEvent(&segmented, repo_root);
+    try appendPlainCreatedEventFor(&segmented, repo_root, "a");
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
+}
+
+test "ordered fold follows archived selectors on admitted plain and segmented plans" {
+    try expectArchivedSelectors(false);
+    try expectArchivedSelectors(true);
+}
+
+fn archivedSelectorDefinition(with_history: bool) ![]u8 {
+    const allocator = std.testing.allocator;
+    var bytes = try allocator.dupe(u8, @embedFile("fixtures/plain-event-definition.json"));
+    errdefer allocator.free(bytes);
+    const replacements = [_][2][]const u8{
+        .{ "/value/id", "/value/next_id" },
+        .{ "\"id\":{}", "\"next_id\":{}" },
+        .{ "/kind", "/event" },
+        .{ "\"kind\":{}", "\"event\":{}" },
+    };
+    for (replacements) |pair| {
+        const next = try std.mem.replaceOwned(u8, allocator, bytes, pair[0], pair[1]);
+        allocator.free(bytes);
+        bytes = next;
+    }
+    if (with_history) {
+        const next = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            bytes,
+            "\"key_field\":\"id\",\"state_field\":\"status\"",
+            "\"key_field\":\"id\",\"state_field\":\"status\"," ++
+                "\"event_kind_counts\":[{\"kind\":\"created\",\"field\":\"created_count\"}]",
+        );
+        allocator.free(bytes);
+        bytes = next;
+    }
+    return bytes;
+}
+
+fn expectArchivedSelectors(with_history: bool) !void {
+    const allocator = std.testing.allocator;
+    var old = try compilePlainPlans();
+    defer old.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_root);
+    try appendPlainCreatedEventFor(&old, repo_root, "z");
+
+    const bytes = try archivedSelectorDefinition(with_history);
+    defer allocator.free(bytes);
+    var current = try compilePlainPlansFrom(bytes);
+    defer current.deinit();
+    try appendPlainRawEvent(&current, repo_root,
+        \\{"event":"created","value":{"next_id":"a","revision":1}}
+    );
+    try expectOrderedPlainId(&current, repo_root, "first", "z");
+    try expectOrderedPlainId(&current, repo_root, "last", "a");
+    if (with_history) {
+        try expectPlainCreatedCount(&current, repo_root, "z");
+        try expectPlainCreatedCount(&current, repo_root, "a");
+        try std.testing.expectError(
+            error.SegmentedProjectionHistoryRequiresFullReplay,
+            compileSegmentedPlainPlansFrom(bytes),
+        );
+        return;
+    }
+    var segmented = try compileSegmentedPlainPlansFrom(bytes);
+    defer segmented.deinit();
+    var migrated = try migration.execute(
+        allocator,
+        &segmented.artifact,
+        &segmented.closure,
+        "plain.json",
+        &segmented.store,
+        &segmented.protocol,
+        repo_root,
+        &segmented.parameters,
+    );
+    defer migrated.deinit(allocator);
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try appendPlainRawEvent(&segmented, repo_root,
+        \\{"event":"updated","value":{"next_id":"a","revision":1}}
+    );
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
+}
+
+fn expectPlainCreatedCount(plans: *const PlainPlans, repo_root: []const u8, id: []const u8) !void {
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        result.payload,
+        .{},
+    );
+    defer parsed.deinit();
+    for (parsed.value.array.items) |row| {
+        if (std.mem.eql(u8, row.object.get("id").?.string, id)) {
+            try std.testing.expectEqual(@as(i64, 1), row.object.get("created_count").?.integer);
+            return;
+        }
+    }
+    return error.ExpectedIdentityMissing;
+}
+
+fn expectOrderedPlainId(
+    plans: *const PlainPlans,
+    repo_root: []const u8,
+    name: []const u8,
+    id: []const u8,
+) !void {
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        name,
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        result.payload,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings(id, parsed.value.array.items[0].object.get("id").?.string);
 }
 
 test "segmented bind existing bootstraps explicit migration" {

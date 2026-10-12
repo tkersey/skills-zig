@@ -319,6 +319,15 @@ chained_current_warm=$("$binary" project \
 grep -Fq '"data":[{"id":"item-1","status":"closed"}]' <<<"$chained_current_warm"
 grep -Fq '"cache_hit":true' <<<"$chained_current_warm"
 
+# Chained protocols own their envelope kind; their reducer deliberately has no
+# event_kind selector. Source-order ranking must not require that plain-only field.
+chained_ordered=$("$binary" project \
+  --definition "$chained_definition" \
+  --projection ordered-current \
+  --repo "$protocol_repo" \
+  --format json)
+grep -Fq '"data":[{"id":"item-1","status":"closed"}]' <<<"$chained_ordered"
+
 chained_doctor=$("$binary" doctor \
   --definition "$chained_definition" \
   --repo "$protocol_repo" \
