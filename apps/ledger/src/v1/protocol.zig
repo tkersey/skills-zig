@@ -1590,14 +1590,14 @@ pub fn materializeEvent(
         body_digest,
         unix_seconds,
     );
-    return .{
-        .content = try definition_core.canonical_json.finalizeFingerprintAlloc(
-            allocator,
-            output.written(),
-            plan.envelope.event_digest_key,
-        ),
-        .generated_outputs = prepared.generated_outputs,
-    };
+    const content = try definition_core.canonical_json.finalizeFingerprintAlloc(
+        allocator,
+        output.written(),
+        plan.envelope.event_digest_key,
+    );
+    errdefer allocator.free(content);
+    try validateMaterializedDerivations(allocator, plan, state, materialization, content);
+    return .{ .content = content, .generated_outputs = prepared.generated_outputs };
 }
 
 pub fn materializePlainEvent(
@@ -1638,10 +1638,40 @@ pub fn materializePlainEvent(
         prepared,
         unix_seconds,
     );
+    try validateMaterializedDerivations(
+        allocator,
+        null,
+        state,
+        materialization,
+        output.written(),
+    );
     return .{
         .content = try output.toOwnedSlice(),
         .generated_outputs = prepared.generated_outputs,
     };
+}
+
+fn validateMaterializedDerivations(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    content: []const u8,
+) !void {
+    if (materialization.derive.len == 0) return;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        content,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    // A successful constructor must be readable by the same replay consumer.
+    const reconstructed = if (plan) |chained|
+        try reconstructInputAlloc(allocator, chained, state.?, materialization, parsed.value)
+    else
+        try reconstructPlainInputAlloc(allocator, state, materialization, parsed.value);
+    allocator.free(reconstructed);
 }
 
 const PreparedMaterializedEvent = struct {
@@ -1914,8 +1944,7 @@ pub fn reconstructInputAlloc(
         event_object,
         plan.envelope.body_key,
     );
-    errdefer allocator.free(reconstructed);
-    try validateStoredEventDerivations(
+    return validateReconstructedInputAlloc(
         allocator,
         state,
         materialization,
@@ -1923,7 +1952,6 @@ pub fn reconstructInputAlloc(
         plan.envelope.body_key,
         reconstructed,
     );
-    return reconstructed;
 }
 
 pub fn reconstructPlainInputAlloc(
@@ -1944,8 +1972,7 @@ pub fn reconstructPlainInputAlloc(
         event_object,
         materialization.body_input_field,
     );
-    errdefer allocator.free(reconstructed);
-    try validateStoredEventDerivations(
+    return validateReconstructedInputAlloc(
         allocator,
         state,
         materialization,
@@ -1953,7 +1980,90 @@ pub fn reconstructPlainInputAlloc(
         materialization.body_input_field,
         reconstructed,
     );
+}
+
+fn validateReconstructedInputAlloc(
+    allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+    body_key: []const u8,
+    reconstructed: []u8,
+) ![]u8 {
+    errdefer allocator.free(reconstructed);
+    validateStoredEventDerivations(
+        allocator,
+        state,
+        materialization,
+        event,
+        body_key,
+        reconstructed,
+    ) catch |err| switch (err) {
+        error.EventDerivedValueMismatch => {
+            // Object layout is not retained source order. Older writers could
+            // hash canonical input JSON before emitting a declared object order.
+            // Recover that one bounded source candidate without changing the
+            // archived definition, event bytes, or any stored identity. Every
+            // derivation must agree with the same complete candidate.
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                reconstructed,
+                .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+            );
+            defer parsed.deinit();
+            const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                parsed.value,
+            );
+            errdefer allocator.free(canonical);
+            if (std.mem.eql(u8, canonical, reconstructed)) return err;
+            if (!try eventLayoutErasesCanonicalOrder(allocator, materialization, event)) {
+                return err;
+            }
+            try validateStoredEventDerivations(
+                allocator,
+                state,
+                materialization,
+                event,
+                body_key,
+                canonical,
+            );
+            allocator.free(reconstructed);
+            return canonical;
+        },
+        else => return err,
+    };
     return reconstructed;
+}
+
+fn eventLayoutErasesCanonicalOrder(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+) !bool {
+    // Chained emission canonicalizes the complete event. Plain emission only
+    // erases the orders declared by its layout; preserve all other byte choices.
+    if (materialization.mode == .chained) return true;
+    const value: std.json.Value = .{ .object = event };
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(allocator, value);
+    defer allocator.free(canonical);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        canonical,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const original_layout = try canonicalPlainStoredEventAlloc(allocator, materialization, value);
+    defer allocator.free(original_layout);
+    const canonical_layout = try canonicalPlainStoredEventAlloc(
+        allocator,
+        materialization,
+        parsed.value,
+    );
+    defer allocator.free(canonical_layout);
+    return std.mem.eql(u8, original_layout, canonical_layout);
 }
 
 fn validateStoredEventDerivations(
@@ -5281,6 +5391,19 @@ const plain_derivation_definition =
     \\{"schema":"ledger-artifact-definition/v1","id":"example/derived-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","composite-identity","event-materialization","exact-object","sha256","timestamp"]},"parameters":{},"inputs":{"submission":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"submission":{"object":"exact","fields":{"logical_kind":{},"note":{"object":"exact","fields":{"operation":{},"summary":{},"details":{"object":"exact","fields":{"z":{},"a":{}}}}},"physical_kind":{}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/derived-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{"mode":"plain","body_input_field":"note","field_order":["v","source","event","record_id","captured_at","kind","logical_kind","operation","note"],"body_order":["id","captured_at","logical_kind","kind","operation","summary","details","fingerprint"],"fields":[{"field":"v","literal":1},{"field":"source","literal":"example"},{"field":"event","literal":"example.capture"},{"field":"record_id","derived":"record_id"},{"field":"captured_at","derived":"captured_at"},{"field":"kind","input_field":"physical_kind"},{"field":"logical_kind","input_field":"logical_kind"},{"field":"operation","derived":"operation"}],"derive":[{"name":"physical_kind","op":"input-text","pointer":"/physical_kind"},{"name":"logical_kind","op":"input-text","pointer":"/logical_kind"},{"name":"operation","op":"input-text","pointer":"/note/operation"},{"name":"captured_at","op":"utc-timestamp","format":"rfc3339-seconds"},{"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[{"literal":"example\n"},{"input_text":"/physical_kind"},{"literal":"\n"},{"input_text":"/logical_kind"},{"literal":"\n"},{"input_json":"/note"}],"max_bytes":4096},{"name":"record_id","op":"concat","fragments":[{"literal":"EVT-"},{"derived":"captured_at","transform":"compact-utc"},{"literal":"-"},{"derived":"fingerprint","prefix_bytes":16}],"max_bytes":64}],"body_fields":[{"field":"id","derived":"record_id"},{"field":"captured_at","derived":"captured_at"},{"field":"logical_kind","derived":"logical_kind"},{"field":"kind","derived":"physical_kind"},{"field":"fingerprint","derived":"fingerprint"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
+const reordered_derivation_definition =
+    @embedFile("fixtures/derived-layout-definition.json");
+
+const reordered_canonical_request =
+    \\{"record":{"subject":{"a":1,"b":2,"c":3}}}
+;
+const reordered_stored_request =
+    \\{"record":{"subject":{"c":3,"b":2,"a":1}}}
+;
+const reordered_unrecoverable_request =
+    \\{"record":{"subject":{"b":2,"a":1,"c":3}}}
+;
+
 const request_literal_input =
     "{\"schema\":\"example-request/v1\",\"kind\":\"created\"," ++
     "\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"," ++
@@ -6049,6 +6172,134 @@ fn verifyPlainDerivationTampering(
             parsed_tampered.value,
         ),
     );
+}
+
+test "plain input JSON derivations replay canonical and stored source layouts" {
+    var plans = try ProtocolTestPlans.init(reordered_derivation_definition);
+    defer plans.deinit();
+    var cached = try plans.cacheStorage();
+    defer cached.deinit(std.testing.allocator);
+    const materialization = &cached.operations[0].effects[0].event.?;
+    try expectReorderedDerivationRoundTrip(
+        materialization,
+        reordered_canonical_request,
+        "e6a3385fb77c287a712e7f406a451727f0625041823ecf23bea7ef39b2e39805",
+    );
+    try expectReorderedDerivationRoundTrip(
+        materialization,
+        reordered_stored_request,
+        "be7c58d90d4201f9846409a94b9719901afb37c7a06c93b6735c0b283cee4243",
+    );
+}
+
+fn expectReorderedDerivationRoundTrip(
+    materialization: *const storage.EventMaterialization,
+    request: []const u8,
+    fingerprint: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        request,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    var generated = try materializePlainEvent(
+        allocator,
+        null,
+        materialization,
+        parsed.value,
+        null,
+        0,
+        std.testing.io,
+    );
+    defer generated.deinit(allocator);
+    try std.testing.expectEqualStrings(fingerprint, generated.generated_outputs[0].value);
+    var event = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        generated.content,
+        .{ .allocate = .alloc_always },
+    );
+    defer event.deinit();
+    const recovered = try reconstructPlainInputAlloc(
+        allocator,
+        null,
+        materialization,
+        event.value,
+    );
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(request, recovered);
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        generated.content,
+        fingerprint,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    defer allocator.free(tampered);
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        tampered,
+        .{ .allocate = .alloc_always },
+    );
+    defer invalid.deinit();
+    try std.testing.expectError(error.EventDerivedValueMismatch, reconstructPlainInputAlloc(
+        allocator,
+        null,
+        materialization,
+        invalid.value,
+    ));
+}
+
+test "plain materialization rejects source order lost by storage before admission" {
+    var plans = try ProtocolTestPlans.init(reordered_derivation_definition);
+    defer plans.deinit();
+    var cached = try plans.cacheStorage();
+    defer cached.deinit(std.testing.allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        reordered_unrecoverable_request,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(error.EventDerivedValueMismatch, materializePlainEvent(
+        std.testing.allocator,
+        null,
+        &cached.operations[0].effects[0].event.?,
+        parsed.value,
+        null,
+        0,
+        std.testing.io,
+    ));
+}
+
+test "derived replay does not erase source order preserved by the event layout" {
+    var plans = try ProtocolTestPlans.init(reordered_derivation_definition);
+    defer plans.deinit();
+    var cached = try plans.cacheStorage();
+    defer cached.deinit(std.testing.allocator);
+    var materialization = cached.operations[0].effects[0].event.?;
+    materialization.object_orders = &.{};
+    const incompatible_event =
+        \\{"event":"capture","record":{"subject":{"c":3,"b":2,"a":1},"fingerprint":"e6a3385fb77c287a712e7f406a451727f0625041823ecf23bea7ef39b2e39805"}}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        incompatible_event,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(error.EventDerivedValueMismatch, reconstructPlainInputAlloc(
+        std.testing.allocator,
+        null,
+        &materialization,
+        parsed.value,
+    ));
 }
 
 test "compact UTC timestamp rejects impossible calendar values" {

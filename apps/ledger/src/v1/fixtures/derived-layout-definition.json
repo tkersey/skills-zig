@@ -1,0 +1,137 @@
+{
+  "schema": "ledger-artifact-definition/v1",
+  "id": "example/reordered-derivation",
+  "owner": "example",
+  "requires": {
+    "abi": "ledger-artifact-abi/v1",
+    "operators": [
+      "compare-and-append",
+      "event-materialization",
+      "exact-object",
+      "sha256",
+      "export"
+    ]
+  },
+  "parameters": {},
+  "inputs": {
+    "submission": {
+      "codec": "json",
+      "max_bytes": 4096
+    }
+  },
+  "canonicalization": {},
+  "shape": {
+    "documents": {
+      "submission": {
+        "object": "exact",
+        "fields": {
+          "record": {
+            "object": "exact",
+            "fields": {
+              "subject": {
+                "object": "exact",
+                "fields": {
+                  "a": {},
+                  "b": {},
+                  "c": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "laws": []
+  },
+  "identity": {},
+  "storage": {
+    "kind": "event-log",
+    "slots": {
+      "events": {
+        "path": "example/reordered.jsonl",
+        "kind": "event-log",
+        "codec": "jsonl",
+        "max_bytes": 65536
+      }
+    }
+  },
+  "operations": {
+    "capture": {
+      "effects": [
+        {
+          "op": "compare-and-append",
+          "slot": "events",
+          "input": "submission",
+          "event": {
+            "mode": "plain",
+            "body_input_field": "record",
+            "field_order": [
+              "event",
+              "record"
+            ],
+            "body_order": [
+              "subject",
+              "fingerprint"
+            ],
+            "object_orders": [
+              {
+                "path": "/subject",
+                "fields": [
+                  "c",
+                  "b",
+                  "a"
+                ]
+              }
+            ],
+            "fields": [
+              {
+                "field": "event",
+                "literal": "capture"
+              }
+            ],
+            "derive": [
+              {
+                "name": "fingerprint",
+                "op": "sha256",
+                "encoding": "hex",
+                "fragments": [
+                  {
+                    "input_json": "/record/subject"
+                  }
+                ],
+                "max_bytes": 4096
+              }
+            ],
+            "body_fields": [
+              {
+                "field": "fingerprint",
+                "derived": "fingerprint"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "projections": {
+    "records": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "export",
+          "path": "/record"
+        }
+      ]
+    }
+  },
+  "bounds": {
+    "max_input_bytes": 4096,
+    "max_store_bytes": 65536,
+    "max_records": 4,
+    "max_output_bytes": 4096,
+    "max_diagnostics": 8,
+    "max_reducer_states": 1
+  }
+}
