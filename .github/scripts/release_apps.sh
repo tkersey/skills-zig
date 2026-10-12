@@ -93,7 +93,7 @@ case "$mode" in
       local raw=$1
       local app token dependency_import=0
       local matched=1
-      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},$' <<<"$raw"; then
+      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)* \},$' <<<"$raw"; then
         dependency_import=1
       fi
       if [[ "$dependency_import" -eq 0 ]] &&
@@ -169,7 +169,7 @@ case "$mode" in
          grep -Eq '^[[:space:]]*[{}(),.;&]+[[:space:]]*$' <<<"$raw"; then
         return 0
       fi
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)* \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
