@@ -13893,7 +13893,9 @@ test "configured parent start sends caller options over RPC and redacts its even
         client.deinit();
     }
     const options = try review_options.ThreadStartOptions.init(allocator,
-        \\{"sandbox":"read-only","config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel"}},"serviceTier":null}
+        \\{"sandbox":"read-only","serviceTier":null,
+        \\"config":{"shell_environment_policy.set":{"ZIG_GLOBAL_CACHE_DIR":"private-cache-sentinel"},
+        \\"numbers":[9007199254740992.1,1e-400,1e400,9223372036854775808]}}
     );
     defer options.deinit();
     const thread_id = try startParentThreadAlloc(
@@ -13908,7 +13910,9 @@ test "configured parent start sends caller options over RPC and redacts its even
     try std.testing.expectEqualStrings("fixture-thread", thread_id);
     const request = try tmp.dir.readFileAlloc(io, "request.json", allocator, .limited(16 * 1024));
     defer allocator.free(request);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{
+        .parse_numbers = false,
+    });
     defer parsed.deinit();
     const params = parsed.value.object.get("params").?.object;
     try std.testing.expectEqualStrings("read-only", params.get("sandbox").?.string);
@@ -13922,6 +13926,14 @@ test "configured parent start sends caller options over RPC and redacts its even
         "private-cache-sentinel",
         environment.get("ZIG_GLOBAL_CACHE_DIR").?.string,
     );
+    const numbers = params.get("config").?.object.get("numbers").?.array.items;
+    const expected_numbers = [_][]const u8{
+        "9007199254740992.1", "1e-400", "1e+400", "9223372036854775808",
+    };
+    try std.testing.expectEqual(expected_numbers.len, numbers.len);
+    for (expected_numbers, numbers) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual.number_string);
+    }
     const log_path = try parentEventLogPathAlloc(allocator, root, thread_id);
     defer allocator.free(log_path);
     const log = try durable_store.readRegularFileNoSymlink(allocator, log_path, 16 * 1024);

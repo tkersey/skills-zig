@@ -1036,40 +1036,17 @@ pub const Client = struct {
         params_json: ?[]const u8,
         send_observer: ?RequestSendObserver,
     ) !void {
-        if (params_json) |raw| {
-            if (raw.len > websocket_transport.max_message_bytes) {
-                return error.AppServerMessageTooLarge;
-            }
-            var parsed_params = try std.json.parseFromSlice(
-                std.json.Value,
-                self.allocator,
-                raw,
-                .{},
-            );
-            defer parsed_params.deinit();
-
-            const ReqWithParams = struct {
-                method: []const u8,
-                id: i64,
-                params: std.json.Value,
-            };
-            const req = ReqWithParams{
-                .method = method,
-                .id = request_id,
-                .params = parsed_params.value,
-            };
-            try self.sendToServer(req, send_observer);
-        } else {
-            const ReqNoParams = struct {
-                method: []const u8,
-                id: i64,
-            };
-            const req = ReqNoParams{
-                .method = method,
-                .id = request_id,
-            };
-            try self.sendToServer(req, send_observer);
-        }
+        const payload = requestPayloadAlloc(
+            self.allocator,
+            request_id,
+            method,
+            params_json,
+        ) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        defer self.allocator.free(payload);
+        try self.sendPayload(payload, send_observer, null, true);
     }
 
     fn sendToServer(
@@ -1915,7 +1892,7 @@ pub const Actor = struct {
             state.mutex.unlock();
         }
 
-        const payload = try actorRequestPayloadAlloc(
+        const payload = try requestPayloadAlloc(
             state.allocator,
             request_id,
             method,
@@ -2670,7 +2647,7 @@ test "server handler result limit includes the JSON-RPC frame" {
     );
 }
 
-test "actor request limit includes the JSON-RPC frame" {
+test "request limit includes the JSON-RPC frame" {
     const allocator = std.testing.allocator;
     const raw = try allocator.alloc(u8, websocket_transport.max_message_bytes - 1);
     defer allocator.free(raw);
@@ -2679,11 +2656,12 @@ test "actor request limit includes the JSON-RPC frame" {
     raw[raw.len - 1] = '"';
     try std.testing.expectError(
         error.AppServerMessageTooLarge,
-        actorRequestPayloadAlloc(allocator, 1, "turn/start", raw),
+        requestPayloadAlloc(allocator, 1, "turn/start", raw),
     );
 }
 
-fn actorRequestPayloadAlloc(
+/// Both request owners frame caller JSON without interpreting its numeric values.
+fn requestPayloadAlloc(
     allocator: std.mem.Allocator,
     id: i64,
     method: []const u8,
@@ -2697,7 +2675,9 @@ fn actorRequestPayloadAlloc(
     try std.json.Stringify.value(id, .{}, &output.writer);
     if (params_json) |raw| {
         if (raw.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+            .parse_numbers = false,
+        });
         defer parsed.deinit();
         try output.writer.writeAll(",\"params\":");
         try std.json.Stringify.value(parsed.value, .{}, &output.writer);
@@ -2706,7 +2686,31 @@ fn actorRequestPayloadAlloc(
     if (output.written().len > websocket_transport.max_message_bytes) {
         return error.AppServerMessageTooLarge;
     }
-    return allocator.dupe(u8, output.written());
+    return output.toOwnedSlice();
+}
+
+test "request framing preserves omission null and exact nested JSON values" {
+    const allocator = std.testing.allocator;
+    const absent = try requestPayloadAlloc(allocator, 1, "thread/start", null);
+    defer allocator.free(absent);
+    try std.testing.expectEqualStrings("{\"method\":\"thread/start\",\"id\":1}", absent);
+    const explicit_null = try requestPayloadAlloc(allocator, 2, "thread/start", "null");
+    defer allocator.free(explicit_null);
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"thread/start\",\"id\":2,\"params\":null}",
+        explicit_null,
+    );
+    const nested = try requestPayloadAlloc(allocator, 3, "quoted\"method",
+        \\{"values":[9007199254740992.1,1e-400,1e400,9223372036854775808,false,null,[],{},"9007199254740992.1"]}
+    );
+    defer allocator.free(nested);
+    try std.testing.expectEqualStrings(
+        \\{"method":"quoted\"method","id":3,"params":{"values":[9007199254740992.1,1e-400,1e400,9223372036854775808,false,null,[],{},"9007199254740992.1"]}}
+    , nested);
+    try std.testing.expectError(
+        error.SyntaxError,
+        requestPayloadAlloc(allocator, 4, "thread/start", "{} trailing"),
+    );
 }
 
 fn actorEnqueueOwned(
