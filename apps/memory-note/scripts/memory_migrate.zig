@@ -149,7 +149,7 @@ fn insertEntry(
 }
 
 const fixture =
-    \\{"schema":"memory-source-note/v1","id":"MSN-one","extension":"learnings","captured_at":"2026-10-11T12:00:00Z","kind":"learning-admission","operation":"assert","authority":"source-admission","summary":"fixture","scope":{"kind":"global","repo":null,"paths":[]},"source_refs":[{"kind":"test","ref":"fixture","summary":"fixture"}],"fingerprint":"same-transport-fingerprint","related_ids":[],"supersedes_id":null,"payload":{"evidence":"retained"}}
+    \\{"schema":"memory-source-note/v1","id":"MSN-20261011T120000Z-0123456789abcdef","extension":"learnings","captured_at":"2026-10-11T12:00:00Z","kind":"learning-admission","operation":"assert","authority":"source-admission","summary":"fixture","scope":{"kind":"global","repo":null,"paths":[]},"source_refs":[{"kind":"test","ref":"fixture","summary":"fixture"}],"fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","related_ids":[],"supersedes_id":null,"payload":{"evidence":"retained"}}
 ;
 
 test "migration rejects incomplete stored envelopes before publishing any note" {
@@ -215,6 +215,50 @@ test "migration preserves exact bytes and filenames and retry skips the same ide
     const retry = try copy(allocator, io, source, destination, "learnings", false);
     try std.testing.expectEqual(@as(u32, 0), retry.copied);
     try std.testing.expectEqual(@as(u32, 1), retry.duplicate_skip);
+}
+
+test "migration rejects malformed generated metadata before publishing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "old");
+    try tmp.dir.writeFile(io, .{ .sub_path = "old/valid.md", .data = fixture });
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    const source = try std.fs.path.join(allocator, &.{ home, "old" });
+    defer allocator.free(source);
+    const destination = try std.fs.path.join(allocator, &.{ home, "new" });
+    defer allocator.free(destination);
+    const invalid = [_][2][]const u8{
+        .{ "id", "MSN-x" },
+        .{ "id", "MSN-20260230T120000Z-0123456789abcdef" },
+        .{ "id", "MSN-20261011T120000Z-0123456789abcdeF" },
+        .{ "captured_at", "not-a-date" },
+        .{ "captured_at", "2026-02-29T12:00:00Z" },
+        .{ "captured_at", "2026-10-11T24:00:00Z" },
+        .{ "fingerprint", "not-a-fingerprint" },
+        .{ "fingerprint", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF" },
+    };
+    for (invalid) |pair| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture, .{});
+        defer parsed.deinit();
+        parsed.value.object.getPtr(pair[0]).?.* = .{ .string = pair[1] };
+        const malformed = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+        defer allocator.free(malformed);
+        try tmp.dir.writeFile(io, .{ .sub_path = "old/invalid.md", .data = malformed });
+        for ([_]bool{ true, false }) |dry_run| {
+            try std.testing.expectError(error.InvalidStoredNote, copy(
+                allocator,
+                io,
+                source,
+                destination,
+                "learnings",
+                dry_run,
+            ));
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "new", .{}));
+        }
+    }
 }
 
 test "distinct stored identities remain distinct even with equal transport fingerprints" {

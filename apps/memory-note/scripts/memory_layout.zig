@@ -46,7 +46,7 @@ pub fn selectedVersion(
         error.FileNotFound => return error.CodexConfigUnavailable,
         else => return err,
     };
-    defer child.kill(io);
+    defer retireConfigChild(io, &child);
     var buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
     var reader: std.Io.File.MultiReader = undefined;
     reader.init(allocator, io, buffer.toStreams(), &.{child.stdout.?});
@@ -69,6 +69,21 @@ pub fn selectedVersion(
     var response = try readResponse(allocator, &reader, 2, deadline, &total_bytes);
     defer response.deinit();
     return versionFromResponse(response.value);
+}
+
+fn retireConfigChild(io: std.Io, child: *std.process.Child) void {
+    // Child.kill sends SIGTERM and waits on POSIX. A config subprocess that
+    // ignores SIGTERM must not turn the request deadline into an endless wait.
+    switch (@import("builtin").os.tag) {
+        .windows, .wasi => {},
+        else => if (child.id) |pid| {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch |err| switch (err) {
+                error.ProcessNotFound => {},
+                else => std.log.warn("could not kill Codex config child: {s}", .{@errorName(err)}),
+            };
+        },
+    }
+    child.kill(io);
 }
 
 const initialize_request =

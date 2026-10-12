@@ -34,10 +34,10 @@ def interrupted_migration(binary, home):
     count = 1024
     for index in range(count):
         envelope = {
-            "schema": "memory-source-note/v1", "id": f"MSN-recovery-{index:04d}",
+            "schema": "memory-source-note/v1", "id": f"MSN-20261011T000000Z-{index:016x}",
             "captured_at": "2026-10-11T00:00:00Z", "extension": "harness",
             "kind": "harness-rule", "operation": "assert", "summary": "fixture",
-            "fingerprint": str(index), "authority": "test-fixture",
+            "fingerprint": f"{index:064x}", "authority": "test-fixture",
             "scope": {"kind": "global", "repo": None, "paths": []},
             "source_refs": [{"kind": "test", "ref": "recovery", "summary": "fixture"}],
             "related_ids": [],
@@ -133,6 +133,63 @@ def duplicate_append_rejects_symlink(binary, root):
     assert not (alias / ".memory-note").exists()
 
 
+def config_cleanup_is_bounded(binary, root):
+    root.mkdir()
+    child = root / "codex"
+    pid_file = root / "pid"
+    child.write_text(f"#!{sys.executable}\n" + '''
+import json, os, signal, sys
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(os.environ["CONFIG_CHILD_PID"]).write_text(str(os.getpid()))
+mode = os.environ["CONFIG_CHILD_MODE"]
+if mode != "timeout":
+    sys.stdin.readline()
+    print('{"id":1,"result":{}}', flush=True)
+    sys.stdin.readline()
+    sys.stdin.readline()
+    response = {"id":2,"result":{"config":{"memories":{"version":"v2"}}}}
+    if mode == "reject":
+        response = {"id":2,"error":{"message":"rejected"}}
+    print(json.dumps(response), flush=True)
+while True:
+    signal.pause()
+''')
+    child.chmod(0o700)
+    home = root / "home"
+    for mode in ("success", "reject", "timeout"):
+        env = dict(os.environ, CODEX_BIN=str(child), CONFIG_CHILD_PID=str(pid_file),
+                   CONFIG_CHILD_MODE=mode)
+        try:
+            started = time.monotonic()
+            result = subprocess.run(
+                [str(binary), "path", "--codex-home", str(home), "--extension", "harness"],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+            elapsed = time.monotonic() - started
+            assert elapsed < (15 if mode == "timeout" else 5), (mode, elapsed)
+            if mode == "success":
+                assert result.returncode == 0 and "memories_v2" in result.stdout, result
+            else:
+                expected = "CodexConfigTimeout" if mode == "timeout" else "CodexConfigRejected"
+                assert result.returncode != 0 and expected in result.stderr, result
+            pid = int(pid_file.read_text())
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError(("config child was not reaped", mode, pid))
+            assert not home.exists()
+        finally:
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                pid_file.unlink()
+
+
 def main():
     binary = Path(sys.argv[1]).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="memory-note-recovery-") as raw:
@@ -141,6 +198,7 @@ def main():
         legacy_lock_is_not_stolen(binary, root / "legacy")
         empty_migration_reports_control_creation(binary, root / "empty")
         duplicate_append_rejects_symlink(binary, root / "duplicate")
+        config_cleanup_is_bounded(binary, root / "config")
     print("memory-note interrupted publication, kernel lock recovery, and path safety: pass")
 
 

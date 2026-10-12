@@ -97,6 +97,27 @@ fn compilePlainPlans() !PlainPlans {
     return compilePlainPlansFrom(@embedFile("fixtures/plain-event-definition.json"));
 }
 
+fn compileSegmentedPlainPlansFrom(bytes: []const u8) !PlainPlans {
+    const allocator = std.testing.allocator;
+    const segmented = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        bytes,
+        "\"codec\":\"jsonl\",\"max_bytes\":65536",
+        "\"codec\":\"jsonl\",\"layout\":\"segmented\",\"max_bytes\":67108864",
+    );
+    defer allocator.free(segmented);
+    const bounded = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        segmented,
+        "\"max_store_bytes\":65536",
+        "\"max_store_bytes\":67108864",
+    );
+    defer allocator.free(bounded);
+    return compilePlainPlansFrom(bounded);
+}
+
 fn compilePlainPlansFrom(bytes: []const u8) !PlainPlans {
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
@@ -328,28 +349,65 @@ test "segmented sorted fold preserves source order through checkpoint and append
     try appendPlainCreatedEvent(&plans, repo_root);
     try expectOrderedPlainId(&plans, repo_root, "first", "z");
     try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
-    plans.store.slots[0].layout = .segmented;
-    plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    var segmented = try compileSegmentedPlainPlansFrom(
+        @embedFile("fixtures/plain-event-definition.json"),
+    );
+    defer segmented.deinit();
     var migrated = try migration.execute(
         std.testing.allocator,
-        &plans.artifact,
-        &plans.closure,
+        &segmented.artifact,
+        &segmented.closure,
         "plain.json",
-        &plans.store,
-        &plans.protocol,
+        &segmented.store,
+        &segmented.protocol,
         repo_root,
-        &plans.parameters,
+        &segmented.parameters,
     );
     defer migrated.deinit(std.testing.allocator);
-    try expectOrderedPlainId(&plans, repo_root, "first", "z");
-    try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
-    try appendPlainEvent(&plans, repo_root);
-    try appendPlainCreatedEventFor(&plans, repo_root, "a");
-    try expectOrderedPlainId(&plans, repo_root, "first", "z");
-    try expectOrderedPlainId(&plans, repo_root, "last", "a");
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "item-1");
+    try appendPlainEvent(&segmented, repo_root);
+    try appendPlainCreatedEventFor(&segmented, repo_root, "a");
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
 }
 
-test "ordered fold follows archived identity and event kind selectors through migration" {
+test "ordered fold follows archived selectors on admitted plain and segmented plans" {
+    try expectArchivedSelectors(false);
+    try expectArchivedSelectors(true);
+}
+
+fn archivedSelectorDefinition(with_history: bool) ![]u8 {
+    const allocator = std.testing.allocator;
+    var bytes = try allocator.dupe(u8, @embedFile("fixtures/plain-event-definition.json"));
+    errdefer allocator.free(bytes);
+    const replacements = [_][2][]const u8{
+        .{ "/value/id", "/value/next_id" },
+        .{ "\"id\":{}", "\"next_id\":{}" },
+        .{ "/kind", "/event" },
+        .{ "\"kind\":{}", "\"event\":{}" },
+    };
+    for (replacements) |pair| {
+        const next = try std.mem.replaceOwned(u8, allocator, bytes, pair[0], pair[1]);
+        allocator.free(bytes);
+        bytes = next;
+    }
+    if (with_history) {
+        const next = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            bytes,
+            "\"key_field\":\"id\",\"state_field\":\"status\"",
+            "\"key_field\":\"id\",\"state_field\":\"status\"," ++
+                "\"event_kind_counts\":[{\"kind\":\"created\",\"field\":\"created_count\"}]",
+        );
+        allocator.free(bytes);
+        bytes = next;
+    }
+    return bytes;
+}
+
+fn expectArchivedSelectors(with_history: bool) !void {
     const allocator = std.testing.allocator;
     var old = try compilePlainPlans();
     defer old.deinit();
@@ -359,24 +417,8 @@ test "ordered fold follows archived identity and event kind selectors through mi
     defer allocator.free(repo_root);
     try appendPlainCreatedEventFor(&old, repo_root, "z");
 
-    var bytes = try allocator.dupe(u8, @embedFile("fixtures/plain-event-definition.json"));
+    const bytes = try archivedSelectorDefinition(with_history);
     defer allocator.free(bytes);
-    const replacements = [_][2][]const u8{
-        .{ "/value/id", "/value/next_id" },
-        .{ "\"id\":{}", "\"next_id\":{}" },
-        .{ "/kind", "/event" },
-        .{ "\"kind\":{}", "\"event\":{}" },
-        .{
-            "\"key_field\":\"id\",\"state_field\":\"status\"",
-            "\"key_field\":\"id\",\"state_field\":\"status\"," ++
-                "\"event_kind_counts\":[{\"kind\":\"created\",\"field\":\"created_count\"}]",
-        },
-    };
-    for (replacements) |pair| {
-        const next = try std.mem.replaceOwned(u8, allocator, bytes, pair[0], pair[1]);
-        allocator.free(bytes);
-        bytes = next;
-    }
     var current = try compilePlainPlansFrom(bytes);
     defer current.deinit();
     try appendPlainRawEvent(&current, repo_root,
@@ -384,25 +426,62 @@ test "ordered fold follows archived identity and event kind selectors through mi
     );
     try expectOrderedPlainId(&current, repo_root, "first", "z");
     try expectOrderedPlainId(&current, repo_root, "last", "a");
-    current.store.slots[0].layout = .segmented;
-    current.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
+    if (with_history) {
+        try expectPlainCreatedCount(&current, repo_root, "z");
+        try expectPlainCreatedCount(&current, repo_root, "a");
+        try std.testing.expectError(
+            error.SegmentedProjectionHistoryRequiresFullReplay,
+            compileSegmentedPlainPlansFrom(bytes),
+        );
+        return;
+    }
+    var segmented = try compileSegmentedPlainPlansFrom(bytes);
+    defer segmented.deinit();
     var migrated = try migration.execute(
         allocator,
-        &current.artifact,
-        &current.closure,
+        &segmented.artifact,
+        &segmented.closure,
         "plain.json",
-        &current.store,
-        &current.protocol,
+        &segmented.store,
+        &segmented.protocol,
         repo_root,
-        &current.parameters,
+        &segmented.parameters,
     );
     defer migrated.deinit(allocator);
-    try expectOrderedPlainId(&current, repo_root, "first", "z");
-    try appendPlainRawEvent(&current, repo_root,
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try appendPlainRawEvent(&segmented, repo_root,
         \\{"event":"updated","value":{"next_id":"a","revision":1}}
     );
-    try expectOrderedPlainId(&current, repo_root, "first", "z");
-    try expectOrderedPlainId(&current, repo_root, "last", "a");
+    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
+}
+
+fn expectPlainCreatedCount(plans: *const PlainPlans, repo_root: []const u8, id: []const u8) !void {
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        result.payload,
+        .{},
+    );
+    defer parsed.deinit();
+    for (parsed.value.array.items) |row| {
+        if (std.mem.eql(u8, row.object.get("id").?.string, id)) {
+            try std.testing.expectEqual(@as(i64, 1), row.object.get("created_count").?.integer);
+            return;
+        }
+    }
+    return error.ExpectedIdentityMissing;
 }
 
 fn expectOrderedPlainId(

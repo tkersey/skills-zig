@@ -6587,12 +6587,19 @@ fn writeSortedKeyedFold(
             history,
             parameters,
         );
+        var reference_field: [1]KeyedHistoryField = undefined;
+        const rendered_fields = if (filter_matches) fields else filteredFoldReferenceFields(
+            &sorted,
+            fields,
+            view,
+            &reference_field,
+        );
         var row: std.Io.Writer.Allocating = .init(allocator);
         defer row.deinit();
         try writeKeyedHistoryRow(
             allocator,
             &row.writer,
-            fields,
+            rendered_fields,
             view,
             history,
             if (keyed.retained_unwrap_path) |*pointer| pointer else null,
@@ -6614,6 +6621,25 @@ fn writeSortedKeyedFold(
     try sorted.reserveOutput(output, limit, max_output_bytes);
     try sorted.write(&output.writer, limit, stats);
     if (output.written().len > max_output_bytes) return error.ProjectionOutputBoundsExceeded;
+}
+
+// Excluded rows only contribute global reference exclusions. Their full output
+// may require retained values they need not have; render just the reference field.
+fn filteredFoldReferenceFields(
+    sorted: *const SortedAccumulator,
+    fields: []const KeyedHistoryField,
+    view: reducer.EntryView,
+    field_storage: *[1]KeyedHistoryField,
+) []const KeyedHistoryField {
+    const relevance = sorted.projection.relevance orelse return fields[0..0];
+    const ranked = relevance.ranked_plan orelse return fields[0..0];
+    if (!sorted.prepared_relevance.?.ranked.exclude_referenced) return fields[0..0];
+    const pointer = ranked.exclude_referenced.?.reference_path;
+    if (pointer.segments.len == 0) return fields[0..0];
+    const field = findKeyedHistoryField(fields, pointer.segments[0]) orelse return fields[0..0];
+    if (field.source == .retained and view.retained == null) return fields[0..0];
+    field_storage[0] = field;
+    return field_storage;
 }
 
 fn writeFilteredKeyedFold(
@@ -8657,6 +8683,99 @@ test "sorted keyed fold filters retained data before output unwrapping" {
     try std.testing.expectEqualStrings(
         "[{\"score\":1,\"id\":\"z\",\"status\":\"active\",\"record\":{\"text\":\"shared\"}}]",
         result,
+    );
+}
+
+fn filteredRankedFoldDefinition() ![]u8 {
+    const allocator = std.testing.allocator;
+    var bytes = try allocator.dupe(u8, ordered_fold_definition);
+    errdefer allocator.free(bytes);
+    const replacements = [_][2][]const u8{
+        .{ "\"fold\",\"limit\"", "\"filter\",\"fold\",\"limit\"" },
+        .{ "\"parameters\":{", "\"parameters\":{\"drop\":{\"type\":\"boolean\"," ++
+            "\"default\":true}," },
+        .{ "{\"op\":\"relevance\"", "{\"op\":\"filter\",\"path\":\"/id\",\"equals\":\"a\"}," ++
+            "{\"op\":\"relevance\"" },
+        .{ "\"mode\":\"tokens\"", "\"mode\":\"ranked-tokens\",\"ranking\":{" ++
+            "\"tokenizer\":{\"minimum_length\":2,\"stopwords\":[],\"suffixes\":[]}," ++
+            "\"weights\":{\"jaccard\":1,\"token_group\":0,\"path_match\":0," ++
+            "\"recency\":0,\"presence\":0}," ++
+            "\"exclude_referenced\":{\"enabled_param\":\"drop\",\"id_path\":\"/id\"," ++
+            "\"reference_path\":\"/record/ref\"}}" },
+    };
+    for (replacements) |pair| {
+        const next = try std.mem.replaceOwned(u8, allocator, bytes, pair[0], pair[1]);
+        allocator.free(bytes);
+        bytes = next;
+    }
+    return bytes;
+}
+
+test "sorted fold skips excluded missing retention but keeps global references" {
+    const allocator = std.testing.allocator;
+    const bytes = try filteredRankedFoldDefinition();
+    defer allocator.free(bytes);
+    var plans = try ProjectionTestPlans.init(bytes);
+    defer plans.deinit();
+    // This archived producer predates retained state; current rows may lack it.
+    const old_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        ordered_fold_definition,
+        ",\"retain_latest\":\"/record\"",
+        "",
+    );
+    defer allocator.free(old_bytes);
+    const old_projection = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        old_bytes,
+        ",\"retained_field\":\"record\",\"retained_unwrap_path\":\"/payload\"",
+        "",
+    );
+    defer allocator.free(old_projection);
+    var old = try ProjectionTestPlans.init(old_projection);
+    defer old.deinit();
+    const protocol_plan = &plans.protocol_plan.?;
+    var state = protocol.ReplayState.init(protocol_plan);
+    defer state.deinit(allocator);
+    const selected = plans.cached.find("current-search").?;
+    var history = (try initFoldHistory(allocator, selected, protocol_plan)).?;
+    defer history.deinit();
+    const events = [_][]const u8{
+        \\{"kind":"capture","id":"z","status":"active"}
+        ,
+        \\{"kind":"capture","id":"a","status":"active","record":{"payload":{"text":"shared"}}}
+        ,
+        \\{"kind":"capture","id":"b","status":"active","record":{"payload":{"text":"shared","ref":"a"}}}
+        ,
+    };
+    for (events, 0..) |raw, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const historical = if (index == 0) &old.protocol_plan.? else protocol_plan;
+        try protocol.applyValue(allocator, historical, &state, parsed.value);
+        try history.observeReplay(parsed.value, raw, &state, historical);
+        if (index == 1) {
+            const result = try orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096);
+            defer allocator.free(result);
+            var output = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, 1), output.value.array.items.len);
+            try std.testing.expectEqualStrings(
+                "a",
+                output.value.array.items[0].object.get("id").?.string,
+            );
+        }
+    }
+    const excluded = try orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096);
+    defer allocator.free(excluded);
+    try std.testing.expectEqualStrings("[]", excluded);
+    // The missing retained value remains an error when its row is selected.
+    selected.predicates[0].one.operand.constant.string[0] = 'z';
+    try std.testing.expectError(
+        error.ReducerRetainedValueMissing,
+        orderedFoldOutput(&plans, &state, &history, "shared", 1, 4096),
     );
 }
 
