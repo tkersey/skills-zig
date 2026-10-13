@@ -3264,7 +3264,7 @@ fn buildIsolatedSource(
     );
 }
 
-fn absoluteMachineDir(allocator: std.mem.Allocator) ![]u8 {
+fn absoluteMachineDir(allocator: std.mem.Allocator) ![:0]u8 {
     const relative = try ensureCurrentMachineDir(allocator);
     defer allocator.free(relative);
     return std.Io.Dir.cwd().realPathFileAlloc(
@@ -6584,6 +6584,9 @@ test "capsule files are digest-addressed beneath the current machine root" {
 
     const machine_dir = try ensureCurrentMachineDir(allocator);
     defer allocator.free(machine_dir);
+    const absolute_machine_dir = try absoluteMachineDir(allocator);
+    defer allocator.free(absolute_machine_dir);
+    try std.testing.expect(std.fs.path.isAbsolute(absolute_machine_dir));
     var sealed = try sealEvidenceBytes(
         allocator,
         machine_dir,
