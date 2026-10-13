@@ -11,12 +11,12 @@ const SurfaceRule = struct {
 
 const surface_rules = [_]SurfaceRule{
     .{
-        .token = "libs/definition_core/**",
+        .token = "\"libs/**\"",
         .pr_ci_occurrences = 1,
         .auto_release_occurrences = 1,
     },
     .{
-        .token = "libs/trace_core/**",
+        .token = "\"build/**\"",
         .pr_ci_occurrences = 1,
         .auto_release_occurrences = 1,
     },
@@ -156,11 +156,11 @@ fn checkOccurrenceCount(
 
 test "surface rules preserve PR and release mappings" {
     const pr_ci =
-        "libs/definition_core/**\n" ++
-        "libs/trace_core/**\n";
+        "\"libs/**\"\n" ++
+        "\"build/**\"\n";
     const auto_release =
-        "libs/definition_core/**\n" ++
-        "libs/trace_core/**\n";
+        "\"libs/**\"\n" ++
+        "\"build/**\"\n";
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
 
@@ -177,10 +177,10 @@ test "surface rules preserve PR and release mappings" {
 
 test "surface rules reject an unpaired mapping" {
     const pr_ci =
-        "libs/trace_core/**\n";
+        "\"build/**\"\n";
     const auto_release =
-        "libs/definition_core/**\n" ++
-        "libs/trace_core/**\n";
+        "\"libs/**\"\n" ++
+        "\"build/**\"\n";
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
 

@@ -117,9 +117,10 @@ Per-app VERSION files are the source of truth:
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that
 app. Ledger stays independently classified because CAS neither bundles nor
-executes it. `build.zig` and `build.zig.zon` changes are classified by their
-affected app or shared-library context and fail closed to every shipped CLI
-when ownership is ambiguous; broad shared shipped surfaces such as
+executes it. `build/apps/<cli>.zig` owns each app's root-build assembly and counts for
+that app. Root `build.zig`, `build.zig.zon`, shared build support, and unknown
+`build/**` or `libs/**` paths count for every shipped CLI. Broad shared shipped
+surfaces such as
 `libs/core/**` count for every shipped CLI;
 `libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
 `cas`, and `ledger`;

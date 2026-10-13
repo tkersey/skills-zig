@@ -26,19 +26,6 @@ head=$(resolve_ref "$head_ref")
 case "$mode" in
   affected|ci-affected)
     declare -A affected=()
-    build_changed=0
-    package_changed=0
-    retired_apps=()
-
-    while IFS=$'\t' read -r status path; do
-      if [[ "$status" != D || "$path" != apps/*/VERSION ]]; then
-        continue
-      fi
-      retired_app=${path#apps/}
-      retired_app=${retired_app%/VERSION}
-      retired_apps+=("$retired_app")
-    done < <(git diff --name-status "$base" "$head" -- 'apps/*/VERSION')
-
     mark_app() {
       affected["$1"]=1
     }
@@ -76,114 +63,34 @@ case "$mode" in
       mark_app memory-note
     }
 
-    is_retired_build_line() {
-      local raw=$1
-      local app token constructor
-      for app in "${retired_apps[@]}"; do
-        token=${app//-/_}
-        constructor="build${token//_/}"
-        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}([_[:alnum:]]*|[^[:alnum:]_])|(^|[^[:alnum:]_])${constructor}([^[:alnum:]_]|$)" <<<"$raw"; then
-          return 0
-        fi
-      done
-      return 1
-    }
-
-    classify_build_line() {
-      local raw=$1
-      local app token dependency_import=0
-      local matched=1
-      if grep -Eq '^[[:space:]]*\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)* \},$' <<<"$raw"; then
-        dependency_import=1
-      fi
-      if [[ "$dependency_import" -eq 0 ]] &&
-         grep -Eqi 'cas_runtime|cas-runtime|cas_hook_policy|cas-hook-policy' <<<"$raw"; then
-        mark_cas_runtime_consumers
-        matched=0
-      fi
-      # Dependency imports inherit the owner of their surrounding build hunk.
-      # Do not let the imported module's name classify the consuming product.
-      if [[ "$dependency_import" -eq 1 ]]; then
-        return "$matched"
-      fi
-      if grep -Eq '(^|[^[:alnum:]_])buildTypeSafe\(' <<<"$raw"; then
-        mark_app typesafe
-        matched=0
-      fi
-      for app in "${apps[@]}"; do
-        token=${app//-/_}
-        if grep -Eqi "apps/$app/|(^|[^[:alnum:]_])${token}_[A-Za-z0-9_]+|build-$app|test-$app|run-$app" <<<"$raw"; then
-          if [[ "$app" == ledger ]]; then
-            mark_ledger
-          else
-            mark_app "$app"
-          fi
-          matched=0
-        fi
-      done
-      if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
-        mark_definition_consumers
-        matched=0
-      fi
-      if grep -Eqi 'trace_core|trace-core' <<<"$raw"; then
-        mark_trace_consumers
-        matched=0
-      fi
-      if grep -Eqi 'durable_store|durable-store|jsonl_core|jsonl-core' <<<"$raw"; then
-        mark_store_consumers
-        matched=0
-      fi
-      if grep -Eqi 'jsonl_[A-Za-z0-9_]*|jsonl-[A-Za-z0-9-]*' <<<"$raw"; then
-        mark_store_consumers
-        matched=0
-      fi
-      if grep -Eqi 'canonical_json|canonical-json' <<<"$raw"; then
-        mark_definition_consumers
-        matched=0
-      fi
-      if grep -Eqi 'perf_(hub|contract)|perf-(hub|contract)' <<<"$raw"; then
-        matched=0
-      fi
-      if grep -Eqi 'retrace|execution_policy|seq_bundle|seq_perf' <<<"$raw"; then
-        mark_app seq
-        matched=0
-      fi
-      if grep -Eqi '(^|[^[:alnum:]_])seq([^[:alnum:]_]|$)|seq[_\.]' <<<"$raw"; then
-        mark_app seq
-        matched=0
-      fi
-      if grep -Eqi '(^|[^[:alnum:]_])cas([^[:alnum:]_]|$)|cas[_\.]' <<<"$raw"; then
-        mark_app cas
-        matched=0
-      fi
-      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]|Ledger[A-Z]' <<<"$raw"; then
-        mark_ledger
-        matched=0
-      fi
-      return "$matched"
-    }
-
-    contextual_build_line() {
-      local raw=$1
-      if [[ -z "${raw//[[:space:]]/}" ]] ||
-         grep -Eq '^[[:space:]]*[{}(),.;&]+[[:space:]]*$' <<<"$raw"; then
-        return 0
-      fi
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|\\\\.*|b,|u8,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|return os_tag == \.macos;|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = (optimize|\.ReleaseSafe),|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.filters = &\.\{.*\},|\.\{ \.filters = &\.\{.*\} \},|\.\{ \.(link_libc|sqlite) = true \},|\.\{ \.link_libc = true, \.filters = &\.\{.*\} \},|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.\{ \.name = "[A-Za-z0-9_-]+", \.module = [A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)* \},|".*",)$' <<<"$raw"
-    }
-
-    while IFS= read -r path; do
+    # Disable rename collapsing so both the previous and current owners are
+    # visited. NUL delimiters preserve paths containing whitespace or newlines.
+    while IFS= read -r -d '' path; do
       case "$path" in
-        build.zig)
-          build_changed=1
+        build.zig|build.zig.zon)
+          mark_all
           ;;
-        build.zig.zon)
-          package_changed=1
+        build/apps/*.zig)
+          matched=0
+          for app in "${apps[@]}"; do
+            if [[ "$path" == "build/apps/$app.zig" ]]; then
+              mark_app "$app"
+              matched=1
+              break
+            fi
+          done
+          if [[ "$matched" -eq 0 ]]; then
+            mark_all
+          fi
+          ;;
+        build/*)
+          mark_all
           ;;
         apps/seq/build_support.zig|tools/install_guard.zig)
           mark_all
           ;;
         libs/core/src/perf_contract.zig)
+          # Preserve the former perf harness's move to tools as test-only work.
           if git cat-file -e "${head}:${path}" 2>/dev/null; then
             mark_all
           fi
@@ -205,6 +112,10 @@ case "$mode" in
           ;;
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
+          ;;
+        libs/*)
+          # New shared owners fail closed until their consumers are explicit.
+          mark_all
           ;;
         scripts/guards/definition-core-domain.sh)
           mark_definition_consumers
@@ -259,234 +170,7 @@ case "$mode" in
           fi
           ;;
       esac
-    done < <(git diff --name-only "$base" "$head")
-
-    if [[ "$build_changed" -eq 1 ]]; then
-      build_hunk=()
-      build_changed_lines=()
-      build_changed_positions=()
-      build_changed_old_positions=()
-
-      build_line_owner() {
-        local ref=$1
-        local line_number=$2
-        git show "${ref}:build.zig" | awk -v stop="$line_number" '
-          NR <= stop && (/^(pub )?(fn|const|var) / ||
-            /^comptime[[:space:]]*\{/ || /^test[[:space:]]/) { owner = $0 }
-          END { print owner }
-        '
-      }
-
-      classify_build_owner() {
-        case "$1" in
-          'fn buildLedger('*|'fn '*Ledger*|'const Ledger'*) mark_ledger ;;
-          'fn buildSeq('*) mark_app seq ;;
-          'fn buildLift('*) mark_app lift ;;
-          'fn buildCas('*) mark_app cas ;;
-          'fn buildMemoryNote('*) mark_app memory-note ;;
-          'fn buildTypeSafe('*) mark_app typesafe ;;
-          *) return 1 ;;
-        esac
-      }
-
-      flush_build_hunk() {
-        if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
-          return
-        fi
-        local change raw index
-        local changed_matched=0
-        local context_matched=0
-        local substantive_unknown=0
-        local retired_app_deletion=0
-        local has_addition=0
-        # Attribute a newly added constructor to TypeSafe, then keep classifying
-        # other changes in the same hunk under their own owners.
-        local in_new_typesafe=0
-        local added_typesafe=0
-        local remaining_changes=()
-        local remaining_positions=()
-        local remaining_old_positions=()
-        for index in "${!build_changed_lines[@]}"; do
-          change=${build_changed_lines[index]}
-          if [[ "$change" == '+fn buildTypeSafe('* ]]; then
-            mark_app typesafe
-            added_typesafe=1
-            in_new_typesafe=1
-            continue
-          fi
-          if [[ "$in_new_typesafe" -eq 1 ]]; then
-            if [[ "$change" == '+}' ]]; then
-              in_new_typesafe=0
-            elif [[ "${change:0:1}" == '-' ]]; then
-              remaining_changes+=("$change")
-              remaining_positions+=("${build_changed_positions[index]}")
-              remaining_old_positions+=("${build_changed_old_positions[index]}")
-            fi
-            continue
-          fi
-          remaining_changes+=("$change")
-          remaining_positions+=("${build_changed_positions[index]}")
-          remaining_old_positions+=("${build_changed_old_positions[index]}")
-        done
-        if [[ "$in_new_typesafe" -eq 1 ]]; then
-          mark_all
-          return
-        fi
-        if [[ "$added_typesafe" -eq 1 ]]; then
-          local substantive_remaining=0
-          for change in "${remaining_changes[@]}"; do
-            if [[ "$change" != '+' ]]; then
-              substantive_remaining=1
-              break
-            fi
-          done
-          if [[ "$substantive_remaining" -eq 0 ]]; then
-            return
-          fi
-        fi
-        for index in "${!remaining_changes[@]}"; do
-          change=${remaining_changes[index]}
-          raw=${change:1}
-          local owner_matched=0
-          if [[ "${change:0:1}" == "+" ]]; then
-            has_addition=1
-            if ! contextual_build_line "$raw" &&
-               classify_build_owner "$(build_line_owner "$head" "${remaining_positions[index]}")"; then
-              changed_matched=1
-              owner_matched=1
-            fi
-          elif [[ "${change:0:1}" == "-" ]]; then
-            if ! contextual_build_line "$raw" &&
-               classify_build_owner "$(build_line_owner "$base" "${remaining_old_positions[index]}")"; then
-              changed_matched=1
-              owner_matched=1
-            fi
-          fi
-          if [[ "${change:0:1}" == "-" ]] && is_retired_build_line "$raw"; then
-            retired_app_deletion=1
-            if classify_build_line "$raw"; then
-              changed_matched=1
-            fi
-          elif classify_build_line "$raw"; then
-            changed_matched=1
-          elif [[ "${change:0:1}" == "-" && "$raw" == *'"apps/'* ]]; then
-            retired_app_deletion=1
-          elif [[ "${change:0:1}" == "+" ]] && ! contextual_build_line "$raw"; then
-            if [[ "$owner_matched" -ne 1 ]]; then
-              substantive_unknown=1
-            fi
-          fi
-        done
-        if [[ "$substantive_unknown" -eq 1 ]]; then
-          mark_all
-          return
-        fi
-        if [[ "$changed_matched" -eq 1 ]]; then
-          return
-        fi
-        if [[ "$retired_app_deletion" -eq 1 && "$has_addition" -eq 0 ]]; then
-          return
-        fi
-        for raw in "${build_hunk[@]}"; do
-          if classify_build_line "$raw"; then
-            context_matched=1
-          fi
-        done
-        if [[ "$context_matched" -eq 0 ]]; then
-          mark_all
-        fi
-      }
-
-      while IFS= read -r line; do
-        case "$line" in
-          "+++"*|"---"*) continue ;;
-          "@@"*)
-            flush_build_hunk
-            build_hunk=()
-            build_changed_lines=()
-            build_changed_positions=()
-            build_changed_old_positions=()
-            if [[ "$line" =~ -([0-9]+) ]]; then
-              hunk_old_line=${BASH_REMATCH[1]}
-            fi
-            if [[ "$line" =~ \+([0-9]+) ]]; then
-              hunk_new_line=${BASH_REMATCH[1]}
-            fi
-            continue
-            ;;
-          "+"*|"-"*)
-            raw=${line:1}
-            build_hunk+=("$raw")
-            build_changed_lines+=("$line")
-            build_changed_positions+=("$hunk_new_line")
-            build_changed_old_positions+=("$hunk_old_line")
-            if [[ "${line:0:1}" == "+" ]]; then
-              hunk_new_line=$((hunk_new_line + 1))
-            else
-              hunk_old_line=$((hunk_old_line + 1))
-            fi
-            ;;
-          " "*)
-            build_hunk+=("${line:1}")
-            hunk_new_line=$((hunk_new_line + 1))
-            hunk_old_line=$((hunk_old_line + 1))
-            ;;
-          *) continue ;;
-        esac
-      done < <(git diff -U3 --no-ext-diff "$base" "$head" -- build.zig)
-      flush_build_hunk
-    fi
-
-    if [[ "$package_changed" -eq 1 ]]; then
-      while IFS= read -r line; do
-        case "$line" in
-          "+++"*|"---"*|"@@"*) continue ;;
-          "+"*|"-"*) ;;
-          *) continue ;;
-        esac
-        raw=${line:1}
-        case "$raw" in
-          *'"apps/learnings/'*|*'"apps/synesthesia/'*)
-            mark_ledger
-            ;;
-          *'"apps/'*)
-            matched=0
-            for app in "${apps[@]}"; do
-              if [[ "$raw" == *"\"apps/$app/"* ]]; then
-                if [[ "$app" == ledger ]]; then
-                  mark_ledger
-                else
-                  mark_app "$app"
-                fi
-                matched=1
-              fi
-            done
-            if [[ "$matched" -eq 0 && "${line:0:1}" == "+" ]]; then
-              mark_all
-            fi
-            ;;
-          *'"libs/definition_core/'*|*'"libs/definition_compat/'*)
-            mark_definition_consumers
-            ;;
-          *'"libs/trace_core/'*)
-            mark_trace_consumers
-            ;;
-          *'"libs/durable_store/'*|*'"libs/jsonl_core/'*)
-            mark_store_consumers
-            ;;
-          *'"libs/core/'*)
-            mark_all
-            ;;
-          *'"build.zig"'*|*'"build.zig.zon"'*)
-            ;;
-          ".{}")
-            ;;
-          *)
-            mark_all
-            ;;
-        esac
-      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig.zon)
-    fi
+    done < <(git diff --no-renames --name-only -z "$base" "$head")
 
     if [[ "$mode" == "ci-affected" ]] &&
        ! git diff --quiet "$base" "$head" -- \
