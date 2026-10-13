@@ -52,17 +52,18 @@ pub const Result = struct {
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     writer: anytype,
 ) !Result {
     const pr_ci_path = ".github/workflows/pr-ci.yml";
     const auto_release_path = ".github/workflows/auto-release.yml";
     const tiger_workflow_path = ".github/workflows/tiger-style.yml";
 
-    const pr_ci = try readFile(allocator, io, pr_ci_path);
+    const pr_ci = try readFile(allocator, io, dir, pr_ci_path);
     defer allocator.free(pr_ci);
-    const auto_release = try readFile(allocator, io, auto_release_path);
+    const auto_release = try readFile(allocator, io, dir, auto_release_path);
     defer allocator.free(auto_release);
-    const tiger_workflow = try readFile(allocator, io, tiger_workflow_path);
+    const tiger_workflow = try readFile(allocator, io, dir, tiger_workflow_path);
     defer allocator.free(tiger_workflow);
 
     var result = Result{};
@@ -84,14 +85,40 @@ pub fn run(
 fn readFile(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     path: []const u8,
 ) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(
+    return dir.readFileAlloc(
         io,
         path,
         allocator,
         .limited(repository_file_bytes_max),
     );
+}
+
+test "repository auditing uses the supplied directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".github/workflows");
+    for ([_][]const u8{ "pr-ci.yml", "auto-release.yml" }) |name| {
+        const path = try std.fs.path.join(std.testing.allocator, &.{ ".github/workflows", name });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = path,
+            .data = "libs/definition_core/**\n",
+        });
+    }
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".github/workflows/tiger-style.yml",
+        .data = ".github/workflows/pr-ci.yml\n" ++
+            ".github/workflows/auto-release.yml\n" ++
+            "zig run tools/tiger_style/main.zig -- audit-repository\n",
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    const result = try run(std.testing.allocator, std.testing.io, tmp.dir, &output.writer);
+    try std.testing.expectEqual(@as(u32, 7), result.checks);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
 }
 
 fn checkSurfaceRules(

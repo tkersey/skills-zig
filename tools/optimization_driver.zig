@@ -8,9 +8,13 @@ const trace = @import("trace_core");
 const warmup_count = 3;
 const sample_count = 30;
 const fixture_limit = 32 * 1024 * 1024;
-fn io() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
+// The driver is also built against archived products. Keep their legacy call
+// shape here while current products receive the caller's explicit authority.
+const explicit_authority = !@hasDecl(ledger.transaction, "installRuntimeIo");
+const Scope = if (explicit_authority)
+    @typeInfo(@typeInfo(@TypeOf(ledger.compiled_plan.load)).@"fn".param_types[0].?).pointer.child
+else
+    void;
 
 const Case = struct {
     id: []const u8,
@@ -41,6 +45,9 @@ const Metrics = struct {
 };
 
 const Fixture = struct {
+    io: std.Io,
+    directory: std.Io.Dir,
+    scope: Scope,
     bytes: []u8,
     definition: []u8,
     expected: []u8,
@@ -51,7 +58,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
         if (self.parameters) |*value| value.deinit(allocator);
         if (self.plans) |*value| value.deinit(allocator);
-        std.Io.Dir.cwd().deleteTree(io(), self.root) catch |err| {
+        self.directory.deleteTree(self.io, self.root) catch |err| {
             std.debug.print("optimization fixture cleanup: {s}\n", .{@errorName(err)});
         };
         allocator.free(self.bytes);
@@ -73,7 +80,7 @@ const Output = union(enum) {
 };
 
 pub fn main(init: std.process.Init) !void {
-    ledger.transaction.installRuntimeIo(init.io);
+    if (comptime !explicit_authority) ledger.transaction.installRuntimeIo(init.io);
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len != 4 or !std.mem.eql(u8, argv[2], "--target")) {
@@ -82,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     const capture = std.mem.eql(u8, argv[1], "capture");
     if (!capture and !std.mem.eql(u8, argv[1], "oracle")) return error.InvalidCommand;
     const case = try findCase(argv[3]);
-    var fixture = try prepareFixture(allocator, case);
+    var fixture = try prepareFixture(init.io, .cwd(), allocator, case);
     defer fixture.deinit(allocator);
     const expected_digest = digest_block: {
         var output = try execute(allocator, case, &fixture);
@@ -92,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     if (!capture) return writeOracle(case, fixture, expected_digest);
     const metrics = try measure(allocator, case, &fixture, expected_digest);
     try writeArtifact(allocator, case, fixture, metrics, expected_digest);
-    var stdout = std.Io.File.stdout().writer(io(), &.{});
+    var stdout = std.Io.File.stdout().writer(init.io, &.{});
     try stdout.interface.print("PASS\t{s}\tcaptured\n", .{case.id});
 }
 
@@ -101,19 +108,19 @@ fn findCase(id: []const u8) !Case {
     return error.UnknownCase;
 }
 
-fn prepareFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
-    var fixture = try allocateFixture(allocator, case);
+fn prepareFixture(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, case: Case) !Fixture {
+    var fixture = try allocateFixture(io, directory, allocator, case);
     errdefer fixture.deinit(allocator);
     if (case.rows > 0) try prepareLedger(allocator, &fixture);
     return fixture;
 }
 
-fn allocateFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
+fn allocateFixture(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, case: Case) !Fixture {
     const root = try allocator.print(
         "{s}/skills-zig-optimization-{d}",
         .{
             if (builtin.target.os.tag == .macos) "/private/tmp" else "/tmp",
-            std.Io.Clock.awake.now(io()).nanoseconds,
+            std.Io.Clock.awake.now(io).nanoseconds,
         },
     );
     errdefer allocator.free(root);
@@ -127,8 +134,11 @@ fn allocateFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
     errdefer allocator.free(definition);
     const expected = try expectedLedger(allocator, case);
     errdefer allocator.free(expected);
-    try std.Io.Dir.createDirAbsolute(io(), root, .fromMode(0o700));
+    try std.Io.Dir.createDirAbsolute(io, root, .fromMode(0o700));
     return Fixture{
+        .io = io,
+        .directory = directory,
+        .scope = if (explicit_authority) .init(.init(io, directory)) else {},
         .root = root,
         .bytes = bytes,
         .definition = definition,
@@ -137,29 +147,29 @@ fn allocateFixture(allocator: std.mem.Allocator, case: Case) !Fixture {
 }
 
 fn prepareLedger(allocator: std.mem.Allocator, fixture: *Fixture) !void {
-    var dir = try std.Io.Dir.openDirAbsolute(io(), fixture.root, .{});
-    defer dir.close(io());
-    try dir.writeFile(io(), .{ .sub_path = "definition.json", .data = fixture.definition });
-    try dir.createDirPath(io(), ".ledger/optimization");
-    try dir.writeFile(io(), .{
+    var dir = try std.Io.Dir.openDirAbsolute(fixture.io, fixture.root, .{});
+    defer dir.close(fixture.io);
+    try dir.writeFile(fixture.io, .{ .sub_path = "definition.json", .data = fixture.definition });
+    try dir.createDirPath(fixture.io, ".ledger/optimization");
+    try dir.writeFile(fixture.io, .{
         .sub_path = ".ledger/optimization/events.jsonl",
         .data = fixture.bytes,
     });
-    var bind_plans = try ledger.compiled_plan.load(
+    var bind_plans = try callWithAuthority(ledger.compiled_plan.load, &fixture.scope, .{
         allocator,
         fixture.root,
         "definition.json",
-        .{ .kind = .transact, .name = "bind-existing" },
+        ledger.compiled_plan.Route{ .kind = .transact, .name = "bind-existing" },
         "1.0.0",
-        .{},
-    );
+        ledger.compiled_plan.Options{},
+    });
     defer bind_plans.deinit(allocator);
     fixture.parameters = try definition_core.parameters.bind(
         allocator,
         &bind_plans.definition_plan.parameter_declarations,
         &.{},
     );
-    var binding = try ledger.transaction.transact(
+    var binding = try callWithAuthority(ledger.transaction.transact, &fixture.scope, .{
         allocator,
         &bind_plans.definition_plan,
         &bind_plans.closure,
@@ -171,17 +181,17 @@ fn prepareLedger(allocator: std.mem.Allocator, fixture: *Fixture) !void {
         fixture.root,
         &.{},
         &fixture.parameters.?,
-    );
+    });
     defer binding.deinit(allocator);
     if (!binding.storage_mutated) return error.FixtureBindingFailed;
-    fixture.plans = try ledger.compiled_plan.load(
+    fixture.plans = try callWithAuthority(ledger.compiled_plan.load, &fixture.scope, .{
         allocator,
         fixture.root,
         "definition.json",
-        .{ .kind = .project, .name = "rows" },
+        ledger.compiled_plan.Route{ .kind = .project, .name = "rows" },
         "1.0.0",
-        .{},
-    );
+        ledger.compiled_plan.Options{},
+    });
 }
 
 fn definitionBytes(allocator: std.mem.Allocator, limit: usize) ![]u8 {
@@ -292,6 +302,9 @@ test "presized trace fixtures preserve the pre-migration workload bytes" {
         const definition = try definitionBytes(allocator, 0);
         defer allocator.free(definition);
         const fixture = Fixture{
+            .io = undefined,
+            .directory = undefined,
+            .scope = undefined,
             .bytes = bytes,
             .definition = definition,
             .expected = &.{},
@@ -332,10 +345,21 @@ fn writeCall(writer: *std.Io.Writer, turn: usize, call: usize) !void {
     );
 }
 
+fn callWithAuthority(
+    comptime function: anytype,
+    authority: anytype,
+    args: anytype,
+) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    if (comptime @typeInfo(@TypeOf(function)).@"fn".param_types.len == args.len + 1) {
+        return @call(.auto, function, .{authority} ++ args);
+    }
+    return @call(.auto, function, args);
+}
+
 fn execute(allocator: std.mem.Allocator, case: Case, fixture: *Fixture) !Output {
     if (case.rows > 0) {
         const plans = &fixture.plans.?;
-        return .{ .ledger = try ledger.projection.execute(
+        return .{ .ledger = try callWithAuthority(ledger.projection.execute, &fixture.scope, .{
             allocator,
             &plans.definition_plan,
             &plans.storage_plan.?,
@@ -344,26 +368,26 @@ fn execute(allocator: std.mem.Allocator, case: Case, fixture: *Fixture) !Output 
             "rows",
             fixture.root,
             &fixture.parameters.?,
-        ) };
+        }) };
     }
     var reader = std.Io.Reader.fixed(fixture.bytes);
     const options = trace.TraceParseOptions{};
     const parsed = if (case.summary)
-        try trace.parseSessionSummaryTraceReader(
+        try callWithAuthority(trace.parseSessionSummaryTraceReader, fixture.io, .{
             allocator,
             "/optimization/rollout.jsonl",
             &reader,
             0,
             options,
-        )
+        })
     else
-        try trace.parseSessionTraceReader(
+        try callWithAuthority(trace.parseSessionTraceReader, fixture.io, .{
             allocator,
             "/optimization/rollout.jsonl",
             &reader,
             0,
             options,
-        );
+        });
     return .{ .trace = parsed };
 }
 
@@ -442,9 +466,9 @@ fn measure(
     var allocations: [sample_count]u64 = undefined;
     for (0..warmup_count + sample_count) |index| {
         var counting = core_perf.CountingAllocator.init(allocator);
-        const start = std.Io.Clock.awake.now(io()).nanoseconds;
+        const start = std.Io.Clock.awake.now(fixture.io).nanoseconds;
         var output = try execute(counting.allocator(), case, fixture);
-        const elapsed = std.Io.Clock.awake.now(io()).nanoseconds - start;
+        const elapsed = std.Io.Clock.awake.now(fixture.io).nanoseconds - start;
         defer output.deinit(counting.allocator());
         const calls = counting.stats.totalCalls();
         const actual_digest = try outputDigest(allocator, case, fixture, output);
@@ -492,7 +516,7 @@ fn workloadDigest(fixture: Fixture) [64]u8 {
 }
 
 fn writeOracle(case: Case, fixture: Fixture, output_digest: [64]u8) !void {
-    var stdout = std.Io.File.stdout().writer(io(), &.{});
+    var stdout = std.Io.File.stdout().writer(fixture.io, &.{});
     try stdout.interface.print(
         "{{\"case_id\":\"{s}\",\"workload_sha256\":\"{s}\",\"output_sha256\":\"{s}\"}}\n",
         .{ case.id, workloadDigest(fixture), output_digest },
@@ -513,7 +537,7 @@ fn writeArtifact(
         &.{ ".perf-local", machine, "baselines", case.binary },
     );
     defer allocator.free(directory);
-    try std.Io.Dir.cwd().createDirPath(io(), directory);
+    try fixture.directory.createDirPath(fixture.io, directory);
     const path = try allocator.print("{s}/{s}.json", .{ directory, case.id });
     defer allocator.free(path);
     const bytes = try std.json.Stringify.valueAlloc(allocator, .{
@@ -532,7 +556,7 @@ fn writeArtifact(
         .compare_detail = "captured",
     }, .{ .emit_strings_as_arrays = false });
     defer allocator.free(bytes);
-    try std.Io.Dir.cwd().writeFile(io(), .{ .sub_path = path, .data = bytes });
+    try fixture.directory.writeFile(fixture.io, .{ .sub_path = path, .data = bytes });
 }
 
 fn machineName(allocator: std.mem.Allocator) ![]u8 {
@@ -590,6 +614,9 @@ test "optimization trace workload stays frozen across full and summary cases" {
     const definition = try definitionBytes(std.testing.allocator, 0);
     defer std.testing.allocator.free(definition);
     const fixture = Fixture{
+        .io = undefined,
+        .directory = undefined,
+        .scope = undefined,
         .bytes = bytes,
         .definition = definition,
         .root = undefined,
