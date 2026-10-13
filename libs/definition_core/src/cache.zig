@@ -81,7 +81,9 @@ pub fn decode(
     const payload_len = std.math.cast(usize, payload_len_u64) orelse
         return error.CachePayloadTooLarge;
     if (payload_len > limits.max_payload_bytes) return error.CachePayloadTooLarge;
-    if (entry.len != header_bytes + payload_len) return error.CacheLengthMismatch;
+    const entry_len = std.math.add(usize, header_bytes, payload_len) catch
+        return error.CacheEntryTooLarge;
+    if (entry.len != entry_len) return error.CacheLengthMismatch;
     if (!std.mem.eql(u8, entry[18..50], &expected_key)) return error.CacheKeyMismatch;
 
     var computed_header_digest: [32]u8 = undefined;
@@ -414,5 +416,24 @@ test "bounded cache codec round trips scalars and rejects malformed payloads" {
     try std.testing.expectError(
         error.CachePayloadTooLarge,
         bounded.writeU16(1),
+    );
+}
+
+test "cache rejects unrepresentable envelope lengths with extreme limits" {
+    var entry: [header_bytes]u8 = @splat(0);
+    @memcpy(entry[0..8], magic);
+    std.mem.writeInt(u16, entry[8..10], format_version, .big);
+    const maximum = std.math.maxInt(usize);
+    const limits: Limits = .{ .max_payload_bytes = maximum, .max_entry_bytes = maximum };
+    std.mem.writeInt(u64, entry[10..18], maximum, .big);
+    try std.testing.expectError(error.CacheEntryTooLarge, decode(@splat(0), &entry, limits));
+    std.mem.writeInt(u64, entry[10..18], maximum - header_bytes + 1, .big);
+    try std.testing.expectError(error.CacheEntryTooLarge, decode(@splat(0), &entry, limits));
+    std.mem.writeInt(u64, entry[10..18], maximum - header_bytes, .big);
+    try std.testing.expectError(error.CacheLengthMismatch, decode(@splat(0), &entry, limits));
+    std.mem.writeInt(u64, entry[10..18], std.math.maxInt(u64), .big);
+    try std.testing.expectError(
+        if (@sizeOf(usize) < @sizeOf(u64)) error.CachePayloadTooLarge else error.CacheEntryTooLarge,
+        decode(@splat(0), &entry, limits),
     );
 }
