@@ -27,29 +27,38 @@ pub fn keyHex(cache_key: [32]u8) [64]u8 {
     return std.fmt.bytesToHex(cache_key, .lower);
 }
 
+/// Build the frozen envelope header without copying or allocating the payload.
+/// Callers may publish header and payload as adjacent parts of one staged file.
+pub fn encodeHeader(
+    cache_key: [32]u8,
+    payload: []const u8,
+    limits: Limits,
+) ![header_bytes]u8 {
+    if (payload.len > limits.max_payload_bytes) return error.CachePayloadTooLarge;
+    const entry_len = std.math.add(usize, header_bytes, payload.len) catch
+        return error.CacheEntryTooLarge;
+    if (entry_len > limits.max_entry_bytes) return error.CacheEntryTooLarge;
+
+    var header: [header_bytes]u8 = undefined;
+    @memcpy(header[0..8], magic);
+    std.mem.writeInt(u16, header[8..10], format_version, .big);
+    std.mem.writeInt(u64, header[10..18], @intCast(payload.len), .big);
+    @memcpy(header[18..50], &cache_key);
+    std.crypto.hash.sha2.Sha256.hash(payload, header[50..82], .{});
+    std.crypto.hash.sha2.Sha256.hash(header[0..82], header[82..114], .{});
+    return header;
+}
+
 pub fn encodeAlloc(
     allocator: std.mem.Allocator,
     cache_key: [32]u8,
     payload: []const u8,
     limits: Limits,
 ) ![]u8 {
-    if (payload.len > limits.max_payload_bytes) return error.CachePayloadTooLarge;
-    const entry_len = std.math.add(usize, header_bytes, payload.len) catch
-        return error.CacheEntryTooLarge;
-    if (entry_len > limits.max_entry_bytes) return error.CacheEntryTooLarge;
-
-    const entry = try allocator.alloc(u8, entry_len);
-    errdefer allocator.free(entry);
-    @memcpy(entry[0..8], magic);
-    std.mem.writeInt(u16, entry[8..10], format_version, .big);
-    std.mem.writeInt(u64, entry[10..18], @intCast(payload.len), .big);
-    @memcpy(entry[18..50], &cache_key);
-    var payload_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
-    @memcpy(entry[50..82], &payload_digest);
-    var header_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(entry[0..82], &header_digest, .{});
-    @memcpy(entry[82..114], &header_digest);
+    const header = try encodeHeader(cache_key, payload, limits);
+    // encodeHeader has checked both the addition and the caller's entry limit.
+    const entry = try allocator.alloc(u8, header_bytes + payload.len);
+    @memcpy(entry[0..header_bytes], &header);
     @memcpy(entry[header_bytes..], payload);
     return entry;
 }
@@ -436,4 +445,36 @@ test "cache rejects unrepresentable envelope lengths with extreme limits" {
         if (@sizeOf(usize) < @sizeOf(u64)) error.CachePayloadTooLarge else error.CacheEntryTooLarge,
         decode(@splat(0), &entry, limits),
     );
+}
+
+test "separate cache header preserves frozen envelope bytes and full payload budget" {
+    var cache_key: [32]u8 = undefined;
+    for (&cache_key, 0..) |*byte, index| byte.* = @intCast(index);
+    const payload = "compiled-plan";
+    const limits: Limits = .{
+        .max_payload_bytes = payload.len,
+        .max_entry_bytes = header_bytes + payload.len,
+    };
+    const header = try encodeHeader(cache_key, payload, limits);
+    const frozen_header = "44464e43434831000001000000000000000d" ++
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" ++
+        "768fc0a9c5ad6936695d809f7a6e2ae224d2d6246fd88f811a2fdabdf35b433b" ++
+        "3dec3525d105cd007644f642ec534a909d2c6191dfee0e2b13ca73ec64638d44";
+    try std.testing.expectEqualStrings(frozen_header, &std.fmt.bytesToHex(header, .lower));
+    var bytes: [header_bytes + payload.len]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try writer.writeAll(&header);
+    try writer.writeAll(payload);
+    try std.testing.expectEqualStrings(payload, try decode(cache_key, writer.buffered(), limits));
+    const allocated = try encodeAlloc(std.testing.allocator, cache_key, payload, limits);
+    defer std.testing.allocator.free(allocated);
+    try std.testing.expectEqualSlices(u8, allocated, writer.buffered());
+    try std.testing.expectError(error.CachePayloadTooLarge, encodeHeader(cache_key, payload, .{
+        .max_payload_bytes = payload.len - 1,
+    }));
+    try std.testing.expectError(error.CacheEntryTooLarge, encodeHeader(cache_key, payload, .{
+        .max_entry_bytes = header_bytes + payload.len - 1,
+    }));
+    const empty = try encodeHeader(cache_key, "", .{ .max_payload_bytes = 0, .max_entry_bytes = header_bytes });
+    try std.testing.expectEqualStrings("", try decode(cache_key, &empty, .{}));
 }
