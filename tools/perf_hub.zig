@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
+const core_perf = @import("core_perf");
 const cas_automation_cli = @import("cas_automation_cli");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
@@ -24,6 +25,14 @@ const active_seq_replay_driver_v2 = DriverSourceIdentity{
     .tree = &seq_replay_driver_tree_sha256,
     .locator = seq_replay_driver_locator,
     .sha256 = &seq_replay_driver_sha256,
+};
+
+// Readback-only identity from the driver before sort-once summaries.
+const legacy_seq_replay_driver_v2 = DriverSourceIdentity{
+    .revision = "d9424914631366021224bffd105cc5f3ac62b35a6487b9198dd383fff27a73de",
+    .tree = "2e85cc190900f3d3cfb9cc1e76ef6f8c901fe998823e08788ca259a7b2d89426",
+    .locator = "tools/seq_replay_driver.zig",
+    .sha256 = "d9424914631366021224bffd105cc5f3ac62b35a6487b9198dd383fff27a73de",
 };
 
 fn seqReplayDriverTreeDigest() [64]u8 {
@@ -53,6 +62,16 @@ const active_optimization_driver_v1 = DriverSourceIdentity{
     .locator = "tools/optimization_driver.zig",
     .sha256 = &optimization_driver_sha256,
 };
+// Readback-only identity from the driver before sort-once summaries.
+const legacy_optimization_summary_driver_v1 = DriverSourceIdentity{
+    .revision = "6f6bd121d3da945cefec99f0c90b7424c9a4c10c2643d4d4962834f7e2e33775",
+    .tree = "1ce85c7567b3c4df5eca4ae9137158cd911adc15de222eedb7524fd87de53f95",
+    .locator = "tools/optimization_driver.zig",
+    .sha256 = "6f6bd121d3da945cefec99f0c90b7424c9a4c10c2643d4d4962834f7e2e33775",
+};
+const legacy_optimization_summary_build_sha256 =
+    "6b2f3185ac7b80960fb6740a9aa1fbccef9db68385be56a97c80bfd830e79458";
+
 // Readback-only identity from the pre-migration source at 9c4a5584608e23cfe3b5c125b9b1e1df38b53aa2.
 const legacy_optimization_driver_v1 = DriverSourceIdentity{
     .revision = "5ba1b03b38b1bc72f7735931324f75679af43907d01338bb7c017b9b1f060925",
@@ -4221,14 +4240,15 @@ fn metricsFromSamples(
     alloc_samples: std.ArrayList(u64),
     rss_samples: std.ArrayList(u64),
 ) !Metrics {
+    const latency = try core_perf.percentilesU64(allocator, samples.items, &.{ 50, 95 });
     return .{
         .samples = samples,
         .alloc_samples = alloc_samples,
         .rss_samples = rss_samples,
-        .p50_ns = try percentileU64(allocator, samples.items, 50),
-        .p95_ns = try percentileU64(allocator, samples.items, 95),
-        .p50_alloc_calls = try percentileU64(allocator, alloc_samples.items, 50),
-        .p95_rss_bytes = try percentileU64(allocator, rss_samples.items, 95),
+        .p50_ns = latency[0],
+        .p95_ns = latency[1],
+        .p50_alloc_calls = try core_perf.percentileU64(allocator, alloc_samples.items, 50),
+        .p95_rss_bytes = try core_perf.percentileU64(allocator, rss_samples.items, 95),
     };
 }
 
@@ -4360,16 +4380,18 @@ fn compareBalancedDeepMetrics(
     for (0..paired_comparison_rounds) |round| {
         const start = round * case_cfg.samples;
         const end = start + case_cfg.samples;
-        p50_ratios[round] = try quantileRatioPpm(
+        const base = try core_perf.percentilesU64(
+            std.heap.page_allocator,
             baseline_latency[start..end],
-            candidate_latency[start..end],
-            50,
+            &.{ 50, 95 },
         );
-        p95_ratios[round] = try quantileRatioPpm(
-            baseline_latency[start..end],
+        const current = try core_perf.percentilesU64(
+            std.heap.page_allocator,
             candidate_latency[start..end],
-            95,
+            &.{ 50, 95 },
         );
+        p50_ratios[round] = try ratioPpm(base[0], current[0]);
+        p95_ratios[round] = try ratioPpm(base[1], current[1]);
         allocation_ratios[round] = try ratioPpm(
             baseline_allocations[round],
             candidate_allocations[round],
@@ -4465,12 +4487,6 @@ fn rssSamples(metrics: anytype) []const u64 {
         metrics.rss_samples_bytes
     else
         metrics.rss_samples.items;
-}
-
-fn quantileRatioPpm(baseline: []const u64, candidate: []const u64, percentile: usize) !u64 {
-    const base = try percentileU64(std.heap.page_allocator, baseline, percentile);
-    const current = try percentileU64(std.heap.page_allocator, candidate, percentile);
-    return ratioPpm(base, current);
 }
 
 fn ratioPpm(base: u64, current: u64) !u64 {
@@ -5479,18 +5495,6 @@ fn closeAutomationDb(db: *Sqlite.sqlite3) void {
     if (rc != Sqlite.SQLITE_OK) std.log.warn("automation database cleanup failed code={d}", .{rc});
 }
 
-fn percentileU64(allocator: std.mem.Allocator, samples: []const u64, p: usize) !u64 {
-    const copy = try allocator.dupe(u64, samples);
-    defer allocator.free(copy);
-    std.mem.sort(u64, copy, {}, struct {
-        fn less(_: void, a: u64, b: u64) bool {
-            return a < b;
-        }
-    }.less);
-    const idx = ((copy.len - 1) * p) / 100;
-    return copy[idx];
-}
-
 fn allowedUpperBoundWithTolerance(base: u64, tolerance_pct: f64) u64 {
     if (base == 0) return 1;
     const factor = 1.0 + @max(tolerance_pct, 0.0) / 100.0;
@@ -5855,10 +5859,7 @@ fn validatePairedDeepDrivers(
     try validateDriverEvidence(allocator, baseline_driver, evidence.baseline.binary);
     try validateDriverEvidence(allocator, candidate_driver, evidence.candidate.binary);
     for ([_]CapsuleDriver{ baseline_driver, candidate_driver }) |driver| {
-        const optimization = driverSourceMatchesIdentity(
-            driver.source,
-            active_optimization_driver_v1,
-        );
+        const optimization = isOptimizationDriverSource(driver.source);
         if (optimization != (case_cfg.driver_kind == .optimization)) {
             return error.PerfDriverSourceMismatch;
         }
@@ -6033,7 +6034,7 @@ fn validateDriverEvidence(
     product: CapsuleProduct,
 ) !void {
     try validateDriverSourceMetadata(driver.source);
-    if (driverSourceMatchesIdentity(driver.source, active_optimization_driver_v1)) {
+    if (isOptimizationDriverSource(driver.source)) {
         try validateOptimizationDriverBuild(driver.build);
     }
     if (!std.mem.eql(u8, driver.product_source.revision, product.source.revision) or !std.mem.eql(
@@ -6066,10 +6067,21 @@ fn validateOptimizationDriverBuild(build: CapsuleBuild) !void {
     }
 }
 
+fn isOptimizationDriverSource(source: CapsuleDriverSource) bool {
+    return driverSourceMatchesIdentity(source, active_optimization_driver_v1) or
+        driverSourceMatchesIdentity(source, legacy_optimization_summary_driver_v1) or
+        driverSourceMatchesIdentity(source, legacy_optimization_driver_v1);
+}
+
 fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
     if (source.build_file) |build_file| {
         if (driverSourceMatchesIdentity(source, active_optimization_driver_v1) and
             std.mem.eql(u8, build_file.sha256, "sha256:" ++ optimization_build_sha256))
+        {
+            return;
+        }
+        if (driverSourceMatchesIdentity(source, legacy_optimization_summary_driver_v1) and
+            std.mem.eql(u8, build_file.sha256, "sha256:" ++ legacy_optimization_summary_build_sha256))
         {
             return;
         }
@@ -6079,6 +6091,7 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
             return;
         }
     } else if (driverSourceMatchesIdentity(source, active_seq_replay_driver_v2) or
+        driverSourceMatchesIdentity(source, legacy_seq_replay_driver_v2) or
         driverSourceMatchesIdentity(source, legacy_seq_replay_driver_v1) or
         driverSourceMatchesIdentity(source, legacy_generic_driver_v1))
     {
@@ -6152,14 +6165,15 @@ fn validateRetainedMetrics(
     {
         return error.InvalidPerfMeasurementCount;
     }
+    const latency = try core_perf.percentilesU64(allocator, metrics.samples_ns, &.{ 50, 95 });
     if (metrics.p50_ns !=
-        try percentileU64(allocator, metrics.samples_ns, 50) or
+        latency[0] or
         metrics.p95_ns !=
-            try percentileU64(allocator, metrics.samples_ns, 95) or
+            latency[1] or
         metrics.p95_rss_bytes !=
-            try percentileU64(allocator, metrics.rss_samples_bytes, 95) or
+            try core_perf.percentileU64(allocator, metrics.rss_samples_bytes, 95) or
         (deep and metrics.p50_alloc_calls !=
-            try percentileU64(allocator, metrics.allocation_samples, 50)))
+            try core_perf.percentileU64(allocator, metrics.allocation_samples, 50)))
     {
         return error.InvalidPerfDerivedMetric;
     }
@@ -7898,7 +7912,7 @@ test "metric sample ownership transfers only after all percentile allocations su
 fn expectMetricSampleTransfer(allocator: std.mem.Allocator) !void {
     var samples = try MetricSamples.init(allocator, 3, 3, 3);
     defer samples.deinit(allocator);
-    const times = [_]u64{ 10, 20, 30 };
+    const times = [_]u64{ 30, 10, 20 };
     const allocations = [_]u64{ 2, 4, 6 };
     const rss = [_]u64{ 100, 200, 300 };
     try samples.times.appendSlice(allocator, &times);
@@ -8032,4 +8046,70 @@ test "optimization readback recomputes workload and output identities" {
         error.PerfSemanticOutputMismatch,
         validateOptimizationObservation(oracle, workload, execution),
     );
+}
+
+test "sort-once summaries retain pre-change driver identities for capsule readback" {
+    const seq_source = CapsuleDriverSource{
+        .revision = legacy_seq_replay_driver_v2.revision,
+        .tree = legacy_seq_replay_driver_v2.tree,
+        .path = legacy_seq_replay_driver_v2.locator,
+        .file = .{
+            .label = "seq_replay_driver.zig",
+            .sha256 = "sha256:" ++ legacy_seq_replay_driver_v2.sha256,
+        },
+    };
+    const optimization_source = CapsuleDriverSource{
+        .revision = legacy_optimization_summary_driver_v1.revision,
+        .tree = legacy_optimization_summary_driver_v1.tree,
+        .path = legacy_optimization_summary_driver_v1.locator,
+        .file = .{
+            .label = "optimization_driver.zig",
+            .sha256 = "sha256:" ++ legacy_optimization_summary_driver_v1.sha256,
+        },
+        .build_file = .{
+            .label = "optimization_build.zig",
+            .sha256 = "sha256:" ++ legacy_optimization_summary_build_sha256,
+        },
+    };
+    try validateDriverSourceMetadata(seq_source);
+    try validateDriverSourceMetadata(optimization_source);
+    try std.testing.expect(!isOptimizationDriverSource(seq_source));
+    try std.testing.expect(isOptimizationDriverSource(optimization_source));
+    try std.testing.expect(!std.mem.eql(u8, seq_source.revision, active_seq_replay_driver_v2.revision));
+    try std.testing.expect(!std.mem.eql(u8, optimization_source.revision, active_optimization_driver_v1.revision));
+    try std.testing.expectEqualStrings(legacy_optimization_summary_build_sha256, &optimization_build_sha256);
+    var mixed_seq = seq_source;
+    mixed_seq.tree = active_seq_replay_driver_v2.tree;
+    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_seq));
+    var mixed_optimization = optimization_source;
+    mixed_optimization.tree = active_optimization_driver_v1.tree;
+    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_optimization));
+    mixed_optimization = optimization_source;
+    mixed_optimization.build_file = null;
+    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_optimization));
+}
+
+test "capsule readback preserves legacy percentile summaries and chronological samples" {
+    var times: [240]u64 = undefined;
+    for (&times, 0..) |*sample, index| sample.* = @intCast((index * 37) % times.len);
+    const captured_times = times;
+    const allocations = [_]u64{ 3, 2, 5, 8, 4, 1, 7, 6 };
+    const rss = [_]u64{ 300, 200, 500, 800, 400, 100, 700, 600 };
+    var metrics = CapsuleMetrics{
+        .samples_ns = &times,
+        .p50_ns = 119,
+        .p95_ns = 227,
+        .rss_samples_bytes = &rss,
+        .p95_rss_bytes = 700,
+        .allocation_samples = &allocations,
+        .p50_alloc_calls = 4,
+    };
+    const config = evidenceCaseConfig("seq-observe-deep-batch8").?;
+    var counting = core_perf.CountingAllocator.init(std.testing.allocator);
+    try validateRetainedMetrics(counting.allocator(), metrics, config, true);
+    try std.testing.expectEqual(@as(u64, 3), counting.stats.alloc_calls);
+    try std.testing.expectEqual(@as(u64, 3), counting.stats.free_calls);
+    try std.testing.expectEqualSlices(u64, &captured_times, &times);
+    metrics.p95_ns = 228;
+    try std.testing.expectError(error.InvalidPerfDerivedMetric, validateRetainedMetrics(std.testing.allocator, metrics, config, true));
 }

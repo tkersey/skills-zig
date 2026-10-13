@@ -1,5 +1,7 @@
 const std = @import("std");
 
+/// Counts allocation attempts and requested bytes, including failed calls.
+/// These totals do not describe successful allocations or live memory.
 pub const AllocStats = struct {
     alloc_calls: u64 = 0,
     resize_calls: u64 = 0,
@@ -129,16 +131,38 @@ pub fn valueToF64(value: std.json.Value) ?f64 {
     };
 }
 
+/// Copies and sorts once for all requested floor-index percentiles. The input
+/// remains in capture order, including when allocating the working copy fails.
+pub fn percentilesU64(
+    allocator: std.mem.Allocator,
+    samples: []const u64,
+    comptime percentages: []const usize,
+) ![percentages.len]u64 {
+    const sorted = try sortedSamplesAlloc(allocator, samples);
+    defer allocator.free(sorted);
+    var result: [percentages.len]u64 = undefined;
+    for (percentages, 0..) |p, index| result[index] = percentileSortedU64(sorted, p);
+    return result;
+}
+
 pub fn percentileU64(allocator: std.mem.Allocator, samples: []const u64, p: usize) !u64 {
+    const sorted = try sortedSamplesAlloc(allocator, samples);
+    defer allocator.free(sorted);
+    return percentileSortedU64(sorted, p);
+}
+
+fn sortedSamplesAlloc(allocator: std.mem.Allocator, samples: []const u64) ![]u64 {
     if (samples.len == 0) return error.EmptySamples;
     const copy = try allocator.dupe(u64, samples);
-    defer allocator.free(copy);
     std.mem.sort(u64, copy, {}, lessThanU64);
+    return copy;
+}
 
-    if (p >= 100) return copy[copy.len - 1];
-    const last = copy.len - 1;
+fn percentileSortedU64(sorted: []const u64, p: usize) u64 {
+    if (p >= 100) return sorted[sorted.len - 1];
+    const last = sorted.len - 1;
     const idx = (last / 100) * p + ((last % 100) * p) / 100;
-    return copy[idx];
+    return sorted[idx];
 }
 
 pub fn allowedUpperBoundWithTolerance(base: u64, tolerance_pct: f64) u64 {
@@ -199,4 +223,71 @@ test "tolerance upper bounds saturate instead of trapping" {
         @as(u64, 100),
         allowedUpperBoundWithTolerance(100, std.math.nan(f64)),
     );
+}
+
+test "percentile summaries preserve floor ranks, duplicates, extremes, and capture order" {
+    const samples = [_]u64{ 9, 0, 3, std.math.maxInt(u64), 3, 7, 1, 8, 2, 6 };
+    const before = samples;
+    const actual = try percentilesU64(std.testing.allocator, &samples, &.{ 0, 50, 95, 100, 101 });
+    try std.testing.expectEqualSlices(u64, &.{ 0, 3, 9, std.math.maxInt(u64), std.math.maxInt(u64) }, &actual);
+    try std.testing.expectEqualSlices(u64, &before, &samples);
+    const singleton = try percentilesU64(std.testing.allocator, &.{42}, &.{ 0, 50, 95, 100 });
+    try std.testing.expectEqualSlices(u64, &.{ 42, 42, 42, 42 }, &singleton);
+}
+
+test "percentile summaries agree with legacy independent sorts at established and large sample counts" {
+    var storage: [4097]u64 = undefined;
+    for (&storage, 0..) |*sample, index| sample.* = @intCast((index * 37) % 113);
+    const percentages = [_]usize{ 0, 1, 50, 95, 99, 100, 101, std.math.maxInt(usize) };
+    for ([_]usize{ 8, 9, 30, 240, storage.len }) |count| {
+        var counting = CountingAllocator.init(std.testing.allocator);
+        const actual = try percentilesU64(counting.allocator(), storage[0..count], &percentages);
+        try std.testing.expectEqual(@as(u64, 1), counting.stats.alloc_calls);
+        try std.testing.expectEqual(@as(u64, 1), counting.stats.free_calls);
+        try std.testing.expectEqual(@as(u64, count * @sizeOf(u64)), counting.stats.requested_alloc_bytes);
+        for (percentages, actual) |percent, result| {
+            var legacy = storage;
+            const sorted = legacy[0..count];
+            std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+            const index = if (percent >= 100) count - 1 else ((count - 1) * percent) / 100;
+            try std.testing.expectEqual(sorted[index], result);
+            try std.testing.expectEqual(result, try percentileU64(std.testing.allocator, storage[0..count], percent));
+        }
+    }
+}
+
+test "percentile summaries preserve empty-input and allocation failure behavior" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    try std.testing.expectError(error.EmptySamples, percentilesU64(allocator, &.{}, &.{ 50, 95 }));
+    try std.testing.expectError(error.EmptySamples, percentileU64(allocator, &.{}, 50));
+    var samples = [_]u64{ 9, 1, 3 };
+    try std.testing.expectError(error.OutOfMemory, percentilesU64(allocator, &samples, &.{ 50, 95 }));
+    try std.testing.expectEqualSlices(u64, &.{ 9, 1, 3 }, &samples);
+}
+
+test "allocation counters retain attempted calls and requested bytes on success and failure" {
+    var storage: [16]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var counting = CountingAllocator.init(fixed.allocator());
+    const allocator = counting.allocator();
+    const alignment = std.mem.Alignment.of(u8);
+    const memory = allocator.rawAlloc(8, alignment, @returnAddress()).?;
+    try std.testing.expect(allocator.rawAlloc(32, alignment, @returnAddress()) == null);
+    try std.testing.expect(allocator.rawResize(memory[0..8], alignment, 12, @returnAddress()));
+    try std.testing.expect(!allocator.rawResize(memory[0..12], alignment, 32, @returnAddress()));
+    const remapped = allocator.rawRemap(memory[0..12], alignment, 4, @returnAddress()).?;
+    try std.testing.expect(allocator.rawRemap(remapped[0..4], alignment, 32, @returnAddress()) == null);
+    allocator.rawFree(remapped[0..4], alignment, @returnAddress());
+    try std.testing.expectEqual(AllocStats{
+        .alloc_calls = 2,
+        .resize_calls = 2,
+        .remap_calls = 2,
+        .free_calls = 1,
+        .requested_alloc_bytes = 40,
+        .requested_resize_bytes = 44,
+        .requested_remap_bytes = 36,
+    }, counting.stats);
+    try std.testing.expectEqual(@as(u64, 6), counting.stats.totalCalls());
+    try std.testing.expectEqual(@as(u64, 120), counting.stats.totalRequestedBytes());
 }

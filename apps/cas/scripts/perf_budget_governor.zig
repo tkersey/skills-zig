@@ -270,11 +270,12 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
         eval_count = round.eval_count;
     }
 
+    const latency = try core_perf.percentilesU64(allocator, ns_per_eval_samples, &.{ 50, 95 });
     return .{
         .rounds = rounds,
         .eval_count = eval_count orelse 0,
-        .p50_ns_per_eval = try core_perf.percentileU64(allocator, ns_per_eval_samples, 50),
-        .p95_ns_per_eval = try core_perf.percentileU64(allocator, ns_per_eval_samples, 95),
+        .p50_ns_per_eval = latency[0],
+        .p95_ns_per_eval = latency[1],
         .p50_alloc_calls_per_eval = try core_perf.percentileU64(
             allocator,
             alloc_calls_per_eval_samples,
@@ -412,4 +413,13 @@ test "enforceTrendGate rejects values outside tolerance" {
         .p50_alloc_calls_per_eval = 13,
     };
     try std.testing.expectError(error.TrendRegression, enforceTrendGate(summary, previous, 20.0));
+}
+
+test "benchmarkGovernor summarizes captured rounds and retains empty-round errors" {
+    const summary = try benchmarkGovernor(std.testing.allocator, 1, 3);
+    try std.testing.expectEqual(@as(usize, 3), summary.rounds);
+    try std.testing.expectEqual(@as(usize, 1), summary.eval_count);
+    try std.testing.expect(summary.p50_ns_per_eval <= summary.p95_ns_per_eval);
+    try std.testing.expect(summary.p50_alloc_calls_per_eval > 0);
+    try std.testing.expectError(error.EmptySamples, benchmarkGovernor(std.testing.allocator, 1, 0));
 }

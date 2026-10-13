@@ -455,17 +455,25 @@ fn measure(
         samples[index - warmup_count] = @intCast(@max(elapsed, 1));
         allocations[index - warmup_count] = calls;
     }
+    const sorted_times = sortedSamples(samples);
+    const sorted_allocations = sortedSamples(allocations);
     return .{
         .samples_ns = samples,
-        .p50_ns = percentile(samples, 50),
-        .p95_ns = percentile(samples, 95),
-        .p50_alloc_calls = percentile(allocations, 50),
+        .p50_ns = percentile(&sorted_times, 50),
+        .p95_ns = percentile(&sorted_times, 95),
+        .p50_alloc_calls = percentile(&sorted_allocations, 50),
     };
 }
 
-fn percentile(values: [sample_count]u64, percent: usize) u64 {
+// Drivers also compile against archived core_perf modules that predate the
+// shared summary API. Keep this fixed-size working copy local to the driver.
+fn sortedSamples(values: [sample_count]u64) [sample_count]u64 {
     var sorted = values;
     std.mem.sort(u64, &sorted, {}, std.sort.asc(u64));
+    return sorted;
+}
+
+fn percentile(sorted: *const [sample_count]u64, percent: usize) u64 {
     return sorted[((sample_count - 1) * percent) / 100];
 }
 
@@ -592,4 +600,14 @@ test "optimization trace workload stays frozen across full and summary cases" {
         &workloadDigest(fixture),
     );
     try std.testing.expectEqual(1 + 12 * 1024, std.mem.count(u8, bytes, "\n"));
+}
+
+test "optimization driver summary sorts once without changing captured order" {
+    var samples: [sample_count]u64 = undefined;
+    for (&samples, 0..) |*sample, index| sample.* = @intCast(sample_count - index);
+    const captured = samples;
+    const sorted = sortedSamples(samples);
+    try std.testing.expectEqual(@as(u64, 15), percentile(&sorted, 50));
+    try std.testing.expectEqual(@as(u64, 28), percentile(&sorted, 95));
+    try std.testing.expectEqualSlices(u64, &captured, &samples);
 }

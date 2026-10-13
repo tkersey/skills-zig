@@ -73,22 +73,26 @@ fn measure(allocator: std.mem.Allocator) !Metrics {
     }
 
     _ = allocator;
+    const sorted_times = sortedSamples(samples_ns);
+    const sorted_allocations = sortedSamples(allocation_calls);
     return .{
         .samples_ns = samples_ns,
-        .p50_ns = percentile(samples_ns, 50),
-        .p95_ns = percentile(samples_ns, 95),
-        .p50_alloc_calls = percentile(allocation_calls, 50),
+        .p50_ns = percentile(&sorted_times, 50),
+        .p95_ns = percentile(&sorted_times, 95),
+        .p50_alloc_calls = percentile(&sorted_allocations, 50),
     };
 }
 
-fn percentile(values: [sample_count]u64, percent: usize) u64 {
+// Drivers also compile against archived core_perf modules that predate the
+// shared summary API. Keep this fixed-size working copy local to the driver.
+fn sortedSamples(values: [sample_count]u64) [sample_count]u64 {
     var sorted = values;
-    std.mem.sort(u64, sorted[0..], {}, struct {
-        fn less(_: void, left: u64, right: u64) bool {
-            return left < right;
-        }
-    }.less);
-    return sorted[((sorted.len - 1) * percent) / 100];
+    std.mem.sort(u64, &sorted, {}, std.sort.asc(u64));
+    return sorted;
+}
+
+fn percentile(sorted: *const [sample_count]u64, percent: usize) u64 {
+    return sorted[((sample_count - 1) * percent) / 100];
 }
 
 fn executeBatch(allocator: std.mem.Allocator) !void {
@@ -228,4 +232,14 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
         host,
         builtin.zig_version_string,
     });
+}
+
+test "Seq replay driver summary sorts once without changing captured order" {
+    var samples: [sample_count]u64 = undefined;
+    for (&samples, 0..) |*sample, index| sample.* = @intCast(sample_count - index);
+    const captured = samples;
+    const sorted = sortedSamples(samples);
+    try std.testing.expectEqual(@as(u64, 15), percentile(&sorted, 50));
+    try std.testing.expectEqual(@as(u64, 28), percentile(&sorted, 95));
+    try std.testing.expectEqualSlices(u64, &captured, &samples);
 }
