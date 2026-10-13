@@ -29,19 +29,19 @@ pub fn runDelegatedCli(
     skill_name: []const u8,
     script_name: []const u8,
     runtime: DelegateRuntime,
-) !void {
+) !u8 {
     if (argv.len <= 1 or isHelpRequested(argv)) {
         var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpWithVersion(stdout, usage_text, version_text);
-        return;
+        return 0;
     }
 
     if (isVersionRequested(argv)) {
         var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, version_text);
-        return;
+        return 0;
     }
 
     const script_path = resolveScriptPath(
@@ -58,7 +58,7 @@ pub fn runDelegatedCli(
             "{s}: unable to locate delegated script {s}\n",
             .{ source_file, script_name },
         );
-        std.process.exit(1);
+        return 1;
     };
     defer allocator.free(script_path);
 
@@ -75,9 +75,9 @@ pub fn runDelegatedCli(
             "{s}: delegate execution failed: {s}\n",
             .{ source_file, @errorName(err) },
         );
-        std.process.exit(1);
+        return 1;
     };
-    if (exit_code != 0) std.process.exit(exit_code);
+    return exit_code;
 }
 
 pub fn runUvPython(
