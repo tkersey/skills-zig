@@ -367,3 +367,29 @@ test "script lookup preserves home-relative precedence" {
         resolveScriptPath(allocator, io, home, "demo", "test.py"),
     );
 }
+
+test "delegated CLI returns nonzero child status without terminating its host" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".codex/skills/demo/scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".codex/skills/demo/scripts/exit.sh",
+        .data = "exit 7\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    try std.testing.expectEqual(@as(u8, 7), try runDelegatedCli(
+        allocator,
+        io,
+        home,
+        &.{ "demo", "run" },
+        "usage",
+        "1",
+        "test",
+        "demo",
+        "exit.sh",
+        .bash,
+    ));
+}

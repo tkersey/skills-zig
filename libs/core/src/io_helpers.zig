@@ -69,3 +69,21 @@ test "filesystem helpers propagate supplied I/O cancellation" {
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
     try std.testing.expectError(error.Canceled, readFileAlloc(io, std.Io.Dir.cwd(), std.testing.allocator, "unused", 32));
 }
+
+test "terminal writes use supplied I/O and swallow only broken pipe" {
+    const ClosedReader = struct {
+        fn operate(_: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            return switch (op) {
+                .file_write_streaming => .{ .file_write_streaming = error.BrokenPipe },
+                else => unreachable,
+            };
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = ClosedReader.operate;
+    const io: std.Io = .{ .userdata = null, .vtable = &vtable };
+    try writeToStreamAllowBrokenPipe(io, std.Io.File.stdout(), "closed");
+    try writeAllAllowBrokenPipe(io, std.Io.File.stdout(), "closed");
+    try std.testing.expectError(error.InputOutput, writeToStreamAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"));
+    try std.testing.expectError(error.InputOutput, writeAllAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"));
+}

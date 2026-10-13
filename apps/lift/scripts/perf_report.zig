@@ -107,26 +107,35 @@ const ReportBody =
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    const stdout = &stdout_writer.interface;
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
 
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(stdout, argv, HelpSurface, Version)) return;
 
-    const cfg = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    const cfg = parseArgs(argv) catch |err| switch (err) {
+        error.HelpRequested => return core_cli.printHelpSurface(stdout, HelpSurface, Version),
+        error.VersionRequested => return core_cli.printVersion(stdout, Version),
+        else => {
+            core_cli.printUsageFailureWithHelp(&stderr_writer.interface, HelpSurface, Version, @errorName(err), null) catch std.process.exit(1);
+            std.process.exit(2);
+        },
     };
-    const report_date = try currentDateIso(allocator);
+    const report_date = try currentDateIso(io, allocator);
     defer allocator.free(report_date);
 
     const output = try renderReportAlloc(allocator, cfg, report_date);
     defer allocator.free(output);
 
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+    try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = cfg.output,
         .data = output,
     });
     const success_message = try allocator.print("Wrote {s}\n", .{cfg.output});
     defer allocator.free(success_message);
-    try writeToStreamAllowBrokenPipe(std.Io.File.stdout(), success_message);
+    try core_io.writeAllAllowBrokenPipe(io, std.Io.File.stdout(), success_message);
 }
 
 fn renderReportAlloc(allocator: std.mem.Allocator, cfg: Config, report_date: []const u8) ![]u8 {
@@ -147,24 +156,8 @@ fn parseArgs(argv: []const []const u8) !Config {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-            std.process.exit(0);
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printVersion(stdout, Version);
-            std.process.exit(0);
-        }
+        if (core_cli.isHelpArg(arg)) return error.HelpRequested;
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
         if (std.mem.eql(u8, arg, "--title")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -194,9 +187,9 @@ fn parseArgs(argv: []const []const u8) !Config {
     return cfg;
 }
 
-fn currentDateIso(allocator: std.mem.Allocator) ![]u8 {
+fn currentDateIso(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     const now_sec: i64 = @intCast(@divFloor(
-        std.Io.Clock.real.now(core_io.defaultIo()).nanoseconds,
+        std.Io.Clock.real.now(io).nanoseconds,
         1_000_000_000,
     ));
     const days: i64 = @divFloor(now_sec, 86_400);
@@ -222,15 +215,19 @@ fn civilFromDays(days_since_unix_epoch: i64) Date {
     };
 }
 
-fn writeToStreamAllowBrokenPipe(file: std.Io.File, bytes: []const u8) !void {
-    return core_io.writeAllAllowBrokenPipe(file, bytes);
-}
-
 test "civil date conversion stable around epoch" {
     const epoch = civilFromDays(0);
     try std.testing.expectEqual(@as(i64, 1970), epoch.year);
     try std.testing.expectEqual(@as(i64, 1), epoch.month);
     try std.testing.expectEqual(@as(i64, 1), epoch.day);
+}
+
+test "report parser preserves help precedence and option-looking values" {
+    try std.testing.expectError(error.HelpRequested, parseArgs(&.{ "perf_report", "--owner", "me", "-h" }));
+    try std.testing.expectError(error.VersionRequested, parseArgs(&.{ "perf_report", "--owner", "me", "-V" }));
+    try std.testing.expectError(error.UnknownArg, parseArgs(&.{ "perf_report", "--unknown", "--help" }));
+    const cfg = try parseArgs(&.{ "perf_report", "--title", "--help", "--title", "-V" });
+    try std.testing.expectEqualStrings("-V", cfg.title);
 }
 
 fn renderReportWithAllocator(allocator: std.mem.Allocator) !void {

@@ -96,38 +96,62 @@ const CiDelta = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    const stdout = &stdout_writer.interface;
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
+    const stderr = &stderr_writer.interface;
 
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(stdout, argv, HelpSurface, Version)) return;
 
-    var cfg = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    var cfg = parseArgs(argv) catch |err| switch (err) {
+        error.HelpRequested => return core_cli.printHelpSurface(stdout, HelpSurface, Version),
+        error.VersionRequested => return core_cli.printVersion(stdout, Version),
+        else => {
+            core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, @errorName(err), null) catch std.process.exit(1);
+            std.process.exit(2);
+        },
     };
     if (cfg.input_path != null and cfg.input_path.?.len == 0) cfg.input_path = null;
     if (cfg.compare_path != null and cfg.compare_path.?.len == 0) cfg.compare_path = null;
 
-    if (cfg.compare_path) |path| return runComparison(allocator, cfg, path);
-    return runSummary(allocator, cfg);
-}
-
-fn runComparison(allocator: std.mem.Allocator, cfg: Config, compare_path: []const u8) !void {
-    if (!(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
-        core_cli.exitUsageFailure(HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha");
+    if (cfg.compare_path != null and !(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
+        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha") catch std.process.exit(1);
+        std.process.exit(2);
     }
 
-    var baseline_values = try readSamples(allocator, cfg, cfg.input_path, "baseline");
+    const outcome = if (cfg.compare_path) |path|
+        runComparison(io, std.Io.Dir.cwd(), std.Io.File.stdout(), allocator, cfg, path)
+    else
+        runSummary(io, std.Io.Dir.cwd(), std.Io.File.stdout(), allocator, cfg);
+    outcome catch |err| {
+        const detail: []const u8 = switch (err) {
+            error.NoSamples => std.process.exit(1),
+            error.InputTooLarge => "input exceeds 16 MiB",
+            error.BaselineInputTooLarge => "baseline input exceeds 16 MiB",
+            error.CompareInputTooLarge => "compare input exceeds 16 MiB",
+            else => return err,
+        };
+        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InputTooLarge", detail) catch std.process.exit(1);
+        std.process.exit(2);
+    };
+}
+
+fn runComparison(io: std.Io, dir: std.Io.Dir, stdout: std.Io.File, allocator: std.mem.Allocator, cfg: Config, compare_path: []const u8) !void {
+    var baseline_values = try readSamples(io, dir, stdout, allocator, cfg, cfg.input_path, "baseline");
     defer baseline_values.deinit(allocator);
-    var variant_values = try readSamples(allocator, cfg, compare_path, "compare");
+    var variant_values = try readSamples(io, dir, stdout, allocator, cfg, compare_path, "compare");
     defer variant_values.deinit(allocator);
 
     const baseline_report = computeReport(baseline_values.items, cfg.unit);
     const variant_report = computeReport(variant_values.items, cfg.unit);
 
-    const ci = try comparisonIntervals(allocator, cfg, baseline_values.items, variant_values.items);
+    const ci = try comparisonIntervals(io, allocator, cfg, baseline_values.items, variant_values.items);
 
     const output = try renderComparisonAlloc(allocator, cfg, baseline_report, variant_report, ci);
     defer allocator.free(output);
-    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output);
+    try core_io.writeToStreamAllowBrokenPipe(io, stdout, output);
 }
 
 fn renderComparisonAlloc(
@@ -169,6 +193,7 @@ fn renderComparisonAlloc(
 }
 
 fn comparisonIntervals(
+    io: std.Io,
     allocator: std.mem.Allocator,
     cfg: Config,
     baseline_values: []const f64,
@@ -177,7 +202,7 @@ fn comparisonIntervals(
     const ci_samples = cfg.ci_samples orelse 1000;
     var ci: CiDelta = .{};
     if (ci_samples > 0) {
-        const seed = cfg.seed orelse defaultSeed();
+        const seed = cfg.seed orelse defaultSeed(io);
         var prng = std.Random.DefaultPrng.init(seed);
         ci.p50 = try bootstrapCiDelta(
             allocator,
@@ -247,18 +272,16 @@ fn writeComparisonText(
 }
 
 fn readSamples(
+    io: std.Io,
+    dir: std.Io.Dir,
+    stdout: std.Io.File,
     allocator: std.mem.Allocator,
     cfg: Config,
     path: ?[]const u8,
     comptime label: []const u8,
 ) !std.ArrayList(f64) {
-    const input = readInputAlloc(allocator, path) catch |err| switch (err) {
-        error.InputTooLarge => core_cli.exitUsageFailure(
-            HelpSurface,
-            Version,
-            "InputTooLarge",
-            label ++ " input exceeds 16 MiB",
-        ),
+    const input = readInputAlloc(io, dir, allocator, path) catch |err| switch (err) {
+        error.InputTooLarge => return if (comptime std.mem.eql(u8, label, "baseline")) error.BaselineInputTooLarge else error.CompareInputTooLarge,
         else => return err,
     };
     defer allocator.free(input);
@@ -268,24 +291,17 @@ fn readSamples(
     if (values.items.len == 0) {
         const sample_label = if (comptime std.mem.eql(u8, label, "compare")) "variant" else label;
         try core_io.writeToStreamAllowBrokenPipe(
-            std.Io.File.stdout(),
+            io,
+            stdout,
             "No numeric " ++ sample_label ++ " samples found.\n",
         );
-        std.process.exit(1);
+        return error.NoSamples;
     }
     return values;
 }
 
-fn runSummary(allocator: std.mem.Allocator, cfg: Config) !void {
-    const input_text = readInputAlloc(allocator, cfg.input_path) catch |err| switch (err) {
-        error.InputTooLarge => core_cli.exitUsageFailure(
-            HelpSurface,
-            Version,
-            "InputTooLarge",
-            "input exceeds 16 MiB",
-        ),
-        else => return err,
-    };
+fn runSummary(io: std.Io, dir: std.Io.Dir, stdout: std.Io.File, allocator: std.mem.Allocator, cfg: Config) !void {
+    const input_text = try readInputAlloc(io, dir, allocator, cfg.input_path);
     defer allocator.free(input_text);
 
     var values: std.ArrayList(f64) = .empty;
@@ -294,17 +310,18 @@ fn runSummary(allocator: std.mem.Allocator, cfg: Config) !void {
 
     if (values.items.len == 0) {
         try core_io.writeToStreamAllowBrokenPipe(
-            std.Io.File.stdout(),
+            io,
+            stdout,
             "No numeric samples found.\n",
         );
-        std.process.exit(1);
+        return error.NoSamples;
     }
 
     const report = computeReport(values.items, cfg.unit);
 
     const output = try renderSummaryAlloc(allocator, cfg, report);
     defer allocator.free(output);
-    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output);
+    try core_io.writeToStreamAllowBrokenPipe(io, stdout, output);
 }
 
 fn renderSummaryAlloc(allocator: std.mem.Allocator, cfg: Config, report: Report) ![]u8 {
@@ -346,24 +363,8 @@ fn parseArgs(argv: []const []const u8) !Config {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-            std.process.exit(0);
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printVersion(stdout, Version);
-            std.process.exit(0);
-        }
+        if (core_cli.isHelpArg(arg)) return error.HelpRequested;
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
         if (std.mem.eql(u8, arg, "--all")) {
             cfg.parse_all = true;
             continue;
@@ -410,16 +411,16 @@ fn setValueArgument(cfg: *Config, arg: []const u8, value: []const u8) !void {
     } else unreachable; // isValueArgument admits the complete set above.
 }
 
-fn readInputAlloc(allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
-    if (path) |value| return readFileWithLimitAlloc(allocator, value);
-    return core_io.readStdinAlloc(allocator, MaxInputBytes) catch |err| switch (err) {
+fn readInputAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
+    if (path) |value| return readFileWithLimitAlloc(io, dir, allocator, value);
+    return core_io.readStdinAlloc(io, allocator, MaxInputBytes) catch |err| switch (err) {
         error.StreamTooLong => error.InputTooLarge,
         else => err,
     };
 }
 
-fn readFileWithLimitAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return core_io.readFileAlloc(allocator, path, MaxInputBytes) catch |err| switch (err) {
+fn readFileWithLimitAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return core_io.readFileAlloc(io, dir, allocator, path, MaxInputBytes) catch |err| switch (err) {
         error.FileTooBig => error.InputTooLarge,
         error.StreamTooLong => error.InputTooLarge,
         else => err,
@@ -501,8 +502,8 @@ fn percentile(sorted_values: []const f64, p: f64) f64 {
     return sorted_values[fi] + (sorted_values[ci] - sorted_values[fi]) * (k - f);
 }
 
-fn defaultSeed() u64 {
-    const ts: i64 = @intCast(std.Io.Clock.awake.now(defaultIo()).nanoseconds);
+fn defaultSeed(io: std.Io) u64 {
+    const ts: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
     return @bitCast(ts);
 }
 
@@ -993,11 +994,35 @@ test "usage text references installed binary" {
     try std.testing.expect(std.mem.indexOf(u8, UsageText, "bench_stats [options]") != null);
 }
 
+test "parser reports command outcomes without swallowing option values or earlier errors" {
+    try std.testing.expectError(error.HelpRequested, parseArgs(&.{ "bench_stats", "--all", "--help" }));
+    try std.testing.expectError(error.VersionRequested, parseArgs(&.{ "bench_stats", "--json", "version" }));
+    try std.testing.expectError(error.UnknownArg, parseArgs(&.{ "bench_stats", "--unknown", "--help" }));
+    const cfg = try parseArgs(&.{ "bench_stats", "--unit", "--help", "--unit", "-V" });
+    try std.testing.expectEqualStrings("-V", cfg.unit);
+}
+
+test "sample file reads use the supplied directory capability" {
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const io = std.testing.io;
+    try first.dir.writeFile(io, .{ .sub_path = "samples", .data = "1\n" });
+    try second.dir.writeFile(io, .{ .sub_path = "samples", .data = "2\n" });
+    const first_bytes = try readInputAlloc(io, first.dir, std.testing.allocator, "samples");
+    defer std.testing.allocator.free(first_bytes);
+    const second_bytes = try readInputAlloc(io, second.dir, std.testing.allocator, "samples");
+    defer std.testing.allocator.free(second_bytes);
+    try std.testing.expectEqualStrings("1\n", first_bytes);
+    try std.testing.expectEqualStrings("2\n", second_bytes);
+}
+
 test "readFileWithLimitAlloc rejects oversized files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var file = try tmp.dir.createFile(io, "oversized.txt", .{});
     defer file.close(io);
 
@@ -1016,7 +1041,7 @@ test "readFileWithLimitAlloc rejects oversized files" {
 
     try std.testing.expectError(
         error.InputTooLarge,
-        readFileWithLimitAlloc(std.testing.allocator, path),
+        readFileWithLimitAlloc(io, std.Io.Dir.cwd(), std.testing.allocator, path),
     );
 }
 
@@ -1047,10 +1072,6 @@ fn fuzzParseLineTarget(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz parse numbers from arbitrary input" {
     try std.testing.fuzz({}, fuzzParseLineTarget, .{});
-}
-
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn renderSummaryWithAllocator(allocator: std.mem.Allocator, output_json: bool) !void {
@@ -1085,8 +1106,8 @@ test "comparison renderer preserves fields and deterministic seeded intervals" {
     const base_report = computeReport(&baseline, "");
     const variant_report = computeReport(&variant, "");
     const cfg = Config{ .output_json = true, .ci_samples = 200, .seed = 42 };
-    const ci = try comparisonIntervals(allocator, cfg, &baseline, &variant);
-    const repeated = try comparisonIntervals(allocator, cfg, &baseline, &variant);
+    const ci = try comparisonIntervals(std.testing.io, allocator, cfg, &baseline, &variant);
+    const repeated = try comparisonIntervals(std.testing.io, allocator, cfg, &baseline, &variant);
     try std.testing.expectEqualDeep(ci, repeated);
     // Pin the existing p50 -> p95 -> p99 RNG consumption order.
     try std.testing.expectEqual(CiInterval{ .lo = -2, .hi = 4 }, ci.p50.?);
