@@ -2280,6 +2280,7 @@ fn compileTestProgram(
         .data = definition_bytes,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         directory,
         "observation.json",

@@ -539,17 +539,19 @@ fn classifyRawEvent(root: std.json.ObjectMap) RawEventClassification {
 }
 
 pub fn parseSessionTrace(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
 
-    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stat = try file.stat(io);
+    var reader = file.reader(io, &.{});
     return parseSessionTraceReader(
+        io,
         allocator,
         path,
         &reader.interface,
@@ -562,6 +564,7 @@ pub fn parseSessionTrace(
 /// only and is never reopened. `source_mtime_ns` is observed by the caller
 /// from the same held source file and is used only for ongoing-turn status.
 pub fn parseSessionTraceBytes(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     content: []const u8,
@@ -569,10 +572,11 @@ pub fn parseSessionTraceBytes(
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
     var reader = std.Io.Reader.fixed(content);
-    return parseSessionTraceReader(allocator, path, &reader, source_mtime_ns, options);
+    return parseSessionTraceReader(io, allocator, path, &reader, source_mtime_ns, options);
 }
 
 pub fn parseSessionTraceReader(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -583,6 +587,7 @@ pub fn parseSessionTraceReader(
         fn visit(_: void, _: []const u8, _: usize) !void {}
     };
     return parseSessionTraceReaderWithVisitor(
+        io,
         allocator,
         path,
         reader,
@@ -594,6 +599,7 @@ pub fn parseSessionTraceReader(
 }
 
 pub fn parseSessionTraceReaderWithVisitor(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -604,6 +610,7 @@ pub fn parseSessionTraceReaderWithVisitor(
 ) !CanonicalSessionTrace {
     var metrics = StreamMetrics{};
     return parseSessionTraceReaderWithVisitorMetrics(
+        io,
         allocator,
         path,
         reader,
@@ -692,6 +699,7 @@ fn appendMalformedWarning(
 }
 
 pub fn parseSessionTraceReaderWithVisitorMetrics(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -731,7 +739,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         } orelse continue;
         try parser.apply(ParsedRecord.init(root, record.number, line));
     }
-    try finalizeTrace(allocator, &trace, source_mtime_ns, options);
+    try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
@@ -1077,12 +1085,13 @@ fn applyThreadSettings(
 }
 
 fn finalizeTrace(
+    io: std.Io,
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     source_mtime_ns: i128,
     options: TraceParseOptions,
 ) !void {
-    const age_secs = @divTrunc(nowRealtimeNs() - source_mtime_ns, std.time.ns_per_s);
+    const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
     for (trace.turns.items) |*turn| {
         if (turn.status != .ongoing) continue;
         const fresh = age_secs <= options.ongoing_threshold_secs;
@@ -1105,17 +1114,19 @@ fn finalizeTrace(
 }
 
 pub fn parseSessionSummaryTrace(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
 
-    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stat = try file.stat(io);
+    var reader = file.reader(io, &.{});
     return parseSessionSummaryTraceReader(
+        io,
         allocator,
         path,
         &reader.interface,
@@ -1125,6 +1136,7 @@ pub fn parseSessionSummaryTrace(
 }
 
 pub fn parseSessionSummaryTraceReader(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -1135,6 +1147,7 @@ pub fn parseSessionSummaryTraceReader(
         fn visit(_: void, _: []const u8, _: usize) !void {}
     };
     return parseSessionSummaryTraceReaderWithVisitor(
+        io,
         allocator,
         path,
         reader,
@@ -1146,6 +1159,7 @@ pub fn parseSessionSummaryTraceReader(
 }
 
 pub fn parseSessionSummaryTraceReaderWithVisitor(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -1156,6 +1170,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitor(
 ) !CanonicalSessionTrace {
     var metrics = StreamMetrics{};
     return parseSessionSummaryTraceReaderWithVisitorMetrics(
+        io,
         allocator,
         path,
         reader,
@@ -1168,6 +1183,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitor(
 }
 
 pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -1208,7 +1224,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         } orelse continue;
         try parser.apply(ParsedRecord.init(root, record.number, line));
     }
-    try parser.finish(source_mtime_ns, options);
+    try parser.finish(io, source_mtime_ns, options);
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
@@ -1313,11 +1329,12 @@ const SummaryParser = struct {
 
     fn finish(
         self: *SummaryParser,
+        io: std.Io,
         source_mtime_ns: i128,
         options: TraceParseOptions,
     ) !void {
         const session = &self.trace.session;
-        const age_secs = @divTrunc(nowRealtimeNs() - source_mtime_ns, std.time.ns_per_s);
+        const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
         if (self.last_turn_open) {
             const fresh = age_secs <= options.ongoing_threshold_secs;
             const reason = if (fresh) "fresh_ongoing_turn" else "stale_ongoing_file";
@@ -2999,12 +3016,8 @@ fn namespaceFromName(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     return try allocator.dupe(u8, rest[0..split]);
 }
 
-fn nowRealtimeNs() i128 {
-    var ts: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
-        .SUCCESS => (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec,
-        else => 0,
-    };
+fn nowRealtimeNs(io: std.Io) i128 {
+    return std.Io.Clock.real.now(io).nanoseconds;
 }
 
 fn bestTimestamp(root: std.json.ObjectMap) ?[]const u8 {
@@ -3060,10 +3073,11 @@ test "canonical messages normalize and suppress repeated source carriers" {
         "\"timestamp\":\"2026-07-13T00:00:03Z\"," ++
         "\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n";
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/tmp/messages.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{},
     );
     defer trace.deinit(std.testing.allocator);
@@ -3103,10 +3117,11 @@ test "canonical messages preserve identical text across turns" {
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:01:02Z\"," ++
         "\"payload\":{\"type\":\"user_message\",\"message\":\"yes\"}}\n";
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/tmp/repeated-messages.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{},
     );
     defer trace.deinit(std.testing.allocator);
@@ -3139,11 +3154,51 @@ test "parseRawTraceEvent detects old root function call output" {
 
 fn testPath(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
     const cwd = try std.process.currentPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        std.testing.io,
         allocator,
     );
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, relative });
+}
+
+test "trace file entry points use the supplied directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "session.jsonl",
+        .data = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"supplied-dir\"}}\n",
+    });
+    inline for (.{ parseSessionTrace, parseSessionSummaryTrace }) |parse| {
+        var trace = try parse(std.testing.io, tmp.dir, std.testing.allocator, "session.jsonl", .{});
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("supplied-dir", trace.session.session_id.?);
+        try std.testing.expectEqualStrings("session.jsonl", trace.session.path);
+    }
+}
+
+test "trace ongoing status uses the supplied clock at the threshold" {
+    const FixedClock = struct {
+        fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            std.debug.assert(clock == .real);
+            return .{ .nanoseconds = 120 * std.time.ns_per_s };
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FixedClock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const content = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"open\"}}\n";
+    inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
+        for ([_]i128{ 60, 59 }) |modified_seconds| {
+            var reader: std.Io.Reader = .fixed(content);
+            var trace = try parse(io, std.testing.allocator, "session.jsonl", &reader, modified_seconds * std.time.ns_per_s, .{});
+            defer trace.deinit(std.testing.allocator);
+            try std.testing.expectEqual(modified_seconds == 60, trace.session.is_ongoing);
+            try std.testing.expectEqualStrings(
+                if (modified_seconds == 60) "fresh_ongoing_turn" else "stale_ongoing_file",
+                trace.session.status_reason.?,
+            );
+        }
+    }
 }
 
 test "parseSessionTrace reconstructs new complete turn" {
@@ -3152,10 +3207,16 @@ test "parseSessionTrace reconstructs new complete turn" {
         "libs/trace_core/testdata/new_044_plus.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{
-        .ongoing_threshold_secs = 0,
-        .include_token_events = true,
-    });
+    var trace = try parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{
+            .ongoing_threshold_secs = 0,
+            .include_token_events = true,
+        },
+    );
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("new-session", trace.session.session_id.?);
     try std.testing.expectEqual(@as(usize, 1), trace.turns.items.len);
@@ -3189,10 +3250,11 @@ test "lossless token events retain lineage, both usage tuples, and event setting
         \\
     ;
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/provenance/worker.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{
             .include_token_events = true,
             .include_occurrence_payloads = false,
@@ -3227,10 +3289,11 @@ test "bytes-backed trace parsing preserves the exact assistant occurrence line" 
         \\
     ;
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/provenance/only.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{ .include_raw = true },
     );
     defer trace.deinit(std.testing.allocator);
@@ -3270,10 +3333,11 @@ test "bounded tool retention still observes the retained call completion" {
         \\
     ;
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/provenance/bounded.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{
             .include_occurrences = false,
             .include_message_bodies = false,
@@ -3306,10 +3370,11 @@ test "bounded tool retention preserves newest-turn query semantics" {
         \\
     ;
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/provenance/bounded-newest.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{
             .include_occurrences = false,
             .include_message_bodies = false,
@@ -3332,10 +3397,11 @@ test "canonical trace retains state and unknown carriers for exact consumers" {
         "{\"record_type\":\"state\",\"payload\":{\"opaque\":true}}\n" ++
         "{\"type\":\"future_carrier\",\"payload\":{\"opaque\":true}}\n";
     var trace = try parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/provenance/only.jsonl",
         source,
-        nowRealtimeNs(),
+        nowRealtimeNs(std.testing.io),
         .{},
     );
     defer trace.deinit(std.testing.allocator);
@@ -3350,11 +3416,17 @@ test "parseSessionSummaryTrace preserves session inventory fields" {
         "libs/trace_core/testdata/new_044_plus.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var full = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var full = try parseSessionTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
     defer full.deinit(std.testing.allocator);
-    var summary = try parseSessionSummaryTrace(std.testing.allocator, path, .{
-        .ongoing_threshold_secs = 0,
-    });
+    var summary = try parseSessionSummaryTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{
+            .ongoing_threshold_secs = 0,
+        },
+    );
     defer summary.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(full.session.session_id.?, summary.session.session_id.?);
@@ -3386,9 +3458,9 @@ test "first file-owner session metadata remains authoritative" {
     );
     defer std.testing.allocator.free(path);
 
-    var full = try parseSessionTrace(std.testing.allocator, path, .{});
+    var full = try parseSessionTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{});
     defer full.deinit(std.testing.allocator);
-    var summary = try parseSessionSummaryTrace(std.testing.allocator, path, .{});
+    var summary = try parseSessionSummaryTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{});
     defer summary.deinit(std.testing.allocator);
 
     for ([_]*const SessionRecord{ &full.session, &summary.session }) |session| {
@@ -3410,9 +3482,15 @@ test "parseSessionTrace reconstructs old synthetic turns" {
         "libs/trace_core/testdata/old_2025_08_root_meta.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{
-        .ongoing_threshold_secs = 0,
-    });
+    var trace = try parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{
+            .ongoing_threshold_secs = 0,
+        },
+    );
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("old-session", trace.session.session_id.?);
     try std.testing.expectEqual(@as(usize, 2), trace.turns.items.len);
@@ -3426,9 +3504,15 @@ test "parseSessionTrace reports lifecycle and graph edges" {
         "libs/trace_core/testdata/tools.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{
-        .ongoing_threshold_secs = 0,
-    });
+    var trace = try parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{
+            .ongoing_threshold_secs = 0,
+        },
+    );
     defer trace.deinit(std.testing.allocator);
     try std.testing.expect(trace.tools.items.len >= 7);
     try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
@@ -3461,10 +3545,17 @@ test "full trace propagates allocation failure and cleans every partial result" 
 }
 
 fn checkFullTraceAllocation(allocator: std.mem.Allocator) !void {
-    var trace = try parseSessionTraceBytes(allocator, "trace.jsonl", allocation_trace, 0, .{
-        .include_raw = true,
-        .include_token_events = true,
-    });
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "trace.jsonl",
+        allocation_trace,
+        0,
+        .{
+            .include_raw = true,
+            .include_token_events = true,
+        },
+    );
     defer trace.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), trace.turns.items.len);
     try std.testing.expectEqual(@as(usize, 2), trace.tools.items.len);
@@ -3483,7 +3574,7 @@ test "summary trace propagates allocation failure and cleans every partial resul
 
 fn checkSummaryAllocation(allocator: std.mem.Allocator) !void {
     var reader = std.Io.Reader.fixed(allocation_trace);
-    var trace = try parseSessionSummaryTraceReader(allocator, "trace.jsonl", &reader, 0, .{});
+    var trace = try parseSessionSummaryTraceReader(std.testing.io, allocator, "trace.jsonl", &reader, 0, .{});
     defer trace.deinit(allocator);
     try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
     try std.testing.expectEqual(@as(i64, 1), trace.session.spawned_worker_count);
@@ -3560,9 +3651,16 @@ test "tool lookup preserves duplicate declarations and latest completion" {
         \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"call","output":"last"}}
     ;
     for ([_]?usize{ null, 1 }) |limit| {
-        var trace = try parseSessionTraceBytes(std.testing.allocator, "trace.jsonl", input, 0, .{
-            .max_tools = limit,
-        });
+        var trace = try parseSessionTraceBytes(
+            std.testing.io,
+            std.testing.allocator,
+            "trace.jsonl",
+            input,
+            0,
+            .{
+                .max_tools = limit,
+            },
+        );
         defer trace.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
         try std.testing.expectEqual(@as(i64, 1), trace.turns.items[0].tool_count);

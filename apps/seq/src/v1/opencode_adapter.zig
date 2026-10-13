@@ -35,6 +35,8 @@ pub fn recognizes(path: []const u8) bool {
 }
 
 pub fn feedFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     runner: *execution.Runner,
@@ -42,6 +44,8 @@ pub fn feedFile(
     max_input_bytes: usize,
 ) !Metrics {
     return feedFileSelected(
+        io,
+        dir,
         allocator,
         program,
         runner,
@@ -52,6 +56,8 @@ pub fn feedFile(
 }
 
 pub fn feedFileSelected(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     runner: *execution.Runner,
@@ -68,8 +74,7 @@ pub fn feedFileSelected(
     }
     var session_id_buffer: [64]u8 = undefined;
     const session_id = try sessionId(&session_id_buffer, path);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try openFile(io, path);
+    const file = try openFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.size > max_input_bytes) {
@@ -846,11 +851,11 @@ fn toolCount(object: std.json.ObjectMap) usize {
     return count;
 }
 
-fn openFile(io: std.Io, path: []const u8) !std.Io.File {
+fn openFile(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     return if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+        try dir.openFile(io, path, .{});
 }
 
 fn encodeDigest(bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8) [71]u8 {
@@ -1183,6 +1188,8 @@ test "OpenCode prompt history streams aggregate input" {
         .child = std.testing.allocator,
     };
     const metrics = try feedFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         tracking.allocator(),
         &program,
         &runner,

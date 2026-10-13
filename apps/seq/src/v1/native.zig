@@ -154,11 +154,12 @@ pub fn run(
     argv: []const []const u8,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
 ) !u8 {
-    var options = try parseOptions(command, argv);
+    var options = try parseOptions(command, argv, io);
     options.environment = environment;
     const normalized_repo = if (options.repo) |repo|
-        try absolutePathAlloc(allocator, options.environment, repo)
+        try absolutePathAlloc(allocator, options.environment, repo, io, dir)
     else
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
@@ -173,6 +174,7 @@ pub fn run(
         allocator,
         &bounded.interface,
         io,
+        dir,
         command,
         options,
     ) catch |err| {
@@ -194,6 +196,7 @@ fn runCommand(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     command: Command,
     options: Options,
 ) !void {
@@ -202,6 +205,7 @@ fn runCommand(
             allocator,
             writer,
             io,
+            dir,
             .sessions,
             options,
             false,
@@ -210,6 +214,7 @@ fn runCommand(
             allocator,
             writer,
             io,
+            dir,
             .turns,
             options,
             false,
@@ -218,6 +223,7 @@ fn runCommand(
             allocator,
             writer,
             io,
+            dir,
             .tool_lifecycle,
             options,
             false,
@@ -226,25 +232,28 @@ fn runCommand(
             allocator,
             writer,
             io,
+            dir,
             options,
         ),
         .session_detail => try runSessionDetail(
             allocator,
             writer,
             io,
+            dir,
             options,
         ),
-        .tail => try runTail(allocator, writer, io, options),
+        .tail => try runTail(allocator, writer, io, dir, options),
         .find_session => try runFindSession(
             allocator,
             writer,
             io,
+            dir,
             options,
         ),
         .datasets => try runDatasets(writer, options),
         .dataset_schema => try runDatasetSchema(writer, options),
-        .query => try runQuery(allocator, writer, io, options),
-        .index => try runIndex(allocator, writer, io, options),
+        .query => try runQuery(allocator, writer, io, dir, options),
+        .index => try runIndex(allocator, writer, io, dir, options),
     }
 }
 
@@ -406,7 +415,7 @@ fn parseNativeLimit(raw: []const u8) !usize {
     return limit;
 }
 
-fn validateNativeSelectors(options: *Options) !void {
+fn validateNativeSelectors(options: *Options, io: std.Io) !void {
     if (options.path != null and
         (options.session_id != null or options.current))
     {
@@ -415,10 +424,10 @@ fn validateNativeSelectors(options: *Options) !void {
     if (options.session_id != null and options.current) {
         return error.ConflictingSessionSelectors;
     }
-    try resolveTemporalBounds(options);
+    try resolveTemporalBounds(options, io);
 }
 
-fn parseOptions(command: Command, argv: []const []const u8) !Options {
+fn parseOptions(command: Command, argv: []const []const u8, io: std.Io) !Options {
     var options = Options{};
     var seen_options: u32 = 0;
     var index: usize = 0;
@@ -444,7 +453,7 @@ fn parseOptions(command: Command, argv: []const []const u8) !Options {
             null;
         try applyNativeOption(&options, option, value);
     }
-    try validateNativeSelectors(&options);
+    try validateNativeSelectors(&options, io);
     return options;
 }
 
@@ -509,7 +518,7 @@ fn optionAllowed(command: Command, option: NativeOption) bool {
     };
 }
 
-pub fn resolveTemporalBounds(options: *Options) !void {
+pub fn resolveTemporalBounds(options: *Options, io: std.Io) !void {
     if (options.last != null and options.since != null) {
         return error.ConflictingTimeSelectors;
     }
@@ -520,7 +529,7 @@ pub fn resolveTemporalBounds(options: *Options) !void {
         null;
     options.until_ms = until_ms;
     if (options.last) |raw| {
-        const anchor = until_ms orelse currentUnixMillis();
+        const anchor = until_ms orelse currentUnixMillis(io);
         options.since_ms = std.math.sub(
             i64,
             anchor,
@@ -557,9 +566,9 @@ fn parseDurationMillis(raw: []const u8) !i64 {
         error.InvalidDurationSelector;
 }
 
-fn currentUnixMillis() i64 {
+fn currentUnixMillis(io: std.Io) i64 {
     return @intCast(@divFloor(
-        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.real.now(io).nanoseconds,
         1_000_000,
     ));
 }
@@ -577,6 +586,7 @@ fn runRelation(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     relation: physical.Relation,
     options: Options,
     require_single: bool,
@@ -585,6 +595,7 @@ fn runRelation(
     var paths = try resolveTargetPaths(
         allocator,
         io,
+        dir,
         options,
         require_single,
     );
@@ -598,6 +609,8 @@ fn runRelation(
         if (selection.remaining != null and remaining == 0) break;
         if (opencode_adapter.recognizes(path)) {
             try writeOpenCodeRelationRows(
+                io,
+                dir,
                 allocator,
                 writer,
                 relation,
@@ -610,12 +623,16 @@ fn runRelation(
         }
         var trace = if (relation == .sessions)
             try trace_core.parseSessionSummaryTrace(
+                io,
+                dir,
                 allocator,
                 path,
                 traceOptions(relation),
             )
         else
             try trace_core.parseSessionTrace(
+                io,
+                dir,
                 allocator,
                 path,
                 traceOptions(relation),
@@ -659,15 +676,18 @@ fn runSessionDetail(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(allocator, io, options, true);
+    var paths = try resolveTargetPaths(allocator, io, dir, options, true);
     defer freePaths(allocator, &paths);
     if (opencode_adapter.recognizes(paths.items[0])) {
         return error.OpenCodeSessionDetailUnavailable;
     }
     var trace = try trace_core.parseSessionTrace(
+        io,
+        dir,
         allocator,
         paths.items[0],
         traceOptions(.turns),
@@ -681,6 +701,7 @@ fn runSessionGraph(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     if (options.format == .json) {
@@ -688,19 +709,22 @@ fn runSessionGraph(
             allocator,
             writer,
             io,
+            dir,
             .session_edges,
             options,
             false,
         );
     }
     if (options.format != .dot) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(allocator, io, options, false);
+    var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
     try writer.writeAll("digraph codex_sessions {\n");
     var remaining = options.limit;
     for (paths.items) |path| {
         if (remaining == 0) break;
         var trace = try trace_core.parseSessionTrace(
+            io,
+            dir,
             allocator,
             path,
             traceOptions(.session_edges),
@@ -725,6 +749,7 @@ fn runTail(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     if (!options.once) return error.TailFollowRequiresExplicitRuntime;
@@ -732,6 +757,7 @@ fn runTail(
         allocator,
         writer,
         io,
+        dir,
         .source_events,
         options,
         true,
@@ -742,6 +768,7 @@ fn runFindSession(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     if (options.prompt == null and options.session_id == null) {
@@ -751,6 +778,7 @@ fn runFindSession(
     var paths = try resolveTargetPaths(
         allocator,
         io,
+        dir,
         options,
         false,
     );
@@ -768,6 +796,8 @@ fn runFindSession(
             var opencode_options = options;
             opencode_options.contains = options.prompt;
             try writeOpenCodeRelationRows(
+                io,
+                dir,
                 allocator,
                 writer,
                 .sessions,
@@ -779,6 +809,8 @@ fn runFindSession(
             continue;
         }
         var trace = try trace_core.parseSessionTrace(
+            io,
+            dir,
             allocator,
             path,
             traceOptions(.messages),
@@ -899,10 +931,11 @@ fn runQuery(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     const raw_spec = options.spec orelse return error.MissingQuerySpec;
-    const spec_bytes = try loadQuerySpecAlloc(allocator, io, raw_spec);
+    const spec_bytes = try loadQuerySpecAlloc(allocator, io, dir, raw_spec);
     defer allocator.free(spec_bytes);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -918,19 +951,20 @@ fn runQuery(
         .object => |value| value,
         else => return error.InvalidQuerySpec,
     };
-    return runQueryObject(allocator, writer, io, options, object);
+    return runQueryObject(allocator, writer, io, dir, options, object);
 }
 
 fn runQueryObject(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
     object: std.json.ObjectMap,
 ) !void {
     var query_options = try queryTargetOptions(options, object);
     const normalized_repo = if (query_options.repo) |repo|
-        try absolutePathAlloc(allocator, query_options.environment, repo)
+        try absolutePathAlloc(allocator, query_options.environment, repo, io, dir)
     else
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
@@ -959,12 +993,15 @@ fn runQueryObject(
     var paths = try resolveTargetPaths(
         allocator,
         io,
+        dir,
         query_options,
         false,
     );
     defer freePaths(allocator, &paths);
     for (paths.items) |path| {
         const feed_result = try feedQueryPath(
+            io,
+            dir,
             allocator,
             path,
             query_options,
@@ -983,6 +1020,8 @@ fn runQueryObject(
 }
 
 fn feedQueryPath(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: Options,
@@ -991,6 +1030,8 @@ fn feedQueryPath(
 ) !execution.Feed {
     if (opencode_adapter.recognizes(path)) {
         return feedOpenCodeQueryPath(
+            io,
+            dir,
             allocator,
             path,
             options,
@@ -1000,12 +1041,16 @@ fn feedQueryPath(
     }
     var trace = if (compilation.relation == .sessions)
         try trace_core.parseSessionSummaryTrace(
+            io,
+            dir,
             allocator,
             path,
             traceOptions(compilation.relation),
         )
     else
         try trace_core.parseSessionTrace(
+            io,
+            dir,
             allocator,
             path,
             traceOptions(compilation.relation),
@@ -1050,6 +1095,8 @@ fn feedQueryPath(
 }
 
 fn feedOpenCodeQueryPath(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: Options,
@@ -1073,6 +1120,8 @@ fn feedOpenCodeQueryPath(
         }
     }
     const metrics = try opencode_adapter.feedFile(
+        io,
+        dir,
         allocator,
         &compilation.program,
         runner,
@@ -1092,10 +1141,11 @@ fn rejectTraceWarnings(trace: *const trace_core.CanonicalSessionTrace) !void {
 fn loadQuerySpecAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     raw: []const u8,
 ) ![]u8 {
     if (raw.len > 1 and raw[0] == '@') {
-        return std.Io.Dir.cwd().readFileAlloc(
+        return dir.readFileAlloc(
             io,
             raw[1..],
             allocator,
@@ -1511,6 +1561,8 @@ fn writeQueryRows(
 }
 
 fn writeOpenCodeRelationRows(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     relation: physical.Relation,
@@ -1545,6 +1597,8 @@ fn writeOpenCodeRelationRows(
     );
     defer runner.deinit();
     const metrics = try opencode_adapter.feedFileSelected(
+        io,
+        dir,
         allocator,
         &compilation.program,
         &runner,
@@ -1681,6 +1735,7 @@ fn runIndex(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
@@ -1688,6 +1743,8 @@ fn runIndex(
         allocator,
         options.environment,
         options.root,
+        io,
+        dir,
     );
     defer allocator.free(root);
     const action = options.action orelse "build";
@@ -1700,6 +1757,7 @@ fn runIndex(
     var paths = try collectJsonlPaths(
         allocator,
         io,
+        dir,
         root,
         options.root != null,
     );
@@ -1708,7 +1766,7 @@ fn runIndex(
     var newest_mtime_ns: i128 = 0;
     var files: usize = 0;
     for (paths.items) |path| {
-        const stat = std.Io.Dir.cwd().statFile(
+        const stat = dir.statFile(
             io,
             path,
             .{ .follow_symlinks = false },
@@ -1735,6 +1793,7 @@ fn runIndex(
 pub fn resolveTargetPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     options: Options,
     require_single: bool,
 ) !std.ArrayList([]u8) {
@@ -1743,7 +1802,7 @@ pub fn resolveTargetPaths(
         errdefer freePaths(allocator, &paths);
         try paths.append(
             allocator,
-            try absolutePathAlloc(allocator, options.environment, path),
+            try absolutePathAlloc(allocator, options.environment, path, io, dir),
         );
         return paths;
     }
@@ -1751,16 +1810,21 @@ pub fn resolveTargetPaths(
         allocator,
         options.environment,
         options.root,
+        io,
+        dir,
     );
     defer allocator.free(root);
     const live_native_root = try isLiveNativeSessionRoot(
         allocator,
         options,
         root,
+        io,
+        dir,
     );
     var paths = try collectTargetJsonlPaths(
         allocator,
         io,
+        dir,
         root,
         options,
     );
@@ -1774,6 +1838,7 @@ pub fn resolveTargetPaths(
         retainCanonicalRolloutWindow(
             allocator,
             io,
+            dir,
             &paths,
             options,
             live_native_root,
@@ -1781,6 +1846,8 @@ pub fn resolveTargetPaths(
     }
     if (exact_session_id) |wanted| {
         retainSessionId(
+            io,
+            dir,
             allocator,
             &paths,
             wanted,
@@ -1797,6 +1864,7 @@ pub fn resolveTargetPaths(
 fn retainCanonicalRolloutWindow(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     paths: *std.ArrayList([]u8),
     options: Options,
     live_native_root: bool,
@@ -1806,7 +1874,7 @@ fn retainCanonicalRolloutWindow(
     for (paths.items) |path| {
         const modified_ms: ?i64 = if (live_native_root and
             options.since_ms != null)
-            modifiedMillis(io, path)
+            modifiedMillis(io, dir, path)
         else
             null;
         if (canonicalRolloutPathPassesWindow(
@@ -1823,8 +1891,8 @@ fn retainCanonicalRolloutWindow(
     paths.items.len = write_index;
 }
 
-fn modifiedMillis(io: std.Io, path: []const u8) ?i64 {
-    const stat = std.Io.Dir.cwd().statFile(
+fn modifiedMillis(io: std.Io, dir: std.Io.Dir, path: []const u8) ?i64 {
+    const stat = dir.statFile(
         io,
         path,
         .{ .follow_symlinks = false },
@@ -1922,6 +1990,8 @@ fn compareDates(left: seq_time.Date, right: seq_time.Date) std.math.Order {
 }
 
 fn retainSessionId(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     paths: *std.ArrayList([]u8),
     wanted: []const u8,
@@ -1954,6 +2024,8 @@ fn retainSessionId(
             continue;
         }
         var trace = trace_core.parseSessionSummaryTrace(
+            io,
+            dir,
             allocator,
             path,
             traceOptions(.sessions),
@@ -2002,12 +2074,13 @@ fn rolloutBasenameMatchesSessionId(
 fn collectJsonlPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     root: []const u8,
     require_existing: bool,
 ) !std.ArrayList([]u8) {
     var paths: std.ArrayList([]u8) = .empty;
     errdefer freePaths(allocator, &paths);
-    var root_dir = std.Io.Dir.openDirAbsolute(
+    var root_dir = dir.openDir(
         io,
         root,
         .{ .iterate = true },
@@ -2047,10 +2120,11 @@ fn collectJsonlPaths(
 fn collectTargetJsonlPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     root: []const u8,
     options: Options,
 ) !std.ArrayList([]u8) {
-    return collectJsonlPaths(allocator, io, root, options.root != null);
+    return collectJsonlPaths(allocator, io, dir, root, options.root != null);
 }
 
 fn lessThanPath(_: void, left: []u8, right: []u8) bool {
@@ -2069,9 +2143,11 @@ fn resolveRootAlloc(
     allocator: std.mem.Allocator,
     environment: ?*const std.process.Environ.Map,
     root: ?[]const u8,
+    io: std.Io,
+    dir: std.Io.Dir,
 ) ![]u8 {
     if (root) |explicit| {
-        return absolutePathAlloc(allocator, environment, explicit);
+        return absolutePathAlloc(allocator, environment, explicit, io, dir);
     }
     if (environmentValue(environment, "CODEX_HOME")) |codex_home| {
         return std.fs.path.join(allocator, &.{ codex_home, "sessions" });
@@ -2085,12 +2161,16 @@ fn isLiveNativeSessionRoot(
     allocator: std.mem.Allocator,
     options: Options,
     root: []const u8,
+    io: std.Io,
+    dir: std.Io.Dir,
 ) !bool {
     if (options.root == null) return true;
     const native_root = resolveRootAlloc(
         allocator,
         options.environment,
         null,
+        io,
+        dir,
     ) catch return false;
     defer allocator.free(native_root);
     return std.mem.eql(u8, root, native_root);
@@ -2100,6 +2180,8 @@ pub fn absolutePathAlloc(
     allocator: std.mem.Allocator,
     environment: ?*const std.process.Environ.Map,
     path: []const u8,
+    io: std.Io,
+    dir: std.Io.Dir,
 ) ![]u8 {
     if (std.mem.startsWith(u8, path, "~/")) {
         const home = environmentValue(environment, "HOME") orelse
@@ -2109,8 +2191,8 @@ pub fn absolutePathAlloc(
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.path.resolve(allocator, &.{path});
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const cwd = try dir.realPathFileAlloc(
+        io,
         ".",
         allocator,
     );
@@ -2253,23 +2335,27 @@ test "final native command registry is physical only" {
 test "native options reject conflicting session selectors" {
     try std.testing.expectError(
         error.ConflictingSessionSelectors,
-        parseOptions(.turns, &.{
-            "--path",
-            "one.jsonl",
-            "--session-id",
-            "session",
-        }),
+        parseOptions(
+            .turns,
+            &.{
+                "--path",
+                "one.jsonl",
+                "--session-id",
+                "session",
+            },
+            std.testing.io,
+        ),
     );
 }
 
 test "native options reject ignored command modifiers" {
     try std.testing.expectError(
         error.UnsupportedNativeOption,
-        parseOptions(.datasets, &.{ "--root", "/tmp/sessions" }),
+        parseOptions(.datasets, &.{ "--root", "/tmp/sessions" }, std.testing.io),
     );
     try std.testing.expectError(
         error.UnsupportedNativeOption,
-        parseOptions(.query, &.{ "--limit", "1" }),
+        parseOptions(.query, &.{ "--limit", "1" }, std.testing.io),
     );
 }
 
@@ -2296,6 +2382,7 @@ test "current session resolves CODEX_THREAD_ID exactly" {
     var paths = try resolveTargetPaths(
         std.testing.allocator,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .{
             .root = root,
             .current = true,
@@ -2327,6 +2414,7 @@ test "exact session selector inspects noncanonical files under imported roots" {
     var paths = try resolveTargetPaths(
         std.testing.allocator,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .{
             .root = root,
             .session_id = "fixture-session",
@@ -2363,6 +2451,7 @@ test "exact session selector rejects duplicate corpus matches" {
         resolveTargetPaths(
             std.testing.allocator,
             std.testing.io,
+            std.Io.Dir.cwd(),
             .{
                 .root = root,
                 .session_id = "duplicate-session",
@@ -2398,6 +2487,7 @@ test "bounded temporal selectors preserve all possible session directories" {
     var paths = try resolveTargetPaths(
         std.testing.allocator,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .{
             .root = root,
             .since_ms = seq_time.parseIsoTimestampMillis(
@@ -2489,11 +2579,15 @@ test "an explicit canonical session root retains live-source semantics" {
         std.testing.allocator,
         .{ .root = root, .environment = &environment },
         root,
+        std.testing.io,
+        std.Io.Dir.cwd(),
     ));
     try std.testing.expect(!(try isLiveNativeSessionRoot(
         std.testing.allocator,
         .{ .root = "/tmp/imported", .environment = &environment },
         "/tmp/imported",
+        std.testing.io,
+        std.Io.Dir.cwd(),
     )));
 }
 
@@ -2543,6 +2637,7 @@ test "physical queries select row timestamps across session directories" {
         std.testing.allocator,
         &output.writer,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .{
             .root = root,
             .since_ms = seq_time.parseIsoTimestampMillis(
@@ -2607,6 +2702,7 @@ test "OpenCode native surfaces reject malformed source records" {
             std.testing.allocator,
             &output.writer,
             std.testing.io,
+            std.Io.Dir.cwd(),
             .turns,
             .{ .path = path },
             true,
@@ -2621,6 +2717,7 @@ fn expectOpenCodeSessionSurfaces(root: []const u8) !void {
         std.testing.allocator,
         &sessions_output.writer,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .sessions,
         .{ .root = root, .contains = "beta" },
         false,
@@ -2639,6 +2736,7 @@ fn expectOpenCodeSessionSurfaces(root: []const u8) !void {
         std.testing.allocator,
         &find_output.writer,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .{ .root = root, .prompt = "beta" },
     );
     try std.testing.expect(
@@ -2657,6 +2755,7 @@ fn expectOpenCodeTurnSurfaces(path: []const u8) !void {
         std.testing.allocator,
         &turns_output.writer,
         std.testing.io,
+        std.Io.Dir.cwd(),
         .turns,
         .{ .path = path },
         true,
@@ -2679,6 +2778,7 @@ fn expectOpenCodeTurnSurfaces(path: []const u8) !void {
             std.testing.allocator,
             &detail_output.writer,
             std.testing.io,
+            std.Io.Dir.cwd(),
             .{ .path = path },
         ),
     );
@@ -2704,9 +2804,59 @@ test "absolute repository selectors normalize lexical aliases" {
         std.testing.allocator,
         null,
         "/repo/project/sub/../",
+        std.testing.io,
+        std.Io.Dir.cwd(),
     );
     defer std.testing.allocator.free(normalized);
     try std.testing.expectEqualStrings("/repo/project", normalized);
+}
+
+test "relative native paths and query specs use the supplied directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "query.json",
+        .data = "{\"dataset\":\"sessions\"}",
+    });
+    const expected = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "query.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(expected);
+    const resolved = try absolutePathAlloc(
+        std.testing.allocator,
+        null,
+        "query.json",
+        std.testing.io,
+        tmp.dir,
+    );
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(expected, resolved);
+    const spec = try loadQuerySpecAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "@query.json",
+    );
+    defer std.testing.allocator.free(spec);
+    try std.testing.expectEqualStrings("{\"dataset\":\"sessions\"}", spec);
+}
+
+test "relative temporal windows use the supplied clock" {
+    const FixedClock = struct {
+        fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            std.debug.assert(clock == .real);
+            return .{ .nanoseconds = 90 * std.time.ns_per_s };
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FixedClock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var options: Options = .{ .last = "1m" };
+    try resolveTemporalBounds(&options, io);
+    try std.testing.expectEqual(@as(?i64, 30_000), options.since_ms);
+    try std.testing.expectEqual(@as(?i64, 90_000), options.until_ms);
 }
 
 fn testSession(
@@ -2759,20 +2909,24 @@ test "native queries reject unknown spec keys" {
 test "native parsing rejects duplicate singleton options and unbounded limits" {
     try std.testing.expectError(
         error.DuplicateNativeOption,
-        parseOptions(.sessions, &.{
-            "--format",
-            "json",
-            "--format",
-            "json",
-        }),
+        parseOptions(
+            .sessions,
+            &.{
+                "--format",
+                "json",
+                "--format",
+                "json",
+            },
+            std.testing.io,
+        ),
     );
     try std.testing.expectError(
         error.InvalidNativeLimit,
-        parseOptions(.sessions, &.{ "--limit", "0" }),
+        parseOptions(.sessions, &.{ "--limit", "0" }, std.testing.io),
     );
     try std.testing.expectError(
         error.InvalidNativeLimit,
-        parseOptions(.sessions, &.{ "--limit", "100001" }),
+        parseOptions(.sessions, &.{ "--limit", "100001" }, std.testing.io),
     );
 }
 

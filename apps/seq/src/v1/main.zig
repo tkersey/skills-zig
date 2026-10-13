@@ -2,12 +2,12 @@ const std = @import("std");
 const app_meta = @import("app_meta");
 const definition_core = @import("definition_core");
 const seq = @import("seq_v1_core");
+const durable_store = @import("durable_store");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const source_adapter_version = "seq-source-adapter-set/v1";
 const max_output_cells: usize = 4_000_000;
 const max_discovery_bytes: usize = 256 * 1024 * 1024;
-threadlocal var runtime_io: ?std.Io = null;
 
 const Help =
     \\seq
@@ -83,8 +83,6 @@ const ObserveArgs = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    runtime_io = init.io;
-    defer runtime_io = null;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (isHostSequenceInvocation(argv[1..])) {
         const system_argv = try init.arena.allocator().alloc(
@@ -95,8 +93,8 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(system_argv[1..], argv[1..]);
         return std.process.replace(init.io, .{ .argv = system_argv });
     }
-    const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
-        emitCommandError(err) catch |write_err| {
+    const code = runWithArgv(init.io, std.Io.Dir.cwd(), init.gpa, init.environ_map, argv) catch |err| blk: {
+        emitCommandError(init.io, err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
             return write_err;
         };
@@ -106,29 +104,33 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn runWithArgv(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     if (argv.len < 2) {
-        try writeStdout(Help);
+        try writeStdout(io, Help);
         return 0;
     }
     if (isHelp(argv[1])) {
         if (argv.len != 2) return error.UnexpectedArgument;
-        try writeStdout(Help);
+        try writeStdout(io, Help);
         return 0;
     }
     if (std.mem.eql(u8, argv[1], "version") or isVersion(argv[1])) {
         if (argv.len != 2) return error.UnexpectedArgument;
-        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    return runSubcommand(allocator, environment, argv[1], argv[2..]);
+    return runSubcommand(io, dir, allocator, environment, argv[1], argv[2..]);
 }
 
 fn runSubcommand(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     command_name: []const u8,
@@ -136,47 +138,50 @@ fn runSubcommand(
 ) !u8 {
     if (std.mem.eql(u8, command_name, "capabilities")) {
         if (isOnlyHelp(argv)) {
-            try writeStdout(Help);
+            try writeStdout(io, Help);
             return 0;
         }
-        return emitCapabilities(argv);
+        return emitCapabilities(io, argv);
     }
     if (std.mem.eql(u8, command_name, "definition")) {
-        return runDefinitionCommand(allocator, environment, argv);
+        return runDefinitionCommand(io, dir, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command_name, "observe")) {
         if (isOnlyHelp(argv)) {
-            try writeStdout(Help);
+            try writeStdout(io, Help);
             return 0;
         }
-        return runObserve(allocator, environment, argv);
+        return runObserve(io, dir, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command_name, "explain")) {
         if (isOnlyHelp(argv)) {
-            try writeStdout(Help);
+            try writeStdout(io, Help);
             return 0;
         }
-        return runExplain(allocator, environment, argv);
+        return runExplain(io, dir, allocator, environment, argv);
     }
     if (seq.native.Command.parse(command_name)) |command| {
         if (isOnlyHelp(argv)) {
-            try writeStdout(seq.native.help(command));
+            try writeStdout(io, seq.native.help(command));
             return 0;
         }
-        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         return seq.native.run(
             allocator,
             environment,
             command,
             argv,
             &stdout_writer.interface,
-            defaultIo(),
+            io,
+            dir,
         );
     }
     return error.UnknownCommand;
 }
 
 fn runDefinitionCommand(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -184,31 +189,33 @@ fn runDefinitionCommand(
     if (argv.len == 0) return error.MissingDefinitionAction;
     if (std.mem.eql(u8, argv[0], "check")) {
         if (isOnlyHelp(argv[1..])) {
-            try writeStdout(Help);
+            try writeStdout(io, Help);
             return 0;
         }
-        return runDefinitionCheck(allocator, environment, argv[1..]);
+        return runDefinitionCheck(io, dir, allocator, environment, argv[1..]);
     }
     if (std.mem.eql(u8, argv[0], "describe")) {
         if (isOnlyHelp(argv[1..])) {
-            try writeStdout(Help);
+            try writeStdout(io, Help);
             return 0;
         }
-        return runDefinitionDescribe(allocator, environment, argv[1..]);
+        return runDefinitionDescribe(io, dir, allocator, environment, argv[1..]);
     }
     return error.UnknownDefinitionAction;
 }
 
 fn runExplain(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
-    var args = try parseObserveArgs(allocator, argv);
+    var args = try parseObserveArgs(io, allocator, argv);
     defer args.deinit(allocator);
     args.selectors.environment = environment;
     const normalized_repo = if (args.selectors.repo) |repo|
-        try seq.native.absolutePathAlloc(allocator, environment, repo)
+        try seq.native.absolutePathAlloc(allocator, environment, repo, io, dir)
     else
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
@@ -218,6 +225,8 @@ fn runExplain(
     }
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
+        io,
+        dir,
         allocator,
         environment,
         args.definition_path,
@@ -231,7 +240,7 @@ fn runExplain(
     );
     defer bindings.deinit(allocator);
     if (usesRelationGraph(&context.definition_plan)) {
-        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         try writeGraphExplanation(
             allocator,
             &stdout_writer.interface,
@@ -249,7 +258,7 @@ fn runExplain(
     );
     defer program.deinit(allocator);
 
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     if (args.format == .text) {
         try writeExplanationText(
             &stdout_writer.interface,
@@ -367,20 +376,24 @@ fn usesRelationGraph(definition_plan: *const seq.definition.Plan) bool {
 }
 
 fn emitGraphObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
 ) !u8 {
-    const execution_start = monotonicNanoseconds();
+    const execution_start = monotonicNanoseconds(io);
     var graph = try executeGraphObservation(
+        io,
+        dir,
         allocator,
         args,
         context,
         bindings,
     );
     defer graph.deinit(allocator);
-    const execution_ns = elapsedNanoseconds(execution_start);
+    const execution_ns = elapsedNanoseconds(io, execution_start);
     var execution_stats = definition_core.result.ExecutionStats{
         .execution_ns = execution_ns,
         .physical_passes = 1,
@@ -414,7 +427,7 @@ fn emitGraphObservation(
         &execution_stats,
     );
     defer allocator.free(rendered);
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     try stdout_writer.interface.writeAll(rendered);
     try stdout_writer.interface.writeByte('\n');
     return 0;
@@ -519,18 +532,22 @@ fn writeExplanationFields(
 }
 
 fn runDefinitionCheck(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     const args = try parseDefinitionArgs(argv);
     var context = loadDefinition(
+        io,
+        dir,
         allocator,
         environment,
         args.definition_path,
         .{},
     ) catch |err| {
-        try emitDefinitionCheckFailure(args.format, err);
+        try emitDefinitionCheckFailure(io, args.format, err);
         return 2;
     };
     defer context.deinit(allocator);
@@ -556,10 +573,10 @@ fn runDefinitionCheck(
             try output.writer.writeAll(
                 ",\"passive\":true,\"authority_granted\":false}\n",
             );
-            try writeStdout(output.written());
+            try writeStdout(io, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(io, &.{});
             try stdout_writer.interface.print(
                 "structurally valid definition {s}@{s}\n",
                 .{
@@ -572,8 +589,8 @@ fn runDefinitionCheck(
     return 0;
 }
 
-fn emitDefinitionCheckFailure(format: Format, err: anyerror) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn emitDefinitionCheckFailure(io: std.Io, format: Format, err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     if (format == .text) {
         try stdout_writer.interface.print(
             "structurally invalid definition: {s}\n",
@@ -593,12 +610,16 @@ fn emitDefinitionCheckFailure(format: Format, err: anyerror) !void {
 }
 
 fn runDefinitionDescribe(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     const args = try parseDefinitionArgs(argv);
     var context = try loadDefinition(
+        io,
+        dir,
         allocator,
         environment,
         args.definition_path,
@@ -610,10 +631,10 @@ fn runDefinitionDescribe(
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
             try writeDefinitionDescriptionJson(&output.writer, &context);
-            try writeStdout(output.written());
+            try writeStdout(io, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(io, &.{});
             try writeDefinitionDescriptionText(
                 &stdout_writer.interface,
                 &context,
@@ -678,15 +699,17 @@ fn writeDefinitionDescriptionText(
 }
 
 fn runObserve(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
-    var args = try parseObserveArgs(allocator, argv);
+    var args = try parseObserveArgs(io, allocator, argv);
     defer args.deinit(allocator);
     args.selectors.environment = environment;
     const normalized_repo = if (args.selectors.repo) |repo|
-        try seq.native.absolutePathAlloc(allocator, environment, repo)
+        try seq.native.absolutePathAlloc(allocator, environment, repo, io, dir)
     else
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
@@ -694,6 +717,8 @@ fn runObserve(
     if (args.format != .json) return error.UnsupportedObservationRenderer;
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
+        io,
+        dir,
         allocator,
         environment,
         args.definition_path,
@@ -717,6 +742,8 @@ fn runObserve(
     defer bindings.deinit(allocator);
     if (usesRelationGraph(&context.definition_plan)) {
         return emitGraphObservation(
+            io,
+            dir,
             allocator,
             &args,
             &context,
@@ -732,6 +759,8 @@ fn runObserve(
     );
     defer program.deinit(allocator);
     return emitObservation(
+        io,
+        dir,
         allocator,
         &args,
         &context,
@@ -741,6 +770,8 @@ fn runObserve(
 }
 
 fn emitObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -758,8 +789,10 @@ fn emitObservation(
     }
     const output = try allocator.alloc(seq.execution.Value, output_cells);
     defer allocator.free(output);
-    const execution_start = monotonicNanoseconds();
+    const execution_start = monotonicNanoseconds(io);
     var execution = try executeObservation(
+        io,
+        dir,
         allocator,
         args,
         context,
@@ -767,7 +800,7 @@ fn emitObservation(
         output,
     );
     defer execution.deinit(allocator);
-    const execution_ns = elapsedNanoseconds(execution_start);
+    const execution_ns = elapsedNanoseconds(io, execution_start);
     var execution_stats = definition_core.result.ExecutionStats{
         .execution_ns = execution_ns,
         .physical_passes = 1,
@@ -801,7 +834,7 @@ fn emitObservation(
         &execution_stats,
     );
     defer allocator.free(rendered);
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     try stdout_writer.interface.writeAll(rendered);
     try stdout_writer.interface.writeByte('\n');
     return 0;
@@ -842,6 +875,8 @@ const GraphScanRows = struct {
 
 // Arguments and allocators are borrowed for one observation; returned values live in arena.
 const GraphObservationContext = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     table_allocator: std.mem.Allocator = std.heap.page_allocator,
@@ -1032,6 +1067,8 @@ fn readMaterializedGraphPaths(
         }
         const input_bound = graph.plans.definition_plan.bounds.max_input_bytes;
         var selected = try seq.trace_adapter.parseRelationsFileSelected(
+            graph.io,
+            graph.dir,
             graph.allocator,
             rows.relations.items,
             path,
@@ -1062,6 +1099,8 @@ fn readMaterializedGraphPaths(
 }
 
 fn executeGraphObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -1077,7 +1116,7 @@ fn executeGraphObservation(
         &context.native_plan,
         args.projection,
     )) |schedule| {
-        return executeStreamingGraphObservation(allocator, args, context, bindings, schedule);
+        return executeStreamingGraphObservation(io, dir, allocator, args, context, bindings, schedule);
     }
     const scan_stages = try seq.relation_graph.requiredScanStages(
         allocator,
@@ -1091,6 +1130,8 @@ fn executeGraphObservation(
     arena.* = .init(allocator);
     errdefer arena.deinit();
     const graph: GraphObservationContext = .{
+        .io = io,
+        .dir = dir,
         .allocator = allocator,
         .arena = arena,
         .args = args,
@@ -1101,7 +1142,8 @@ fn executeGraphObservation(
     defer rows.deinit(&graph);
     var paths = try seq.native.resolveTargetPaths(
         allocator,
-        defaultIo(),
+        io,
+        dir,
         graphDiscoverySelectors(args),
         false,
     );
@@ -1125,6 +1167,8 @@ const DiscoveredSession = struct {
 };
 
 const StreamingParseTask = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator = std.heap.smp_allocator,
     path: []const u8,
     relation: seq.physical.Relation,
@@ -1135,6 +1179,8 @@ const StreamingParseTask = struct {
 
     fn run(self: *StreamingParseTask) void {
         self.selected = seq.trace_adapter.parseRelationsFileSelected(
+            self.io,
+            self.dir,
             self.allocator,
             &.{self.relation},
             self.path,
@@ -1163,6 +1209,8 @@ const DiscoveredSessions = struct {
     identity_bytes: usize = 0,
 
     fn init(
+        io: std.Io,
+        dir: std.Io.Dir,
         allocator: std.mem.Allocator,
         paths: []const []const u8,
         max_depth: usize,
@@ -1175,7 +1223,7 @@ const DiscoveredSessions = struct {
         for (paths, result.items, 0..) |path, *item, index| {
             item.* = .{
                 .path_index = index,
-                .identity = try seq.trace_adapter.discoverSessionIdentity(allocator, path, .{}),
+                .identity = try seq.trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}),
             };
             result.initialized_count += 1;
             result.identity_bytes = try std.math.add(
@@ -1280,6 +1328,8 @@ fn createStreamingParseTasks(
             return error.GraphObservationOpenCodeUnsupported;
         }
         try tasks.append(graph.allocator, .{
+            .io = graph.io,
+            .dir = graph.dir,
             .path = path,
             .relation = graph.plans.native_plan.stages[schedule.scan_stage].operation.scan.relation,
             .max_input_bytes = graph.plans.definition_plan.bounds.max_input_bytes,
@@ -1416,6 +1466,8 @@ fn runStreamingParseTasks(
 }
 
 fn executeStreamingGraphObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -1427,6 +1479,8 @@ fn executeStreamingGraphObservation(
     arena.* = .init(allocator);
     errdefer arena.deinit();
     const graph: GraphObservationContext = .{
+        .io = io,
+        .dir = dir,
         .allocator = allocator,
         .arena = arena,
         .args = args,
@@ -1435,12 +1489,15 @@ fn executeStreamingGraphObservation(
     };
     var paths = try seq.native.resolveTargetPaths(
         allocator,
-        defaultIo(),
+        io,
+        dir,
         graphDiscoverySelectors(args),
         false,
     );
     defer seq.native.freePaths(allocator, &paths);
     var discovered = try DiscoveredSessions.init(
+        io,
+        dir,
         allocator,
         paths.items,
         context.definition_plan.bounds.max_graph_depth,
@@ -1679,6 +1736,8 @@ fn findPartitionScanRoot(
 }
 
 fn executeObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -1687,6 +1746,8 @@ fn executeObservation(
 ) !ObservationExecution {
     return switch (program.source) {
         .physical => |relation| executePhysicalObservation(
+            io,
+            dir,
             allocator,
             args,
             context,
@@ -1695,6 +1756,8 @@ fn executeObservation(
             output,
         ),
         .external => |input_index| executeExternalObservation(
+            io,
+            dir,
             allocator,
             args,
             context,
@@ -1706,6 +1769,8 @@ fn executeObservation(
 }
 
 fn executePhysicalObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -1721,7 +1786,8 @@ fn executePhysicalObservation(
     discovery_selectors.session_id = null;
     var paths = try seq.native.resolveTargetPaths(
         allocator,
-        defaultIo(),
+        io,
+        dir,
         discovery_selectors,
         false,
     );
@@ -1737,6 +1803,8 @@ fn executePhysicalObservation(
     var digest_set = CorpusSetHasher{};
     for (paths.items) |path| {
         const feed = try feedPhysicalFile(
+            io,
+            dir,
             allocator,
             args,
             program,
@@ -1787,6 +1855,8 @@ const PhysicalMetrics = struct {
 };
 
 fn feedPhysicalFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     program: *const seq.execution.Program,
@@ -1799,6 +1869,8 @@ fn feedPhysicalFile(
 ) !seq.execution.Feed {
     if (seq.opencode_adapter.recognizes(path)) {
         return feedOpenCodeFile(
+            io,
+            dir,
             allocator,
             args,
             program,
@@ -1810,6 +1882,8 @@ fn feedPhysicalFile(
         );
     }
     return feedCodexFile(
+        io,
+        dir,
         allocator,
         args,
         program,
@@ -1823,6 +1897,8 @@ fn feedPhysicalFile(
 }
 
 fn feedOpenCodeFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     program: *const seq.execution.Program,
@@ -1846,6 +1922,8 @@ fn feedOpenCodeFile(
     else
         return error.ObservationInputByteBoundExceeded;
     const observed = try seq.opencode_adapter.feedFile(
+        io,
+        dir,
         allocator,
         program,
         runner,
@@ -1895,6 +1973,8 @@ fn openCodeSessionPasses(
 }
 
 fn feedCodexFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     program: *const seq.execution.Program,
@@ -1906,6 +1986,8 @@ fn feedCodexFile(
     metrics: *PhysicalMetrics,
 ) !seq.execution.Feed {
     const selected = try seq.trace_adapter.parseFileSelected(
+        io,
+        dir,
         allocator,
         program,
         path,
@@ -2045,6 +2127,8 @@ fn structuredLimitsFor(
 }
 
 fn executeExternalObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
@@ -2060,6 +2144,8 @@ fn executeExternalObservation(
     }
     const input_name = context.definition_plan.inputs[input_index].name;
     var relation = try loadExternalInput(
+        io,
+        dir,
         allocator,
         &context.definition_plan,
         input_name,
@@ -2281,6 +2367,7 @@ const ObserveParseState = struct {
 
     fn finish(
         self: *ObserveParseState,
+        io: std.Io,
         allocator: std.mem.Allocator,
     ) !ObserveArgs {
         const definition_path = self.definition_path orelse
@@ -2293,7 +2380,7 @@ const ObserveParseState = struct {
         {
             return error.ConflictingSessionSelectors;
         }
-        try seq.native.resolveTemporalBounds(&self.selectors);
+        try seq.native.resolveTemporalBounds(&self.selectors, io);
         const input_specs = try self.inputs.toOwnedSlice(allocator);
         errdefer allocator.free(input_specs);
         const parameter_specs =
@@ -2319,6 +2406,7 @@ fn setOnce(
 }
 
 fn parseObserveArgs(
+    io: std.Io,
     allocator: std.mem.Allocator,
     argv: []const []const u8,
 ) !ObserveArgs {
@@ -2332,7 +2420,7 @@ fn parseObserveArgs(
         try state.apply(allocator, option, argv[index]);
         index += 1;
     }
-    return state.finish(allocator);
+    return state.finish(io, allocator);
 }
 
 fn hasPhysicalSelector(options: seq.native.Options) bool {
@@ -2407,21 +2495,24 @@ const CorpusSetHasher = struct {
 };
 
 fn loadDefinition(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     path: []const u8,
     request: seq.compiled_plan.Request,
 ) !seq.compiled_plan.PlanSet {
-    const absolute = try absoluteDefinitionPathAlloc(allocator, path);
+    const absolute = try absoluteDefinitionPathAlloc(io, dir, allocator, path);
     defer allocator.free(absolute);
     const package_location =
         try definition_core.closure.admittedPackageLocation(
+            io,
             absolute,
             "skills",
         );
     const cwd = if (package_location == null)
-        try std.Io.Dir.cwd().realPathFileAlloc(
-            defaultIo(),
+        try dir.realPathFileAlloc(
+            io,
             ".",
             allocator,
         )
@@ -2430,13 +2521,15 @@ fn loadDefinition(
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
         try definition_core.closure.admittedLocation(
+            io,
             absolute,
             cwd.?,
             "skills",
         );
-    const cache_dir = try seqCacheDirAlloc(allocator, environment);
+    const cache_dir = try seqCacheDirAlloc(io, dir, allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return seq.compiled_plan.load(
+        durable_store.Fs.init(io, dir),
         allocator,
         location.root,
         location.entry,
@@ -2448,14 +2541,16 @@ fn loadDefinition(
 }
 
 fn absoluteDefinitionPathAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.path.resolve(allocator, &.{path});
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
+    const cwd = try dir.realPathFileAlloc(
+        io,
         ".",
         allocator,
     );
@@ -2464,6 +2559,8 @@ fn absoluteDefinitionPathAlloc(
 }
 
 fn seqCacheDirAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
 ) !?[]u8 {
@@ -2486,8 +2583,8 @@ fn seqCacheDirAlloc(
     if (std.fs.path.isAbsolute(joined)) {
         return try allocator.dupe(u8, joined);
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
+    const cwd = try dir.realPathFileAlloc(
+        io,
         ".",
         allocator,
     );
@@ -2496,6 +2593,8 @@ fn seqCacheDirAlloc(
 }
 
 fn loadExternalInput(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     definition_plan: *const seq.definition.Plan,
     expected_name: []const u8,
@@ -2514,6 +2613,7 @@ fn loadExternalInput(
     }
     if (!std.mem.eql(u8, source, "-")) {
         return seq.external_input.loadFile(
+            durable_store.Fs.init(io, dir),
             allocator,
             definition_plan,
             name,
@@ -2526,7 +2626,7 @@ fn loadExternalInput(
         input.max_bytes,
         definition_plan.bounds.max_input_bytes,
     );
-    var stdin_reader = std.Io.File.stdin().reader(defaultIo(), &.{});
+    var stdin_reader = std.Io.File.stdin().reader(io, &.{});
     const bytes = try stdin_reader.interface.allocRemaining(
         allocator,
         .limited(max_bytes),
@@ -2564,7 +2664,7 @@ fn bindParameters(
     return definition_core.parameters.bind(allocator, declarations, inputs);
 }
 
-fn emitCapabilities(argv: []const []const u8) !u8 {
+fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
     var format: Format = .json;
     var format_seen = false;
     var index: usize = 0;
@@ -2578,7 +2678,7 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         format_seen = true;
         format = try Format.parse(argv[index]);
     }
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     if (format == .text) {
         try stdout_writer.interface.print(
             "Seq {s}\nABI: {s}\n",
@@ -2639,15 +2739,16 @@ fn writeCompileStats(
     );
 }
 
-fn emitCommandError(err: anyerror) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
-    try stdout_writer.interface.writeAll(
+fn emitCommandError(io: std.Io, err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    stdout_writer.interface.writeAll(
         "{\"schema\":\"seq-command-error/v1\",\"code\":",
-    );
-    try writeString(&stdout_writer.interface, @errorName(err));
-    try stdout_writer.interface.writeAll(
+    ) catch |write_err| return stdout_writer.err orelse write_err;
+    writeString(&stdout_writer.interface, @errorName(err)) catch |write_err|
+        return stdout_writer.err orelse write_err;
+    stdout_writer.interface.writeAll(
         ",\"authority_granted\":false}\n",
-    );
+    ) catch |write_err| return stdout_writer.err orelse write_err;
 }
 
 fn findProjection(
@@ -2690,35 +2791,23 @@ fn environmentValue(
     return if (value.len == 0) null else value;
 }
 
-fn monotonicNanoseconds() i128 {
-    var timestamp: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(
-        .MONOTONIC,
-        &timestamp,
-    ))) {
-        .SUCCESS => @as(i128, timestamp.sec) * std.time.ns_per_s +
-            timestamp.nsec,
-        else => 0,
-    };
+fn monotonicNanoseconds(io: std.Io) i128 {
+    return std.Io.Clock.awake.now(io).nanoseconds;
 }
 
-fn elapsedNanoseconds(start: i128) u64 {
-    const finish = monotonicNanoseconds();
+fn elapsedNanoseconds(io: std.Io, start: i128) u64 {
+    const finish = monotonicNanoseconds(io);
     if (finish <= start) return 0;
     return std.math.cast(u64, finish - start) orelse std.math.maxInt(u64);
 }
 
-fn defaultIo() std.Io {
-    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
-}
-
-fn writeStdout(bytes: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn writeStdout(io: std.Io, bytes: []const u8) !void {
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     try stdout_writer.interface.writeAll(bytes);
 }
 
 fn isClosedPipe(err: anyerror) bool {
-    return err == error.WriteFailed or err == error.BrokenPipe;
+    return err == error.BrokenPipe;
 }
 
 fn isHelp(token: []const u8) bool {
@@ -2789,7 +2878,7 @@ test "host numeric seq syntax is disjoint from the product command surface" {
 }
 
 test "observe parser accepts explicit definition selectors and parameters" {
-    var args = try parseObserveArgs(std.testing.allocator, &.{
+    var args = try parseObserveArgs(std.testing.io, std.testing.allocator, &.{
         "--definition",
         "observation.json",
         "--projection",
@@ -2955,6 +3044,8 @@ test "failed first parse joins and releases prefetched successful results" {
     defer allocator.free(missing);
     var tasks = [_]StreamingParseTask{
         .{
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
             .allocator = allocator,
             .path = missing,
             .relation = .sessions,
@@ -2962,6 +3053,8 @@ test "failed first parse joins and releases prefetched successful results" {
             .repo = null,
         },
         .{
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
             .allocator = allocator,
             .path = path,
             .relation = .sessions,
@@ -2984,6 +3077,8 @@ fn exerciseRetainedGraphResultFailure(allocator: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const graph: GraphObservationContext = .{
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
         .allocator = allocator,
         .arena = &arena,
         .table_allocator = std.testing.allocator,
@@ -3008,4 +3103,26 @@ test "graph result retention releases the source table on every allocation failu
         exerciseRetainedGraphResultFailure,
         .{},
     );
+}
+
+test "command diagnostics preserve supplied I/O failure identity" {
+    const Failure = struct {
+        failure: std.Io.File.WritePositionalError,
+        calls: usize = 0,
+
+        fn write(userdata: ?*anyopaque, _: std.Io.File, _: []const u8, _: []const []const u8, _: usize, _: u64) std.Io.File.WritePositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.calls += 1;
+            return self.failure;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Failure.write;
+    for ([_]std.Io.File.WritePositionalError{ error.BrokenPipe, error.AccessDenied, error.Canceled }) |failure| {
+        var witness: Failure = .{ .failure = failure };
+        const io: std.Io = .{ .userdata = &witness, .vtable = &vtable };
+        try std.testing.expectError(failure, emitCommandError(io, error.UnknownCommand));
+        try std.testing.expectEqual(1, witness.calls);
+        try std.testing.expectEqual(failure == error.BrokenPipe, isClosedPipe(failure));
+    }
 }

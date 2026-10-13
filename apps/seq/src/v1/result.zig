@@ -460,6 +460,7 @@ const TestDefinition = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             dir,
             "observation.json",

@@ -31,6 +31,7 @@ pub const Relation = struct {
 };
 
 pub fn loadFile(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     input_name: []const u8,
@@ -43,6 +44,7 @@ pub fn loadFile(
         definition_plan.bounds.max_input_bytes,
     );
     const bytes = try durable_store.readRegularFileNoSymlink(
+        fs,
         allocator,
         path,
         max_bytes,
@@ -434,6 +436,7 @@ const TestDefinition = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             dir,
             "observation.json",

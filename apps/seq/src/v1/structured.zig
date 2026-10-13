@@ -759,6 +759,7 @@ fn expectStructuredObservation(index: *const Index) !void {
         .data = structured_observation_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "observation.json",
@@ -809,6 +810,7 @@ fn expectStructuredObservation(index: *const Index) !void {
 
 test "structured index canonicalizes and flattens tool result JSON" {
     var trace = try trace_core.parseSessionTraceBytes(
+        std.testing.io,
         std.testing.allocator,
         "/structured.jsonl",
         structured_trace_source,
