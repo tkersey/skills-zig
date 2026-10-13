@@ -39,254 +39,29 @@ const max_captured_notifications: usize = 1024;
 const max_captured_notification_bytes: usize = 16 * 1024 * 1024;
 const default_request_timeout_ms: i64 = 30_000;
 const handshake_timeout_ms: i64 = 10_000;
-pub const max_server_request_carrier_bytes: usize = 1024 * 1024;
-pub const max_initialize_capabilities_bytes: usize = 64 * 1024;
+pub const max_server_request_carrier_bytes = server_requests.max_server_request_carrier_bytes;
+const initialize_capabilities = @import("initialize_capabilities.zig");
+pub const max_initialize_capabilities_bytes =
+    initialize_capabilities.max_initialize_capabilities_bytes;
+pub const InitializeCapabilityBuilder = initialize_capabilities.InitializeCapabilityBuilder;
 pub const max_codex_enable_features: usize = 16;
 
-pub const InitializeCapabilityBuilder = struct {
-    experimental_api: bool = true,
-    opt_out_notification_methods: []const []const u8 = &.{},
-    mcp_server_openai_form_elicitation: bool = false,
-    request_attestation: bool = false,
-    additional_json: ?[]const u8 = null,
+const server_requests = @import("server_requests.zig");
+pub const ServerRequestHandlerKind = server_requests.ServerRequestHandlerKind;
+pub const ServerRequestHandlerDescriptor = server_requests.ServerRequestHandlerDescriptor;
+pub const server_request_handler_descriptors = server_requests.server_request_handler_descriptors;
+pub const serverRequestHandler = server_requests.serverRequestHandler;
 
-    const max_additional_fields: usize = 64;
-    const max_notification_methods: usize = 256;
-    const max_method_bytes: usize = 1024;
-
-    pub fn validate(self: InitializeCapabilityBuilder, allocator: std.mem.Allocator) !void {
-        if (self.opt_out_notification_methods.len > max_notification_methods) {
-            return error.InitializeCapabilitiesTooLarge;
-        }
-        for (self.opt_out_notification_methods) |method| {
-            if (method.len == 0 or method.len > max_method_bytes) {
-                return error.InvalidInitializeCapabilities;
-            }
-        }
-        const raw = self.additional_json orelse return;
-        if (raw.len > max_initialize_capabilities_bytes) {
-            return error.InitializeCapabilitiesTooLarge;
-        }
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err|
-            switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidInitializeCapabilities,
-            };
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidInitializeCapabilities,
-        };
-        if (object.count() > max_additional_fields) return error.InitializeCapabilitiesTooLarge;
-        var iterator = object.iterator();
-        while (iterator.next()) |entry| {
-            if (entry.key_ptr.*.len == 0 or isTypedCapability(entry.key_ptr.*))
-                return error.DuplicateInitializeCapabilityOwner;
-        }
-    }
-
-    pub fn buildAlloc(self: InitializeCapabilityBuilder, allocator: std.mem.Allocator) ![]u8 {
-        try self.validate(allocator);
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        self.writeJson(allocator, &output.writer) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => return err,
-        };
-        if (output.written().len > max_initialize_capabilities_bytes) {
-            return error.InitializeCapabilitiesTooLarge;
-        }
-        return output.toOwnedSlice();
-    }
-
-    fn writeJson(
-        self: InitializeCapabilityBuilder,
-        allocator: std.mem.Allocator,
-        writer: *std.Io.Writer,
-    ) !void {
-        try writer.writeAll("{\"experimentalApi\":");
-        try std.json.Stringify.value(self.experimental_api, .{}, writer);
-        try writer.writeAll(",\"optOutNotificationMethods\":");
-        try std.json.Stringify.value(self.opt_out_notification_methods, .{}, writer);
-        try writer.writeAll(",\"mcpServerOpenaiFormElicitation\":");
-        try std.json.Stringify.value(self.mcp_server_openai_form_elicitation, .{}, writer);
-        try writer.writeAll(",\"requestAttestation\":");
-        try std.json.Stringify.value(self.request_attestation, .{}, writer);
-
-        if (self.additional_json) |raw| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-            defer parsed.deinit();
-            var iterator = parsed.value.object.iterator();
-            while (iterator.next()) |entry| {
-                try writer.writeByte(',');
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
-                try writer.writeByte(':');
-                try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
-            }
-        }
-        try writer.writeByte('}');
-    }
-
-    fn isTypedCapability(key: []const u8) bool {
-        return std.mem.eql(u8, key, "experimentalApi") or
-            std.mem.eql(u8, key, "optOutNotificationMethods") or
-            std.mem.eql(u8, key, "mcpServerOpenaiFormElicitation") or
-            std.mem.eql(u8, key, "requestAttestation");
-    }
-};
-
-pub const ServerRequestHandlerKind = enum {
-    command_execution_approval,
-    file_change_approval,
-    permissions_approval,
-    request_user_input,
-    mcp_elicitation,
-    dynamic_tool_call,
-    auth_tokens_refresh,
-    attestation_generate,
-    current_time_read,
-    apply_patch_approval,
-    exec_command_approval,
-    unknown,
-
-    fn parse(method: []const u8) ServerRequestHandlerKind {
-        return if (serverRequestHandler(method)) |descriptor| descriptor.kind else .unknown;
-    }
-};
-
-pub const ServerRequestHandlerDescriptor = struct {
-    method: []const u8,
-    policy: []const u8,
-    kind: ServerRequestHandlerKind,
-};
-
-pub const server_request_handler_descriptors = [_]ServerRequestHandlerDescriptor{
-    .{
-        .method = "item/commandExecution/requestApproval",
-        .policy = "configured-approval-or-decline",
-        .kind = .command_execution_approval,
-    },
-    .{
-        .method = "item/fileChange/requestApproval",
-        .policy = "configured-approval-or-decline",
-        .kind = .file_change_approval,
-    },
-    .{
-        .method = "item/tool/requestUserInput",
-        .policy = "exact-response-or-decline",
-        .kind = .request_user_input,
-    },
-    .{
-        .method = "mcpServer/elicitation/request",
-        .policy = "mode-aware-exact-response-or-decline",
-        .kind = .mcp_elicitation,
-    },
-    .{
-        .method = "item/permissions/requestApproval",
-        .policy = "configured-approval-or-decline",
-        .kind = .permissions_approval,
-    },
-    .{
-        .method = "item/tool/call",
-        .policy = "configured-tool-handler-or-error",
-        .kind = .dynamic_tool_call,
-    },
-    .{
-        .method = "account/chatgptAuthTokens/refresh",
-        .policy = "exact-secret-provider-or-typed-error",
-        .kind = .auth_tokens_refresh,
-    },
-    .{
-        .method = "attestation/generate",
-        .policy = "exact-attestation-provider-or-typed-error",
-        .kind = .attestation_generate,
-    },
-    .{
-        .method = "applyPatchApproval",
-        .policy = "deprecated-reject",
-        .kind = .apply_patch_approval,
-    },
-    .{
-        .method = "execCommandApproval",
-        .policy = "deprecated-reject",
-        .kind = .exec_command_approval,
-    },
-    .{ .method = "currentTime/read", .policy = "exact-unix-seconds", .kind = .current_time_read },
-};
-
-pub fn serverRequestHandler(method: []const u8) ?ServerRequestHandlerDescriptor {
-    for (server_request_handler_descriptors) |descriptor| {
-        if (std.mem.eql(u8, method, descriptor.method)) return descriptor;
-    }
-    return null;
-}
-
-pub const max_overload_retries: u32 = 16;
-pub const max_overload_delay_ms: u32 = 4_000;
-pub const max_overload_jitter_percent: u8 = 25;
-
-pub const OverloadRetryPolicy = struct {
-    max_retries: u32 = 4,
-    base_delay_ms: u32 = 250,
-    max_delay_ms: u32 = max_overload_delay_ms,
-    jitter_percent: u8 = max_overload_jitter_percent,
-};
-
-pub const OverloadRetryTelemetry = struct {
-    wire_attempts: u32 = 0,
-    overload_responses: u32 = 0,
-    retries: u32 = 0,
-    delay_count: u32 = 0,
-    delays_ms: [max_overload_retries]u32 = @splat(0),
-    exhausted: bool = false,
-
-    pub fn reset(self: *OverloadRetryTelemetry) void {
-        self.* = .{};
-    }
-};
-
-pub fn validateOverloadRetryPolicy(policy: OverloadRetryPolicy) !void {
-    if (policy.max_retries > max_overload_retries) return error.InvalidOverloadRetryPolicy;
-    if (policy.base_delay_ms == 0 or policy.base_delay_ms > max_overload_delay_ms) {
-        return error.InvalidOverloadRetryPolicy;
-    }
-    if (policy.max_delay_ms == 0 or policy.max_delay_ms > max_overload_delay_ms) {
-        return error.InvalidOverloadRetryPolicy;
-    }
-    if (policy.base_delay_ms > policy.max_delay_ms) return error.InvalidOverloadRetryPolicy;
-    if (policy.jitter_percent > max_overload_jitter_percent) {
-        return error.InvalidOverloadRetryPolicy;
-    }
-}
-
-fn resolveOverloadRetrySeed(explicit: ?u64, io: std.Io) !u64 {
-    if (explicit) |seed| return seed;
-    var seed: u64 = undefined;
-    try std.Io.randomSecure(io, std.mem.asBytes(&seed));
-    return seed;
-}
-
-pub fn overloadRetryDelayMs(policy: OverloadRetryPolicy, retry_index: u32, seed: u64) u32 {
-    std.debug.assert(retry_index < max_overload_retries);
-    const shift: u6 = @intCast(@min(retry_index, 31));
-    const exponential = @min(
-        @as(u64, policy.base_delay_ms) << shift,
-        @as(u64, policy.max_delay_ms),
-    );
-    const jitter_limit = exponential * policy.jitter_percent / 100;
-    const retry_bytes = std.mem.asBytes(&retry_index);
-    const sample = std.hash.Wyhash.hash(seed, retry_bytes);
-    const jitter = if (jitter_limit == 0) 0 else sample % (jitter_limit + 1);
-    return @intCast(@min(exponential + jitter, @as(u64, policy.max_delay_ms)));
-}
-
-pub fn isStructuredOverloadError(error_value: std.json.Value) bool {
-    const object = switch (error_value) {
-        .object => |value| value,
-        else => return false,
-    };
-    return core_json.intField(object, "code") == -32001;
-}
+const overload_retry = @import("overload_retry.zig");
+pub const max_overload_retries = overload_retry.max_overload_retries;
+pub const max_overload_delay_ms = overload_retry.max_overload_delay_ms;
+pub const max_overload_jitter_percent = overload_retry.max_overload_jitter_percent;
+pub const OverloadRetryPolicy = overload_retry.OverloadRetryPolicy;
+pub const OverloadRetryTelemetry = overload_retry.OverloadRetryTelemetry;
+pub const validateOverloadRetryPolicy = overload_retry.validateOverloadRetryPolicy;
+pub const overloadRetryDelayMs = overload_retry.overloadRetryDelayMs;
+pub const isStructuredOverloadError = overload_retry.isStructuredOverloadError;
+const resolveOverloadRetrySeed = overload_retry.resolveOverloadRetrySeed;
 
 pub const TransportKind = enum {
     stdio,
@@ -1094,39 +869,11 @@ pub const Client = struct {
         }
     }
 
-    const max_exact_response_bytes: usize = max_server_request_carrier_bytes;
-
-    const JsonRpcId = union(enum) {
-        integer: i64,
-        string: []const u8,
-
-        fn parse(value: std.json.Value) ?JsonRpcId {
-            return switch (value) {
-                .integer => |id| .{ .integer = id },
-                .string => |id| .{ .string = id },
-                else => null,
-            };
-        }
-    };
-
+    const max_exact_response_bytes = max_server_request_carrier_bytes;
+    const JsonRpcId = server_requests.JsonRpcId;
     const ServerRequestMethod = ServerRequestHandlerKind;
-
-    const ErrorReply = struct {
-        code: i64,
-        message: []const u8,
-    };
-
-    const ServerReply = union(enum) {
-        result_json: []u8,
-        server_error: ErrorReply,
-
-        fn deinit(reply: *ServerReply, allocator: std.mem.Allocator) void {
-            switch (reply.*) {
-                .result_json => |owned| allocator.free(owned),
-                .server_error => {},
-            }
-        }
-    };
+    const ServerReply = server_requests.ServerReply;
+    const serverReplyPayloadAlloc = server_requests.serverReplyPayloadAlloc;
 
     fn autoHandleServerRequest(self: *Client, msg_obj: core_json.ObjectMap) !void {
         const method = core_json.stringField(msg_obj, "method") orelse return;
@@ -1141,7 +888,7 @@ pub const Client = struct {
         };
         self.blocking_server_request_count += 1;
 
-        var reply = try self.prepareServerReply(request_method, msg_obj);
+        var reply = try self.serverRequestPolicy().prepareServerReply(request_method, msg_obj);
         defer reply.deinit(self.allocator);
         self.emitServerReply(id, reply) catch {
             // A failed reply is terminal for this connection: continuing could
@@ -1182,37 +929,6 @@ pub const Client = struct {
         }
     }
 
-    fn serverReplyPayloadAlloc(
-        allocator: std.mem.Allocator,
-        id: JsonRpcId,
-        reply: ServerReply,
-    ) ![]u8 {
-        var payload_writer: std.Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-
-        try payload_writer.writer.writeAll("{\"id\":");
-        switch (id) {
-            .integer => |integer| try std.json.Stringify.value(
-                integer,
-                .{},
-                &payload_writer.writer,
-            ),
-            .string => |string| try std.json.Stringify.value(string, .{}, &payload_writer.writer),
-        }
-        switch (reply) {
-            .result_json => |result_json| {
-                try payload_writer.writer.writeAll(",\"result\":");
-                try payload_writer.writer.writeAll(result_json);
-            },
-            .server_error => |server_error| {
-                try payload_writer.writer.writeAll(",\"error\":");
-                try std.json.Stringify.value(server_error, .{}, &payload_writer.writer);
-            },
-        }
-        try payload_writer.writer.writeAll("}");
-        return allocator.dupe(u8, payload_writer.written());
-    }
-
     fn sendWebSocket(
         self: *Client,
         payload: []const u8,
@@ -1239,183 +955,8 @@ pub const Client = struct {
         };
     }
 
-    fn resolveExecDecision(self: *const Client) []const u8 {
-        if (self.read_only) return "decline";
-        if (self.exec_approval) |decision| return decision;
-        return "decline";
-    }
-
-    fn resolveFileDecision(self: *const Client) []const u8 {
-        if (self.read_only) return "decline";
-        if (self.file_approval) |decision| {
-            if (!std.mem.eql(u8, decision, "auto")) return decision;
-        }
-        return "decline";
-    }
-
-    fn prepareServerReply(
-        self: *Client,
-        method: ServerRequestMethod,
-        msg_obj: core_json.ObjectMap,
-    ) !ServerReply {
-        return switch (method) {
-            .command_execution_approval => try self.prepareCommandApproval(msg_obj),
-            .file_change_approval => .{
-                .result_json = try approvalResultAlloc(
-                    self.allocator,
-                    self.resolveFileDecision(),
-                ),
-            },
-            .permissions_approval => .{ .result_json = try self.preparePermissionsResult(msg_obj) },
-            .request_user_input => .{ .result_json = try self.prepareUserInputResult() },
-            .mcp_elicitation => .{ .result_json = try self.prepareMcpElicitationResult(msg_obj) },
-            .dynamic_tool_call => if (self.dynamic_tool_response_json) |raw|
-                .{ .result_json = try self.allocator.dupe(u8, raw) }
-            else
-                .{ .server_error = .{
-                    .code = -32603,
-                    .message = "dynamic tool response provider unavailable",
-                } },
-            .auth_tokens_refresh => if (self.auth_refresh_response_json) |raw|
-                .{ .result_json = try self.allocator.dupe(u8, raw) }
-            else
-                .{ .server_error = .{
-                    .code = -32603,
-                    .message = "chatgpt auth token refresh provider unavailable",
-                } },
-            .attestation_generate => if (self.attestation_response_json) |raw|
-                .{ .result_json = try self.allocator.dupe(u8, raw) }
-            else
-                .{ .server_error = .{
-                    .code = -32603,
-                    .message = "attestation provider unavailable",
-                } },
-            .current_time_read => .{ .result_json = try self.allocator.print(
-                "{{\"currentTimeAt\":{d}}}",
-                .{@as(i64, @intCast(@divFloor(
-                    std.Io.Clock.real.now(self.io).nanoseconds,
-                    1_000_000_000,
-                )))},
-            ) },
-            .apply_patch_approval, .exec_command_approval => .{
-                .result_json = try self.allocator.dupe(
-                    u8,
-                    "{\"decision\":{\"denied\":{\"rejection\":" ++
-                        "\"deprecated approval request is unsupported\"}}}",
-                ),
-            },
-            .unknown => .{ .server_error = .{
-                .code = -32601,
-                .message = "unsupported server request in native cas client",
-            } },
-        };
-    }
-
-    fn prepareCommandApproval(self: *Client, msg_obj: core_json.ObjectMap) !ServerReply {
-        _ = msg_obj;
-        const decision = self.resolveExecDecision();
-        return .{ .result_json = try approvalResultAlloc(self.allocator, decision) };
-    }
-
-    fn approvalResultAlloc(allocator: std.mem.Allocator, decision: []const u8) ![]u8 {
-        var writer: std.Io.Writer.Allocating = .init(allocator);
-        defer writer.deinit();
-        try writer.writer.writeAll("{\"decision\":");
-        try std.json.Stringify.value(decision, .{}, &writer.writer);
-        try writer.writer.writeAll("}");
-        return allocator.dupe(u8, writer.written());
-    }
-
-    fn preparePermissionsResult(self: *Client, msg_obj: core_json.ObjectMap) ![]u8 {
-        const params_obj = core_json.objectField(msg_obj, "params");
-        const mode = self.resolvePermissionsApproval();
-        if (mode == .deny or params_obj == null) {
-            return self.allocator.dupe(u8, "{\"permissions\":{},\"scope\":\"turn\"}");
-        }
-
-        const permissions_val = params_obj.?.get("permissions") orelse {
-            return self.allocator.dupe(u8, "{\"permissions\":{},\"scope\":\"turn\"}");
-        };
-        const permissions_json = try core_json.stringifyAlloc(self.allocator, permissions_val);
-        defer self.allocator.free(permissions_json);
-        const response_json = try self.allocator.print(
-            "{{\"permissions\":{s},\"scope\":\"{s}\"}}",
-            .{ permissions_json, switch (mode) {
-                .grant_turn => "turn",
-                .grant_session => "session",
-                .deny => "turn",
-            } },
-        );
-        return response_json;
-    }
-
-    fn prepareUserInputResult(self: *Client) ![]u8 {
-        if (self.request_user_input_response_json) |raw| {
-            return self.allocator.dupe(u8, raw);
-        }
-        return self.allocator.dupe(u8, "{\"answers\":{}}");
-    }
-
-    fn prepareMcpElicitationResult(self: *Client, msg_obj: core_json.ObjectMap) ![]u8 {
-        const params_obj = core_json.objectField(msg_obj, "params");
-        const mode = if (params_obj) |params| core_json.stringField(params, "mode") else null;
-        const action = self.resolveElicitationAction();
-        const accepts_exact_content = if (mode) |value|
-            std.mem.eql(u8, value, "form") or std.mem.eql(u8, value, "openai/form")
-        else
-            false;
-        if (!accepts_exact_content) {
-            const conservative_action: []const u8 = if (action == .cancel) "cancel" else "decline";
-            return self.allocator.print(
-                "{{\"action\":\"{s}\",\"content\":null,\"_meta\":null}}",
-                .{conservative_action},
-            );
-        }
-        if (self.elicitation_response_json) |raw| return self.allocator.dupe(u8, raw);
-        const content_json = self.elicitation_content_json orelse "null";
-        return switch (action) {
-            .accept => self.allocator.print(
-                "{{\"action\":\"accept\",\"content\":{s},\"_meta\":null}}",
-                .{content_json},
-            ),
-            .decline => self.allocator.dupe(
-                u8,
-                "{\"action\":\"decline\",\"content\":null,\"_meta\":null}",
-            ),
-            .cancel => self.allocator.dupe(
-                u8,
-                "{\"action\":\"cancel\",\"content\":null,\"_meta\":null}",
-            ),
-        };
-    }
-
-    const PermissionsApproval = enum {
-        deny,
-        grant_turn,
-        grant_session,
-    };
-
-    fn resolvePermissionsApproval(self: *const Client) PermissionsApproval {
-        if (self.read_only) return .deny;
-        if (self.permissions_approval) |decision| {
-            if (std.mem.eql(u8, decision, "grant-session")) return .grant_session;
-            if (std.mem.eql(u8, decision, "grant-turn")) return .grant_turn;
-        }
-        return .deny;
-    }
-
-    const McpElicitationResponseAction = enum {
-        accept,
-        decline,
-        cancel,
-    };
-
-    fn resolveElicitationAction(self: *const Client) McpElicitationResponseAction {
-        if (self.elicitation_action) |action| {
-            if (std.mem.eql(u8, action, "accept")) return .accept;
-            if (std.mem.eql(u8, action, "cancel")) return .cancel;
-        }
-        return .decline;
+    fn serverRequestPolicy(self: *const Client) server_requests.Policy {
+        return requestPolicy(self.allocator, self.io, self);
     }
 
     fn setLastErrorOwned(self: *Client, owned: []u8) void {
@@ -2981,182 +2522,42 @@ fn initializePayloadAlloc(
     return output.toOwnedSlice();
 }
 
+fn requestPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: anytype,
+) server_requests.Policy {
+    return .{
+        .allocator = allocator,
+        .io = io,
+        .exec_approval = options.exec_approval,
+        .file_approval = options.file_approval,
+        .permissions_approval = options.permissions_approval,
+        .request_user_input_response_json = options.request_user_input_response_json,
+        .elicitation_action = options.elicitation_action,
+        .elicitation_content_json = options.elicitation_content_json,
+        .elicitation_response_json = options.elicitation_response_json,
+        .dynamic_tool_response_json = options.dynamic_tool_response_json,
+        .auth_refresh_response_json = options.auth_refresh_response_json,
+        .attestation_response_json = options.attestation_response_json,
+        .read_only = options.read_only,
+    };
+}
+
 fn hasExactOpenaiFormPolicy(opts: ClientOptions) bool {
-    if (opts.elicitation_response_json != null) return true;
-    const action = opts.elicitation_action orelse return false;
-    if (std.mem.eql(u8, action, "decline") or std.mem.eql(u8, action, "cancel")) return true;
-    return std.mem.eql(u8, action, "accept") and opts.elicitation_content_json != null;
+    return server_requests.hasExactOpenaiFormPolicy(
+        opts.elicitation_response_json,
+        opts.elicitation_action,
+        opts.elicitation_content_json,
+    );
 }
 
 fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOptions) !void {
-    if (opts.server_request_timeout_ms != null) return error.UnsupportedServerRequestTimeout;
-    if (opts.elicitation_response_json != null and
-        (opts.elicitation_action != null or opts.elicitation_content_json != null))
-    {
-        return error.ConflictingElicitationResponsePolicies;
-    }
-    try validateChoice(opts.exec_approval, &.{ "accept", "acceptForSession", "decline", "cancel" });
-    try validateChoice(
-        opts.file_approval,
-        &.{ "auto", "accept", "acceptForSession", "decline", "cancel" },
+    try server_requests.validateServerRequestOptions(
+        allocator,
+        requestPolicy(allocator, opts.io, opts),
+        opts.server_request_timeout_ms,
     );
-    try validateChoice(opts.permissions_approval, &.{ "grant-turn", "grant-session", "deny" });
-    try validateChoice(opts.elicitation_action, &.{ "accept", "decline", "cancel" });
-
-    if (opts.request_user_input_response_json) |raw| try validateUserInputCarrier(allocator, raw);
-    if (opts.elicitation_content_json) |raw| try validateElicitationContent(allocator, raw);
-    if (opts.elicitation_action) |action| {
-        if (std.mem.eql(u8, action, "accept") and opts.elicitation_content_json == null) {
-            return error.MissingElicitationContent;
-        }
-    }
-    if (opts.elicitation_response_json) |raw| try validateElicitationCarrier(allocator, raw);
-    if (opts.dynamic_tool_response_json) |raw| try validateDynamicToolCarrier(allocator, raw);
-    if (opts.auth_refresh_response_json) |raw| try validateAuthRefreshCarrier(allocator, raw);
-    if (opts.attestation_response_json) |raw| try validateAttestationCarrier(allocator, raw);
-}
-
-fn validateUserInputCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidRequestUserInputResponse,
-    };
-    const answers = object.get("answers") orelse return error.InvalidRequestUserInputResponse;
-    const answers_object = switch (answers) {
-        .object => |value| value,
-        else => return error.InvalidRequestUserInputResponse,
-    };
-    var answer_iterator = answers_object.iterator();
-    while (answer_iterator.next()) |entry| {
-        const answer_object = switch (entry.value_ptr.*) {
-            .object => |value| value,
-            else => return error.InvalidRequestUserInputResponse,
-        };
-        const answer_values = answer_object.get("answers") orelse
-            return error.InvalidRequestUserInputResponse;
-        const answer_array = switch (answer_values) {
-            .array => |value| value.items,
-            else => return error.InvalidRequestUserInputResponse,
-        };
-        for (answer_array) |answer| {
-            if (answer != .string) return error.InvalidRequestUserInputResponse;
-        }
-    }
-}
-
-fn validateElicitationContent(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    if (parsed.value == .null) return error.InvalidElicitationContent;
-}
-
-fn validateElicitationCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidElicitationResponse,
-    };
-    const action = core_json.stringField(object, "action") orelse
-        return error.InvalidElicitationResponse;
-    const accepts = std.mem.eql(u8, action, "accept");
-    const declines = std.mem.eql(u8, action, "decline");
-    const cancels = std.mem.eql(u8, action, "cancel");
-    if (!accepts and !declines and !cancels) return error.InvalidElicitationResponse;
-    const content = object.get("content");
-    if (accepts and (content == null or content.? == .null)) {
-        return error.InvalidElicitationResponse;
-    }
-    if (!accepts and content != null and content.? != .null) {
-        return error.InvalidElicitationResponse;
-    }
-    // `_meta` is intentionally unconstrained by the generated schema and is
-    // preserved byte-for-byte by the full response carrier.
-}
-
-fn validateDynamicToolCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidDynamicToolResponse,
-    };
-    const content_items = object.get("contentItems") orelse
-        return error.InvalidDynamicToolResponse;
-    const success = object.get("success") orelse return error.InvalidDynamicToolResponse;
-    const items = switch (content_items) {
-        .array => |value| value.items,
-        else => return error.InvalidDynamicToolResponse,
-    };
-    if (success != .bool) return error.InvalidDynamicToolResponse;
-    for (items) |item| {
-        const item_object = switch (item) {
-            .object => |value| value,
-            else => return error.InvalidDynamicToolResponse,
-        };
-        const item_type = core_json.stringField(item_object, "type") orelse
-            return error.InvalidDynamicToolResponse;
-        const required_field = if (std.mem.eql(u8, item_type, "inputText"))
-            "text"
-        else if (std.mem.eql(u8, item_type, "inputImage"))
-            "imageUrl"
-        else if (std.mem.eql(u8, item_type, "inputAudio"))
-            "audioUrl"
-        else
-            return error.InvalidDynamicToolResponse;
-        const required_value = item_object.get(required_field) orelse
-            return error.InvalidDynamicToolResponse;
-        if (required_value != .string) return error.InvalidDynamicToolResponse;
-    }
-}
-
-fn validateAuthRefreshCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidAuthRefreshResponse,
-    };
-    const access_token = core_json.stringField(object, "accessToken") orelse
-        return error.InvalidAuthRefreshResponse;
-    const account_id = core_json.stringField(object, "chatgptAccountId") orelse
-        return error.InvalidAuthRefreshResponse;
-    if (access_token.len == 0 or account_id.len == 0) return error.InvalidAuthRefreshResponse;
-    if (object.get("chatgptPlanType")) |plan| switch (plan) {
-        .null, .string => {},
-        else => return error.InvalidAuthRefreshResponse,
-    };
-}
-
-fn validateAttestationCarrier(allocator: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = try parseExactCarrier(allocator, raw);
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidAttestationResponse,
-    };
-    const token = core_json.stringField(object, "token") orelse
-        return error.InvalidAttestationResponse;
-    if (token.len == 0) return error.InvalidAttestationResponse;
-}
-
-fn validateChoice(value: ?[]const u8, allowed: []const []const u8) !void {
-    const raw = value orelse return;
-    for (allowed) |candidate| {
-        if (std.mem.eql(u8, raw, candidate)) return;
-    }
-    return error.InvalidServerRequestPolicy;
-}
-
-fn parseExactCarrier(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-) !std.json.Parsed(std.json.Value) {
-    if (raw.len > Client.max_exact_response_bytes) return error.ServerRequestCarrierTooLarge;
-    return std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
-        return error.InvalidServerRequestCarrierJson;
 }
 
 pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -3327,7 +2728,10 @@ test "all contracted server request methods and unknown have one typed reply" {
         defer std.testing.allocator.free(raw);
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
         defer parsed.deinit();
-        var reply = try client.prepareServerReply(case[1], parsed.value.object);
+        var reply = try client.serverRequestPolicy().prepareServerReply(
+            case[1],
+            parsed.value.object,
+        );
         defer reply.deinit(std.testing.allocator);
         const payload = try Client.serverReplyPayloadAlloc(
             std.testing.allocator,
@@ -3352,10 +2756,16 @@ test "server request defaults never invent approval or user input" {
     );
     defer parsed.deinit();
 
-    var command = try client.prepareServerReply(.command_execution_approval, parsed.value.object);
+    var command = try client.serverRequestPolicy().prepareServerReply(
+        .command_execution_approval,
+        parsed.value.object,
+    );
     defer command.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("{\"decision\":\"decline\"}", command.result_json);
-    var user_input = try client.prepareServerReply(.request_user_input, parsed.value.object);
+    var user_input = try client.serverRequestPolicy().prepareServerReply(
+        .request_user_input,
+        parsed.value.object,
+    );
     defer user_input.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("{\"answers\":{}}", user_input.result_json);
     try std.testing.expect(std.mem.indexOf(u8, user_input.result_json, "invented") == null);
@@ -3374,7 +2784,9 @@ test "mcp elicitation is mode aware and url never accepts" {
         .{},
     );
     defer form.deinit();
-    const form_result = try client.prepareMcpElicitationResult(form.value.object);
+    const form_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        form.value.object,
+    );
     defer std.testing.allocator.free(form_result);
     try std.testing.expect(std.mem.indexOf(u8, form_result, "\"action\":\"accept\"") != null);
 
@@ -3385,7 +2797,9 @@ test "mcp elicitation is mode aware and url never accepts" {
         .{},
     );
     defer url.deinit();
-    const url_result = try client.prepareMcpElicitationResult(url.value.object);
+    const url_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        url.value.object,
+    );
     defer std.testing.allocator.free(url_result);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "\"action\":\"decline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "secret.example") == null);
@@ -3397,7 +2811,9 @@ test "mcp elicitation is mode aware and url never accepts" {
         .{},
     );
     defer future.deinit();
-    const future_result = try client.prepareMcpElicitationResult(future.value.object);
+    const future_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        future.value.object,
+    );
     defer std.testing.allocator.free(future_result);
     try std.testing.expect(std.mem.indexOf(u8, future_result, "\"action\":\"decline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, future_result, "exact") == null);
@@ -3414,7 +2830,10 @@ test "auth and attestation failures do not echo secret request data" {
     );
     defer parsed.deinit();
     for ([_]Client.ServerRequestMethod{ .auth_tokens_refresh, .attestation_generate }) |method| {
-        var reply = try client.prepareServerReply(method, parsed.value.object);
+        var reply = try client.serverRequestPolicy().prepareServerReply(
+            method,
+            parsed.value.object,
+        );
         defer reply.deinit(std.testing.allocator);
         const payload = try Client.serverReplyPayloadAlloc(
             std.testing.allocator,
@@ -3760,7 +3179,10 @@ test "current time reply is whole unix seconds" {
         std.Io.Clock.real.now(client.io).nanoseconds,
         1_000_000_000,
     )));
-    var reply = try client.prepareServerReply(.current_time_read, parsed.value.object);
+    var reply = try client.serverRequestPolicy().prepareServerReply(
+        .current_time_read,
+        parsed.value.object,
+    );
     defer reply.deinit(std.testing.allocator);
     const after = @as(i64, @intCast(@divFloor(
         std.Io.Clock.real.now(client.io).nanoseconds,
@@ -3784,7 +3206,10 @@ test "deprecated approval methods return schema-valid denial results" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
     defer parsed.deinit();
     for ([_]Client.ServerRequestMethod{ .apply_patch_approval, .exec_command_approval }) |method| {
-        var reply = try client.prepareServerReply(method, parsed.value.object);
+        var reply = try client.serverRequestPolicy().prepareServerReply(
+            method,
+            parsed.value.object,
+        );
         defer reply.deinit(std.testing.allocator);
         var result = try std.json.parseFromSlice(
             std.json.Value,
@@ -3930,10 +3355,13 @@ test "auth refresh and attestation providers return only exact validated carrier
     client.attestation_response_json = attestation;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
     defer parsed.deinit();
-    var auth_reply = try client.prepareServerReply(.auth_tokens_refresh, parsed.value.object);
+    var auth_reply = try client.serverRequestPolicy().prepareServerReply(
+        .auth_tokens_refresh,
+        parsed.value.object,
+    );
     defer auth_reply.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(auth, auth_reply.result_json);
-    var attestation_reply = try client.prepareServerReply(
+    var attestation_reply = try client.serverRequestPolicy().prepareServerReply(
         .attestation_generate,
         parsed.value.object,
     );
@@ -4089,7 +3517,9 @@ test "full MCP response carrier preserves opaque meta and never crosses url or f
         .{},
     );
     defer form.deinit();
-    const form_result = try client.prepareMcpElicitationResult(form.value.object);
+    const form_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        form.value.object,
+    );
     defer std.testing.allocator.free(form_result);
     try std.testing.expectEqualStrings(exact, form_result);
 
@@ -4100,7 +3530,9 @@ test "full MCP response carrier preserves opaque meta and never crosses url or f
         .{},
     );
     defer url.deinit();
-    const url_result = try client.prepareMcpElicitationResult(url.value.object);
+    const url_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        url.value.object,
+    );
     defer std.testing.allocator.free(url_result);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "\"action\":\"decline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, url_result, "opaque") == null);
@@ -4112,7 +3544,9 @@ test "full MCP response carrier preserves opaque meta and never crosses url or f
         .{},
     );
     defer future.deinit();
-    const future_result = try client.prepareMcpElicitationResult(future.value.object);
+    const future_result = try client.serverRequestPolicy().prepareMcpElicitationResult(
+        future.value.object,
+    );
     defer std.testing.allocator.free(future_result);
     try std.testing.expect(std.mem.indexOf(u8, future_result, "opaque") == null);
 }
@@ -6165,17 +5599,35 @@ test "resolveExecDecision honors read_only and explicit approvals" {
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("acceptForSession", client.resolveExecDecision());
-    try std.testing.expectEqualStrings("decline", client.resolveFileDecision());
+    try std.testing.expectEqualStrings(
+        "acceptForSession",
+        client.serverRequestPolicy().resolveExecDecision(),
+    );
+    try std.testing.expectEqualStrings(
+        "decline",
+        client.serverRequestPolicy().resolveFileDecision(),
+    );
 
     client.exec_approval = "decline";
     client.file_approval = "accept";
-    try std.testing.expectEqualStrings("decline", client.resolveExecDecision());
-    try std.testing.expectEqualStrings("accept", client.resolveFileDecision());
+    try std.testing.expectEqualStrings(
+        "decline",
+        client.serverRequestPolicy().resolveExecDecision(),
+    );
+    try std.testing.expectEqualStrings(
+        "accept",
+        client.serverRequestPolicy().resolveFileDecision(),
+    );
 
     client.read_only = true;
-    try std.testing.expectEqualStrings("decline", client.resolveExecDecision());
-    try std.testing.expectEqualStrings("decline", client.resolveFileDecision());
+    try std.testing.expectEqualStrings(
+        "decline",
+        client.serverRequestPolicy().resolveExecDecision(),
+    );
+    try std.testing.expectEqualStrings(
+        "decline",
+        client.serverRequestPolicy().resolveFileDecision(),
+    );
 }
 
 test "resolvePermissionsApproval honors explicit grants and read_only" {
@@ -6201,18 +5653,18 @@ test "resolvePermissionsApproval honors explicit grants and read_only" {
     defer client.line_buf.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(
-        Client.PermissionsApproval.grant_session,
-        client.resolvePermissionsApproval(),
+        server_requests.Policy.PermissionsApproval.grant_session,
+        client.serverRequestPolicy().resolvePermissionsApproval(),
     );
     client.permissions_approval = "grant-turn";
     try std.testing.expectEqual(
-        Client.PermissionsApproval.grant_turn,
-        client.resolvePermissionsApproval(),
+        server_requests.Policy.PermissionsApproval.grant_turn,
+        client.serverRequestPolicy().resolvePermissionsApproval(),
     );
     client.read_only = true;
     try std.testing.expectEqual(
-        Client.PermissionsApproval.deny,
-        client.resolvePermissionsApproval(),
+        server_requests.Policy.PermissionsApproval.deny,
+        client.serverRequestPolicy().resolvePermissionsApproval(),
     );
 }
 
@@ -6239,17 +5691,17 @@ test "resolveElicitationAction defaults to decline" {
     defer client.line_buf.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(
-        Client.McpElicitationResponseAction.decline,
-        client.resolveElicitationAction(),
+        server_requests.Policy.McpElicitationResponseAction.decline,
+        client.serverRequestPolicy().resolveElicitationAction(),
     );
     client.elicitation_action = "accept";
     try std.testing.expectEqual(
-        Client.McpElicitationResponseAction.accept,
-        client.resolveElicitationAction(),
+        server_requests.Policy.McpElicitationResponseAction.accept,
+        client.serverRequestPolicy().resolveElicitationAction(),
     );
     client.elicitation_action = "cancel";
     try std.testing.expectEqual(
-        Client.McpElicitationResponseAction.cancel,
-        client.resolveElicitationAction(),
+        server_requests.Policy.McpElicitationResponseAction.cancel,
+        client.serverRequestPolicy().resolveElicitationAction(),
     );
 }
