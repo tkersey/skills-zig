@@ -1463,12 +1463,12 @@ const TransactionCommit = struct {
         defer journal_lock.close(fs.io);
         errdefer if (!self.record_persisted) {
             fs.directory().deleteTree(fs.io, self.transaction_dir) catch |err| {
-                std.log.warn("journal rollback failed for {s}: {s}; run recovery", .{
+                fs_authority.warn(fs.io, "journal rollback failed for {s}: {s}; run recovery", .{
                     self.transaction_dir, @errorName(err),
                 });
             };
             syncDirectoryPath(fs, self.transactions_dir) catch |err| {
-                std.log.warn("journal rollback sync failed for {s}: {s}; run recovery", .{
+                fs_authority.warn(fs.io, "journal rollback sync failed for {s}: {s}; run recovery", .{
                     self.transactions_dir, @errorName(err),
                 });
             };
@@ -3024,7 +3024,7 @@ const TransactionRecovery = struct {
             leases,
             self.storage_mutated,
         ) catch |release_error| {
-            std.log.warn("recovery lease cleanup failed for {s}: {s}; inspect recovery locks", .{
+            fs_authority.warn(fs.io, "recovery lease cleanup failed for {s}: {s}; inspect recovery locks", .{
                 self.transaction_dir,
                 @errorName(release_error),
             });
@@ -3767,7 +3767,7 @@ fn acquireLegacyTransactionRecoveryLeases(
                 &leases[index],
                 leases[index].fencing_token,
             ) catch |err| {
-                std.log.warn("lease rollback failed for {s}: {s}; run lease recovery", .{
+                fs_authority.warn(fs.io, "lease rollback failed for {s}: {s}; run lease recovery", .{
                     leases[index].path, @errorName(err),
                 });
                 leases[index].deinit(allocator);

@@ -2338,7 +2338,8 @@ fn writeTempAndRename(
 pub fn deleteFileAfterFailure(fs: Fs, dir: std.Io.Dir, path: []const u8) void {
     dir.deleteFile(fs.io, path) catch |err| switch (err) {
         error.FileNotFound => {},
-        else => std.log.warn(
+        else => fs_authority.warn(
+            fs.io,
             "rollback file removal failed for {s}: {s}; inspect and remove the leftover file",
             .{ path, @errorName(err) },
         ),
@@ -2627,10 +2628,12 @@ pub const LockFile = struct {
     }
 
     pub fn release(self: *LockFile, allocator: std.mem.Allocator) void {
+        const fs = self.fs;
         self.releaseChecked(allocator) catch |err| {
             // Release often follows publication: cleanup failure cannot turn a
             // committed write into a reported failure that invites a retry.
-            std.log.warn(
+            fs_authority.warn(
+                fs.io,
                 "lock release failed for {s}: {s}; inspect and remove stale lock",
                 .{ self.path, @errorName(err) },
             );
