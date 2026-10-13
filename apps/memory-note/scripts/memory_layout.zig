@@ -26,6 +26,7 @@ pub const Version = enum {
 pub fn selectedVersion(
     allocator: std.mem.Allocator,
     io: std.Io,
+    cwd: std.Io.Dir,
     env: *const std.process.Environ.Map,
     home: []const u8,
     explicit_version: ?Version,
@@ -36,8 +37,13 @@ pub fn selectedVersion(
     defer child_env.deinit();
     try child_env.put("CODEX_HOME", home);
     const executable = env.get("CODEX_BIN") orelse "codex";
+    // Spawn requires an actual directory handle; Dir.cwd() may be a sentinel.
+    // Keep this handle through both child startup and the config request.
+    var child_cwd = try cwd.openDir(io, ".", .{});
+    defer child_cwd.close(io);
     var child = std.process.spawn(io, .{
         .argv = &.{ executable, "app-server" },
+        .cwd = .{ .dir = child_cwd },
         .environ_map = &child_env,
         .stdin = .pipe,
         .stdout = .pipe,
@@ -61,9 +67,9 @@ pub fn selectedVersion(
     var initialized = try readResponse(allocator, &reader, 1, deadline, &total_bytes);
     initialized.deinit();
     try writeMessage(io, child.stdin.?, "{\"method\":\"initialized\"}\n", deadline);
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(cwd);
-    const request = try configRequest(allocator, cwd);
+    const cwd_path = try child_cwd.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd_path);
+    const request = try configRequest(allocator, cwd_path);
     defer allocator.free(request);
     try writeMessage(io, child.stdin.?, request, deadline);
     var response = try readResponse(allocator, &reader, 2, deadline, &total_bytes);
@@ -74,12 +80,17 @@ pub fn selectedVersion(
 fn retireConfigChild(io: std.Io, child: *std.process.Child) void {
     // Child.kill sends SIGTERM and waits on POSIX. A config subprocess that
     // ignores SIGTERM must not turn the request deadline into an endless wait.
+    // Zig 0.17 has no force-signal I/O operation: this one host call uses the
+    // explicit owned child PID as authority, then I/O-owned kill reaps/closes it.
     switch (@import("builtin").os.tag) {
         .windows, .wasi => {},
         else => if (child.id) |pid| {
             std.posix.kill(pid, std.posix.SIG.KILL) catch |err| switch (err) {
                 error.ProcessNotFound => {},
-                else => std.log.warn("could not kill Codex config child: {s}", .{@errorName(err)}),
+                else => {
+                    var diagnostic = std.Io.File.stderr().writer(io, &.{});
+                    diagnostic.interface.print("warning: could not kill Codex config child: {s}\n", .{@errorName(err)}) catch {};
+                },
             };
         },
     }
@@ -211,11 +222,11 @@ fn objectField(parent: std.json.Value, key: []const u8) !std.json.Value {
 
 /// Check the selected spelling without creating directories or hiding symlinks.
 /// Absence is a valid empty source; non-directory and symlink ancestors are not.
-pub fn validateDirectory(io: std.Io, path: []const u8) !void {
+pub fn validateDirectory(io: std.Io, directory: std.Io.Dir, path: []const u8) !void {
     if (!std.fs.path.isAbsolute(path)) return error.InvalidPath;
     var parts = std.fs.path.componentIterator(path);
     while (parts.next()) |part| {
-        const info = std.Io.Dir.cwd().statFile(io, part.path, .{
+        const info = directory.statFile(io, part.path, .{
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -277,13 +288,14 @@ const config_server_fixture =
     \\#!/bin/sh
     \\[ "$1" = app-server ] || exit 3
     \\[ "$CODEX_HOME" = "$EXPECTED_HOME" ] || exit 4
+    \\[ "$PWD" = "$EXPECTED_CWD" ] || exit 11
     \\IFS= read -r init || exit 5
     \\case "$init" in *'"method":"initialize"'*) ;; *) exit 6 ;; esac
     \\printf '%s\n' '{"method":"notice","params":{}}' '{"id":1,"result":{}}'
     \\IFS= read -r ready || exit 7
     \\[ "$ready" = '{"method":"initialized"}' ] || exit 8
     \\IFS= read -r request || exit 9
-    \\case "$request" in *'"method":"config/read"'*'"cwd":"/'*) ;; *) exit 10 ;; esac
+    \\case "$request" in *'"method":"config/read"'*"\"cwd\":\"$EXPECTED_CWD\""*) ;; *) exit 10 ;; esac
     \\printf '%s\n' "$CONFIG_RESPONSE"
     \\IFS= read -r unused
 ;
@@ -307,8 +319,11 @@ fn fixtureSelection(response: []const u8) !Version {
     try env.put("CODEX_BIN", executable);
     try env.put("CODEX_HOME", "/unselected/home");
     try env.put("EXPECTED_HOME", "/selected/home");
+    const expected_cwd = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(expected_cwd);
+    try env.put("EXPECTED_CWD", expected_cwd);
     try env.put("CONFIG_RESPONSE", response);
-    return selectedVersion(allocator, io, &env, "/selected/home", null);
+    return selectedVersion(allocator, io, tmp.dir, &env, "/selected/home", null);
 }
 
 test "config client initializes and reads effective config for the selected home and cwd" {
@@ -339,6 +354,7 @@ test "explicit session version does not require Codex and relative homes are rej
     try std.testing.expectEqual(Version.v2, try selectedVersion(
         std.testing.allocator,
         std.testing.io,
+        .cwd(),
         &env,
         "/selected/home",
         .v2,
@@ -346,6 +362,7 @@ test "explicit session version does not require Codex and relative homes are rej
     try std.testing.expectError(error.InvalidCodexHome, selectedVersion(
         std.testing.allocator,
         std.testing.io,
+        .cwd(),
         &env,
         "relative",
         .v2,
@@ -353,6 +370,7 @@ test "explicit session version does not require Codex and relative homes are rej
     try std.testing.expectError(error.CodexConfigUnavailable, selectedVersion(
         std.testing.allocator,
         std.testing.io,
+        .cwd(),
         &env,
         "/selected/home",
         null,
