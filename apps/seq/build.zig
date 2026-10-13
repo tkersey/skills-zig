@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = seq_meta },
             .{ .name = "test_support", .module = modules.test_support },
             .{ .name = "definition_core", .module = modules.definition_core },
+            .{ .name = "durable_store", .module = modules.durable_store },
             .{ .name = "seq_v1_core", .module = modules.seq_core },
         },
     });
@@ -45,6 +46,7 @@ pub fn build(b: *std.Build) void {
 }
 
 const CoreModules = struct {
+    durable_store: *std.Build.Module,
     definition_core: *std.Build.Module,
     seq_core: *std.Build.Module,
     test_support: *std.Build.Module,
@@ -111,6 +113,7 @@ fn createCoreModules(
         definition_core, seq_core, durable_store, jsonl_core, trace_core,
     }) |module| module.addImport("test_support", test_support);
     return .{
+        .durable_store = durable_store,
         .definition_core = definition_core,
         .seq_core = seq_core,
         .test_support = test_support,

@@ -25,6 +25,7 @@ pub fn build(ctx: BuildContext, shared: SharedModules) DefinitionApp {
     const seq_root = ctx.module("apps/seq/src/v1/main.zig", &.{
         .{ .name = "app_meta", .module = seq_meta },
         .{ .name = "definition_core", .module = shared.definitions },
+        .{ .name = "durable_store", .module = shared.durable },
         .{ .name = "seq_v1_core", .module = seq_v1_core },
     });
     seq_root.strip = ctx.optimize == .fast;
