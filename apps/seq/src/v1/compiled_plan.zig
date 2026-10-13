@@ -72,6 +72,7 @@ pub const PlanSet = struct {
 const Locator = source_cache.Locator;
 
 pub fn load(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -84,12 +85,13 @@ pub fn load(
     if (!std.fs.path.isAbsolute(admitted_root)) {
         return error.DefinitionRootNotAbsolute;
     }
-    const start_ns = monotonicNanoseconds();
+    const start_ns = monotonicNanoseconds(fs.io);
     if (options.cache_dir) |cache_dir| {
         if (!std.fs.path.isAbsolute(cache_dir)) {
             return error.CacheRootNotAbsolute;
         }
         const cached = tryLoadCache(
+            fs,
             allocator,
             admitted_root,
             entry_path,
@@ -104,21 +106,23 @@ pub fn load(
         };
         if (cached) |value| {
             var result = value;
-            result.stats.compile_ns = elapsedNanoseconds(start_ns);
+            result.stats.compile_ns = elapsedNanoseconds(fs.io, start_ns);
             return result;
         }
     }
 
     var compiled = try compileFromSource(
+        fs,
         allocator,
         admitted_root,
         entry_path,
         request,
         options.closure_limits,
     );
-    compiled.stats.compile_ns = elapsedNanoseconds(start_ns);
+    compiled.stats.compile_ns = elapsedNanoseconds(fs.io, start_ns);
     if (options.cache_dir) |cache_dir| {
         writeCache(
+            fs,
             allocator,
             cache_dir,
             admitted_root,
@@ -134,6 +138,7 @@ pub fn load(
 }
 
 fn compileFromSource(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -141,6 +146,7 @@ fn compileFromSource(
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
     var closure = try definition_core.closure.load(
+        fs.io,
         allocator,
         admitted_root,
         entry_path,
@@ -173,6 +179,7 @@ fn compileFromSource(
 }
 
 fn tryLoadCache(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -190,6 +197,7 @@ fn tryLoadCache(
         source_adapter_version,
     );
     const cached_locator = try loadLocator(
+        fs,
         allocator,
         cache_dir,
         locator_key,
@@ -199,6 +207,7 @@ fn tryLoadCache(
     var locator = cached_locator orelse return null;
     defer locator.deinit(allocator);
     return @as(?PlanSet, try loadCachedPlan(
+        fs,
         allocator,
         cache_dir,
         entry_path,
@@ -211,6 +220,7 @@ fn tryLoadCache(
 }
 
 fn loadLocator(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     locator_key: [32]u8,
@@ -225,6 +235,7 @@ fn loadLocator(
     );
     defer allocator.free(locator_path);
     const locator_entry = durable_store.readPrivateRegularFileNoSymlink(
+        fs,
         allocator,
         locator_path,
         locator_limits.max_entry_bytes,
@@ -241,6 +252,7 @@ fn loadLocator(
     var locator = try decodeLocator(allocator, locator_payload);
     errdefer locator.deinit(allocator);
     _ = try definition_core.closure.verifySourceManifest(
+        fs.io,
         allocator,
         admitted_root,
         locator.files,
@@ -250,6 +262,7 @@ fn loadLocator(
 }
 
 fn loadCachedPlan(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     entry_path: []const u8,
@@ -267,6 +280,7 @@ fn loadCachedPlan(
     );
     defer allocator.free(plan_path);
     const plan_entry = try durable_store.readPrivateRegularFileNoSymlink(
+        fs,
         allocator,
         plan_path,
         cache_limits.max_entry_bytes,
@@ -304,6 +318,7 @@ fn loadCachedPlan(
 }
 
 fn writeCache(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     admitted_root: []const u8,
@@ -322,11 +337,12 @@ fn writeCache(
         &.{ cache_dir, "locators" },
     );
     defer allocator.free(locators_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(plans_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(locators_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(fs, cache_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(fs, plans_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(fs, locators_dir);
 
     const plan_key = try writePlanEntry(
+        fs,
         allocator,
         cache_dir,
         runtime_version,
@@ -335,6 +351,7 @@ fn writeCache(
         plan_set,
     );
     try writeLocatorEntry(
+        fs,
         allocator,
         cache_dir,
         admitted_root,
@@ -347,6 +364,7 @@ fn writeCache(
 }
 
 fn writePlanEntry(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     runtime_version: []const u8,
@@ -382,11 +400,12 @@ fn writePlanEntry(
         plan_key,
     );
     defer allocator.free(plan_path);
-    try durable_store.writeTextAtomicPrivate(allocator, plan_path, plan_entry);
+    try durable_store.writeTextAtomicPrivate(fs, allocator, plan_path, plan_entry);
     return plan_key;
 }
 
 fn writeLocatorEntry(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     admitted_root: []const u8,
@@ -426,6 +445,7 @@ fn writeLocatorEntry(
     );
     defer allocator.free(locator_path);
     try durable_store.writeTextAtomicPrivate(
+        fs,
         allocator,
         locator_path,
         locator_entry,
@@ -636,19 +656,15 @@ fn cachePathAlloc(
     );
 }
 
-fn monotonicNanoseconds() u64 {
-    const now = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+fn monotonicNanoseconds(io: std.Io) u64 {
+    const now = std.Io.Clock.awake.now(io).nanoseconds;
     if (now <= 0) return 0;
     return std.math.cast(u64, now) orelse std.math.maxInt(u64);
 }
 
-fn elapsedNanoseconds(start: u64) u64 {
-    const now = monotonicNanoseconds();
+fn elapsedNanoseconds(io: std.Io, start: u64) u64 {
+    const now = monotonicNanoseconds(io);
     return if (now > start) now - start else 0;
-}
-
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn decodePlanSetForAllocationFailure(
@@ -706,6 +722,7 @@ fn cacheHitKey(
     request: Request,
 ) ![32]u8 {
     var cold = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -731,6 +748,7 @@ fn cacheHitKey(
     );
 
     var warm = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -771,6 +789,7 @@ fn repairCache(
         .data = "corrupt",
     });
     var rebuilt = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -782,6 +801,7 @@ fn repairCache(
     defer rebuilt.deinit(std.testing.allocator);
     try std.testing.expect(!rebuilt.stats.cache_hit);
     var repaired_hit = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -806,6 +826,7 @@ fn invalidateCache(
         .data = "\n" ++ cached_observation_definition,
     });
     var source_miss = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -818,6 +839,7 @@ fn invalidateCache(
     try std.testing.expect(!source_miss.stats.cache_hit);
 
     var adapter_miss = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -840,6 +862,7 @@ fn invalidateCache(
     );
     defer std.testing.allocator.free(blocked_cache);
     var write_failure = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
