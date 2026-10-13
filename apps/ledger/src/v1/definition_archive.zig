@@ -33,15 +33,16 @@ pub const Loaded = struct {
 };
 
 pub fn prepare(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     entry_path: []const u8,
     closure: *const definition_core.Closure,
 ) !Candidate {
-    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(scope, repo_root)) return error.RepositoryRootNotAbsolute;
     if (closure.find(entry_path) == null) return error.EntryDefinitionMissing;
-    const path = try pathAlloc(allocator, repo_root, closure.digestSlice());
+    const path = try pathAlloc(scope, allocator, repo_root, closure.digestSlice());
     errdefer allocator.free(path);
     const content = try renderAlloc(
         allocator,
@@ -50,8 +51,9 @@ pub fn prepare(
         closure,
     );
     errdefer allocator.free(content);
-    try durable_store.rejectSymlinkComponents(path);
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
     const existing = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         max_bytes,
@@ -73,6 +75,7 @@ pub fn prepare(
 }
 
 pub fn pathAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     digest: []const u8,
@@ -82,19 +85,21 @@ pub fn pathAlloc(
     defer allocator.free(name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".definitions", name },
+        &.{ repo_root, storage_root.controlComponent(scope), ".definitions", name },
     );
 }
 
 pub fn load(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     expected_digest: []const u8,
 ) !Loaded {
-    const path = try pathAlloc(allocator, repo_root, expected_digest);
+    const path = try pathAlloc(scope, allocator, repo_root, expected_digest);
     defer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
     const bytes = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         max_bytes,
@@ -322,6 +327,8 @@ pub fn renderAlloc(
 }
 
 test "definition archive is deterministic and content addressed" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -333,6 +340,7 @@ test "definition archive is deterministic and content addressed" {
         .data = "{\"imports\":[\"child.json\"],\"value\":2}",
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "root.json",
@@ -370,13 +378,15 @@ test "definition archive is deterministic and content addressed" {
     );
     defer std.testing.allocator.free(repo_root);
     const path = try pathAlloc(
+        scope,
         std.testing.allocator,
         repo_root,
         closure.digestSlice(),
     );
     defer std.testing.allocator.free(path);
-    try durable_store.writeTextAtomic(std.testing.allocator, path, first);
+    try durable_store.writeTextAtomic(scope.fs, std.testing.allocator, path, first);
     var loaded = try load(
+        scope,
         std.testing.allocator,
         repo_root,
         closure.digestSlice(),

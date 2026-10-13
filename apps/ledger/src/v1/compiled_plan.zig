@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const source_cache = definition_core.source_cache;
 const durable_store = @import("durable_store");
@@ -98,6 +99,7 @@ const VerifiedLocator = struct {
 };
 
 pub fn load(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -109,12 +111,13 @@ pub fn load(
     if (!std.fs.path.isAbsolute(admitted_root)) {
         return error.DefinitionRootNotAbsolute;
     }
-    const start_ns = monotonicNanoseconds();
+    const start_ns = monotonicNanoseconds(scope.fs.io);
     if (options.cache_dir) |cache_dir| {
         if (!std.fs.path.isAbsolute(cache_dir)) {
             return error.CacheRootNotAbsolute;
         }
         const cached = tryLoadCache(
+            scope,
             allocator,
             admitted_root,
             entry_path,
@@ -128,21 +131,23 @@ pub fn load(
         };
         if (cached) |value| {
             var result = value;
-            result.stats.compile_ns = elapsedNanoseconds(start_ns);
+            result.stats.compile_ns = elapsedNanoseconds(scope.fs.io, start_ns);
             return result;
         }
     }
 
     var compiled = try compileFromSource(
+        scope,
         allocator,
         admitted_root,
         entry_path,
         route,
         options.closure_limits,
     );
-    compiled.stats.compile_ns = elapsedNanoseconds(start_ns);
+    compiled.stats.compile_ns = elapsedNanoseconds(scope.fs.io, start_ns);
     if (options.cache_dir) |cache_dir| {
         writeCache(
+            scope,
             allocator,
             cache_dir,
             admitted_root,
@@ -159,6 +164,7 @@ pub fn load(
 }
 
 fn compileFromSource(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -167,6 +173,7 @@ fn compileFromSource(
 ) !PlanSet {
     var result: PlanSet = result: {
         var closure = try definition_core.closure.load(
+            scope.fs.io,
             allocator,
             admitted_root,
             entry_path,
@@ -308,6 +315,7 @@ fn compileDurablePlans(
 }
 
 fn tryLoadCache(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -323,6 +331,7 @@ fn tryLoadCache(
         runtime_version,
     );
     var locator = (try tryLoadLocator(
+        scope,
         allocator,
         admitted_root,
         cache_dir,
@@ -331,6 +340,7 @@ fn tryLoadCache(
     )) orelse return null;
     defer locator.deinit(allocator);
     return try loadCachedPlan(
+        scope,
         allocator,
         entry_path,
         route,
@@ -342,6 +352,7 @@ fn tryLoadCache(
 }
 
 fn tryLoadLocator(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     cache_dir: []const u8,
@@ -356,6 +367,7 @@ fn tryLoadLocator(
     );
     defer allocator.free(locator_path);
     const locator_entry = durable_store.readPrivateRegularFileNoSymlink(
+        scope.fs,
         allocator,
         locator_path,
         locator_limits.max_entry_bytes,
@@ -373,6 +385,7 @@ fn tryLoadLocator(
     errdefer locator.deinit(allocator);
     const verified_source_bytes =
         try definition_core.closure.verifySourceManifest(
+            scope.fs.io,
             allocator,
             admitted_root,
             locator.files,
@@ -382,6 +395,7 @@ fn tryLoadLocator(
 }
 
 fn loadCachedPlan(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     entry_path: []const u8,
     route: Route,
@@ -398,6 +412,7 @@ fn loadCachedPlan(
     );
     defer allocator.free(plan_path);
     const plan_entry = try durable_store.readPrivateRegularFileNoSymlink(
+        scope.fs,
         allocator,
         plan_path,
         cache_limits.max_entry_bytes,
@@ -439,6 +454,7 @@ fn loadCachedPlan(
 }
 
 fn writeCache(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     admitted_root: []const u8,
@@ -446,13 +462,14 @@ fn writeCache(
     runtime_version: []const u8,
     plan_set: *const PlanSet,
 ) !void {
-    try ensureCacheDirectories(allocator, cache_dir);
+    try ensureCacheDirectories(scope, allocator, cache_dir);
     const plan_key = planKey(
         runtime_version,
         route,
         &plan_set.definition_plan,
     );
     try writePlanCache(
+        scope,
         allocator,
         cache_dir,
         route,
@@ -460,6 +477,7 @@ fn writeCache(
         plan_key,
     );
     try writeLocatorCache(
+        scope,
         allocator,
         cache_dir,
         admitted_root,
@@ -471,6 +489,7 @@ fn writeCache(
 }
 
 fn ensureCacheDirectories(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
 ) !void {
@@ -484,12 +503,13 @@ fn ensureCacheDirectories(
         &.{ cache_dir, "locators" },
     );
     defer allocator.free(locators_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(plans_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(locators_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(scope.fs, cache_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(scope.fs, plans_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(scope.fs, locators_dir);
 }
 
 fn writePlanCache(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     route: Route,
@@ -518,10 +538,11 @@ fn writePlanCache(
         plan_key,
     );
     defer allocator.free(plan_path);
-    try durable_store.writeTextAtomicPrivate(allocator, plan_path, plan_entry);
+    try durable_store.writeTextAtomicPrivate(scope.fs, allocator, plan_path, plan_entry);
 }
 
 fn writeLocatorCache(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     admitted_root: []const u8,
@@ -559,6 +580,7 @@ fn writeLocatorCache(
     );
     defer allocator.free(locator_path);
     try durable_store.writeTextAtomicPrivate(
+        scope.fs,
         allocator,
         locator_path,
         locator_entry,
@@ -1001,19 +1023,15 @@ fn cachePathAlloc(
     );
 }
 
-fn monotonicNanoseconds() u64 {
-    const now = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+fn monotonicNanoseconds(io: std.Io) u64 {
+    const now = std.Io.Clock.awake.now(io).nanoseconds;
     if (now <= 0) return 0;
     return std.math.cast(u64, now) orelse std.math.maxInt(u64);
 }
 
-fn elapsedNanoseconds(start: u64) u64 {
-    const now = monotonicNanoseconds();
+fn elapsedNanoseconds(io: std.Io, start: u64) u64 {
+    const now = monotonicNanoseconds(io);
     return if (now > start) now - start else 0;
-}
-
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn expectColdAndWarmCache(
@@ -1021,7 +1039,10 @@ fn expectColdAndWarmCache(
     cache_root: []const u8,
     route: Route,
 ) !void {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var cold = try load(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1035,6 +1056,7 @@ fn expectColdAndWarmCache(
     try std.testing.expect(cold.closure.files[0].canonical_json.len > 0);
     try std.testing.expect(cold.definition_plan.rules.len > 0);
     var warm = try load(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1060,7 +1082,10 @@ fn expectChangedAndCorruptCacheRebuild(
     cache_root: []const u8,
     route: Route,
 ) !void {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var changed = try load(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1078,8 +1103,9 @@ fn expectChangedAndCorruptCacheRebuild(
         key,
     );
     defer std.testing.allocator.free(path);
-    try durable_store.writeTextAtomic(std.testing.allocator, path, "corrupt");
+    try durable_store.writeTextAtomic(scope.fs, std.testing.allocator, path, "corrupt");
     var rebuilt = try load(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1092,6 +1118,8 @@ fn expectChangedAndCorruptCacheRebuild(
 }
 
 test "compiled plan cache rebuilds misses and skips definition parsing on hits" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     try source_tmp.dir.writeFile(std.testing.io, .{
@@ -1137,6 +1165,7 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     );
     defer std.testing.allocator.free(blocked_cache);
     var write_failure = try load(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1149,6 +1178,8 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
 }
 
 test "transaction cache retains canonical definition archive sources" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     const source_root = try std.Io.Dir.cwd().realPathFileAlloc(
         std.testing.io,
         ".",
@@ -1167,6 +1198,7 @@ test "transaction cache retains canonical definition archive sources" {
     const route: Route = .{ .kind = .transact, .name = "append" };
 
     var cold = try load(
+        scope,
         std.testing.allocator,
         source_root,
         entry,
@@ -1176,6 +1208,7 @@ test "transaction cache retains canonical definition archive sources" {
     );
     defer cold.deinit(std.testing.allocator);
     var warm = try load(
+        scope,
         std.testing.allocator,
         source_root,
         entry,
@@ -1193,6 +1226,8 @@ test "transaction cache retains canonical definition archive sources" {
 }
 
 test "migration cache retains canonical definition archive sources" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     const source_root = try std.Io.Dir.cwd().realPathFileAlloc(
         std.testing.io,
         ".",
@@ -1210,6 +1245,7 @@ test "migration cache retains canonical definition archive sources" {
     const entry = "apps/ledger/src/v1/fixtures/event-definition.json";
     const route: Route = .{ .kind = .migration };
     var cold = try load(
+        scope,
         std.testing.allocator,
         source_root,
         entry,
@@ -1219,6 +1255,7 @@ test "migration cache retains canonical definition archive sources" {
     );
     defer cold.deinit(std.testing.allocator);
     var warm = try load(
+        scope,
         std.testing.allocator,
         source_root,
         entry,
@@ -1255,7 +1292,10 @@ fn compilePlanSetForAllocationFailure(
     allocator: std.mem.Allocator,
     source_root: []const u8,
 ) !void {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var compiled = compileFromSource(
+        scope,
         allocator,
         source_root,
         "artifact.json",
@@ -1279,6 +1319,8 @@ test "relation compiled plans release every allocation on compile and decode fai
 }
 
 fn checkFixtureAllocationFailures(fixture: []const u8) !void {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     try source_tmp.dir.writeFile(std.testing.io, .{
@@ -1297,6 +1339,7 @@ fn checkFixtureAllocationFailures(fixture: []const u8) !void {
         .{source_root},
     );
     var plan_set = try compileFromSource(
+        scope,
         std.testing.allocator,
         source_root,
         "artifact.json",

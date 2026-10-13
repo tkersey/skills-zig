@@ -14,13 +14,14 @@ pub const Candidate = struct {
 };
 
 pub fn prepare(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     revision: []const u8,
     content: []const u8,
     max_bytes: usize,
 ) !Candidate {
-    if (!storage_root.validRepoRoot(repo_root)) {
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (content.len > max_bytes) return error.RevisionArchiveTooLarge;
@@ -33,10 +34,11 @@ pub fn prepare(
     if (!std.mem.eql(u8, actual, revision)) {
         return error.RevisionArchiveDigestMismatch;
     }
-    const path = try pathAlloc(allocator, repo_root, revision);
+    const path = try pathAlloc(scope, allocator, repo_root, revision);
     errdefer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
     const existing = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         max_bytes,
@@ -58,18 +60,20 @@ pub fn prepare(
 }
 
 pub fn load(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     revision: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (!storage_root.validRepoRoot(repo_root)) {
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     try definition_core.json.digest(revision);
-    const path = try pathAlloc(allocator, repo_root, revision);
+    const path = try pathAlloc(scope, allocator, repo_root, revision);
     defer allocator.free(path);
     const content = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         max_bytes,
@@ -90,6 +94,7 @@ pub fn load(
 }
 
 pub fn pathAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     revision: []const u8,
@@ -102,11 +107,13 @@ pub fn pathAlloc(
     defer allocator.free(file_name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".revisions", file_name },
+        &.{ repo_root, storage_root.controlComponent(scope), ".revisions", file_name },
     );
 }
 
 test "revision archive is immutable and content addressed" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(
@@ -117,10 +124,10 @@ test "revision archive is immutable and content addressed" {
     defer std.testing.allocator.free(root);
     const archive_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, storage_root.controlComponent(), ".revisions" },
+        &.{ root, storage_root.controlComponent(scope), ".revisions" },
     );
     defer std.testing.allocator.free(archive_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(archive_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, archive_dir);
     const content = "{\"value\":1}";
     const revision = try definition_core.canonical_json.digestBytesAlloc(
         std.testing.allocator,
@@ -128,6 +135,7 @@ test "revision archive is immutable and content addressed" {
     );
     defer std.testing.allocator.free(revision);
     var candidate = try prepare(
+        scope,
         std.testing.allocator,
         root,
         revision,
@@ -137,11 +145,13 @@ test "revision archive is immutable and content addressed" {
     defer candidate.deinit(std.testing.allocator);
     try std.testing.expect(!candidate.exists);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         candidate.path,
         content,
     );
     var existing = try prepare(
+        scope,
         std.testing.allocator,
         root,
         revision,
@@ -151,6 +161,7 @@ test "revision archive is immutable and content addressed" {
     defer existing.deinit(std.testing.allocator);
     try std.testing.expect(existing.exists);
     const loaded = try load(
+        scope,
         std.testing.allocator,
         root,
         revision,

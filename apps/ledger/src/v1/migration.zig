@@ -28,6 +28,7 @@ pub const Result = struct {
 };
 
 pub fn execute(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -37,8 +38,8 @@ pub fn execute(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    transaction.resetMutationState();
-    if (!storage_root.validRepoRoot(repo_root)) {
+    transaction.resetMutationState(scope);
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (!std.mem.eql(
@@ -49,9 +50,10 @@ pub fn execute(
         return error.DefinitionClosureDigestMismatch;
     }
     if (try transaction.recoverRepositoryTransactions(
+        scope,
         allocator,
         repo_root,
-    )) transaction.markStorageMutated();
+    )) transaction.markStorageMutated(scope);
     var resolved = try storage.resolve(allocator, storage_plan, parameters);
     defer resolved.deinit(allocator);
     const event_plan = event_protocol orelse
@@ -61,12 +63,14 @@ pub fn execute(
         return error.SegmentedMigrationRequiresSegmentedEventLog;
     }
     var target = try segmented_event_log.Snapshot.load(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
     );
     defer target.deinit(allocator);
     if (target.head_exists) return validateExistingTarget(
+        scope,
         allocator,
         definition_plan,
         repo_root,
@@ -76,6 +80,7 @@ pub fn execute(
         &target,
     );
     return migrateLegacySlot(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -89,6 +94,7 @@ pub fn execute(
 }
 
 fn migrateLegacySlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -103,6 +109,7 @@ fn migrateLegacySlot(
     legacy_slot.layout = .monolithic;
     legacy_slot.max_bytes = segmented_event_log.legacy_event_max_bytes;
     var legacy = try custody.readReplaySlotOrMissing(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -114,6 +121,7 @@ fn migrateLegacySlot(
         legacy.binding.rows.len - 1
     ].record_end orelse return error.InvalidStoreBinding;
     var stats = try replay.validateReplaySlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -134,6 +142,7 @@ fn migrateLegacySlot(
     );
     defer allocator.free(checkpoint_bytes);
     return migrateLegacyFile(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -148,6 +157,7 @@ fn migrateLegacySlot(
 }
 
 fn migrateLegacyFile(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -159,8 +169,8 @@ fn migrateLegacyFile(
     checkpoint_bytes: []const u8,
     target: *const segmented_event_log.Snapshot,
 ) !Result {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const event_stat = try std.Io.Dir.cwd().statFile(
+    const io = scope.fs.io;
+    const event_stat = try scope.fs.directory().statFile(
         io,
         legacy.path,
         .{ .follow_symlinks = false },
@@ -168,10 +178,7 @@ fn migrateLegacyFile(
     const event_bytes = std.math.cast(usize, event_stat.size) orelse
         return error.FileTooBig;
     if (event_bytes == 0) return error.InvalidLegacySegmentSource;
-    var event_file = if (std.fs.path.isAbsolute(legacy.path))
-        try std.Io.Dir.openFileAbsolute(io, legacy.path, .{})
-    else
-        try std.Io.Dir.cwd().openFile(io, legacy.path, .{});
+    var event_file = try scope.fs.directory().openFile(io, legacy.path, .{});
     defer event_file.close(io);
     var event_map = try std.Io.File.MemoryMap.create(io, event_file, .{
         .len = event_bytes,
@@ -181,6 +188,7 @@ fn migrateLegacyFile(
     defer event_map.destroy(io);
     try event_map.read(io);
     return migrateLegacyBytes(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -196,6 +204,7 @@ fn migrateLegacyFile(
 }
 
 fn migrateLegacyBytes(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -232,6 +241,7 @@ fn migrateLegacyBytes(
     try requireRevision(revision, legacy.revision);
     releaseReadCustody(legacy);
     const transaction_id = try commitMigration(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -366,6 +376,7 @@ fn requireRevision(actual: []const u8, expected: []const u8) !void {
 }
 
 fn validateExistingTarget(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
@@ -374,8 +385,9 @@ fn validateExistingTarget(
     logical_ref: []const u8,
     target: *const segmented_event_log.Snapshot,
 ) !Result {
-    try segmented_event_log.auditHistory(allocator, target);
+    try segmented_event_log.auditHistory(scope, allocator, target);
     try replay.validateSegmentedHistory(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -398,6 +410,7 @@ fn validateExistingTarget(
     );
     defer binding.deinit(allocator);
     var stats = try replay.validateSegmentedSnapshot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -413,6 +426,7 @@ fn validateExistingTarget(
         return error.SegmentedMigrationCheckpointMissing;
     }
     const transaction_id = try reconcileExistingTombstones(
+        scope,
         allocator,
         repo_root,
         target,
@@ -434,17 +448,20 @@ fn validateExistingTarget(
 const TombstoneState = enum { absent, exact, invalid };
 
 fn reconcileExistingTombstones(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     target: *const segmented_event_log.Snapshot,
 ) !?[]u8 {
     const paths = &target.paths;
     const event_state = try tombstoneState(
+        scope,
         allocator,
         paths.legacy_event,
         segmented_event_log.legacy_event_tombstone,
     );
     const binding_state = try tombstoneState(
+        scope,
         allocator,
         paths.legacy_binding,
         segmented_event_log.legacy_binding_tombstone,
@@ -452,6 +469,7 @@ fn reconcileExistingTombstones(
     if (event_state == .exact and binding_state == .exact) return null;
     if (event_state == .absent and binding_state == .absent) {
         return installTombstones(
+            scope,
             allocator,
             repo_root,
             paths,
@@ -463,12 +481,14 @@ fn reconcileExistingTombstones(
         return error.SegmentedLegacyCustodyMismatch;
     }
     const legacy_events = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         paths.legacy_event,
         segmented_event_log.legacy_event_max_bytes,
     );
     defer allocator.free(legacy_events);
     const legacy_bindings = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         paths.legacy_binding,
         custody.binding_max_bytes,
@@ -484,6 +504,7 @@ fn reconcileExistingTombstones(
     const binding_digest = try digestAlloc(allocator, legacy_bindings);
     defer allocator.free(binding_digest);
     return installTombstones(
+        scope,
         allocator,
         repo_root,
         paths,
@@ -493,21 +514,22 @@ fn reconcileExistingTombstones(
 }
 
 fn installTombstones(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     paths: *const segmented_event_log.Paths,
     event_digest: ?[]const u8,
     binding_digest: ?[]const u8,
 ) !?[]u8 {
-    transaction.markStorageMutationUnknown();
+    transaction.markStorageMutationUnknown(scope);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     const counter = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".fencing.counter" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".fencing.counter" },
     );
     defer allocator.free(counter);
     const mutations = [_]durable_store.TransactionMutation{
@@ -525,6 +547,7 @@ fn installTombstones(
         ),
     };
     var commit = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         &mutations,
@@ -539,7 +562,7 @@ fn installTombstones(
         },
     );
     defer commit.deinit(allocator);
-    transaction.markStorageMutated();
+    transaction.markStorageMutated(scope);
     return @as(?[]u8, try allocator.dupe(u8, commit.transaction_id));
 }
 
@@ -593,11 +616,13 @@ fn bindingHistoryEquals(
 }
 
 fn tombstoneState(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     expected: []const u8,
 ) !TombstoneState {
     const bytes = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         expected.len,
@@ -629,6 +654,7 @@ fn tombstoneMutation(
 }
 
 fn commitMigration(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -640,10 +666,11 @@ fn commitMigration(
     segments: *const MigrationSegments,
     checkpoint_bytes: []const u8,
 ) ![]u8 {
-    transaction.markStorageMutationUnknown();
-    try ensureMigrationDirectories(allocator, target, repo_root);
-    transaction.markStorageMutated();
+    transaction.markStorageMutationUnknown(scope);
+    try ensureMigrationDirectories(scope, allocator, target, repo_root);
+    transaction.markStorageMutated(scope);
     var archive = try definition_archive.prepare(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -652,6 +679,7 @@ fn commitMigration(
     );
     defer archive.deinit(allocator);
     var owned = try MigrationMutations.init(
+        scope,
         allocator,
         target,
         repo_root,
@@ -664,15 +692,16 @@ fn commitMigration(
     defer owned.deinit(allocator);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     const counter = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".fencing.counter" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".fencing.counter" },
     );
     defer allocator.free(counter);
     var commit = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         owned.mutations,
@@ -687,24 +716,25 @@ fn commitMigration(
         },
     );
     defer commit.deinit(allocator);
-    transaction.markStorageMutated();
+    transaction.markStorageMutated(scope);
     return allocator.dupe(u8, commit.transaction_id);
 }
 
 fn ensureMigrationDirectories(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     target: *const segmented_event_log.Snapshot,
     repo_root: []const u8,
 ) !void {
-    try durable_store.ensureDirectoryPathNoSymlinks(target.paths.events);
-    try durable_store.ensureDirectoryPathNoSymlinks(target.paths.bindings);
-    try durable_store.ensureDirectoryPathNoSymlinks(target.paths.checkpoints);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, target.paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, target.paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, target.paths.checkpoints);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
-    try durable_store.ensureDirectoryPathNoSymlinks(transactions);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, transactions);
 }
 
 const MigrationMutations = struct {
@@ -720,6 +750,7 @@ const MigrationMutations = struct {
     legacy_binding_tombstone_digest: []u8,
 
     fn init(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         target: *const segmented_event_log.Snapshot,
         repo_root: []const u8,
@@ -730,6 +761,7 @@ const MigrationMutations = struct {
         archive: *const definition_archive.Candidate,
     ) !MigrationMutations {
         var result = try initMigrationMutationStorage(
+            scope,
             allocator,
             target,
             repo_root,
@@ -809,6 +841,7 @@ const MigrationMutations = struct {
 };
 
 fn initMigrationMutationStorage(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     target: *const segmented_event_log.Snapshot,
     repo_root: []const u8,
@@ -840,6 +873,7 @@ fn initMigrationMutationStorage(
     const checkpoint_path = try target.paths.checkpointAlloc(allocator, 0);
     errdefer allocator.free(checkpoint_path);
     const legacy_binding_path = try custody.bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         head.logical_path,
@@ -1030,6 +1064,8 @@ test "legacy migration partitions a monolithic log above one segment" {
 }
 
 test "explicit migration reserves absent legacy paths for segmented stores" {
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
@@ -1042,12 +1078,14 @@ test "explicit migration reserves absent legacy paths for segmented stores" {
     );
     defer std.testing.allocator.free(repo_root);
     var paths = try segmented_event_log.Paths.init(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/events.jsonl",
     );
     defer paths.deinit(std.testing.allocator);
     const transaction_id = (try installTombstones(
+        scope,
         std.testing.allocator,
         repo_root,
         &paths,
@@ -1058,6 +1096,7 @@ test "explicit migration reserves absent legacy paths for segmented stores" {
     try std.testing.expectEqual(
         TombstoneState.exact,
         try tombstoneState(
+            scope,
             std.testing.allocator,
             paths.legacy_event,
             segmented_event_log.legacy_event_tombstone,

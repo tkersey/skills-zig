@@ -11,6 +11,7 @@ const replay = @import("replay.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
+const storage_root = @import("storage_root");
 
 const streaming_projection_min_store_bytes: usize = 64 * 1024;
 
@@ -4792,6 +4793,7 @@ fn compileLimit(
 }
 
 pub fn execute(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
@@ -4806,6 +4808,7 @@ pub fn execute(
     try requireProjectionParameters(compiled, parameters);
     if (compiled.source_scope == .matching) {
         return executeMatchingDocuments(
+            scope,
             allocator,
             definition_plan,
             storage_plan,
@@ -4818,6 +4821,7 @@ pub fn execute(
         );
     }
     return executeResolvedProjection(
+        scope,
         allocator,
         definition_plan,
         storage_plan,
@@ -4831,6 +4835,7 @@ pub fn execute(
 }
 
 fn executeResolvedProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
@@ -4846,6 +4851,7 @@ fn executeResolvedProjection(
     defer resolved_storage.deinit(allocator);
     const slot = resolved_storage.slot(compiled.slot_index);
     if (slot.isSegmented()) return executeSegmentedProjection(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -4857,6 +4863,7 @@ fn executeResolvedProjection(
         parameters,
     );
     return executeResolvedSlotProjection(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -4870,6 +4877,7 @@ fn executeResolvedProjection(
 }
 
 fn executeResolvedSlotProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -4900,6 +4908,7 @@ fn executeResolvedSlotProjection(
         (fold_history != null or fused_sorted != null))
     {
         const streamed = executeResolvedStreamProjection(
+            scope,
             allocator,
             definition_plan,
             event_protocol,
@@ -4918,6 +4927,7 @@ fn executeResolvedSlotProjection(
         if (streamed) |result| return result;
     }
     return executeMaterializedProjection(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -4934,6 +4944,7 @@ fn executeResolvedSlotProjection(
 }
 
 fn executeSegmentedProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -4945,12 +4956,14 @@ fn executeSegmentedProjection(
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
     );
     defer snapshot.deinit(allocator);
     try segmented_event_log.requireMigratedCustody(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
@@ -4958,6 +4971,7 @@ fn executeSegmentedProjection(
     );
     if (compiled.fold == null) {
         return executeValidatedSegmentedHistory(
+            scope,
             allocator,
             definition_plan,
             event_protocol != null,
@@ -4975,6 +4989,7 @@ fn executeSegmentedProjection(
     const revision = try snapshot.head.revisionAlloc(allocator);
     defer allocator.free(revision);
     var replay_stats = try segmentedFoldReplay(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -5002,6 +5017,7 @@ fn executeSegmentedProjection(
 }
 
 fn segmentedFoldReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5013,6 +5029,7 @@ fn segmentedFoldReplay(
     history: ?*FoldHistoryAccumulator,
 ) !replay.Stats {
     const observer = history orelse return segmentedProjectionReplay(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -5029,6 +5046,7 @@ fn segmentedFoldReplay(
         .protocol_state = protocol.ReplayState.init(event_plan),
     };
     var observed = try replay.validateSegmentedHistoryObserved(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -5044,6 +5062,7 @@ fn segmentedFoldReplay(
 }
 
 fn executeValidatedSegmentedHistory(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     has_event_protocol: bool,
@@ -5057,6 +5076,7 @@ fn executeValidatedSegmentedHistory(
 ) !Result {
     if (snapshot.head_exists) {
         try replay.validateSegmentedHistory(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -5185,6 +5205,7 @@ fn executeSegmentedJsonlHistory(
 }
 
 fn segmentedProjectionReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5219,6 +5240,7 @@ fn segmentedProjectionReplay(
     );
     defer binding.deinit(allocator);
     var stats = try replay.validateSegmentedSnapshot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -5281,6 +5303,7 @@ fn renderSegmentedFold(
 }
 
 fn executeMaterializedProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5295,6 +5318,7 @@ fn executeMaterializedProjection(
     fused_sorted: *?SortedAccumulator,
 ) !Result {
     var snapshot = try custody.readSlotOrMissing(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -5302,6 +5326,7 @@ fn executeMaterializedProjection(
     );
     defer snapshot.deinit(allocator);
     var replay_stats = try validateProjectionReplay(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -5332,6 +5357,7 @@ fn executeMaterializedProjection(
 }
 
 fn executeResolvedStreamProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5345,6 +5371,7 @@ fn executeResolvedStreamProjection(
     fused_sorted: *?SortedAccumulator,
 ) !?Result {
     var snapshot = try custody.readReplaySlotOrMissing(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -5355,6 +5382,7 @@ fn executeResolvedStreamProjection(
     const protocol_required = event_protocol != null and
         event_protocol.?.target_slot_index == compiled.slot_index;
     var replay_stats = try validateStreamProjectionReplay(
+        scope,
         allocator,
         definition_plan,
         repo_root,
@@ -5436,6 +5464,7 @@ fn renderStreamProjectionResult(
 }
 
 fn validateStreamProjectionReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
@@ -5448,6 +5477,7 @@ fn validateStreamProjectionReplay(
 ) !replay.Stats {
     return if (fold_history.*) |*accumulator|
         try replay.validateReplaySlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -5460,6 +5490,7 @@ fn validateStreamProjectionReplay(
         )
     else if (fused_sorted.*) |*accumulator|
         try replay.validateReplaySlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -5634,6 +5665,7 @@ fn initFoldHistory(
 }
 
 fn validateProjectionReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5660,6 +5692,7 @@ fn validateProjectionReplay(
     }
     if (fold_history) |accumulator| {
         return replay.validateSlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -5673,6 +5706,7 @@ fn validateProjectionReplay(
     }
     if (fused_sorted) |accumulator| {
         return replay.validateSlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -5685,6 +5719,7 @@ fn validateProjectionReplay(
         );
     }
     return replay.validateSlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -6154,6 +6189,7 @@ fn buildProjectionResult(
 }
 
 fn executeMatchingDocuments(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
@@ -6167,6 +6203,7 @@ fn executeMatchingDocuments(
     if (event_protocol != null) return error.MatchingProtocolProjectionUnsupported;
     const source_slot = storage_plan.slots[compiled.slot_index];
     const paths = try storage.enumerateMatchingPathsAlloc(
+        scope,
         allocator,
         repo_root,
         source_slot,
@@ -6188,6 +6225,7 @@ fn executeMatchingDocuments(
     }
     const selected_path = paths[
         try latestMatchingPathIndex(
+            scope,
             allocator,
             definition_plan,
             source_slot,
@@ -6199,6 +6237,7 @@ fn executeMatchingDocuments(
         )
     ];
     return executeSelectedDocument(
+        scope,
         allocator,
         definition_plan,
         plan,
@@ -6213,6 +6252,7 @@ fn executeMatchingDocuments(
 }
 
 fn latestMatchingPathIndex(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     source_slot: storage.Slot,
@@ -6228,6 +6268,7 @@ fn latestMatchingPathIndex(
     for (paths, 0..) |path, path_index| {
         const resolved_slot = resolveMatchingSlot(source_slot, path);
         var snapshot = try custody.readSlot(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -6235,6 +6276,7 @@ fn latestMatchingPathIndex(
         );
         defer snapshot.deinit(allocator);
         var replay_stats = try replay.validateSlot(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -6281,6 +6323,7 @@ fn latestMatchingPathIndex(
 }
 
 fn executeSelectedDocument(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     plan: *const Plan,
@@ -6294,6 +6337,7 @@ fn executeSelectedDocument(
 ) !Result {
     const resolved_slot = resolveMatchingSlot(source_slot, selected_path);
     var snapshot = try custody.readSlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -6301,6 +6345,7 @@ fn executeSelectedDocument(
     );
     defer snapshot.deinit(allocator);
     var replay_stats = try replay.validateSlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -8208,6 +8253,7 @@ const ProjectionTestPlans = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             &tmp.dir,
             "protocol.json",

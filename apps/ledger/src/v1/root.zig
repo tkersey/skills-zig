@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
+const storage_root = @import("storage_root");
 
 pub const definition = @import("definition.zig");
 pub const compiled_plan = @import("compiled_plan.zig");
@@ -126,6 +127,7 @@ fn compilePlainPlansFrom(bytes: []const u8) !PlainPlans {
         .data = bytes,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &definition_tmp.dir,
         "plain.json",
@@ -188,8 +190,9 @@ fn compilePlainPlansFrom(bytes: []const u8) !PlainPlans {
     };
 }
 
-fn bindPlainStore(plans: *const PlainPlans, repo_root: []const u8) !void {
+fn bindPlainStore(scope: *storage_root.Scope, plans: *const PlainPlans, repo_root: []const u8) !void {
     var binding = try transaction.transact(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -206,8 +209,9 @@ fn bindPlainStore(plans: *const PlainPlans, repo_root: []const u8) !void {
     try std.testing.expect(binding.storage_mutated);
 }
 
-fn appendPlainEvent(plans: *const PlainPlans, repo_root: []const u8) !void {
+fn appendPlainEvent(scope: *storage_root.Scope, plans: *const PlainPlans, repo_root: []const u8) !void {
     var appended = try transaction.transact(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -228,10 +232,12 @@ fn appendPlainEvent(plans: *const PlainPlans, repo_root: []const u8) !void {
 }
 
 fn appendPlainCreatedEvent(
+    scope: *storage_root.Scope,
     plans: *const PlainPlans,
     repo_root: []const u8,
 ) !void {
     var appended = try transaction.transact(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -253,6 +259,7 @@ fn appendPlainCreatedEvent(
 }
 
 fn appendPlainCreatedEventFor(
+    scope: *storage_root.Scope,
     plans: *const PlainPlans,
     repo_root: []const u8,
     id: []const u8,
@@ -263,11 +270,12 @@ fn appendPlainCreatedEventFor(
         .{id},
     );
     defer std.testing.allocator.free(bytes);
-    try appendPlainRawEvent(plans, repo_root, bytes);
+    try appendPlainRawEvent(scope, plans, repo_root, bytes);
 }
 
-fn appendPlainRawEvent(plans: *const PlainPlans, repo_root: []const u8, bytes: []const u8) !void {
+fn appendPlainRawEvent(scope: *storage_root.Scope, plans: *const PlainPlans, repo_root: []const u8, bytes: []const u8) !void {
     var appended = try transaction.transact(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -284,8 +292,9 @@ fn appendPlainRawEvent(plans: *const PlainPlans, repo_root: []const u8, bytes: [
     try std.testing.expect(appended.storage_mutated);
 }
 
-fn expectPlainProjection(plans: *const PlainPlans, repo_root: []const u8) !void {
+fn expectPlainProjection(scope: *storage_root.Scope, plans: *const PlainPlans, repo_root: []const u8) !void {
     var result = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -304,6 +313,8 @@ fn expectPlainProjection(plans: *const PlainPlans, repo_root: []const u8) !void 
 }
 
 test "plain protocol binds appends replays and folds without rewriting history" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -321,7 +332,7 @@ test "plain protocol binds appends replays and folds without rewriting history" 
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    try bindPlainStore(&plans, repo_root);
+    try bindPlainStore(scope, &plans, repo_root);
     const after_binding = try repo_tmp.dir.readFileAlloc(
         std.testing.io,
         ".ledger/example/plain.jsonl",
@@ -330,11 +341,13 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     );
     defer std.testing.allocator.free(after_binding);
     try std.testing.expectEqualStrings(original, after_binding);
-    try appendPlainEvent(&plans, repo_root);
-    try expectPlainProjection(&plans, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
+    try expectPlainProjection(scope, &plans, repo_root);
 }
 
 test "segmented sorted fold preserves source order through checkpoint and append" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -345,15 +358,16 @@ test "segmented sorted fold preserves source order through checkpoint and append
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    try appendPlainCreatedEventFor(&plans, repo_root, "z");
-    try appendPlainCreatedEvent(&plans, repo_root);
-    try expectOrderedPlainId(&plans, repo_root, "first", "z");
-    try expectOrderedPlainId(&plans, repo_root, "last", "item-1");
+    try appendPlainCreatedEventFor(scope, &plans, repo_root, "z");
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
+    try expectOrderedPlainId(scope, &plans, repo_root, "first", "z");
+    try expectOrderedPlainId(scope, &plans, repo_root, "last", "item-1");
     var segmented = try compileSegmentedPlainPlansFrom(
         @embedFile("fixtures/plain-event-definition.json"),
     );
     defer segmented.deinit();
     var migrated = try migration.execute(
+        scope,
         std.testing.allocator,
         &segmented.artifact,
         &segmented.closure,
@@ -364,17 +378,19 @@ test "segmented sorted fold preserves source order through checkpoint and append
         &segmented.parameters,
     );
     defer migrated.deinit(std.testing.allocator);
-    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
-    try expectOrderedPlainId(&segmented, repo_root, "last", "item-1");
-    try appendPlainEvent(&segmented, repo_root);
-    try appendPlainCreatedEventFor(&segmented, repo_root, "a");
-    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
-    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "last", "item-1");
+    try appendPlainEvent(scope, &segmented, repo_root);
+    try appendPlainCreatedEventFor(scope, &segmented, repo_root, "a");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "last", "a");
 }
 
 test "ordered fold follows archived selectors on admitted plain and segmented plans" {
-    try expectArchivedSelectors(false);
-    try expectArchivedSelectors(true);
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
+    try expectArchivedSelectors(scope, false);
+    try expectArchivedSelectors(scope, true);
 }
 
 fn archivedSelectorDefinition(with_history: bool) ![]u8 {
@@ -407,7 +423,7 @@ fn archivedSelectorDefinition(with_history: bool) ![]u8 {
     return bytes;
 }
 
-fn expectArchivedSelectors(with_history: bool) !void {
+fn expectArchivedSelectors(scope: *storage_root.Scope, with_history: bool) !void {
     const allocator = std.testing.allocator;
     var old = try compilePlainPlans();
     defer old.deinit();
@@ -415,20 +431,20 @@ fn expectArchivedSelectors(with_history: bool) !void {
     defer repo_tmp.cleanup();
     const repo_root = try repo_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(repo_root);
-    try appendPlainCreatedEventFor(&old, repo_root, "z");
+    try appendPlainCreatedEventFor(scope, &old, repo_root, "z");
 
     const bytes = try archivedSelectorDefinition(with_history);
     defer allocator.free(bytes);
     var current = try compilePlainPlansFrom(bytes);
     defer current.deinit();
-    try appendPlainRawEvent(&current, repo_root,
+    try appendPlainRawEvent(scope, &current, repo_root,
         \\{"event":"created","value":{"next_id":"a","revision":1}}
     );
-    try expectOrderedPlainId(&current, repo_root, "first", "z");
-    try expectOrderedPlainId(&current, repo_root, "last", "a");
+    try expectOrderedPlainId(scope, &current, repo_root, "first", "z");
+    try expectOrderedPlainId(scope, &current, repo_root, "last", "a");
     if (with_history) {
-        try expectPlainCreatedCount(&current, repo_root, "z");
-        try expectPlainCreatedCount(&current, repo_root, "a");
+        try expectPlainCreatedCount(scope, &current, repo_root, "z");
+        try expectPlainCreatedCount(scope, &current, repo_root, "a");
         try std.testing.expectError(
             error.SegmentedProjectionHistoryRequiresFullReplay,
             compileSegmentedPlainPlansFrom(bytes),
@@ -438,6 +454,7 @@ fn expectArchivedSelectors(with_history: bool) !void {
     var segmented = try compileSegmentedPlainPlansFrom(bytes);
     defer segmented.deinit();
     var migrated = try migration.execute(
+        scope,
         allocator,
         &segmented.artifact,
         &segmented.closure,
@@ -448,16 +465,17 @@ fn expectArchivedSelectors(with_history: bool) !void {
         &segmented.parameters,
     );
     defer migrated.deinit(allocator);
-    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
-    try appendPlainRawEvent(&segmented, repo_root,
+    try expectOrderedPlainId(scope, &segmented, repo_root, "first", "z");
+    try appendPlainRawEvent(scope, &segmented, repo_root,
         \\{"event":"updated","value":{"next_id":"a","revision":1}}
     );
-    try expectOrderedPlainId(&segmented, repo_root, "first", "z");
-    try expectOrderedPlainId(&segmented, repo_root, "last", "a");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "first", "z");
+    try expectOrderedPlainId(scope, &segmented, repo_root, "last", "a");
 }
 
-fn expectPlainCreatedCount(plans: *const PlainPlans, repo_root: []const u8, id: []const u8) !void {
+fn expectPlainCreatedCount(scope: *storage_root.Scope, plans: *const PlainPlans, repo_root: []const u8, id: []const u8) !void {
     var result = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -485,12 +503,14 @@ fn expectPlainCreatedCount(plans: *const PlainPlans, repo_root: []const u8, id: 
 }
 
 fn expectOrderedPlainId(
+    scope: *storage_root.Scope,
     plans: *const PlainPlans,
     repo_root: []const u8,
     name: []const u8,
     id: []const u8,
 ) !void {
     var result = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -513,6 +533,8 @@ fn expectOrderedPlainId(
 }
 
 test "segmented bind existing bootstraps explicit migration" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -530,8 +552,9 @@ test "segmented bind existing bootstraps explicit migration" {
     defer std.testing.allocator.free(repo_root);
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
-    try bindPlainStore(&plans, repo_root);
+    try bindPlainStore(scope, &plans, repo_root);
     var migrated = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -544,11 +567,13 @@ test "segmented bind existing bootstraps explicit migration" {
     defer migrated.deinit(std.testing.allocator);
     try std.testing.expect(!migrated.already_migrated);
     try std.testing.expectEqual(@as(usize, 1), migrated.records);
-    try appendPlainEvent(&plans, repo_root);
-    try expectPlainProjection(&plans, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
+    try expectPlainProjection(scope, &plans, repo_root);
 }
 
 test "segmented migration preserves legacy jsonl framing" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -569,7 +594,7 @@ test "segmented migration preserves legacy jsonl framing" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    try bindPlainStore(&plans, repo_root);
+    try bindPlainStore(scope, &plans, repo_root);
     const legacy_revision = try definition_core.canonical_json.digestBytesAlloc(
         std.testing.allocator,
         legacy,
@@ -578,6 +603,7 @@ test "segmented migration preserves legacy jsonl framing" {
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
     var migrated = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -590,9 +616,10 @@ test "segmented migration preserves legacy jsonl framing" {
     defer migrated.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(legacy_revision, migrated.revision);
     try std.testing.expectEqual(@as(usize, 2), migrated.records);
-    try expectLegacySeparatorPending(repo_root);
-    try appendPlainEvent(&plans, repo_root);
+    try expectLegacySeparatorPending(scope, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
     var after_append = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
@@ -602,6 +629,7 @@ test "segmented migration preserves legacy jsonl framing" {
     try std.testing.expect(after_append.event_bytes.len != 0);
     try std.testing.expectEqual(@as(u8, '\n'), after_append.event_bytes[0]);
     var health = try doctor.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -614,6 +642,8 @@ test "segmented migration preserves legacy jsonl framing" {
 }
 
 test "segmented successor bounds checkpoint before enforcement" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -627,10 +657,11 @@ test "segmented successor bounds checkpoint before enforcement" {
     defer std.testing.allocator.free(repo_root);
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
-    try appendPlainCreatedEvent(&plans, repo_root);
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
     plans.artifact.bounds.max_records = 1;
-    try appendPlainEvent(&plans, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
@@ -650,17 +681,19 @@ test "segmented successor bounds checkpoint before enforcement" {
         snapshot.head.event_index + 1,
     );
     defer std.testing.allocator.free(future_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = future_path,
         .data = "{}\n",
     });
     try std.testing.expectError(
         error.UnexpectedFutureSegment,
-        segmented_event_log.auditHistory(std.testing.allocator, &snapshot),
+        segmented_event_log.auditHistory(scope, std.testing.allocator, &snapshot),
     );
 }
 
 test "segmented checkpoint enforces keyed reducer retained bounds" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -674,14 +707,15 @@ test "segmented checkpoint enforces keyed reducer retained bounds" {
     defer std.testing.allocator.free(repo_root);
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
-    try appendPlainCreatedEvent(&plans, repo_root);
-    try appendPlainCreatedEventFor(&plans, repo_root, "item-2");
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
+    try appendPlainCreatedEventFor(scope, &plans, repo_root, "item-2");
     plans.artifact.bounds.max_records = 2;
     plans.protocol.reducer_plan.?.max_retained_value_bytes = 1;
     plans.protocol.reducer_plan.?.max_retained_total_bytes = 1;
     try std.testing.expectError(
         error.CheckpointBoundsExceeded,
         transaction.transact(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -702,6 +736,8 @@ test "segmented checkpoint enforces keyed reducer retained bounds" {
 }
 
 test "segmented migration treats max records as a suffix bound" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -713,13 +749,14 @@ test "segmented migration treats max records as a suffix bound" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    try appendPlainCreatedEvent(&plans, repo_root);
-    try appendPlainEvent(&plans, repo_root);
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
     plans.artifact.bounds.max_records = 1;
     plans.protocol.max_records = 1;
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
     var migrated = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -734,6 +771,8 @@ test "segmented migration treats max records as a suffix bound" {
 }
 
 test "segmented full history admits missing genesis and lifetime states" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -752,6 +791,7 @@ test "segmented full history admits missing genesis and lifetime states" {
     history_projection.fold = null;
     defer history_projection.fold = fold;
     var missing = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -763,8 +803,9 @@ test "segmented full history admits missing genesis and lifetime states" {
     );
     defer missing.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("[]", missing.payload);
-    try appendPlainCreatedEvent(&plans, repo_root);
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
     var genesis_doctor = try doctor.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -775,6 +816,7 @@ test "segmented full history admits missing genesis and lifetime states" {
     defer genesis_doctor.deinit(std.testing.allocator);
     try std.testing.expect(genesis_doctor.healthy);
     var genesis_projection = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -785,8 +827,9 @@ test "segmented full history admits missing genesis and lifetime states" {
         &plans.parameters,
     );
     defer genesis_projection.deinit(std.testing.allocator);
-    for (0..4) |_| try appendPlainEvent(&plans, repo_root);
+    for (0..4) |_| try appendPlainEvent(scope, &plans, repo_root);
     var lifetime_doctor = try doctor.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -799,6 +842,8 @@ test "segmented full history admits missing genesis and lifetime states" {
 }
 
 test "segmented present head requires its checkpoint" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -812,11 +857,12 @@ test "segmented present head requires its checkpoint" {
     defer std.testing.allocator.free(repo_root);
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
-    try appendPlainCreatedEvent(&plans, repo_root);
-    try removePlainCheckpoint(repo_root);
+    try appendPlainCreatedEvent(scope, &plans, repo_root);
+    try removePlainCheckpoint(scope, repo_root);
     try std.testing.expectError(
         error.SegmentedProjectionCheckpointMissing,
         projection.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.store,
@@ -830,6 +876,7 @@ test "segmented present head requires its checkpoint" {
     try std.testing.expectError(
         error.SegmentedReplayCheckpointMissing,
         transaction.transact(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -850,6 +897,8 @@ test "segmented present head requires its checkpoint" {
 }
 
 test "segmented migration preserves bytes revision and replay state" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -867,8 +916,8 @@ test "segmented migration preserves bytes revision and replay state" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    try bindPlainStore(&plans, repo_root);
-    try appendPlainEvent(&plans, repo_root);
+    try bindPlainStore(scope, &plans, repo_root);
+    try appendPlainEvent(scope, &plans, repo_root);
     const legacy_bytes = try repo_tmp.dir.readFileAlloc(
         std.testing.io,
         ".ledger/example/plain.jsonl",
@@ -882,18 +931,20 @@ test "segmented migration preserves bytes revision and replay state" {
     );
     defer std.testing.allocator.free(legacy_revision);
     const binding_path = try custody.bindingPathAlloc(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
     );
     defer std.testing.allocator.free(binding_path);
     const legacy_binding = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         binding_path,
         1024 * 1024,
     );
     defer std.testing.allocator.free(legacy_binding);
-    try verifyPlainMigration(&plans, repo_root, legacy_bytes, legacy_revision, legacy_binding);
+    try verifyPlainMigration(scope, &plans, repo_root, legacy_bytes, legacy_revision, legacy_binding);
 }
 
 test "segmented cross-plan admission rejects unsupported surfaces" {
@@ -940,6 +991,8 @@ test "segmented cross-plan admission rejects unsupported surfaces" {
 }
 
 test "segmented migration recovers pending transactions before custody reads" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     plans.store.slots[0].layout = .segmented;
@@ -963,6 +1016,7 @@ test "segmented migration recovers pending transactions before custody reads" {
     try std.testing.expectError(
         error.TransactionCorrupt,
         migration.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -976,6 +1030,8 @@ test "segmented migration recovers pending transactions before custody reads" {
 }
 
 test "event-log projection treats a missing store as an empty relation" {
+    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
     var plans = try compilePlainPlans();
     defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
@@ -987,6 +1043,7 @@ test "event-log projection treats a missing store as an empty relation" {
     );
     defer std.testing.allocator.free(repo_root);
     var result = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -1000,22 +1057,25 @@ test "event-log projection treats a missing store as an empty relation" {
     try std.testing.expectEqualStrings("[]", result.payload);
 }
 
-fn expectLegacySeparatorPending(repo_root: []const u8) !void {
+fn expectLegacySeparatorPending(scope: *storage_root.Scope, repo_root: []const u8) !void {
     var before_append = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
     );
     try std.testing.expect(before_append.head.event_separator_pending);
     try segmented_event_log.auditHistory(
+        scope,
         std.testing.allocator,
         &before_append,
     );
     before_append.deinit(std.testing.allocator);
 }
 
-fn removePlainCheckpoint(repo_root: []const u8) !void {
+fn removePlainCheckpoint(scope: *storage_root.Scope, repo_root: []const u8) !void {
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
@@ -1036,21 +1096,23 @@ fn removePlainCheckpoint(repo_root: []const u8) !void {
     );
     defer std.testing.allocator.free(manifest_path);
     snapshot.deinit(std.testing.allocator);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = manifest_path,
         .data = head_bytes,
     });
 }
 
 fn verifyPlainMigration(
+    scope: *storage_root.Scope,
     plans: *PlainPlans,
     repo_root: []const u8,
     legacy_bytes: []const u8,
     legacy_revision: []const u8,
     legacy_binding: []const u8,
 ) !void {
-    try verifyMigrationAdmission(plans, repo_root);
+    try verifyMigrationAdmission(scope, plans, repo_root);
     var migrated = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -1065,19 +1127,21 @@ fn verifyPlainMigration(
     try std.testing.expectEqualStrings(legacy_revision, migrated.revision);
     try std.testing.expectEqual(@as(usize, 2), migrated.records);
     var segmented = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         repo_root,
         "example/plain.jsonl",
     );
     defer segmented.deinit(std.testing.allocator);
-    try verifySealedMigrationBytes(&segmented, legacy_bytes, legacy_binding);
-    try verifyMigratedProjections(plans, repo_root);
-    try corruptMigratedCheckpoint(plans, &segmented);
-    try expectMigrationCorruptionPreservesCustody(plans, repo_root, &segmented);
-    try verifyMigrationRecovery(plans, repo_root, &segmented, legacy_revision);
+    try verifySealedMigrationBytes(scope, &segmented, legacy_bytes, legacy_binding);
+    try verifyMigratedProjections(scope, plans, repo_root);
+    try corruptMigratedCheckpoint(scope, plans, &segmented);
+    try expectMigrationCorruptionPreservesCustody(scope, plans, repo_root, &segmented);
+    try verifyMigrationRecovery(scope, plans, repo_root, &segmented, legacy_revision);
 }
 
 fn verifySealedMigrationBytes(
+    scope: *storage_root.Scope,
     segmented: *const segmented_event_log.Snapshot,
     legacy_bytes: []const u8,
     legacy_binding: []const u8,
@@ -1092,6 +1156,7 @@ fn verifySealedMigrationBytes(
     );
     defer std.testing.allocator.free(sealed_event_path);
     const sealed_events = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         sealed_event_path,
         segmented_event_log.event_segment_bytes,
@@ -1104,6 +1169,7 @@ fn verifySealedMigrationBytes(
     );
     defer std.testing.allocator.free(sealed_binding_path);
     const sealed_bindings = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         sealed_binding_path,
         segmented_event_log.binding_segment_bytes,
@@ -1112,12 +1178,13 @@ fn verifySealedMigrationBytes(
     try std.testing.expectEqualStrings(legacy_binding, sealed_bindings);
 }
 
-fn verifyMigratedProjections(plans: *PlainPlans, repo_root: []const u8) !void {
-    try expectPlainProjection(plans, repo_root);
+fn verifyMigratedProjections(scope: *storage_root.Scope, plans: *PlainPlans, repo_root: []const u8) !void {
+    try expectPlainProjection(scope, plans, repo_root);
     const post_migration_projection = &plans.projection.projections[0];
     const post_migration_fold = post_migration_projection.fold;
     post_migration_projection.fold = null;
     var raw_projection = try projection.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -1137,6 +1204,7 @@ fn verifyMigratedProjections(plans: *PlainPlans, repo_root: []const u8) !void {
     );
     post_migration_projection.fold = post_migration_fold;
     var post_migration_doctor = try doctor.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -1149,6 +1217,7 @@ fn verifyMigratedProjections(plans: *PlainPlans, repo_root: []const u8) !void {
 }
 
 fn corruptMigratedCheckpoint(
+    scope: *storage_root.Scope,
     plans: *const PlainPlans,
     segmented: *const segmented_event_log.Snapshot,
 ) !void {
@@ -1178,25 +1247,26 @@ fn corruptMigratedCheckpoint(
         std.testing.allocator,
     );
     defer std.testing.allocator.free(invalid_head_bytes);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.checkpoint_path.?,
         .data = invalid_checkpoint,
     });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.paths.manifest,
         .data = invalid_head_bytes,
     });
-    try std.Io.Dir.cwd().deleteFile(
+    try scope.fs.directory().deleteFile(
         std.testing.io,
         segmented.paths.legacy_event,
     );
-    try std.Io.Dir.cwd().deleteFile(
+    try scope.fs.directory().deleteFile(
         std.testing.io,
         segmented.paths.legacy_binding,
     );
 }
 
 fn expectMigrationCorruptionPreservesCustody(
+    scope: *storage_root.Scope,
     plans: *PlainPlans,
     repo_root: []const u8,
     segmented: *const segmented_event_log.Snapshot,
@@ -1204,6 +1274,7 @@ fn expectMigrationCorruptionPreservesCustody(
     try std.testing.expectError(
         error.SegmentedCheckpointStateMismatch,
         migration.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -1216,7 +1287,7 @@ fn expectMigrationCorruptionPreservesCustody(
     );
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.cwd().statFile(
+        scope.fs.directory().statFile(
             std.testing.io,
             segmented.paths.legacy_event,
             .{},
@@ -1224,17 +1295,17 @@ fn expectMigrationCorruptionPreservesCustody(
     );
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.cwd().statFile(
+        scope.fs.directory().statFile(
             std.testing.io,
             segmented.paths.legacy_binding,
             .{},
         ),
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.paths.legacy_event,
         .data = segmented_event_log.legacy_event_tombstone,
     });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.paths.legacy_binding,
         .data = segmented_event_log.legacy_binding_tombstone,
     });
@@ -1243,34 +1314,36 @@ fn expectMigrationCorruptionPreservesCustody(
     checkpoint_projection.fold = null;
     try std.testing.expectError(
         error.SegmentedCheckpointStateMismatch,
-        expectPlainProjection(plans, repo_root),
+        expectPlainProjection(scope, plans, repo_root),
     );
     checkpoint_projection.fold = checkpoint_fold;
 }
 
 fn verifyMigrationRecovery(
+    scope: *storage_root.Scope,
     plans: *PlainPlans,
     repo_root: []const u8,
     segmented: *const segmented_event_log.Snapshot,
     legacy_revision: []const u8,
 ) !void {
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.checkpoint_path.?,
         .data = segmented.checkpoint_bytes,
     });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = segmented.paths.manifest,
         .data = segmented.head_bytes,
     });
-    try std.Io.Dir.cwd().deleteFile(
+    try scope.fs.directory().deleteFile(
         std.testing.io,
         segmented.paths.legacy_event,
     );
-    try std.Io.Dir.cwd().deleteFile(
+    try scope.fs.directory().deleteFile(
         std.testing.io,
         segmented.paths.legacy_binding,
     );
     var reconciled = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -1282,8 +1355,9 @@ fn verifyMigrationRecovery(
     );
     defer reconciled.deinit(std.testing.allocator);
     try std.testing.expect(!reconciled.already_migrated);
-    try verifyMigrationArchiveCustody(plans, repo_root);
+    try verifyMigrationArchiveCustody(scope, plans, repo_root);
     var repeated = try migration.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.closure,
@@ -1302,6 +1376,7 @@ fn verifyMigrationRecovery(
     try std.testing.expectError(
         error.StoreBindingDefinitionMismatch,
         migration.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -1314,12 +1389,13 @@ fn verifyMigrationRecovery(
     );
 }
 
-fn verifyMigrationAdmission(plans: *PlainPlans, repo_root: []const u8) !void {
+fn verifyMigrationAdmission(scope: *storage_root.Scope, plans: *PlainPlans, repo_root: []const u8) !void {
     plans.store.slots[0].layout = .segmented;
     plans.store.slots[0].max_bytes = segmented_event_log.event_segment_bytes;
     try std.testing.expectError(
         error.SegmentedMigrationRequired,
         projection.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.store,
@@ -1331,6 +1407,7 @@ fn verifyMigrationAdmission(plans: *PlainPlans, repo_root: []const u8) !void {
         ),
     );
     var pre_migration_doctor = try doctor.execute(
+        scope,
         std.testing.allocator,
         &plans.artifact,
         &plans.store,
@@ -1352,6 +1429,7 @@ fn verifyMigrationAdmission(plans: *PlainPlans, repo_root: []const u8) !void {
     try std.testing.expectError(
         error.DefinitionClosureDigestMismatch,
         migration.execute(
+            scope,
             std.testing.allocator,
             &plans.artifact,
             &plans.closure,
@@ -1365,30 +1443,32 @@ fn verifyMigrationAdmission(plans: *PlainPlans, repo_root: []const u8) !void {
     plans.artifact.closure_digest = closure_digest;
 }
 
-fn verifyMigrationArchiveCustody(plans: *PlainPlans, repo_root: []const u8) !void {
+fn verifyMigrationArchiveCustody(scope: *storage_root.Scope, plans: *PlainPlans, repo_root: []const u8) !void {
     const archive_path = try definition_archive.pathAlloc(
+        scope,
         std.testing.allocator,
         repo_root,
         &plans.artifact.closure_digest,
     );
     defer std.testing.allocator.free(archive_path);
     const archive_bytes = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         archive_path,
         definition_archive.max_bytes,
     );
     defer std.testing.allocator.free(archive_bytes);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, archive_path);
+    try scope.fs.directory().deleteFile(std.testing.io, archive_path);
     const history_projection = &plans.projection.projections[0];
     const fold = history_projection.fold;
     history_projection.fold = null;
     defer history_projection.fold = fold;
     try std.testing.expectError(
         error.HistoricalDefinitionMissing,
-        expectPlainProjection(plans, repo_root),
+        expectPlainProjection(scope, plans, repo_root),
     );
     history_projection.fold = fold;
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = archive_path,
         .data = archive_bytes,
     });

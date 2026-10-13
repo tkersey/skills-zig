@@ -1,4 +1,5 @@
 const std = @import("std");
+const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const custody = @import("custody.zig");
@@ -34,6 +35,7 @@ const ArchivedPlan = struct {
 };
 
 const PlanCache = struct {
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -54,6 +56,7 @@ const PlanCache = struct {
             return &self.plans.items[index];
         }
         var archive = try definition_archive.load(
+            self.scope,
             self.allocator,
             self.repo_root,
             digest,
@@ -166,12 +169,14 @@ const PlanCache = struct {
 };
 
 pub fn validateSegmentedHistoryArchives(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
@@ -211,6 +216,7 @@ pub fn validateSegmentedHistoryArchives(
 }
 
 pub fn validateSegmentedHistory(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -221,6 +227,7 @@ pub fn validateSegmentedHistory(
 ) !void {
     var observer: IgnoreRecords = .{};
     var stats = try validateSegmentedHistoryObserved(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -234,6 +241,7 @@ pub fn validateSegmentedHistory(
 }
 
 pub fn validateSegmentedHistoryObserved(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -247,6 +255,7 @@ pub fn validateSegmentedHistoryObserved(
         return error.SegmentedReplayCheckpointMissing;
     }
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
@@ -396,6 +405,7 @@ fn notifyObserver(
 }
 
 pub fn validateSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -407,6 +417,7 @@ pub fn validateSlot(
 ) !Stats {
     var observer: IgnoreRecords = .{};
     return validateSlotObserved(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -420,6 +431,7 @@ pub fn validateSlot(
 }
 
 pub fn validateSlotObserved(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -434,6 +446,7 @@ pub fn validateSlotObserved(
         return error.InvalidReplayRecordBound;
     }
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
@@ -458,6 +471,7 @@ pub fn validateSlotObserved(
 }
 
 pub fn validateReplaySlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -469,6 +483,7 @@ pub fn validateReplaySlot(
 ) !Stats {
     var observer: IgnoreRecords = .{};
     return validateReplaySlotObserved(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -482,6 +497,7 @@ pub fn validateReplaySlot(
 }
 
 pub fn validateReplaySlotObserved(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -503,6 +519,7 @@ pub fn validateReplaySlotObserved(
         return error.InvalidStoreBinding;
     }
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
@@ -533,6 +550,7 @@ pub fn validateReplaySlotObserved(
 }
 
 pub fn validateSegmentedSnapshot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -545,6 +563,7 @@ pub fn validateSegmentedSnapshot(
 ) !Stats {
     var observer: IgnoreRecords = .{};
     return validateSegmentedSnapshotObserved(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -559,6 +578,7 @@ pub fn validateSegmentedSnapshot(
 }
 
 pub fn validateSegmentedSnapshotObserved(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -580,6 +600,7 @@ pub fn validateSegmentedSnapshotObserved(
         return error.InvalidReplayRecordBound;
     }
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = definition_id,
@@ -1322,7 +1343,7 @@ fn validateStreamedEventEpoch(
         bindings.deinit(allocator);
     };
     errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
-    var backend = durable_store.PersistentEventStore.init(path);
+    var backend = durable_store.PersistentEventStore.init(cache.scope.fs, path);
     var summary = try backend.eventStore().scan(
         allocator,
         current_slot.max_bytes,
@@ -1412,6 +1433,7 @@ fn validateHistory(
             const prior_revision = row.revision_before orelse
                 return error.HistoricalReplaceWithoutState;
             const prior_content = try revision_archive.load(
+                cache.scope,
                 allocator,
                 cache.repo_root,
                 prior_revision,
@@ -2144,6 +2166,8 @@ fn findEffectForSlot(
 }
 
 test "segmented rolling replay retains a bounded recent plan set" {
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const allocator = std.testing.allocator;
     const first_source = @embedFile("fixtures/plain-event-definition.json");
     const second_source = try std.mem.replaceOwned(
@@ -2165,6 +2189,7 @@ test "segmented rolling replay retains a bounded recent plan set" {
         .data = second_source,
     });
     var first = try definition_core.closure.loadFromDir(
+        scope.fs.io,
         allocator,
         &definitions.dir,
         "first.json",
@@ -2172,6 +2197,7 @@ test "segmented rolling replay retains a bounded recent plan set" {
     );
     defer first.deinit(allocator);
     var second = try definition_core.closure.loadFromDir(
+        scope.fs.io,
         allocator,
         &definitions.dir,
         "second.json",
@@ -2187,9 +2213,10 @@ test "segmented rolling replay retains a bounded recent plan set" {
         allocator,
     );
     defer allocator.free(repo_root);
-    try archiveReplayTestDefinitions(repo_root, &first, &second);
-    try expectArchiveInsertionAllocationFailure(repo_root, first.digestSlice());
+    try archiveReplayTestDefinitions(scope, repo_root, &first, &second);
+    try expectArchiveInsertionAllocationFailure(scope, repo_root, first.digestSlice());
     var cache = PlanCache{
+        .scope = scope,
         .allocator = allocator,
         .repo_root = repo_root,
         .definition_id = "example/plain-protocol",
@@ -2204,6 +2231,7 @@ test "segmented rolling replay retains a bounded recent plan set" {
 }
 
 fn archiveReplayTestDefinitions(
+    scope: *storage_root.Scope,
     repo_root: []const u8,
     first: *const definition_core.Closure,
     second: *const definition_core.Closure,
@@ -2220,20 +2248,22 @@ fn archiveReplayTestDefinitions(
         );
         defer allocator.free(content);
         const path = try definition_archive.pathAlloc(
+            scope,
             allocator,
             repo_root,
             closure.digestSlice(),
         );
         defer allocator.free(path);
-        try durable_store.writeTextAtomic(allocator, path, content);
+        try durable_store.writeTextAtomic(scope.fs, allocator, path, content);
     }
 }
 
-fn archiveInsertionAllocationCount(repo_root: []const u8, digest: []const u8) !usize {
+fn archiveInsertionAllocationCount(scope: *storage_root.Scope, repo_root: []const u8, digest: []const u8) !usize {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .resize_fail_index = 0,
     });
     var cache: PlanCache = .{
+        .scope = scope,
         .allocator = failing.allocator(),
         .repo_root = repo_root,
         .definition_id = "example/plain-protocol",
@@ -2243,8 +2273,8 @@ fn archiveInsertionAllocationCount(repo_root: []const u8, digest: []const u8) !u
     return failing.alloc_index;
 }
 
-fn expectArchiveInsertionAllocationFailure(repo_root: []const u8, digest: []const u8) !void {
-    const allocation_count = try archiveInsertionAllocationCount(repo_root, digest);
+fn expectArchiveInsertionAllocationFailure(scope: *storage_root.Scope, repo_root: []const u8, digest: []const u8) !void {
+    const allocation_count = try archiveInsertionAllocationCount(scope, repo_root, digest);
     try std.testing.expect(allocation_count >= 2);
     // On an empty cache the final two allocations reserve its row and index owners.
     // Match the counting trial's relocation policy, independent of heap history.
@@ -2254,6 +2284,7 @@ fn expectArchiveInsertionAllocationFailure(repo_root: []const u8, digest: []cons
             .resize_fail_index = 0,
         });
         var cache: PlanCache = .{
+            .scope = scope,
             .allocator = failing.allocator(),
             .repo_root = repo_root,
             .definition_id = "example/plain-protocol",

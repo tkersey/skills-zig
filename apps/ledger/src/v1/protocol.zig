@@ -1517,6 +1517,7 @@ fn stringValueEquals(value: std.json.Value, expected: []const u8) bool {
 }
 
 pub fn materializeEventAlloc(
+    io: std.Io,
     allocator: std.mem.Allocator,
     plan: *const Plan,
     state: *const ReplayState,
@@ -1535,7 +1536,7 @@ pub fn materializeEventAlloc(
         request,
         null,
         unix_seconds,
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
     );
     defer {
         for (result.generated_outputs) |*output| output.deinit(allocator);
@@ -5463,6 +5464,7 @@ const ProtocolTestPlans = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             &tmp.dir,
             "protocol.json",
@@ -5878,6 +5880,7 @@ fn verifyMaterializedRequestRoundTrip(
     );
     defer request.deinit();
     const event = try materializeEventAlloc(
+        std.testing.io,
         std.testing.allocator,
         plan,
         state,
@@ -6016,6 +6019,7 @@ fn verifyMaterializedRequestRejections(
     try std.testing.expectError(
         error.EventRequestLiteralMismatch,
         materializeEventAlloc(
+            std.testing.io,
             std.testing.allocator,
             plan,
             state,
@@ -6034,6 +6038,7 @@ fn verifyMaterializedRequestRejections(
     try std.testing.expectError(
         error.EventBodyRequestInputMismatch,
         materializeEventAlloc(
+            std.testing.io,
             std.testing.allocator,
             plan,
             state,

@@ -10409,6 +10409,7 @@ const ValidationTestPlan = struct {
         cache_limit: usize,
     ) !ValidationTestPlan {
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             allocator,
             directory,
             path,
@@ -10510,6 +10511,7 @@ const DefinitionReferenceTestPlan = struct {
         directory: anytype,
     ) !DefinitionReferenceTestPlan {
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             allocator,
             directory,
             "packet.json",
@@ -11516,6 +11518,7 @@ test "validation reports missing and malformed inputs without granting authority
         .data = validation_test_definition_05,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -11560,6 +11563,7 @@ test "count rules apply predicates across declared fields and survive cache" {
         .data = validation_test_definition_06,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -11662,6 +11666,7 @@ test "compiled namespace uniqueness and nested reference coverage survive cache"
         .data = validation_test_definition_08,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -11936,6 +11941,7 @@ test "collection item rules reuse one imported scalar definition" {
         .data = validation_test_definition_13,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "list.json",
@@ -11993,6 +11999,7 @@ test "definition references execute imported cross-record constraints" {
         .data = validation_test_definition_15,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "wrapper.json",
@@ -12132,6 +12139,7 @@ test "embedded validation compares borrowed event and retained state values" {
         .data = validation_test_definition_17,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -12185,6 +12193,7 @@ test "tagged union item implications compile conditional native rules" {
         .data = validation_test_definition_18,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",

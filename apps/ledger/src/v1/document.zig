@@ -1226,6 +1226,7 @@ test "bounded document plans render timestamp templates and append-once edits" {
         .data = document_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &directory.dir,
         "definition.json",

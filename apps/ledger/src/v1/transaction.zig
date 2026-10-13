@@ -15,8 +15,6 @@ const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-threadlocal var runtime_io: ?std.Io = null;
-threadlocal var last_mutation_state: ?bool = false;
 const recovery_lock_retry_interval_ms: i64 = 25;
 const recovery_lock_attempts_max: usize = 201;
 
@@ -131,28 +129,24 @@ const SegmentedPrepared = struct {
     }
 };
 
-pub fn installRuntimeIo(io: std.Io) void {
-    runtime_io = io;
-    durable_store.installRuntimeIo(io);
+pub fn lastMutationState(scope: *storage_root.Scope) ?bool {
+    return scope.mutation_state;
 }
 
-pub fn lastMutationState() ?bool {
-    return last_mutation_state;
+pub fn resetMutationState(scope: *storage_root.Scope) void {
+    scope.mutation_state = false;
 }
 
-pub fn resetMutationState() void {
-    last_mutation_state = false;
+pub fn markStorageMutated(scope: *storage_root.Scope) void {
+    scope.mutation_state = true;
 }
 
-pub fn markStorageMutated() void {
-    last_mutation_state = true;
-}
-
-pub fn markStorageMutationUnknown() void {
-    if (last_mutation_state != true) last_mutation_state = null;
+pub fn markStorageMutationUnknown(scope: *storage_root.Scope) void {
+    if (scope.mutation_state != true) scope.mutation_state = null;
 }
 
 pub fn transact(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -165,8 +159,8 @@ pub fn transact(
     documents: []const validation.InputDocument,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    last_mutation_state = false;
-    if (!storage_root.validRepoRoot(repo_root)) {
+    scope.mutation_state = false;
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (!std.mem.eql(
@@ -179,6 +173,7 @@ pub fn transact(
     const unresolved_operation = storage_plan.findOperation(operation_name) orelse
         return error.UnknownOperation;
     const transaction_generated = try generateDocumentOutputsAlloc(
+        scope,
         allocator,
         storage_plan,
         unresolved_operation,
@@ -201,6 +196,7 @@ pub fn transact(
     const operation = resolved_storage.findOperation(operation_name) orelse
         return error.UnknownOperation;
     return transactResolved(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -218,6 +214,7 @@ pub fn transact(
 }
 
 fn transactResolved(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -238,6 +235,7 @@ fn transactResolved(
             return error.BindingOperationRejectsExternalInput;
         }
         return bindExisting(
+            scope,
             allocator,
             definition_plan,
             definition_closure,
@@ -267,6 +265,7 @@ fn transactResolved(
         parameters,
     );
     return transactValidated(
+        scope,
         allocator,
         definition_plan,
         definition_closure,
@@ -292,13 +291,14 @@ const TransactionPaths = struct {
     recovery_mutated_storage: bool,
 
     fn init(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         require_revisions: bool,
     ) !TransactionPaths {
         const ledger_root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, storage_root.controlComponent() },
+            &.{ repo_root, storage_root.controlComponent(scope) },
         );
         errdefer allocator.free(ledger_root);
         const paths: TransactionPaths = .{
@@ -331,10 +331,11 @@ const TransactionPaths = struct {
         );
         errdefer allocator.free(initialized.revisions);
         initialized.ensure(
+            scope,
             allocator,
             require_revisions,
         ) catch |err| {
-            last_mutation_state = if (initialized.created_control_paths or
+            scope.mutation_state = if (initialized.created_control_paths or
                 initialized.recovery_mutated_storage)
                 true
             else
@@ -346,10 +347,11 @@ const TransactionPaths = struct {
 
     fn ensure(
         self: *TransactionPaths,
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         require_revisions: bool,
     ) !void {
-        try ensureTransactionDirectories(self, require_revisions);
+        try ensureTransactionDirectories(scope, self, require_revisions);
         const counter_path = try std.fs.path.join(
             allocator,
             &.{ self.ledger_root, ".fencing.counter" },
@@ -359,6 +361,7 @@ const TransactionPaths = struct {
         var recovery_lock_attempts: usize = 1;
         while (recovery_lock_attempts <= recovery_lock_attempts_max) {
             durable_store.recoverAndCompactTransactionsAccumulating(
+                scope.fs,
                 allocator,
                 self.transactions,
                 .{
@@ -379,7 +382,7 @@ const TransactionPaths = struct {
                     }
                     recovery_lock_attempts += 1;
                     try std.Io.sleep(
-                        defaultIo(),
+                        scope.fs.io,
                         .fromMilliseconds(
                             recovery_lock_retry_interval_ms,
                         ),
@@ -400,6 +403,7 @@ const TransactionPaths = struct {
             self.recovery_mutated_storage or
             recovery.storage_mutated;
         try durable_store.ensureNoPendingTransactions(
+            scope.fs,
             allocator,
             self.transactions,
         );
@@ -419,39 +423,75 @@ const TransactionPaths = struct {
 };
 
 const StartupRecoveryWorker = struct {
+    scope: *storage_root.Scope,
     repo_root: []const u8,
     result: ?anyerror = null,
     completed: bool = false,
 };
 
 pub fn recoverRepositoryTransactions(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
 ) !bool {
-    var paths = try TransactionPaths.init(allocator, repo_root, false);
+    var paths = try TransactionPaths.init(scope, allocator, repo_root, false);
     defer paths.deinit(allocator);
     return paths.created_control_paths or paths.recovery_mutated_storage;
 }
 
 test "startup recovery exposes control path mutations to its caller" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         std.testing.allocator,
     );
     defer std.testing.allocator.free(root);
-    resetMutationState();
+    resetMutationState(scope);
     if (try recoverRepositoryTransactions(
+        scope,
         std.testing.allocator,
         root,
-    )) markStorageMutated();
-    try std.testing.expect(lastMutationState().?);
+    )) markStorageMutated(scope);
+    try std.testing.expect(lastMutationState(scope).?);
+}
+
+test "transaction recovery isolates directory authority and mutation evidence" {
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    var first_scope = storage_root.Scope.init(.anchored(std.testing.io, first.dir));
+    var second_scope = storage_root.Scope.init(.anchored(std.testing.io, second.dir));
+
+    markStorageMutationUnknown(&second_scope);
+    if (try recoverRepositoryTransactions(&first_scope, std.testing.allocator, ".")) {
+        markStorageMutated(&first_scope);
+    }
+    try std.testing.expect(lastMutationState(&first_scope).?);
+    try std.testing.expectEqual(@as(?bool, null), lastMutationState(&second_scope));
+    try std.testing.expect(directoryExists(&first_scope, ".transactions"));
+    try std.testing.expect(!directoryExists(&second_scope, ".transactions"));
+
+    resetMutationState(&second_scope);
+    if (try recoverRepositoryTransactions(&second_scope, std.testing.allocator, ".")) {
+        markStorageMutated(&second_scope);
+    }
+    markStorageMutationUnknown(&first_scope);
+    try std.testing.expect(lastMutationState(&first_scope).?);
+    try std.testing.expect(lastMutationState(&second_scope).?);
+    resetMutationState(&first_scope);
+    try std.testing.expectEqual(@as(?bool, false), lastMutationState(&first_scope));
+    try std.testing.expect(lastMutationState(&second_scope).?);
 }
 
 fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
+    const scope = context.scope;
     var paths = TransactionPaths.init(
+        scope,
         std.heap.smp_allocator,
         context.repo_root,
         false,
@@ -464,75 +504,81 @@ fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
 }
 
 test "transaction startup retries transient recovery lock contention" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         allocator,
     );
     defer allocator.free(root);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".transactions" },
+        &.{ root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
-    try durable_store.ensureDirectoryPathNoSymlinks(transactions);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, transactions);
     const recovery_advisory = try std.fs.path.join(
         allocator,
         &.{ transactions, ".recovery.advisory" },
     );
     defer allocator.free(recovery_advisory);
-    try std.Io.Dir.cwd().writeFile(defaultIo(), .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = recovery_advisory,
         .data = "",
     });
-    var held = try std.Io.Dir.openFileAbsolute(
-        defaultIo(),
+    var held = try scope.fs.directory().openFile(
+        scope.fs.io,
         recovery_advisory,
         .{
             .lock = .exclusive,
             .lock_nonblocking = true,
         },
     );
-    var context: StartupRecoveryWorker = .{ .repo_root = root };
+    var context: StartupRecoveryWorker = .{ .scope = scope, .repo_root = root };
     const thread = try std.Thread.spawn(
         .{},
         runStartupRecoveryWorker,
         .{&context},
     );
     try std.Io.sleep(
-        defaultIo(),
+        scope.fs.io,
         .fromMilliseconds(50),
         .awake,
     );
-    held.close(defaultIo());
+    held.close(scope.fs.io);
     thread.join();
     try std.testing.expect(context.completed);
     try std.testing.expect(context.result == null);
 }
 
 test "known recovery mutation survives later commit uncertainty" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         allocator,
     );
     defer allocator.free(root);
     var paths = try TransactionPaths.init(
+        scope,
         allocator,
         root,
         false,
     );
     defer paths.deinit(allocator);
-    last_mutation_state = true;
+    scope.mutation_state = true;
     try std.testing.expectError(
         error.InvalidPath,
         commitMutationsAlloc(
+            scope,
             allocator,
             &paths,
             &.{},
@@ -540,38 +586,40 @@ test "known recovery mutation survives later commit uncertainty" {
     );
     try std.testing.expectEqual(
         true,
-        lastMutationState().?,
+        lastMutationState(scope).?,
     );
 }
 
 test "created control paths survive later recovery uncertainty" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         allocator,
     );
     defer allocator.free(root);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".transactions" },
+        &.{ root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
-    try durable_store.ensureDirectoryPathNoSymlinks(transactions);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, transactions);
     const invalid = try std.fs.path.join(
         allocator,
         &.{ transactions, "invalid" },
     );
     defer allocator.free(invalid);
-    try durable_store.ensureDirectoryPathNoSymlinks(invalid);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, invalid);
     const recovery_advisory = try std.fs.path.join(
         allocator,
         &.{ transactions, ".recovery.advisory" },
     );
     defer allocator.free(recovery_advisory);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = recovery_advisory,
         .data = "",
     });
@@ -580,53 +628,57 @@ test "created control paths survive later recovery uncertainty" {
         &.{ transactions, ".journal.advisory" },
     );
     defer allocator.free(journal_advisory);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = journal_advisory,
         .data = "",
     });
 
-    last_mutation_state = null;
+    scope.mutation_state = null;
     try std.testing.expectError(
         error.TransactionCorrupt,
         TransactionPaths.init(
+            scope,
             allocator,
             root,
             false,
         ),
     );
-    try std.testing.expect(lastMutationState().?);
+    try std.testing.expect(lastMutationState(scope).?);
     const bindings = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".bindings" },
+        &.{ root, storage_root.controlComponent(scope), ".bindings" },
     );
     defer allocator.free(bindings);
-    try std.testing.expect(directoryExists(bindings));
+    try std.testing.expect(directoryExists(scope, bindings));
 }
 
 test "failed control path creation remains uncertain" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         allocator,
     );
     defer allocator.free(root);
     const ledger_root = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent() },
+        &.{ root, storage_root.controlComponent(scope) },
     );
     defer allocator.free(ledger_root);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = ledger_root,
         .data = "not-a-directory",
     });
 
-    last_mutation_state = false;
+    scope.mutation_state = false;
     try std.testing.expectError(
         error.NotDir,
         TransactionPaths.init(
+            scope,
             allocator,
             root,
             false,
@@ -634,13 +686,13 @@ test "failed control path creation remains uncertain" {
     );
     try std.testing.expectEqual(
         @as(?bool, null),
-        lastMutationState(),
+        lastMutationState(scope),
     );
 }
 
-fn directoryExists(path: []const u8) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var directory = std.Io.Dir.openDirAbsolute(io, path, .{}) catch
+fn directoryExists(scope: *storage_root.Scope, path: []const u8) bool {
+    const io = scope.fs.io;
+    var directory = scope.fs.directory().openDir(io, path, .{}) catch
         return false;
     directory.close(io);
     return true;
@@ -675,6 +727,7 @@ fn invalidTransactionResult(
 }
 
 fn transactValidated(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -688,16 +741,18 @@ fn transactValidated(
     parameters: *const definition_core.parameters.Bindings,
     transaction_generated: []const protocol.GeneratedOutput,
 ) !Result {
-    last_mutation_state = null;
+    scope.mutation_state = null;
     var paths = try TransactionPaths.init(
+        scope,
         allocator,
         repo_root,
         operationNeedsRevisionArchive(operation),
     );
     defer paths.deinit(allocator);
-    last_mutation_state = paths.created_control_paths or
+    scope.mutation_state = paths.created_control_paths or
         paths.recovery_mutated_storage;
     var archive = try definition_archive.prepare(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -707,6 +762,7 @@ fn transactValidated(
     defer archive.deinit(allocator);
 
     const prepared = try prepareEffects(
+        scope,
         allocator,
         definition_plan,
         storage_plan,
@@ -722,6 +778,7 @@ fn transactValidated(
     try validateReturnedContentBound(definition_plan, prepared);
     const duplicate_count = try validateIdempotencyDisposition(prepared, archive.exists);
     const transaction_id = try commitPreparedEffects(
+        scope,
         allocator,
         storage_plan,
         prepared,
@@ -781,6 +838,7 @@ fn validateIdempotencyDisposition(
 }
 
 fn commitPreparedEffects(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.ResolvedPlan,
     prepared: []const PreparedEffect,
@@ -797,6 +855,7 @@ fn commitPreparedEffects(
     );
     defer allocator.free(mutations);
     return try commitMutationsAlloc(
+        scope,
         allocator,
         paths,
         mutations,
@@ -804,6 +863,7 @@ fn commitPreparedEffects(
 }
 
 fn commitMutationsAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     paths: *const TransactionPaths,
     mutations: []const durable_store.TransactionMutation,
@@ -813,10 +873,11 @@ fn commitMutationsAlloc(
         &.{ paths.ledger_root, ".fencing.counter" },
     );
     defer allocator.free(counter_path);
-    if (last_mutation_state != true) {
-        last_mutation_state = null;
+    if (scope.mutation_state != true) {
+        scope.mutation_state = null;
     }
     var commit = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         paths.transactions,
         mutations,
@@ -830,7 +891,7 @@ fn commitMutationsAlloc(
             .reject_symlinks = true,
         },
     );
-    last_mutation_state = true;
+    scope.mutation_state = true;
     defer commit.deinit(allocator);
     return allocator.dupe(u8, commit.transaction_id);
 }
@@ -929,6 +990,7 @@ fn operationNeedsRevisionArchive(operation: *const storage.Operation) bool {
 }
 
 fn bindExisting(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     definition_closure: *const definition_core.Closure,
@@ -941,16 +1003,18 @@ fn bindExisting(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    last_mutation_state = null;
+    scope.mutation_state = null;
     var paths = try TransactionPaths.init(
+        scope,
         allocator,
         repo_root,
         false,
     );
     defer paths.deinit(allocator);
-    last_mutation_state = paths.created_control_paths or
+    scope.mutation_state = paths.created_control_paths or
         paths.recovery_mutated_storage;
     var archive = try definition_archive.prepare(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -959,6 +1023,7 @@ fn bindExisting(
     );
     defer archive.deinit(allocator);
     const prepared = try prepareExistingBindingsAlloc(
+        scope,
         allocator,
         definition_plan,
         validation_plan,
@@ -978,6 +1043,7 @@ fn bindExisting(
     );
     defer allocator.free(mutations);
     const transaction_id = try commitMutationsAlloc(
+        scope,
         allocator,
         &paths,
         mutations,
@@ -994,6 +1060,7 @@ fn bindExisting(
 }
 
 fn prepareExistingBindingsAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
@@ -1012,6 +1079,7 @@ fn prepareExistingBindingsAlloc(
     }
     for (operation.effects, 0..) |effect, index| {
         prepared[index] = try prepareExistingBinding(
+            scope,
             allocator,
             definition_plan,
             validation_plan,
@@ -1188,10 +1256,11 @@ const ExistingContent = struct {
     bytes: []const u8,
     owned: ?[]u8 = null,
     memory_map: ?std.Io.File.MemoryMap = null,
+    memory_map_io: ?std.Io = null,
 
     fn deinit(self: *ExistingContent, allocator: std.mem.Allocator) void {
         if (self.memory_map) |*memory_map| {
-            memory_map.destroy(std.Io.Threaded.global_single_threaded.io());
+            memory_map.destroy(self.memory_map_io.?);
         } else if (self.owned) |bytes| {
             allocator.free(bytes);
         }
@@ -1200,6 +1269,7 @@ const ExistingContent = struct {
 };
 
 fn prepareExistingBinding(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
@@ -1215,6 +1285,7 @@ fn prepareExistingBinding(
     }
     const slot = storage_plan.slot(effect.slot_index);
     var source = try readExistingBindingSource(
+        scope,
         allocator,
         definition_plan,
         slot,
@@ -1303,6 +1374,7 @@ fn appendExistingBindingAlloc(
 }
 
 fn readExistingBindingSource(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
@@ -1311,11 +1383,12 @@ fn readExistingBindingSource(
 ) !ExistingBindingSource {
     const slot_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(scope), slot.relative_path },
     );
     errdefer allocator.free(slot_path);
-    try durable_store.rejectSymlinkComponents(slot_path);
+    try durable_store.rejectSymlinkComponents(scope.fs, slot_path);
     var content = try readExistingContent(
+        scope,
         allocator,
         slot,
         slot_path,
@@ -1328,6 +1401,7 @@ fn readExistingBindingSource(
     );
     errdefer allocator.free(slot_digest);
     const binding_path = try custody.bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
@@ -1335,6 +1409,7 @@ fn readExistingBindingSource(
     errdefer allocator.free(binding_path);
     var before = if (kind == .rebind_existing)
         try custody.readBindingSnapshotBeforeReplay(
+            scope,
             allocator,
             binding_path,
             definition_plan.id,
@@ -1344,6 +1419,7 @@ fn readExistingBindingSource(
         )
     else
         try custody.readBindingSnapshot(
+            scope,
             allocator,
             binding_path,
             definition_plan.id,
@@ -1363,6 +1439,7 @@ fn readExistingBindingSource(
 }
 
 fn readExistingContent(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     slot: storage.ResolvedSlot,
     path: []const u8,
@@ -1370,14 +1447,15 @@ fn readExistingContent(
 ) !ExistingContent {
     if (!slot.isSegmented()) {
         const bytes = try durable_store.readRegularFileNoSymlink(
+            scope.fs,
             allocator,
             path,
             maximum,
         );
         return .{ .bytes = bytes, .owned = bytes };
     }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file_stat = try std.Io.Dir.cwd().statFile(
+    const io = scope.fs.io;
+    const file_stat = try scope.fs.directory().statFile(
         io,
         path,
         .{ .follow_symlinks = false },
@@ -1389,10 +1467,7 @@ fn readExistingContent(
         const bytes = try allocator.alloc(u8, 0);
         return .{ .bytes = bytes, .owned = bytes };
     }
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(io, path, .{})
-    else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+    var file = try scope.fs.directory().openFile(io, path, .{});
     defer file.close(io);
     var memory_map = try std.Io.File.MemoryMap.create(io, file, .{
         .len = length,
@@ -1404,6 +1479,7 @@ fn readExistingContent(
     return .{
         .bytes = memory_map.memory,
         .memory_map = memory_map,
+        .memory_map_io = io,
     };
 }
 
@@ -1719,6 +1795,7 @@ fn bindingValidationResult(
 }
 
 fn prepareEffects(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.ResolvedPlan,
@@ -1738,6 +1815,7 @@ fn prepareEffects(
     }
     for (operation.effects, 0..) |effect, index| {
         prepared[index] = try prepareEffect(
+            scope,
             allocator,
             definition_plan,
             storage_plan,
@@ -1755,6 +1833,7 @@ fn prepareEffects(
 }
 
 fn prepareEffect(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.ResolvedPlan,
@@ -1769,6 +1848,7 @@ fn prepareEffect(
     const slot = storage_plan.slot(effect.slot_index);
     if (slot.isSegmented()) {
         return prepareSegmentedEffect(
+            scope,
             allocator,
             definition_plan,
             event_protocol,
@@ -1782,6 +1862,7 @@ fn prepareEffect(
         );
     }
     return prepareResolvedEffect(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -1796,6 +1877,7 @@ fn prepareEffect(
 }
 
 fn prepareSegmentedEffect(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -1814,6 +1896,7 @@ fn prepareSegmentedEffect(
         return error.UnsupportedSegmentedEffect;
     }
     const request: SegmentedEffectRequest = .{
+        .scope = scope,
         .allocator = allocator,
         .definition_plan = definition_plan,
         .event_protocol = event_protocol.?,
@@ -1828,6 +1911,7 @@ fn prepareSegmentedEffect(
 }
 
 const SegmentedEffectRequest = struct {
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: *const protocol.Plan,
@@ -1841,16 +1925,19 @@ const SegmentedEffectRequest = struct {
     fn prepare(
         self: *const SegmentedEffectRequest,
     ) !PreparedEffect {
+        const scope = self.scope;
         const allocator = self.allocator;
         const repo_root = self.repo_root;
         const slot = self.slot;
         var snapshot = try segmented_event_log.Snapshot.load(
+            scope,
             allocator,
             repo_root,
             slot.relative_path,
         );
         defer snapshot.deinit(allocator);
         try segmented_event_log.requireMigratedCustody(
+            scope,
             allocator,
             repo_root,
             slot.relative_path,
@@ -1866,6 +1953,7 @@ const SegmentedEffectRequest = struct {
         self: *const SegmentedEffectRequest,
         snapshot: *const segmented_event_log.Snapshot,
     ) !PreparedEffect {
+        const scope = self.scope;
         const allocator = self.allocator;
         const definition_plan = self.definition_plan;
         const event_protocol = self.event_protocol;
@@ -1902,6 +1990,7 @@ const SegmentedEffectRequest = struct {
         );
         errdefer binding.deinit(allocator);
         var replay_context = try segmentedReplayBefore(
+            scope,
             allocator,
             definition_plan,
             event_protocol,
@@ -2148,6 +2237,7 @@ fn materializeSegmentedInput(
     request: *const SegmentedEffectRequest,
     replay_context: *EffectReplayContext,
 ) !EffectMaterializedInput {
+    const scope = request.scope;
     const allocator = request.allocator;
     const definition_plan = request.definition_plan;
     const event_protocol = request.event_protocol;
@@ -2155,6 +2245,7 @@ fn materializeSegmentedInput(
     const execution = request.execution;
     const parameters = request.parameters;
     if (effect.event) |*event| return materializeEventEffectInput(
+        scope,
         allocator,
         event_protocol,
         effect.slot_index,
@@ -2208,6 +2299,7 @@ fn segmentedBindingBefore(
 }
 
 fn segmentedReplayBefore(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_plan: *const protocol.Plan,
@@ -2229,6 +2321,7 @@ fn segmentedReplayBefore(
         };
     }
     var stats = try replay.validateSegmentedSnapshot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -2526,6 +2619,7 @@ fn digestBytesAlloc(
 }
 
 fn prepareEffectWithBinding(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -2541,6 +2635,7 @@ fn prepareEffectWithBinding(
     idempotency: *const EffectIdempotency,
 ) !PreparedEffect {
     var replay_context = try prepareEffectReplay(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -2555,6 +2650,7 @@ fn prepareEffectWithBinding(
     );
     defer replay_context.deinit(allocator);
     return prepareEffectAfterReplay(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -2584,6 +2680,7 @@ const EffectSlotSource = struct {
     read_custody: ?durable_store.CasReadLockPair,
 
     fn init(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         slot: storage.ResolvedSlot,
         effect: storage.Effect,
@@ -2591,16 +2688,18 @@ const EffectSlotSource = struct {
     ) !EffectSlotSource {
         const slot_path = try std.fs.path.join(
             allocator,
-            &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
+            &.{ repo_root, storage_root.controlComponent(scope), slot.relative_path },
         );
         errdefer allocator.free(slot_path);
         const binding_path = try custody.bindingPathAlloc(
+            scope,
             allocator,
             repo_root,
             slot.relative_path,
         );
         errdefer allocator.free(binding_path);
         var read_custody_pair = try durable_store.acquireCasReadLockPair(
+            scope.fs,
             allocator,
             slot_path,
             binding_path,
@@ -2616,6 +2715,7 @@ const EffectSlotSource = struct {
             null
         else
             durable_store.readRegularFileNoSymlink(
+                scope.fs,
                 allocator,
                 slot_path,
                 slot.max_bytes,
@@ -2625,7 +2725,7 @@ const EffectSlotSource = struct {
             };
         errdefer if (before) |bytes| allocator.free(bytes);
         const before_exists = if (stream_event_log)
-            try eventLogSlotExists(slot_path, slot.max_bytes)
+            try eventLogSlotExists(scope, slot_path, slot.max_bytes)
         else
             before != null;
         const before_digest = if (before) |bytes|
@@ -2665,10 +2765,10 @@ const EffectSlotSource = struct {
     }
 };
 
-fn eventLogSlotExists(path: []const u8, max_bytes: usize) !bool {
-    try durable_store.rejectSymlinkComponents(path);
-    const stat = std.Io.Dir.cwd().statFile(
-        defaultIo(),
+fn eventLogSlotExists(scope: *storage_root.Scope, path: []const u8, max_bytes: usize) !bool {
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
+    const stat = scope.fs.directory().statFile(
+        scope.fs.io,
         path,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
@@ -2779,6 +2879,7 @@ fn deriveEffectIdempotencyKeyAlloc(
 }
 
 fn readEffectBindingSnapshot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_id: []const u8,
     definition_digest: []const u8,
@@ -2798,6 +2899,7 @@ fn readEffectBindingSnapshot(
         null;
     var snapshot = if (source.stream_event_log)
         try custody.readBindingSnapshotBeforeReplay(
+            scope,
             allocator,
             source.binding_path,
             definition_id,
@@ -2807,6 +2909,7 @@ fn readEffectBindingSnapshot(
         )
     else
         try custody.readBindingSnapshot(
+            scope,
             allocator,
             source.binding_path,
             definition_id,
@@ -2848,6 +2951,7 @@ const EffectReplayContext = struct {
 };
 
 fn prepareEffectReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -2872,6 +2976,7 @@ fn prepareEffectReplay(
         );
         defer derived_observer.deinit();
         var stats = try validateExistingEffectReplay(
+            scope,
             allocator,
             definition_plan,
             slot,
@@ -2909,6 +3014,7 @@ fn prepareEffectReplay(
 }
 
 fn validateExistingEffectReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
@@ -2921,6 +3027,7 @@ fn validateExistingEffectReplay(
 ) !replay.Stats {
     if (!source.stream_event_log) {
         return validateMaterializedEffectReplay(
+            scope,
             allocator,
             definition_plan,
             slot,
@@ -2933,6 +3040,7 @@ fn validateExistingEffectReplay(
         );
     }
     const streamed = validateStreamedEffectReplay(
+        scope,
         allocator,
         definition_plan,
         slot,
@@ -2946,11 +3054,13 @@ fn validateExistingEffectReplay(
     return streamed catch |err| switch (err) {
         error.ReplayRequiresMaterializedHistory => {
             source.before = try durable_store.readRegularFileNoSymlink(
+                scope.fs,
                 allocator,
                 source.slot_path,
                 slot.max_bytes,
             );
             return validateMaterializedEffectReplay(
+                scope,
                 allocator,
                 definition_plan,
                 slot,
@@ -2967,6 +3077,7 @@ fn validateExistingEffectReplay(
 }
 
 fn validateStreamedEffectReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
@@ -2980,6 +3091,7 @@ fn validateStreamedEffectReplay(
     const snapshot = streamingReplaySlot(source, binding_before);
     if (observer.active()) {
         return replay.validateReplaySlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -2992,6 +3104,7 @@ fn validateStreamedEffectReplay(
         );
     }
     return replay.validateReplaySlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -3017,6 +3130,7 @@ fn streamingReplaySlot(
 }
 
 fn validateMaterializedEffectReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
@@ -3036,6 +3150,7 @@ fn validateMaterializedEffectReplay(
     };
     return if (observer.active())
         replay.validateSlotObserved(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -3048,6 +3163,7 @@ fn validateMaterializedEffectReplay(
         )
     else
         replay.validateSlot(
+            scope,
             allocator,
             repo_root,
             definition_plan.id,
@@ -3150,6 +3266,7 @@ fn replayParameterNamesAlloc(
 }
 
 fn prepareEffectAfterReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -3170,6 +3287,7 @@ fn prepareEffectAfterReplay(
     const idempotency_match = binding_before.idempotency_match or
         derived_match != null;
     var input = try materializeEffectInputAlloc(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -3186,6 +3304,7 @@ fn prepareEffectAfterReplay(
     );
     errdefer input.deinit(allocator);
     return finishPreparedEffect(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -3219,6 +3338,7 @@ const EffectMaterializedInput = struct {
 };
 
 fn materializeEffectInputAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -3242,6 +3362,7 @@ fn materializeEffectInputAlloc(
     defer allocator.free(request);
     if (binding_before.idempotency_match and effect.event != null) {
         return materializeBoundEventInputAlloc(
+            scope,
             allocator,
             source,
             slot.max_bytes,
@@ -3253,6 +3374,7 @@ fn materializeEffectInputAlloc(
     }
     if (effect.event) |*event| {
         return materializeEventEffectInput(
+            scope,
             allocator,
             event_protocol,
             effect.slot_index,
@@ -3323,6 +3445,7 @@ fn materializeNonEventEffectInput(
 }
 
 fn materializeBoundEventInputAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     source: *const EffectSlotSource,
     max_bytes: usize,
@@ -3330,6 +3453,7 @@ fn materializeBoundEventInputAlloc(
 ) !EffectMaterializedInput {
     const owned = if (source.before == null)
         try durable_store.readRegularFileNoSymlink(
+            scope.fs,
             allocator,
             source.slot_path,
             max_bytes,
@@ -3364,6 +3488,7 @@ fn effectInputWithNoOutputs(
 }
 
 fn materializeEventEffectInput(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     event_protocol: ?*const protocol.Plan,
     slot_index: u16,
@@ -3380,6 +3505,7 @@ fn materializeEventEffectInput(
     );
     var materialized_event = switch (event.mode) {
         .chained => try materializeChainedEffectEvent(
+            scope,
             allocator,
             event_protocol,
             protocol_required,
@@ -3390,6 +3516,7 @@ fn materializeEventEffectInput(
             replay_context,
         ),
         .plain => try materializePlainEffectEvent(
+            scope,
             allocator,
             event_protocol,
             protocol_required,
@@ -3419,6 +3546,7 @@ fn materializeEventEffectInput(
 }
 
 fn materializeChainedEffectEvent(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     event_protocol: ?*const protocol.Plan,
     protocol_required: bool,
@@ -3446,12 +3574,13 @@ fn materializeChainedEffectEvent(
         execution.inputJson(input_index) orelse
             return error.ProtocolInputMustBeJson,
         parameters,
-        currentUnixSeconds(),
-        defaultIo(),
+        currentUnixSeconds(scope),
+        scope.fs.io,
     );
 }
 
 fn materializePlainEffectEvent(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     event_protocol: ?*const protocol.Plan,
     protocol_required: bool,
@@ -3479,8 +3608,8 @@ fn materializePlainEffectEvent(
         execution.inputJson(input_index) orelse
             return error.ProtocolInputMustBeJson,
         parameters,
-        currentUnixSeconds(),
-        defaultIo(),
+        currentUnixSeconds(scope),
+        scope.fs.io,
     );
 }
 
@@ -3586,6 +3715,7 @@ fn materializeRawEffectInput(
 }
 
 fn finishPreparedEffect(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -3615,6 +3745,7 @@ fn finishPreparedEffect(
     errdefer allocator.free(slot_after.bytes);
     errdefer allocator.free(slot_after.digest);
     var revision = try prepareEffectRevision(
+        scope,
         allocator,
         effect,
         slot,
@@ -3847,6 +3978,7 @@ fn prepareStreamAppendSlotAfter(
 }
 
 fn prepareEffectRevision(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     effect: storage.Effect,
     slot: storage.ResolvedSlot,
@@ -3862,6 +3994,7 @@ fn prepareEffectRevision(
             binding_before.rows[match_index].revision_before orelse
             return error.InvalidIdempotencyBinding;
         const prior_content = try revision_archive.load(
+            scope,
             allocator,
             repo_root,
             prior_revision,
@@ -3871,6 +4004,7 @@ fn prepareEffectRevision(
         return null;
     }
     return try revision_archive.prepare(
+        scope,
         allocator,
         repo_root,
         source.before_digest.?,
@@ -4226,6 +4360,7 @@ fn collectGeneratedOutputsAlloc(
 }
 
 fn generateDocumentOutputsAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     operation: *const storage.Operation,
@@ -4238,12 +4373,13 @@ fn generateDocumentOutputsAlloc(
         outputs.deinit(allocator);
     }
     const now_ns: i128 = @intCast(
-        std.Io.Clock.real.now(defaultIo()).nanoseconds,
+        std.Io.Clock.real.now(scope.fs.io).nanoseconds,
     );
     for (operation.effects) |effect| {
         const document_plan = effect.document orelse continue;
         const identity = document_plan.identity orelse continue;
         try appendDocumentIdentityOutputs(
+            scope,
             allocator,
             storage_plan,
             effect.slot_index,
@@ -4279,6 +4415,7 @@ const DocumentIdentityCandidate = struct {
 };
 
 fn appendDocumentIdentityOutputs(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     slot_index: u16,
@@ -4290,6 +4427,7 @@ fn appendDocumentIdentityOutputs(
 ) !void {
     try validateGeneratedIdentityRequest(identity, parameters, outputs.items);
     var selected = try selectDocumentIdentityAlloc(
+        scope,
         allocator,
         storage_plan,
         slot_index,
@@ -4343,6 +4481,7 @@ fn validateGeneratedIdentityRequest(
 }
 
 fn selectDocumentIdentityAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     slot_index: u16,
@@ -4360,6 +4499,7 @@ fn selectDocumentIdentityAlloc(
     var ordinal: u32 = 0;
     while (ordinal <= identity.max_ordinal) : (ordinal += 1) {
         const candidate = try availableDocumentIdentityCandidate(
+            scope,
             allocator,
             storage_plan,
             slot_index,
@@ -4381,6 +4521,7 @@ fn selectDocumentIdentityAlloc(
 }
 
 fn availableDocumentIdentityCandidate(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     slot_index: u16,
@@ -4405,6 +4546,7 @@ fn availableDocumentIdentityCandidate(
         null;
     errdefer if (path) |value| allocator.free(value);
     const exists = try documentIdentityPathExists(
+        scope,
         allocator,
         storage_plan,
         slot_index,
@@ -4423,6 +4565,7 @@ fn availableDocumentIdentityCandidate(
 }
 
 fn documentIdentityPathExists(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     slot_index: u16,
@@ -4458,11 +4601,11 @@ fn documentIdentityPathExists(
     defer allocator.free(relative_path);
     const absolute_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), relative_path },
+        &.{ repo_root, storage_root.controlComponent(scope), relative_path },
     );
     defer allocator.free(absolute_path);
-    const stat = std.Io.Dir.cwd().statFile(
-        defaultIo(),
+    const stat = scope.fs.directory().statFile(
+        scope.fs.io,
         absolute_path,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
@@ -4627,15 +4770,11 @@ fn parameterBoolean(
     return null;
 }
 
-fn currentUnixSeconds() i64 {
+fn currentUnixSeconds(scope: *storage_root.Scope) i64 {
     return @intCast(@divFloor(
-        std.Io.Clock.real.now(defaultIo()).nanoseconds,
+        std.Io.Clock.real.now(scope.fs.io).nanoseconds,
         std.time.ns_per_s,
     ));
-}
-
-fn defaultIo() std.Io {
-    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
 const ChainedEvent = struct {
@@ -4709,6 +4848,7 @@ fn chainedEventAlloc(
 }
 
 const TransactionTestPlans = struct {
+    scope: *storage_root.Scope,
     definition_tmp: std.testing.TmpDir,
     closure: definition_core.closure.Closure,
     definition_plan: definition.Plan,
@@ -4719,16 +4859,18 @@ const TransactionTestPlans = struct {
     entry_path: []const u8,
 
     fn init(
+        scope: *storage_root.Scope,
         source: []const u8,
         entry_path: []const u8,
     ) !TransactionTestPlans {
         var definition_tmp = std.testing.tmpDir(.{});
         errdefer definition_tmp.cleanup();
-        try definition_tmp.dir.writeFile(std.testing.io, .{
+        try definition_tmp.dir.writeFile(scope.fs.io, .{
             .sub_path = entry_path,
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            scope.fs.io,
             std.testing.allocator,
             &definition_tmp.dir,
             entry_path,
@@ -4754,11 +4896,12 @@ const TransactionTestPlans = struct {
         var repo_tmp = std.testing.tmpDir(.{});
         errdefer repo_tmp.cleanup();
         const repo_root = try repo_tmp.dir.realPathFileAlloc(
-            std.testing.io,
+            scope.fs.io,
             ".",
             std.testing.allocator,
         );
         return .{
+            .scope = scope,
             .definition_tmp = definition_tmp,
             .closure = closure,
             .definition_plan = definition_plan,
@@ -4799,7 +4942,9 @@ const TransactionTestPlans = struct {
         documents: []const validation.InputDocument,
         parameters: *const definition_core.parameters.Bindings,
     ) !Result {
+        const scope = self.scope;
         return transact(
+            scope,
             std.testing.allocator,
             &self.definition_plan,
             &self.closure,
@@ -4851,6 +4996,7 @@ const BasicAppendResults = struct {
 };
 
 fn appendBasicEvents(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     first_parameters: *const definition_core.parameters.Bindings,
     second_parameters: *const definition_core.parameters.Bindings,
@@ -4863,7 +5009,7 @@ fn appendBasicEvents(
     );
     errdefer first.deinit(std.testing.allocator);
     try std.testing.expect(first.storage_mutated);
-    try std.testing.expect(lastMutationState().?);
+    try std.testing.expect(lastMutationState(scope).?);
     try std.testing.expect(!first.semantic_authority_granted);
     try std.testing.expectEqualStrings("appended", first.effects[0].result);
     var second = try plans.execute(
@@ -4889,16 +5035,18 @@ fn appendBasicEvents(
 }
 
 fn expectBasicEventBytesAndDuplicate(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     second_parameters: *const definition_core.parameters.Bindings,
     results: *const BasicAppendResults,
 ) !void {
     const event_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, storage_root.controlComponent(), "example", "events.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(scope), "example", "events.jsonl" },
     );
     defer std.testing.allocator.free(event_path);
     const events = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         event_path,
         65536,
@@ -4912,14 +5060,14 @@ fn expectBasicEventBytesAndDuplicate(
         std.testing.allocator,
         &.{
             plans.repo_root,
-            storage_root.controlComponent(),
+            storage_root.controlComponent(scope),
             ".transactions",
             results.second.transaction_id.?,
             "commit.json",
         },
     );
     defer std.testing.allocator.free(commit_marker_path);
-    try std.Io.Dir.deleteFileAbsolute(std.testing.io, commit_marker_path);
+    try scope.fs.directory().deleteFile(scope.fs.io, commit_marker_path);
     var duplicate = try plans.execute(
         null,
         "append",
@@ -4928,7 +5076,7 @@ fn expectBasicEventBytesAndDuplicate(
     );
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(duplicate.storage_mutated);
-    try std.testing.expect(lastMutationState().?);
+    try std.testing.expect(lastMutationState(scope).?);
     try std.testing.expectEqualStrings(
         "idempotent",
         duplicate.effects[0].result,
@@ -4940,6 +5088,7 @@ fn expectBasicEventBytesAndDuplicate(
 }
 
 fn expectBasicBoundsAndBinding(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     first_parameters: *const definition_core.parameters.Bindings,
     third_parameters: *const definition_core.parameters.Bindings,
@@ -4957,7 +5106,7 @@ fn expectBasicBoundsAndBinding(
             third_parameters,
         ),
     );
-    try std.testing.expect(!lastMutationState().?);
+    try std.testing.expect(!lastMutationState(scope).?);
     var resolved = try storage.resolve(
         std.testing.allocator,
         &plans.storage_plan,
@@ -4965,6 +5114,7 @@ fn expectBasicBoundsAndBinding(
     );
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -4974,6 +5124,7 @@ fn expectBasicBoundsAndBinding(
     try std.testing.expectError(
         error.CurrentStoreRecordBoundsExceeded,
         replay.validateSlot(
+            scope,
             std.testing.allocator,
             plans.repo_root,
             plans.definition_plan.id,
@@ -4984,14 +5135,16 @@ fn expectBasicBoundsAndBinding(
             false,
         ),
     );
-    try expectBasicBindingDefinitionMismatch(plans, results);
+    try expectBasicBindingDefinitionMismatch(scope, plans, results);
 }
 
 fn expectBasicBindingDefinitionMismatch(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     results: *const BasicAppendResults,
 ) !void {
     const binding_path = try custody.bindingPathAlloc(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         "example/events.jsonl",
@@ -5000,6 +5153,7 @@ fn expectBasicBindingDefinitionMismatch(
     try std.testing.expectError(
         error.StoreBindingDefinitionMismatch,
         custody.readBindingSnapshot(
+            scope,
             std.testing.allocator,
             binding_path,
             "example/other-events",
@@ -5012,12 +5166,13 @@ fn expectBasicBindingDefinitionMismatch(
 }
 
 fn expectBasicPendingRecovery(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     third_parameters: *const definition_core.parameters.Bindings,
 ) !void {
     const transactions_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ plans.repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer std.testing.allocator.free(transactions_dir);
     const pending_path = try std.fs.path.join(
@@ -5026,6 +5181,7 @@ fn expectBasicPendingRecovery(
     );
     defer std.testing.allocator.free(pending_path);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         pending_path,
         "{}\n",
@@ -5045,7 +5201,10 @@ fn expectBasicPendingRecovery(
 }
 
 test "transaction appends an event and binding in one durable transaction" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         basic_event_definition,
         "protocol.json",
     );
@@ -5063,23 +5222,26 @@ test "transaction appends an event and binding in one durable transaction" {
     );
     defer third_parameters.deinit(std.testing.allocator);
     var results = try appendBasicEvents(
+        scope,
         &plans,
         &first_parameters,
         &second_parameters,
     );
     defer results.deinit(std.testing.allocator);
     try expectBasicEventBytesAndDuplicate(
+        scope,
         &plans,
         &second_parameters,
         &results,
     );
     try expectBasicBoundsAndBinding(
+        scope,
         &plans,
         &first_parameters,
         &third_parameters,
         &results,
     );
-    try expectBasicPendingRecovery(&plans, &third_parameters);
+    try expectBasicPendingRecovery(scope, &plans, &third_parameters);
 }
 
 const chained_genesis_digest =
@@ -5180,6 +5342,7 @@ fn cachedStoragePlan(
 }
 
 fn executeTestWithStorage(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     storage_plan: *const storage.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -5189,6 +5352,7 @@ fn executeTestWithStorage(
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     return transact(
+        scope,
         std.testing.allocator,
         &plans.definition_plan,
         &plans.closure,
@@ -5344,6 +5508,7 @@ fn expectSecondChainedEventAndDuplicate(
 }
 
 fn expectChainedReplay(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     parameters: *const definition_core.parameters.Bindings,
 ) !void {
@@ -5354,6 +5519,7 @@ fn expectChainedReplay(
     );
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5361,6 +5527,7 @@ fn expectChainedReplay(
     );
     defer snapshot.deinit(std.testing.allocator);
     var stats = try replay.validateSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5375,7 +5542,10 @@ fn expectChainedReplay(
 }
 
 test "transaction materializes passive event requests before chained append" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         chained_event_definition,
         "protocol.json",
     );
@@ -5410,7 +5580,7 @@ test "transaction materializes passive event requests before chained append" {
         &second_parameters,
         first_digest,
     );
-    try expectChainedReplay(&plans, &first_parameters);
+    try expectChainedReplay(scope, &plans, &first_parameters);
 }
 
 const plain_event_materialization =
@@ -5471,11 +5641,13 @@ fn expectPlainCachedStorage(
 }
 
 fn expectPlainAppendAndReplay(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     cached_storage: *const storage.Plan,
     parameters: *const definition_core.parameters.Bindings,
 ) !void {
     var appended = try executeTestWithStorage(
+        scope,
         plans,
         cached_storage,
         null,
@@ -5496,6 +5668,7 @@ fn expectPlainAppendAndReplay(
     );
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5507,6 +5680,7 @@ fn expectPlainAppendAndReplay(
         snapshot.content,
     );
     var stats = try replay.validateSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5521,6 +5695,7 @@ fn expectPlainAppendAndReplay(
 }
 
 fn expectPlainExistingBinding(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     cached_storage: *const storage.Plan,
     parameters: *const definition_core.parameters.Bindings,
@@ -5528,28 +5703,30 @@ fn expectPlainExistingBinding(
     var binding_tmp = std.testing.tmpDir(.{});
     defer binding_tmp.cleanup();
     const binding_root = try binding_tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         std.testing.allocator,
     );
     defer std.testing.allocator.free(binding_root);
     const event_dir = try std.fs.path.join(
         std.testing.allocator,
-        &.{ binding_root, storage_root.controlComponent(), "example" },
+        &.{ binding_root, storage_root.controlComponent(scope), "example" },
     );
     defer std.testing.allocator.free(event_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(event_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, event_dir);
     const event_path = try std.fs.path.join(
         std.testing.allocator,
         &.{ event_dir, "plain-events.jsonl" },
     );
     defer std.testing.allocator.free(event_path);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         event_path,
         plain_event_existing_noncanonical ++ "\n",
     );
     var bound = try executeTestWithStorage(
+        scope,
         plans,
         cached_storage,
         null,
@@ -5568,6 +5745,7 @@ fn expectPlainExistingBinding(
     );
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readReplaySlotOrMissing(
+        scope,
         std.testing.allocator,
         binding_root,
         plans.definition_plan.id,
@@ -5575,6 +5753,7 @@ fn expectPlainExistingBinding(
     );
     defer snapshot.deinit(std.testing.allocator);
     var stats = try replay.validateReplaySlot(
+        scope,
         std.testing.allocator,
         binding_root,
         plans.definition_plan.id,
@@ -5589,7 +5768,10 @@ fn expectPlainExistingBinding(
 }
 
 test "plain event materialization preserves declared bytes through replay and binding" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         plain_event_definition,
         "protocol.json",
     );
@@ -5599,8 +5781,8 @@ test "plain event materialization preserves declared bytes through replay and bi
     try expectPlainCachedStorage(&plans, &cached_storage);
     var parameters = try plans.bind(&.{});
     defer parameters.deinit(std.testing.allocator);
-    try expectPlainAppendAndReplay(&plans, &cached_storage, &parameters);
-    try expectPlainExistingBinding(&plans, &cached_storage, &parameters);
+    try expectPlainAppendAndReplay(scope, &plans, &cached_storage, &parameters);
+    try expectPlainExistingBinding(scope, &plans, &cached_storage, &parameters);
 }
 
 const capability_protocol_definition =
@@ -5737,7 +5919,10 @@ fn expectCapabilityForbidden(
 }
 
 test "transaction keeps generated capabilities transient and checks retained custody" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         capability_protocol_definition,
         "protocol.json",
     );
@@ -5805,9 +5990,11 @@ fn segmentedDefinitionBoundAlloc(allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "segmented definitions reject inputs that can exceed one event" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
-    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    var plans = try TransactionTestPlans.init(scope, source, "protocol.json");
     defer plans.deinit();
     plans.definition_plan.inputs[0].max_bytes =
         segmented_event_log.event_max_bytes + 1;
@@ -5822,15 +6009,17 @@ test "segmented definitions reject inputs that can exceed one event" {
 }
 
 test "segmented bind existing maps its admitted source read only" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const bytes = "{\"kind\":\"created\"}\n";
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(scope.fs.io, .{
         .sub_path = "source.jsonl",
         .data = bytes,
     });
     const path = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         "source.jsonl",
         std.testing.allocator,
     );
@@ -5845,6 +6034,7 @@ test "segmented bind existing maps its admitted source read only" {
         .layout = .segmented,
     };
     var content = try readExistingContent(
+        scope,
         std.testing.allocator,
         slot,
         path,
@@ -5921,6 +6111,7 @@ fn expectBrokenDefinitionBoundEvent(
 }
 
 fn expectDefinitionBoundReplay(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     protocol_plan: *const protocol.Plan,
     parameters: *const definition_core.parameters.Bindings,
@@ -5934,6 +6125,7 @@ fn expectDefinitionBoundReplay(
     defer resolved.deinit(std.testing.allocator);
     const slot = resolved.slot(protocol_plan.target_slot_index);
     var snapshot = try custody.readSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5941,6 +6133,7 @@ fn expectDefinitionBoundReplay(
     );
     defer snapshot.deinit(std.testing.allocator);
     var stats = try replay.validateSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -5960,6 +6153,7 @@ fn expectDefinitionBoundReplay(
     try std.testing.expectError(
         error.HistoricalProtocolBindingMismatch,
         replay.validateSlot(
+            scope,
             std.testing.allocator,
             plans.repo_root,
             plans.definition_plan.id,
@@ -5973,7 +6167,10 @@ fn expectDefinitionBoundReplay(
 }
 
 test "transaction admits and replays a definition-bound event chain" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         definition_bound_event_definition,
         "protocol.json",
     );
@@ -5998,6 +6195,7 @@ test "transaction admits and replays a definition-bound event chain" {
         &parameters,
     );
     try expectDefinitionBoundReplay(
+        scope,
         &plans,
         &protocol_plan,
         &parameters,
@@ -6006,9 +6204,11 @@ test "transaction admits and replays a definition-bound event chain" {
 }
 
 test "segmented transaction checkpoints and appends bounded active files" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
-    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    var plans = try TransactionTestPlans.init(scope, source, "protocol.json");
     defer plans.deinit();
     var protocol_plan = (try protocol.compile(
         std.testing.allocator,
@@ -6032,15 +6232,16 @@ test "segmented transaction checkpoints and appends bounded active files" {
     defer resolved.deinit(std.testing.allocator);
     const slot = resolved.slot(protocol_plan.target_slot_index);
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         slot.relative_path,
     );
     defer snapshot.deinit(std.testing.allocator);
-    try expectSegmentedLegacyCustody(plans.repo_root, slot, &snapshot);
-    var stats = try replaySegmentedTestSnapshot(&plans, slot, &snapshot, &parameters);
+    try expectSegmentedLegacyCustody(scope, plans.repo_root, slot, &snapshot);
+    var stats = try replaySegmentedTestSnapshot(scope, &plans, slot, &snapshot, &parameters);
     defer stats.deinit(std.testing.allocator);
-    try expectSegmentedArchiveCustody(&plans, &snapshot);
+    try expectSegmentedArchiveCustody(scope, &plans, &snapshot);
     try std.testing.expectEqual(@as(usize, 2), stats.records_validated);
     try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
     try std.testing.expect(snapshot.event_bytes.len <
@@ -6050,9 +6251,11 @@ test "segmented transaction checkpoints and appends bounded active files" {
 }
 
 test "segmented record bound limits suffix replay rather than lifetime" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
-    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    var plans = try TransactionTestPlans.init(scope, source, "protocol.json");
     defer plans.deinit();
     var protocol_plan = (try protocol.compile(
         std.testing.allocator,
@@ -6092,6 +6295,7 @@ test "segmented record bound limits suffix replay rather than lifetime" {
     defer resolved.deinit(std.testing.allocator);
     const slot = resolved.slot(protocol_plan.target_slot_index);
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         slot.relative_path,
@@ -6100,19 +6304,21 @@ test "segmented record bound limits suffix replay rather than lifetime" {
     try std.testing.expectEqual(@as(u64, 5), snapshot.head.total_event_records);
     try std.testing.expectEqual(@as(u64, 3), snapshot.head.checkpoint_event_records);
     try std.testing.expectEqual(@as(usize, 2), snapshot.head.event_records);
-    var stats = try replaySegmentedTestSnapshot(&plans, slot, &snapshot, &parameters);
+    var stats = try replaySegmentedTestSnapshot(scope, &plans, slot, &snapshot, &parameters);
     defer stats.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 5), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 5), stats.protocol_state.?.records);
 }
 
 test "segmented transaction refuses unmigrated legacy custody" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
-    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    var plans = try TransactionTestPlans.init(scope, source, "protocol.json");
     defer plans.deinit();
-    try plans.repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
-    try plans.repo_tmp.dir.writeFile(std.testing.io, .{
+    try plans.repo_tmp.dir.createDirPath(scope.fs.io, ".ledger/example");
+    try plans.repo_tmp.dir.writeFile(scope.fs.io, .{
         .sub_path = ".ledger/example/chained-events.jsonl",
         .data = "{}\n",
     });
@@ -6144,6 +6350,8 @@ test "segmented transaction refuses unmigrated legacy custody" {
 }
 
 test "segmented compare append enforces its expected revision" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     const with_parameter = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -6162,7 +6370,7 @@ test "segmented compare append enforces its expected revision" {
             "\"expected_revision_param\":\"revision\"",
     );
     defer std.testing.allocator.free(source);
-    var plans = try TransactionTestPlans.init(source, "protocol.json");
+    var plans = try TransactionTestPlans.init(scope, source, "protocol.json");
     defer plans.deinit();
     const expected =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -6216,15 +6424,17 @@ fn renamedPartitionDefinitionV2Alloc(
 }
 
 fn appendWithRenamedPartition(
+    scope: *storage_root.Scope,
     plans: *TransactionTestPlans,
     source: []const u8,
     event: []const u8,
 ) !Result {
-    try plans.definition_tmp.dir.writeFile(std.testing.io, .{
+    try plans.definition_tmp.dir.writeFile(scope.fs.io, .{
         .sub_path = plans.entry_path,
         .data = source,
     });
     var closure = try definition_core.closure.loadFromDir(
+        scope.fs.io,
         std.testing.allocator,
         &plans.definition_tmp.dir,
         plans.entry_path,
@@ -6260,6 +6470,7 @@ fn appendWithRenamedPartition(
     );
     defer parameters.deinit(std.testing.allocator);
     return transact(
+        scope,
         std.testing.allocator,
         &definition_plan,
         &closure,
@@ -6275,7 +6486,10 @@ fn appendWithRenamedPartition(
 }
 
 test "historical replay uses the parameter names archived with each row" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         renamed_partition_definition,
         "renamed.json",
     );
@@ -6318,6 +6532,7 @@ test "historical replay uses the parameter names archived with each row" {
     );
     defer std.testing.allocator.free(updated);
     var second = try appendWithRenamedPartition(
+        scope,
         &plans,
         updated,
         second_event.bytes,
@@ -6370,7 +6585,10 @@ const parameter_bound_document_definition =
     "\"max_reducer_states\":4}}";
 
 test "transaction binds logical path parameters to validated input fields" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         parameter_bound_document_definition,
         "document.json",
     );
@@ -6479,6 +6697,7 @@ fn duplicateDocumentReplacement(
 }
 
 fn expectDocumentReplayAndCorruption(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     parameters: *const definition_core.parameters.Bindings,
     duplicate_parameters: *const definition_core.parameters.Bindings,
@@ -6490,6 +6709,7 @@ fn expectDocumentReplayAndCorruption(
     );
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -6498,6 +6718,7 @@ fn expectDocumentReplayAndCorruption(
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), snapshot.binding.rows.len);
     var stats = try replay.validateSlot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
@@ -6511,7 +6732,7 @@ fn expectDocumentReplayAndCorruption(
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
     try std.testing.expectEqualStrings("{\"value\":2}", snapshot.content);
-    try corruptDocumentRevision(plans, &snapshot);
+    try corruptDocumentRevision(scope, plans, &snapshot);
     try std.testing.expectError(
         error.RevisionArchiveDigestMismatch,
         plans.execute(
@@ -6524,6 +6745,7 @@ fn expectDocumentReplayAndCorruption(
     try std.testing.expectError(
         error.RevisionArchiveDigestMismatch,
         replay.validateSlot(
+            scope,
             std.testing.allocator,
             plans.repo_root,
             plans.definition_plan.id,
@@ -6537,16 +6759,19 @@ fn expectDocumentReplayAndCorruption(
 }
 
 fn corruptDocumentRevision(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     snapshot: *const custody.SlotSnapshot,
 ) !void {
     const path = try revision_archive.pathAlloc(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         snapshot.binding.rows[1].revision_before.?,
     );
     defer std.testing.allocator.free(path);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         path,
         "{\"value\":9}",
@@ -6554,7 +6779,10 @@ fn corruptDocumentRevision(
 }
 
 test "document replacements replay from immutable prior revisions" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         document_history_definition,
         "document.json",
     );
@@ -6574,6 +6802,7 @@ test "document replacements replay from immutable prior revisions" {
     );
     defer duplicate_parameters.deinit(std.testing.allocator);
     try expectDocumentReplayAndCorruption(
+        scope,
         &plans,
         &parameters,
         &duplicate_parameters,
@@ -6585,7 +6814,10 @@ const replaced_event_log_definition =
 ;
 
 test "transaction streaming replay owns and releases read custody" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         replaced_event_log_definition,
         "stream-custody.json",
     );
@@ -6609,6 +6841,7 @@ test "transaction streaming replay owns and releases read custody" {
     const effect = operation.effects[0];
     const slot = resolved.slot(effect.slot_index);
     var source = try EffectSlotSource.init(
+        scope,
         std.testing.allocator,
         slot,
         effect,
@@ -6619,6 +6852,7 @@ test "transaction streaming replay owns and releases read custody" {
     try std.testing.expect(source.before == null);
     try std.testing.expect(source.read_custody != null);
     var binding = try custody.readBindingSnapshotBeforeReplay(
+        scope,
         std.testing.allocator,
         source.binding_path,
         plans.definition_plan.id,
@@ -6638,7 +6872,10 @@ test "transaction streaming replay owns and releases read custody" {
 }
 
 test "append falls back to materialized replay after an event-log replacement" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         replaced_event_log_definition,
         "replaced-log.json",
     );
@@ -6677,10 +6914,11 @@ test "append falls back to materialized replay after an event-log replacement" {
     try std.testing.expect(appended.storage_mutated);
     const store_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, storage_root.controlComponent(), "example", "replaced-log.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(scope), "example", "replaced-log.jsonl" },
     );
     defer std.testing.allocator.free(store_path);
     const content = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         store_path,
         65536,
@@ -6708,7 +6946,10 @@ const unbound_store_definition =
     "\"max_diagnostics\":8,\"max_reducer_states\":4}}";
 
 test "transaction fails closed for an unbound existing store" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         unbound_store_definition,
         "protocol.json",
     );
@@ -6717,10 +6958,11 @@ test "transaction fails closed for an unbound existing store" {
     defer parameters.deinit(std.testing.allocator);
     const event_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, storage_root.controlComponent(), "example", "events.jsonl" },
+        &.{ plans.repo_root, storage_root.controlComponent(scope), "example", "events.jsonl" },
     );
     defer std.testing.allocator.free(event_path);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         event_path,
         "{\"legacy\":true}\n",
@@ -6765,11 +7007,13 @@ fn expectContentIdempotencyCache(
 }
 
 fn captureInitialContentEvent(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     storage_plan: *const storage.Plan,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     var first = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6797,6 +7041,7 @@ fn captureInitialContentEvent(
         first.returned_content.?,
     );
     var duplicate = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6822,6 +7067,7 @@ fn captureInitialContentEvent(
 }
 
 fn expectLegacyContentBinding(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     storage_plan: *const storage.Plan,
     parameters: *const definition_core.parameters.Bindings,
@@ -6830,7 +7076,7 @@ fn expectLegacyContentBinding(
     var legacy_tmp = std.testing.tmpDir(.{});
     defer legacy_tmp.cleanup();
     const legacy_root = try legacy_tmp.dir.realPathFileAlloc(
-        std.testing.io,
+        scope.fs.io,
         ".",
         std.testing.allocator,
     );
@@ -6839,7 +7085,7 @@ fn expectLegacyContentBinding(
         std.testing.allocator,
         &.{
             legacy_root,
-            storage_root.controlComponent(),
+            storage_root.controlComponent(scope),
             "example",
             "content-idempotency.jsonl",
         },
@@ -6851,11 +7097,13 @@ fn expectLegacyContentBinding(
     );
     defer std.testing.allocator.free(content);
     try durable_store.writeTextAtomic(
+        scope.fs,
         std.testing.allocator,
         event_path,
         content,
     );
     var binding = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6868,6 +7116,7 @@ fn expectLegacyContentBinding(
     try std.testing.expect(binding.storage_mutated);
     try std.testing.expectEqualStrings("bound", binding.effects[0].result);
     var duplicate = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6888,6 +7137,7 @@ fn expectLegacyContentBinding(
 }
 
 fn expectContentIdempotencyBypass(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     storage_plan: *const storage.Plan,
     ordinary: *const definition_core.parameters.Bindings,
@@ -6895,6 +7145,7 @@ fn expectContentIdempotencyBypass(
     expected: []const u8,
 ) !void {
     var allowed = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6909,6 +7160,7 @@ fn expectContentIdempotencyBypass(
     defer allowed.deinit(std.testing.allocator);
     try std.testing.expect(allowed.storage_mutated);
     var duplicate = try executeTestWithStorage(
+        scope,
         plans,
         storage_plan,
         null,
@@ -6923,10 +7175,11 @@ fn expectContentIdempotencyBypass(
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqualStrings(expected, duplicate.returned_content.?);
-    try expectContentEventCount(plans, 2);
+    try expectContentEventCount(scope, plans, 2);
 }
 
 fn expectContentEventCount(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     expected: usize,
 ) !void {
@@ -6934,13 +7187,14 @@ fn expectContentEventCount(
         std.testing.allocator,
         &.{
             plans.repo_root,
-            storage_root.controlComponent(),
+            storage_root.controlComponent(scope),
             "example",
             "content-idempotency.jsonl",
         },
     );
     defer std.testing.allocator.free(event_path);
     const events = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         event_path,
         65536,
@@ -6955,7 +7209,10 @@ fn expectContentEventCount(
 }
 
 test "plain event idempotency derives a transformed truncated digest with an explicit bypass" {
+    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
+        scope,
         content_idempotency_definition,
         "protocol.json",
     );
@@ -6970,18 +7227,21 @@ test "plain event idempotency derives a transformed truncated digest with an exp
     );
     defer bypass.deinit(std.testing.allocator);
     var first = try captureInitialContentEvent(
+        scope,
         &plans,
         &storage_plan,
         &ordinary,
     );
     defer first.deinit(std.testing.allocator);
     try expectLegacyContentBinding(
+        scope,
         &plans,
         &storage_plan,
         &ordinary,
         first.returned_content.?,
     );
     try expectContentIdempotencyBypass(
+        scope,
         &plans,
         &storage_plan,
         &ordinary,
@@ -6990,25 +7250,30 @@ test "plain event idempotency derives a transformed truncated digest with an exp
     );
 }
 
-fn ensureTransactionDirectories(self: *TransactionPaths, require_revisions: bool) !void {
+fn ensureTransactionDirectories(scope: *storage_root.Scope, self: *TransactionPaths, require_revisions: bool) !void {
     try durable_store.ensureDirectoryPathNoSymlinksObserved(
+        scope.fs,
         self.ledger_root,
         &self.created_control_paths,
     );
     try durable_store.ensureDirectoryPathNoSymlinksObserved(
+        scope.fs,
         self.transactions,
         &self.created_control_paths,
     );
     try durable_store.ensureDirectoryPathNoSymlinksObserved(
+        scope.fs,
         self.bindings,
         &self.created_control_paths,
     );
     try durable_store.ensureDirectoryPathNoSymlinksObserved(
+        scope.fs,
         self.definitions,
         &self.created_control_paths,
     );
     if (require_revisions) {
         try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            scope.fs,
             self.revisions,
             &self.created_control_paths,
         );
@@ -7137,6 +7402,7 @@ fn writeSegmentedLegacyMutations(
 }
 
 fn prepareResolvedEffect(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
@@ -7148,7 +7414,7 @@ fn prepareResolvedEffect(
     transaction_generated: []const protocol.GeneratedOutput,
     slot: storage.ResolvedSlot,
 ) !PreparedEffect {
-    var source = try EffectSlotSource.init(allocator, slot, effect, repo_root);
+    var source = try EffectSlotSource.init(scope, allocator, slot, effect, repo_root);
     errdefer source.deinit(allocator);
     var idempotency = try EffectIdempotency.init(
         allocator,
@@ -7159,6 +7425,7 @@ fn prepareResolvedEffect(
     );
     defer idempotency.deinit(allocator);
     var binding_before = try readEffectBindingSnapshot(
+        scope,
         allocator,
         definition_plan.id,
         definition_plan.closure_digest[0..],
@@ -7175,6 +7442,7 @@ fn prepareResolvedEffect(
         parameters,
     );
     const prepared = try prepareEffectWithBinding(
+        scope,
         allocator,
         definition_plan,
         event_protocol,
@@ -7194,11 +7462,13 @@ fn prepareResolvedEffect(
 }
 
 fn expectSegmentedLegacyCustody(
+    scope: *storage_root.Scope,
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
     const legacy_event = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         snapshot.paths.legacy_event,
         segmented_event_log.legacy_event_tombstone.len,
@@ -7209,6 +7479,7 @@ fn expectSegmentedLegacyCustody(
         legacy_event,
     );
     const legacy_binding = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         snapshot.paths.legacy_binding,
         segmented_event_log.legacy_binding_tombstone.len,
@@ -7218,24 +7489,26 @@ fn expectSegmentedLegacyCustody(
         segmented_event_log.legacy_binding_tombstone,
         legacy_binding,
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = snapshot.paths.legacy_event,
         .data = "{}\n",
     });
     try std.testing.expectError(
         error.SegmentedLegacyCustodyMismatch,
         segmented_event_log.requireMigratedCustody(
+            scope,
             std.testing.allocator,
             repo_root,
             slot.relative_path,
             true,
         ),
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = snapshot.paths.legacy_event,
         .data = segmented_event_log.legacy_event_tombstone,
     });
     try segmented_event_log.requireMigratedCustody(
+        scope,
         std.testing.allocator,
         repo_root,
         slot.relative_path,
@@ -7244,44 +7517,50 @@ fn expectSegmentedLegacyCustody(
 }
 
 fn expectSegmentedArchiveCustody(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
     try replay.validateSegmentedHistoryArchives(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
         snapshot,
     );
     const archive_path = try definition_archive.pathAlloc(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         &plans.definition_plan.closure_digest,
     );
     defer std.testing.allocator.free(archive_path);
     const archive_bytes = try durable_store.readRegularFileNoSymlink(
+        scope.fs,
         std.testing.allocator,
         archive_path,
         definition_archive.max_bytes,
     );
     defer std.testing.allocator.free(archive_bytes);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, archive_path);
+    try scope.fs.directory().deleteFile(scope.fs.io, archive_path);
     try std.testing.expectError(
         error.HistoricalDefinitionMissing,
         replay.validateSegmentedHistoryArchives(
+            scope,
             std.testing.allocator,
             plans.repo_root,
             plans.definition_plan.id,
             snapshot,
         ),
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = archive_path,
         .data = archive_bytes,
     });
 }
 
 fn replaySegmentedTestSnapshot(
+    scope: *storage_root.Scope,
     plans: *const TransactionTestPlans,
     slot: storage.ResolvedSlot,
     snapshot: *const segmented_event_log.Snapshot,
@@ -7301,6 +7580,7 @@ fn replaySegmentedTestSnapshot(
     );
     defer binding.deinit(std.testing.allocator);
     return replay.validateSegmentedSnapshot(
+        scope,
         std.testing.allocator,
         plans.repo_root,
         plans.definition_plan.id,
