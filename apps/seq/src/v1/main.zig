@@ -93,7 +93,13 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(system_argv[1..], argv[1..]);
         return std.process.replace(init.io, .{ .argv = system_argv });
     }
-    const code = runWithArgv(init.io, std.Io.Dir.cwd(), init.gpa, init.environ_map, argv) catch |err| blk: {
+    const code = runWithArgv(
+        init.io,
+        std.Io.Dir.cwd(),
+        init.gpa,
+        init.environ_map,
+        argv,
+    ) catch |err| blk: {
         emitCommandError(init.io, err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
             return write_err;
@@ -268,12 +274,7 @@ fn runExplain(
         );
         return 0;
     }
-    try writeExplanationJson(
-        &stdout_writer.interface,
-        &context,
-        &args,
-        &program,
-    );
+    try writeExplanationJson(&stdout_writer.interface, &context, &args, &program);
     return 0;
 }
 
@@ -1116,7 +1117,15 @@ fn executeGraphObservation(
         &context.native_plan,
         args.projection,
     )) |schedule| {
-        return executeStreamingGraphObservation(io, dir, allocator, args, context, bindings, schedule);
+        return executeStreamingGraphObservation(
+            io,
+            dir,
+            allocator,
+            args,
+            context,
+            bindings,
+            schedule,
+        );
     }
     const scan_stages = try seq.relation_graph.requiredScanStages(
         allocator,
@@ -1223,7 +1232,13 @@ const DiscoveredSessions = struct {
         for (paths, result.items, 0..) |path, *item, index| {
             item.* = .{
                 .path_index = index,
-                .identity = try seq.trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}),
+                .identity = try seq.trace_adapter.discoverSessionIdentity(
+                    io,
+                    dir,
+                    allocator,
+                    path,
+                    .{},
+                ),
             };
             result.initialized_count += 1;
             result.identity_bytes = try std.math.add(
@@ -3110,7 +3125,14 @@ test "command diagnostics preserve supplied I/O failure identity" {
         failure: std.Io.File.WritePositionalError,
         calls: usize = 0,
 
-        fn write(userdata: ?*anyopaque, _: std.Io.File, _: []const u8, _: []const []const u8, _: usize, _: u64) std.Io.File.WritePositionalError!usize {
+        fn write(
+            userdata: ?*anyopaque,
+            _: std.Io.File,
+            _: []const u8,
+            _: []const []const u8,
+            _: usize,
+            _: u64,
+        ) std.Io.File.WritePositionalError!usize {
             const self: *@This() = @ptrCast(@alignCast(userdata.?));
             self.calls += 1;
             return self.failure;
@@ -3118,7 +3140,10 @@ test "command diagnostics preserve supplied I/O failure identity" {
     };
     var vtable = std.testing.io.vtable.*;
     vtable.fileWritePositional = Failure.write;
-    for ([_]std.Io.File.WritePositionalError{ error.BrokenPipe, error.AccessDenied, error.Canceled }) |failure| {
+    const failures = [_]std.Io.File.WritePositionalError{
+        error.BrokenPipe, error.AccessDenied, error.Canceled,
+    };
+    for (failures) |failure| {
         var witness: Failure = .{ .failure = failure };
         const io: std.Io = .{ .userdata = &witness, .vtable = &vtable };
         try std.testing.expectError(failure, emitCommandError(io, error.UnknownCommand));

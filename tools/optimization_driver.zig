@@ -108,14 +108,24 @@ fn findCase(id: []const u8) !Case {
     return error.UnknownCase;
 }
 
-fn prepareFixture(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, case: Case) !Fixture {
+fn prepareFixture(
+    io: std.Io,
+    directory: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    case: Case,
+) !Fixture {
     var fixture = try allocateFixture(io, directory, allocator, case);
     errdefer fixture.deinit(allocator);
     if (case.rows > 0) try prepareLedger(allocator, &fixture);
     return fixture;
 }
 
-fn allocateFixture(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, case: Case) !Fixture {
+fn allocateFixture(
+    io: std.Io,
+    directory: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    case: Case,
+) !Fixture {
     const root = try allocator.print(
         "{s}/skills-zig-optimization-{d}",
         .{

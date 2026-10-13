@@ -3186,11 +3186,19 @@ test "trace ongoing status uses the supplied clock at the threshold" {
     var vtable = std.testing.io.vtable.*;
     vtable.now = FixedClock.now;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    const content = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"open\"}}\n";
+    const content = "{\"type\":\"event_msg\",\"payload\":" ++
+        "{\"type\":\"task_started\",\"turn_id\":\"open\"}}\n";
     inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
         for ([_]i128{ 60, 59 }) |modified_seconds| {
             var reader: std.Io.Reader = .fixed(content);
-            var trace = try parse(io, std.testing.allocator, "session.jsonl", &reader, modified_seconds * std.time.ns_per_s, .{});
+            var trace = try parse(
+                io,
+                std.testing.allocator,
+                "session.jsonl",
+                &reader,
+                modified_seconds * std.time.ns_per_s,
+                .{},
+            );
             defer trace.deinit(std.testing.allocator);
             try std.testing.expectEqual(modified_seconds == 60, trace.session.is_ongoing);
             try std.testing.expectEqualStrings(
@@ -3416,7 +3424,13 @@ test "parseSessionSummaryTrace preserves session inventory fields" {
         "libs/trace_core/testdata/new_044_plus.jsonl",
     );
     defer std.testing.allocator.free(path);
-    var full = try parseSessionTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var full = try parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{ .ongoing_threshold_secs = 0 },
+    );
     defer full.deinit(std.testing.allocator);
     var summary = try parseSessionSummaryTrace(
         std.testing.io,
@@ -3458,9 +3472,21 @@ test "first file-owner session metadata remains authoritative" {
     );
     defer std.testing.allocator.free(path);
 
-    var full = try parseSessionTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{});
+    var full = try parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{},
+    );
     defer full.deinit(std.testing.allocator);
-    var summary = try parseSessionSummaryTrace(std.testing.io, std.Io.Dir.cwd(), std.testing.allocator, path, .{});
+    var summary = try parseSessionSummaryTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        path,
+        .{},
+    );
     defer summary.deinit(std.testing.allocator);
 
     for ([_]*const SessionRecord{ &full.session, &summary.session }) |session| {
@@ -3574,7 +3600,14 @@ test "summary trace propagates allocation failure and cleans every partial resul
 
 fn checkSummaryAllocation(allocator: std.mem.Allocator) !void {
     var reader = std.Io.Reader.fixed(allocation_trace);
-    var trace = try parseSessionSummaryTraceReader(std.testing.io, allocator, "trace.jsonl", &reader, 0, .{});
+    var trace = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        allocator,
+        "trace.jsonl",
+        &reader,
+        0,
+        .{},
+    );
     defer trace.deinit(allocator);
     try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
     try std.testing.expectEqual(@as(i64, 1), trace.session.spawned_worker_count);

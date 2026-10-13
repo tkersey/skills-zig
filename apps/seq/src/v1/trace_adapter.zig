@@ -173,10 +173,7 @@ pub fn parseFileSelected(
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    var replay_reader = PrefixReader.init(
-        prefix,
-        &file_reader.interface,
-    );
+    var replay_reader = PrefixReader.init(prefix, &file_reader.interface);
     const reader = if (selection != null)
         &replay_reader.interface
     else
@@ -2144,10 +2141,7 @@ test "selector discovery replays the admitted prefix without a second read" {
         @as(usize, trace_rollout.len),
         selected.parsed.?.metrics.bytes_read,
     );
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        selected.discovery_bytes_read,
-    );
+    try std.testing.expectEqual(@as(usize, 0), selected.discovery_bytes_read);
 
     const rejected = try parseFileSelected(
         std.testing.io,
@@ -2174,10 +2168,7 @@ test "selector discovery replays the admitted prefix without a second read" {
         .{ .exclude_session_id = "session-1" },
     );
     try std.testing.expect(excluded.parsed == null);
-    try std.testing.expectEqual(
-        @as(usize, trace_rollout.len),
-        excluded.discovery_bytes_read,
-    );
+    try std.testing.expectEqual(@as(usize, trace_rollout.len), excluded.discovery_bytes_read);
 }
 
 test "selector discovery reads a complete large session metadata record" {

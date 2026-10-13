@@ -176,7 +176,11 @@ fn cleanupFixture(fs: durable_store.Fs, path: []const u8) void {
     };
 }
 
-fn measureFixture(fs: durable_store.Fs, fixture_path: []const u8, fixture_bytes: usize) !Measurements {
+fn measureFixture(
+    fs: durable_store.Fs,
+    fixture_path: []const u8,
+    fixture_bytes: usize,
+) !Measurements {
     const fixture = try writeFixture(fs, fixture_path, fixture_bytes);
     const actual_bytes = fixture.actual_bytes;
 

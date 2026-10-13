@@ -605,6 +605,7 @@ fn runRelation(
     var first = true;
     var remaining = options.limit;
     const selection = relationRowSelection(options, relation, &remaining);
+    const trace_options = traceOptions(relation);
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
         if (opencode_adapter.recognizes(path)) {
@@ -622,21 +623,9 @@ fn runRelation(
             continue;
         }
         var trace = if (relation == .sessions)
-            try trace_core.parseSessionSummaryTrace(
-                io,
-                dir,
-                allocator,
-                path,
-                traceOptions(relation),
-            )
+            try trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
         else
-            try trace_core.parseSessionTrace(
-                io,
-                dir,
-                allocator,
-                path,
-                traceOptions(relation),
-            );
+            try trace_core.parseSessionTrace(io, dir, allocator, path, trace_options);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace);
         if (relation == .sessions and
@@ -1039,22 +1028,11 @@ fn feedQueryPath(
             runner,
         );
     }
+    const trace_options = traceOptions(compilation.relation);
     var trace = if (compilation.relation == .sessions)
-        try trace_core.parseSessionSummaryTrace(
-            io,
-            dir,
-            allocator,
-            path,
-            traceOptions(compilation.relation),
-        )
+        try trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
     else
-        try trace_core.parseSessionTrace(
-            io,
-            dir,
-            allocator,
-            path,
-            traceOptions(compilation.relation),
-        );
+        try trace_core.parseSessionTrace(io, dir, allocator, path, trace_options);
     defer trace.deinit(allocator);
     try rejectTraceWarnings(&trace);
     if (compilation.relation == .sessions) {
