@@ -186,39 +186,43 @@ pub const ReplaySlot = struct {
 };
 
 pub fn readReplaySlotOrMissing(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
 ) !ReplaySlot {
-    if (!storage_root.validRepoRoot(repo_root)) {
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     const path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(scope), slot.relative_path },
     );
     errdefer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
     const binding_path = try bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
     );
     defer allocator.free(binding_path);
     var read_custody = try acquireSlotReadCustody(
+        scope,
         allocator,
         path,
         binding_path,
     );
     errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
-    const stat = std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
+    const stat = scope.fs.directory().statFile(
+        scope.fs.io,
         path,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
         error.FileNotFound => {
             try requireStableMissingSlot(
+                scope,
                 allocator,
                 repo_root,
                 slot.relative_path,
@@ -231,6 +235,7 @@ pub fn readReplaySlotOrMissing(
         else => return err,
     };
     return finishReplaySlotRead(
+        scope,
         allocator,
         definition_id,
         slot,
@@ -242,6 +247,7 @@ pub fn readReplaySlotOrMissing(
 }
 
 fn finishReplaySlotRead(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
@@ -254,6 +260,7 @@ fn finishReplaySlotRead(
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > slot.max_bytes) return error.FileTooBig;
     var binding = try readBindingSnapshotInternal(
+        scope,
         allocator,
         binding_path,
         definition_id,
@@ -269,6 +276,7 @@ fn finishReplaySlotRead(
         binding.last_revision orelse return error.InvalidStoreBinding,
     );
     if (read_custody == null and try slotReadCustodyAppeared(
+        scope,
         allocator,
         path,
         binding_path,
@@ -308,12 +316,14 @@ fn missingReplaySlot(
 }
 
 pub fn readSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
 ) !SlotSnapshot {
     return readSlotInternal(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -323,12 +333,14 @@ pub fn readSlot(
 }
 
 pub fn readSlotOrMissing(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
 ) !SlotSnapshot {
     return readSlotInternal(
+        scope,
         allocator,
         repo_root,
         definition_id,
@@ -338,32 +350,36 @@ pub fn readSlotOrMissing(
 }
 
 fn readSlotInternal(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
     allow_missing: bool,
 ) !SlotSnapshot {
-    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(scope, repo_root)) return error.RepositoryRootNotAbsolute;
     const path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), slot.relative_path },
+        &.{ repo_root, storage_root.controlComponent(scope), slot.relative_path },
     );
     errdefer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
     const binding_path = try bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
     );
     defer allocator.free(binding_path);
     var read_custody = try acquireSlotReadCustody(
+        scope,
         allocator,
         path,
         binding_path,
     );
     errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
     const content = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         slot.max_bytes,
@@ -371,6 +387,7 @@ fn readSlotInternal(
         error.FileNotFound => {
             if (!allow_missing) return err;
             try requireStableMissingSlot(
+                scope,
                 allocator,
                 repo_root,
                 slot.relative_path,
@@ -383,6 +400,7 @@ fn readSlotInternal(
         else => return err,
     };
     return finishPresentSlot(
+        scope,
         allocator,
         path,
         binding_path,
@@ -394,6 +412,7 @@ fn readSlotInternal(
 }
 
 fn finishPresentSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []u8,
     binding_path: []const u8,
@@ -409,6 +428,7 @@ fn finishPresentSlot(
     );
     errdefer allocator.free(revision);
     var binding = try readBindingSnapshot(
+        scope,
         allocator,
         binding_path,
         definition_id,
@@ -420,6 +440,7 @@ fn finishPresentSlot(
     errdefer binding.deinit(allocator);
     if (!binding.exists) return error.StoreSlotWithoutBinding;
     if (read_custody == null and try slotReadCustodyAppeared(
+        scope,
         allocator,
         path,
         binding_path,
@@ -435,11 +456,13 @@ fn finishPresentSlot(
 }
 
 fn acquireSlotReadCustody(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     slot_path: []const u8,
     binding_path: []const u8,
 ) !?durable_store.CasReadLockPair {
     var read_custody = try durable_store.acquireCasReadLockPair(
+        scope.fs,
         allocator,
         slot_path,
         binding_path,
@@ -450,6 +473,7 @@ fn acquireSlotReadCustody(
 }
 
 fn requireStableMissingSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     logical_path: []const u8,
@@ -458,12 +482,14 @@ fn requireStableMissingSlot(
     read_custody_held: bool,
 ) !void {
     rejectOrphanedBinding(
+        scope,
         allocator,
         repo_root,
         logical_path,
     ) catch |err| switch (err) {
         error.StoreBindingWithoutSlot => {
             if (!read_custody_held and try slotReadCustodyAppeared(
+                scope,
                 allocator,
                 slot_path,
                 binding_path,
@@ -473,6 +499,7 @@ fn requireStableMissingSlot(
         else => return err,
     };
     if (!read_custody_held and try slotReadCustodyAppeared(
+        scope,
         allocator,
         slot_path,
         binding_path,
@@ -480,31 +507,37 @@ fn requireStableMissingSlot(
 }
 
 fn slotReadCustodyAppeared(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     slot_path: []const u8,
     binding_path: []const u8,
 ) !bool {
     return try durable_store.casAdvisoryLockExists(
+        scope.fs,
         allocator,
         slot_path,
     ) or try durable_store.casAdvisoryLockExists(
+        scope.fs,
         allocator,
         binding_path,
     );
 }
 
 fn rejectOrphanedBinding(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     logical_path: []const u8,
 ) !void {
     const binding_path = try bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         logical_path,
     );
     defer allocator.free(binding_path);
     const bytes = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         binding_path,
         binding_max_bytes,
@@ -551,6 +584,7 @@ fn missingSlot(
 }
 
 pub fn verifyDefinitionArchives(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
@@ -565,6 +599,7 @@ pub fn verifyDefinitionArchives(
             )) break;
         } else {
             var archived = try definition_archive.load(
+                scope,
                 allocator,
                 repo_root,
                 row.definition_digest,
@@ -578,6 +613,7 @@ pub fn verifyDefinitionArchives(
 }
 
 pub fn readBindingSnapshot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     definition_id: []const u8,
@@ -587,6 +623,7 @@ pub fn readBindingSnapshot(
     idempotency: ?IdempotencyQuery,
 ) !BindingSnapshot {
     return readBindingSnapshotInternal(
+        scope,
         allocator,
         path,
         definition_id,
@@ -601,6 +638,7 @@ pub fn readBindingSnapshot(
 /// Reads and validates binding history while deferring the current slot
 /// revision comparison to the immediately following streaming replay.
 pub fn readBindingSnapshotBeforeReplay(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     definition_id: []const u8,
@@ -609,6 +647,7 @@ pub fn readBindingSnapshotBeforeReplay(
     idempotency: ?IdempotencyQuery,
 ) !BindingSnapshot {
     return readBindingSnapshotInternal(
+        scope,
         allocator,
         path,
         definition_id,
@@ -681,6 +720,7 @@ pub fn parseBindingSegment(
 }
 
 fn readBindingSnapshotInternal(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     definition_id: []const u8,
@@ -691,6 +731,7 @@ fn readBindingSnapshotInternal(
     verify_current_revision: bool,
 ) !BindingSnapshot {
     const bytes = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         binding_max_bytes,
@@ -1239,6 +1280,7 @@ fn writeBindingEffectFields(
 }
 
 pub fn bindingPathAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     logical_path: []const u8,
@@ -1255,7 +1297,7 @@ pub fn bindingPathAlloc(
     defer allocator.free(file_name);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".bindings", file_name },
+        &.{ repo_root, storage_root.controlComponent(scope), ".bindings", file_name },
     );
 }
 
@@ -1285,6 +1327,10 @@ fn optionalUnsigned(
 }
 
 test "missing slot rejects an orphaned custody binding" {
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ledger/.bindings");
@@ -1303,6 +1349,7 @@ test "missing slot rejects an orphaned custody binding" {
         .max_bytes = 4096,
     };
     var missing = try readSlotOrMissing(
+        scope,
         std.testing.allocator,
         root,
         "example/events",
@@ -1310,18 +1357,20 @@ test "missing slot rejects an orphaned custody binding" {
     );
     missing.deinit(std.testing.allocator);
     const binding_path = try bindingPathAlloc(
+        scope,
         std.testing.allocator,
         root,
         slot.relative_path,
     );
     defer std.testing.allocator.free(binding_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = binding_path,
         .data = "{}\n",
     });
     try std.testing.expectError(
         error.StoreBindingWithoutSlot,
         readSlotOrMissing(
+            scope,
             std.testing.allocator,
             root,
             "example/events",
@@ -1388,6 +1437,7 @@ test "binding segment continues the checkpoint revision" {
 }
 
 fn writeTestBoundSlot(
+    scope: *storage_root.Scope,
     root: []const u8,
     slot: storage.ResolvedSlot,
     content: []const u8,
@@ -1399,14 +1449,15 @@ fn writeTestBoundSlot(
     defer std.testing.allocator.free(revision);
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, storage_root.controlComponent(), slot.relative_path },
+        &.{ root, storage_root.controlComponent(scope), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = slot_path,
         .data = content,
     });
     const binding_path = try bindingPathAlloc(
+        scope,
         std.testing.allocator,
         root,
         slot.relative_path,
@@ -1428,13 +1479,14 @@ fn writeTestBoundSlot(
         .{revision},
     );
     defer std.testing.allocator.free(binding);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = binding_path,
         .data = binding,
     });
 }
 
 fn writeTestAdvisory(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) !void {
@@ -1443,13 +1495,17 @@ fn writeTestAdvisory(
         .{store_path},
     );
     defer allocator.free(advisory_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = advisory_path,
         .data = "",
     });
 }
 
 test "sidecar-free bound slot remains materialization readable" {
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
@@ -1469,8 +1525,9 @@ test "sidecar-free bound slot remains materialization readable" {
         .max_bytes = 4096,
     };
     const content = "{}\n";
-    try writeTestBoundSlot(root, slot, content);
+    try writeTestBoundSlot(scope, root, slot, content);
     var snapshot = try readSlot(
+        scope,
         std.testing.allocator,
         root,
         "example/events",
@@ -1481,6 +1538,7 @@ test "sidecar-free bound slot remains materialization readable" {
     try std.testing.expect(snapshot.read_custody == null);
 
     var replay_snapshot = try readReplaySlotOrMissing(
+        scope,
         std.testing.allocator,
         root,
         "example/events",
@@ -1491,6 +1549,10 @@ test "sidecar-free bound slot remains materialization readable" {
 }
 
 test "idle custody sidecars preserve stable missing slots" {
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
@@ -1511,19 +1573,21 @@ test "idle custody sidecars preserve stable missing slots" {
     };
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, storage_root.controlComponent(), slot.relative_path },
+        &.{ root, storage_root.controlComponent(scope), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
     const binding_path = try bindingPathAlloc(
+        scope,
         std.testing.allocator,
         root,
         slot.relative_path,
     );
     defer std.testing.allocator.free(binding_path);
-    try writeTestAdvisory(std.testing.allocator, slot_path);
-    try writeTestAdvisory(std.testing.allocator, binding_path);
+    try writeTestAdvisory(scope, std.testing.allocator, slot_path);
+    try writeTestAdvisory(scope, std.testing.allocator, binding_path);
 
     var materialized = try readSlotOrMissing(
+        scope,
         std.testing.allocator,
         root,
         "example/events",
@@ -1534,6 +1598,7 @@ test "idle custody sidecars preserve stable missing slots" {
     try std.testing.expect(materialized.read_custody != null);
 
     var streamed = try readReplaySlotOrMissing(
+        scope,
         std.testing.allocator,
         root,
         "example/events",
@@ -1545,6 +1610,10 @@ test "idle custody sidecars preserve stable missing slots" {
 }
 
 test "existing slot without a binding fails custody integrity" {
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
@@ -1564,16 +1633,17 @@ test "existing slot without a binding fails custody integrity" {
     };
     const slot_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root, storage_root.controlComponent(), slot.relative_path },
+        &.{ root, storage_root.controlComponent(scope), slot.relative_path },
     );
     defer std.testing.allocator.free(slot_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(scope.fs.io, .{
         .sub_path = slot_path,
         .data = "{}\n",
     });
     try std.testing.expectError(
         error.StoreSlotWithoutBinding,
         readSlotOrMissing(
+            scope,
             std.testing.allocator,
             root,
             "example/events",

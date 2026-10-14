@@ -8,7 +8,7 @@ const memory_migrate = @import("memory_migrate.zig");
 const memory_storage = @import("memory_storage.zig");
 const memory_envelope = @import("memory_envelope.zig");
 
-const Io = std.Io.Threaded.global_single_threaded;
+const Fs = durable_store.Fs;
 const Version = core_cli.normalizeVersion(app_meta.version);
 
 const MaxInputBytes = 1024 * 1024;
@@ -97,14 +97,33 @@ const Date = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try handleHelpAndVersion(allocator, argv)) return;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
+    const stdout = &stdout_writer.interface;
+    if (try handleHelpAndVersion(allocator, stdout, argv)) return;
 
     const args = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
+        core_cli.printUsageFailureWithHelp(
+            &stderr_writer.interface,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            null,
+        ) catch {
+            std.process.exit(1);
+        };
+        std.process.exit(2);
     };
 
-    const code = run(allocator, init.io, init.environ_map, args) catch |err| {
-        var stderr_writer = std.Io.File.stderr().writer(Io.io(), &.{});
+    const code = run(
+        Fs.init(init.io, .cwd()),
+        allocator,
+        std.Io.File.stdin(),
+        stdout,
+        init.environ_map,
+        args,
+    ) catch |err| {
+        var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("memory-note: {s}\n", .{@errorName(err)});
         std.process.exit(exitCodeForError(err));
@@ -112,39 +131,43 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(code);
 }
 
-fn handleHelpAndVersion(allocator: std.mem.Allocator, argv: []const []const u8) !bool {
+fn handleHelpAndVersion(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    argv: []const []const u8,
+) !bool {
     if (argv.len <= 1) {
-        try writeHelp(allocator);
+        try writeHelp(allocator, stdout);
         return true;
     }
     const first = argv[1];
     if (core_cli.isHelpArg(first)) {
-        try writeHelp(allocator);
+        try writeHelp(allocator, stdout);
         return true;
     }
     if (core_cli.isVersionArg(first) or core_cli.isVersionSubcommand(first)) {
-        try writeVersion(allocator);
+        try writeVersion(allocator, stdout);
         return true;
     }
     if (parseCommand(first) != null and core_cli.containsHelpArg(argv[2..])) {
-        try writeHelp(allocator);
+        try writeHelp(allocator, stdout);
         return true;
     }
     return false;
 }
 
-fn writeHelp(allocator: std.mem.Allocator) !void {
+fn writeHelp(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try core_cli.printHelpSurface(&out.writer, HelpSurface, Version);
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
 }
 
-fn writeVersion(allocator: std.mem.Allocator) !void {
+fn writeVersion(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try core_cli.printVersion(&out.writer, Version);
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -228,8 +251,10 @@ fn parseCommand(raw: []const u8) ?Command {
 }
 
 fn run(
+    fs: Fs,
     allocator: std.mem.Allocator,
-    process_io: std.Io,
+    stdin: std.Io.File,
+    stdout: *std.Io.Writer,
     env: *std.process.Environ.Map,
     unresolved: Args,
 ) !u8 {
@@ -237,32 +262,33 @@ fn run(
     if (args.command != .migrate and args.from_memory_version != null)
         return error.UnexpectedMigrationSource;
     if (args.command == .version) {
-        try writeVersion(allocator);
+        try writeVersion(allocator, stdout);
         return 0;
     }
     const home = try codexHomeAlloc(allocator, env, args.codex_home);
     defer allocator.free(home);
     if (!std.fs.path.isAbsolute(home)) return error.InvalidCodexHome;
-    memory_layout.validateDirectory(process_io, home) catch |err| {
-        if (args.command == .doctor) return cmdDoctor(allocator, env, args, err);
+    memory_layout.validateDirectory(fs.io, fs.directory(), home) catch |err| {
+        if (args.command == .doctor) return cmdDoctor(fs, allocator, stdout, home, args, err);
         return err;
     };
     args.memory_version = try memory_layout.selectedVersion(
         allocator,
-        process_io,
+        fs.io,
+        fs.directory(),
         env,
         home,
         args.memory_version,
     );
     return switch (args.command) {
-        .append => try cmdAppend(allocator, env, args),
-        .list => try cmdList(allocator, env, args),
-        .show => try cmdShow(allocator, env, args),
-        .doctor => try cmdDoctor(allocator, env, args, null),
-        .path => try cmdPath(allocator, env, args),
-        .migrate => try cmdMigrate(allocator, env, args),
+        .append => try cmdAppend(fs, stdin, allocator, stdout, home, args),
+        .list => try cmdList(fs, allocator, stdout, home, args),
+        .show => try cmdShow(fs, allocator, stdout, home, args),
+        .doctor => try cmdDoctor(fs, allocator, stdout, home, args, null),
+        .path => try cmdPath(fs, allocator, stdout, home, args),
+        .migrate => try cmdMigrate(fs, allocator, stdout, home, args),
         .version => {
-            try writeVersion(allocator);
+            try writeVersion(allocator, stdout);
             return 0;
         },
     };
@@ -283,13 +309,20 @@ fn validatedAppendInput(
     return parsed;
 }
 
-fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdAppend(
+    fs: Fs,
+    stdin: std.Io.File,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     const kind = args.kind orelse return error.MissingKind;
     const json_path = args.json_path orelse return error.MissingJson;
     try validateExtensionKind(extension, kind);
 
-    const input = try readJsonInput(allocator, json_path);
+    const input = try readJsonInput(fs, stdin, allocator, json_path);
     defer allocator.free(input);
     if (input.len > MaxInputBytes) return error.InputTooLarge;
 
@@ -300,7 +333,7 @@ fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
     const fingerprint = try fingerprintInputAlloc(allocator, extension, kind, input);
     defer allocator.free(fingerprint);
     const fp16 = fingerprint[0..16];
-    const now = try nowUtcAlloc(allocator);
+    const now = try nowUtcAlloc(fs.io, allocator);
     defer allocator.free(now);
     const id = try noteIdAlloc(allocator, now, fp16);
     defer allocator.free(id);
@@ -308,56 +341,56 @@ fn cmdAppend(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
     defer allocator.free(slug);
     const filename = try filenameAlloc(allocator, now, kind, slug, fp16);
     defer allocator.free(filename);
-    const note = try renderEnvelopeAlloc(
-        allocator,
-        id,
-        now,
-        extension,
-        kind,
-        fingerprint,
-        parsed.value,
-    );
+    const note =
+        try renderEnvelopeAlloc(allocator, id, now, extension, kind, fingerprint, parsed.value);
     defer allocator.free(note);
     if (note.len > MaxNoteBytes) return error.OutputTooLarge;
 
-    const notes_dir = try notesDirAlloc(allocator, env, args, extension);
+    const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
-    try memory_layout.validateDirectory(Io.io(), notes_dir);
+    try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
     const dest_path = try std.fs.path.join(allocator, &.{ notes_dir, filename });
     defer allocator.free(dest_path);
 
-    const lock_path = try memoryNoteLockPathAlloc(allocator, env, args.codex_home, extension);
+    const lock_path = try memoryNoteLockPathAlloc(allocator, home, extension);
     defer allocator.free(lock_path);
     var lock = if (args.dry_run)
         null
     else
-        try memory_storage.acquireExtensionLock(allocator, lock_path);
+        try memory_storage.acquireExtensionLock(fs, allocator, lock_path);
     defer if (lock) |*held| held.release();
 
-    if (try findFingerprint(allocator, notes_dir, fingerprint)) |existing| {
+    if (try findFingerprint(fs, allocator, notes_dir, fingerprint)) |existing| {
         defer allocator.free(existing.id);
         defer allocator.free(existing.path);
-        try writeDuplicateSkip(allocator, extension, kind, existing.id, fingerprint, existing.path);
+        try writeDuplicateSkip(allocator, stdout, extension, kind, existing, fingerprint);
         return 0;
     }
 
     if (args.dry_run) {
-        try writeDryRun(allocator, id, extension, kind, fingerprint, dest_path, note);
+        try writeDryRun(allocator, stdout, id, extension, kind, fingerprint, dest_path, note);
         return 0;
     }
 
-    try memory_storage.publishNote(allocator, dest_path, note);
-    try writeCreated(allocator, id, extension, kind, fingerprint, dest_path);
+    try memory_storage.publishNote(fs, allocator, dest_path, note);
+    try writeCreated(allocator, stdout, id, extension, kind, fingerprint, dest_path);
     return 0;
 }
 
-fn cmdList(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdList(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
-    const notes_dir = try notesDirAlloc(allocator, env, args, extension);
+    const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
-    try memory_layout.validateDirectory(Io.io(), notes_dir);
+    try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
     const names = durable_store.listSortedRegularFilesNoSymlink(
+        fs,
         allocator,
         notes_dir,
         MaxFiles,
@@ -380,7 +413,7 @@ fn cmdList(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
         idx -= 1;
         const path = try std.fs.path.join(allocator, &.{ notes_dir, names[idx] });
         defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
+        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
         defer allocator.free(raw);
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -398,18 +431,25 @@ fn cmdList(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     try w.writeAll("],\"truncated\":");
     try w.writeAll(if (names.len > emitted) "true" else "false");
     try w.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
     return 0;
 }
 
-fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdShow(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     const id = args.id orelse return error.MissingId;
     try validateExtension(extension);
-    const notes_dir = try notesDirAlloc(allocator, env, args, extension);
+    const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
-    try memory_layout.validateDirectory(Io.io(), notes_dir);
+    try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
     const names = try durable_store.listSortedRegularFilesNoSymlink(
+        fs,
         allocator,
         notes_dir,
         MaxFiles,
@@ -422,7 +462,7 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
         defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
+        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
         defer allocator.free(raw);
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -438,15 +478,17 @@ fn cmdShow(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     const payload = found orelse return error.NotFound;
     const format = args.format orelse "json";
     if (std.mem.eql(u8, format, "raw") or std.mem.eql(u8, format, "json")) {
-        try writeStdoutBytes(payload);
+        try stdout.writeAll(payload);
         return 0;
     }
     return error.InvalidFormat;
 }
 
 fn cmdDoctor(
+    fs: Fs,
     allocator: std.mem.Allocator,
-    env: *std.process.Environ.Map,
+    stdout: *std.Io.Writer,
+    home: []const u8,
     args: Args,
     home_issue: ?anyerror,
 ) !u8 {
@@ -468,24 +510,25 @@ fn cmdDoctor(
         try w.writeAll("{\"extension\":");
         try writeJsonString(w, extension);
         const notes_dir = if (args.memory_version != null)
-            try notesDirAlloc(allocator, env, args, extension)
+            try notesDirAlloc(allocator, home, args, extension)
         else
-            try codexHomeAlloc(allocator, env, args.codex_home);
+            try allocator.dupe(u8, home);
         defer allocator.free(notes_dir);
         var path_issue = home_issue;
         if (path_issue == null) {
-            memory_layout.validateDirectory(Io.io(), notes_dir) catch |err| {
+            memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir) catch |err| {
                 path_issue = err;
             };
         }
         if (path_issue) |err| {
             issues += 1;
-            var diagnostic = try doctorPathDiagnosticAlloc(allocator, notes_dir, err);
+            var diagnostic = try doctorPathDiagnosticAlloc(fs, allocator, notes_dir, err);
             defer diagnostic.deinit(allocator);
             try writeDoctorFailureJson(w, err, diagnostic);
             continue;
         }
         const names = durable_store.listSortedRegularFilesNoSymlink(
+            fs,
             allocator,
             notes_dir,
             MaxFiles,
@@ -495,7 +538,7 @@ fn cmdDoctor(
             else => return err,
         };
         defer durable_store.freeStringList(allocator, names);
-        const counts = try doctorNoteCounts(allocator, notes_dir, names, extension);
+        const counts = try doctorNoteCounts(fs, allocator, notes_dir, names, extension);
         checked += counts.checked;
         issues += counts.issues;
         try w.print(",\"status\":\"ok\",\"notes\":{d}}}", .{names.len});
@@ -503,11 +546,12 @@ fn cmdDoctor(
     try w.print("],\"checked\":{d},\"issues\":{d},\"storage_mutated\":false}}\n", .{
         checked, issues,
     });
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
     return if (issues == 0) 0 else 8;
 }
 
 fn doctorNoteCounts(
+    fs: Fs,
     allocator: std.mem.Allocator,
     notes_dir: []const u8,
     names: []const []const u8,
@@ -518,7 +562,7 @@ fn doctorNoteCounts(
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
         defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(allocator, path, MaxNoteBytes);
+        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
         defer allocator.free(raw);
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -536,12 +580,16 @@ fn doctorNoteCounts(
     return .{ .checked = checked, .issues = issues };
 }
 
-fn cmdPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdPath(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
     const version = args.memory_version.?;
-    const home = try codexHomeAlloc(allocator, env, args.codex_home);
-    defer allocator.free(home);
     const root = try std.fs.path.join(allocator, &.{ home, version.directory() });
     defer allocator.free(root);
     const extension_root = try std.fs.path.join(allocator, &.{ root, "extensions", extension });
@@ -552,7 +600,7 @@ fn cmdPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
     defer allocator.free(instructions);
     const resources = try std.fs.path.join(allocator, &.{ extension_root, "resources" });
     defer allocator.free(resources);
-    try memory_layout.validateDirectory(Io.io(), notes_dir);
+    try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const format = args.format orelse "text";
@@ -571,11 +619,17 @@ fn cmdPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Ar
         }, .{}, &out.writer);
         try out.writer.writeByte('\n');
     } else return error.InvalidFormat;
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
     return 0;
 }
 
-fn cmdMigrate(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: Args) !u8 {
+fn cmdMigrate(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
     const from = args.from_memory_version orelse return error.MissingFromMemoryVersion;
@@ -583,20 +637,20 @@ fn cmdMigrate(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args:
     if (from == to) return error.SameMemoryVersion;
     var source_args = args;
     source_args.memory_version = from;
-    const source = try notesDirAlloc(allocator, env, source_args, extension);
+    const source = try notesDirAlloc(allocator, home, source_args, extension);
     defer allocator.free(source);
-    const destination = try notesDirAlloc(allocator, env, args, extension);
+    const destination = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(destination);
     const result = if (args.dry_run)
-        try memory_migrate.copy(allocator, Io.io(), source, destination, extension, true)
+        try memory_migrate.copy(fs, allocator, source, destination, extension, true)
     else result: {
-        const lock_path = try memoryNoteLockPathAlloc(allocator, env, args.codex_home, extension);
+        const lock_path = try memoryNoteLockPathAlloc(allocator, home, extension);
         defer allocator.free(lock_path);
-        var lock = try memory_storage.acquireExtensionLock(allocator, lock_path);
+        var lock = try memory_storage.acquireExtensionLock(fs, allocator, lock_path);
         defer lock.release();
         var copied = try memory_migrate.copy(
+            fs,
             allocator,
-            Io.io(),
             source,
             destination,
             extension,
@@ -618,7 +672,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args:
         .storage_mutated = result.storage_mutated,
     }, .{}, &out.writer);
     try out.writer.writeByte('\n');
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
     return 0;
 }
 
@@ -847,12 +901,17 @@ fn oneOfAsciiLower(value: []const u8, comptime values: []const []const u8) bool 
     return false;
 }
 
-fn readJsonInput(allocator: std.mem.Allocator, json_path: []const u8) ![]u8 {
+fn readJsonInput(
+    fs: Fs,
+    stdin: std.Io.File,
+    allocator: std.mem.Allocator,
+    json_path: []const u8,
+) ![]u8 {
     if (std.mem.eql(u8, json_path, "-")) {
-        var reader = std.Io.File.stdin().reader(Io.io(), &.{});
+        var reader = stdin.reader(fs.io, &.{});
         return reader.interface.allocRemaining(allocator, .limited(MaxInputBytes + 1));
     }
-    return durable_store.readFileAlloc(allocator, json_path, MaxInputBytes + 1);
+    return durable_store.readFileAlloc(fs, allocator, json_path, MaxInputBytes + 1);
 }
 
 fn codexHomeAlloc(
@@ -868,13 +927,11 @@ fn codexHomeAlloc(
 
 fn notesDirAlloc(
     allocator: std.mem.Allocator,
-    env: *std.process.Environ.Map,
+    home: []const u8,
     args: Args,
     extension: []const u8,
 ) ![]u8 {
     const version = args.memory_version.?;
-    const home = try codexHomeAlloc(allocator, env, args.codex_home);
-    defer allocator.free(home);
     if (!std.fs.path.isAbsolute(home)) return error.InvalidCodexHome;
     return std.fs.path.join(allocator, &.{
         home, version.directory(), "extensions", extension, "notes",
@@ -882,6 +939,7 @@ fn notesDirAlloc(
 }
 
 fn doctorPathDiagnosticAlloc(
+    fs: Fs,
     allocator: std.mem.Allocator,
     checked_path: []const u8,
     issue: anyerror,
@@ -891,8 +949,8 @@ fn doctorPathDiagnosticAlloc(
 
     var it = std.fs.path.componentIterator(checked_path);
     while (it.next()) |component| {
-        const stat = std.Io.Dir.cwd().statFile(
-            Io.io(),
+        const stat = fs.directory().statFile(
+            fs.io,
             component.path,
             .{ .follow_symlinks = false },
         ) catch |err| switch (err) {
@@ -915,12 +973,9 @@ fn doctorPathDiagnosticAlloc(
 
 fn memoryNoteLockPathAlloc(
     allocator: std.mem.Allocator,
-    env: *std.process.Environ.Map,
-    override: ?[]const u8,
+    home: []const u8,
     extension: []const u8,
 ) ![]u8 {
-    const home = try codexHomeAlloc(allocator, env, override);
-    defer allocator.free(home);
     const lock_name = try allocator.print("{s}.lock", .{extension});
     defer allocator.free(lock_name);
     return std.fs.path.join(allocator, &.{ home, ".memory-note", "locks", lock_name });
@@ -1065,11 +1120,13 @@ const ExistingFingerprint = struct {
 };
 
 fn findFingerprint(
+    fs: Fs,
     allocator: std.mem.Allocator,
     notes_dir: []const u8,
     fingerprint: []const u8,
 ) !?ExistingFingerprint {
     const names = durable_store.listSortedRegularFilesNoSymlink(
+        fs,
         allocator,
         notes_dir,
         MaxFiles,
@@ -1083,6 +1140,7 @@ fn findFingerprint(
         const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
         defer allocator.free(path);
         const raw = try durable_store.readRegularFileNoSymlink(
+            fs,
             allocator,
             path,
             MaxNoteBytes,
@@ -1129,6 +1187,7 @@ fn stringField(root: std.json.ObjectMap, field: []const u8) ?[]const u8 {
 
 fn writeCreated(
     allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
     id: []const u8,
     extension: []const u8,
     kind: []const u8,
@@ -1149,22 +1208,22 @@ fn writeCreated(
     try w.writeAll(",\"path\":");
     try writeJsonString(w, path);
     try w.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
 }
 
 fn writeDuplicateSkip(
     allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
     extension: []const u8,
     kind: []const u8,
-    id: []const u8,
+    existing: ExistingFingerprint,
     fingerprint: []const u8,
-    path: []const u8,
 ) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
     try w.writeAll("{\"command\":\"append\",\"status\":\"duplicate_skip\",\"id\":");
-    try writeJsonString(w, id);
+    try writeJsonString(w, existing.id);
     try w.writeAll(",\"extension\":");
     try writeJsonString(w, extension);
     try w.writeAll(",\"kind\":");
@@ -1172,13 +1231,14 @@ fn writeDuplicateSkip(
     try w.writeAll(",\"fingerprint\":");
     try writeJsonString(w, fingerprint);
     try w.writeAll(",\"path\":");
-    try writeJsonString(w, path);
+    try writeJsonString(w, existing.path);
     try w.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
 }
 
 fn writeDryRun(
     allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
     id: []const u8,
     extension: []const u8,
     kind: []const u8,
@@ -1202,7 +1262,7 @@ fn writeDryRun(
     try w.writeAll(",\"note\":");
     try writeJsonString(w, note);
     try w.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    try writeOutputAlloc(allocator, stdout, &out);
 }
 
 fn writeNoteSummaryJson(w: *std.Io.Writer, note: ParsedNote, path: []const u8) !void {
@@ -1245,15 +1305,14 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, w);
 }
 
-fn writeStdoutAlloc(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) !void {
+fn writeOutputAlloc(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    out: *std.Io.Writer.Allocating,
+) !void {
     const payload = try out.toOwnedSlice();
     defer allocator.free(payload);
-    try writeStdoutBytes(payload);
-}
-
-fn writeStdoutBytes(bytes: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(Io.io(), &.{});
-    try stdout_writer.interface.writeAll(bytes);
+    try stdout.writeAll(payload);
 }
 
 fn exitCodeForError(err: anyerror) u8 {
@@ -1297,9 +1356,9 @@ fn exitCodeForError(err: anyerror) u8 {
     };
 }
 
-fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
+fn nowUtcAlloc(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     const now_sec: i64 = @intCast(@divFloor(
-        std.Io.Clock.real.now(Io.io()).nanoseconds,
+        std.Io.Clock.real.now(io).nanoseconds,
         1_000_000_000,
     ));
     var days = @divFloor(now_sec, 86_400);
@@ -1382,11 +1441,11 @@ test "renders envelope with generated fields" {
 test "doctor path diagnostic reports symlink component" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    try tmp.dir.createDir(Io.io(), "real", .default_dir);
-    try tmp.dir.symLink(Io.io(), "real", "link", .{ .is_directory = true });
+    try tmp.dir.createDir(std.testing.io, "real", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true });
     const checked_path = try std.fs.path.join(
         std.testing.allocator,
         &.{ root, "link", "harness", "notes" },
@@ -1396,6 +1455,7 @@ test "doctor path diagnostic reports symlink component" {
     defer std.testing.allocator.free(offending);
 
     var diagnostic = try doctorPathDiagnosticAlloc(
+        Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         checked_path,
         error.SymlinkComponent,
@@ -1410,16 +1470,17 @@ test "doctor path diagnostic reports symlink component" {
 test "doctor path diagnostic reports not-dir component" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    try tmp.dir.writeFile(Io.io(), .{ .sub_path = "file", .data = "payload" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "file", .data = "payload" });
     const checked_path = try std.fs.path.join(std.testing.allocator, &.{ root, "file", "notes" });
     defer std.testing.allocator.free(checked_path);
     const offending = try std.fs.path.join(std.testing.allocator, &.{ root, "file" });
     defer std.testing.allocator.free(offending);
 
     var diagnostic = try doctorPathDiagnosticAlloc(
+        Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         checked_path,
         error.NotDir,
@@ -1520,8 +1581,12 @@ const LookupNoteFixture =
     "\"extension\":\"harness\",\"kind\":\"harness-rule\",\"operation\":\"assert\"," ++
     "\"summary\":\"test\",\"fingerprint\":\"fixture-fingerprint\"}";
 
-fn lookupFingerprintWithAllocator(allocator: std.mem.Allocator, notes_dir: []const u8) !void {
-    const found = try findFingerprint(allocator, notes_dir, "fixture-fingerprint") orelse
+fn lookupFingerprintWithAllocator(
+    allocator: std.mem.Allocator,
+    fs: Fs,
+    notes_dir: []const u8,
+) !void {
+    const found = try findFingerprint(fs, allocator, notes_dir, "fixture-fingerprint") orelse
         return error.MissingFingerprint;
     defer allocator.free(found.id);
     defer allocator.free(found.path);
@@ -1532,13 +1597,13 @@ test "fingerprint lookup propagates allocation failure without losing the duplic
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(Io.io(), .{ .sub_path = "one.json", .data = LookupNoteFixture });
-    const path = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one.json", .data = LookupNoteFixture });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path);
     try @import("test_support").checkAllAllocationFailures(
         allocator,
         lookupFingerprintWithAllocator,
-        .{path},
+        .{ Fs.init(std.testing.io, .cwd()), path },
     );
 }
 
@@ -1547,20 +1612,23 @@ test "show releases a retained matching note when a later duplicate is rejected"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const notes_path = "memories/extensions/harness/notes";
-    try tmp.dir.createDirPath(Io.io(), notes_path);
-    try tmp.dir.writeFile(Io.io(), .{
+    try tmp.dir.createDirPath(std.testing.io, notes_path);
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = notes_path ++ "/one.json",
         .data = LookupNoteFixture,
     });
-    try tmp.dir.writeFile(Io.io(), .{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = notes_path ++ "/two.json",
         .data = LookupNoteFixture,
     });
-    const home = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(home);
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try std.testing.expectError(error.DuplicateId, cmdShow(allocator, &env, .{
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try std.testing.expectError(error.DuplicateId, cmdShow(Fs.init(
+        std.testing.io,
+        .cwd(),
+    ), allocator, &output.writer, home, .{
         .command = .show,
         .codex_home = home,
         .memory_version = .v1,
@@ -1571,4 +1639,68 @@ test "show releases a retained matching note when a later duplicate is rejected"
 
 test {
     _ = memory_migrate;
+}
+
+test "input reads use independent supplied directories and propagate canceled I/O" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var left = std.testing.tmpDir(.{});
+    defer left.cleanup();
+    var right = std.testing.tmpDir(.{});
+    defer right.cleanup();
+    try left.dir.writeFile(io, .{ .sub_path = "input.json", .data = "left" });
+    try right.dir.writeFile(io, .{ .sub_path = "input.json", .data = "right" });
+    const left_bytes = try readJsonInput(Fs.init(io, left.dir), .stdin(), allocator, "input.json");
+    defer allocator.free(left_bytes);
+    const right_bytes = try readJsonInput(
+        Fs.init(io, right.dir),
+        .stdin(),
+        allocator,
+        "input.json",
+    );
+    defer allocator.free(right_bytes);
+    try std.testing.expectEqualStrings("left", left_bytes);
+    try std.testing.expectEqualStrings("right", right_bytes);
+    var vtable = io.vtable.*;
+    vtable.dirOpenFile = struct {
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
+            return error.Canceled;
+        }
+    }.open;
+    const canceled = Fs.init(.{ .userdata = io.userdata, .vtable = &vtable }, left.dir);
+    try std.testing.expectError(
+        error.Canceled,
+        readJsonInput(canceled, .stdin(), allocator, "input.json"),
+    );
+}
+
+test "help rendering propagates writer failure without terminating the host" {
+    var writer = std.Io.Writer.fixed(&.{});
+    try std.testing.expectError(
+        error.WriteFailed,
+        handleHelpAndVersion(std.testing.allocator, &writer, &.{"memory-note"}),
+    );
+}
+
+test "home selection remains explicit override then Codex home then user home" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", "/user/home");
+    try env.put("CODEX_HOME", "/codex/home");
+    const explicit = try codexHomeAlloc(allocator, &env, "/selected/home");
+    defer allocator.free(explicit);
+    try std.testing.expectEqualStrings("/selected/home", explicit);
+    const codex = try codexHomeAlloc(allocator, &env, null);
+    defer allocator.free(codex);
+    try std.testing.expectEqualStrings("/codex/home", codex);
+    try std.testing.expect(env.swapRemove("CODEX_HOME"));
+    const user = try codexHomeAlloc(allocator, &env, null);
+    defer allocator.free(user);
+    try std.testing.expectEqualStrings("/user/home/.codex", user);
 }

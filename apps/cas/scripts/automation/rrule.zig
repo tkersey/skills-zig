@@ -10,7 +10,7 @@ pub const Day = enum {
     TU,
     WE,
 
-    pub fn parse(raw: []const u8) !Day {
+    pub fn parse(io: std.Io, raw: []const u8) !Day {
         if (std.ascii.eqlIgnoreCase(raw, "MO")) return .MO;
         if (std.ascii.eqlIgnoreCase(raw, "TU")) return .TU;
         if (std.ascii.eqlIgnoreCase(raw, "WE")) return .WE;
@@ -18,7 +18,7 @@ pub const Day = enum {
         if (std.ascii.eqlIgnoreCase(raw, "FR")) return .FR;
         if (std.ascii.eqlIgnoreCase(raw, "SA")) return .SA;
         if (std.ascii.eqlIgnoreCase(raw, "SU")) return .SU;
-        return userErrorFmt("invalid BYDAY value: {s}", .{raw});
+        return userErrorFmt(io, "invalid BYDAY value: {s}", .{raw});
     }
 
     pub fn asText(self: Day) []const u8 {
@@ -43,11 +43,11 @@ pub const Freq = enum {
     HOURLY,
     WEEKLY,
 
-    pub fn parse(raw: []const u8) !Freq {
+    pub fn parse(io: std.Io, raw: []const u8) !Freq {
         if (std.ascii.eqlIgnoreCase(raw, "HOURLY")) return .HOURLY;
         if (std.ascii.eqlIgnoreCase(raw, "DAILY")) return .DAILY;
         if (std.ascii.eqlIgnoreCase(raw, "WEEKLY")) return .WEEKLY;
-        return userErrorFmt("unsupported FREQ: {s} (allowed: HOURLY, DAILY, WEEKLY)", .{raw});
+        return userErrorFmt(io, "unsupported FREQ: {s} (allowed: HOURLY, DAILY, WEEKLY)", .{raw});
     }
 
     pub fn asText(self: Freq) []const u8 {
@@ -77,20 +77,24 @@ pub const RRule = struct {
     }
 };
 
-pub fn parseAndCanonicalizeRrule(allocator: std.mem.Allocator, raw_input: []const u8) ![]u8 {
+pub fn parseAndCanonicalizeRrule(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    raw_input: []const u8,
+) ![]u8 {
     var input = std.mem.trim(u8, raw_input, " \t\r\n");
-    if (input.len == 0) return userErrorFmt("rrule must not be empty", .{});
+    if (input.len == 0) return userErrorFmt(io, "rrule must not be empty", .{});
 
     if (std.ascii.startsWithIgnoreCase(input, "RRULE:")) {
         input = std.mem.trim(u8, input[6..], " \t\r\n");
     }
 
-    var rule = try parseRrule(allocator, input);
+    var rule = try parseRrule(io, allocator, input);
     defer rule.deinit(allocator);
     return renderCanonicalRrule(allocator, rule);
 }
 
-pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
+pub fn parseRrule(io: std.Io, allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
     var out = RRule.init(allocator);
     errdefer out.deinit(allocator);
     var have_freq = false;
@@ -105,54 +109,59 @@ pub fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
 
         var kv = std.mem.splitScalar(u8, part, '=');
         const key_raw = kv.next() orelse
-            return userErrorFmt("rrule token missing key: {s}", .{part});
+            return userErrorFmt(io, "rrule token missing key: {s}", .{part});
         const value_raw = kv.next() orelse
-            return userErrorFmt("rrule token missing value: {s}", .{part});
-        if (kv.next() != null) return userErrorFmt("rrule token has multiple '=': {s}", .{part});
+            return userErrorFmt(io, "rrule token missing value: {s}", .{part});
+        if (kv.next() != null) return userErrorFmt(
+            io,
+            "rrule token has multiple '=': {s}",
+            .{part},
+        );
 
         const key = std.mem.trim(u8, key_raw, " \t\r\n");
         const value = std.mem.trim(u8, value_raw, " \t\r\n");
 
         if (std.ascii.eqlIgnoreCase(key, "FREQ")) {
-            out.freq = try Freq.parse(value);
+            out.freq = try Freq.parse(io, value);
             have_freq = true;
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "INTERVAL")) {
-            const parsed = try parsePositiveUsize(value, "INTERVAL");
+            const parsed = try parsePositiveUsize(io, value, "INTERVAL");
             out.interval = std.math.cast(u32, parsed) orelse
-                return userErrorFmt("INTERVAL must fit an unsigned 32-bit integer", .{});
+                return userErrorFmt(io, "INTERVAL must fit an unsigned 32-bit integer", .{});
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYHOUR")) {
-            out.byhour = try parseBoundedU8(value, "BYHOUR", 23);
+            out.byhour = try parseBoundedU8(io, value, "BYHOUR", 23);
             have_byhour = true;
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYMINUTE")) {
-            out.byminute = try parseBoundedU8(value, "BYMINUTE", 59);
+            out.byminute = try parseBoundedU8(io, value, "BYMINUTE", 59);
             have_byminute = true;
             continue;
         }
         if (std.ascii.eqlIgnoreCase(key, "BYDAY")) {
-            if (value.len == 0) return userErrorFmt("BYDAY must not be empty", .{});
+            if (value.len == 0) return userErrorFmt(io, "BYDAY must not be empty", .{});
             var days_iter = std.mem.splitScalar(u8, value, ',');
             while (days_iter.next()) |day_raw| {
-                const day = try Day.parse(std.mem.trim(u8, day_raw, " \t\r\n"));
+                const day = try Day.parse(io, std.mem.trim(u8, day_raw, " \t\r\n"));
                 if (!containsDay(out.byday.items, day)) try out.byday.append(allocator, day);
             }
             have_byday = out.byday.items.len > 0;
             continue;
         }
-        return userErrorFmt("unsupported RRULE token: {s}", .{key});
+        return userErrorFmt(io, "unsupported RRULE token: {s}", .{key});
     }
 
-    if (!have_freq) return userErrorFmt("rrule must include FREQ=...", .{});
-    try validateRruleShape(out, have_byminute, have_byhour, have_byday);
+    if (!have_freq) return userErrorFmt(io, "rrule must include FREQ=...", .{});
+    try validateRruleShape(io, out, have_byminute, have_byhour, have_byday);
     return out;
 }
 
 fn validateRruleShape(
+    io: std.Io,
     rule: RRule,
     have_byminute: bool,
     have_byhour: bool,
@@ -160,18 +169,19 @@ fn validateRruleShape(
 ) !void {
     switch (rule.freq) {
         .HOURLY => {
-            if (!have_byminute) return userErrorFmt("HOURLY rrules must include BYMINUTE", .{});
-            if (have_byhour) return userErrorFmt("HOURLY rrules must not include BYHOUR", .{});
-            if (have_byday) return userErrorFmt("HOURLY rrules must not include BYDAY", .{});
+            if (!have_byminute) return userErrorFmt(io, "HOURLY rrules must include BYMINUTE", .{});
+            if (have_byhour) return userErrorFmt(io, "HOURLY rrules must not include BYHOUR", .{});
+            if (have_byday) return userErrorFmt(io, "HOURLY rrules must not include BYDAY", .{});
         },
         .DAILY => {
             if (!have_byhour or !have_byminute) {
-                return userErrorFmt("DAILY rrules must include BYHOUR and BYMINUTE", .{});
+                return userErrorFmt(io, "DAILY rrules must include BYHOUR and BYMINUTE", .{});
             }
-            if (have_byday) return userErrorFmt("DAILY rrules must not include BYDAY", .{});
+            if (have_byday) return userErrorFmt(io, "DAILY rrules must not include BYDAY", .{});
         },
         .WEEKLY => if (!have_byday or !have_byhour or !have_byminute) {
             return userErrorFmt(
+                io,
                 "WEEKLY rrules must include BYDAY, BYHOUR, and BYMINUTE",
                 .{},
             );
@@ -203,34 +213,28 @@ pub fn containsDay(items: []const Day, needle: Day) bool {
     return false;
 }
 
-fn parsePositiveUsize(raw: []const u8, field: []const u8) !usize {
+fn parsePositiveUsize(io: std.Io, raw: []const u8, field: []const u8) !usize {
     const parsed = std.fmt.parseInt(usize, raw, 10) catch
-        return userErrorFmt("{s} must be a positive integer", .{field});
-    if (parsed == 0) return userErrorFmt("{s} must be a positive integer", .{field});
+        return userErrorFmt(io, "{s} must be a positive integer", .{field});
+    if (parsed == 0) return userErrorFmt(io, "{s} must be a positive integer", .{field});
     return parsed;
 }
 
-fn parseBoundedU8(raw: []const u8, field: []const u8, max: u8) !u8 {
+fn parseBoundedU8(io: std.Io, raw: []const u8, field: []const u8, max: u8) !u8 {
     const parsed = std.fmt.parseInt(i64, raw, 10) catch
-        return userErrorFmt("{s} must be an integer 0..{d}", .{ field, max });
+        return userErrorFmt(io, "{s} must be an integer 0..{d}", .{ field, max });
     if (parsed < 0 or parsed > max) {
-        return userErrorFmt("{s} must be in 0..{d}", .{ field, max });
+        return userErrorFmt(io, "{s} must be in 0..{d}", .{ field, max });
     }
     return @intCast(parsed);
 }
 
-fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
-    var stderr_file = std.Io.File.stderr();
-    var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stderr = &stderr_writer.interface;
-    stderr.print("error: " ++ fmt ++ "\n", args) catch return error.UserInput;
-    return error.UserInput;
-}
+const userErrorFmt = @import("output.zig").userErrorFmt;
 
-pub fn alignMsToMinute(ms: i64) !i64 {
+pub fn alignMsToMinute(io: std.Io, ms: i64) !i64 {
     const minute = @divFloor(ms, 60_000);
     return std.math.mul(i64, minute, 60_000) catch
-        return userErrorFmt("aligned minute is outside the timestamp range", .{});
+        return userErrorFmt(io, "aligned minute is outside the timestamp range", .{});
 }
 
 const CivilDate = struct {
@@ -284,17 +288,26 @@ pub fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
 }
 
-pub fn computeNextRunAt(allocator: std.mem.Allocator, row: anytype, run_started_ms: i64) !i64 {
+pub fn computeNextRunAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    row: anytype,
+    run_started_ms: i64,
+) !i64 {
     const raw = std.mem.trim(u8, row.rrule, " \t\r\n");
-    if (raw.len == 0) return userErrorFmt("automation {s} has empty rrule", .{row.id});
+    if (raw.len == 0) return userErrorFmt(io, "automation {s} has empty rrule", .{row.id});
 
     const rule_text = if (std.ascii.startsWithIgnoreCase(raw, "RRULE:"))
         std.mem.trim(u8, raw[6..], " \t\r\n")
     else
         raw;
-    if (rule_text.len == 0) return userErrorFmt("automation {s} has malformed rrule", .{row.id});
+    if (rule_text.len == 0) return userErrorFmt(
+        io,
+        "automation {s} has malformed rrule",
+        .{row.id},
+    );
 
-    var rule = try parseRrule(allocator, rule_text);
+    var rule = try parseRrule(io, allocator, rule_text);
     defer rule.deinit(allocator);
 
     const dtstart_ms: i64 = if (row.next_run_at) |next_ms|
@@ -304,18 +317,22 @@ pub fn computeNextRunAt(allocator: std.mem.Allocator, row: anytype, run_started_
     else
         row.created_at;
 
-    const dtstart = try alignMsToMinute(dtstart_ms);
-    const anchor = try alignMsToMinute(run_started_ms);
+    const dtstart = try alignMsToMinute(io, dtstart_ms);
+    const anchor = try alignMsToMinute(io, run_started_ms);
 
     return switch (rule.freq) {
-        .HOURLY => nextHourly(rule, dtstart, anchor),
-        .DAILY => nextDaily(rule, dtstart, anchor),
-        .WEEKLY => nextWeekly(rule, dtstart, anchor),
+        .HOURLY => nextHourly(io, rule, dtstart, anchor),
+        .DAILY => nextDaily(io, rule, dtstart, anchor),
+        .WEEKLY => nextWeekly(io, rule, dtstart, anchor),
     };
 }
 
-pub fn nextHourly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
-    const minute = rule.byminute orelse return userErrorFmt("HOURLY rrule missing BYMINUTE", .{});
+pub fn nextHourly(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "HOURLY rrule missing BYMINUTE",
+        .{},
+    );
 
     const base_sec = @divFloor(dtstart_ms, 1000);
     const anchor_sec = @divFloor(anchor_ms, 1000);
@@ -327,15 +344,19 @@ pub fn nextHourly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
         if (@mod(hour - base_hour, @as(i64, rule.interval)) != 0) continue;
         const candidate_sec = hour * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
-        return checkedTimestampMillis(candidate_sec);
+        return checkedTimestampMillis(io, candidate_sec);
     }
 
-    return userErrorFmt("unable to compute next HOURLY run", .{});
+    return userErrorFmt(io, "unable to compute next HOURLY run", .{});
 }
 
-pub fn nextDaily(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
-    const hour = rule.byhour orelse return userErrorFmt("DAILY rrule missing BYHOUR", .{});
-    const minute = rule.byminute orelse return userErrorFmt("DAILY rrule missing BYMINUTE", .{});
+pub fn nextDaily(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
+    const hour = rule.byhour orelse return userErrorFmt(io, "DAILY rrule missing BYHOUR", .{});
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "DAILY rrule missing BYMINUTE",
+        .{},
+    );
 
     const base_sec = @divFloor(dtstart_ms, 1000);
     const anchor_sec = @divFloor(anchor_ms, 1000);
@@ -347,16 +368,20 @@ pub fn nextDaily(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
         if (@mod(day - base_day, @as(i64, rule.interval)) != 0) continue;
         const candidate_sec = day * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
-        return checkedTimestampMillis(candidate_sec);
+        return checkedTimestampMillis(io, candidate_sec);
     }
 
-    return userErrorFmt("unable to compute next DAILY run", .{});
+    return userErrorFmt(io, "unable to compute next DAILY run", .{});
 }
 
-pub fn nextWeekly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
-    const hour = rule.byhour orelse return userErrorFmt("WEEKLY rrule missing BYHOUR", .{});
-    const minute = rule.byminute orelse return userErrorFmt("WEEKLY rrule missing BYMINUTE", .{});
-    if (rule.byday.items.len == 0) return userErrorFmt("WEEKLY rrule missing BYDAY", .{});
+pub fn nextWeekly(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
+    const hour = rule.byhour orelse return userErrorFmt(io, "WEEKLY rrule missing BYHOUR", .{});
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "WEEKLY rrule missing BYMINUTE",
+        .{},
+    );
+    if (rule.byday.items.len == 0) return userErrorFmt(io, "WEEKLY rrule missing BYDAY", .{});
 
     const base_sec = @divFloor(dtstart_ms, 1000);
     const anchor_sec = @divFloor(anchor_ms, 1000);
@@ -379,10 +404,10 @@ pub fn nextWeekly(rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
         const candidate_sec = day * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60;
         if (candidate_sec <= anchor_sec or candidate_sec < base_sec) continue;
 
-        return checkedTimestampMillis(candidate_sec);
+        return checkedTimestampMillis(io, candidate_sec);
     }
 
-    return userErrorFmt("unable to compute next WEEKLY run", .{});
+    return userErrorFmt(io, "unable to compute next WEEKLY run", .{});
 }
 
 pub fn weekdayAllowed(days: []const Day, weekday_index_mon: u8) bool {
@@ -392,15 +417,18 @@ pub fn weekdayAllowed(days: []const Day, weekday_index_mon: u8) bool {
     return false;
 }
 
-fn checkedTimestampMillis(seconds: i64) !i64 {
+fn checkedTimestampMillis(io: std.Io, seconds: i64) !i64 {
     return std.math.mul(i64, seconds, 1000) catch
-        return userErrorFmt("next run is outside the timestamp range", .{});
+        return userErrorFmt(io, "next run is outside the timestamp range", .{});
 }
 
 test "minute alignment preserves negative floors and rejects an unrepresentable floor" {
-    try std.testing.expectEqual(@as(i64, -60_000), try alignMsToMinute(-1));
-    try std.testing.expectEqual(@as(i64, 60_000), try alignMsToMinute(60_001));
-    try std.testing.expectError(error.UserInput, alignMsToMinute(std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i64, -60_000), try alignMsToMinute(std.testing.io, -1));
+    try std.testing.expectEqual(@as(i64, 60_000), try alignMsToMinute(std.testing.io, 60_001));
+    try std.testing.expectError(
+        error.UserInput,
+        alignMsToMinute(std.testing.io, std.math.minInt(i64)),
+    );
 }
 
 test "hourly recurrence preserves the largest representable interval" {
@@ -408,7 +436,7 @@ test "hourly recurrence preserves the largest representable interval" {
     defer rule.deinit(std.testing.allocator);
     rule.interval = std.math.maxInt(u32);
     rule.byminute = 1;
-    try std.testing.expectEqual(@as(i64, 60_000), try nextHourly(rule, 0, 0));
+    try std.testing.expectEqual(@as(i64, 60_000), try nextHourly(std.testing.io, rule, 0, 0));
 }
 
 test "hourly recurrence reports when the next timestamp exceeds i64" {
@@ -416,11 +444,11 @@ test "hourly recurrence reports when the next timestamp exceeds i64" {
     defer rule.deinit(std.testing.allocator);
     rule.byminute = 59;
     const last = std.math.maxInt(i64);
-    try std.testing.expectError(error.UserInput, nextHourly(rule, last, last));
+    try std.testing.expectError(error.UserInput, nextHourly(std.testing.io, rule, last, last));
 }
 
-fn parseWeeklyWithAllocator(allocator: std.mem.Allocator) !void {
-    var rule = try parseRrule(allocator, "FREQ=WEEKLY;BYDAY=MO,TU,WE;BYHOUR=1;BYMINUTE=2");
+fn parseWeeklyWithAllocator(allocator: std.mem.Allocator, io: std.Io) !void {
+    var rule = try parseRrule(io, allocator, "FREQ=WEEKLY;BYDAY=MO,TU,WE;BYHOUR=1;BYMINUTE=2");
     defer rule.deinit(allocator);
 }
 
@@ -428,17 +456,21 @@ test "recurrence parser releases accumulated days on allocation or shape failure
     try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         parseWeeklyWithAllocator,
-        .{},
+        .{std.testing.io},
     );
     try std.testing.expectError(
         error.UserInput,
-        parseRrule(std.testing.allocator, "FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=1"),
+        parseRrule(std.testing.io, std.testing.allocator, "FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=1"),
     );
 }
 
 test "recurrence parser rejects intervals that do not fit the stored representation" {
     try std.testing.expectError(
         error.UserInput,
-        parseRrule(std.testing.allocator, "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296"),
+        parseRrule(
+            std.testing.io,
+            std.testing.allocator,
+            "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296",
+        ),
     );
 }

@@ -4,63 +4,51 @@ const durable_store = @import("durable_store");
 pub const marker_name = ".ledger-root.json";
 const marker_schema = "ledger-storage-root/v1";
 
-pub const Selection = struct {
-    argv: []const []const u8,
-    control: ?std.Io.Dir = null,
-    io: ?std.Io = null,
+/// Borrowed filesystem authority for one operation. Selection owns any managed
+/// directory handle; scopes neither replace process cwd nor own those handles.
+/// Keep this scope stable and its owning selection alive until all stores,
+/// snapshots, scans, locks, and transactions borrowing it have completed.
+pub const Scope = struct {
+    fs: durable_store.Fs,
+    mutation_state: ?bool = false,
 
-    pub fn deinit(self: *Selection, allocator: std.mem.Allocator) void {
-        allocator.free(self.argv);
-        if (self.control) |control| control.close(self.io.?);
-        self.* = undefined;
+    pub fn init(fs: durable_store.Fs) Scope {
+        return .{ .fs = fs };
     }
 };
 
-threadlocal var pending_control: ?std.Io.Dir = null;
-threadlocal var active_control: ?std.Io.Dir = null;
+pub const Selection = struct {
+    argv: []const []const u8,
+    control: ?std.Io.Dir = null,
+    io: std.Io,
 
-pub fn install(selection: *const Selection) void {
-    pending_control = selection.control;
-}
-
-pub fn uninstall() void {
-    durable_store.setRelativePathAnchor(false);
-    active_control = null;
-    pending_control = null;
-}
-
-pub fn enterControl() !bool {
-    active_control = pending_control;
-    if (active_control) |control| {
-        if (std.Io.Dir.cwd().handle != control.handle) {
-            active_control = null;
-            return error.ManagedRootNotAnchored;
-        }
+    pub fn deinit(self: *Selection, allocator: std.mem.Allocator) void {
+        allocator.free(self.argv);
+        if (self.control) |control| control.close(self.io);
+        self.* = undefined;
     }
-    durable_store.setRelativePathAnchor(active_control != null);
-    return active_control != null;
+
+    pub fn invocationScope(self: *const Selection, invocation_dir: std.Io.Dir) Scope {
+        return .init(.init(self.io, invocation_dir));
+    }
+
+    /// Enter only after command input paths have been read in invocation scope.
+    pub fn enterControl(self: *const Selection, scope: *Scope) void {
+        if (self.control) |control| scope.fs = .anchored(self.io, control);
+    }
+};
+
+pub fn controlComponent(scope: *const Scope) []const u8 {
+    return if (scope.fs.isPinned()) "." else ".ledger";
 }
 
-pub fn leaveControl() void {
-    durable_store.setRelativePathAnchor(false);
-    active_control = null;
+pub fn isActive(scope: *const Scope) bool {
+    return scope.fs.isPinned();
 }
 
-pub fn currentCwd() std.Io.Dir {
-    return active_control orelse .{ .handle = std.posix.AT.FDCWD };
-}
-
-pub fn controlComponent() []const u8 {
-    return if (active_control != null) "." else ".ledger";
-}
-
-pub fn isActive() bool {
-    return active_control != null;
-}
-
-pub fn validRepoRoot(path: []const u8) bool {
+pub fn validRepoRoot(scope: *const Scope, path: []const u8) bool {
     return std.fs.path.isAbsolute(path) or
-        (active_control != null and std.mem.eql(u8, path, "."));
+        (scope.fs.isPinned() and std.mem.eql(u8, path, "."));
 }
 
 pub fn hasSelector(argv: []const []const u8) bool {
@@ -81,7 +69,7 @@ pub fn prepare(
     io: std.Io,
     argv: []const []const u8,
 ) !Selection {
-    if (!hasSelector(argv)) return .{ .argv = try allocator.dupe([]const u8, argv) };
+    if (!hasSelector(argv)) return .{ .argv = try allocator.dupe([]const u8, argv), .io = io };
     if (argv.len < 2 or !isDurableCommand(argv[1])) {
         return error.StorageRootRequiresDurableCommand;
     }
@@ -216,6 +204,9 @@ fn checkMarker(
     root: std.Io.Dir,
     expected_id: []const u8,
 ) !void {
+    // The supplied root handle authorizes this host-only open. std.Io does not
+    // expose O_NONBLOCK, which is required to reject FIFO markers without waiting.
+    // Every operation on the resulting file uses the caller's I/O implementation.
     const marker_fd = std.posix.openat(root.handle, marker_name, .{
         .ACCMODE = .RDONLY,
         .NONBLOCK = true,
@@ -313,9 +304,13 @@ test "managed root verifies identity and preserves native argument values" {
     try std.testing.expectEqualStrings(".", selected.argv[3]);
     try std.testing.expect(selected.control != null);
     try std.testing.expectEqualStrings("query=two words", selected.argv[5]);
-    install(&selected);
-    defer uninstall();
-    try std.testing.expectError(error.ManagedRootNotAnchored, enterControl());
+    var scope = selected.invocationScope(tmp.dir);
+    try std.testing.expect(!isActive(&scope));
+    selected.enterControl(&scope);
+    try std.testing.expect(isActive(&scope));
+    try std.testing.expectEqual(selected.control.?.handle, scope.fs.directory().handle);
+    try std.testing.expectEqualStrings(".", controlComponent(&scope));
+    try std.testing.expect(validRepoRoot(&scope, "."));
     try std.testing.expectError(error.StorageRootIdentityMismatch, prepare(
         std.testing.allocator,
         std.testing.io,
@@ -367,4 +362,55 @@ test "duplicate marker identity fields are rejected" {
         std.testing.io,
         &.{ "ledger", "doctor", "--store-root", root, "--store-id", "example" },
     ));
+}
+
+fn prepareAllocationProbe(allocator: std.mem.Allocator, root: []const u8) !void {
+    var selected = prepare(allocator, std.testing.io, &.{
+        "ledger", "doctor", "--store-root", root, "--store-id", "allocation-probe",
+    }) catch |err| switch (err) {
+        // Marker admission intentionally classifies parser failures uniformly.
+        // This fixture is valid, so this failure can only be injected OOM.
+        error.InvalidStorageRootMarker => return error.OutOfMemory,
+        else => return err,
+    };
+    defer selected.deinit(allocator);
+    var scope = selected.invocationScope(std.Io.Dir.cwd());
+    selected.enterControl(&scope);
+    try std.testing.expect(scope.fs.isPinned());
+}
+
+test "managed admission cleans up every partial allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".ledger", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = marker_name,
+        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"allocation-probe\"}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        prepareAllocationProbe,
+        .{root},
+    );
+}
+
+test "managed admission propagates supplied I/O cancellation" {
+    const Cancelled = struct {
+        fn openDir(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenOptions,
+        ) std.Io.Dir.OpenError!std.Io.Dir {
+            return error.Canceled;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirOpenDir = Cancelled.openDir;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, prepare(std.testing.allocator, io, &.{
+        "ledger", "doctor", "--store-root", "/", "--store-id", "cancelled",
+    }));
 }

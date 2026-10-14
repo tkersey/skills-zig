@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const core_json = @import("core_json");
 const std = @import("std");
 const app_server_launch = @import("transport.zig");
@@ -75,6 +76,8 @@ pub fn unsupportedSummary(policy: HookPolicy, hook_log_path: ?[]const u8) HookSu
 pub const HookAccumulator = struct {
     pub const Log = struct {
         io: std.Io,
+        /// Borrowed for the accumulator's lifetime.
+        dir: std.Io.Dir,
         path: []const u8,
     };
 
@@ -210,6 +213,8 @@ pub fn appendAppServerArgs(
 pub fn ensureLaunchSupportsPolicy(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     codex_path: []const u8,
     cwd: []const u8,
     policy: HookPolicy,
@@ -218,12 +223,23 @@ pub fn ensureLaunchSupportsPolicy(
         std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     ))) + app_server_launch.default_startup_timeout_ms;
-    return ensureLaunchSupportsPolicyUntil(allocator, io, codex_path, cwd, policy, deadline_ms);
+    return ensureLaunchSupportsPolicyUntil(
+        allocator,
+        io,
+        dir,
+        environ,
+        codex_path,
+        cwd,
+        policy,
+        deadline_ms,
+    );
 }
 
 pub fn ensureLaunchSupportsPolicyUntil(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     codex_path: []const u8,
     cwd: []const u8,
     policy: HookPolicy,
@@ -234,7 +250,7 @@ pub fn ensureLaunchSupportsPolicyUntil(
         .raw = .fromNanoseconds(@as(i96, deadline_ms) * 1_000_000),
         .clock = .awake,
     };
-    const help = try helpOutputUntil(allocator, io, codex_path, cwd, deadline);
+    const help = try helpOutputUntil(allocator, io, dir, environ, codex_path, cwd, deadline);
     defer allocator.free(help);
     if (std.mem.indexOf(u8, help, "--disable") == null) return error.HooksUnsupported;
     if (policy == .require_observed and
@@ -250,15 +266,33 @@ const HelpProbeEvent = union(enum) {
 fn helpOutputUntil(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     codex_path: []const u8,
     cwd: []const u8,
     deadline: std.Io.Clock.Timestamp,
 ) ![]u8 {
     if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.ConnectionTimedOut;
     const builtin = @import("builtin");
+    const owned_codex_path = if (std.fs.path.isAbsolute(codex_path))
+        null
+    else
+        try app_server_launch.resolveExecutableAlloc(
+            allocator,
+            io,
+            dir,
+            environ.get("PATH"),
+            codex_path,
+        );
+    defer if (owned_codex_path) |path| allocator.free(path);
+    const resolved_codex_path = owned_codex_path orelse codex_path;
+    const child_cwd = try core_io.openSearchDirectory(io, dir, cwd, .{});
+    defer child_cwd.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ codex_path, "app-server", "--help" },
-        .cwd = .{ .path = cwd },
+        .exe = .{ .explicit = .{ .dir = dir, .path = resolved_codex_path } },
+        .argv = &.{ resolved_codex_path, "app-server", "--help" },
+        .cwd = .{ .dir = child_cwd },
+        .environ_map = environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -331,10 +365,10 @@ fn isHookNotificationMethod(method: []const u8) bool {
 }
 
 fn appendRawHookLine(log: HookAccumulator.Log, line: []const u8) !void {
-    var file = std.Io.Dir.openFileAbsolute(log.io, log.path, .{
+    var file = log.dir.openFile(log.io, log.path, .{
         .mode = .write_only,
     }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.createFileAbsolute(log.io, log.path, .{
+        error.FileNotFound => try log.dir.createFile(log.io, log.path, .{
             .truncate = false,
         }),
         else => return err,
@@ -371,6 +405,9 @@ fn exerciseHangingHelp(close_output: bool) !void {
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/bin:/usr/bin");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -388,8 +425,10 @@ fn exerciseHangingHelp(close_output: bool) !void {
     try std.testing.expectError(error.ConnectionTimedOut, ensureLaunchSupportsPolicyUntil(
         allocator,
         io,
+        tmp.dir,
+        &environ,
         executable,
-        root,
+        ".",
         .off,
         started_ms + 500,
     ));
@@ -413,25 +452,37 @@ test "help policy probe preserves supported and unsupported launch admission" {
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOOK_PROBE_VALUE", "supplied");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "codex" });
     defer allocator.free(executable);
+    const alias = try std.fs.path.join(allocator, &.{ root, "codex-alias" });
+    defer allocator.free(alias);
+    try environ.put("HOOK_PROBE_EXE", alias);
     try tmp.dir.writeFile(io, .{
         .sub_path = "codex",
-        .data = "#!/bin/sh\nprintf '%s\\n' '--disable generate-json-schema'\n",
+        .data = "#!/bin/sh\n[ \"$HOOK_PROBE_VALUE\" = supplied ] || exit 1\n" ++
+            "[ \"$0\" = \"$HOOK_PROBE_EXE\" ] || exit 1\n" ++
+            "[ -f cwd-marker ] || exit 1\nprintf '%s\\n' '--disable generate-json-schema'\n",
     });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cwd-marker", .data = "" });
     try tmp.dir.setFilePermissions(io, "codex", .fromMode(0o755), .{});
-    try ensureLaunchSupportsPolicy(allocator, io, executable, root, .off);
-    try ensureLaunchSupportsPolicy(allocator, io, executable, root, .require_observed);
+    try tmp.dir.symLink(io, "codex", "codex-alias", .{});
+    try ensureLaunchSupportsPolicy(allocator, io, tmp.dir, &environ, alias, ".", .off);
+    try ensureLaunchSupportsPolicy(allocator, io, tmp.dir, &environ, alias, ".", .require_observed);
     try tmp.dir.writeFile(io, .{ .sub_path = "codex", .data = "#!/bin/sh\nexit 0\n" });
     try std.testing.expectError(error.HooksUnsupported, ensureLaunchSupportsPolicy(
         allocator,
         io,
+        tmp.dir,
+        &environ,
         executable,
-        root,
+        ".",
         .off,
     ));
 }
@@ -521,13 +572,10 @@ test "hook overflow is rejected before logging or counter mutation" {
     const allocator = std.testing.allocator;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    const root_path = try directory.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(root_path);
-    const log_path = try std.fs.path.join(allocator, &.{ root_path, "hooks.jsonl" });
-    defer allocator.free(log_path);
     var accumulator = HookAccumulator.init(.require_observed, .{
         .io = std.testing.io,
-        .path = log_path,
+        .dir = directory.dir,
+        .path = "hooks.jsonl",
     });
     accumulator.failed = std.math.maxInt(usize);
     try std.testing.expectError(error.Overflow, accumulator.absorbLine(
@@ -542,17 +590,14 @@ test "hook overflow is rejected before logging or counter mutation" {
     );
 }
 
-test "hook log uses the supplied I/O and preserves raw line order" {
+test "hook log uses the supplied I/O and directory and preserves raw line order" {
     const allocator = std.testing.allocator;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    const root_path = try directory.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(root_path);
-    const log_path = try std.fs.path.join(allocator, &.{ root_path, "hooks.jsonl" });
-    defer allocator.free(log_path);
     var accumulator = HookAccumulator.init(.require_observed, .{
         .io = std.testing.io,
-        .path = log_path,
+        .dir = directory.dir,
+        .path = "hooks.jsonl",
     });
     const first = "{\"method\":\"hook/started\"}";
     const second = "{\"method\":\"hook/completed\"}";

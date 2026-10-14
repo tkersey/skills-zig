@@ -10,11 +10,12 @@ pub const Options = struct {
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     writer: anytype,
     options: Options,
     audit: *audit_module.Audit,
 ) !void {
-    const input = try gitDiffAlloc(allocator, io, writer, options);
+    const input = try gitDiffAlloc(allocator, io, dir, writer, options);
     defer allocator.free(input);
 
     var new_files: std.ArrayList([]const u8) = .empty;
@@ -22,13 +23,14 @@ pub fn run(
 
     try text(allocator, writer, input, audit, &new_files);
     for (new_files.items) |path| {
-        try audit_module.file(allocator, io, writer, path, audit, false);
+        try audit_module.file(allocator, io, dir, writer, path, audit, false);
     }
 }
 
 fn gitDiffAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     writer: anytype,
     options: Options,
 ) ![]u8 {
@@ -54,6 +56,7 @@ fn gitDiffAlloc(
     };
     const result = try std.process.run(allocator, io, .{
         .argv = &arguments,
+        .cwd = .{ .dir = dir },
         .stdout_limit = .limited(limits.diff_bytes_max),
         .stderr_limit = .limited(1024 * 1024),
     });

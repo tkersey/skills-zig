@@ -165,19 +165,20 @@ const StagingPaths = struct {
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
+        dir: std.Io.Dir,
         cache_path: []const u8,
         nonce: i128,
     ) !StagingPaths {
         const root = try allocator.print("{s}.staging.{d}", .{ cache_path, nonce });
         errdefer allocator.free(root);
-        try std.Io.Dir.cwd().deleteTree(io, root);
-        errdefer std.Io.Dir.cwd().deleteTree(io, root) catch |err| logCacheRecoveryFailure(err);
+        try dir.deleteTree(io, root);
+        errdefer dir.deleteTree(io, root) catch |err| logCacheRecoveryFailure(err);
         const stable = try std.fs.path.join(allocator, &.{ root, "stable" });
         errdefer allocator.free(stable);
         const experimental = try std.fs.path.join(allocator, &.{ root, "experimental" });
         errdefer allocator.free(experimental);
-        try std.Io.Dir.cwd().createDirPath(io, stable);
-        try std.Io.Dir.cwd().createDirPath(io, experimental);
+        try dir.createDirPath(io, stable);
+        try dir.createDirPath(io, experimental);
         return .{ .root = root, .stable = stable, .experimental = experimental };
     }
 
@@ -201,41 +202,47 @@ const GeneratedBundles = struct {
 pub fn ensureSchemaCache(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     options: CacheOptions,
 ) !CachedSchemas {
-    return ensureSchemaCacheWithLimits(allocator, io, options, .{});
+    return ensureSchemaCacheWithLimits(allocator, io, dir, environ, options, .{});
 }
 
 fn ensureSchemaCacheWithLimits(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     options: CacheOptions,
     limits: CacheLimits,
 ) !CachedSchemas {
     if (options.cache_root.len == 0 or options.contract_id.len == 0) {
         return error.InvalidCacheOptions;
     }
-    const cache_root = try absoluteCacheRootAlloc(allocator, io, options.cache_root);
+    const cache_root = try absoluteCacheRootAlloc(allocator, io, dir, options.cache_root);
     defer allocator.free(cache_root);
 
     var identity = try resolveExecutableIdentity(
         allocator,
         io,
+        dir,
+        environ,
         options.codex_path,
         limits.binary_bytes,
     );
     errdefer identity.deinit(allocator);
-    var version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
+    var version = try readCodexVersion(allocator, io, dir, environ, identity.resolved_path, limits);
     errdefer version.deinit(allocator);
-    try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
+    try requireIdentityUnchanged(allocator, io, dir, environ, &identity, limits.binary_bytes);
 
     const path_hex = identity.path_fingerprint["sha256:".len..];
     const executable_root = try std.fs.path.join(allocator, &.{ cache_root, path_hex });
     defer allocator.free(executable_root);
-    try std.Io.Dir.cwd().createDirPath(io, executable_root);
+    try dir.createDirPath(io, executable_root);
     const lock_path = try std.fs.path.join(allocator, &.{ executable_root, ".lock" });
     defer allocator.free(lock_path);
-    var lock = try acquireCacheLock(io, lock_path, limits);
+    var lock = try acquireCacheLock(io, dir, lock_path, limits);
     errdefer {
         lock.unlock(io);
         lock.close(io);
@@ -244,6 +251,8 @@ fn ensureSchemaCacheWithLimits(
     return ensureSchemaCacheLocked(
         allocator,
         io,
+        dir,
+        environ,
         options,
         limits,
         executable_root,
@@ -256,6 +265,8 @@ fn ensureSchemaCacheWithLimits(
 fn ensureSchemaCacheLocked(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     options: CacheOptions,
     limits: CacheLimits,
     executable_root: []const u8,
@@ -264,7 +275,7 @@ fn ensureSchemaCacheLocked(
     lock: std.Io.File,
 ) !CachedSchemas {
     // Bind the generation to the identity and banner observed after lock acquisition.
-    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+    try requireIdentityUnchanged(allocator, io, dir, environ, identity, limits.binary_bytes);
     const binary_hex = identity.binary_digest["sha256:".len..];
     const paths = try CachePaths.init(allocator, executable_root, binary_hex);
     errdefer paths.deinit(allocator);
@@ -286,6 +297,8 @@ fn ensureSchemaCacheLocked(
     return generateSchemaCache(
         allocator,
         io,
+        dir,
+        environ,
         paths,
         identity,
         version,
@@ -324,6 +337,8 @@ fn cachedSchemasFromManifest(
 fn generateSchemaCache(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     paths: CachePaths,
     identity: *ExecutableIdentity,
     version: CodexVersion,
@@ -332,12 +347,14 @@ fn generateSchemaCache(
     limits: CacheLimits,
 ) !CachedSchemas {
     const nonce = std.Io.Clock.awake.now(io).nanoseconds;
-    const staging = try StagingPaths.init(allocator, io, paths.cache, nonce);
+    const staging = try StagingPaths.init(allocator, io, dir, paths.cache, nonce);
     defer staging.deinit(allocator);
-    errdefer std.Io.Dir.cwd().deleteTree(io, staging.root) catch |err| logCacheRecoveryFailure(err);
+    errdefer dir.deleteTree(io, staging.root) catch |err| logCacheRecoveryFailure(err);
     var generated = try stageSchemaCache(
         allocator,
         io,
+        dir,
+        environ,
         staging,
         identity,
         version,
@@ -345,7 +362,7 @@ fn generateSchemaCache(
         limits,
     );
     defer generated.deinit(allocator);
-    try promoteCacheDirectory(allocator, io, staging.root, paths.cache, nonce);
+    try promoteCacheDirectory(allocator, io, dir, staging.root, paths.cache, nonce);
 
     const owned_stable_digest = try allocator.dupe(u8, generated.stable.digest);
     errdefer allocator.free(owned_stable_digest);
@@ -371,20 +388,32 @@ fn generateSchemaCache(
 fn stageSchemaCache(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     staging: StagingPaths,
     identity: *ExecutableIdentity,
     version: CodexVersion,
     contract_id: []const u8,
     limits: CacheLimits,
 ) !GeneratedBundles {
-    try generateBundle(allocator, io, identity.resolved_path, staging.stable, false, limits);
-    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
-    try generateBundle(allocator, io, identity.resolved_path, staging.experimental, true, limits);
-    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
-    var final_version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
+    const executable = identity.resolved_path;
+    try generateBundle(allocator, io, dir, environ, executable, staging.stable, false, limits);
+    try requireIdentityUnchanged(allocator, io, dir, environ, identity, limits.binary_bytes);
+    try generateBundle(
+        allocator,
+        io,
+        dir,
+        environ,
+        executable,
+        staging.experimental,
+        true,
+        limits,
+    );
+    try requireIdentityUnchanged(allocator, io, dir, environ, identity, limits.binary_bytes);
+    var final_version = try readCodexVersion(allocator, io, dir, environ, executable, limits);
     defer final_version.deinit(allocator);
     if (!versionsEqual(version, final_version)) return error.ExecutableChanged;
-    try requireIdentityUnchanged(allocator, io, identity, limits.binary_bytes);
+    try requireIdentityUnchanged(allocator, io, dir, environ, identity, limits.binary_bytes);
 
     var stable = try digestBundle(allocator, io, staging.stable, limits);
     errdefer stable.deinit(allocator);
@@ -422,9 +451,14 @@ pub fn defaultCacheRootAlloc(
     return std.fs.path.join(allocator, &.{ home, ".cache", "cas", "app-server-schema" });
 }
 
-fn absoluteCacheRootAlloc(allocator: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
+fn absoluteCacheRootAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    raw: []const u8,
+) ![]u8 {
     if (std.fs.path.isAbsolute(raw)) return std.fs.path.resolve(allocator, &.{raw});
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const cwd = try dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &.{ cwd, raw });
 }
@@ -481,10 +515,14 @@ fn validSemverIdentifiers(text: []const u8) bool {
 fn readCodexVersion(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     executable: []const u8,
     limits: CacheLimits,
 ) !CodexVersion {
     const result = std.process.run(allocator, io, .{
+        .cwd = .{ .dir = dir },
+        .environ_map = environ,
         .argv = &.{ executable, "--version" },
         .stdout_limit = .limited(limits.version_stdout_bytes),
         .stderr_limit = .limited(limits.version_stderr_bytes),
@@ -499,6 +537,8 @@ fn readCodexVersion(
 fn generateBundle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     executable: []const u8,
     output: []const u8,
     experimental: bool,
@@ -509,6 +549,8 @@ fn generateBundle(
     else
         &.{ executable, "app-server", "generate-json-schema", "--out", output };
     const result = std.process.run(allocator, io, .{
+        .cwd = .{ .dir = dir },
+        .environ_map = environ,
         .argv = argv,
         .stdout_limit = .limited(limits.generator_stdout_bytes),
         .stderr_limit = .limited(limits.generator_stderr_bytes),
@@ -548,15 +590,17 @@ fn versionsEqual(left: CodexVersion, right: CodexVersion) bool {
 fn resolveExecutableIdentity(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     explicit_path: ?[]const u8,
     binary_limit: u64,
 ) !ExecutableIdentity {
     const candidate = if (explicit_path) |path|
         try allocator.dupe(u8, path)
     else
-        try findOnPath(allocator, io, "codex");
+        try findOnPath(allocator, io, dir, environ, "codex");
     defer allocator.free(candidate);
-    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator);
+    const resolved = try dir.realPathFileAlloc(io, candidate, allocator);
     errdefer allocator.free(resolved);
     var file = try std.Io.Dir.openFileAbsolute(io, resolved, .{
         .follow_symlinks = false,
@@ -580,14 +624,20 @@ fn resolveExecutableIdentity(
     };
 }
 
-fn findOnPath(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
-    const path_value = std.Io.Threaded.global_single_threaded.environString("PATH") orelse
+fn findOnPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+) ![]u8 {
+    const path_value = environ.get("PATH") orelse
         return error.CodexNotFound;
     var components = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
     while (components.next()) |component| {
         const directory = if (component.len == 0) "." else component;
         const candidate = try std.fs.path.join(allocator, &.{ directory, name });
-        var file = std.Io.Dir.cwd().openFile(io, candidate, .{ .allow_directory = false }) catch {
+        var file = dir.openFile(io, candidate, .{ .allow_directory = false }) catch {
             allocator.free(candidate);
             continue;
         };
@@ -615,10 +665,19 @@ fn hasExecutablePermission(permissions: std.Io.File.Permissions) bool {
 fn requireIdentityUnchanged(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     expected: *const ExecutableIdentity,
     binary_limit: u64,
 ) !void {
-    var actual = try resolveExecutableIdentity(allocator, io, expected.resolved_path, binary_limit);
+    var actual = try resolveExecutableIdentity(
+        allocator,
+        io,
+        dir,
+        environ,
+        expected.resolved_path,
+        binary_limit,
+    );
     defer actual.deinit(allocator);
     if (!identitiesEqual(expected.*, actual)) return error.ExecutableChanged;
 }
@@ -626,9 +685,11 @@ fn requireIdentityUnchanged(
 pub fn verifyExecutableIdentity(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     expected: *const ExecutableIdentity,
 ) !void {
-    return requireIdentityUnchanged(allocator, io, expected, max_binary_bytes);
+    return requireIdentityUnchanged(allocator, io, dir, environ, expected, max_binary_bytes);
 }
 
 fn identitiesEqual(left: ExecutableIdentity, right: ExecutableIdentity) bool {
@@ -669,8 +730,13 @@ fn digestBytesAlloc(allocator: std.mem.Allocator, digest: *const [32]u8) ![]u8 {
     return allocator.print("sha256:{x}", .{digest.*});
 }
 
-fn acquireCacheLock(io: std.Io, path: []const u8, limits: CacheLimits) !std.Io.File {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+fn acquireCacheLock(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    limits: CacheLimits,
+) !std.Io.File {
+    var file = try dir.createFile(io, path, .{ .truncate = false });
     errdefer file.close(io);
     const deadline = awakeDeadline(io, limits.lock_timeout_ms);
     while (!(try file.tryLock(io, .exclusive))) {
@@ -968,13 +1034,14 @@ fn syncDirectory(io: std.Io, path: []const u8) !void {
 fn promoteCacheDirectory(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     staging: []const u8,
     target: []const u8,
     nonce: i128,
 ) !void {
     const backup = try allocator.print("{s}.rollback.{d}", .{ target, nonce });
     defer allocator.free(backup);
-    try std.Io.Dir.cwd().deleteTree(io, backup);
+    try dir.deleteTree(io, backup);
     var had_target = true;
     std.Io.Dir.renameAbsolute(target, backup, io) catch |err| switch (err) {
         error.FileNotFound => had_target = false,
@@ -989,7 +1056,7 @@ fn promoteCacheDirectory(
     };
     const parent = std.fs.path.dirname(target) orelse return error.InvalidCachePath;
     syncDirectory(io, parent) catch |err| {
-        std.Io.Dir.cwd().deleteTree(io, target) catch |delete_err|
+        dir.deleteTree(io, target) catch |delete_err|
             logCacheRecoveryFailure(delete_err);
         if (had_target) {
             std.Io.Dir.renameAbsolute(backup, target, io) catch |restore_err|
@@ -998,7 +1065,7 @@ fn promoteCacheDirectory(
         return err;
     };
     if (had_target) {
-        std.Io.Dir.cwd().deleteTree(io, backup) catch |err| logCacheRecoveryFailure(err);
+        dir.deleteTree(io, backup) catch |err| logCacheRecoveryFailure(err);
     }
 }
 
@@ -3236,6 +3303,10 @@ test "codex version accepts bounded stderr diagnostics" {
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
@@ -3248,7 +3319,7 @@ test "codex version accepts bounded stderr diagnostics" {
     );
     try makeTestExecutable(io, executable);
 
-    var version = try readCodexVersion(allocator, io, executable, .{});
+    var version = try readCodexVersion(allocator, io, dir, environ, executable, .{});
     defer version.deinit(allocator);
     try std.testing.expectEqualStrings("0.146.0", version.text);
 }
@@ -3258,6 +3329,10 @@ test "schema cache admission is independent of Codex version and release channel
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     for ([_][]const u8{ "0.1.0", "0.148.0-alpha.5", "dev-build" }, 0..) |version_text, index| {
@@ -3281,7 +3356,7 @@ test "schema cache admission is independent of Codex version and release channel
         try writeAbsoluteTestFile(io, executable, script);
         try makeTestExecutable(io, executable);
 
-        var schemas = try ensureSchemaCache(allocator, io, .{
+        var schemas = try ensureSchemaCache(allocator, io, dir, environ, .{
             .cache_root = cache_root,
             .codex_path = executable,
         });
@@ -3300,8 +3375,8 @@ test "canonical bundle digest ignores object and creation order but binds path a
     defer std.testing.allocator.free(left);
     const right = try std.fs.path.join(std.testing.allocator, &.{ root, "right" });
     defer std.testing.allocator.free(right);
-    try std.Io.Dir.cwd().createDirPath(io, left);
-    try std.Io.Dir.cwd().createDirPath(io, right);
+    try tmp.dir.createDirPath(io, left);
+    try tmp.dir.createDirPath(io, right);
     try writeTestFile(io, left, "a.json", "{\"z\":1,\"a\":[2,3]}\n");
     try writeTestFile(io, left, "b.json", "{\"k\":true}\n");
     try writeTestFile(io, right, "b.json", "{\"k\":true}\n");
@@ -3318,7 +3393,7 @@ test "canonical bundle digest ignores object and creation order but binds path a
     try std.testing.expect(!std.mem.eql(u8, left_digest.digest, content_drift.digest));
     const old_path = try std.fs.path.join(std.testing.allocator, &.{ right, "a.json" });
     defer std.testing.allocator.free(old_path);
-    try std.Io.Dir.cwd().deleteFile(io, old_path);
+    try tmp.dir.deleteFile(io, old_path);
     try writeTestFile(io, right, "renamed.json", "{\"z\":1,\"a\":[2,3]}\n");
     var path_drift = try digestBundle(std.testing.allocator, io, right, .{});
     defer path_drift.deinit(std.testing.allocator);
@@ -3341,7 +3416,7 @@ test "bundle bounds reject symlink count and byte excess" {
         error.InvalidBundleEntry,
         digestBundle(std.testing.allocator, io, root, .{}),
     );
-    try std.Io.Dir.cwd().deleteFile(io, link);
+    try tmp.dir.deleteFile(io, link);
 
     try writeTestFile(io, root, "b.json", "{}\n");
     try std.testing.expectError(
@@ -3363,20 +3438,31 @@ test "executable identity verification rejects an in-place replacement" {
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
     defer allocator.free(executable);
     try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 0\n");
     try makeTestExecutable(io, executable);
-    var identity = try resolveExecutableIdentity(allocator, io, executable, max_binary_bytes);
+    var identity = try resolveExecutableIdentity(
+        allocator,
+        io,
+        dir,
+        environ,
+        executable,
+        max_binary_bytes,
+    );
     defer identity.deinit(allocator);
 
     try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 1\n");
     try makeTestExecutable(io, executable);
     try std.testing.expectError(
         error.ExecutableChanged,
-        verifyExecutableIdentity(allocator, io, &identity),
+        verifyExecutableIdentity(allocator, io, dir, environ, &identity),
     );
 }
 
@@ -3385,6 +3471,10 @@ test "schema cache hits only after exact identity manifest and canonical bundles
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
@@ -3398,13 +3488,23 @@ test "schema cache hits only after exact identity manifest and canonical bundles
     try writeAbsoluteTestFile(io, executable, script);
     try makeTestExecutable(io, executable);
 
-    const saved = try primeSchemaCache(allocator, io, cache_root, executable, log_path);
+    const saved = try primeSchemaCache(
+        allocator,
+        io,
+        dir,
+        environ,
+        cache_root,
+        executable,
+        log_path,
+    );
     defer allocator.free(saved.stable);
     defer allocator.free(saved.cache);
-    try expectSchemaCacheHit(allocator, io, cache_root, executable, log_path);
+    try expectSchemaCacheHit(allocator, io, dir, environ, cache_root, executable, log_path);
     try expectSchemaCacheRegeneration(
         allocator,
         io,
+        dir,
+        environ,
         cache_root,
         executable,
         script,
@@ -3417,11 +3517,13 @@ const SavedCachePaths = struct { stable: []u8, cache: []u8 };
 fn primeSchemaCache(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     cache_root: []const u8,
     executable: []const u8,
     log_path: []const u8,
 ) !SavedCachePaths {
-    var first = try ensureSchemaCache(allocator, io, .{
+    var first = try ensureSchemaCache(allocator, io, dir, environ, .{
         .cache_root = cache_root,
         .codex_path = executable,
     });
@@ -3438,6 +3540,8 @@ fn primeSchemaCache(
         ensureSchemaCacheWithLimits(
             allocator,
             io,
+            dir,
+            environ,
             .{ .cache_root = cache_root, .codex_path = executable },
             .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
         ),
@@ -3447,6 +3551,8 @@ fn primeSchemaCache(
     var concurrent_reader = try ensureSchemaCacheWithLimits(
         allocator,
         io,
+        dir,
+        environ,
         .{ .cache_root = cache_root, .codex_path = executable },
         .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
     );
@@ -3461,13 +3567,15 @@ fn primeSchemaCache(
 fn expectSchemaCacheHit(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     cache_root: []const u8,
     executable: []const u8,
     log_path: []const u8,
 ) !void {
     const first_log = try readAbsoluteTestFile(allocator, io, log_path, 16 * 1024);
     defer allocator.free(first_log);
-    var second = try ensureSchemaCache(allocator, io, .{
+    var second = try ensureSchemaCache(allocator, io, dir, environ, .{
         .cache_root = cache_root,
         .codex_path = executable,
     });
@@ -3488,6 +3596,8 @@ fn expectSchemaCacheHit(
 fn expectSchemaCacheRegeneration(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     cache_root: []const u8,
     executable: []const u8,
     script: []const u8,
@@ -3495,7 +3605,7 @@ fn expectSchemaCacheRegeneration(
 ) !void {
     try writeTestFile(io, saved.stable, "root.json", "{\"drift\":true}\n");
     {
-        var bundle_regenerated = try ensureSchemaCache(allocator, io, .{
+        var bundle_regenerated = try ensureSchemaCache(allocator, io, dir, environ, .{
             .cache_root = cache_root,
             .codex_path = executable,
         });
@@ -3507,7 +3617,7 @@ fn expectSchemaCacheRegeneration(
     defer allocator.free(manifest_path);
     try writeAbsoluteTestFile(io, manifest_path, "{}\n");
     {
-        var manifest_regenerated = try ensureSchemaCache(allocator, io, .{
+        var manifest_regenerated = try ensureSchemaCache(allocator, io, dir, environ, .{
             .cache_root = cache_root,
             .codex_path = executable,
         });
@@ -3519,7 +3629,7 @@ fn expectSchemaCacheRegeneration(
     defer allocator.free(changed_script);
     try writeAbsoluteTestFile(io, executable, changed_script);
     try makeTestExecutable(io, executable);
-    var identity_regenerated = try ensureSchemaCache(allocator, io, .{
+    var identity_regenerated = try ensureSchemaCache(allocator, io, dir, environ, .{
         .cache_root = cache_root,
         .codex_path = executable,
     });
@@ -3532,6 +3642,10 @@ test "relative cache root is normalized to an absolute isolated path" {
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
@@ -3543,22 +3657,79 @@ test "relative cache root is normalized to an absolute isolated path" {
         &.{ root, "relative-cache", "missing-child" },
     );
     defer allocator.free(absolute_cache);
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(cwd);
-    const relative_cache = try std.fs.path.relative(allocator, cwd, null, cwd, absolute_cache);
-    defer allocator.free(relative_cache);
+    const relative_cache = "relative-cache/missing-child";
     const script = try fakeCodexScriptAlloc(allocator, log_path, false, false);
     defer allocator.free(script);
     try writeAbsoluteTestFile(io, executable, script);
     try makeTestExecutable(io, executable);
 
-    var schemas = try ensureSchemaCache(allocator, io, .{
+    var schemas = try ensureSchemaCache(allocator, io, dir, environ, .{
         .cache_root = relative_cache,
-        .codex_path = executable,
+        .codex_path = "fake-codex",
     });
     defer schemas.deinit(allocator);
     try std.testing.expect(std.fs.path.isAbsolute(schemas.cache_path));
     try std.testing.expect(std.mem.startsWith(u8, schemas.cache_path, absolute_cache));
+}
+
+test "schema caches isolate supplied directories PATH and child environments" {
+    const allocator = std.testing.allocator;
+    var left = std.testing.tmpDir(.{});
+    defer left.cleanup();
+    var right = std.testing.tmpDir(.{});
+    defer right.cleanup();
+
+    var left_cache = try scopedTestSchemaCache(left.dir, "left");
+    defer left_cache.deinit(allocator);
+    var right_cache = try scopedTestSchemaCache(right.dir, "right");
+    defer right_cache.deinit(allocator);
+    try std.testing.expect(!std.mem.eql(u8, left_cache.cache_path, right_cache.cache_path));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        left_cache.executable.path_fingerprint,
+        right_cache.executable.path_fingerprint,
+    ));
+}
+
+fn scopedTestSchemaCache(dir: std.Io.Dir, token: []const u8) !CachedSchemas {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "codex" });
+    defer allocator.free(executable);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "invocations.log" });
+    defer allocator.free(log_path);
+    const base = try fakeCodexScriptAlloc(allocator, log_path, false, false);
+    defer allocator.free(base);
+    const guard = try allocator.print(
+        "set -eu\nread -r actual < scope-token\n" ++
+            "[ \"$actual\" = '{s}' ]\n[ \"$CAS_CACHE_TEST_TOKEN\" = '{s}' ]\n",
+        .{ token, token },
+    );
+    defer allocator.free(guard);
+    const script = try std.mem.replaceOwned(u8, allocator, base, "set -eu\n", guard);
+    defer allocator.free(script);
+    try writeAbsoluteTestFile(io, executable, script);
+    try makeTestExecutable(io, executable);
+    const marker = try allocator.print("{s}\n", .{token});
+    defer allocator.free(marker);
+    try writeTestFile(io, root, "scope-token", marker);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try std.testing.expectError(
+        error.CodexNotFound,
+        resolveExecutableIdentity(allocator, io, dir, &environ, null, max_binary_bytes),
+    );
+    // An empty PATH component selects the explicitly supplied working directory.
+    try environ.put("PATH", ":/bin:/usr/bin");
+    try environ.put("CAS_CACHE_TEST_TOKEN", token);
+    var cache = try ensureSchemaCache(allocator, io, dir, &environ, .{ .cache_root = "cache" });
+    errdefer cache.deinit(allocator);
+    try std.testing.expectEqualStrings(executable, cache.executable.resolved_path);
+    try std.testing.expect(std.mem.startsWith(u8, cache.cache_path, root));
+    return cache;
 }
 
 test "tiny process deadline and output limits fail closed" {
@@ -3566,6 +3737,10 @@ test "tiny process deadline and output limits fail closed" {
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const dir = tmp.dir;
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    const environ = &environment;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const cache_root = try std.fs.path.join(allocator, &.{ root, "cache" });
@@ -3584,6 +3759,8 @@ test "tiny process deadline and output limits fail closed" {
         ensureSchemaCacheWithLimits(
             allocator,
             io,
+            dir,
+            environ,
             .{ .cache_root = cache_root, .codex_path = executable },
             .{ .version_timeout_ms = 10 },
         ),
@@ -3598,6 +3775,8 @@ test "tiny process deadline and output limits fail closed" {
         ensureSchemaCacheWithLimits(
             allocator,
             io,
+            dir,
+            environ,
             .{ .cache_root = cache_root, .codex_path = executable },
             .{ .version_stdout_bytes = 16 },
         ),
@@ -3665,12 +3844,16 @@ fn fakeCodexScriptVersionAlloc(
 }
 
 fn makeTestExecutable(io: std.Io, path: []const u8) !void {
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        path,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    try file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+}
+
+fn testEnvironment(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var environ = std.process.Environ.Map.init(allocator);
+    errdefer environ.deinit();
+    try environ.put("PATH", "/bin:/usr/bin");
+    return environ;
 }
 
 fn referenceKeysAllowed(schema_object: std.json.ObjectMap) bool {

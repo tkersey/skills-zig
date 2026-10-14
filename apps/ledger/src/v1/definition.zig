@@ -1935,6 +1935,7 @@ test "artifact definition compiles structural rules and effect plans" {
         .data = compiled_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -1983,6 +1984,7 @@ test "artifact definition rejects executable hooks" {
         .data = hook_definition_json,
     });
     var hook_closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "hook.json",
@@ -1999,6 +2001,7 @@ test "artifact definition rejects executable hooks" {
         .data = nested_hook_definition_json,
     });
     var nested_hook_closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "nested-hook.json",
@@ -2019,6 +2022,7 @@ test "artifact definition rejects undeclared operators and unused terms" {
         .data = undeclared_operator_definition_json,
     });
     var operator_closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "operator.json",
@@ -2035,6 +2039,7 @@ test "artifact definition rejects undeclared operators and unused terms" {
         .data = unused_unsupported_term_definition_json,
     });
     var unused_term_closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "unused-term.json",
@@ -2059,6 +2064,7 @@ test "artifact definition rejects named but unimplemented operators" {
         .data = unsupported_operator_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
@@ -2079,6 +2085,7 @@ test "artifact definition permits inert command data fields" {
         .data = inert_command_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "inert.json",

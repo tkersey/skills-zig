@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
 const core_cli = @import("core_cli");
@@ -82,68 +83,86 @@ const CodeModeHostReport = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
+    const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        return usageFailure(io, @errorName(err), null);
     };
     defer allocator.free(parsed.opt_out_methods);
 
     if (parsed.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     if (parsed.show_help) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
+        return 0;
     }
 
     const cwd = parsed.cwd orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
 
-    return runConfiguredSmoke(allocator, init.io, parsed, cwd);
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
+    defer directory.close(io);
+    const environ = init.environ_map;
+    return runConfiguredSmoke(directory, environ, allocator, init.io, parsed, cwd);
 }
 
 fn runConfiguredSmoke(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     parsed: ParsedArgs,
     cwd: []const u8,
-) !void {
+) !u8 {
     const validated_transport = launch.validateTransport(
         parsed.requested_transport,
         parsed.transport_endpoint,
     ) catch |err| {
-        core_cli.exitUsageFailure(
-            HelpSurface,
-            Version,
+        return usageFailure(
+            io,
             @errorName(err),
             "--app-server-transport/--app-server-endpoint",
         );
     };
     var code_mode_host = if (parsed.code_mode_host) |raw|
         launch.CodeModeHost.init(allocator, raw) catch |err| {
-            core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), "--code-mode-host");
+            return usageFailure(io, @errorName(err), "--code-mode-host");
         }
     else
         null;
     defer if (code_mode_host) |*host| host.deinit();
 
     var acquired = acquireClient(
+        directory,
+        environ,
         allocator,
         io,
         cwd,
@@ -151,11 +170,12 @@ fn runConfiguredSmoke(
         validated_transport,
         if (code_mode_host) |*host| host else null,
     ) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), "app-server transport");
+        return usageFailure(io, @errorName(err), "app-server transport");
     };
     defer acquired.deinit();
 
     return runSmokeChecks(
+        directory,
         allocator,
         io,
         parsed,
@@ -166,13 +186,14 @@ fn runConfiguredSmoke(
 }
 
 fn runSmokeChecks(
+    directory: std.Io.Dir,
     allocator: std.mem.Allocator,
     io: std.Io,
     parsed: ParsedArgs,
     cwd: []const u8,
     acquired: *AcquiredClient,
     code_mode_host: ?*const launch.CodeModeHost,
-) !void {
+) !u8 {
     var checks: std.ArrayList(CheckResult) = .empty;
     defer checks.deinit(allocator);
 
@@ -200,6 +221,7 @@ fn runSmokeChecks(
     const context = SmokeContext{
         .allocator = allocator,
         .io = io,
+        .dir = directory,
         .client = &acquired.client,
         .notification_capture = notification_capture,
     };
@@ -223,7 +245,7 @@ fn runSmokeChecks(
         captured_notifications.items,
         hook_log_path,
     );
-    std.process.exit(if (ok) 0 else 1);
+    return if (ok) 0 else 1;
 }
 
 fn reportSmokeChecks(
@@ -244,7 +266,7 @@ fn reportSmokeChecks(
     }
     var hook_accumulator = cas.hooks.HookAccumulator.init(
         parsed.hook_policy,
-        if (hook_log_path) |path| .{ .io = context.io, .path = path } else null,
+        if (hook_log_path) |path| .{ .io = context.io, .dir = context.dir, .path = path } else null,
     );
     try hook_accumulator.absorbLines(allocator, captured_notifications);
     const hook_summary = hook_accumulator.summary();
@@ -270,14 +292,14 @@ fn reportSmokeChecks(
         .hookSummary = hook_summary,
         .checks = checks,
     };
-    try writeSmokeReport(parsed.json, report);
+    try writeSmokeReport(context.io, parsed.json, report);
     return overall_ok;
 }
 
-fn writeSmokeReport(json: bool, report: anytype) !void {
+fn writeSmokeReport(io: std.Io, json: bool, report: anytype) !void {
     if (json) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -285,7 +307,7 @@ fn writeSmokeReport(json: bool, report: anytype) !void {
         try stdout.writeAll("\n");
     } else {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -359,6 +381,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 }
 
 fn baseClientOptions(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     io: std.Io,
     cwd: []const u8,
     parsed: ParsedArgs,
@@ -366,6 +390,8 @@ fn baseClientOptions(
     return .{
         .cwd = cwd,
         .io = io,
+        .dir = directory,
+        .environ = environ,
         .opt_out_notification_methods = parsed.opt_out_methods,
         .hook_policy = parsed.hook_policy,
         .websocket_connect_timeout_ms = parsed.request_timeout_ms,
@@ -373,6 +399,8 @@ fn baseClientOptions(
 }
 
 fn acquireClient(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -381,11 +409,19 @@ fn acquireClient(
     code_mode_host: ?*const launch.CodeModeHost,
 ) !AcquiredClient {
     return switch (transport) {
-        .stdio => acquireStdio(allocator, io, cwd, parsed, code_mode_host),
-        .managed_websocket => acquireManaged(allocator, io, cwd, parsed, code_mode_host),
+        .stdio => acquireStdio(directory, environ, allocator, io, cwd, parsed, code_mode_host),
+        .managed_websocket => acquireManaged(
+            directory,
+            environ,
+            allocator,
+            io,
+            cwd,
+            parsed,
+            code_mode_host,
+        ),
         .explicit_websocket => |url| blk: {
             if (code_mode_host != null) return error.CodeModeHostRequiresManagedLaunch;
-            var options = baseClientOptions(io, cwd, parsed);
+            var options = baseClientOptions(directory, environ, io, cwd, parsed);
             options.transport = .{ .explicit_websocket = url };
             const endpoint_identity = try allocator.dupe(u8, url);
             errdefer allocator.free(endpoint_identity);
@@ -401,11 +437,15 @@ fn acquireClient(
             const path = if (maybe_path) |path|
                 try launch.resolveUnixPathAlloc(allocator, cwd, path)
             else
-                try launch.defaultUnixPathAlloc(allocator);
+                try launch.defaultUnixPathAlloc(
+                    allocator,
+                    environ.get("CODEX_HOME"),
+                    environ.get("HOME"),
+                );
             defer allocator.free(path);
             const endpoint_identity = try allocator.print("unix://{s}", .{path});
             errdefer allocator.free(endpoint_identity);
-            var options = baseClientOptions(io, cwd, parsed);
+            var options = baseClientOptions(directory, environ, io, cwd, parsed);
             options.transport = .{ .unix_socket = path };
             break :blk .{
                 .allocator = allocator,
@@ -414,24 +454,32 @@ fn acquireClient(
                 .endpoint_identity = endpoint_identity,
             };
         },
-        .auto => acquireAuto(allocator, io, cwd, parsed, code_mode_host),
+        .auto => acquireAuto(directory, environ, allocator, io, cwd, parsed, code_mode_host),
     };
 }
 
 fn acquireStdio(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     parsed: ParsedArgs,
     code_mode_host: ?*const launch.CodeModeHost,
 ) !AcquiredClient {
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     const endpoint_identity = try allocator.dupe(u8, "stdio://");
     errdefer allocator.free(endpoint_identity);
     const codex_path_identity = try allocator.dupe(u8, resolved_codex_path);
     errdefer allocator.free(codex_path_identity);
-    var options = baseClientOptions(io, cwd, parsed);
+    var options = baseClientOptions(directory, environ, io, cwd, parsed);
     options.codex_path = resolved_codex_path;
     options.transport = .stdio;
     options.code_mode_host = code_mode_host;
@@ -445,24 +493,34 @@ fn acquireStdio(
 }
 
 fn acquireManaged(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     parsed: ParsedArgs,
     code_mode_host: ?*const launch.CodeModeHost,
 ) !AcquiredClient {
-    const server = try startManaged(allocator, io, cwd, parsed, code_mode_host);
-    return connectManaged(allocator, io, cwd, parsed, server);
+    const server = try startManaged(directory, environ, allocator, io, cwd, parsed, code_mode_host);
+    return connectManaged(directory, environ, allocator, io, cwd, parsed, server);
 }
 
 fn startManaged(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     parsed: ParsedArgs,
     code_mode_host: ?*const launch.CodeModeHost,
 ) !websocket.ManagedServer {
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     return if (code_mode_host) |host|
         websocket.startManagedLoopbackServerWithCodeModeHost(
@@ -472,6 +530,8 @@ fn startManaged(
             parsed.hook_policy,
             host,
             io,
+            directory,
+            environ,
         )
     else
         websocket.startManagedLoopbackServer(
@@ -480,10 +540,14 @@ fn startManaged(
             resolved_codex_path,
             parsed.hook_policy,
             io,
+            directory,
+            environ,
         );
 }
 
 fn connectManaged(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -494,11 +558,17 @@ fn connectManaged(
     errdefer server.deinit(allocator);
     const endpoint_identity = try allocator.dupe(u8, server.listen_url);
     errdefer allocator.free(endpoint_identity);
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     const codex_path_identity = try allocator.dupe(u8, resolved_codex_path);
     errdefer allocator.free(codex_path_identity);
-    var options = baseClientOptions(io, cwd, parsed);
+    var options = baseClientOptions(directory, environ, io, cwd, parsed);
     options.websocket_url = server.listen_url;
     return .{
         .allocator = allocator,
@@ -730,6 +800,8 @@ test "isMethodUnavailableError handles structured and text errors" {
 }
 
 fn acquireAuto(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -737,6 +809,8 @@ fn acquireAuto(
     code_mode_host: ?*const launch.CodeModeHost,
 ) !AcquiredClient {
     const managed_server = startManaged(
+        directory,
+        environ,
         allocator,
         io,
         cwd,
@@ -751,6 +825,8 @@ fn acquireAuto(
             true,
         )) return err;
         return acquireStdio(
+            directory,
+            environ,
             allocator,
             io,
             cwd,
@@ -760,12 +836,13 @@ fn acquireAuto(
     };
     // From this point Client.start performs initialize, so a failure is
     // observable protocol work and must not trigger a transport retry.
-    return connectManaged(allocator, io, cwd, parsed, managed_server);
+    return connectManaged(directory, environ, allocator, io, cwd, parsed, managed_server);
 }
 
 const SmokeContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     client: *cas.Client,
     notification_capture: ?*std.ArrayList([]u8),
 
@@ -942,7 +1019,7 @@ fn checkSteer(ctx: SmokeContext, thread_id: ?[]const u8) !CheckResult {
         .detail = "no threadId available for turn/steer check",
     };
     const expected_turn_id = try ctx.allocator.print("cas-smoke-{d}", .{@divFloor(
-        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.real.now(ctx.io).nanoseconds,
         1_000_000_000,
     )});
     defer ctx.allocator.free(expected_turn_id);
@@ -1011,4 +1088,16 @@ test "parseArgs rejects timeout outside the client integer domain" {
     try std.testing.expectError(error.InvalidTimeout, parseArgs(std.testing.allocator, &.{
         "cas_smoke_check", "--request-timeout-ms", "4294967296",
     }));
+}
+
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
+    return 2;
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const durable_store = @import("durable_store");
+const Fs = durable_store.Fs;
 const layout = @import("memory_layout.zig");
 const memory_storage = @import("memory_storage.zig");
 const memory_envelope = @import("memory_envelope.zig");
@@ -41,16 +42,16 @@ const Inventory = struct {
 /// Preflight catches conflicts before writing. Interrupted copies can be retried:
 /// complete envelopes become visible atomically and existing IDs are preserved.
 pub fn copy(
+    fs: Fs,
     allocator: std.mem.Allocator,
-    io: std.Io,
     source: []const u8,
     destination: []const u8,
     extension: []const u8,
     dry_run: bool,
 ) !Result {
-    var prior = try inventory(allocator, io, source, extension);
+    var prior = try inventory(fs, allocator, source, extension);
     defer prior.deinit(allocator);
-    var current = try inventory(allocator, io, destination, extension);
+    var current = try inventory(fs, allocator, destination, extension);
     defer current.deinit(allocator);
     var result = try preflight(prior, current);
     if (dry_run) return result;
@@ -61,6 +62,7 @@ pub fn copy(
         const target_path = try std.fs.path.join(allocator, &.{ destination, entry.name });
         defer allocator.free(target_path);
         const raw = try durable_store.readRegularFileNoSymlink(
+            fs,
             allocator,
             source_path,
             note_bytes_max,
@@ -69,7 +71,7 @@ pub fn copy(
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
         if (!std.mem.eql(u8, &digest, &entry.digest)) return error.MigrationSourceChanged;
-        try memory_storage.publishNote(allocator, target_path, raw);
+        try memory_storage.publishNote(fs, allocator, target_path, raw);
         result.copied += 1;
     }
     result.storage_mutated = result.copied > 0;
@@ -95,13 +97,14 @@ fn preflight(source: Inventory, destination: Inventory) !Result {
 }
 
 fn inventory(
+    fs: Fs,
     allocator: std.mem.Allocator,
-    io: std.Io,
     directory: []const u8,
     extension: []const u8,
 ) !Inventory {
-    try layout.validateDirectory(io, directory);
+    try layout.validateDirectory(fs.io, fs.directory(), directory);
     const names = durable_store.listSortedRegularFilesNoSymlink(
+        fs,
         allocator,
         directory,
         note_count_max,
@@ -116,7 +119,7 @@ fn inventory(
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ directory, name });
         defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(allocator, path, note_bytes_max);
+        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, note_bytes_max);
         defer allocator.free(raw);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed.deinit();
@@ -155,6 +158,7 @@ const fixture =
 test "migration rejects incomplete stored envelopes before publishing any note" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const fs = Fs.init(io, .cwd());
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "old");
@@ -176,8 +180,8 @@ test "migration rejects incomplete stored envelopes before publishing any note" 
         try tmp.dir.writeFile(io, .{ .sub_path = "old/incomplete.md", .data = incomplete });
         for ([_]bool{ true, false }) |dry_run| {
             try std.testing.expectError(error.InvalidStoredNote, copy(
+                fs,
                 allocator,
-                io,
                 source,
                 destination,
                 "learnings",
@@ -191,6 +195,7 @@ test "migration rejects incomplete stored envelopes before publishing any note" 
 test "migration preserves exact bytes and filenames and retry skips the same identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const fs = Fs.init(io, .cwd());
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "old");
@@ -201,18 +206,18 @@ test "migration preserves exact bytes and filenames and retry skips the same ide
     defer allocator.free(source);
     const destination = try std.fs.path.join(allocator, &.{ home, "new" });
     defer allocator.free(destination);
-    const preview = try copy(allocator, io, source, destination, "learnings", true);
+    const preview = try copy(fs, allocator, source, destination, "learnings", true);
     try std.testing.expectEqual(@as(u32, 1), preview.planned);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "new", .{}));
-    const first = try copy(allocator, io, source, destination, "learnings", false);
+    const first = try copy(fs, allocator, source, destination, "learnings", false);
     try std.testing.expectEqual(@as(u32, 1), first.copied);
     const target = try std.fs.path.join(allocator, &.{ destination, "original.md" });
     defer allocator.free(target);
-    const bytes = try durable_store.readRegularFileNoSymlink(allocator, target, note_bytes_max);
+    const bytes = try durable_store.readRegularFileNoSymlink(fs, allocator, target, note_bytes_max);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings(fixture, bytes);
     _ = try tmp.dir.statFile(io, "old/original.md", .{});
-    const retry = try copy(allocator, io, source, destination, "learnings", false);
+    const retry = try copy(fs, allocator, source, destination, "learnings", false);
     try std.testing.expectEqual(@as(u32, 0), retry.copied);
     try std.testing.expectEqual(@as(u32, 1), retry.duplicate_skip);
 }
@@ -220,6 +225,7 @@ test "migration preserves exact bytes and filenames and retry skips the same ide
 test "migration rejects malformed generated metadata before publishing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const fs = Fs.init(io, .cwd());
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "old");
@@ -249,8 +255,8 @@ test "migration rejects malformed generated metadata before publishing" {
         try tmp.dir.writeFile(io, .{ .sub_path = "old/invalid.md", .data = malformed });
         for ([_]bool{ true, false }) |dry_run| {
             try std.testing.expectError(error.InvalidStoredNote, copy(
+                fs,
                 allocator,
-                io,
                 source,
                 destination,
                 "learnings",

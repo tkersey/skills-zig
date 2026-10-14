@@ -43,12 +43,13 @@ pub const SessionIdentity = struct {
 };
 
 pub fn discoverSessionIdentity(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: Options,
 ) !SessionIdentity {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try openTraceFile(io, path);
+    const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
     var file_reader = file.reader(io, &.{});
@@ -56,6 +57,7 @@ pub fn discoverSessionIdentity(
     defer allocator.free(prefix);
     var reader = std.Io.Reader.fixed(prefix);
     var summary = try trace_core.parseSessionSummaryTraceReader(
+        io,
         allocator,
         path,
         &reader,
@@ -104,12 +106,16 @@ pub const ParsedTrace = struct {
 };
 
 pub fn parseFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     path: []const u8,
     options: Options,
 ) !ParsedTrace {
     const selected = try parseFileSelected(
+        io,
+        dir,
         allocator,
         program,
         path,
@@ -120,6 +126,8 @@ pub fn parseFile(
 }
 
 pub fn parseFileSelected(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     path: []const u8,
@@ -137,8 +145,7 @@ pub fn parseFileSelected(
         }
     }
 
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try openTraceFile(io, path);
+    const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.size > options.max_input_bytes) {
@@ -153,6 +160,7 @@ pub fn parseFileSelected(
     defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
+            io,
             allocator,
             path,
             stat.mtime.nanoseconds,
@@ -165,16 +173,14 @@ pub fn parseFileSelected(
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    var replay_reader = PrefixReader.init(
-        prefix,
-        &file_reader.interface,
-    );
+    var replay_reader = PrefixReader.init(prefix, &file_reader.interface);
     const reader = if (selection != null)
         &replay_reader.interface
     else
         &file_reader.interface;
     return .{
         .parsed = try parseSelectedReader(
+            io,
             allocator,
             program,
             relation,
@@ -189,6 +195,8 @@ pub fn parseFileSelected(
 }
 
 pub fn parseRelationsFileSelected(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     relations: []const physical.Relation,
     path: []const u8,
@@ -204,8 +212,7 @@ pub fn parseRelationsFileSelected(
             return skippedSelection(false, 0);
         }
     }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try openTraceFile(io, path);
+    const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.size > options.max_input_bytes) {
@@ -220,6 +227,7 @@ pub fn parseRelationsFileSelected(
     defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
+            io,
             allocator,
             path,
             stat.mtime.nanoseconds,
@@ -238,6 +246,7 @@ pub fn parseRelationsFileSelected(
     else
         &file_reader.interface;
     return parseSelectedRelations(
+        io,
         allocator,
         path,
         reader,
@@ -248,6 +257,7 @@ pub fn parseRelationsFileSelected(
 }
 
 fn parseSelectedRelations(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     reader: *std.Io.Reader,
@@ -258,6 +268,7 @@ fn parseSelectedRelations(
     var metrics = trace_core.StreamMetrics{};
     var corpus_hasher = CorpusHasher{};
     const trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
+        io,
         allocator,
         path,
         reader,
@@ -346,11 +357,11 @@ fn readSummaryPrefixAlloc(
     return prefix.toOwnedSlice(allocator);
 }
 
-fn openTraceFile(io: std.Io, path: []const u8) !std.Io.File {
+fn openTraceFile(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     return if (std.fs.path.isAbsolute(path))
         std.Io.Dir.openFileAbsolute(io, path, .{})
     else
-        std.Io.Dir.cwd().openFile(io, path, .{});
+        dir.openFile(io, path, .{});
 }
 
 fn skippedSelection(file_opened: bool, bytes_read: usize) SelectedParse {
@@ -362,6 +373,7 @@ fn skippedSelection(file_opened: bool, bytes_read: usize) SelectedParse {
 }
 
 fn parseSelectedReader(
+    io: std.Io,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     relation: physical.Relation,
@@ -379,6 +391,7 @@ fn parseSelectedReader(
     var corpus_hasher = CorpusHasher{};
     const trace = if (relation == .sessions)
         try trace_core.parseSessionSummaryTraceReaderWithVisitorMetrics(
+            io,
             allocator,
             path,
             reader,
@@ -390,6 +403,7 @@ fn parseSelectedReader(
         )
     else
         try trace_core.parseSessionTraceReaderWithVisitorMetrics(
+            io,
             allocator,
             path,
             reader,
@@ -487,6 +501,7 @@ fn requiresSummaryPreselection(selection: SessionSelection) bool {
 }
 
 fn preselectSession(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     source_mtime_ns: i128,
@@ -499,6 +514,7 @@ fn preselectSession(
     }
     var reader = std.Io.Reader.fixed(prefix);
     var summary = try trace_core.parseSessionSummaryTraceReader(
+        io,
         allocator,
         path,
         &reader,
@@ -620,6 +636,8 @@ fn pathEqualOrDescendant(path: []const u8, root: []const u8) bool {
 }
 
 pub fn observeFile(
+    io: std.Io,
+    dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     path: []const u8,
@@ -630,7 +648,7 @@ pub fn observeFile(
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
     };
-    var parsed = try parseFile(allocator, program, path, options);
+    var parsed = try parseFile(io, dir, allocator, program, path, options);
     errdefer parsed.deinit(allocator);
     var structured_index = structured.Index{};
     errdefer structured_index.deinit(allocator);
@@ -1956,6 +1974,7 @@ const TestProgram = struct {
     ) !TestProgram {
         try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = source });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             dir,
             path,
@@ -2054,6 +2073,8 @@ test "trace adapter scans demanded session columns in one file pass" {
     defer std.testing.allocator.free(path);
     var output: [2]execution.Value = undefined;
     var observation = try observeFile(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &session_program.program,
         path,
@@ -2072,6 +2093,8 @@ test "trace adapter scans demanded session columns in one file pass" {
 
     var event_output: [5]execution.Value = undefined;
     var events = try observeFile(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2103,6 +2126,8 @@ test "selector discovery replays the admitted prefix without a second read" {
     defer std.testing.allocator.free(path);
 
     var selected = try parseFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2116,12 +2141,11 @@ test "selector discovery replays the admitted prefix without a second read" {
         @as(usize, trace_rollout.len),
         selected.parsed.?.metrics.bytes_read,
     );
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        selected.discovery_bytes_read,
-    );
+    try std.testing.expectEqual(@as(usize, 0), selected.discovery_bytes_read);
 
     const rejected = try parseFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2135,6 +2159,8 @@ test "selector discovery replays the admitted prefix without a second read" {
     );
 
     const excluded = try parseFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2142,10 +2168,7 @@ test "selector discovery replays the admitted prefix without a second read" {
         .{ .exclude_session_id = "session-1" },
     );
     try std.testing.expect(excluded.parsed == null);
-    try std.testing.expectEqual(
-        @as(usize, trace_rollout.len),
-        excluded.discovery_bytes_read,
-    );
+    try std.testing.expectEqual(@as(usize, trace_rollout.len), excluded.discovery_bytes_read);
 }
 
 test "selector discovery reads a complete large session metadata record" {
@@ -2184,6 +2207,8 @@ test "selector discovery reads a complete large session metadata record" {
     defer std.testing.allocator.free(path);
 
     var selected = try parseFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2196,6 +2221,8 @@ test "selector discovery reads a complete large session metadata record" {
     try std.testing.expectEqual(source.items.len, selected.parsed.?.metrics.bytes_read);
 
     const rejected = try parseFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,
@@ -2226,6 +2253,8 @@ test "trace adapter applies temporal selectors to physical event rows" {
     );
     defer std.testing.allocator.free(path);
     var parsed = try parseFile(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         &event_program.program,
         path,

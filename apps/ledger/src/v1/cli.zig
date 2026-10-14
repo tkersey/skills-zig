@@ -9,7 +9,6 @@ const storage_root = @import("storage_root");
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const max_projection_table_columns: usize = 1024;
 const max_projection_table_cells: usize = 4_000_000;
-threadlocal var runtime_io: ?std.Io = null;
 
 pub const panic = if (builtin.is_test)
     std.debug.FullPanic(std.debug.defaultPanic)
@@ -164,15 +163,16 @@ const RecoveryPaths = struct {
     counter_path: []u8,
 
     fn init(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         repo_path: []const u8,
         transaction_id: []const u8,
     ) !RecoveryPaths {
-        const repo_root = try resolveRepoRoot(allocator, repo_path);
+        const repo_root = try resolveRepoRoot(scope, allocator, repo_path);
         defer allocator.free(repo_root);
         const ledger_root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, storage_root.controlComponent() },
+            &.{ repo_root, storage_root.controlComponent(scope) },
         );
         defer allocator.free(ledger_root);
         const transaction_dir = try std.fs.path.join(
@@ -185,8 +185,8 @@ const RecoveryPaths = struct {
             &.{ ledger_root, ".fencing.counter" },
         );
         errdefer allocator.free(counter_path);
-        try durable_store.rejectSymlinkComponents(transaction_dir);
-        try durable_store.rejectSymlinkComponents(counter_path);
+        try durable_store.rejectSymlinkComponents(scope.fs, transaction_dir);
+        try durable_store.rejectSymlinkComponents(scope.fs, counter_path);
         return .{
             .transaction_dir = transaction_dir,
             .counter_path = counter_path,
@@ -200,13 +200,17 @@ const RecoveryPaths = struct {
     }
 };
 
-fn resolveRepoRoot(allocator: std.mem.Allocator, repo_path: []const u8) ![:0]u8 {
-    if (storage_root.isActive()) {
+fn resolveRepoRoot(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_path: []const u8,
+) ![:0]u8 {
+    if (storage_root.isActive(scope)) {
         if (!std.mem.eql(u8, repo_path, ".")) return error.InvalidManagedRoot;
         return allocator.dupeSentinel(u8, ".", 0);
     }
-    try durable_store.rejectSymlinkComponents(repo_path);
-    return std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), repo_path, allocator);
+    try durable_store.rejectSymlinkComponents(scope.fs, repo_path);
+    return scope.fs.directory().realPathFileAlloc(scope.fs.io, repo_path, allocator);
 }
 
 const DefinitionContext = ledger.compiled_plan.PlanSet;
@@ -222,56 +226,34 @@ const OwnedDocument = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
-    runtime_io = init.io;
-    defer runtime_io = null;
-    const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (requiresDurableIo(argv)) {
-        ledger.transaction.installRuntimeIo(init.io);
-    }
-    const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
-        emitCommandError(err) catch |write_err| {
-            if (isClosedPipe(write_err)) return;
-            return write_err;
-        };
-        break :blk @as(u8, 2);
-    };
-    if (code != 0) std.process.exit(code);
-}
-
-fn requiresDurableIo(argv: []const []const u8) bool {
-    if (argv.len < 2) return false;
-    return std.mem.eql(u8, argv[1], "transact") or
-        std.mem.eql(u8, argv[1], "project") or
-        std.mem.eql(u8, argv[1], "doctor") or
-        std.mem.eql(u8, argv[1], "migrate-segmented") or
-        std.mem.eql(u8, argv[1], "recovery");
-}
-
 pub fn runWithArgv(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     if (argv.len < 2) {
-        try writeStdout(Help);
+        try writeStdout(scope, Help);
         return 0;
     }
     if (isHelp(argv[1])) {
         if (argv.len != 2) return error.UnexpectedArgument;
-        try writeStdout(Help);
+        try writeStdout(scope, Help);
         return 0;
     }
     if (std.mem.eql(u8, argv[1], "version") or isVersion(argv[1])) {
         if (argv.len != 2) return error.UnexpectedArgument;
-        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    return runSubcommand(allocator, environment, argv[1], argv[2..]);
+    return runSubcommand(scope, selection, allocator, environment, argv[1], argv[2..]);
 }
 
 fn runSubcommand(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     command: []const u8,
@@ -279,21 +261,22 @@ fn runSubcommand(
 ) !u8 {
     if (std.mem.eql(u8, command, "capabilities")) {
         if (isOnlyHelp(argv)) {
-            try writeStdout(Help);
+            try writeStdout(scope, Help);
             return 0;
         }
-        return emitCapabilities(argv);
+        return emitCapabilities(scope, argv);
     }
     if (std.mem.eql(u8, command, "definition")) {
-        return runDefinitionCommand(allocator, environment, argv);
+        return runDefinitionCommand(scope, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "recovery")) {
-        return runRecoveryCommand(allocator, argv);
+        return runRecoveryCommand(scope, selection, allocator, argv);
     }
-    return runOperationCommand(allocator, environment, command, argv);
+    return runOperationCommand(scope, selection, allocator, environment, command, argv);
 }
 
 fn runDefinitionCommand(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -301,22 +284,24 @@ fn runDefinitionCommand(
     if (argv.len == 0) return error.MissingDefinitionAction;
     if (std.mem.eql(u8, argv[0], "check")) {
         if (isOnlyHelp(argv[1..])) {
-            try writeStdout(Help);
+            try writeStdout(scope, Help);
             return 0;
         }
-        return runDefinitionCheck(allocator, environment, argv[1..]);
+        return runDefinitionCheck(scope, allocator, environment, argv[1..]);
     }
     if (std.mem.eql(u8, argv[0], "describe")) {
         if (isOnlyHelp(argv[1..])) {
-            try writeStdout(Help);
+            try writeStdout(scope, Help);
             return 0;
         }
-        return runDefinitionDescribe(allocator, environment, argv[1..]);
+        return runDefinitionDescribe(scope, allocator, environment, argv[1..]);
     }
     return error.UnknownDefinitionAction;
 }
 
 fn runOperationCommand(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     command: []const u8,
@@ -324,26 +309,26 @@ fn runOperationCommand(
 ) !u8 {
     if (!isOperationCommand(command)) return error.UnknownCommand;
     if (isOnlyHelp(argv)) {
-        try writeStdout(Help);
+        try writeStdout(scope, Help);
         return 0;
     }
     if (std.mem.eql(u8, command, "validate")) {
-        return runValidate(allocator, environment, argv);
+        return runValidate(scope, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "materialize")) {
-        return runMaterialize(allocator, environment, argv);
+        return runMaterialize(scope, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "transact")) {
-        return runTransact(allocator, environment, argv);
+        return runTransact(scope, selection, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "project")) {
-        return runProject(allocator, environment, argv);
+        return runProject(scope, selection, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "doctor")) {
-        return runDoctor(allocator, environment, argv);
+        return runDoctor(scope, selection, allocator, environment, argv);
     }
     if (std.mem.eql(u8, command, "migrate-segmented")) {
-        return runSegmentedMigration(allocator, environment, argv);
+        return runSegmentedMigration(scope, selection, allocator, environment, argv);
     }
     return error.UnknownCommand;
 }
@@ -358,6 +343,8 @@ fn isOperationCommand(command: []const u8) bool {
 }
 
 fn runRecoveryCommand(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     argv: []const []const u8,
 ) !u8 {
@@ -368,32 +355,34 @@ fn runRecoveryCommand(
         return error.UnknownRecoveryAction;
     }
     if (isOnlyHelp(argv[1..])) {
-        try writeStdout(Help);
+        try writeStdout(scope, Help);
         return 0;
     }
     const reclaim = std.mem.eql(u8, argv[0], "reclaim");
     const args = try parseRecoveryArgs(argv[1..], reclaim);
     try validateRecoveryTransactionId(args.transaction_id);
-    const anchored = try storage_root.enterControl();
-    defer if (anchored) storage_root.leaveControl();
+    selection.enterControl(scope);
     var paths = try RecoveryPaths.init(
+        scope,
         allocator,
         args.repo_path,
         args.transaction_id,
     );
     defer paths.deinit(allocator);
     return if (reclaim)
-        runRecoveryReclaim(allocator, args, paths)
+        runRecoveryReclaim(scope, allocator, args, paths)
     else
-        runRecoveryInspection(allocator, args.format, paths);
+        runRecoveryInspection(scope, allocator, args.format, paths);
 }
 
 fn runRecoveryInspection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: Format,
     paths: RecoveryPaths,
 ) !u8 {
     const candidates = try durable_store.inspectLegacyLeaseRecoveryCandidates(
+        scope.fs,
         allocator,
         paths.transaction_dir,
         .{ .shared = paths.counter_path },
@@ -402,17 +391,19 @@ fn runRecoveryInspection(
         allocator,
         candidates,
     );
-    try emitRecoveryInspection(format, candidates);
+    try emitRecoveryInspection(scope, format, candidates);
     return 0;
 }
 
 fn runRecoveryReclaim(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     args: RecoveryArgs,
     paths: RecoveryPaths,
 ) !u8 {
     var summary: durable_store.TransactionRecoverySummary = .{};
     const receipt = durable_store.reclaimLegacyLease(
+        scope.fs,
         allocator,
         paths.transaction_dir,
         .{ .shared = paths.counter_path },
@@ -425,7 +416,7 @@ fn runRecoveryReclaim(
         },
         &summary,
     ) catch |err| {
-        try emitRecoveryError(err, summary.storage_mutated);
+        try emitRecoveryError(scope, err, summary.storage_mutated);
         return 2;
     };
     defer {
@@ -433,14 +424,16 @@ fn runRecoveryReclaim(
         allocator.free(receipt.resource);
         allocator.free(receipt.result);
     }
-    emitRecoveryReclaim(args.format, receipt) catch |err| {
-        try emitRecoveryError(err, summary.storage_mutated);
+    emitRecoveryReclaim(scope, args.format, receipt) catch |err| {
+        try emitRecoveryError(scope, err, summary.storage_mutated);
         return 2;
     };
     return 0;
 }
 
 fn runTransact(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -448,6 +441,7 @@ fn runTransact(
     var args = try parseTransactionArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.common.definition_path,
@@ -461,6 +455,7 @@ fn runTransact(
     );
     defer bindings.deinit(allocator);
     const owned_documents = try readDocuments(
+        scope,
         allocator,
         &context.validation_plan.?,
         args.common.input_specs,
@@ -468,11 +463,11 @@ fn runTransact(
     defer deinitDocuments(allocator, owned_documents);
     const documents = try documentViews(allocator, owned_documents);
     defer allocator.free(documents);
-    const anchored = try storage_root.enterControl();
-    defer if (anchored) storage_root.leaveControl();
-    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
+    selection.enterControl(scope);
+    const repo_root = try resolveRepoRoot(scope, allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = ledger.transaction.transact(
+        scope,
         allocator,
         &context.definition_plan,
         &context.closure,
@@ -486,25 +481,29 @@ fn runTransact(
         &bindings,
     ) catch |err| {
         try emitTransactionError(
+            scope,
             err,
-            ledger.transaction.lastMutationState(),
+            ledger.transaction.lastMutationState(scope),
         );
         return 2;
     };
     defer result.deinit(allocator);
     emitTransaction(
+        scope,
         allocator,
         args.common.format,
         &result,
         context.stats,
     ) catch |err| {
-        try emitTransactionError(err, result.storage_mutated);
+        try emitTransactionError(scope, err, result.storage_mutated);
         return 2;
     };
     return if (result.validation_result.valid) 0 else 2;
 }
 
 fn runDoctor(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -512,6 +511,7 @@ fn runDoctor(
     var args = try parseDoctorArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -524,11 +524,11 @@ fn runDoctor(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    const anchored = try storage_root.enterControl();
-    defer if (anchored) storage_root.leaveControl();
-    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
+    selection.enterControl(scope);
+    const repo_root = try resolveRepoRoot(scope, allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = try ledger.doctor.execute(
+        scope,
         allocator,
         &context.definition_plan,
         &context.storage_plan.?,
@@ -537,11 +537,13 @@ fn runDoctor(
         &bindings,
     );
     defer result.deinit(allocator);
-    try emitDoctor(allocator, args.format, &result, context.stats);
+    try emitDoctor(scope, allocator, args.format, &result, context.stats);
     return if (result.healthy) 0 else 2;
 }
 
 fn runSegmentedMigration(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -549,6 +551,7 @@ fn runSegmentedMigration(
     var args = try parseDoctorArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -561,11 +564,11 @@ fn runSegmentedMigration(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    const anchored = try storage_root.enterControl();
-    defer if (anchored) storage_root.leaveControl();
-    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
+    selection.enterControl(scope);
+    const repo_root = try resolveRepoRoot(scope, allocator, args.repo_path);
     defer allocator.free(repo_root);
     var result = ledger.migration.execute(
+        scope,
         allocator,
         &context.definition_plan,
         &context.closure,
@@ -575,14 +578,15 @@ fn runSegmentedMigration(
         repo_root,
         &bindings,
     ) catch |err| {
-        try emitTransactionError(err, ledger.transaction.lastMutationState());
+        try emitTransactionError(scope, err, ledger.transaction.lastMutationState(scope));
         return 2;
     };
     defer result.deinit(allocator);
-    emitSegmentedMigration(args.format, &result) catch |err| {
+    emitSegmentedMigration(scope, args.format, &result) catch |err| {
         try emitTransactionError(
+            scope,
             err,
-            ledger.transaction.lastMutationState(),
+            ledger.transaction.lastMutationState(scope),
         );
         return 2;
     };
@@ -590,6 +594,8 @@ fn runSegmentedMigration(
 }
 
 fn runProject(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -597,6 +603,7 @@ fn runProject(
     var args = try parseProjectionArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -609,14 +616,14 @@ fn runProject(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    const anchored = try storage_root.enterControl();
-    defer if (anchored) storage_root.leaveControl();
-    const repo_root = try resolveRepoRoot(allocator, args.repo_path);
+    selection.enterControl(scope);
+    const repo_root = try resolveRepoRoot(scope, allocator, args.repo_path);
     defer allocator.free(repo_root);
     const compiled_projection = context.projection_plan.?.find(
         args.projection,
     ) orelse return error.UnknownProjection;
     var result = ledger.projection.execute(
+        scope,
         allocator,
         &context.definition_plan,
         &context.storage_plan.?,
@@ -628,6 +635,7 @@ fn runProject(
     ) catch |err| {
         if (compiled_projection.exit_policy.failure) |exit_code| {
             try emitProjectionError(
+                scope,
                 err,
                 &context.definition_plan,
                 args.projection,
@@ -639,6 +647,7 @@ fn runProject(
     };
     defer result.deinit(allocator);
     try emitProjection(
+        scope,
         allocator,
         args.format,
         args.payload_only,
@@ -649,6 +658,7 @@ fn runProject(
 }
 
 fn runDefinitionCheck(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -656,12 +666,13 @@ fn runDefinitionCheck(
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
     var context = loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
         .{ .kind = .definition_check },
     ) catch |err| {
-        try emitDefinitionCheckFailure(args.format, err);
+        try emitDefinitionCheckFailure(scope, args.format, err);
         return 2;
     };
     defer context.deinit(allocator);
@@ -693,10 +704,10 @@ fn runDefinitionCheck(
             try output.writer.writeAll(
                 ",\"passive\":true,\"authority_granted\":false}\n",
             );
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             try stdout_writer.interface.print(
                 "structurally valid definition {s}@{s}\n",
                 .{
@@ -709,8 +720,8 @@ fn runDefinitionCheck(
     return 0;
 }
 
-fn emitDefinitionCheckFailure(format: Format, err: anyerror) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn emitDefinitionCheckFailure(scope: *storage_root.Scope, format: Format, err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     if (format == .text) {
         try stdout_writer.interface.print(
             "structurally invalid definition: {s}\n",
@@ -733,6 +744,7 @@ fn emitDefinitionCheckFailure(format: Format, err: anyerror) !void {
 }
 
 fn runDefinitionDescribe(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -740,6 +752,7 @@ fn runDefinitionDescribe(
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -756,10 +769,10 @@ fn runDefinitionDescribe(
                 context.stats,
             );
             try output.writer.writeByte('\n');
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             try stdout_writer.interface.print(
                 "{s}\nowner: {s}\ndigest: {s}\nabi: {s}\n",
                 .{
@@ -775,6 +788,7 @@ fn runDefinitionDescribe(
 }
 
 fn runValidate(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -782,6 +796,7 @@ fn runValidate(
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -795,6 +810,7 @@ fn runValidate(
     );
     defer bindings.deinit(allocator);
     const owned_documents = try readDocuments(
+        scope,
         allocator,
         &context.validation_plan.?,
         args.input_specs,
@@ -810,11 +826,12 @@ fn runValidate(
         documents,
     );
     defer result.deinit(allocator);
-    try emitValidation(allocator, args.format, &result, context.stats);
+    try emitValidation(scope, allocator, args.format, &result, context.stats);
     return if (result.valid) 0 else 2;
 }
 
 fn runMaterialize(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
@@ -822,6 +839,7 @@ fn runMaterialize(
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
     var context = try loadDefinition(
+        scope,
         allocator,
         environment,
         args.definition_path,
@@ -835,6 +853,7 @@ fn runMaterialize(
     );
     defer bindings.deinit(allocator);
     const owned_documents = try readDocuments(
+        scope,
         allocator,
         &context.validation_plan.?,
         args.input_specs,
@@ -851,6 +870,7 @@ fn runMaterialize(
     );
     defer result.deinit(allocator);
     try emitMaterialization(
+        scope,
         allocator,
         args.format,
         &result,
@@ -1288,21 +1308,23 @@ fn validateRecoveryTransactionId(transaction_id: []const u8) !void {
 }
 
 fn loadDefinition(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
     path: []const u8,
     route: ledger.compiled_plan.Route,
 ) !DefinitionContext {
-    const absolute = try absoluteDefinitionPathAlloc(allocator, path);
+    const absolute = try absoluteDefinitionPathAlloc(scope, allocator, path);
     defer allocator.free(absolute);
     const package_location =
         try definition_core.closure.admittedPackageLocation(
+            scope.fs.io,
             absolute,
             "skills",
         );
     const cwd = if (package_location == null)
-        try std.Io.Dir.cwd().realPathFileAlloc(
-            defaultIo(),
+        try scope.fs.directory().realPathFileAlloc(
+            scope.fs.io,
             ".",
             allocator,
         )
@@ -1311,13 +1333,15 @@ fn loadDefinition(
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
         try definition_core.closure.admittedLocation(
+            scope.fs.io,
             absolute,
             cwd.?,
             "skills",
         );
-    const cache_dir = try ledgerCacheDirAlloc(allocator, environment);
+    const cache_dir = try ledgerCacheDirAlloc(scope, allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
+        scope,
         allocator,
         location.root,
         location.entry,
@@ -1328,14 +1352,15 @@ fn loadDefinition(
 }
 
 fn absoluteDefinitionPathAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.path.resolve(allocator, &.{path});
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
+    const cwd = try scope.fs.directory().realPathFileAlloc(
+        scope.fs.io,
         ".",
         allocator,
     );
@@ -1344,6 +1369,7 @@ fn absoluteDefinitionPathAlloc(
 }
 
 fn ledgerCacheDirAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
 ) !?[]u8 {
@@ -1366,8 +1392,8 @@ fn ledgerCacheDirAlloc(
     if (std.fs.path.isAbsolute(joined)) {
         return try allocator.dupe(u8, joined);
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
+    const cwd = try scope.fs.directory().realPathFileAlloc(
+        scope.fs.io,
         ".",
         allocator,
     );
@@ -1384,6 +1410,7 @@ fn environmentValue(
 }
 
 fn readDocuments(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     plan: *const ledger.validation.Plan,
     specs: []const []const u8,
@@ -1406,13 +1433,13 @@ fn readDocuments(
         const bytes = if (std.mem.eql(u8, source, "-")) blk: {
             if (stdin_used) return error.MultipleStdinInputs;
             stdin_used = true;
-            var stdin_reader = std.Io.File.stdin().reader(defaultIo(), &.{});
+            var stdin_reader = std.Io.File.stdin().reader(scope.fs.io, &.{});
             break :blk try stdin_reader.interface.allocRemaining(
                 allocator,
                 .limited(limit),
             );
-        } else try std.Io.Dir.cwd().readFileAlloc(
-            defaultIo(),
+        } else try scope.fs.directory().readFileAlloc(
+            scope.fs.io,
             source,
             allocator,
             .limited(limit),
@@ -1497,6 +1524,7 @@ fn parameterInputs(
 }
 
 fn emitValidation(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.validation.Result,
@@ -1512,10 +1540,10 @@ fn emitValidation(
                 compile_stats,
             );
             try output.writer.writeByte('\n');
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             try stdout_writer.interface.print(
                 "{s} under {s}@{s}\n",
                 .{
@@ -1529,6 +1557,7 @@ fn emitValidation(
 }
 
 fn emitMaterialization(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.materialization.Result,
@@ -1544,10 +1573,10 @@ fn emitMaterialization(
                 compile_stats,
             );
             try output.writer.writeByte('\n');
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             if (result.validation_result.valid) {
                 try stdout_writer.interface.print(
                     "materialized {s}@{s}\n",
@@ -1564,6 +1593,7 @@ fn emitMaterialization(
 }
 
 fn emitTransaction(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.transaction.Result,
@@ -1579,10 +1609,10 @@ fn emitTransaction(
                 compile_stats,
             );
             try output.writer.writeByte('\n');
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             try stdout_writer.interface.print(
                 "{s} {s}@{s}; storage_mutated={s}\n",
                 .{
@@ -1596,8 +1626,8 @@ fn emitTransaction(
     }
 }
 
-fn emitTransactionError(err: anyerror, storage_mutated: ?bool) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn emitTransactionError(scope: *storage_root.Scope, err: anyerror, storage_mutated: ?bool) !void {
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try ledger.envelope.writeTransactionErrorJson(
         &stdout_writer.interface,
         err,
@@ -1607,6 +1637,7 @@ fn emitTransactionError(err: anyerror, storage_mutated: ?bool) !void {
 }
 
 fn emitProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: ProjectionFormat,
     payload_only: bool,
@@ -1614,12 +1645,13 @@ fn emitProjection(
     compile_stats: definition_core.result.CompileStats,
 ) !void {
     if (payload_only) {
-        return emitProjectionPayload(result.payload);
+        return emitProjectionPayload(scope, result.payload);
     }
     return switch (format) {
-        .json => emitProjectionJson(allocator, result, compile_stats),
-        .text => emitProjectionText(allocator, result.payload),
+        .json => emitProjectionJson(scope, allocator, result, compile_stats),
+        .text => emitProjectionText(scope, allocator, result.payload),
         .jsonl, .table, .markdown => emitRenderedProjection(
+            scope,
             allocator,
             format,
             result,
@@ -1627,13 +1659,14 @@ fn emitProjection(
     };
 }
 
-fn emitProjectionPayload(payload: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn emitProjectionPayload(scope: *storage_root.Scope, payload: []const u8) !void {
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try stdout_writer.interface.writeAll(payload);
     try stdout_writer.interface.writeByte('\n');
 }
 
 fn emitProjectionJson(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     result: *const ledger.projection.Result,
     compile_stats: definition_core.result.CompileStats,
@@ -1646,14 +1679,15 @@ fn emitProjectionJson(
         compile_stats,
     );
     try output.writer.writeByte('\n');
-    try writeStdout(output.written());
+    try writeStdout(scope, output.written());
 }
 
 fn emitProjectionText(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     payload: []const u8,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -1674,6 +1708,7 @@ fn emitProjectionText(
 }
 
 fn emitRenderedProjection(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: ProjectionFormat,
     result: *const ledger.projection.Result,
@@ -1705,7 +1740,7 @@ fn emitRenderedProjection(
     if (output.written().len > result.max_output_bytes) {
         return error.OutputBytesExceeded;
     }
-    try writeStdout(output.written());
+    try writeStdout(scope, output.written());
 }
 
 fn writeProjectionJsonl(
@@ -2115,12 +2150,13 @@ fn writeBoundedByte(
 }
 
 fn emitProjectionError(
+    scope: *storage_root.Scope,
     err: anyerror,
     definition_plan: *const ledger.definition.Plan,
     projection: []const u8,
     exit_code: u8,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try stdout_writer.interface.writeAll(
         "{\"schema\":\"ledger-projection-error/v1\",\"definition\":{\"id\":",
     );
@@ -2152,6 +2188,7 @@ fn emitProjectionError(
 }
 
 fn emitDoctor(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.doctor.Result,
@@ -2167,10 +2204,10 @@ fn emitDoctor(
                 compile_stats,
             );
             try output.writer.writeByte('\n');
-            try writeStdout(output.written());
+            try writeStdout(scope, output.written());
         },
         .text => {
-            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
             try stdout_writer.interface.print(
                 "{s} {s}@{s}; pending_transactions={d}\n",
                 .{
@@ -2185,10 +2222,11 @@ fn emitDoctor(
 }
 
 fn emitSegmentedMigration(
+    scope: *storage_root.Scope,
     format: Format,
     result: *const ledger.migration.Result,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     switch (format) {
         .json => {
             try stdout_writer.interface.writeAll(
@@ -2233,9 +2271,9 @@ fn emitSegmentedMigration(
     }
 }
 
-fn emitCapabilities(argv: []const []const u8) !u8 {
+fn emitCapabilities(scope: *storage_root.Scope, argv: []const []const u8) !u8 {
     const format = try parseCapabilitiesFormat(argv);
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     if (format == .text) {
         try stdout_writer.interface.print(
             "Ledger {s}\nABI: {s}\n",
@@ -2337,8 +2375,8 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
     );
 }
 
-pub fn emitCommandError(err: anyerror) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+pub fn emitCommandError(scope: *storage_root.Scope, err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try stdout_writer.interface.writeAll(
         "{\"schema\":\"ledger-command-error/v1\",\"code\":",
     );
@@ -2352,10 +2390,11 @@ pub fn emitCommandError(err: anyerror) !void {
 }
 
 fn emitRecoveryInspection(
+    scope: *storage_root.Scope,
     format: Format,
     candidates: []const durable_store.LegacyLeaseRecoveryCandidate,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     switch (format) {
         .json => {
             try stdout_writer.interface.writeAll(
@@ -2413,10 +2452,11 @@ fn emitRecoveryInspection(
 }
 
 fn emitRecoveryReclaim(
+    scope: *storage_root.Scope,
     format: Format,
     receipt: durable_store.ReclaimReceipt,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     switch (format) {
         .json => {
             try stdout_writer.interface.writeAll(
@@ -2452,10 +2492,11 @@ fn emitRecoveryReclaim(
 }
 
 fn emitRecoveryError(
+    scope: *storage_root.Scope,
     err: anyerror,
     storage_mutated: bool,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try stdout_writer.interface.writeAll(
         "{\"schema\":\"ledger-command-error/v1\",\"code\":",
     );
@@ -2479,12 +2520,8 @@ fn findValidationInput(
     return null;
 }
 
-fn defaultIo() std.Io {
-    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
-}
-
-fn writeStdout(bytes: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+fn writeStdout(scope: *storage_root.Scope, bytes: []const u8) !void {
+    var stdout_writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     try stdout_writer.interface.writeAll(bytes);
 }
 
@@ -2509,22 +2546,6 @@ test "final command surface excludes source and positional contract routing" {
     try std.testing.expect(std.mem.indexOf(u8, Help, "capture") == null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "definition check") != null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "materialize") != null);
-}
-
-test "only store-backed commands install durable runtime IO" {
-    try std.testing.expect(!requiresDurableIo(&.{}));
-    try std.testing.expect(!requiresDurableIo(&.{"ledger"}));
-    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "validate" }));
-    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "materialize" }));
-    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "definition" }));
-    try std.testing.expect(requiresDurableIo(&.{ "ledger", "transact" }));
-    try std.testing.expect(requiresDurableIo(&.{ "ledger", "project" }));
-    try std.testing.expect(requiresDurableIo(&.{ "ledger", "doctor" }));
-    try std.testing.expect(requiresDurableIo(&.{
-        "ledger",
-        "migrate-segmented",
-    }));
-    try std.testing.expect(requiresDurableIo(&.{ "ledger", "recovery" }));
 }
 
 test "recovery parser separates inspection from exact witnessed reclaim" {
@@ -2594,29 +2615,33 @@ test "recovery parser separates inspection from exact witnessed reclaim" {
 }
 
 test "recovery paths reject symlinks in generated control components" {
+    var scope_value = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_value;
     if (@import("builtin").os.tag == .windows) {
         return error.SkipZigTest;
     }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
-    try tmp.dir.createDir(defaultIo(), "repo", .default_dir);
-    try tmp.dir.createDir(defaultIo(), "outside", .default_dir);
+    try tmp.dir.createDir(scope.fs.io, "repo", .default_dir);
+    try tmp.dir.createDir(scope.fs.io, "outside", .default_dir);
     try tmp.dir.symLink(
-        defaultIo(),
+        scope.fs.io,
         "../outside",
         "repo/.ledger",
         .{ .is_directory = true },
     );
     const repo = try tmp.dir.realPathFileAlloc(
-        defaultIo(),
+        scope.fs.io,
         "repo",
         allocator,
     );
     defer allocator.free(repo);
     try std.testing.expectError(
         error.SymlinkComponent,
-        RecoveryPaths.init(allocator, repo, "dtx-42"),
+        RecoveryPaths.init(scope, allocator, repo, "dtx-42"),
     );
 }
 

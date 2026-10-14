@@ -60,7 +60,7 @@ pub fn writeCanonicalJson(
 }
 
 const WriteFrame = struct {
-    value: std.json.Value,
+    value: *const std.json.Value,
     keys: std.ArrayList([]const u8) = .empty,
     index: usize = 0,
     started: bool = false,
@@ -78,7 +78,7 @@ const WriteFrame = struct {
         depth: usize,
     ) !bool {
         self.started = true;
-        switch (self.value) {
+        switch (self.value.*) {
             .null => try writer.writeAll("null"),
             .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
             .integer => |number| try writer.print("{d}", .{number}),
@@ -98,15 +98,15 @@ const WriteFrame = struct {
         return false;
     }
 
-    fn next(self: *WriteFrame, writer: *std.Io.Writer) !?std.json.Value {
-        switch (self.value) {
+    fn next(self: *WriteFrame, writer: *std.Io.Writer) !?*const std.json.Value {
+        switch (self.value.*) {
             .array => |items| {
                 if (self.index == items.items.len) {
                     try writer.writeByte(']');
                     return null;
                 }
                 if (self.index != 0) try writer.writeByte(',');
-                const item = items.items[self.index];
+                const item = &items.items[self.index];
                 self.index += 1;
                 return item;
             },
@@ -121,7 +121,7 @@ const WriteFrame = struct {
                 try writeCanonicalString(writer, key);
                 try writer.writeByte(':');
                 self.index += 1;
-                return map.get(key).?;
+                return map.getPtr(key).?;
             },
             else => unreachable,
         }
@@ -154,8 +154,10 @@ fn writeCanonicalJsonWithOmission(
     omission: Omission,
 ) !void {
     // The root has depth zero; one slot covers each admitted nesting level.
+    // Frames borrow the unchanged input graph for this synchronous traversal;
+    // only sorted key lists are owned, so the bounded stack need not copy values.
     var frames: [max_nesting_depth + 1]WriteFrame = undefined;
-    frames[0] = .{ .value = value };
+    frames[0] = .{ .value = &value };
     var count: usize = 1;
     defer for (frames[0..count]) |*frame| frame.deinit(allocator);
     while (count != 0) {
@@ -409,14 +411,38 @@ fn sortKeys(keys: [][]const u8) void {
 pub fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return formatDigestAlloc(allocator, digest);
+}
+
+fn formatDigestAlloc(allocator: std.mem.Allocator, digest: [32]u8) ![]u8 {
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return allocator.print("sha256:{s}", .{hex});
+    const result = try allocator.alloc(u8, 71);
+    result[0..7].* = "sha256:".*;
+    result[7..71].* = hex;
+    return result;
 }
 
 pub fn digestValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    const canonical = try canonicalJsonAlloc(allocator, value);
-    defer allocator.free(canonical);
-    return digestBytesAlloc(allocator, canonical);
+    return digestWithOmissionAlloc(allocator, value, .{});
+}
+
+// The standard sink consumes buffered tails, vectors, and repeated writes.
+// Key ordering still needs allocator-backed scratch; output size does not.
+const DigestWriter = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256);
+
+fn digestWithOmissionAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    omission: Omission,
+) ![]u8 {
+    // Batch small writes without retaining a page-sized buffer in digest callers.
+    var buffer: [512]u8 = undefined;
+    var sink = DigestWriter.init(&buffer);
+    try writeCanonicalJsonWithOmission(allocator, &sink.writer, value, omission);
+    try sink.writer.flush();
+    var digest: [32]u8 = undefined;
+    sink.hasher.final(&digest);
+    return formatDigestAlloc(allocator, digest);
 }
 
 pub fn fingerprintObjectOmittingAlloc(
@@ -424,9 +450,8 @@ pub fn fingerprintObjectOmittingAlloc(
     value: std.json.Value,
     omitted: []const u8,
 ) ![]u8 {
-    const canonical = try canonicalObjectOmittingKeyAlloc(allocator, value, omitted);
-    defer allocator.free(canonical);
-    return digestBytesAlloc(allocator, canonical);
+    if (value != .object) return error.ExpectedObject;
+    return digestWithOmissionAlloc(allocator, value, .{ .key = omitted });
 }
 
 pub fn finalizeFingerprintAlloc(
@@ -612,6 +637,122 @@ test "canonical JSON preserves the exact nesting boundary without recursive call
         error.JsonNestingExceeded,
         canonicalJsonAlloc(std.testing.allocator, values[0]),
     );
+    try expectDigestMatchesBytes(values[1]);
+    try std.testing.expectError(
+        error.JsonNestingExceeded,
+        digestValueAlloc(std.testing.allocator, values[0]),
+    );
+}
+
+fn expectDigestMatchesBytes(value: std.json.Value) !void {
+    const allocator = std.testing.allocator;
+    const bytes = try canonicalJsonAlloc(allocator, value);
+    defer allocator.free(bytes);
+    const expected = try digestBytesAlloc(allocator, bytes);
+    defer allocator.free(expected);
+    const actual = try digestValueAlloc(allocator, value);
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "streaming digests preserve canonical bytes and root omission" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        "null",
+        "[]",
+        "{}",
+        "[true,false,0,-0,1e2,1.2300e-2]",
+        "[9223372036854775807,-9223372036854775808,9007199254740992.1]",
+        "{\"z\":1,\"a\":{\"z\":2,\"a\":3}}",
+        "{\"a\":{\"a\":3,\"z\":2},\"z\":1}",
+        "{\"\\ue000\":1,\"\\ud800\\udc00\":2,\"é\":3}",
+        "{\"fingerprint\":\"root\",\"child\":{\"fingerprint\":\"keep\"}}",
+    }) |input| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            input,
+            .{ .parse_numbers = false },
+        );
+        defer parsed.deinit();
+        try expectDigestMatchesBytes(parsed.value);
+        if (parsed.value == .object) {
+            const bytes = try canonicalObjectOmittingKeyAlloc(
+                allocator,
+                parsed.value,
+                "fingerprint",
+            );
+            defer allocator.free(bytes);
+            const expected = try digestBytesAlloc(allocator, bytes);
+            defer allocator.free(expected);
+            const actual = try fingerprintObjectOmittingAlloc(
+                allocator,
+                parsed.value,
+                "fingerprint",
+            );
+            defer allocator.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+    }
+    for ([_]f64{ 0, -0.0, 1.0e-7, 1.0e20, 9.223372036854776e18 }) |number| {
+        try expectDigestMatchesBytes(.{ .float = number });
+    }
+    try std.testing.expectError(
+        error.ExpectedObject,
+        fingerprintObjectOmittingAlloc(allocator, .null, "x"),
+    );
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        digestValueAlloc(allocator, .{ .string = "\xff" }),
+    );
+    try std.testing.expectError(
+        error.InvalidNumber,
+        digestValueAlloc(allocator, .{ .number_string = "01" }),
+    );
+    try std.testing.expectError(
+        error.NonFiniteNumber,
+        digestValueAlloc(allocator, .{ .float = std.math.inf(f64) }),
+    );
+}
+
+test "digest sink includes vectors repeated writes and buffered tails" {
+    for ([_]usize{ 0, 1, 7, 4096 }) |capacity| {
+        var buffer: [4096]u8 = undefined;
+        var sink = DigestWriter.init(buffer[0..capacity]);
+        try sink.writer.writeAll("prefix");
+        _ = try sink.writer.writeSplat(&.{ "first", "xy" }, 3000);
+        _ = try sink.writer.writeSplat(&.{ "last", "ignored" }, 0);
+        try sink.writer.writeAll("tail");
+        try sink.writer.flush();
+        var expected = std.crypto.hash.sha2.Sha256.init(.{});
+        expected.update("prefixfirst");
+        for (0..3000) |_| expected.update("xy");
+        expected.update("lasttail");
+        try std.testing.expectEqual(expected.finalResult(), sink.hasher.finalResult());
+    }
+}
+
+test "digest-only long string allocates only its final representation" {
+    const text = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'x');
+    // A byte-producing serialization cannot fit; the digest gets exactly 71 bytes.
+    var storage: [71]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&storage);
+    const actual = try digestValueAlloc(bounded.allocator(), .{ .string = text });
+    try std.testing.expectEqual(@as(usize, 71), bounded.end_index);
+    const bytes = try canonicalJsonAlloc(std.testing.allocator, .{ .string = text });
+    defer std.testing.allocator.free(bytes);
+    const expected = try digestBytesAlloc(std.testing.allocator, bytes);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+fn digestForAllocationFailure(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const digest = try digestValueAlloc(allocator, value);
+    defer allocator.free(digest);
+    const omitted = try fingerprintObjectOmittingAlloc(allocator, value, "z");
+    defer allocator.free(omitted);
 }
 
 fn canonicalizeForAllocationFailure(
@@ -633,6 +774,11 @@ test "canonical traversal releases all live frame keys on allocation failure" {
     try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         canonicalizeForAllocationFailure,
+        .{parsed.value},
+    );
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        digestForAllocationFailure,
         .{parsed.value},
     );
 }
@@ -660,6 +806,11 @@ fn fuzzCanonicalJson(_: void, smith: *std.testing.Smith) !void {
         else => return err,
     };
     defer allocator.free(canonical);
+    const expected_digest = try digestBytesAlloc(allocator, canonical);
+    defer allocator.free(expected_digest);
+    const actual_digest = try digestValueAlloc(allocator, parsed.value);
+    defer allocator.free(actual_digest);
+    try std.testing.expectEqualStrings(expected_digest, actual_digest);
     var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, canonical, .{
         .parse_numbers = false,
         .duplicate_field_behavior = .@"error",

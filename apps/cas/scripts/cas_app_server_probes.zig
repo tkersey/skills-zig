@@ -478,6 +478,7 @@ fn externalImportRecordProbe(
 pub fn structuredReviewProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     client: *proxy.Client,
     cwd: []const u8,
 ) LiveWitness {
@@ -515,12 +516,13 @@ pub fn structuredReviewProbe(
     defer allocator.free(rollout_path);
     defer deleteThread(allocator, client, thread_id);
 
-    return dispatchStructuredReviewProbe(allocator, io, client, thread_id, rollout_path);
+    return dispatchStructuredReviewProbe(allocator, io, dir, client, thread_id, rollout_path);
 }
 
 fn dispatchStructuredReviewProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     client: *proxy.Client,
     thread_id: []const u8,
     rollout_path: []const u8,
@@ -563,6 +565,7 @@ fn dispatchStructuredReviewProbe(
     return structuredReviewTerminalProbe(
         allocator,
         io,
+        dir,
         client,
         thread_id,
         turn_id,
@@ -574,6 +577,7 @@ fn dispatchStructuredReviewProbe(
 fn structuredReviewTerminalProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     client: *proxy.Client,
     thread_id: []const u8,
     turn_id: []const u8,
@@ -620,6 +624,7 @@ fn structuredReviewTerminalProbe(
         const page_state = completedReviewTurnPageState(
             allocator,
             io,
+            dir,
             read_json,
             rollout_path,
             turn_id,
@@ -2477,6 +2482,7 @@ fn reviewCompletionNotificationState(
 fn completedReviewTurnState(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     raw: []const u8,
     expected_turn_id: []const u8,
 ) ReviewCompletionState {
@@ -2512,7 +2518,7 @@ fn completedReviewTurnState(
             else => return .pending,
         };
         if (path.len == 0) return .pending;
-        const rollout = std.Io.Dir.cwd().readFileAlloc(
+        const rollout = dir.readFileAlloc(
             io,
             path,
             allocator,
@@ -2533,6 +2539,7 @@ fn completedReviewTurnState(
 fn completedReviewTurnPageState(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     raw: []const u8,
     rollout_path: []const u8,
     expected_turn_id: []const u8,
@@ -2557,7 +2564,7 @@ fn completedReviewTurnPageState(
         if (objectStringEquals(turn, "status", "inProgress")) return .pending;
         if (!objectStringEquals(turn, "status", "completed")) return .failed;
         if (!reviewModeItemsComplete(turn)) return .pending;
-        const rollout = std.Io.Dir.cwd().readFileAlloc(
+        const rollout = dir.readFileAlloc(
             io,
             rollout_path,
             allocator,
@@ -3204,6 +3211,7 @@ test "structured review terminal read requires completed rollout review output" 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const dir = tmp.dir;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const rollout_path = try std.fs.path.join(allocator, &.{ root, "review.jsonl" });
@@ -3224,7 +3232,7 @@ test "structured review terminal read requires completed rollout review output" 
     defer allocator.free(completed);
     try std.testing.expectEqual(
         ReviewCompletionState.passed,
-        completedReviewTurnState(allocator, io, completed, "turn-review"),
+        completedReviewTurnState(allocator, io, dir, completed, "turn-review"),
     );
     const completed_page =
         "{\"data\":[{\"id\":\"turn-review\",\"status\":\"completed\",\"items\":[" ++
@@ -3235,6 +3243,7 @@ test "structured review terminal read requires completed rollout review output" 
         completedReviewTurnPageState(
             allocator,
             io,
+            dir,
             completed_page,
             rollout_path,
             "turn-review",
@@ -3245,6 +3254,7 @@ test "structured review terminal read requires completed rollout review output" 
         completedReviewTurnState(
             allocator,
             io,
+            dir,
             "{\"thread\":{\"path\":null,\"turns\":[{" ++
                 "\"id\":\"turn-review\",\"status\":\"inProgress\"}]}}",
             "turn-review",

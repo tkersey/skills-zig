@@ -3156,6 +3156,7 @@ test "streaming lineage lowering is selected from non-token topology" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "definition.json",

@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
@@ -173,6 +174,19 @@ const Options = struct {
     capsule_validation_bytes: ?[]const u8 = null,
     plan_bytes: ?[]const u8 = null,
     plan_validation_bytes: ?[]const u8 = null,
+};
+
+const StoreSelection = union(enum) {
+    repository: ?[]const u8,
+    explicit: []const u8,
+};
+
+/// Borrows the filesystem directory and environment strings for one command.
+const Operation = struct {
+    fs: durable_store.Fs,
+    store_selection: StoreSelection,
+    home: ?[]const u8,
+    environ: *const std.process.Environ.Map,
 };
 
 const ValidatedInput = struct {
@@ -534,28 +548,85 @@ const ThreadHistorySnapshot = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) !u8 {
+    execute(init) catch |err| return switch (err) {
+        error.CommandReportedSuccess => 0,
+        error.CommandReportedFailure => 1,
+        error.CommandReportedRejection => 2,
+        else => err,
+    };
+    return 0;
+}
+
+fn execute(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var stdout = std.Io.File.stdout().writer(init.io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &stdout.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return;
     var options = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        try usageFailure(init.io, @errorName(err), null);
     };
     options.home = init.environ_map.get("HOME") orelse "";
     options.path_env = init.environ_map.get("PATH") orelse "";
-    configured_store_root_override = options.store_root orelse
-        init.environ_map.get("CAS_STORE_ROOT");
-    configured_store_cwd = options.cwd;
+    const root_override = options.store_root orelse init.environ_map.get("CAS_STORE_ROOT");
+    const op = Operation{
+        .fs = .init(init.io, .cwd()),
+        .store_selection = if (root_override) |root| .{ .explicit = root } else .{
+            .repository = options.cwd,
+        },
+        .home = init.environ_map.get("HOME"),
+        .environ = init.environ_map,
+    };
 
     switch (options.command) {
-        .preflight => try cmdPreflight(allocator, init.io, options),
-        .run => try cmdRun(allocator, init.io, options, false),
-        .start => try cmdRun(allocator, init.io, options, true),
-        .status => try cmdStatus(allocator, options),
-        .wait => try cmdWait(allocator, options),
-        .interrupt => try cmdInterrupt(allocator, options),
-        .receipt => try cmdReceipt(allocator, options),
-        .cleanup => try cmdCleanup(allocator, options),
+        .preflight => try cmdPreflight(op, allocator, options),
+        .run => try cmdRun(op, allocator, options, false),
+        .start => try cmdRun(op, allocator, options, true),
+        .status => try cmdStatus(op, allocator, options),
+        .wait => try cmdWait(op, allocator, options),
+        .interrupt => try cmdInterrupt(op, allocator, options),
+        .receipt => try cmdReceipt(op, allocator, options),
+        .cleanup => try cmdCleanup(op, allocator, options),
     }
+}
+
+fn usageFailure(io: std.Io, err_token: []const u8, detail: ?[]const u8) !noreturn {
+    var stderr = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(
+        &stderr.interface,
+        HelpSurface,
+        Version,
+        err_token,
+        detail,
+    ) catch return error.CommandReportedFailure;
+    return error.CommandReportedRejection;
+}
+
+fn printDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = io.lockStderr(&buffer, null) catch return;
+    defer io.unlockStderr();
+    stderr.file_writer.interface.print(format, args) catch return;
+}
+
+fn testOperation() Operation {
+    return .{
+        .fs = .init(std.testing.io, .cwd()),
+        .store_selection = .{ .repository = null },
+        .home = null,
+        .environ = &.{ .array_hash_map = .empty, .allocator = std.testing.allocator },
+    };
 }
 
 fn parseArgs(argv: []const []const u8) !Options {
@@ -688,14 +759,14 @@ fn isSafePathComponent(value: []const u8) bool {
     return true;
 }
 
-fn cmdPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
-    const result = runPreflight(allocator, io, options) catch |err| {
-        try printPreflightFailure(allocator, options, err);
-        std.process.exit(1);
+fn cmdPreflight(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
+    const result = runPreflight(op, allocator, options) catch |err| {
+        try printPreflightFailure(op, allocator, options, err);
+        return error.CommandReportedFailure;
     };
     defer deinitPreflightResult(allocator, result);
-    try printJsonValue(allocator, .{ .session_inquiry_preflight = result });
-    if (!result.inquiry_allowed) std.process.exit(2);
+    try printJsonValue(op, allocator, .{ .session_inquiry_preflight = result });
+    if (!result.inquiry_allowed) return error.CommandReportedRejection;
 }
 
 const RunPaths = struct {
@@ -708,25 +779,35 @@ const RunPaths = struct {
     receipt_dir: []const u8,
 };
 
-fn requiredRunFlag(value: ?[]const u8, flag: []const u8) []const u8 {
-    return value orelse core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", flag);
+fn requiredRunFlag(op: Operation, value: ?[]const u8, flag: []const u8) ![]const u8 {
+    return value orelse try usageFailure(op.fs.io, "MissingFlag", flag);
 }
 
-fn requiredRunPaths(options: Options) RunPaths {
+fn requiredRunPaths(op: Operation, options: Options) !RunPaths {
     return .{
-        .capsule = requiredRunFlag(options.capsule_path, "--capsule"),
-        .capsule_validation = requiredRunFlag(
+        .capsule = try requiredRunFlag(op, options.capsule_path, "--capsule"),
+        .capsule_validation = try requiredRunFlag(
+            op,
             options.capsule_validation_path,
             "--capsule-validation",
         ),
-        .capsule_definition = requiredRunFlag(
+        .capsule_definition = try requiredRunFlag(
+            op,
             options.capsule_definition_path,
             "--capsule-definition",
         ),
-        .plan = requiredRunFlag(options.plan_path, "--plan"),
-        .plan_validation = requiredRunFlag(options.plan_validation_path, "--plan-validation"),
-        .plan_definition = requiredRunFlag(options.plan_definition_path, "--plan-definition"),
-        .receipt_dir = requiredRunFlag(options.receipt_dir, "--receipt-dir"),
+        .plan = try requiredRunFlag(op, options.plan_path, "--plan"),
+        .plan_validation = try requiredRunFlag(
+            op,
+            options.plan_validation_path,
+            "--plan-validation",
+        ),
+        .plan_definition = try requiredRunFlag(
+            op,
+            options.plan_definition_path,
+            "--plan-definition",
+        ),
+        .receipt_dir = try requiredRunFlag(op, options.receipt_dir, "--receipt-dir"),
     };
 }
 
@@ -741,6 +822,7 @@ const BoundRunInput = struct {
 };
 
 fn bindRunInput(
+    op: Operation,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     validation_path: []const u8,
@@ -749,27 +831,29 @@ fn bindRunInput(
     input_name: []const u8,
     failure: FailureCode,
 ) !BoundRunInput {
-    const absolute = absoluteLexicalPathAlloc(allocator, definition_path) catch |err| {
-        try printFailureJson(allocator, failure, @errorName(err));
-        std.process.exit(2);
+    const absolute = absoluteLexicalPathAlloc(op, allocator, definition_path) catch |err| {
+        try printFailureJson(op, allocator, failure, @errorName(err));
+        return error.CommandReportedRejection;
     };
     errdefer allocator.free(absolute);
     const validated = validateLedgerInput(
+        op,
         allocator,
         input_path,
         validation_path,
         definition_id,
         input_name,
     ) catch |err| {
-        try printFailureJson(allocator, failure, @errorName(err));
-        std.process.exit(2);
+        try printFailureJson(op, allocator, failure, @errorName(err));
+        return error.CommandReportedRejection;
     };
     return .{ .definition_path = absolute, .validated = validated };
 }
 
-fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: bool) !void {
-    const paths = requiredRunPaths(options);
+fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detached: bool) !void {
+    const paths = try requiredRunPaths(op, options);
     var capsule = try bindRunInput(
+        op,
         allocator,
         paths.capsule,
         paths.capsule_validation,
@@ -780,11 +864,12 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
     );
     defer capsule.deinit(allocator);
     const dcp = loadDcpBytes(allocator, capsule.validated.input) catch |err| {
-        try printFailureJson(allocator, .capsule_invalid, @errorName(err));
-        std.process.exit(2);
+        try printFailureJson(op, allocator, .capsule_invalid, @errorName(err));
+        return error.CommandReportedRejection;
     };
     defer deinitDcp(allocator, dcp);
     var plan = try bindRunInput(
+        op,
         allocator,
         paths.plan,
         paths.plan_validation,
@@ -795,8 +880,8 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
     );
     defer plan.deinit(allocator);
     const rip = loadRipBytes(allocator, plan.validated.input) catch |err| {
-        try printFailureJson(allocator, .plan_invalid, @errorName(err));
-        std.process.exit(2);
+        try printFailureJson(op, allocator, .plan_invalid, @errorName(err));
+        return error.CommandReportedRejection;
     };
     defer deinitRip(allocator, rip);
     var bound_options = options;
@@ -806,11 +891,11 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
     bound_options.plan_definition_path = plan.definition_path;
     bound_options.plan_bytes = plan.validated.input;
     bound_options.plan_validation_bytes = plan.validated.receipt;
-    try validateRunOrExit(allocator, bound_options, dcp, rip, paths.receipt_dir, detached);
+    try validateRunForCommand(op, allocator, bound_options, dcp, rip, paths.receipt_dir, detached);
     const preflight_allocator = std.heap.page_allocator;
-    const preflight = try runPreflightOrExit(
+    const preflight = try runPreflightForCommand(
+        op,
         preflight_allocator,
-        io,
         bound_options,
         dcp,
         rip,
@@ -820,6 +905,7 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
     defer deinitPreflightResult(preflight_allocator, preflight);
     const run_allocator = std.heap.page_allocator;
     const result = try runInquiryOrRecordFailure(
+        op,
         run_allocator,
         bound_options,
         dcp,
@@ -829,11 +915,12 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, options: Options, detached: 
         detached,
     );
     defer deinitRunOutput(run_allocator, result);
-    try printJsonValue(allocator, .{ .session_inquiry = result });
-    if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
+    try printJsonValue(op, allocator, .{ .session_inquiry = result });
+    if (!std.mem.eql(u8, result.failure_code, "")) return error.CommandReportedRejection;
 }
 
-fn validateRunOrExit(
+fn validateRunForCommand(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -843,37 +930,47 @@ fn validateRunOrExit(
 ) !void {
     if (!std.mem.eql(u8, rip.plan_id, dcp.packet_id)) {
         try printFailureJson(
+            op,
             allocator,
             .plan_invalid,
             "RIP source_capsule does not match DCP packet_id",
         );
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     }
-    const gate = validateInquiryInputs(allocator, dcp, rip, options);
+    const gate = validateInquiryInputs(op, allocator, dcp, rip, options);
     if (gate.valid) return;
-    try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, gate, detached);
-    try printFailureJson(allocator, gate.failure_code orelse .receipt_invalid, gate.hint);
-    std.process.exit(2);
+    try persistInvalidRunArtifacts(op, allocator, options, dcp, rip, receipt_dir, gate, detached);
+    try printFailureJson(op, allocator, gate.failure_code orelse .receipt_invalid, gate.hint);
+    return error.CommandReportedRejection;
 }
 
-fn runPreflightOrExit(
+fn runPreflightForCommand(
+    op: Operation,
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: Options,
     dcp: Dcp,
     rip: Rip,
     receipt_dir: []const u8,
     detached: bool,
 ) !PreflightResult {
-    const preflight = runPreflight(allocator, io, options) catch |err| {
+    const preflight = runPreflight(op, allocator, options) catch |err| {
         const failed = GateResult{
             .valid = false,
             .failure_code = .codex_incompatible,
             .hint = @errorName(err),
         };
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
-        try printFailureJson(allocator, .codex_incompatible, @errorName(err));
-        std.process.exit(1);
+        try persistInvalidRunArtifacts(
+            op,
+            allocator,
+            options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
+        try printFailureJson(op, allocator, .codex_incompatible, @errorName(err));
+        return error.CommandReportedFailure;
     };
     errdefer deinitPreflightResult(allocator, preflight);
     const lineage_supported = if (dcp.source_thread_id != null)
@@ -891,12 +988,13 @@ fn runPreflightOrExit(
             "exact Codex app-server preflight did not prove the required " ++
                 "rollout-transcript inquiry behavior",
     };
-    try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
-    try printFailureJson(allocator, .codex_incompatible, failed.hint);
-    std.process.exit(2);
+    try persistInvalidRunArtifacts(op, allocator, options, dcp, rip, receipt_dir, failed, detached);
+    try printFailureJson(op, allocator, .codex_incompatible, failed.hint);
+    return error.CommandReportedRejection;
 }
 
 fn runInquiryOrRecordFailure(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -906,21 +1004,30 @@ fn runInquiryOrRecordFailure(
     detached: bool,
 ) !RunOutput {
     const result = if (detached)
-        startDetachedInquiry(allocator, options, dcp, rip, receipt_dir, preflight)
+        startDetachedInquiry(op, allocator, options, dcp, rip, receipt_dir, preflight)
     else
-        executeLiveInquiry(allocator, options, dcp, rip, receipt_dir, preflight, false);
+        executeLiveInquiry(op, allocator, options, dcp, rip, receipt_dir, preflight, false);
     return result catch |err| {
         const failed = GateResult{
             .valid = false,
             .failure_code = failureCodeForError(err),
             .hint = @errorName(err),
         };
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
+        try persistInvalidRunArtifacts(
+            op,
+            allocator,
+            options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         return .{
             .inquiry_id = rip.inquiry_id,
             .state = @tagName(InquiryState.failed),
             .receipt_dir = receipt_dir,
-            .state_ref = try stateRecordPath(allocator, options.home, rip.inquiry_id),
+            .state_ref = try stateRecordPath(op, allocator, options.home, rip.inquiry_id),
             .events_ref = try allocator.print("{s}/events.jsonl", .{receipt_dir}),
             .summary_ref = try allocator.print("{s}/summary.json", .{receipt_dir}),
             .failure_code = (failed.failure_code orelse FailureCode.receipt_invalid).asString(),
@@ -929,38 +1036,38 @@ fn runInquiryOrRecordFailure(
     };
 }
 
-fn cmdStatus(allocator: std.mem.Allocator, options: Options) !void {
+fn cmdStatus(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
-    const path = try stateRecordPath(allocator, options.home, inquiry_id);
-    const raw = readFileAlloc(allocator, path, MaxInputBytes) catch |err| {
-        try printFailureJson(allocator, FailureCode.receipt_invalid, @errorName(err));
-        std.process.exit(1);
+    const path = try stateRecordPath(op, allocator, options.home, inquiry_id);
+    const raw = readFileAlloc(op, allocator, path, MaxInputBytes) catch |err| {
+        try printFailureJson(op, allocator, FailureCode.receipt_invalid, @errorName(err));
+        return error.CommandReportedFailure;
     };
     defer allocator.free(raw);
-    try printRawJson(raw);
+    try printRawJson(op, raw);
 }
 
-fn cmdWait(allocator: std.mem.Allocator, options: Options) !void {
+fn cmdWait(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
-    const result = waitDetachedInquiry(allocator, options, inquiry_id) catch |err| {
-        try printFailureJson(allocator, failureCodeForError(err), @errorName(err));
-        std.process.exit(1);
+    const result = waitDetachedInquiry(op, allocator, options, inquiry_id) catch |err| {
+        try printFailureJson(op, allocator, failureCodeForError(err), @errorName(err));
+        return error.CommandReportedFailure;
     };
     defer deinitRunOutput(allocator, result);
-    try printJsonValue(allocator, .{ .session_inquiry = result });
-    if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
+    try printJsonValue(op, allocator, .{ .session_inquiry = result });
+    if (!std.mem.eql(u8, result.failure_code, "")) return error.CommandReportedRejection;
 }
 
-fn cmdInterrupt(allocator: std.mem.Allocator, options: Options) !void {
+fn cmdInterrupt(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
-    const result = interruptDetachedInquiry(allocator, options, inquiry_id) catch |err| {
-        try printJsonValue(allocator, .{
+    const result = interruptDetachedInquiry(op, allocator, options, inquiry_id) catch |err| {
+        try printJsonValue(op, allocator, .{
             .session_inquiry_interrupt = .{
                 .inquiry_id = inquiry_id,
                 .interrupted = false,
@@ -968,17 +1075,22 @@ fn cmdInterrupt(allocator: std.mem.Allocator, options: Options) !void {
                 .failure_hint = @errorName(err),
             },
         });
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
-    try printJsonValue(allocator, result);
-    if (!result.session_inquiry_interrupt.interrupted) std.process.exit(2);
+    try printJsonValue(op, allocator, result);
+    if (!result.session_inquiry_interrupt.interrupted) return error.CommandReportedRejection;
 }
 
-fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
+fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
-    const maybe_record = loadDetachedRecordAlloc(allocator, options.home, inquiry_id) catch null;
+    const maybe_record = loadDetachedRecordAlloc(
+        op,
+        allocator,
+        options.home,
+        inquiry_id,
+    ) catch null;
     defer if (maybe_record) |loaded| freeDetachedRecord(allocator, loaded);
     const was_alive = if (maybe_record) |loaded|
         cas_websocket.processAlive(loaded.managed_server_pid)
@@ -987,6 +1099,7 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
     var cleanup_result: CleanupForksResult = .{};
     if (maybe_record) |loaded| {
         cleanup_result = cleanupPersistedForks(
+            op,
             allocator,
             options,
             inquiry_id,
@@ -996,12 +1109,16 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
             .failed = 1,
             .failure_hint = @errorName(err),
         };
-        if (was_alive) {
-            cas_websocket.terminateProcess(loaded.managed_server_pid);
-        }
+        if (was_alive) cas_websocket.terminateProcess(loaded.managed_server_pid);
     }
-    const cleanup_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "cleanup.json");
-    try ensureParentDir(cleanup_path);
+    const cleanup_path = try inquiryPathJoin(
+        op,
+        allocator,
+        options.home,
+        inquiry_id,
+        "cleanup.json",
+    );
+    try ensureParentDir(op, cleanup_path);
     const cleanup_status = if (cleanup_result.failed > 0)
         "cleanup_failed"
     else if (cleanup_result.persisted_forks > 0)
@@ -1025,8 +1142,8 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
             .warnings = warnings,
         },
     };
-    try writeJsonFile(allocator, cleanup_path, payload);
-    try printJsonValue(allocator, .{ .session_inquiry_cleanup = payload.cleanup });
+    try writeJsonFile(op, allocator, cleanup_path, payload);
+    try printJsonValue(op, allocator, .{ .session_inquiry_cleanup = payload.cleanup });
 }
 
 const CleanupForksResult = struct {
@@ -1038,6 +1155,7 @@ const CleanupForksResult = struct {
 };
 
 fn cleanupPersistedForks(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
@@ -1056,11 +1174,16 @@ fn cleanupPersistedForks(
             record.cwd,
             record.codex_path,
             hook_policy,
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
+            op.fs.directory(),
+            op.environ,
         );
         break :blk recovery_server.?.listen_url;
     };
     var client = try cas_client.Client.start(allocator, .{
+        .io = op.fs.io,
+        .dir = op.fs.directory(),
+        .environ = op.environ,
         .cwd = record.cwd,
         .codex_path = record.codex_path,
         .client_name = "cas-session-inquiry-cleanup",
@@ -1082,22 +1205,23 @@ fn cleanupPersistedForks(
         client.deinit();
     }
 
-    const lane_glob = try inquiryPathJoin(allocator, options.home, inquiry_id, "lanes/*.json");
+    const lane_glob = try inquiryPathJoin(op, allocator, options.home, inquiry_id, "lanes/*.json");
     defer allocator.free(lane_glob);
-    const lane_files = try expandSimpleGlobAlloc(allocator, lane_glob);
+    const lane_files = try expandSimpleGlobAlloc(op, allocator, lane_glob);
     defer freeStringList(allocator, lane_files);
 
-    return cleanupLaneFiles(allocator, &client, lane_files);
+    return cleanupLaneFiles(op, allocator, &client, lane_files);
 }
 
 fn cleanupLaneFiles(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     lane_files: []const []const u8,
 ) !CleanupForksResult {
     var result: CleanupForksResult = .{};
     for (lane_files) |lane_path| {
-        const handle = loadLaneHandleAlloc(allocator, lane_path) catch |err| {
+        const handle = loadLaneHandleAlloc(op, allocator, lane_path) catch |err| {
             result.failed += 1;
             result.failure_hint = @errorName(err);
             continue;
@@ -1105,9 +1229,9 @@ fn cleanupLaneFiles(
         defer freeLaneHandle(allocator, handle);
         if (handle.fork_policy.ephemeral or handle.fork_cleaned) continue;
         result.persisted_forks += 1;
-        if (cleanupForkWithMethod(allocator, client, handle, "thread/delete")) {
+        if (cleanupForkWithMethod(op, allocator, client, handle, "thread/delete")) {
             result.deleted += 1;
-        } else if (cleanupForkWithMethod(allocator, client, handle, "thread/archive")) {
+        } else if (cleanupForkWithMethod(op, allocator, client, handle, "thread/archive")) {
             result.archived += 1;
         } else {
             result.failed += 1;
@@ -1118,12 +1242,14 @@ fn cleanupLaneFiles(
 }
 
 fn cleanupForkWithMethod(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     handle: LaneHandle,
     method: []const u8,
 ) bool {
     return cleanupForkThreadIdWithMethod(
+        op,
         allocator,
         client,
         handle.lane_events,
@@ -1133,6 +1259,7 @@ fn cleanupForkWithMethod(
 }
 
 fn cleanupForkThreadIdWithMethod(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     lane_events: []const u8,
@@ -1146,7 +1273,7 @@ fn cleanupForkThreadIdWithMethod(
         .{ .event = method, .thread_id = fork_thread_id },
     ) catch return false;
     defer allocator.free(request_event);
-    appendLine(lane_events, request_event) catch return false;
+    appendLine(op, lane_events, request_event) catch return false;
     const response = client.requestJson(method, params) catch |err| {
         const error_event = stringifyAnyAlloc(allocator, .{
             .event = method,
@@ -1154,27 +1281,27 @@ fn cleanupForkThreadIdWithMethod(
             .failure = client.lastError() orelse @errorName(err),
         }) catch return false;
         defer allocator.free(error_event);
-        appendLine(lane_events, error_event) catch return false;
+        appendLine(op, lane_events, error_event) catch return false;
         return false;
     };
     defer allocator.free(response);
-    appendLine(lane_events, response) catch return false;
+    appendLine(op, lane_events, response) catch return false;
     return true;
 }
 
-fn cmdReceipt(allocator: std.mem.Allocator, options: Options) !void {
+fn cmdReceipt(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const glob = options.receipt_glob orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--glob");
+        try usageFailure(op.fs.io, "MissingFlag", "--glob");
     };
-    const files = try expandSimpleGlobAlloc(allocator, glob);
+    const files = try expandSimpleGlobAlloc(op, allocator, glob);
     var valid: usize = 0;
     var invalid: usize = 0;
     for (files) |path| {
-        const receipt_valid = readFirReceiptValid(allocator, path) catch false;
+        const receipt_valid = readFirReceiptValid(op, allocator, path) catch false;
         if (receipt_valid) valid += 1 else invalid += 1;
     }
     if (std.mem.eql(u8, options.receipt_format, "json") or options.json) {
-        try printJsonValue(allocator, .{
+        try printJsonValue(op, allocator, .{
             .session_inquiry_receipt = .{
                 .glob = glob,
                 .format = "json",
@@ -1187,17 +1314,17 @@ fn cmdReceipt(allocator: std.mem.Allocator, options: Options) !void {
         });
     } else {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
         try stdout.print("files valid invalid\n{d} {d} {d}\n", .{ files.len, valid, invalid });
     }
-    if (invalid > 0) std.process.exit(2);
+    if (invalid > 0) return error.CommandReportedRejection;
 }
 
-fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !PreflightResult {
-    var shared = try runSharedSessionInquiryPreflight(allocator, io, options);
+fn runPreflight(op: Operation, allocator: std.mem.Allocator, options: Options) !PreflightResult {
+    var shared = try runSharedSessionInquiryPreflight(op, allocator, options);
     defer shared.deinit(allocator);
     const fingerprint_source = try allocator.print(
         "cas-session-inquiry-schema-fingerprint/v1\x00{s}\x00{s}",
@@ -1207,7 +1334,7 @@ fn runPreflight(allocator: std.mem.Allocator, io: std.Io, options: Options) !Pre
     const fingerprint = sha256HexAlloc(allocator, fingerprint_source) catch
         return error.SchemaFingerprintFailed;
     errdefer allocator.free(fingerprint);
-    const caps = try deriveCapabilitiesFromCache(allocator, shared.experimental_path);
+    const caps = try deriveCapabilitiesFromCache(op, allocator, shared.experimental_path);
     var missing = try missingInquiryCapabilities(allocator, shared, caps);
     defer missing.deinit(allocator);
     const missing_owned = try allocator.dupe([]const u8, missing.items);
@@ -1308,11 +1435,14 @@ fn missingInquiryCapabilities(
 }
 
 fn runSharedSessionInquiryPreflight(
+    op: Operation,
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: Options,
 ) !SharedSessionInquiryPreflight {
-    const self_path = std.process.executablePathAlloc(io, allocator) catch |err| switch (err) {
+    const self_path = std.process.executablePathAlloc(
+        op.fs.io,
+        allocator,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.PreflightExecutablePathOutOfMemory,
         else => return err,
     };
@@ -1347,18 +1477,21 @@ fn runSharedSessionInquiryPreflight(
     }
     argv.append(allocator, "--json") catch return error.PreflightArgumentsOutOfMemory;
 
-    return invokeSharedInquiryPreflight(allocator, io, options, argv.items);
+    return invokeSharedInquiryPreflight(op, allocator, options, argv.items);
 }
 
 fn invokeSharedInquiryPreflight(
+    op: Operation,
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: Options,
     argv: []const []const u8,
 ) !SharedSessionInquiryPreflight {
-    var child = std.process.spawn(io, .{
+    var child_cwd = try core_io.openSearchDirectory(op.fs.io, op.fs.directory(), options.cwd, .{});
+    defer child_cwd.close(op.fs.io);
+    var child = std.process.spawn(op.fs.io, .{
         .argv = argv,
-        .cwd = if (std.mem.eql(u8, options.cwd, ".")) .inherit else .{ .path = options.cwd },
+        .cwd = .{ .dir = child_cwd },
+        .environ_map = op.environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -1366,10 +1499,10 @@ fn invokeSharedInquiryPreflight(
         error.OutOfMemory => return error.PreflightProcessOutOfMemory,
         else => return err,
     };
-    defer child.kill(io);
+    defer child.kill(op.fs.io);
     const stdout_file = child.stdout orelse return error.PreflightMissingStdout;
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout_reader = stdout_file.reader(io, &stdout_buffer);
+    var stdout_reader = stdout_file.reader(op.fs.io, &stdout_buffer);
     const stdout = stdout_reader.interface.allocRemaining(
         allocator,
         .limited(2 * 1024 * 1024),
@@ -1379,7 +1512,7 @@ fn invokeSharedInquiryPreflight(
         else => return err,
     };
     defer allocator.free(stdout);
-    const term = try child.wait(io);
+    const term = try child.wait(op.fs.io);
     const exit_code: u8 = switch (term) {
         .exited => |code| code,
         else => return error.AppServerPreflightFailed,
@@ -1662,15 +1795,16 @@ fn deinitRunOutput(allocator: std.mem.Allocator, result: RunOutput) void {
 }
 
 fn validateLedgerInput(
+    op: Operation,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     receipt_path: []const u8,
     definition_id: []const u8,
     input_name: []const u8,
 ) !ValidatedInput {
-    const input = try readFileAlloc(allocator, input_path, MaxInputBytes);
+    const input = try readFileAlloc(op, allocator, input_path, MaxInputBytes);
     errdefer allocator.free(input);
-    const receipt = try readFileAlloc(allocator, receipt_path, MaxInputBytes);
+    const receipt = try readFileAlloc(op, allocator, receipt_path, MaxInputBytes);
     errdefer allocator.free(receipt);
     const definition_digest = try validateLedgerReceiptBytes(
         allocator,
@@ -1688,28 +1822,37 @@ fn validateLedgerInput(
 }
 
 fn deriveCapabilitiesFromCache(
+    op: Operation,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
 ) !SchemaCapabilities {
-    var client_request = try loadSchema(allocator, cache_dir, &.{"ClientRequest.json"});
+    var client_request = try loadSchema(op, allocator, cache_dir, &.{"ClientRequest.json"});
     defer client_request.deinit();
-    var fork_params = try loadSchema(allocator, cache_dir, &.{ "v2", "ThreadForkParams.json" });
+    var fork_params = try loadSchema(op, allocator, cache_dir, &.{ "v2", "ThreadForkParams.json" });
     defer fork_params.deinit();
-    var fork_response = try loadSchema(allocator, cache_dir, &.{ "v2", "ThreadForkResponse.json" });
+    var fork_response = try loadSchema(
+        op,
+        allocator,
+        cache_dir,
+        &.{ "v2", "ThreadForkResponse.json" },
+    );
     defer fork_response.deinit();
     var rollback_params = try loadSchema(
+        op,
         allocator,
         cache_dir,
         &.{ "v2", "ThreadRollbackParams.json" },
     );
     defer rollback_params.deinit();
     var turns_list_params = try loadSchema(
+        op,
         allocator,
         cache_dir,
         &.{ "v2", "ThreadTurnsListParams.json" },
     );
     defer turns_list_params.deinit();
     var turns_list_response = try loadSchema(
+        op,
         allocator,
         cache_dir,
         &.{ "v2", "ThreadTurnsListResponse.json" },
@@ -1726,6 +1869,7 @@ fn deriveCapabilitiesFromCache(
 }
 
 fn loadSchema(
+    op: Operation,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     suffix: []const []const u8,
@@ -1734,7 +1878,7 @@ fn loadSchema(
     defer allocator.free(relative);
     const path = try std.fs.path.join(allocator, &.{ cache_dir, relative });
     defer allocator.free(path);
-    const raw = try readFileAlloc(allocator, path, MaxSchemaBytes);
+    const raw = try readFileAlloc(op, allocator, path, MaxSchemaBytes);
     defer allocator.free(raw);
     return std.json.parseFromSlice(
         std.json.Value,
@@ -1843,8 +1987,8 @@ fn schemaDefinitionPropertyPresent(
     return properties.get(property) != null;
 }
 
-fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
-    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+fn loadDcp(op: Operation, allocator: std.mem.Allocator, path: []const u8) !Dcp {
+    const raw = try readFileAlloc(op, allocator, path, MaxInputBytes);
     defer allocator.free(raw);
     return loadDcpBytes(allocator, raw);
 }
@@ -1857,6 +2001,7 @@ fn loadDcpBytes(allocator: std.mem.Allocator, raw: []const u8) !Dcp {
 }
 
 fn validateLedgerInputReceipt(
+    op: Operation,
     allocator: std.mem.Allocator,
     receipt_path: []const u8,
     input_path: []const u8,
@@ -1864,9 +2009,9 @@ fn validateLedgerInputReceipt(
     expected_definition_digest: []const u8,
     input_name: []const u8,
 ) !ValidatedInput {
-    const input = try readFileAlloc(allocator, input_path, MaxInputBytes);
+    const input = try readFileAlloc(op, allocator, input_path, MaxInputBytes);
     errdefer allocator.free(input);
-    const receipt = try readFileAlloc(allocator, receipt_path, MaxInputBytes);
+    const receipt = try readFileAlloc(op, allocator, receipt_path, MaxInputBytes);
     errdefer allocator.free(receipt);
     const definition_digest = try validateLedgerReceiptBytes(
         allocator,
@@ -2314,8 +2459,8 @@ fn deinitDcp(allocator: std.mem.Allocator, dcp: Dcp) void {
     }
 }
 
-fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
-    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+fn loadRip(op: Operation, allocator: std.mem.Allocator, path: []const u8) !Rip {
+    const raw = try readFileAlloc(op, allocator, path, MaxInputBytes);
     defer allocator.free(raw);
     return loadRipBytes(allocator, raw);
 }
@@ -2543,12 +2688,14 @@ test "replay mode is one-fork pre-decision only" {
 }
 
 fn validateInquiryInputs(
+    op: Operation,
     allocator: std.mem.Allocator,
     dcp: Dcp,
     rip: Rip,
     options: Options,
 ) GateResult {
     const lineage = resolveSourceLineage(
+        op,
         allocator,
         dcp,
         rip,
@@ -2622,12 +2769,19 @@ fn invalidInquiryGate(failure: FailureCode, hint: []const u8) GateResult {
     return .{ .valid = false, .failure_code = failure, .hint = hint };
 }
 
-fn resolveSourceLineage(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip) !SourceLineageMode {
+fn resolveSourceLineage(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    dcp: Dcp,
+    rip: Rip,
+) !SourceLineageMode {
     if (dcp.source_thread_id != null) return .thread_fork;
     const rollout_path = dcp.source_rollout_path orelse return error.SourceNotFound;
     if (!std.mem.eql(u8, rip.workspace_policy, "transcript_only")) return error.WorkspaceMismatch;
 
     var trace = canonical_trace.parseSessionTrace(
+        op.fs.io,
+        op.fs.directory(),
         allocator,
         rollout_path,
         .{},
@@ -2732,6 +2886,7 @@ fn anchorForHorizon(dcp: Dcp, horizon: []const u8) ?Anchor {
 }
 
 const InquiryExecution = struct {
+    operation: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -2745,6 +2900,7 @@ const InquiryExecution = struct {
 };
 
 fn executeLiveInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -2754,17 +2910,18 @@ fn executeLiveInquiry(
     detached: bool,
 ) !RunOutput {
     if (detached) return error.InquiryTransportLost;
-    try ensureDir(receipt_dir);
+    try ensureDir(op, receipt_dir);
     const lanes_dir = try allocator.print("{s}/lanes", .{receipt_dir});
     defer allocator.free(lanes_dir);
-    try ensureDir(lanes_dir);
-    try persistInputCopies(allocator, options, rip.inquiry_id);
-    const inquiry_cwd = try inquiryWorkspaceCwdAlloc(allocator, options, rip);
+    try ensureDir(op, lanes_dir);
+    try persistInputCopies(op, allocator, options, rip.inquiry_id);
+    const inquiry_cwd = try inquiryWorkspaceCwdAlloc(op, allocator, options, rip);
     defer allocator.free(inquiry_cwd);
     const events_path = try allocator.print("{s}/events.jsonl", .{receipt_dir});
     const summary_path = try allocator.print("{s}/summary.json", .{receipt_dir});
-    const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
+    const state_path = try stateRecordPath(op, allocator, options.home, rip.inquiry_id);
     const run = InquiryExecution{
+        .operation = op,
         .allocator = allocator,
         .options = options,
         .dcp = dcp,
@@ -2776,23 +2933,23 @@ fn executeLiveInquiry(
         .summary_path = summary_path,
         .state_path = state_path,
     };
-    try appendSimpleEvent(allocator, events_path, "run_initialized");
+    try appendSimpleEvent(op, allocator, events_path, "run_initialized");
 
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
     var managed_server = try startInquiryManagedServer(
+        op,
         allocator,
         inquiry_cwd,
-        null,
         preflight.codex_path,
         hook_policy,
         options.code_mode_host,
-        std.Io.Threaded.global_single_threaded.io(),
+        null,
     );
     defer managed_server.kill();
     defer managed_server.deinit(allocator);
-    try appendSimpleEvent(allocator, events_path, "client_start");
+    try appendSimpleEvent(op, allocator, events_path, "client_start");
     var client = try startLiveInquiryClient(run, hook_policy, managed_server.listen_url);
-    try appendSimpleEvent(allocator, events_path, "client_started");
+    try appendSimpleEvent(op, allocator, events_path, "client_started");
     defer {
         client.close();
         client.deinit();
@@ -2804,6 +2961,7 @@ fn executeLiveInquiry(
 }
 
 fn executeLiveLanes(run: InquiryExecution, client: *cas_client.Client) !FirCounts {
+    const op = run.operation;
     var valid_count: u64 = 0;
     var invalid_count: u64 = 0;
     var launched: u64 = 0;
@@ -2811,6 +2969,7 @@ fn executeLiveLanes(run: InquiryExecution, client: *cas_client.Client) !FirCount
         var ordinal: u64 = 0;
         while (ordinal < lane.fork_count) : (ordinal += 1) {
             const receipt_valid = try executeLaneForkWithRetries(
+                op,
                 run.allocator,
                 client,
                 run.options,
@@ -2833,12 +2992,14 @@ fn executeLiveLanes(run: InquiryExecution, client: *cas_client.Client) !FirCount
 }
 
 fn finishLiveInquiry(run: InquiryExecution, counts: FirCounts, detached: bool) !RunOutput {
+    const op = run.operation;
     const valid_count = counts.valid;
     const invalid_count = counts.invalid;
     const terminal_state = terminalInquiryState(valid_count, invalid_count);
     const failure_code = if (invalid_count == 0) "" else FailureCode.receipt_invalid.asString();
     const failure_hint = if (invalid_count == 0) "" else "one or more lane FIR gates failed";
     try writeSummary(
+        op,
         run.allocator,
         run.summary_path,
         run.rip.inquiry_id,
@@ -2863,6 +3024,7 @@ fn finishLiveInquiry(run: InquiryExecution, counts: FirCounts, detached: bool) !
 }
 
 fn startDetachedInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -2870,22 +3032,24 @@ fn startDetachedInquiry(
     receipt_dir: []const u8,
     preflight: PreflightResult,
 ) !RunOutput {
-    try ensureDir(receipt_dir);
-    const receipt_root = try absoluteDirPathAlloc(allocator, receipt_dir);
+    try ensureDir(op, receipt_dir);
+    const receipt_root = try absoluteDirPathAlloc(op, allocator, receipt_dir);
     const lanes_dir = try allocator.print("{s}/lanes", .{receipt_root});
     defer allocator.free(lanes_dir);
-    try ensureDir(lanes_dir);
-    const state_lanes_dir = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, "lanes");
+    try ensureDir(op, lanes_dir);
+    const state_lanes_dir =
+        try inquiryPathJoin(op, allocator, options.home, rip.inquiry_id, "lanes");
     defer allocator.free(state_lanes_dir);
-    try ensureDir(state_lanes_dir);
-    try persistInputCopies(allocator, options, rip.inquiry_id);
-    const inquiry_cwd = try inquiryWorkspaceCwdAlloc(allocator, options, rip);
+    try ensureDir(op, state_lanes_dir);
+    try persistInputCopies(op, allocator, options, rip.inquiry_id);
+    const inquiry_cwd = try inquiryWorkspaceCwdAlloc(op, allocator, options, rip);
     defer allocator.free(inquiry_cwd);
     const events_path = try allocator.print("{s}/events.jsonl", .{receipt_root});
     const summary_path = try allocator.print("{s}/summary.json", .{receipt_root});
-    const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
+    const state_path = try stateRecordPath(op, allocator, options.home, rip.inquiry_id);
 
     const run = InquiryExecution{
+        .operation = op,
         .allocator = allocator,
         .options = options,
         .dcp = dcp,
@@ -2897,18 +3061,24 @@ fn startDetachedInquiry(
         .summary_path = summary_path,
         .state_path = state_path,
     };
+    return launchDetachedInquiry(run);
+}
+
+fn launchDetachedInquiry(run: InquiryExecution) !RunOutput {
+    const op = run.operation;
+    const allocator = run.allocator;
+    const options = run.options;
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
     var managed_server = try startInquiryManagedServer(
+        op,
         allocator,
-        inquiry_cwd,
-        receipt_root,
-        preflight.codex_path,
+        run.inquiry_cwd,
+        run.preflight.codex_path,
         hook_policy,
         options.code_mode_host,
-        std.Io.Threaded.global_single_threaded.io(),
+        run.receipt_dir,
     );
-    var keep_server = false;
-    defer if (!keep_server) managed_server.deinit(allocator);
+    defer managed_server.deinit(allocator);
 
     var client = try startDetachedInquiryClient(run, hook_policy, managed_server.listen_url);
     defer {
@@ -2920,14 +3090,14 @@ fn startDetachedInquiry(
     try startDetachedLanes(run, &client);
     try persistDetachedTransport(run, managed_server);
     try startDetachedWaiter(run, managed_server);
-    keep_server = true;
+    try managed_server.detach();
     return .{
-        .inquiry_id = rip.inquiry_id,
+        .inquiry_id = run.rip.inquiry_id,
         .state = @tagName(InquiryState.turn_running),
-        .receipt_dir = receipt_root,
-        .state_ref = state_path,
-        .events_ref = events_path,
-        .summary_ref = summary_path,
+        .receipt_dir = run.receipt_dir,
+        .state_ref = run.state_path,
+        .events_ref = run.events_path,
+        .summary_ref = run.summary_path,
         .failure_code = "",
         .failure_hint = "",
     };
@@ -2938,7 +3108,11 @@ fn startLiveInquiryClient(
     hook_policy: cas_client.hooks.HookPolicy,
     listen_url: []const u8,
 ) !cas_client.Client {
+    const op = run.operation;
     return cas_client.Client.start(run.allocator, .{
+        .io = op.fs.io,
+        .dir = op.fs.directory(),
+        .environ = op.environ,
         .cwd = run.inquiry_cwd,
         .codex_path = run.preflight.codex_path,
         .exec_approval = "decline",
@@ -2958,20 +3132,30 @@ fn verifyInquirySource(
     client: *cas_client.Client,
     record_start: bool,
 ) !void {
+    const op = run.operation;
     if (run.dcp.source_thread_id) |source_thread_id| {
         if (record_start) try appendSimpleEvent(
+            op,
             run.allocator,
             run.events_path,
             "source_thread_verify_start",
         );
-        try verifySourceThread(run.allocator, client, source_thread_id, run.dcp, run.events_path);
+        try verifySourceThread(
+            op,
+            run.allocator,
+            client,
+            source_thread_id,
+            run.dcp,
+            run.events_path,
+        );
     } else {
         if (record_start) try appendSimpleEvent(
+            op,
             run.allocator,
             run.events_path,
             "rollout_source_verify_start",
         );
-        _ = try resolveSourceLineage(run.allocator, run.dcp, run.rip);
+        _ = try resolveSourceLineage(op, run.allocator, run.dcp, run.rip);
         const verified_event = try stringifyAnyAlloc(
             run.allocator,
             .{
@@ -2980,7 +3164,7 @@ fn verifyInquirySource(
             },
         );
         defer run.allocator.free(verified_event);
-        try appendLine(run.events_path, verified_event);
+        try appendLine(op, run.events_path, verified_event);
     }
 }
 
@@ -2991,6 +3175,7 @@ fn writeLiveTerminalState(
     failure_hint: []const u8,
     detached: bool,
 ) !void {
+    const op = run.operation;
     const state = .{
         .session_inquiry_record = .{
             .record_version = "SIR-v1",
@@ -3017,16 +3202,16 @@ fn writeLiveTerminalState(
                 .timeout_ms = run.rip.timeout_ms,
             },
             .tokens_used = 0,
-            .started_at = nowMillis(),
-            .updated_at = nowMillis(),
-            .terminal_at = nowMillis(),
+            .started_at = nowMillis(op),
+            .updated_at = nowMillis(op),
+            .terminal_at = nowMillis(op),
             .failure_code = failure_code,
             .failure_hint = failure_hint,
             .summary_ref = run.summary_path,
         },
     };
-    try ensureParentDir(run.state_path);
-    try writeJsonFile(run.allocator, run.state_path, state);
+    try ensureParentDir(op, run.state_path);
+    try writeJsonFile(op, run.allocator, run.state_path, state);
 }
 
 fn startDetachedInquiryClient(
@@ -3034,7 +3219,11 @@ fn startDetachedInquiryClient(
     hook_policy: cas_client.hooks.HookPolicy,
     listen_url: []const u8,
 ) !cas_client.Client {
+    const op = run.operation;
     return cas_client.Client.start(run.allocator, .{
+        .io = op.fs.io,
+        .dir = op.fs.directory(),
+        .environ = op.environ,
         .cwd = run.inquiry_cwd,
         .codex_path = run.preflight.codex_path,
         .client_name = "cas-session-inquiry",
@@ -3053,6 +3242,7 @@ fn startDetachedInquiryClient(
 }
 
 fn startDetachedLanes(run: InquiryExecution, client: *cas_client.Client) !void {
+    const op = run.operation;
     var launched: u64 = 0;
     for (run.rip.lanes) |lane| {
         var ordinal: u64 = 0;
@@ -3060,6 +3250,7 @@ fn startDetachedLanes(run: InquiryExecution, client: *cas_client.Client) !void {
             if (launched >= run.rip.max_forks) return error.BudgetExhausted;
             launched += 1;
             _ = try startLaneFork(
+                op,
                 run.allocator,
                 client,
                 run.options,
@@ -3081,14 +3272,16 @@ fn persistDetachedTransport(
     run: InquiryExecution,
     managed_server: cas_websocket.ManagedServer,
 ) !void {
+    const op = run.operation;
     const transport_path = try inquiryPathJoin(
+        op,
         run.allocator,
         run.options.home,
         run.rip.inquiry_id,
         "managed-transport.json",
     );
     defer run.allocator.free(transport_path);
-    try writeJsonFile(run.allocator, transport_path, .{
+    try writeJsonFile(op, run.allocator, transport_path, .{
         .managed_transport = .{
             .selected_transport = "managed-ws",
             .detached = true,
@@ -3106,7 +3299,9 @@ fn persistDetachedTransport(
 }
 
 fn startDetachedWaiter(run: InquiryExecution, managed_server: cas_websocket.ManagedServer) !void {
+    const op = run.operation;
     try writeInquiryState(
+        op,
         run.allocator,
         run.state_path,
         run.dcp,
@@ -3126,6 +3321,7 @@ fn startDetachedWaiter(run: InquiryExecution, managed_server: cas_websocket.Mana
         null,
     );
     try writeSummary(
+        op,
         run.allocator,
         run.summary_path,
         run.rip.inquiry_id,
@@ -3136,9 +3332,10 @@ fn startDetachedWaiter(run: InquiryExecution, managed_server: cas_websocket.Mana
         "",
         "",
     );
-    const store_root = try casStoreRootAlloc(run.allocator);
+    const store_root = try casStoreRootAlloc(op, run.allocator);
     defer run.allocator.free(store_root);
     try spawnDetachedWaitWorker(
+        op,
         run.allocator,
         run.options,
         run.rip.inquiry_id,
@@ -3146,23 +3343,27 @@ fn startDetachedWaiter(run: InquiryExecution, managed_server: cas_websocket.Mana
         store_root,
     );
     std.Io.sleep(
-        std.Io.Threaded.global_single_threaded.io(),
+        op.fs.io,
         .fromMilliseconds(750),
         .awake,
     ) catch |err| {
         // The detached worker has already started. Keep its server alive.
-        std.debug.print("detached worker startup delay interrupted: {s}\n", .{@errorName(err)});
+        printDiagnostic(
+            op.fs.io,
+            "detached worker startup delay interrupted: {s}\n",
+            .{@errorName(err)},
+        );
     };
 }
 
 fn startInquiryManagedServer(
+    op: Operation,
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    owner_receipt_dir: ?[]const u8,
     codex_path: []const u8,
     hook_policy: cas_client.hooks.HookPolicy,
     code_mode_host_raw: ?[]const u8,
-    io: std.Io,
+    owner_receipt_dir: ?[]const u8,
 ) !cas_websocket.ManagedServer {
     var code_mode_host: ?cas_client.app_server_launch.CodeModeHost = if (code_mode_host_raw) |raw|
         try cas_client.app_server_launch.CodeModeHost.init(allocator, raw)
@@ -3178,7 +3379,9 @@ fn startInquiryManagedServer(
                 codex_path,
                 hook_policy,
                 host,
-                io,
+                op.fs.io,
+                op.fs.directory(),
+                op.environ,
             );
         }
         return cas_websocket.startOwnerLivedLoopbackServer(
@@ -3187,7 +3390,9 @@ fn startInquiryManagedServer(
             receipt_dir,
             codex_path,
             hook_policy,
-            io,
+            op.fs.io,
+            op.fs.directory(),
+            op.environ,
         );
     }
     if (code_mode_host) |*host| return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
@@ -3196,23 +3401,34 @@ fn startInquiryManagedServer(
         codex_path,
         hook_policy,
         host,
-        io,
+        op.fs.io,
+        op.fs.directory(),
+        op.environ,
     );
-    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
+    return cas_websocket.startManagedLoopbackServer(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        op.fs.io,
+        op.fs.directory(),
+        op.environ,
+    );
 }
 
 fn spawnDetachedWaitWorker(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
     timeout_ms: u64,
     store_root: []const u8,
 ) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const self_exe = if (fileExists("zig-out/bin/cas_session_inquiry"))
+    const io = op.fs.io;
+    const self_exe = if (fileExists(op, "zig-out/bin/cas_session_inquiry"))
         try allocator.dupe(u8, "zig-out/bin/cas_session_inquiry")
     else
-        try resolveExecutablePathAlloc(allocator, "cas_session_inquiry", options.path_env);
+        try resolveExecutablePathAlloc(op, allocator, "cas_session_inquiry", options.path_env);
     defer allocator.free(self_exe);
     const timeout_text = try allocator.print("{d}", .{timeout_ms});
     defer allocator.free(timeout_text);
@@ -3234,6 +3450,8 @@ fn spawnDetachedWaitWorker(
         ".",
         argv.items,
         io,
+        op.fs.directory(),
+        op.environ,
     );
 }
 
@@ -3271,6 +3489,7 @@ fn preflightFromDetachedRecord(record: DetachedRecord) PreflightResult {
 }
 
 fn loadPersistedInquiryInput(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
@@ -3282,14 +3501,15 @@ fn loadPersistedInquiryInput(
     defer allocator.free(input_leaf);
     const receipt_leaf = try allocator.print("{s}.validation.json", .{stem});
     defer allocator.free(receipt_leaf);
-    const input_path = try inquiryPathJoin(allocator, options.home, inquiry_id, input_leaf);
+    const input_path = try inquiryPathJoin(op, allocator, options.home, inquiry_id, input_leaf);
     defer allocator.free(input_path);
-    const receipt_path = try inquiryPathJoin(allocator, options.home, inquiry_id, receipt_leaf);
+    const receipt_path = try inquiryPathJoin(op, allocator, options.home, inquiry_id, receipt_leaf);
     defer allocator.free(receipt_path);
-    return validateLedgerInput(allocator, input_path, receipt_path, definition_id, input_name);
+    return validateLedgerInput(op, allocator, input_path, receipt_path, definition_id, input_name);
 }
 
 fn startDetachedCollector(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     record: DetachedRecord,
@@ -3299,6 +3519,9 @@ fn startDetachedCollector(
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
 
     return cas_client.Client.start(allocator, .{
+        .io = op.fs.io,
+        .dir = op.fs.directory(),
+        .environ = op.environ,
         .cwd = record.cwd,
         .codex_path = record.codex_path,
         .client_name = "cas-session-inquiry",
@@ -3317,11 +3540,12 @@ fn startDetachedCollector(
 }
 
 fn waitDetachedInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
 ) !RunOutput {
-    const record = try loadDetachedRecordAlloc(allocator, options.home, inquiry_id);
+    const record = try loadDetachedRecordAlloc(op, allocator, options.home, inquiry_id);
     if (std.mem.eql(u8, record.state, @tagName(InquiryState.completed)) or
         std.mem.eql(u8, record.state, @tagName(InquiryState.partially_completed)) or
         std.mem.eql(u8, record.state, @tagName(InquiryState.failed)) or
@@ -3340,6 +3564,7 @@ fn waitDetachedInquiry(
         };
     }
     var capsule_input = try loadPersistedInquiryInput(
+        op,
         allocator,
         options,
         inquiry_id,
@@ -3349,6 +3574,7 @@ fn waitDetachedInquiry(
     );
     defer capsule_input.deinit(allocator);
     var plan_input = try loadPersistedInquiryInput(
+        op,
         allocator,
         options,
         inquiry_id,
@@ -3362,33 +3588,34 @@ fn waitDetachedInquiry(
     const rip = try loadRipBytes(allocator, plan_input.input);
     defer deinitRip(allocator, rip);
 
-    var client = try startDetachedCollector(allocator, options, record);
+    var client = try startDetachedCollector(op, allocator, options, record);
     defer {
         client.close();
         client.deinit();
     }
 
-    const counts = try collectDetachedLaneFiles(allocator, &client, options, dcp, inquiry_id);
-    return finishDetachedInquiry(allocator, record, dcp, rip, counts, inquiry_id);
+    const counts = try collectDetachedLaneFiles(op, allocator, &client, options, dcp, inquiry_id);
+    return finishDetachedInquiry(op, allocator, record, dcp, rip, counts, inquiry_id);
 }
 
 fn collectDetachedLaneFiles(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
     dcp: Dcp,
     inquiry_id: []const u8,
 ) !FirCounts {
-    const lane_glob = try inquiryPathJoin(allocator, options.home, inquiry_id, "lanes/*.json");
+    const lane_glob = try inquiryPathJoin(op, allocator, options.home, inquiry_id, "lanes/*.json");
     defer allocator.free(lane_glob);
-    const lane_files = try expandSimpleGlobAlloc(allocator, lane_glob);
+    const lane_files = try expandSimpleGlobAlloc(op, allocator, lane_glob);
     defer freeStringList(allocator, lane_files);
     var valid_count: u64 = 0;
     var invalid_count: u64 = 0;
     for (lane_files) |lane_path| {
-        const handle = try loadLaneHandleAlloc(allocator, lane_path);
+        const handle = try loadLaneHandleAlloc(op, allocator, lane_path);
         defer freeLaneHandle(allocator, handle);
-        const result = try collectLaneFork(allocator, client, options, dcp, handle);
+        const result = try collectLaneFork(op, allocator, client, options, dcp, handle);
         if (result.receipt_valid) valid_count += 1 else invalid_count += 1;
     }
 
@@ -3396,6 +3623,7 @@ fn collectDetachedLaneFiles(
 }
 
 fn finishDetachedInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     record: DetachedRecord,
     dcp: Dcp,
@@ -3409,6 +3637,7 @@ fn finishDetachedInquiry(
     const failure_code = if (invalid_count == 0) "" else FailureCode.receipt_invalid.asString();
     const failure_hint = if (invalid_count == 0) "" else "one or more lane FIR gates failed";
     try writeSummary(
+        op,
         allocator,
         record.summary_ref,
         inquiry_id,
@@ -3420,6 +3649,7 @@ fn finishDetachedInquiry(
         failure_hint,
     );
     try writeInquiryState(
+        op,
         allocator,
         record.state_ref,
         dcp,
@@ -3436,7 +3666,7 @@ fn finishDetachedInquiry(
         record.cwd,
         failure_code,
         failure_hint,
-        nowMillis(),
+        nowMillis(op),
     );
     return .{
         .inquiry_id = inquiry_id,
@@ -3461,13 +3691,17 @@ const InterruptOutput = struct {
 };
 
 fn interruptDetachedInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
 ) !InterruptOutput {
-    const record = try loadDetachedRecordAlloc(allocator, options.home, inquiry_id);
+    const record = try loadDetachedRecordAlloc(op, allocator, options.home, inquiry_id);
     if (!cas_websocket.processAlive(record.managed_server_pid)) return error.InquiryTransportLost;
     var client = try cas_client.Client.start(allocator, .{
+        .io = op.fs.io,
+        .dir = op.fs.directory(),
+        .environ = op.environ,
         .cwd = record.cwd,
         .codex_path = record.codex_path,
         .client_name = "cas-session-inquiry",
@@ -3483,9 +3717,9 @@ fn interruptDetachedInquiry(
         client.close();
         client.deinit();
     }
-    const interrupted = try interruptLaneFiles(allocator, &client, options, inquiry_id);
+    const interrupted = try interruptLaneFiles(op, allocator, &client, options, inquiry_id);
     if (interrupted > 0) {
-        try recordInterruptedInquiry(allocator, options, inquiry_id, record, interrupted);
+        try recordInterruptedInquiry(op, allocator, options, inquiry_id, record, interrupted);
     }
     return .{
         .session_inquiry_interrupt = .{
@@ -3499,6 +3733,7 @@ fn interruptDetachedInquiry(
 }
 
 fn recordInterruptedInquiry(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
@@ -3506,19 +3741,21 @@ fn recordInterruptedInquiry(
     interrupted: u64,
 ) !void {
     const capsule_path = try inquiryPathJoin(
+        op,
         allocator,
         options.home,
         inquiry_id,
         "capsule.json",
     );
     defer allocator.free(capsule_path);
-    const plan_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "plan.json");
+    const plan_path = try inquiryPathJoin(op, allocator, options.home, inquiry_id, "plan.json");
     defer allocator.free(plan_path);
-    const dcp = try loadDcp(allocator, capsule_path);
+    const dcp = try loadDcp(op, allocator, capsule_path);
     defer deinitDcp(allocator, dcp);
-    const rip = try loadRip(allocator, plan_path);
+    const rip = try loadRip(op, allocator, plan_path);
     defer deinitRip(allocator, rip);
     try writeSummary(
+        op,
         allocator,
         record.summary_ref,
         inquiry_id,
@@ -3530,6 +3767,7 @@ fn recordInterruptedInquiry(
         "active inquiry turns were interrupted",
     );
     try writeInquiryState(
+        op,
         allocator,
         record.state_ref,
         dcp,
@@ -3546,23 +3784,24 @@ fn recordInterruptedInquiry(
         record.cwd,
         FailureCode.fork_interrupted.asString(),
         "active inquiry turns were interrupted",
-        nowMillis(),
+        nowMillis(op),
     );
 }
 
 fn interruptLaneFiles(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
     inquiry_id: []const u8,
 ) !u64 {
-    const lane_glob = try inquiryPathJoin(allocator, options.home, inquiry_id, "lanes/*.json");
+    const lane_glob = try inquiryPathJoin(op, allocator, options.home, inquiry_id, "lanes/*.json");
     defer allocator.free(lane_glob);
-    const lane_files = try expandSimpleGlobAlloc(allocator, lane_glob);
+    const lane_files = try expandSimpleGlobAlloc(op, allocator, lane_glob);
     defer freeStringList(allocator, lane_files);
     var interrupted: u64 = 0;
     for (lane_files) |lane_path| {
-        const handle = try loadLaneHandleAlloc(allocator, lane_path);
+        const handle = try loadLaneHandleAlloc(op, allocator, lane_path);
         defer freeLaneHandle(allocator, handle);
         const params = try stringifyAnyAlloc(
             allocator,
@@ -3576,14 +3815,15 @@ fn interruptLaneFiles(
             continue;
         };
         defer allocator.free(result);
-        try appendLine(handle.lane_events, result);
-        try writeLaneHandle(allocator, handle, @tagName(InquiryState.interrupted));
+        try appendLine(op, handle.lane_events, result);
+        try writeLaneHandle(op, allocator, handle, @tagName(InquiryState.interrupted));
         interrupted += 1;
     }
     return interrupted;
 }
 
 fn verifySourceThread(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     source_thread_id: []const u8,
@@ -3591,6 +3831,7 @@ fn verifySourceThread(
     events_path: []const u8,
 ) !void {
     const source = try readThreadHistorySnapshot(
+        op,
         allocator,
         client,
         source_thread_id,
@@ -3601,6 +3842,7 @@ fn verifySourceThread(
     defer source.deinit(allocator);
     if (source.digest.count != dcp.total_turns) {
         try appendSourceDigestMismatchEvent(
+            op,
             allocator,
             events_path,
             source.digest,
@@ -3612,6 +3854,7 @@ fn verifySourceThread(
     }
     if (!std.mem.eql(u8, source.digest.digest, dcp.source_turn_digest)) {
         try appendSourceDigestMismatchEvent(
+            op,
             allocator,
             events_path,
             source.digest,
@@ -3638,6 +3881,7 @@ fn threadHistoryModeFromRead(allocator: std.mem.Allocator, raw: []const u8) !Thr
 }
 
 fn writeSummary(
+    op: Operation,
     allocator: std.mem.Allocator,
     summary_path: []const u8,
     inquiry_id: []const u8,
@@ -3648,7 +3892,7 @@ fn writeSummary(
     failure_code: []const u8,
     failure_hint: []const u8,
 ) !void {
-    try writeJsonFile(allocator, summary_path, .{
+    try writeJsonFile(op, allocator, summary_path, .{
         .session_inquiry_summary = .{
             .summary_version = "SIS-v1",
             .inquiry_id = inquiry_id,
@@ -3663,6 +3907,7 @@ fn writeSummary(
 }
 
 fn writeInquiryState(
+    op: Operation,
     allocator: std.mem.Allocator,
     state_path: []const u8,
     dcp: Dcp,
@@ -3681,8 +3926,8 @@ fn writeInquiryState(
     failure_hint: []const u8,
     terminal_at: ?i128,
 ) !void {
-    try ensureParentDir(state_path);
-    try writeJsonFile(allocator, state_path, .{
+    try ensureParentDir(op, state_path);
+    try writeJsonFile(op, allocator, state_path, .{
         .session_inquiry_record = .{
             .record_version = "SIR-v1",
             .inquiry_id = rip.inquiry_id,
@@ -3716,8 +3961,8 @@ fn writeInquiryState(
                 .timeout_ms = rip.timeout_ms,
             },
             .tokens_used = 0,
-            .started_at = nowMillis(),
-            .updated_at = nowMillis(),
+            .started_at = nowMillis(op),
+            .updated_at = nowMillis(op),
             .terminal_at = terminal_at,
             .failure_code = failure_code,
             .failure_hint = failure_hint,
@@ -3727,12 +3972,13 @@ fn writeInquiryState(
 }
 
 fn loadDetachedRecordAlloc(
+    op: Operation,
     allocator: std.mem.Allocator,
     home: []const u8,
     inquiry_id: []const u8,
 ) !DetachedRecord {
-    const path = try stateRecordPath(allocator, home, inquiry_id);
-    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+    const path = try stateRecordPath(op, allocator, home, inquiry_id);
+    const raw = try readFileAlloc(op, allocator, path, MaxInputBytes);
     defer allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -3775,6 +4021,7 @@ fn loadDetachedRecordAlloc(
 }
 
 fn executeLaneFork(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
@@ -3789,6 +4036,7 @@ fn executeLaneFork(
     preflight: PreflightResult,
 ) !LaneExecutionResult {
     const handle = try startLaneFork(
+        op,
         allocator,
         client,
         options,
@@ -3802,10 +4050,11 @@ fn executeLaneFork(
         events_path,
         preflight,
     );
-    return collectLaneFork(allocator, client, options, dcp, handle);
+    return collectLaneFork(op, allocator, client, options, dcp, handle);
 }
 
 fn executeLaneForkWithRetries(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
@@ -3821,6 +4070,7 @@ fn executeLaneForkWithRetries(
     initial_handle: ?LaneHandle,
 ) !bool {
     const retry = LaneRetry{
+        .operation = op,
         .allocator = allocator,
         .client = client,
         .options = options,
@@ -3838,6 +4088,7 @@ fn executeLaneForkWithRetries(
 }
 
 const LaneRetry = struct {
+    operation: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
@@ -3852,10 +4103,12 @@ const LaneRetry = struct {
     launched: *u64,
 
     fn run(self: LaneRetry, initial_handle: ?LaneHandle) !bool {
+        const op = self.operation;
         const max_attempts: u64 = 3;
         for (0..max_attempts) |attempt| {
             const result = if (attempt == 0 and initial_handle != null)
                 try collectLaneFork(
+                    op,
                     self.allocator,
                     self.client,
                     self.options,
@@ -3889,7 +4142,9 @@ const LaneRetry = struct {
     }
 
     fn execute(self: LaneRetry, attempt: u64) !LaneExecutionResult {
+        const op = self.operation;
         return executeLaneFork(
+            op,
             self.allocator,
             self.client,
             self.options,
@@ -3906,6 +4161,7 @@ const LaneRetry = struct {
     }
 
     fn recordAttempt(self: LaneRetry, attempt: u64) !void {
+        const op = self.operation;
         const event_json = try stringifyAnyAlloc(self.allocator, .{
             .event = "lane_start_attempt",
             .lane_id = self.lane.lane_id,
@@ -3916,11 +4172,13 @@ const LaneRetry = struct {
             .max_forks = self.rip.max_forks,
         });
         defer self.allocator.free(event_json);
-        try appendLine(self.events_path, event_json);
+        try appendLine(op, self.events_path, event_json);
     }
 
     fn event(self: LaneRetry, attempt: u64, reason: []const u8) !void {
+        const op = self.operation;
         try appendLaneRetryEvent(
+            op,
             self.allocator,
             self.events_path,
             self.lane.lane_id,
@@ -3931,9 +4189,10 @@ const LaneRetry = struct {
     }
 
     fn waitRetry(self: LaneRetry, attempt: u64, reason: []const u8) !void {
+        const op = self.operation;
         try self.event(attempt, reason);
         try std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             .fromMilliseconds(1500),
             .awake,
         );
@@ -3941,6 +4200,7 @@ const LaneRetry = struct {
 };
 
 fn appendLaneRetryEvent(
+    op: Operation,
     allocator: std.mem.Allocator,
     events_path: []const u8,
     lane_id: []const u8,
@@ -3957,7 +4217,7 @@ fn appendLaneRetryEvent(
         .reason = reason,
     });
     defer allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
 }
 
 fn isRetryableLaneError(err: anyerror) bool {
@@ -3975,6 +4235,7 @@ fn isRetryableLaneError(err: anyerror) bool {
 }
 
 const LaneStart = struct {
+    operation: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
@@ -3995,6 +4256,7 @@ const LanePaths = struct {
     state: []const u8,
 
     fn init(start: LaneStart, receipt_dir: []const u8, attempt: u64) !LanePaths {
+        const op = start.operation;
         const allocator = start.allocator;
         const stem = if (attempt == 0)
             try allocator.print(
@@ -4025,6 +4287,7 @@ const LanePaths = struct {
         const leaf = try allocator.print("lanes/{s}.json", .{stem});
         defer allocator.free(leaf);
         const state = try inquiryPathJoin(
+            op,
             allocator,
             start.options.home,
             start.rip.inquiry_id,
@@ -4064,6 +4327,7 @@ const LaneStartedTurn = struct {
 };
 
 fn startLaneFork(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
@@ -4083,6 +4347,7 @@ fn startLaneFork(
     ) orelse return error.AnchorDigestMismatch;
     if (!anchor.available) return error.AnchorDigestMismatch;
     const start = LaneStart{
+        .operation = op,
         .allocator = allocator,
         .client = client,
         .options = options,
@@ -4106,9 +4371,11 @@ fn startLaneFork(
 }
 
 fn startThreadBackedLane(start: LaneStart, paths: LanePaths) !LaneHandle {
+    const op = start.operation;
     const source_thread_id = start.dcp.source_thread_id orelse return error.SourceNotFound;
     if (!start.preflight.capabilities.paginatedAnchorSupported()) return error.ForkUnsupported;
     const history = try readThreadHistorySnapshot(
+        op,
         start.allocator,
         start.client,
         source_thread_id,
@@ -4140,8 +4407,8 @@ fn startThreadBackedLane(start: LaneStart, paths: LanePaths) !LaneHandle {
         anchored,
     );
     errdefer freeLaneHandle(start.allocator, handle);
-    writeLaneHandle(start.allocator, handle, @tagName(InquiryState.turn_running)) catch |err| {
-        std.debug.print("writeLaneHandle failed: {s}\n", .{@errorName(err)});
+    writeLaneHandle(op, start.allocator, handle, @tagName(InquiryState.turn_running)) catch |err| {
+        printDiagnostic(op.fs.io, "writeLaneHandle failed: {s}\n", .{@errorName(err)});
         return err;
     };
     return handle;
@@ -4152,11 +4419,13 @@ fn validateLaneSourceHistory(
     events_path: []const u8,
     history: ThreadHistorySnapshot,
 ) !TurnDigest {
+    const op = start.operation;
     const before = history.digest;
     if (before.count != start.dcp.total_turns or
         !std.mem.eql(u8, before.digest, start.dcp.source_turn_digest))
     {
         try appendSourceDigestMismatchEvent(
+            op,
             start.allocator,
             events_path,
             before,
@@ -4175,6 +4444,7 @@ fn validateLaneSourceHistory(
         .{ .count = anchored.count, .digest = anchored.digest },
     )) {
         try appendSourceDigestMismatchEvent(
+            op,
             start.allocator,
             events_path,
             anchored,
@@ -4192,6 +4462,7 @@ fn selectLaneForkBoundary(
     events_path: []const u8,
     history: ThreadHistorySnapshot,
 ) !inquiry_anchor.Boundary {
+    const op = start.operation;
     const boundary = try inquiry_anchor.selectBoundary(
         history.turn_ids,
         history.completed_boundaries,
@@ -4210,7 +4481,7 @@ fn selectLaneForkBoundary(
         .expected_anchor_digest = start.anchor.anchor_digest orelse "",
     });
     defer start.allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
     return boundary;
 }
 
@@ -4256,11 +4527,12 @@ fn requestLaneFork(
     events_path: []const u8,
     boundary: inquiry_anchor.Boundary,
 ) !LaneForkIdentity {
+    const op = start.operation;
     const allocator = start.allocator;
     const params = try laneForkParamsAlloc(start, boundary);
     defer allocator.free(params);
     const response = start.client.requestJson("thread/fork", params) catch |err| {
-        if (start.client.lastError()) |detail| try appendLine(events_path, detail);
+        if (start.client.lastError()) |detail| try appendLine(op, events_path, detail);
         return preserveServerRequestProviderError(err, error.ForkFailed);
     };
     defer allocator.free(response);
@@ -4270,8 +4542,8 @@ fn requestLaneFork(
         .ordinal = start.ordinal + 1,
     });
     defer allocator.free(event);
-    try appendLine(start.events_path, event);
-    try appendLine(events_path, response);
+    try appendLine(op, start.events_path, event);
+    try appendLine(op, events_path, response);
     const thread_id = try threadIdFromResponse(allocator, response);
     errdefer allocator.free(thread_id);
     const forked_from = try forkedFromIdFromResponse(allocator, response);
@@ -4289,13 +4561,14 @@ fn persistLineageMismatch(
     identity: LaneForkIdentity,
     before: TurnDigest,
 ) !void {
+    const op = start.operation;
     const handle = try buildLaneHandleSnapshot(start, paths, identity, .{
         .id = "",
         .client_msg_id = "",
         .policy_request_count_before = start.client.blockingServerRequestCount(),
     }, before, before);
     defer freeLaneHandle(start.allocator, handle);
-    try writeLaneHandle(start.allocator, handle, @tagName(InquiryState.failed));
+    try writeLaneHandle(op, start.allocator, handle, @tagName(InquiryState.failed));
 }
 
 fn startLaneTurn(
@@ -4342,6 +4615,7 @@ fn requestLaneTurn(
     params: []const u8,
     cleanup_on_failure: bool,
 ) ![]u8 {
+    const op = start.operation;
     const allocator = start.allocator;
     var notifications: std.ArrayList([]u8) = .empty;
     defer {
@@ -4353,15 +4627,17 @@ fn requestLaneTurn(
         params,
         &notifications,
     ) catch |err| {
-        if (start.client.lastError()) |detail| try appendLine(paths.events, detail);
+        if (start.client.lastError()) |detail| try appendLine(op, paths.events, detail);
         if (cleanup_on_failure) {
             _ = cleanupForkThreadIdWithMethod(
+                op,
                 allocator,
                 start.client,
                 paths.events,
                 thread_id,
                 "thread/delete",
             ) or cleanupForkThreadIdWithMethod(
+                op,
                 allocator,
                 start.client,
                 paths.events,
@@ -4372,16 +4648,18 @@ fn requestLaneTurn(
         return preserveServerRequestProviderError(err, error.TurnStartFailed);
     };
     errdefer allocator.free(response);
-    try appendLine(paths.events, response);
-    for (notifications.items) |line| try appendLine(paths.events, line);
+    try appendLine(op, paths.events, response);
+    for (notifications.items) |line| try appendLine(op, paths.events, line);
     return response;
 }
 
 fn startRolloutTranscriptLane(start: LaneStart, paths: LanePaths) !LaneHandle {
+    const op = start.operation;
     const allocator = start.allocator;
     const thread_id = try startRolloutThread(start, paths.events);
     defer allocator.free(thread_id);
     const prompt = try buildRolloutInquiryPromptAlloc(
+        op,
         allocator,
         start.dcp,
         start.rip,
@@ -4403,11 +4681,12 @@ fn startRolloutTranscriptLane(start: LaneStart, paths: LanePaths) !LaneHandle {
         .digest = start.anchor.anchor_digest orelse "",
     });
     errdefer freeLaneHandle(allocator, handle);
-    try writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running));
+    try writeLaneHandle(op, allocator, handle, @tagName(InquiryState.turn_running));
     return handle;
 }
 
 fn startRolloutThread(start: LaneStart, lane_events: []const u8) ![]const u8 {
+    const op = start.operation;
     const allocator = start.allocator;
     const params = try stringifyAnyAlloc(allocator, .{
         .cwd = start.inquiry_cwd,
@@ -4432,9 +4711,9 @@ fn startRolloutThread(start: LaneStart, lane_events: []const u8) ![]const u8 {
         .lineage_mode = "rollout_transcript",
     });
     defer allocator.free(event);
-    try appendLine(start.events_path, event);
-    try appendLine(lane_events, response);
-    for (notifications.items) |line| try appendLine(lane_events, line);
+    try appendLine(op, start.events_path, event);
+    try appendLine(op, lane_events, response);
+    for (notifications.items) |line| try appendLine(op, lane_events, line);
     return threadIdFromResponse(allocator, response);
 }
 
@@ -4752,12 +5031,14 @@ const LaneCompletion = struct {
 };
 
 fn observeLaneCompletion(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
     handle: LaneHandle,
 ) !LaneCompletion {
     var observed = try waitForTurnObservation(
+        op,
         allocator,
         client,
         handle.fork_thread_id,
@@ -4767,7 +5048,7 @@ fn observeLaneCompletion(
     );
     errdefer observed.deinit(allocator);
     const final_text = observed.finalText();
-    try durable_store.writeTextAtomic(allocator, handle.lane_final, final_text);
+    try durable_store.writeTextAtomic(op.fs, allocator, handle.lane_final, final_text);
     const answer = parseFiaAnswerAlloc(
         allocator,
         final_text,
@@ -4787,12 +5068,14 @@ fn observeLaneCompletion(
         handle.anchor_digest_expected,
     );
     const deleted = !handle.fork_policy.ephemeral and cleanupForkWithMethod(
+        op,
         allocator,
         client,
         handle,
         "thread/delete",
     );
     const archived = !handle.fork_policy.ephemeral and !deleted and cleanupForkWithMethod(
+        op,
         allocator,
         client,
         handle,
@@ -4815,12 +5098,14 @@ fn observeLaneCompletion(
 }
 
 const LaneReceipt = struct {
+    operation: Operation,
     dcp: Dcp,
     handle: LaneHandle,
     options: Options,
     completion: LaneCompletion,
 
     fn jsonAlloc(self: LaneReceipt, allocator: std.mem.Allocator, receipt_id: []const u8) ![]u8 {
+        const op = self.operation;
         const handle = self.handle;
         const dcp = self.dcp;
         const result = self.completion;
@@ -4860,8 +5145,8 @@ const LaneReceipt = struct {
             .question = handle.question,
             .client_user_message_id = handle.client_user_message_id,
             .turn_id = handle.turn_id,
-            .started_at = nowMillis(),
-            .ended_at = nowMillis(),
+            .started_at = nowMillis(op),
+            .ended_at = nowMillis(op),
             .status = self.status(),
             .reconstructed_decision = answer.reconstructed_decision,
             .selected_route = answer.selected_route,
@@ -4898,13 +5183,14 @@ const LaneReceipt = struct {
 };
 
 fn collectLaneFork(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     options: Options,
     dcp: Dcp,
     handle: LaneHandle,
 ) !LaneExecutionResult {
-    var completion = try observeLaneCompletion(allocator, client, options, handle);
+    var completion = try observeLaneCompletion(op, allocator, client, options, handle);
     defer completion.deinit(allocator);
     var completed_handle = handle;
     completed_handle.fork_cleaned = completion.cleanup_valid;
@@ -4914,6 +5200,7 @@ fn collectLaneFork(
     );
     defer allocator.free(receipt_id);
     const receipt = LaneReceipt{
+        .operation = op,
         .dcp = dcp,
         .handle = handle,
         .options = options,
@@ -4923,8 +5210,9 @@ fn collectLaneFork(
     defer allocator.free(receipt_json);
     const receipt_file = try allocator.print("{s}\n", .{receipt_json});
     defer allocator.free(receipt_file);
-    try durable_store.writeTextAtomic(allocator, handle.lane_receipt, receipt_file);
+    try durable_store.writeTextAtomic(op.fs, allocator, handle.lane_receipt, receipt_file);
     try writeLaneHandle(
+        op,
         allocator,
         completed_handle,
         if (completion.receipt_valid)
@@ -4939,7 +5227,12 @@ fn collectLaneFork(
             completion.observed.finalText().len == 0 and !completion.blocking_event,
     };
 }
-fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []const u8) !void {
+fn writeLaneHandle(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    handle: LaneHandle,
+    state: []const u8,
+) !void {
     const payload = .{
         .session_inquiry_lane = .{
             .record_version = "SIL-v1",
@@ -4986,7 +5279,7 @@ fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []co
             },
         },
     };
-    try writeJsonFile(allocator, handle.lane_state_ref, payload);
+    try writeJsonFile(op, allocator, handle.lane_state_ref, payload);
 }
 
 fn dupeRequiredField(
@@ -4997,8 +5290,8 @@ fn dupeRequiredField(
     return allocator.dupe(u8, try requiredString(object, name));
 }
 
-fn loadLaneHandleAlloc(allocator: std.mem.Allocator, path: []const u8) !LaneHandle {
-    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+fn loadLaneHandleAlloc(op: Operation, allocator: std.mem.Allocator, path: []const u8) !LaneHandle {
+    const raw = try readFileAlloc(op, allocator, path, MaxInputBytes);
     defer allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -5107,6 +5400,7 @@ fn buildInquiryPromptAlloc(allocator: std.mem.Allocator, rip: Rip, lane: Lane) !
 }
 
 fn buildRolloutInquiryPromptAlloc(
+    op: Operation,
     allocator: std.mem.Allocator,
     dcp: Dcp,
     rip: Rip,
@@ -5114,7 +5408,13 @@ fn buildRolloutInquiryPromptAlloc(
     anchor: Anchor,
 ) ![]const u8 {
     const rollout_path = dcp.source_rollout_path orelse return error.SourceNotFound;
-    var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
+    var trace = try canonical_trace.parseSessionTrace(
+        op.fs.io,
+        op.fs.directory(),
+        allocator,
+        rollout_path,
+        .{},
+    );
     defer trace.deinit(allocator);
     const hindsight_literal = if (std.mem.eql(
         u8,
@@ -5211,6 +5511,7 @@ fn writeIndentedExcerpt(writer: anytype, text: []const u8, indent: usize, max_by
 }
 
 fn waitForTurnObservation(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     thread_id: []const u8,
@@ -5218,7 +5519,7 @@ fn waitForTurnObservation(
     timeout_ms: u64,
     lane_events: []const u8,
 ) !TurnObservation {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = op.fs.io;
     const start_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     var latest = TurnObservation{};
     errdefer latest.deinit(allocator);
@@ -5240,9 +5541,9 @@ fn waitForTurnObservation(
             &notifications,
         );
         defer allocator.free(read_json);
-        try appendLine(lane_events, read_json);
+        try appendLine(op, lane_events, read_json);
         for (notifications.items) |line| {
-            try appendLine(lane_events, line);
+            try appendLine(op, lane_events, line);
             absorbNotification(allocator, line, turn_id, &latest) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
@@ -5255,7 +5556,7 @@ fn waitForTurnObservation(
         elapsed = std.math.cast(u64, @max(0, now_ms - start_ms)) orelse return latest;
         if (elapsed >= timeout_ms) return latest;
         try std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             .fromMilliseconds(500),
             .awake,
         );
@@ -5806,6 +6107,7 @@ fn threadHistorySnapshotFromThreadRead(
 }
 
 const HistoryPageReader = struct {
+    operation: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     thread_id: []const u8,
@@ -5814,6 +6116,7 @@ const HistoryPageReader = struct {
     resume_attempted: bool = false,
 
     fn request(self: *HistoryPageReader) ![]u8 {
+        const op = self.operation;
         const params = if (self.cursor) |value|
             try stringifyAnyAlloc(self.allocator, .{
                 .threadId = self.thread_id,
@@ -5844,6 +6147,7 @@ const HistoryPageReader = struct {
             }
             self.resume_attempted = true;
             try resumePaginatedThreadForTurnsList(
+                op,
                 self.allocator,
                 self.client,
                 self.thread_id,
@@ -5862,6 +6166,7 @@ const HistoryPageReader = struct {
         history: *HistoryAccumulator,
         expected_turns: u64,
     ) !bool {
+        const op = self.operation;
         const page_json = try self.request();
         defer self.allocator.free(page_json);
         var page = try std.json.parseFromSlice(std.json.Value, self.allocator, page_json, .{});
@@ -5878,6 +6183,7 @@ const HistoryPageReader = struct {
         for (data.items) |value| try history.append(self.allocator, value);
         const next_text = optionalString(root, "nextCursor");
         try appendHistoryReadEvent(
+            op,
             self.allocator,
             self.events_path,
             self.thread_id,
@@ -5899,6 +6205,7 @@ const HistoryPageReader = struct {
 };
 
 fn readThreadHistorySnapshot(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     thread_id: []const u8,
@@ -5916,9 +6223,16 @@ fn readThreadHistorySnapshot(
         return preserveServerRequestProviderError(err, error.SourceNotFound);
     defer allocator.free(metadata);
     const mode = try threadHistoryModeFromRead(allocator, metadata);
-    try appendHistoryReadEvent(allocator, events_path, thread_id, mode, false, 0, false);
+    try appendHistoryReadEvent(op, allocator, events_path, thread_id, mode, false, 0, false);
     if (mode == .legacy) {
-        return readLegacyThreadHistory(allocator, client, thread_id, retained_turns, events_path);
+        return readLegacyThreadHistory(
+            op,
+            allocator,
+            client,
+            thread_id,
+            retained_turns,
+            events_path,
+        );
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, metadata, .{});
     defer parsed.deinit();
@@ -5930,6 +6244,7 @@ fn readThreadHistorySnapshot(
     var history = try HistoryAccumulator.init(allocator, thread, thread_id);
     defer history.deinit(allocator);
     var reader = HistoryPageReader{
+        .operation = op,
         .allocator = allocator,
         .client = client,
         .thread_id = thread_id,
@@ -5945,6 +6260,7 @@ fn readThreadHistorySnapshot(
 }
 
 fn readLegacyThreadHistory(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     thread_id: []const u8,
@@ -5962,6 +6278,7 @@ fn readLegacyThreadHistory(
     const snapshot = try threadHistorySnapshotFromThreadRead(allocator, raw, retained_turns);
     errdefer snapshot.deinit(allocator);
     try appendHistoryReadEvent(
+        op,
         allocator,
         events_path,
         thread_id,
@@ -5974,6 +6291,7 @@ fn readLegacyThreadHistory(
 }
 
 fn resumePaginatedThreadForTurnsList(
+    op: Operation,
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
     thread_id: []const u8,
@@ -5994,7 +6312,7 @@ fn resumePaginatedThreadForTurnsList(
         .exclude_turns = true,
     });
     defer allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
 }
 
 fn clientLastErrorIsThreadNotLoaded(
@@ -6118,6 +6436,7 @@ fn threadTurnRecord(
 }
 
 fn appendHistoryReadEvent(
+    op: Operation,
     allocator: std.mem.Allocator,
     events_path: []const u8,
     thread_id: []const u8,
@@ -6135,7 +6454,7 @@ fn appendHistoryReadEvent(
         .has_next = has_next,
     });
     defer allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
 }
 
 fn appendToolRecordsFromThreadItems(
@@ -6375,6 +6694,7 @@ fn messageTextFromThreadItems(
 }
 
 fn appendSourceDigestMismatchEvent(
+    op: Operation,
     allocator: std.mem.Allocator,
     events_path: []const u8,
     observed: TurnDigest,
@@ -6391,10 +6711,11 @@ fn appendSourceDigestMismatchEvent(
         .observed_digest = observed.digest,
     });
     defer allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
 }
 
 fn persistInvalidRunArtifacts(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -6403,8 +6724,8 @@ fn persistInvalidRunArtifacts(
     gate: GateResult,
     detached: bool,
 ) !void {
-    try ensureDir(receipt_dir);
-    try persistInputCopies(allocator, options, rip.inquiry_id);
+    try ensureDir(op, receipt_dir);
+    try persistInputCopies(op, allocator, options, rip.inquiry_id);
     const events_path = try allocator.print("{s}/events.jsonl", .{receipt_dir});
     defer allocator.free(events_path);
     const gate_event = try stringifyAnyAlloc(allocator, .{
@@ -6413,10 +6734,11 @@ fn persistInvalidRunArtifacts(
         .failure_hint = gate.hint,
     });
     defer allocator.free(gate_event);
-    try appendLine(events_path, gate_event);
+    try appendLine(op, events_path, gate_event);
     const summary_path = try allocator.print("{s}/summary.json", .{receipt_dir});
     defer allocator.free(summary_path);
     try writeSummary(
+        op,
         allocator,
         summary_path,
         rip.inquiry_id,
@@ -6427,10 +6749,11 @@ fn persistInvalidRunArtifacts(
         if (gate.failure_code) |code| code.asString() else FailureCode.receipt_invalid.asString(),
         gate.hint,
     );
-    try writeInvalidInquiryState(allocator, options, dcp, rip, gate, detached, summary_path);
+    try writeInvalidInquiryState(op, allocator, options, dcp, rip, gate, detached, summary_path);
 }
 
 fn writeInvalidInquiryState(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     dcp: Dcp,
@@ -6467,9 +6790,9 @@ fn writeInvalidInquiryState(
                 .timeout_ms = rip.timeout_ms,
             },
             .tokens_used = 0,
-            .started_at = nowMillis(),
-            .updated_at = nowMillis(),
-            .terminal_at = nowMillis(),
+            .started_at = nowMillis(op),
+            .updated_at = nowMillis(op),
+            .terminal_at = nowMillis(op),
             .failure_code = if (gate.failure_code) |code|
                 code.asString()
             else
@@ -6478,80 +6801,67 @@ fn writeInvalidInquiryState(
             .summary_ref = summary_path,
         },
     };
-    const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
+    const state_path = try stateRecordPath(op, allocator, options.home, rip.inquiry_id);
     defer allocator.free(state_path);
-    try ensureParentDir(state_path);
-    try writeJsonFile(allocator, state_path, state);
+    try ensureParentDir(op, state_path);
+    try writeJsonFile(op, allocator, state_path, state);
 }
 
 fn persistInputCopies(
+    op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
     inquiry_id: []const u8,
 ) !void {
-    if (options.capsule_definition_path) |source| {
+    const Copy = struct { name: []const u8, source: ?[]const u8, validated: ?[]const u8 };
+    const copies = [_]Copy{
+        .{
+            .name = "capsule.definition.path",
+            .source = options.capsule_definition_path,
+            .validated = options.capsule_definition_path,
+        },
+        .{
+            .name = "capsule.json",
+            .source = options.capsule_path,
+            .validated = options.capsule_bytes,
+        },
+        .{
+            .name = "capsule.validation.json",
+            .source = options.capsule_validation_path,
+            .validated = options.capsule_validation_bytes,
+        },
+        .{
+            .name = "plan.definition.path",
+            .source = options.plan_definition_path,
+            .validated = options.plan_definition_path,
+        },
+        .{
+            .name = "plan.json",
+            .source = options.plan_path,
+            .validated = options.plan_bytes,
+        },
+        .{
+            .name = "plan.validation.json",
+            .source = options.plan_validation_path,
+            .validated = options.plan_validation_bytes,
+        },
+    };
+    for (copies) |copy| {
+        const source = copy.source orelse continue;
         try persistInputCopy(
+            op,
             allocator,
             options.home,
             inquiry_id,
-            "capsule.definition.path",
-            source,
-            source,
-        );
-    }
-    if (options.capsule_path) |source| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "capsule.json",
-            options.capsule_bytes,
-            source,
-        );
-    }
-    if (options.capsule_validation_path) |source| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "capsule.validation.json",
-            options.capsule_validation_bytes,
-            source,
-        );
-    }
-    if (options.plan_definition_path) |source| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "plan.definition.path",
-            source,
-            source,
-        );
-    }
-    if (options.plan_path) |source| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "plan.json",
-            options.plan_bytes,
-            source,
-        );
-    }
-    if (options.plan_validation_path) |source| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "plan.validation.json",
-            options.plan_validation_bytes,
+            copy.name,
+            copy.validated,
             source,
         );
     }
 }
 
 fn persistInputCopy(
+    op: Operation,
     allocator: std.mem.Allocator,
     home: []const u8,
     inquiry_id: []const u8,
@@ -6560,11 +6870,12 @@ fn persistInputCopy(
     source: []const u8,
 ) !void {
     const owned = if (validated == null)
-        try readFileAlloc(allocator, source, MaxInputBytes)
+        try readFileAlloc(op, allocator, source, MaxInputBytes)
     else
         null;
     defer if (owned) |bytes| allocator.free(bytes);
     const target = try inquiryPathJoin(
+        op,
         allocator,
         home,
         inquiry_id,
@@ -6572,20 +6883,26 @@ fn persistInputCopy(
     );
     defer allocator.free(target);
     try durable_store.writeTextAtomic(
+        op.fs,
         allocator,
         target,
         validated orelse owned.?,
     );
 }
 
-fn inquiryWorkspaceCwdAlloc(allocator: std.mem.Allocator, options: Options, rip: Rip) ![]const u8 {
+fn inquiryWorkspaceCwdAlloc(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    options: Options,
+    rip: Rip,
+) ![]const u8 {
     if (!std.mem.eql(
         u8,
         rip.workspace_policy,
         "transcript_only",
     )) return allocator.dupe(u8, options.cwd);
-    const workspace = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, "workspace");
-    try ensureDir(workspace);
+    const workspace = try inquiryPathJoin(op, allocator, options.home, rip.inquiry_id, "workspace");
+    try ensureDir(op, workspace);
     return workspace;
 }
 
@@ -6643,6 +6960,7 @@ fn requiredListLen(obj: std.json.ObjectMap, key: []const u8) !usize {
 }
 
 fn resolveExecutablePathAlloc(
+    op: Operation,
     allocator: std.mem.Allocator,
     codex_path: []const u8,
     path_env: []const u8,
@@ -6652,36 +6970,35 @@ fn resolveExecutablePathAlloc(
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         const candidate = try allocator.print("{s}/{s}", .{ dir, codex_path });
-        if (fileExists(candidate)) return candidate;
+        if (fileExists(op, candidate)) return candidate;
         allocator.free(candidate);
     }
     for ([_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin" }) |dir| {
         const candidate = try allocator.print("{s}/{s}", .{ dir, codex_path });
-        if (fileExists(candidate)) return candidate;
+        if (fileExists(op, candidate)) return candidate;
         allocator.free(candidate);
     }
     return error.CodexUnavailable;
 }
 
-var configured_store_root_override: ?[]const u8 = null;
-var configured_store_cwd: ?[]const u8 = null;
-
-fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    if (configured_store_root_override) |root| {
-        return absoluteStoreRootOverrideAlloc(allocator, root);
-    }
-    const start_input = if (configured_store_cwd) |cwd|
-        try allocator.dupe(u8, cwd)
-    else
-        try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+fn casStoreRootAlloc(op: Operation, allocator: std.mem.Allocator) ![]const u8 {
+    const selected_cwd = switch (op.store_selection) {
+        .explicit => |root| return absoluteStoreRootOverrideAlloc(op, allocator, root),
+        .repository => |cwd| cwd,
+    };
+    const start_input = try allocator.dupe(u8, selected_cwd orelse ".");
     defer allocator.free(start_input);
-    const start = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const start = try op.fs.directory().realPathFileAlloc(
+        op.fs.io,
         start_input,
         allocator,
     );
     defer allocator.free(start);
-    const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
+    const repo_root = durable_store.findGitRootAlloc(
+        op.fs,
+        allocator,
+        start,
+    ) catch |err| switch (err) {
         error.GitCommandFailed => return allocator.print("{s}/.ledger/cas", .{start}),
         else => return err,
     };
@@ -6689,14 +7006,15 @@ fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return allocator.print("{s}/.ledger/cas", .{repo_root});
 }
 
-fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
-    const expanded = try core_path.expandHomePath(allocator, root);
+fn absoluteStoreRootOverrideAlloc(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) ![]const u8 {
+    const expanded = try core_path.expandHomePath(allocator, op.home, root);
     errdefer allocator.free(expanded);
     if (std.fs.path.isAbsolute(expanded)) return expanded;
-    const cwd = try std.process.currentPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        allocator,
-    );
+    const cwd = try op.fs.directory().realPathFileAlloc(op.fs.io, ".", allocator);
     defer allocator.free(cwd);
     const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
     allocator.free(expanded);
@@ -6704,6 +7022,7 @@ fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8
 }
 
 fn stateRecordPath(
+    op: Operation,
     allocator: std.mem.Allocator,
     home: []const u8,
     inquiry_id: []const u8,
@@ -6711,12 +7030,13 @@ fn stateRecordPath(
     _ = home;
     const safe = try sanitizeInquiryIdAlloc(allocator, inquiry_id);
     defer allocator.free(safe);
-    const root = try casStoreRootAlloc(allocator);
+    const root = try casStoreRootAlloc(op, allocator);
     defer allocator.free(root);
     return allocator.print("{s}/session_inquiries/{s}.json", .{ root, safe });
 }
 
 fn inquiryPathJoin(
+    op: Operation,
     allocator: std.mem.Allocator,
     home: []const u8,
     inquiry_id: []const u8,
@@ -6725,7 +7045,7 @@ fn inquiryPathJoin(
     _ = home;
     const safe = try sanitizeInquiryIdAlloc(allocator, inquiry_id);
     defer allocator.free(safe);
-    const root = try casStoreRootAlloc(allocator);
+    const root = try casStoreRootAlloc(op, allocator);
     defer allocator.free(root);
     return allocator.print("{s}/session_inquiries/{s}/{s}", .{ root, safe, leaf });
 }
@@ -6743,48 +7063,49 @@ fn sanitizeInquiryIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out;
 }
 
-fn ensureDir(path: []const u8) !void {
+fn ensureDir(op: Operation, path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         const rel = std.mem.trim(u8, path, "/");
         if (rel.len == 0) return;
         var root = try std.Io.Dir.openDirAbsolute(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             "/",
             .{},
         );
-        defer root.close(std.Io.Threaded.global_single_threaded.io());
-        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
+        defer root.close(op.fs.io);
+        try root.createDirPath(op.fs.io, rel);
     } else {
-        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), path);
+        try op.fs.directory().createDirPath(op.fs.io, path);
     }
 }
 
-fn ensureParentDir(path: []const u8) !void {
+fn ensureParentDir(op: Operation, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
-    try ensureDir(parent);
+    try ensureDir(op, parent);
 }
 
-fn absoluteDirPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn absoluteDirPathAlloc(op: Operation, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const io = op.fs.io;
     if (std.fs.path.isAbsolute(path)) {
         var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
         defer dir.close(io);
         return dir.realPathFileAlloc(io, ".", allocator);
     }
-    var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+    var dir = try op.fs.directory().openDir(io, path, .{});
     defer dir.close(io);
     return dir.realPathFileAlloc(io, ".", allocator);
 }
 
 fn absoluteLexicalPathAlloc(
+    op: Operation,
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.path.resolve(allocator, &.{path});
     }
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const cwd = try op.fs.directory().realPathFileAlloc(
+        op.fs.io,
         ".",
         allocator,
     );
@@ -6792,12 +7113,17 @@ fn absoluteLexicalPathAlloc(
     return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
-fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn readFileAlloc(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]const u8 {
+    const io = op.fs.io;
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+        try op.fs.directory().openFile(io, path, .{});
     defer file.close(io);
     const size = (try file.stat(io)).size;
     if (size > max_bytes) return error.FileTooBig;
@@ -6808,24 +7134,28 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usiz
     return if (read_len == buffer.len) buffer else try allocator.realloc(buffer, read_len);
 }
 
-fn fileExists(path: []const u8) bool {
+fn fileExists(op: Operation, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             path,
             .{},
         ) catch return false;
         return true;
     }
-    std.Io.Dir.cwd().access(
-        std.Io.Threaded.global_single_threaded.io(),
+    op.fs.directory().access(
+        op.fs.io,
         path,
         .{},
     ) catch return false;
     return true;
 }
 
-fn expandSimpleGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+fn expandSimpleGlobAlloc(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+) ![]const []const u8 {
     if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
         var one = try allocator.alloc([]const u8, 1);
         errdefer allocator.free(one);
@@ -6834,7 +7164,7 @@ fn expandSimpleGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]c
     }
     const dir_name = std.fs.path.dirname(pattern) orelse ".";
     const base = std.fs.path.basename(pattern);
-    const dirs = try expandDirectoryGlobAlloc(allocator, dir_name);
+    const dirs = try expandDirectoryGlobAlloc(op, allocator, dir_name);
     defer {
         for (dirs) |dir_path| allocator.free(dir_path);
         allocator.free(dirs);
@@ -6845,12 +7175,16 @@ fn expandSimpleGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]c
         out.deinit(allocator);
     }
     for (dirs) |dir_path| {
-        try appendFileGlobMatches(allocator, &out, dir_path, base);
+        try appendFileGlobMatches(op, allocator, &out, dir_path, base);
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn expandDirectoryGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+fn expandDirectoryGlobAlloc(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+) ![]const []const u8 {
     var components: std.ArrayList([]const u8) = .empty;
     defer components.deinit(allocator);
     var prefix = pattern;
@@ -6868,6 +7202,7 @@ fn expandDirectoryGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) !
     while (remaining > 0) {
         remaining -= 1;
         const expanded = try expandDirectoryComponent(
+            op,
             allocator,
             parents,
             components.items[remaining],
@@ -6880,6 +7215,7 @@ fn expandDirectoryGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) !
 }
 
 fn expandDirectoryComponent(
+    op: Operation,
     allocator: std.mem.Allocator,
     parents: []const []const u8,
     base: []const u8,
@@ -6893,21 +7229,21 @@ fn expandDirectoryComponent(
         if (std.mem.indexOfScalar(u8, base, '*')) |base_star| {
             var dir = if (std.fs.path.isAbsolute(parent_path))
                 try std.Io.Dir.openDirAbsolute(
-                    std.Io.Threaded.global_single_threaded.io(),
+                    op.fs.io,
                     parent_path,
                     .{ .iterate = true },
                 )
             else
-                try std.Io.Dir.cwd().openDir(
-                    std.Io.Threaded.global_single_threaded.io(),
+                try op.fs.directory().openDir(
+                    op.fs.io,
                     parent_path,
                     .{ .iterate = true },
                 );
-            defer dir.close(std.Io.Threaded.global_single_threaded.io());
+            defer dir.close(op.fs.io);
             var iter = dir.iterate();
             const prefix = base[0..base_star];
             const suffix = base[base_star + 1 ..];
-            while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+            while (try iter.next(op.fs.io)) |entry| {
                 if (entry.kind != .directory) continue;
                 if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
                 if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
@@ -6916,7 +7252,7 @@ fn expandDirectoryComponent(
         } else {
             const candidate = try joinPathAlloc(allocator, parent_path, base);
             errdefer allocator.free(candidate);
-            if (dirExists(candidate)) {
+            if (dirExists(op, candidate)) {
                 try out.append(allocator, candidate);
             } else {
                 allocator.free(candidate);
@@ -6927,6 +7263,7 @@ fn expandDirectoryComponent(
 }
 
 fn appendFileGlobMatches(
+    op: Operation,
     allocator: std.mem.Allocator,
     out: *std.ArrayList([]const u8),
     dir_name: []const u8,
@@ -6935,7 +7272,7 @@ fn appendFileGlobMatches(
     const base_star = std.mem.indexOfScalar(u8, base, '*') orelse {
         const candidate = try joinPathAlloc(allocator, dir_name, base);
         errdefer allocator.free(candidate);
-        if (fileExists(candidate)) {
+        if (fileExists(op, candidate)) {
             try out.append(allocator, candidate);
         } else {
             allocator.free(candidate);
@@ -6946,19 +7283,19 @@ fn appendFileGlobMatches(
     const suffix = base[base_star + 1 ..];
     var dir = if (std.fs.path.isAbsolute(dir_name))
         try std.Io.Dir.openDirAbsolute(
-            std.Io.Threaded.global_single_threaded.io(),
+            op.fs.io,
             dir_name,
             .{ .iterate = true },
         )
     else
-        try std.Io.Dir.cwd().openDir(
-            std.Io.Threaded.global_single_threaded.io(),
+        try op.fs.directory().openDir(
+            op.fs.io,
             dir_name,
             .{ .iterate = true },
         );
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    defer dir.close(op.fs.io);
     var iter = dir.iterate();
-    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+    while (try iter.next(op.fs.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
@@ -6977,12 +7314,12 @@ fn appendGlobPath(
     try paths.append(allocator, path);
 }
 
-fn dirExists(path: []const u8) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn dirExists(op: Operation, path: []const u8) bool {
+    const io = op.fs.io;
     var dir = if (std.fs.path.isAbsolute(path))
         std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false
     else
-        std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+        op.fs.directory().openDir(io, path, .{}) catch return false;
     dir.close(io);
     return true;
 }
@@ -6993,8 +7330,8 @@ fn joinPathAlloc(allocator: std.mem.Allocator, parent: []const u8, child: []cons
     return allocator.print("{s}/{s}", .{ parent, child });
 }
 
-fn readFirReceiptValid(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+fn readFirReceiptValid(op: Operation, allocator: std.mem.Allocator, path: []const u8) !bool {
+    const raw = try readFileAlloc(op, allocator, path, MaxInputBytes);
     defer allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -7007,7 +7344,12 @@ fn readFirReceiptValid(allocator: std.mem.Allocator, path: []const u8) !bool {
     return boolField(gate, "receipt_valid") orelse false;
 }
 
-fn writeJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
+fn writeJsonFile(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    value: anytype,
+) !void {
     const json = try stringifyAnyAlloc(allocator, value);
     defer allocator.free(json);
     var payload: std.Io.Writer.Allocating = .init(allocator);
@@ -7016,11 +7358,12 @@ fn writeJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype)
     try payload.writer.writeByte('\n');
     const text = try payload.toOwnedSlice();
     defer allocator.free(text);
-    try durable_store.writeTextAtomic(allocator, path, text);
+    try durable_store.writeTextAtomic(op.fs, allocator, path, text);
 }
 
-fn appendLine(path: []const u8, line: []const u8) !void {
+fn appendLine(op: Operation, path: []const u8, line: []const u8) !void {
     const existing = readFileAlloc(
+        op,
         std.heap.page_allocator,
         path,
         MaxInputBytes,
@@ -7038,40 +7381,46 @@ fn appendLine(path: []const u8, line: []const u8) !void {
     try out.writer.writeByte('\n');
     const payload = try out.toOwnedSlice();
     defer std.heap.page_allocator.free(payload);
-    try durable_store.writeTextAtomic(std.heap.page_allocator, path, payload);
+    try durable_store.writeTextAtomic(op.fs, std.heap.page_allocator, path, payload);
 }
 
 fn appendSimpleEvent(
+    op: Operation,
     allocator: std.mem.Allocator,
     events_path: []const u8,
     event_name: []const u8,
 ) !void {
     const event = try stringifyAnyAlloc(allocator, .{ .event = event_name });
     defer allocator.free(event);
-    try appendLine(events_path, event);
+    try appendLine(op, events_path, event);
 }
 
 fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
 }
 
-fn printJsonValue(allocator: std.mem.Allocator, value: anytype) !void {
+fn printJsonValue(op: Operation, allocator: std.mem.Allocator, value: anytype) !void {
     const json = try stringifyAnyAlloc(allocator, value);
     defer allocator.free(json);
-    try printRawJson(json);
+    try printRawJson(op, json);
 }
 
-fn printRawJson(raw: []const u8) !void {
+fn printRawJson(op: Operation, raw: []const u8) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        op.fs.io,
         &.{},
     );
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{raw});
 }
 
-fn printFailureJson(allocator: std.mem.Allocator, code: FailureCode, hint: []const u8) !void {
-    try printJsonValue(allocator, .{
+fn printFailureJson(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    code: FailureCode,
+    hint: []const u8,
+) !void {
+    try printJsonValue(op, allocator, .{
         .session_inquiry_error = .{
             .failure_code = code.asString(),
             .failure_hint = hint,
@@ -7079,7 +7428,12 @@ fn printFailureJson(allocator: std.mem.Allocator, code: FailureCode, hint: []con
     });
 }
 
-fn printPreflightFailure(allocator: std.mem.Allocator, options: Options, err: anyerror) !void {
+fn printPreflightFailure(
+    op: Operation,
+    allocator: std.mem.Allocator,
+    options: Options,
+    err: anyerror,
+) !void {
     const failure_code: FailureCode = switch (err) {
         error.AppServerPreflightFailed,
         error.AppServerPreflightStatusMismatch,
@@ -7088,7 +7442,7 @@ fn printPreflightFailure(allocator: std.mem.Allocator, options: Options, err: an
         => .codex_incompatible,
         else => .schema_unavailable,
     };
-    try printJsonValue(allocator, .{
+    try printJsonValue(op, allocator, .{
         .session_inquiry_preflight = .{
             .compatibility_verdict = "incompatible",
             .codex_path = options.codex_path,
@@ -7120,11 +7474,80 @@ fn sha256HexAlloc(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return out;
 }
 
-fn nowMillis() i128 {
+fn nowMillis(op: Operation) i128 {
     return @divTrunc(
-        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.real.now(op.fs.io).nanoseconds,
         1_000_000,
     );
+}
+
+test "inquiry server survives launcher teardown and cleanup retires its descendants" {
+    const allocator = std.testing.allocator;
+    var environ = try std.testing.environ.createMap(allocator);
+    defer environ.deinit();
+    const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const wrapper = try std.fs.path.join(allocator, &.{ root, "codex-wrapper" });
+    defer allocator.free(wrapper);
+    try environ.put("CAS_INQUIRY_TEST_CODEX", codex_bin);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "codex-wrapper",
+        .data = "#!/bin/sh\n/bin/sleep 600 &\nprintf '%s' \"$!\" > descendant.pid\n" ++
+            "exec \"$CAS_INQUIRY_TEST_CODEX\" \"$@\"\n",
+    });
+    try tmp.dir.setFilePermissions(std.testing.io, "codex-wrapper", .fromMode(0o700), .{});
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    var io_deinitialized = false;
+    defer if (!io_deinitialized) threaded.deinit();
+    var op = testOperation();
+    op.fs = .init(threaded.io(), .cwd());
+    op.environ = &environ;
+    var managed = try startInquiryManagedServer(op, allocator, root, wrapper, .inherit, null, root);
+    var deinitialized = false;
+    defer if (!deinitialized) managed.deinit(allocator);
+    try std.testing.expect(managed.owner_control != null);
+    const url = try allocator.dupe(u8, managed.listen_url);
+    defer allocator.free(url);
+    var child = managed.child;
+    const pid = managed.processId();
+    const group_id = managed.processGroupId();
+    defer @import("cas_runtime").websocket.retireProcessChild(std.testing.io, &child, group_id);
+    const descendant_raw = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "descendant.pid",
+        allocator,
+        .limited(128),
+    );
+    defer allocator.free(descendant_raw);
+    const descendant = try std.fmt.parseInt(u64, descendant_raw, 10);
+    try std.testing.expect(cas_websocket.processAlive(descendant));
+    try managed.detach();
+    managed.deinit(allocator);
+    deinitialized = true;
+    threaded.deinit();
+    io_deinitialized = true;
+
+    var connection = try cas_websocket.Connection.connect(allocator, std.testing.io, url, 2_000);
+    defer connection.deinit();
+    defer connection.close();
+    try connection.sendTextTimeout(
+        "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":" ++
+            "{\"name\":\"cas-inquiry-detach-test\",\"version\":\"1\"},\"capabilities\":{}}}",
+        2_000,
+    );
+    const response = (try connection.readTextAllocTimeout(2_000)) orelse return error.EndOfStream;
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+    try std.testing.expect(parsed.value.object.contains("result"));
+    connection.close();
+    cas_websocket.terminateProcess(pid);
+    _ = try child.wait(std.testing.io);
+    try std.testing.expect(cas_websocket.waitForProcessExit(std.testing.io, descendant, 2_000));
 }
 
 test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
@@ -7149,28 +7572,23 @@ test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
 }
 
 test "casStoreRootAlloc falls back to cwd ledger outside git" {
-    const old_store_root = configured_store_root_override;
-    const old_store_cwd = configured_store_cwd;
-    configured_store_root_override = null;
-    defer configured_store_root_override = old_store_root;
-    defer configured_store_cwd = old_store_cwd;
-
+    var op = testOperation();
     const root = try std.testing.allocator.print(
         "/tmp/cas-session-inquiry-store-root-test-{d}",
-        .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
+        .{std.Io.Clock.real.now(op.fs.io).nanoseconds},
     );
     defer std.testing.allocator.free(root);
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), root);
-    defer std.Io.Dir.cwd().deleteTree(
-        std.Io.Threaded.global_single_threaded.io(),
+    try op.fs.directory().createDirPath(op.fs.io, root);
+    defer op.fs.directory().deleteTree(
+        op.fs.io,
         root,
     ) catch |err| std.debug.panic("test directory cleanup failed: {s}", .{@errorName(err)});
-    configured_store_cwd = root;
+    op.store_selection = .{ .repository = root };
 
-    const store_root = try casStoreRootAlloc(std.testing.allocator);
+    const store_root = try casStoreRootAlloc(op, std.testing.allocator);
     defer std.testing.allocator.free(store_root);
-    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const real_root = try op.fs.directory().realPathFileAlloc(
+        op.fs.io,
         root,
         std.testing.allocator,
     );
@@ -7178,6 +7596,57 @@ test "casStoreRootAlloc falls back to cwd ledger outside git" {
     const expected = try std.testing.allocator.print("{s}/.ledger/cas", .{real_root});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, store_root);
+}
+
+test "inquiry operations keep directory and store selections independent" {
+    const allocator = std.testing.allocator;
+    var first_dir = std.testing.tmpDir(.{});
+    defer first_dir.cleanup();
+    var second_dir = std.testing.tmpDir(.{});
+    defer second_dir.cleanup();
+    var first = testOperation();
+    first.fs = .init(std.testing.io, first_dir.dir);
+    first.store_selection = .{ .explicit = "store" };
+    var second = testOperation();
+    second.fs = .init(std.testing.io, second_dir.dir);
+    second.store_selection = .{ .explicit = "store" };
+
+    const first_path = try stateRecordPath(first, allocator, "", "INQ-independent");
+    defer allocator.free(first_path);
+    const second_path = try stateRecordPath(second, allocator, "", "INQ-independent");
+    defer allocator.free(second_path);
+    try std.testing.expect(!std.mem.eql(u8, first_path, second_path));
+    try writeJsonFile(first, allocator, first_path, .{ .state = "first" });
+    try writeJsonFile(second, allocator, second_path, .{ .state = "second" });
+    const first_again = try stateRecordPath(first, allocator, "", "INQ-independent");
+    defer allocator.free(first_again);
+    try std.testing.expectEqualStrings(first_path, first_again);
+    const first_bytes = try readFileAlloc(first, allocator, first_again, MaxInputBytes);
+    defer allocator.free(first_bytes);
+    const second_bytes = try readFileAlloc(second, allocator, second_path, MaxInputBytes);
+    defer allocator.free(second_bytes);
+    try std.testing.expectEqualStrings("{\n  \"state\": \"first\"\n}\n", first_bytes);
+    try std.testing.expectEqualStrings("{\n  \"state\": \"second\"\n}\n", second_bytes);
+}
+
+test "inquiry store expansion uses the operation home" {
+    const allocator = std.testing.allocator;
+    var first = testOperation();
+    first.store_selection = .{ .explicit = "~/inquiries" };
+    first.home = "/first-home";
+    var second = first;
+    second.home = "/second-home";
+    const first_root = try casStoreRootAlloc(first, allocator);
+    defer allocator.free(first_root);
+    const second_root = try casStoreRootAlloc(second, allocator);
+    defer allocator.free(second_root);
+    try std.testing.expectEqualStrings("/first-home/inquiries", first_root);
+    try std.testing.expectEqualStrings("/second-home/inquiries", second_root);
+    second.home = null;
+    try std.testing.expectError(
+        error.EnvironmentVariableNotFound,
+        casStoreRootAlloc(second, allocator),
+    );
 }
 
 test "deriveCapabilities recognizes exact schema method and local field surface" {
@@ -7245,6 +7714,7 @@ test "validateLane enforces mode horizon invariants" {
 }
 
 test "validateInquiryInputs rejects unavailable workspace" {
+    const op = testOperation();
     const dcp = Dcp{
         .packet_id = "CAP",
         .source_episode_id = "session:test#turn:decision",
@@ -7284,20 +7754,25 @@ test "validateInquiryInputs rejects unavailable workspace" {
     };
     var lanes = [_]Lane{inquiryTestLane("x")};
     const rip = inquiryTestRip("unavailable", &lanes);
-    const gate = validateInquiryInputs(std.testing.allocator, dcp, rip, .{ .command = .run });
+    const gate = validateInquiryInputs(op, std.testing.allocator, dcp, rip, .{ .command = .run });
     try std.testing.expect(!gate.valid);
     try std.testing.expectEqual(FailureCode.workspace_mismatch, gate.failure_code.?);
 }
 
 test "validateInquiryInputs accepts verified rollout transcript lineage only" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
-    const rollout_path = try repoTestPathAlloc(
-        allocator,
-        "libs/trace_core/testdata/new_044_plus.jsonl",
-    );
+    const rollout_path =
+        try repoTestPathAlloc(op, allocator, "libs/trace_core/testdata/new_044_plus.jsonl");
     defer allocator.free(rollout_path);
 
-    var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
+    var trace = try canonical_trace.parseSessionTrace(
+        op.fs.io,
+        op.fs.directory(),
+        allocator,
+        rollout_path,
+        .{},
+    );
     defer trace.deinit(allocator);
     const source_digest = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(source_digest);
@@ -7337,31 +7812,39 @@ test "validateInquiryInputs accepts verified rollout transcript lineage only" {
     };
     var lanes = [_]Lane{inquiryTestLane("x")};
     const rip = inquiryTestRip("transcript_only", &lanes);
-    const gate = validateInquiryInputs(allocator, dcp, rip, .{ .command = .run });
+    try expectTranscriptLineage(op, allocator, dcp, rip);
+}
+
+fn expectTranscriptLineage(op: Operation, allocator: std.mem.Allocator, dcp: Dcp, rip: Rip) !void {
+    const gate = validateInquiryInputs(op, allocator, dcp, rip, .{ .command = .run });
     try std.testing.expect(gate.valid);
 
     var exact_workspace = rip;
     exact_workspace.workspace_policy = "exact";
-    const exact_gate = validateInquiryInputs(allocator, dcp, exact_workspace, .{ .command = .run });
+    const exact_gate =
+        validateInquiryInputs(op, allocator, dcp, exact_workspace, .{ .command = .run });
     try std.testing.expect(!exact_gate.valid);
     try std.testing.expectEqual(FailureCode.workspace_mismatch, exact_gate.failure_code.?);
 
     var stale_dcp = dcp;
     stale_dcp.source_turn_digest = "sha256:bad-source";
-    const stale_gate = validateInquiryInputs(allocator, stale_dcp, rip, .{ .command = .run });
+    const stale_gate = validateInquiryInputs(op, allocator, stale_dcp, rip, .{ .command = .run });
     try std.testing.expect(!stale_gate.valid);
     try std.testing.expectEqual(FailureCode.source_turn_digest_mismatch, stale_gate.failure_code.?);
 
     var anchor_bad_dcp = dcp;
     anchor_bad_dcp.anchors[1].anchor_digest = "sha256:bad-anchor";
-    const anchor_gate = validateInquiryInputs(allocator, anchor_bad_dcp, rip, .{ .command = .run });
+    const anchor_gate =
+        validateInquiryInputs(op, allocator, anchor_bad_dcp, rip, .{ .command = .run });
     try std.testing.expect(!anchor_gate.valid);
     try std.testing.expectEqual(FailureCode.anchor_digest_mismatch, anchor_gate.failure_code.?);
 }
 
 test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained horizon" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     const rollout_path = try repoTestPathAlloc(
+        op,
         allocator,
         "libs/trace_core/testdata/new_044_plus.jsonl",
     );
@@ -7400,7 +7883,14 @@ test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained hori
     var rip = inquiryTestRip("transcript_only", &.{});
     rip.objective = "test objective";
     const lane = inquiryTestLane("why");
-    const prompt = try buildRolloutInquiryPromptAlloc(allocator, dcp, rip, lane, dcp.anchors[1]);
+    const prompt = try buildRolloutInquiryPromptAlloc(
+        op,
+        allocator,
+        dcp,
+        rip,
+        lane,
+        dcp.anchors[1],
+    );
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lineage_mode: rollout_transcript") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_turns_retained: 1") != null);
@@ -7617,11 +8107,8 @@ test "CAS accepts a validated DCP without a source episode projection" {
     try std.testing.expect(dcp.source_episode_id == null);
 }
 
-fn repoTestPathAlloc(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        allocator,
-    );
+fn repoTestPathAlloc(op: Operation, allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
+    const cwd = try op.fs.directory().realPathFileAlloc(op.fs.io, ".", allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, relative });
 }
@@ -7659,28 +8146,29 @@ test "validateLane rejects path traversal lane ids" {
 }
 
 test "expandSimpleGlobAlloc supports wildcard directories" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "INQ-1/lanes");
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "INQ-2/lanes");
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+    try tmp.dir.createDirPath(op.fs.io, "INQ-1/lanes");
+    try tmp.dir.createDirPath(op.fs.io, "INQ-2/lanes");
+    try tmp.dir.writeFile(op.fs.io, .{
         .sub_path = "INQ-1/lanes/a.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+    try tmp.dir.writeFile(op.fs.io, .{
         .sub_path = "INQ-2/lanes/b.json",
         .data = "{}",
     });
     const tmp_path = try tmp.dir.realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        op.fs.io,
         ".",
         allocator,
     );
     defer allocator.free(tmp_path);
     const pattern = try allocator.print("{s}/*/lanes/*.json", .{tmp_path});
     defer allocator.free(pattern);
-    const matches = try expandSimpleGlobAlloc(allocator, pattern);
+    const matches = try expandSimpleGlobAlloc(op, allocator, pattern);
     defer freeStringList(allocator, matches);
     try std.testing.expectEqual(@as(usize, 2), matches.len);
 }
@@ -7696,6 +8184,7 @@ test "sha256HexAlloc prefixes digest" {
 }
 
 test "CAS binds caller Ledger receipts without a Ledger runtime" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7712,11 +8201,7 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
         .sub_path = "validation.json",
         .data = receipt,
     });
-    const input_path = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        "capsule.json",
-        allocator,
-    );
+    const input_path = try tmp.dir.realPathFileAlloc(std.testing.io, "capsule.json", allocator);
     defer allocator.free(input_path);
     const receipt_path = try tmp.dir.realPathFileAlloc(
         std.testing.io,
@@ -7725,6 +8210,7 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
     );
     defer allocator.free(receipt_path);
     var validated = try validateLedgerInput(
+        op,
         allocator,
         input_path,
         receipt_path,
@@ -7741,6 +8227,7 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
     try std.testing.expectError(
         error.LedgerValidationInputDigestMismatch,
         validateLedgerInput(
+            op,
             allocator,
             input_path,
             receipt_path,
@@ -7755,6 +8242,7 @@ test "CAS binds caller Ledger receipts without a Ledger runtime" {
     try std.testing.expectError(
         error.LedgerValidationDefinitionDigestMismatch,
         validateLedgerInputReceipt(
+            op,
             allocator,
             receipt_path,
             input_path,
@@ -7889,11 +8377,12 @@ test "shared session inquiry probe gate rejects failed or duplicate witnesses" {
 }
 
 test "resolveExecutablePathAlloc uses standard fallback paths" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
-    const path = try resolveExecutablePathAlloc(allocator, "sh", "");
+    const path = try resolveExecutablePathAlloc(op, allocator, "sh", "");
     defer allocator.free(path);
 
-    try std.testing.expect(fileExists(path));
+    try std.testing.expect(fileExists(op, path));
     const fallback_dirs = [_][]const u8{
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -8113,12 +8602,13 @@ test "forkPolicyProofFromResponse requires response-backed proof" {
 }
 
 test "detached lane handle round-trips persisted fork turn handle" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_path = try tmp.dir.realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        op.fs.io,
         ".",
         allocator,
     );
@@ -8168,8 +8658,8 @@ test "detached lane handle round-trips persisted fork turn handle" {
         .fork_cleaned = true,
     };
 
-    try writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running));
-    const loaded = try loadLaneHandleAlloc(allocator, path);
+    try writeLaneHandle(op, allocator, handle, @tagName(InquiryState.turn_running));
+    const loaded = try loadLaneHandleAlloc(op, allocator, path);
     defer freeLaneHandle(allocator, loaded);
     try std.testing.expectEqualStrings("INQ-TEST", loaded.inquiry_id);
     try std.testing.expectEqualStrings("fork", loaded.fork_thread_id);
@@ -8483,6 +8973,7 @@ fn allocatingTestError(err: anyerror) anyerror {
 }
 
 test "directory glob preserves caller parent order across two wildcard levels" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8494,16 +8985,16 @@ test "directory glob preserves caller parent order across two wildcard levels" {
     defer allocator.free(parent_b);
     const parent_a = try std.fs.path.join(allocator, &.{ root, "parent-a" });
     defer allocator.free(parent_a);
-    const fixed = try expandDirectoryComponent(allocator, &.{ parent_b, parent_a }, "fixed");
+    const fixed = try expandDirectoryComponent(op, allocator, &.{ parent_b, parent_a }, "fixed");
     defer freeStringList(allocator, fixed);
-    const lanes = try expandDirectoryComponent(allocator, fixed, "lane-*");
+    const lanes = try expandDirectoryComponent(op, allocator, fixed, "lane-*");
     defer freeStringList(allocator, lanes);
     try std.testing.expectEqual(@as(usize, 2), lanes.len);
     try std.testing.expect(std.mem.endsWith(u8, lanes[0], "/parent-b/fixed/lane-b"));
     try std.testing.expect(std.mem.endsWith(u8, lanes[1], "/parent-a/fixed/lane-a"));
     const pattern = try std.fs.path.join(allocator, &.{ root, "parent-*", "fixed", "lane-*" });
     defer allocator.free(pattern);
-    const expanded = try expandDirectoryGlobAlloc(allocator, pattern);
+    const expanded = try expandDirectoryGlobAlloc(op, allocator, pattern);
     defer freeStringList(allocator, expanded);
     try std.testing.expectEqual(@as(usize, 2), expanded.len);
     for (lanes) |expected| {
@@ -8514,11 +9005,12 @@ test "directory glob preserves caller parent order across two wildcard levels" {
 }
 
 test "directory glob accepts a wildcard root relative to the current directory" {
+    const op = testOperation();
     const allocator = std.testing.allocator;
     const pattern = "*";
-    const expected = try expandDirectoryComponent(allocator, &.{"."}, pattern);
+    const expected = try expandDirectoryComponent(op, allocator, &.{"."}, pattern);
     defer freeStringList(allocator, expected);
-    const actual = try expandDirectoryGlobAlloc(allocator, pattern);
+    const actual = try expandDirectoryGlobAlloc(op, allocator, pattern);
     defer freeStringList(allocator, actual);
     try std.testing.expectEqualDeep(expected, actual);
 }
@@ -8682,4 +9174,60 @@ fn freeDetachedRecord(allocator: std.mem.Allocator, record: DetachedRecord) void
     allocator.free(record.cwd);
     allocator.free(record.failure_code);
     allocator.free(record.failure_hint);
+}
+
+test "command runner returns status and remains callable after a rejected command" {
+    const Hooks = struct {
+        var written: usize = 0;
+        var fail_writes: bool = false;
+        fn operate(
+            userdata: ?*anyopaque,
+            operation: std.Io.Operation,
+        ) std.Io.Cancelable!std.Io.Operation.Result {
+            switch (operation) {
+                .file_write_streaming => |write| {
+                    if (fail_writes) return .{ .file_write_streaming = error.InputOutput };
+                    var count = write.header.len;
+                    for (write.data, 0..) |bytes, i| {
+                        count += bytes.len * (if (i + 1 == write.data.len) write.splat else 1);
+                    }
+                    written += count;
+                    return .{ .file_write_streaming = count };
+                },
+                else => return std.testing.io.vtable.operate(userdata, operation),
+            }
+        }
+    };
+    Hooks.written = 0;
+    Hooks.fail_writes = false;
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = Hooks.operate;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ = try std.testing.environ.createMap(std.testing.allocator);
+    defer environ.deinit();
+    var init: std.process.Init = .{
+        .minimal = .{
+            .environ = std.testing.environ,
+            .args = .{ .vector = &.{ "cas_session_inquiry", "--unknown" } },
+        },
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable },
+        .environ_map = &environ,
+        .preopens = .empty,
+    };
+    try std.testing.expectEqual(@as(u8, 2), try runCommand(init));
+    try std.testing.expect(Hooks.written > 0);
+    Hooks.fail_writes = true;
+    try std.testing.expectEqual(@as(u8, 1), try runCommand(init));
+    Hooks.fail_writes = false;
+    var operation = testOperation();
+    operation.fs = .init(init.io, .cwd());
+    try std.testing.expectError(
+        error.CommandReportedRejection,
+        cmdStatus(operation, std.testing.allocator, .{ .command = .status }),
+    );
+    init.minimal.args.vector = &.{ "cas_session_inquiry", "--version" };
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(init));
 }

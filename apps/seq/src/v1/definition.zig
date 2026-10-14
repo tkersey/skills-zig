@@ -1591,6 +1591,7 @@ test "observation definition compiles passive structure into an immutable plan" 
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "observation.json",
@@ -1641,6 +1642,7 @@ test "observation definition rejects undeclared operators and domain relations" 
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "invalid.json",

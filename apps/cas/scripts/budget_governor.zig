@@ -102,12 +102,18 @@ const WindowEval = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    var help_writer = std.Io.File.stdout().writer(init.io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersion(
+        &help_writer.interface,
+        argv,
+        UsageText,
+        Version,
+    )) return;
 
     const parsed = try parseArgs(argv);
     if (parsed.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            init.io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -116,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (parsed.show_help) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            init.io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -132,12 +138,18 @@ pub fn main(init: std.process.Init) !void {
     );
     defer allocator.free(input);
 
-    var owned = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);
+    var owned = try computeBudgetGovernorFromSlice(
+        allocator,
+        input,
+        parsed.now_sec orelse @intCast(
+            @divFloor(std.Io.Clock.real.now(init.io).nanoseconds, 1_000_000_000),
+        ),
+    );
     defer owned.deinit();
     const out = owned.value;
 
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        init.io,
         &.{},
     );
     const stdout = &stdout_writer.interface;
@@ -173,7 +185,7 @@ pub const OwnedGovernor = struct {
 pub fn computeBudgetGovernorFromSlice(
     allocator: std.mem.Allocator,
     input: []const u8,
-    now_sec_opt: ?i64,
+    now_sec: i64,
 ) !OwnedGovernor {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -184,7 +196,7 @@ pub fn computeBudgetGovernorFromSlice(
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-    return .{ .value = computeBudgetGovernor(root, now_sec_opt), .arena = arena };
+    return .{ .value = computeBudgetGovernor(root, now_sec), .arena = arena };
 }
 
 const ParsedArgs = struct {
@@ -440,14 +452,7 @@ fn pickStricterWindow(
 }
 
 // Returned strings borrow root's backing owner; callers keep that owner alive.
-pub fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
-    const now_sec = now_sec_opt orelse @as(
-        i64,
-        @intCast(@divFloor(
-            std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
-            1_000_000_000,
-        )),
-    );
+pub fn computeBudgetGovernor(root: ObjectMap, now_sec: i64) GovernorOut {
     const picked = pickBucket(root);
     if (picked.bucket == null) {
         return .{

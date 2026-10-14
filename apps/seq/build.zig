@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = seq_meta },
             .{ .name = "test_support", .module = modules.test_support },
             .{ .name = "definition_core", .module = modules.definition_core },
+            .{ .name = "durable_store", .module = modules.durable_store },
             .{ .name = "seq_v1_core", .module = modules.seq_core },
         },
     });
@@ -45,6 +46,7 @@ pub fn build(b: *std.Build) void {
 }
 
 const CoreModules = struct {
+    durable_store: *std.Build.Module,
     definition_core: *std.Build.Module,
     seq_core: *std.Build.Module,
     test_support: *std.Build.Module,
@@ -60,14 +62,7 @@ fn createCoreModules(
         .target = target,
         .optimize = optimize,
     });
-    const durable_store = b.createModule(.{
-        .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "jsonl_core", .module = jsonl_core },
-        },
-    });
+    const durable_store = createDurableStoreModule(b, target, optimize, jsonl_core);
     const definition_compat = b.createModule(.{
         .root_source_file = b.path("../../libs/definition_compat/src/root.zig"),
         .target = target,
@@ -111,10 +106,33 @@ fn createCoreModules(
         definition_core, seq_core, durable_store, jsonl_core, trace_core,
     }) |module| module.addImport("test_support", test_support);
     return .{
+        .durable_store = durable_store,
         .definition_core = definition_core,
         .seq_core = seq_core,
         .test_support = test_support,
     };
+}
+
+fn createDurableStoreModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    jsonl_core: *std.Build.Module,
+) *std.Build.Module {
+    const core_io = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/io_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    return b.createModule(.{
+        .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_io", .module = core_io },
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
+    });
 }
 
 fn createTimeModule(

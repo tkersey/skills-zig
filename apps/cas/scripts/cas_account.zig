@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const budget_governor = @import("budget_governor.zig");
 const cas = @import("cas_proxy_client.zig");
@@ -125,39 +126,73 @@ const FailureOut = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
+    const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
-
-    const opts = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
-    };
-
-    if (opts.show_version) return printVersion();
-    if (opts.show_help) return printHelp();
-    if (opts.command == null) core_cli.exitUsageFailure(
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
         HelpSurface,
         Version,
+    )) return 0;
+
+    const opts = parseArgs(argv) catch |err| {
+        return usageFailure(io, @errorName(err), null);
+    };
+
+    if (opts.show_version) {
+        try printVersion(io);
+        return 0;
+    }
+    if (opts.show_help) {
+        try printHelp(io);
+        return 0;
+    }
+    if (opts.command == null) return usageFailure(
+        io,
         "MissingCommand",
         "status",
     );
 
     const cwd = opts.cwd orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
 
-    var account_client = startAccountClient(allocator, opts, cwd, init.io) catch |err| {
-        try fail(allocator, opts, "transportFailure", @errorName(err), 1);
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
+    defer directory.close(io);
+    const environ = init.environ_map;
+
+    var account_client = startAccountClient(
+        directory,
+        environ,
+        allocator,
+        opts,
+        cwd,
+        init.io,
+    ) catch |err| {
+        return fail(io, allocator, opts, "transportFailure", @errorName(err), 1);
     };
     defer account_client.deinit(allocator);
 
-    runStatus(allocator, opts, &account_client.client) catch |err| {
+    runStatus(io, allocator, opts, &account_client.client) catch |err| {
         const code = classifyFailure(err);
-        try fail(allocator, opts, code, failureHint(code), 1);
+        return fail(io, allocator, opts, code, failureHint(code), 1);
     };
+    return 0;
 }
 
-fn runStatus(allocator: std.mem.Allocator, opts: ParsedArgs, client: *cas.Client) !void {
+fn runStatus(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    opts: ParsedArgs,
+    client: *cas.Client,
+) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -177,7 +212,7 @@ fn runStatus(allocator: std.mem.Allocator, opts: ParsedArgs, client: *cas.Client
         else
             account_auth.auth;
 
-    const rate_limits = try parseRateLimits(arena, rate_limits_json);
+    const rate_limits = try parseRateLimits(io, arena, rate_limits_json);
     const usage = if (opts.usage) blk: {
         const usage_json = try client.requestJson("account/usage/read", null);
         defer allocator.free(usage_json);
@@ -192,13 +227,13 @@ fn runStatus(allocator: std.mem.Allocator, opts: ParsedArgs, client: *cas.Client
         .usage = usage,
     };
 
-    try writeStatus(opts.json, payload);
+    try writeStatus(io, opts.json, payload);
 }
 
-fn writeStatus(json: bool, payload: StatusOut) !void {
+fn writeStatus(io: std.Io, json: bool, payload: StatusOut) !void {
     if (json) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -206,7 +241,7 @@ fn writeStatus(json: bool, payload: StatusOut) !void {
         try stdout.writeAll("\n");
     } else {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -303,13 +338,16 @@ fn readAuthFallback(
     };
 }
 
-fn parseRateLimits(allocator: std.mem.Allocator, json: []const u8) !RateLimitsOut {
+fn parseRateLimits(io: std.Io, allocator: std.mem.Allocator, json: []const u8) !RateLimitsOut {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     const root = switch (parsed.value) {
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-    const governor = budget_governor.computeBudgetGovernor(root, null);
+    const governor = budget_governor.computeBudgetGovernor(
+        root,
+        @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, 1_000_000_000)),
+    );
     const bucket = selectedRateLimitBucket(root, governor);
     return .{
         .governor = governor,
@@ -353,6 +391,8 @@ fn parseUsage(allocator: std.mem.Allocator, json: []const u8) !UsageOut {
 }
 
 fn startAccountClient(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -360,6 +400,9 @@ fn startAccountClient(
 ) !AccountClient {
     const resolved_codex_path = cas.resolveExecutableAlloc(
         allocator,
+        io,
+        directory,
+        environ.get("PATH"),
         opts.codex_path,
     ) catch opts.codex_path;
     defer if (resolved_codex_path.ptr != opts.codex_path.ptr) allocator.free(resolved_codex_path);
@@ -370,11 +413,21 @@ fn startAccountClient(
         resolved_codex_path,
         opts.hook_policy,
         io,
+        directory,
+        environ,
     ) catch null;
     const client = if (managed_server) |server|
         cas.Client.start(
             allocator,
-            clientOptions(opts, cwd, io, resolved_codex_path, server.listen_url),
+            clientOptions(
+                directory,
+                environ,
+                opts,
+                cwd,
+                io,
+                resolved_codex_path,
+                server.listen_url,
+            ),
         ) catch blk: {
             var owned_server = server;
             defer owned_server.deinit(allocator);
@@ -382,16 +435,21 @@ fn startAccountClient(
             managed_server = null;
             break :blk try cas.Client.start(
                 allocator,
-                clientOptions(opts, cwd, io, resolved_codex_path, null),
+                clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null),
             );
         }
     else
-        try cas.Client.start(allocator, clientOptions(opts, cwd, io, resolved_codex_path, null));
+        try cas.Client.start(
+            allocator,
+            clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null),
+        );
 
     return .{ .client = client, .managed_server = managed_server };
 }
 
 fn clientOptions(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     opts: ParsedArgs,
     cwd: []const u8,
     io: std.Io,
@@ -401,6 +459,8 @@ fn clientOptions(
     return .{
         .cwd = cwd,
         .io = io,
+        .dir = directory,
+        .environ = environ,
         .codex_path = codex_path,
         .client_name = "cas-account",
         .client_title = "CAS Account",
@@ -635,19 +695,20 @@ fn failureHint(code: []const u8) []const u8 {
 }
 
 fn fail(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     code: []const u8,
     hint: ?[]const u8,
     exit_code: u8,
-) !noreturn {
+) !u8 {
     if (opts.json) {
         const payload = FailureOut{
             .failureCode = code,
             .failureHint = hint,
         };
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -655,7 +716,7 @@ fn fail(
         try stdout.writeAll("\n");
     } else {
         var stderr_writer = std.Io.File.stderr().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stderr = &stderr_writer.interface;
@@ -665,20 +726,20 @@ fn fail(
         ) else try stderr.print("cas_account status: {s}\n", .{code});
     }
     _ = allocator;
-    std.process.exit(exit_code);
+    return exit_code;
 }
 
-fn printVersion() !void {
+fn printVersion(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     try core_cli.printVersion(&stdout_writer.interface, Version);
 }
 
-fn printHelp() !void {
+fn printHelp(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     try core_cli.printHelpSurface(&stdout_writer.interface, HelpSurface, Version);
@@ -745,7 +806,7 @@ test "parseRateLimits reuses budget governor and classifies reached state" {
     const raw =
         \\{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"plus","rateLimitReachedType":"none","rateLimitResetCredits":{"availableCount":1},"primary":{"usedPercent":20,"resetsAt":2000,"windowDurationMins":60}}}
     ;
-    const parsed = try parseRateLimits(arena_state.allocator(), raw);
+    const parsed = try parseRateLimits(std.testing.io, arena_state.allocator(), raw);
     try std.testing.expect(parsed.governor.ok);
     try std.testing.expectEqualStrings("none", parsed.rateLimitReachedType.?);
     try std.testing.expect(parsed.hasCredits);
@@ -757,7 +818,7 @@ test "parseRateLimits scopes reached state to selected codex bucket" {
     const raw =
         \\{"rateLimitsByLimitId":{"other":{"limitId":"other","rateLimitReachedType":"hard","primary":{"usedPercent":99,"resetsAt":2000,"windowDurationMins":60}},"codex":{"limitId":"codex","limitName":"Codex","rateLimitReachedType":"none","rateLimitResetCredits":{"availableCount":2},"primary":{"usedPercent":20,"resetsAt":2000,"windowDurationMins":60}}}}
     ;
-    const parsed = try parseRateLimits(arena_state.allocator(), raw);
+    const parsed = try parseRateLimits(std.testing.io, arena_state.allocator(), raw);
     try std.testing.expectEqualStrings("codex", parsed.governor.bucketKey.?);
     try std.testing.expectEqualStrings("none", parsed.rateLimitReachedType.?);
     try std.testing.expect(parsed.hasCredits);
@@ -856,4 +917,16 @@ test "usage search handles deep and wide JSON without recursion" {
         wide.value,
         json.items.len,
     ));
+}
+
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
+    return 2;
 }

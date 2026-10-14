@@ -29,19 +29,19 @@ pub fn runDelegatedCli(
     skill_name: []const u8,
     script_name: []const u8,
     runtime: DelegateRuntime,
-) !void {
+) !u8 {
     if (argv.len <= 1 or isHelpRequested(argv)) {
         var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpWithVersion(stdout, usage_text, version_text);
-        return;
+        return 0;
     }
 
     if (isVersionRequested(argv)) {
         var stdout_writer = std.Io.File.stdout().writer(io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, version_text);
-        return;
+        return 0;
     }
 
     const script_path = resolveScriptPath(
@@ -58,7 +58,7 @@ pub fn runDelegatedCli(
             "{s}: unable to locate delegated script {s}\n",
             .{ source_file, script_name },
         );
-        std.process.exit(1);
+        return 1;
     };
     defer allocator.free(script_path);
 
@@ -75,9 +75,9 @@ pub fn runDelegatedCli(
             "{s}: delegate execution failed: {s}\n",
             .{ source_file, @errorName(err) },
         );
-        std.process.exit(1);
+        return 1;
     };
-    if (exit_code != 0) std.process.exit(exit_code);
+    return exit_code;
 }
 
 pub fn runUvPython(
@@ -366,4 +366,30 @@ test "script lookup preserves home-relative precedence" {
         error.ScriptNotFound,
         resolveScriptPath(allocator, io, home, "demo", "test.py"),
     );
+}
+
+test "delegated CLI returns nonzero child status without terminating its host" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".codex/skills/demo/scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".codex/skills/demo/scripts/exit.sh",
+        .data = "exit 7\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    try std.testing.expectEqual(@as(u8, 7), try runDelegatedCli(
+        allocator,
+        io,
+        home,
+        &.{ "demo", "run" },
+        "usage",
+        "1",
+        "test",
+        "demo",
+        "exit.sh",
+        .bash,
+    ));
 }

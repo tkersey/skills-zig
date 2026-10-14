@@ -5247,18 +5247,19 @@ pub fn resolveSlotPathAlloc(
 }
 
 pub fn enumerateMatchingPathsAlloc(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     slot: Slot,
     max_paths: usize,
 ) ![][]u8 {
-    if (!storage_root.validRepoRoot(repo_root)) {
+    if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
     if (max_paths == 0) return error.StoragePathEnumerationBoundsExceeded;
     const ledger_root = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent() },
+        &.{ repo_root, storage_root.controlComponent(scope) },
     );
     defer allocator.free(ledger_root);
     var paths: std.ArrayList([]u8) = .empty;
@@ -5268,6 +5269,7 @@ pub fn enumerateMatchingPathsAlloc(
     }
     var visited_entries: usize = 0;
     try enumeratePathSegments(
+        scope,
         allocator,
         ledger_root,
         "",
@@ -5287,6 +5289,7 @@ pub fn enumerateMatchingPathsAlloc(
 }
 
 fn enumeratePathSegments(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     absolute_parent: []const u8,
     relative_parent: []const u8,
@@ -5318,6 +5321,7 @@ fn enumeratePathSegments(
         const frame = &frames[frame_count - 1];
         switch (frame.state) {
             .ready => try advanceReadyPathEnumeration(
+                scope,
                 allocator,
                 frame,
                 segments,
@@ -5326,6 +5330,7 @@ fn enumeratePathSegments(
                 &frame_count,
             ),
             .parameter => try advanceParameterPathEnumeration(
+                scope,
                 allocator,
                 frames,
                 &frame_count,
@@ -5340,6 +5345,7 @@ fn enumeratePathSegments(
 }
 
 const PathEnumerationParameter = struct {
+    io: std.Io,
     directory: std.Io.Dir,
     iterator: std.Io.Dir.Iterator,
 };
@@ -5360,17 +5366,13 @@ const PathEnumerationFrame = struct {
         allocator: std.mem.Allocator,
     ) void {
         if (self.state == .parameter) {
-            self.state.parameter.directory.close(storageIo());
+            self.state.parameter.directory.close(self.state.parameter.io);
         }
         allocator.free(self.absolute_parent);
         allocator.free(self.relative_parent);
         self.* = undefined;
     }
 };
-
-fn storageIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
 
 fn initialPathEnumerationFrame(
     allocator: std.mem.Allocator,
@@ -5388,6 +5390,7 @@ fn initialPathEnumerationFrame(
 }
 
 fn advanceReadyPathEnumeration(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     frame: *PathEnumerationFrame,
     segments: []const PathSegment,
@@ -5399,13 +5402,13 @@ fn advanceReadyPathEnumeration(
     if (segment.kind == .parameter) {
         var directory = (if (std.fs.path.isAbsolute(frame.absolute_parent))
             std.Io.Dir.openDirAbsolute(
-                storageIo(),
+                scope.fs.io,
                 frame.absolute_parent,
                 .{ .iterate = true, .follow_symlinks = false },
             )
         else
-            std.Io.Dir.cwd().openDir(
-                storageIo(),
+            scope.fs.directory().openDir(
+                scope.fs.io,
                 frame.absolute_parent,
                 .{ .iterate = true, .follow_symlinks = false },
             )) catch |err| switch (err) {
@@ -5417,6 +5420,7 @@ fn advanceReadyPathEnumeration(
             else => return err,
         };
         frame.state = .{ .parameter = .{
+            .io = scope.fs.io,
             .directory = directory,
             .iterator = directory.iterate(),
         } };
@@ -5433,6 +5437,7 @@ fn advanceReadyPathEnumeration(
     if (last) {
         frame_count.* -= 1;
         try appendLiteralEnumerationPath(
+            scope,
             allocator,
             &child,
             max_paths,
@@ -5445,6 +5450,7 @@ fn advanceReadyPathEnumeration(
 }
 
 fn advanceParameterPathEnumeration(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     frames: []PathEnumerationFrame,
     frame_count: *usize,
@@ -5456,7 +5462,7 @@ fn advanceParameterPathEnumeration(
 ) !void {
     const frame = &frames[frame_count.* - 1];
     const parameter = &frame.state.parameter;
-    while (try parameter.iterator.next(storageIo())) |entry| {
+    while (try parameter.iterator.next(scope.fs.io)) |entry| {
         visited_entries.* += 1;
         if (visited_entries.* > max_entries) {
             return error.StoragePathEntryBoundsExceeded;
@@ -5469,7 +5475,7 @@ fn advanceParameterPathEnumeration(
         definition_core.json.safeIdentifier(entry.name, 128) catch continue;
         if (std.mem.indexOfScalar(u8, entry.name, '/') != null) continue;
         const stat = parameter.directory.statFile(
-            storageIo(),
+            scope.fs.io,
             entry.name,
             .{ .follow_symlinks = false },
         ) catch |err| switch (err) {
@@ -5538,13 +5544,14 @@ fn childPathEnumerationFrame(
 }
 
 fn appendLiteralEnumerationPath(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     child: *const PathEnumerationFrame,
     max_paths: usize,
     paths: *std.ArrayList([]u8),
 ) !void {
-    const stat = std.Io.Dir.cwd().statFile(
-        storageIo(),
+    const stat = scope.fs.directory().statFile(
+        scope.fs.io,
         child.absolute_parent,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
@@ -5715,6 +5722,7 @@ const StorageTestPlan = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             &tmp.dir,
             "definition.json",
@@ -5812,6 +5820,7 @@ fn expectStorageCompileError(
         .data = source,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "definition.json",
@@ -5947,6 +5956,10 @@ test "storage path parameters compile once and resolve as safe components" {
 }
 
 test "matching storage enumeration excludes transaction control artifacts" {
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &scope_storage;
     var test_plan = try StorageTestPlan.init(
         storage_parameterized_definition,
     );
@@ -5976,6 +5989,7 @@ test "matching storage enumeration excludes transaction control artifacts" {
     );
     defer std.testing.allocator.free(repo_root);
     const paths = try enumerateMatchingPathsAlloc(
+        scope,
         std.testing.allocator,
         repo_root,
         test_plan.plan.slots[0],

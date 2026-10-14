@@ -1,11 +1,22 @@
+const Operation = @import("operation.zig").Operation;
 const std = @import("std");
 
-pub fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
+pub fn userErrorFmt(io: std.Io, comptime fmt: []const u8, args: anytype) error{UserInput} {
     var stderr_file = std.Io.File.stderr();
-    var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stderr_writer = stderr_file.writer(io, &.{});
     const stderr = &stderr_writer.interface;
     stderr.print("error: " ++ fmt ++ "\n", args) catch return error.UserInput;
     return error.UserInput;
+}
+
+pub fn warningFmt(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    if (!std.log.logEnabled(.warn, .default)) return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
+    defer io.unlockStderr();
+    std.log.defaultLogFileTerminal(.warn, .default, fmt, args, stderr) catch return;
 }
 
 pub fn jsonWriteString(writer: anytype, value: []const u8) !void {
@@ -86,36 +97,47 @@ pub fn renderTomlStringArray(allocator: std.mem.Allocator, values: []const []con
 }
 
 pub fn writeFileAtomic(
+    operation: Operation,
     allocator: std.mem.Allocator,
     path: []const u8,
     contents: []const u8,
 ) !void {
     const timestamp = std.Io.Clock.awake.now(
-        std.Io.Threaded.global_single_threaded.io(),
+        operation.io,
     ).nanoseconds;
     const tmp = try allocator.print("{s}.tmp.{d}", .{ path, timestamp });
     defer allocator.free(tmp);
 
     {
-        var file = std.Io.Dir.cwd().createFile(
-            std.Io.Threaded.global_single_threaded.io(),
+        var file = operation.cwd.createFile(
+            operation.io,
             tmp,
             .{},
         ) catch |err| {
-            return userErrorFmt("unable to create temp file ({s}): {s}", .{ tmp, @errorName(err) });
+            return userErrorFmt(
+                operation.io,
+                "unable to create temp file ({s}): {s}",
+                .{ tmp, @errorName(err) },
+            );
         };
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), contents) catch |err| {
-            return userErrorFmt("unable to write temp file ({s}): {s}", .{ tmp, @errorName(err) });
+        defer file.close(operation.io);
+        file.writeStreamingAll(operation.io, contents) catch |err| {
+            return userErrorFmt(
+                operation.io,
+                "unable to write temp file ({s}): {s}",
+                .{ tmp, @errorName(err) },
+            );
         };
     }
 
-    std.Io.Dir.renameAbsolute(
+    operation.cwd.rename(
         tmp,
+        operation.cwd,
         path,
-        std.Io.Threaded.global_single_threaded.io(),
+        operation.io,
     ) catch |err| {
         return userErrorFmt(
+            operation.io,
             "unable to move temp file to target ({s}): {s}",
             .{ path, @errorName(err) },
         );

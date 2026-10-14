@@ -1,3 +1,5 @@
+const core_io = @import("core_io");
+pub const Operation = @import("automation/operation.zig").Operation;
 const app_meta = @import("app_meta");
 const automation_files = @import("automation/files.zig");
 const automation_output = @import("automation/output.zig");
@@ -15,11 +17,6 @@ const SourceFile = "cas_automation.zig";
 const DefaultCodexBin = "codex";
 const DefaultLaunchdLabel = "com.openai.codex.automation-runner";
 const DefaultIntervalSeconds: i64 = 60;
-
-fn envString(key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    return std.mem.span(value);
-}
 
 pub const Command = enum {
     doctor,
@@ -120,7 +117,13 @@ pub const PerfCase = enum {
     run_due,
 };
 
-pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []const u8) !void {
+pub fn runPerfCase(
+    supplied_operation: Operation,
+    allocator: std.mem.Allocator,
+    case: PerfCase,
+    temp_root: []const u8,
+) !void {
+    var operation = supplied_operation;
     const db_path = try std.fs.path.join(allocator, &.{ temp_root, "codex-dev.db" });
     defer allocator.free(db_path);
     const automation_root = try std.fs.path.join(
@@ -128,24 +131,33 @@ pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []co
         &.{ temp_root, ".codex", "automations" },
     );
     defer allocator.free(automation_root);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try std.Io.Dir.cwd().createDirPath(io, automation_root);
-    automation_files.setAutomationRootOverride(automation_root);
-    defer automation_files.setAutomationRootOverride(null);
-    try seedPerfDb(allocator, db_path);
+    try operation.cwd.createDirPath(operation.io, automation_root);
 
-    const stdout_guard = try silenceStdout();
-    defer restoreStdout(stdout_guard);
+    operation.automation_root = automation_root;
 
+    try seedPerfDb(operation, allocator, db_path);
+
+    const stdout_guard = try silenceStdout(operation.io);
+    defer restoreStdout(operation.io, stdout_guard);
+
+    try executePerfCase(operation, allocator, case, db_path);
+}
+
+fn executePerfCase(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    case: PerfCase,
+    db_path: []const u8,
+) !void {
     switch (case) {
         .show => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "show", "--id", "cron-001" },
         ),
         .create => try run(
             allocator,
-            io,
+            operation,
             &.{
                 "--db",
                 db_path,
@@ -160,32 +172,32 @@ pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []co
         ),
         .update => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "update", "--id", "cron-001", "--new-name", "Updated Perf" },
         ),
         .enable => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "enable", "--id", "cron-001" },
         ),
         .disable => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "disable", "--id", "cron-001" },
         ),
         .run_now => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "run-now", "--id", "cron-001" },
         ),
         .delete => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "delete", "--id", "cron-001" },
         ),
         .run_due => try run(
             allocator,
-            io,
+            operation,
             &.{ "--db", db_path, "run-due", "--id", "cron-001", "--dry-run" },
         ),
     }
@@ -196,11 +208,11 @@ const StdoutGuard = struct {
     devnull: std.Io.File,
 };
 
-fn silenceStdout() !StdoutGuard {
+fn silenceStdout(io: std.Io) !StdoutGuard {
     const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
     if (saved_fd < 0) return error.SystemResources;
     const devnull = try std.Io.Dir.openFileAbsolute(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         "/dev/null",
         .{ .mode = .write_only },
     );
@@ -208,10 +220,10 @@ fn silenceStdout() !StdoutGuard {
     return .{ .saved_fd = saved_fd, .devnull = devnull };
 }
 
-fn restoreStdout(guard: StdoutGuard) void {
+fn restoreStdout(io: std.Io, guard: StdoutGuard) void {
     _ = std.c.dup2(guard.saved_fd, std.posix.STDOUT_FILENO);
     _ = std.c.close(guard.saved_fd);
-    guard.devnull.close(std.Io.Threaded.global_single_threaded.io());
+    guard.devnull.close(io);
 }
 
 fn ignoreError(result: anyerror!void) void {
@@ -243,141 +255,157 @@ const SchedulerLabelArgs = automation_scheduler.SchedulerLabelArgs;
 const DoctorArgs = automation_store.DoctorArgs;
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
-        try printUsage();
-        return;
+        try printUsage(init.io);
+        return 0;
     }
     if (isHelpArg(argv[1])) {
-        try printUsage();
-        return;
+        try printUsage(init.io);
+        return 0;
     }
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
         var stdout_file = std.Io.File.stdout();
-        var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = stdout_file.writer(init.io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
-    run(allocator, init.io, argv[1..]) catch |err| {
-        if (err == error.UserInput) std.process.exit(1);
+    var cwd = try core_io.openSearchDirectory(init.io, .cwd(), ".", .{});
+    defer cwd.close(init.io);
+    const cwd_path = try cwd.realPathFileAlloc(init.io, ".", init.gpa);
+    defer init.gpa.free(cwd_path);
+    const operation: Operation = .{
+        .io = init.io,
+        .cwd = cwd,
+        .cwd_path = cwd_path,
+        .environment = init.environ_map,
+    };
+    run(allocator, operation, argv[1..]) catch |err| {
+        if (err == error.UserInput) return 1;
 
         var stderr_file = std.Io.File.stderr();
-        var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stderr_writer = stderr_file.writer(operation.io, &.{});
         const stderr = &stderr_writer.interface;
         ignoreError(stderr.print("error: {s}: {s}\n", .{ @errorName(err), SourceFile }));
-        std.process.exit(1);
+        return 1;
     };
+    return 0;
 }
 
-fn run(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
-    const global = try parseGlobalArgs(allocator, raw_args);
+fn run(allocator: std.mem.Allocator, operation: Operation, raw_args: []const []const u8) !void {
+    const global = try parseGlobalArgs(operation, allocator, raw_args);
     defer allocator.free(global.db_path);
     defer allocator.free(global.args);
 
     if (global.args.len == 0) {
-        try printUsage();
+        try printUsage(operation.io);
         return;
     }
 
     const command = parseCommand(global.args[0]);
 
     if (global.args.len >= 2 and isHelpArg(global.args[1])) {
-        try printUsage();
+        try printUsage(operation.io);
         return;
     }
 
-    return dispatchCommand(allocator, io, global.db_path, global.args, command);
+    return dispatchCommand(allocator, operation, global.db_path, global.args, command);
 }
 
 fn dispatchCommand(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db_path: []const u8,
     args: []const []const u8,
     command: Command,
 ) !void {
     switch (command) {
         .doctor => {
-            const parsed = try parseDoctorArgs(args[1..]);
-            try cmdDoctor(allocator, io, db_path, parsed);
+            const parsed = try parseDoctorArgs(operation.io, args[1..]);
+            try cmdDoctor(allocator, operation, db_path, parsed);
             return;
         },
         .list => {
-            const parsed = try parseListArgs(args[1..]);
-            try cmdList(allocator, db_path, parsed);
+            const parsed = try parseListArgs(operation.io, args[1..]);
+            try cmdList(operation, allocator, db_path, parsed);
             return;
         },
         .show => {
-            const parsed = try parseShowArgs(args[1..]);
-            try cmdShow(allocator, db_path, parsed);
+            const parsed = try parseShowArgs(operation.io, args[1..]);
+            try cmdShow(operation, allocator, db_path, parsed);
             return;
         },
         .create => {
-            var parsed = try parseCreateArgs(allocator, args[1..]);
+            var parsed = try parseCreateArgs(operation.io, allocator, args[1..]);
             defer parsed.cwds.deinit(allocator);
-            try cmdCreate(allocator, db_path, parsed);
+            try cmdCreate(operation, allocator, db_path, parsed);
             return;
         },
         .update => {
-            var parsed = try parseUpdateArgs(allocator, args[1..]);
+            var parsed = try parseUpdateArgs(operation.io, allocator, args[1..]);
             defer parsed.cwds.deinit(allocator);
-            try cmdUpdate(allocator, db_path, parsed);
+            try cmdUpdate(operation, allocator, db_path, parsed);
             return;
         },
         .enable => {
-            const resolve = try parseResolveOnly(args[1..]);
-            try cmdEnableDisable(allocator, db_path, resolve, .ACTIVE);
+            const resolve = try parseResolveOnly(operation.io, args[1..]);
+            try cmdEnableDisable(operation, allocator, db_path, resolve, .ACTIVE);
             return;
         },
         .disable => {
-            const resolve = try parseResolveOnly(args[1..]);
-            try cmdEnableDisable(allocator, db_path, resolve, .PAUSED);
+            const resolve = try parseResolveOnly(operation.io, args[1..]);
+            try cmdEnableDisable(operation, allocator, db_path, resolve, .PAUSED);
             return;
         },
         .run_now => {
-            const resolve = try parseResolveOnly(args[1..]);
-            try cmdRunNow(allocator, db_path, resolve);
+            const resolve = try parseResolveOnly(operation.io, args[1..]);
+            try cmdRunNow(operation, allocator, db_path, resolve);
             return;
         },
         .delete => {
-            const resolve = try parseResolveOnly(args[1..]);
-            try cmdDelete(allocator, db_path, resolve);
+            const resolve = try parseResolveOnly(operation.io, args[1..]);
+            try cmdDelete(operation, allocator, db_path, resolve);
             return;
         },
         .run_due => {
-            const parsed = try parseRunDueArgs(args[1..]);
-            try cmdRunDue(allocator, io, db_path, parsed);
+            const parsed = try parseRunDueArgs(operation, args[1..]);
+            try cmdRunDue(allocator, operation, db_path, parsed);
             return;
         },
         .scheduler => {
-            try cmdScheduler(allocator, io, args[1..]);
+            try cmdScheduler(allocator, operation, args[1..]);
             return;
         },
         .unknown => {},
     }
 
-    return userErrorFmt("unknown command: {s}", .{args[0]});
+    return userErrorFmt(operation.io, "unknown command: {s}", .{args[0]});
 }
 
-fn parseDoctorArgs(args: []const []const u8) !DoctorArgs {
+fn parseDoctorArgs(io: std.Io, args: []const []const u8) !DoctorArgs {
     var out: DoctorArgs = .{};
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             out.json = true;
         } else {
-            return userErrorFmt("unknown doctor arg: {s}", .{arg});
+            return userErrorFmt(io, "unknown doctor arg: {s}", .{arg});
         }
     }
     return out;
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(io, &.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
         \\cas automation
@@ -419,17 +447,25 @@ const GlobalArgs = struct {
     args: []const []const u8,
 };
 
-fn parseGlobalArgs(allocator: std.mem.Allocator, raw_args: []const []const u8) !GlobalArgs {
+fn parseGlobalArgs(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    raw_args: []const []const u8,
+) !GlobalArgs {
     var filtered = std.ArrayList([]const u8).empty;
     defer filtered.deinit(allocator);
 
-    var db_path = try defaultDbPath(allocator);
+    var db_path = try defaultDbPath(operation, allocator);
 
     var i: usize = 0;
     while (i < raw_args.len) : (i += 1) {
         const arg = raw_args[i];
         if (std.mem.eql(u8, arg, "--db")) {
-            if (i + 1 >= raw_args.len) return userErrorFmt("--db requires a value", .{});
+            if (i + 1 >= raw_args.len) return userErrorFmt(
+                operation.io,
+                "--db requires a value",
+                .{},
+            );
             allocator.free(db_path);
             db_path = try allocator.dupe(u8, raw_args[i + 1]);
             i += 1;
@@ -444,14 +480,14 @@ fn parseGlobalArgs(allocator: std.mem.Allocator, raw_args: []const []const u8) !
     };
 }
 
-fn parseListArgs(args: []const []const u8) !ListArgs {
+fn parseListArgs(io: std.Io, args: []const []const u8) !ListArgs {
     var out = ListArgs{ .status = null, .json = false };
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--status")) {
-            if (i + 1 >= args.len) return userErrorFmt("--status requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--status requires a value", .{});
             out.status = args[i + 1];
             i += 1;
             continue;
@@ -460,13 +496,13 @@ fn parseListArgs(args: []const []const u8) !ListArgs {
             out.json = true;
             continue;
         }
-        return userErrorFmt("unknown list arg: {s}", .{arg});
+        return userErrorFmt(io, "unknown list arg: {s}", .{arg});
     }
 
     return out;
 }
 
-fn parseShowArgs(args: []const []const u8) !ShowArgs {
+fn parseShowArgs(io: std.Io, args: []const []const u8) !ShowArgs {
     var resolve = ResolveArgs{};
     var as_json = false;
 
@@ -474,13 +510,13 @@ fn parseShowArgs(args: []const []const u8) !ShowArgs {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--id")) {
-            if (i + 1 >= args.len) return userErrorFmt("--id requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--id requires a value", .{});
             resolve.automation_id = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--name")) {
-            if (i + 1 >= args.len) return userErrorFmt("--name requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--name requires a value", .{});
             resolve.name = args[i + 1];
             i += 1;
             continue;
@@ -489,39 +525,39 @@ fn parseShowArgs(args: []const []const u8) !ShowArgs {
             as_json = true;
             continue;
         }
-        return userErrorFmt("unknown show arg: {s}", .{arg});
+        return userErrorFmt(io, "unknown show arg: {s}", .{arg});
     }
 
-    try validateResolveArgs(resolve);
+    try validateResolveArgs(io, resolve);
     return .{ .resolve = resolve, .json = as_json };
 }
 
-fn parseResolveOnly(args: []const []const u8) !ResolveArgs {
+fn parseResolveOnly(io: std.Io, args: []const []const u8) !ResolveArgs {
     var resolve = ResolveArgs{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--id")) {
-            if (i + 1 >= args.len) return userErrorFmt("--id requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--id requires a value", .{});
             resolve.automation_id = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--name")) {
-            if (i + 1 >= args.len) return userErrorFmt("--name requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--name requires a value", .{});
             resolve.name = args[i + 1];
             i += 1;
             continue;
         }
-        return userErrorFmt("unknown arg: {s}", .{arg});
+        return userErrorFmt(io, "unknown arg: {s}", .{arg});
     }
 
-    try validateResolveArgs(resolve);
+    try validateResolveArgs(io, resolve);
     return resolve;
 }
 
-fn parseCreateArgs(allocator: std.mem.Allocator, args: []const []const u8) !CreateArgs {
+fn parseCreateArgs(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !CreateArgs {
     var name: ?[]const u8 = null;
     var prompt: []const u8 = "";
     var prompt_file: ?[]const u8 = null;
@@ -534,47 +570,47 @@ fn parseCreateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Crea
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--name")) {
-            if (i + 1 >= args.len) return userErrorFmt("--name requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--name requires a value", .{});
             name = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--prompt")) {
-            if (i + 1 >= args.len) return userErrorFmt("--prompt requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--prompt requires a value", .{});
             prompt = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--prompt-file")) {
-            if (i + 1 >= args.len) return userErrorFmt("--prompt-file requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--prompt-file requires a value", .{});
             prompt_file = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--rrule")) {
-            if (i + 1 >= args.len) return userErrorFmt("--rrule requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--rrule requires a value", .{});
             rrule = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--status")) {
-            if (i + 1 >= args.len) return userErrorFmt("--status requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--status requires a value", .{});
             status = args[i + 1];
             i += 1;
             continue;
         }
-        if (try parseCwdsArg(allocator, args, &i, &cwds, .inherit_default)) continue;
+        if (try parseCwdsArg(io, allocator, args, &i, &cwds, .inherit_default)) continue;
         if (std.mem.eql(u8, arg, "--next-run-at")) {
-            if (i + 1 >= args.len) return userErrorFmt("--next-run-at requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--next-run-at requires a value", .{});
             next_run_at = args[i + 1];
             i += 1;
             continue;
         }
-        return userErrorFmt("unknown create arg: {s}", .{arg});
+        return userErrorFmt(io, "unknown create arg: {s}", .{arg});
     }
 
-    if (name == null) return userErrorFmt("--name is required", .{});
-    if (rrule == null) return userErrorFmt("--rrule is required", .{});
+    if (name == null) return userErrorFmt(io, "--name is required", .{});
+    if (rrule == null) return userErrorFmt(io, "--rrule is required", .{});
 
     return .{
         .name = name.?,
@@ -588,6 +624,7 @@ fn parseCreateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Crea
 }
 
 fn parseCwdsArg(
+    io: std.Io,
     allocator: std.mem.Allocator,
     args: []const []const u8,
     index: *usize,
@@ -596,9 +633,10 @@ fn parseCwdsArg(
 ) !bool {
     const arg = args[index.*];
     if (std.mem.eql(u8, arg, "--cwd")) {
-        if (index.* + 1 >= args.len) return userErrorFmt("--cwd requires a value", .{});
+        if (index.* + 1 >= args.len) return userErrorFmt(io, "--cwd requires a value", .{});
         if (cwds.mode != initial_mode and cwds.mode != .list) {
             return userErrorFmt(
+                io,
                 "--cwd cannot be combined with --cwds-json/--clear-cwds",
                 .{},
             );
@@ -610,10 +648,11 @@ fn parseCwdsArg(
     }
     if (std.mem.eql(u8, arg, "--cwds-json")) {
         if (index.* + 1 >= args.len) {
-            return userErrorFmt("--cwds-json requires a value", .{});
+            return userErrorFmt(io, "--cwds-json requires a value", .{});
         }
         if (cwds.mode != initial_mode) {
             return userErrorFmt(
+                io,
                 "--cwds-json cannot be combined with --cwd/--clear-cwds",
                 .{},
             );
@@ -626,6 +665,7 @@ fn parseCwdsArg(
     if (std.mem.eql(u8, arg, "--clear-cwds")) {
         if (cwds.mode != initial_mode) {
             return userErrorFmt(
+                io,
                 "--clear-cwds cannot be combined with --cwd/--cwds-json",
                 .{},
             );
@@ -637,19 +677,20 @@ fn parseCwdsArg(
 }
 
 fn parseResolveArg(
+    io: std.Io,
     args: []const []const u8,
     index: *usize,
     resolve: *ResolveArgs,
 ) !bool {
     const arg = args[index.*];
     if (std.mem.eql(u8, arg, "--id")) {
-        if (index.* + 1 >= args.len) return userErrorFmt("--id requires a value", .{});
+        if (index.* + 1 >= args.len) return userErrorFmt(io, "--id requires a value", .{});
         resolve.automation_id = args[index.* + 1];
         index.* += 1;
         return true;
     }
     if (std.mem.eql(u8, arg, "--name")) {
-        if (index.* + 1 >= args.len) return userErrorFmt("--name requires a value", .{});
+        if (index.* + 1 >= args.len) return userErrorFmt(io, "--name requires a value", .{});
         resolve.name = args[index.* + 1];
         index.* += 1;
         return true;
@@ -657,7 +698,7 @@ fn parseResolveArg(
     return false;
 }
 
-fn parseUpdateArgs(allocator: std.mem.Allocator, args: []const []const u8) !UpdateArgs {
+fn parseUpdateArgs(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !UpdateArgs {
     var resolve = ResolveArgs{};
     var new_name: ?[]const u8 = null;
     var prompt: ?[]const u8 = null;
@@ -670,40 +711,40 @@ fn parseUpdateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Upda
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (try parseResolveArg(args, &i, &resolve)) continue;
+        if (try parseResolveArg(io, args, &i, &resolve)) continue;
         if (std.mem.eql(u8, arg, "--new-name")) {
-            if (i + 1 >= args.len) return userErrorFmt("--new-name requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--new-name requires a value", .{});
             new_name = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--prompt")) {
-            if (i + 1 >= args.len) return userErrorFmt("--prompt requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--prompt requires a value", .{});
             prompt = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--prompt-file")) {
-            if (i + 1 >= args.len) return userErrorFmt("--prompt-file requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--prompt-file requires a value", .{});
             prompt_file = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--rrule")) {
-            if (i + 1 >= args.len) return userErrorFmt("--rrule requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--rrule requires a value", .{});
             rrule = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--status")) {
-            if (i + 1 >= args.len) return userErrorFmt("--status requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--status requires a value", .{});
             status = args[i + 1];
             i += 1;
             continue;
         }
-        if (try parseCwdsArg(allocator, args, &i, &cwds, .unchanged)) continue;
+        if (try parseCwdsArg(io, allocator, args, &i, &cwds, .unchanged)) continue;
         if (std.mem.eql(u8, arg, "--next-run-at")) {
-            if (i + 1 >= args.len) return userErrorFmt("--next-run-at requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(io, "--next-run-at requires a value", .{});
             next_run_at = args[i + 1];
             i += 1;
             continue;
@@ -712,9 +753,9 @@ fn parseUpdateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Upda
             clear_next_run_at = true;
             continue;
         }
-        return userErrorFmt("unknown update arg: {s}", .{arg});
+        return userErrorFmt(io, "unknown update arg: {s}", .{arg});
     }
-    try validateResolveArgs(resolve);
+    try validateResolveArgs(io, resolve);
     return .{
         .resolve = resolve,
         .new_name = new_name,
@@ -728,26 +769,30 @@ fn parseUpdateArgs(allocator: std.mem.Allocator, args: []const []const u8) !Upda
     };
 }
 
-fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
+fn parseRunDueArgs(operation: Operation, args: []const []const u8) !RunDueArgs {
     var id_value: ?[]const u8 = null;
     var limit: i64 = 10;
     var dry_run = false;
-    var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
+    var codex_bin: []const u8 = operation.environment.get("CODEX_BIN") orelse DefaultCodexBin;
     var lock_label: []const u8 =
-        envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+        operation.environment.get("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--id")) {
-            if (i + 1 >= args.len) return userErrorFmt("--id requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(operation.io, "--id requires a value", .{});
             id_value = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--limit")) {
-            if (i + 1 >= args.len) return userErrorFmt("--limit requires a value", .{});
-            limit = try parsePositiveI64(args[i + 1], "--limit");
+            if (i + 1 >= args.len) return userErrorFmt(
+                operation.io,
+                "--limit requires a value",
+                .{},
+            );
+            limit = try parsePositiveI64(operation.io, args[i + 1], "--limit");
             i += 1;
             continue;
         }
@@ -756,21 +801,29 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
             continue;
         }
         if (std.mem.eql(u8, arg, "--codex-bin")) {
-            if (i + 1 >= args.len) return userErrorFmt("--codex-bin requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(
+                operation.io,
+                "--codex-bin requires a value",
+                .{},
+            );
             codex_bin = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--lock-label")) {
-            if (i + 1 >= args.len) return userErrorFmt("--lock-label requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(
+                operation.io,
+                "--lock-label requires a value",
+                .{},
+            );
             lock_label = args[i + 1];
             i += 1;
             continue;
         }
-        return userErrorFmt("unknown run-due arg: {s}", .{arg});
+        return userErrorFmt(operation.io, "unknown run-due arg: {s}", .{arg});
     }
 
-    const validated_lock_label = try validateSchedulerLabel(lock_label);
+    const validated_lock_label = try validateSchedulerLabel(operation.io, lock_label);
 
     return .{
         .automation_id = id_value,
@@ -781,81 +834,99 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
     };
 }
 
-fn cmdScheduler(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+fn cmdScheduler(
+    allocator: std.mem.Allocator,
+    operation: Operation,
+    args: []const []const u8,
+) !void {
     if (args.len == 0) {
         return userErrorFmt(
+            operation.io,
             "scheduler requires one of: install, uninstall, status",
             .{},
         );
     }
     if (isHelpArg(args[0])) {
-        try printUsage();
+        try printUsage(operation.io);
         return;
     }
     if (args.len >= 2 and isHelpArg(args[1])) {
-        try printUsage();
+        try printUsage(operation.io);
         return;
     }
 
     switch (parseSchedulerCommand(args[0])) {
         .install => {
-            const parsed = try parseSchedulerInstallArgs(args[1..]);
-            try cmdSchedulerInstall(allocator, io, parsed);
+            const parsed = try parseSchedulerInstallArgs(operation, args[1..]);
+            try cmdSchedulerInstall(allocator, operation, parsed);
             return;
         },
         .uninstall => {
-            const parsed = try parseSchedulerLabelArgs(args[1..]);
-            try cmdSchedulerUninstall(allocator, io, parsed);
+            const parsed = try parseSchedulerLabelArgs(operation, args[1..]);
+            try cmdSchedulerUninstall(allocator, operation, parsed);
             return;
         },
         .status => {
-            const parsed = try parseSchedulerLabelArgs(args[1..]);
-            try cmdSchedulerStatus(allocator, io, parsed);
+            const parsed = try parseSchedulerLabelArgs(operation, args[1..]);
+            try cmdSchedulerStatus(allocator, operation, parsed);
             return;
         },
         .unknown => {},
     }
 
-    return userErrorFmt("unknown scheduler action: {s}", .{args[0]});
+    return userErrorFmt(operation.io, "unknown scheduler action: {s}", .{args[0]});
 }
 
-fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
-    var label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+fn parseSchedulerInstallArgs(operation: Operation, args: []const []const u8) !SchedulerInstallArgs {
+    var label: []const u8 = operation.environment.get(
+        "CAS_AUTOMATION_LAUNCHD_LABEL",
+    ) orelse DefaultLaunchdLabel;
     var interval_seconds: i64 = blk: {
-        if (envString("CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS")) |value| {
-            break :blk try parsePositiveI64(value, "CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS");
+        if (operation.environment.get("CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS")) |value| {
+            break :blk try parsePositiveI64(
+                operation.io,
+                value,
+                "CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS",
+            );
         }
         break :blk DefaultIntervalSeconds;
     };
-    var path_value: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_PATH") orelse
-        envString("PATH") orelse
+    var path_value: []const u8 = operation.environment.get("CAS_AUTOMATION_LAUNCHD_PATH") orelse
+        operation.environment.get("PATH") orelse
         "/usr/bin:/bin:/usr/sbin:/sbin";
-    var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
+    var codex_bin: []const u8 = operation.environment.get("CODEX_BIN") orelse DefaultCodexBin;
     var replace = false;
-
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--label")) {
-            if (i + 1 >= args.len) return userErrorFmt("--label requires a value", .{});
+            if (i + 1 >= args.len)
+                return userErrorFmt(operation.io, "--label requires a value", .{});
             label = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--interval-seconds")) {
-            if (i + 1 >= args.len) return userErrorFmt("--interval-seconds requires a value", .{});
-            interval_seconds = try parsePositiveI64(args[i + 1], "--interval-seconds");
+            if (i + 1 >= args.len)
+                return userErrorFmt(operation.io, "--interval-seconds requires a value", .{});
+            interval_seconds = try parsePositiveI64(
+                operation.io,
+                args[i + 1],
+                "--interval-seconds",
+            );
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--path")) {
-            if (i + 1 >= args.len) return userErrorFmt("--path requires a value", .{});
+            if (i + 1 >= args.len)
+                return userErrorFmt(operation.io, "--path requires a value", .{});
             path_value = args[i + 1];
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--codex-bin")) {
-            if (i + 1 >= args.len) return userErrorFmt("--codex-bin requires a value", .{});
+            if (i + 1 >= args.len)
+                return userErrorFmt(operation.io, "--codex-bin requires a value", .{});
             codex_bin = args[i + 1];
             i += 1;
             continue;
@@ -864,10 +935,9 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
             replace = true;
             continue;
         }
-        return userErrorFmt("unknown scheduler install arg: {s}", .{arg});
+        return userErrorFmt(operation.io, "unknown scheduler install arg: {s}", .{arg});
     }
-
-    const validated_label = try validateSchedulerLabel(label);
+    const validated_label = try validateSchedulerLabel(operation.io, label);
     return .{
         .label = validated_label,
         .interval_seconds = interval_seconds,
@@ -877,15 +947,21 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
     };
 }
 
-fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
-    var label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+fn parseSchedulerLabelArgs(operation: Operation, args: []const []const u8) !SchedulerLabelArgs {
+    var label: []const u8 = operation.environment.get(
+        "CAS_AUTOMATION_LAUNCHD_LABEL",
+    ) orelse DefaultLaunchdLabel;
     var json = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--label")) {
-            if (i + 1 >= args.len) return userErrorFmt("--label requires a value", .{});
+            if (i + 1 >= args.len) return userErrorFmt(
+                operation.io,
+                "--label requires a value",
+                .{},
+            );
             label = args[i + 1];
             i += 1;
             continue;
@@ -894,28 +970,28 @@ fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
             json = true;
             continue;
         }
-        return userErrorFmt("unknown scheduler arg: {s}", .{arg});
+        return userErrorFmt(operation.io, "unknown scheduler arg: {s}", .{arg});
     }
 
-    return .{ .label = try validateSchedulerLabel(label), .json = json };
+    return .{ .label = try validateSchedulerLabel(operation.io, label), .json = json };
 }
 
-fn validateResolveArgs(resolve: ResolveArgs) !void {
+fn validateResolveArgs(io: std.Io, resolve: ResolveArgs) !void {
     if (resolve.automation_id == null and resolve.name == null) {
-        return userErrorFmt("provide --id or --name", .{});
+        return userErrorFmt(io, "provide --id or --name", .{});
     }
     if (resolve.automation_id != null and resolve.name != null) {
-        return userErrorFmt("use either --id or --name", .{});
+        return userErrorFmt(io, "use either --id or --name", .{});
     }
 }
 
 const validateSchedulerLabel = automation_scheduler.validateSchedulerLabel;
 
-fn parsePositiveI64(raw: []const u8, field: []const u8) !i64 {
+fn parsePositiveI64(io: std.Io, raw: []const u8, field: []const u8) !i64 {
     const parsed = std.fmt.parseInt(i64, raw, 10) catch {
-        return userErrorFmt("{s} must be a positive integer", .{field});
+        return userErrorFmt(io, "{s} must be a positive integer", .{field});
     };
-    if (parsed < 1) return userErrorFmt("{s} must be >= 1", .{field});
+    if (parsed < 1) return userErrorFmt(io, "{s} must be >= 1", .{field});
     return parsed;
 }
 
@@ -972,6 +1048,7 @@ const insert_automation_sql =
 test "parseAndCanonicalizeRrule canonicalizes prefix and key order" {
     const alloc = std.testing.allocator;
     const rule = try parseAndCanonicalizeRrule(
+        std.testing.io,
         alloc,
         "freq=weekly;byday=mo,we,fr;byhour=9;byminute=0",
     );
@@ -986,24 +1063,28 @@ test "parseRrule rejects unsupported status tokens" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UserInput,
-        parseAndCanonicalizeRrule(alloc, "RRULE:FREQ=MONTHLY;BYHOUR=9;BYMINUTE=0"),
+        parseAndCanonicalizeRrule(std.testing.io, alloc, "RRULE:FREQ=MONTHLY;BYHOUR=9;BYMINUTE=0"),
     );
 }
 
 test "nextWeekly computes next weekday correctly" {
     const alloc = std.testing.allocator;
-    var rule = try parseRrule(alloc, "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0");
+    var rule = try parseRrule(
+        std.testing.io,
+        alloc,
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0",
+    );
     defer rule.deinit(alloc);
 
     const dtstart = 1_772_469_600_000; // 2026-03-03T09:00:00Z (Tuesday)
     const anchor = 1_772_556_000_000; // later on 2026-03-04
-    const next = try nextWeekly(rule, dtstart, anchor);
+    const next = try nextWeekly(std.testing.io, rule, dtstart, anchor);
     try std.testing.expect(next > anchor);
 }
 
 test "generateUuidV4 emits expected shape" {
     const alloc = std.testing.allocator;
-    const value = try generateUuidV4(alloc);
+    const value = try generateUuidV4(std.testing.io, alloc);
     defer alloc.free(value);
 
     try std.testing.expectEqual(@as(usize, 36), value.len);
@@ -1014,21 +1095,36 @@ test "generateUuidV4 emits expected shape" {
 }
 
 test "parseSchedulerLabelArgs rejects invalid labels" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     try std.testing.expectError(
         error.UserInput,
-        parseSchedulerLabelArgs(&.{ "--label", "../bad" }),
+        parseSchedulerLabelArgs(operation, &.{ "--label", "../bad" }),
     );
     try std.testing.expectError(
         error.UserInput,
-        parseSchedulerLabelArgs(&.{ "--label", "bad label" }),
+        parseSchedulerLabelArgs(operation, &.{ "--label", "bad label" }),
     );
 }
 
 test "parseRunDueArgs rejects invalid lock label" {
-    try std.testing.expectError(error.UserInput, parseRunDueArgs(&.{ "--lock-label", "../bad" }));
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     try std.testing.expectError(
         error.UserInput,
-        parseRunDueArgs(&.{ "--lock-label", "bad label" }),
+        parseRunDueArgs(operation, &.{ "--lock-label", "../bad" }),
+    );
+    try std.testing.expectError(
+        error.UserInput,
+        parseRunDueArgs(operation, &.{ "--lock-label", "bad label" }),
     );
 }
 
@@ -1049,12 +1145,12 @@ test "computeNextRunAt accepts legacy non-prefixed rrule" {
     defer row.deinit(alloc);
 
     const anchor: i64 = 1_772_470_000_000;
-    const next = try computeNextRunAt(alloc, &row, anchor);
+    const next = try computeNextRunAt(std.testing.io, alloc, &row, anchor);
     try std.testing.expect(next > anchor);
 }
 
 test "nowMs returns unix epoch milliseconds" {
-    const value = nowMs();
+    const value = nowMs(std.testing.io);
     try std.testing.expect(value > 1_600_000_000_000);
     try std.testing.expect(value < 4_102_444_800_000);
 }
@@ -1102,8 +1198,14 @@ test "automation rows json uses valid separators for multiple rows" {
 }
 
 test "cmdUpdate preserves prompt text until sqlite step" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1111,12 +1213,18 @@ test "cmdUpdate preserves prompt text until sqlite step" {
     try tmp.dir.writeFile(io, .{ .sub_path = "prompt.md", .data = "file prompt\n" });
     const root_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root_abs);
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("HOME", root_abs);
+    operation.environment = &environment;
+    operation.cwd_path = root_abs;
+    operation.cwd = tmp.dir;
     const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
     defer alloc.free(db_path);
     const prompt_path = try std.fs.path.join(alloc, &.{ root_abs, "prompt.md" });
     defer alloc.free(prompt_path);
 
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try createTestSchema(alloc, &db);
     const created_at: i64 = 1_772_469_600_000;
@@ -1137,40 +1245,43 @@ test "cmdUpdate preserves prompt text until sqlite step" {
         },
     );
 
-    var inline_args = try parseUpdateArgs(
-        alloc,
-        &.{ "--id", "prompt-update-id", "--prompt", "inline prompt" },
-    );
-    defer inline_args.cwds.deinit(alloc);
+    try expectPromptUpdate(operation, alloc, db_path, &db, &.{
+        "--id", "prompt-update-id", "--prompt", "inline prompt",
+    }, "inline prompt");
+    try expectPromptUpdate(operation, alloc, db_path, &db, &.{
+        "--id", "prompt-update-id", "--prompt-file", prompt_path,
+    }, "file prompt");
+}
+
+fn expectPromptUpdate(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    db: *Db,
+    argv: []const []const u8,
+    expected: []const u8,
+) !void {
+    var args = try parseUpdateArgs(operation.io, allocator, argv);
+    defer args.cwds.deinit(allocator);
     {
-        const stdout_guard = try silenceStdout();
-        defer restoreStdout(stdout_guard);
-        try cmdUpdate(alloc, db_path, inline_args);
+        const stdout_guard = try silenceStdout(operation.io);
+        defer restoreStdout(operation.io, stdout_guard);
+        try cmdUpdate(operation, allocator, db_path, args);
     }
-
-    var inline_row = try getAutomationById(alloc, &db, "prompt-update-id");
-    defer inline_row.deinit(alloc);
-    try std.testing.expectEqualStrings("inline prompt", inline_row.prompt);
-
-    var file_args = try parseUpdateArgs(
-        alloc,
-        &.{ "--id", "prompt-update-id", "--prompt-file", prompt_path },
-    );
-    defer file_args.cwds.deinit(alloc);
-    {
-        const stdout_guard = try silenceStdout();
-        defer restoreStdout(stdout_guard);
-        try cmdUpdate(alloc, db_path, file_args);
-    }
-
-    var file_row = try getAutomationById(alloc, &db, "prompt-update-id");
-    defer file_row.deinit(alloc);
-    try std.testing.expectEqualStrings("file prompt", file_row.prompt);
+    var row = try getAutomationById(allocator, db, "prompt-update-id");
+    defer row.deinit(allocator);
+    try std.testing.expectEqualStrings(expected, row.prompt);
 }
 
 test "cmdRunNow writes unix epoch milliseconds" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1183,10 +1294,9 @@ test "cmdRunNow writes unix epoch milliseconds" {
     defer alloc.free(automation_root);
     try std.Io.Dir.cwd().createDirPath(io, automation_root);
 
-    automation_files.setAutomationRootOverride(automation_root);
-    defer automation_files.setAutomationRootOverride(null);
+    operation.automation_root = automation_root;
 
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try createTestSchema(alloc, &db);
 
@@ -1208,13 +1318,13 @@ test "cmdRunNow writes unix epoch milliseconds" {
         },
     );
 
-    const before = nowMs();
+    const before = nowMs(std.testing.io);
     {
-        const stdout_guard = try silenceStdout();
-        defer restoreStdout(stdout_guard);
-        try cmdRunNow(alloc, db_path, .{ .automation_id = "run-now-id" });
+        const stdout_guard = try silenceStdout(std.testing.io);
+        defer restoreStdout(std.testing.io, stdout_guard);
+        try cmdRunNow(operation, alloc, db_path, .{ .automation_id = "run-now-id" });
     }
-    const after = nowMs();
+    const after = nowMs(std.testing.io);
 
     var row = try getAutomationById(alloc, &db, "run-now-id");
     defer row.deinit(alloc);
@@ -1392,8 +1502,14 @@ test "launchctl ProgramArguments parser rejects an unbounded argument list" {
 }
 
 test "store schema gate accepts additive columns and rejects missing required tables" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
@@ -1401,7 +1517,7 @@ test "store schema gate accepts additive columns and rejects missing required ta
     defer alloc.free(root);
     const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
     defer alloc.free(db_path);
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try createTestSchema(alloc, &db);
     try db.exec(alloc, "alter table automations add column future_metadata text", &.{});
@@ -1423,6 +1539,7 @@ test "store schema gate accepts additive columns and rejects missing required ta
 }
 
 fn expectWritabilityDiagnostic(
+    operation: Operation,
     allocator: std.mem.Allocator,
     db_path: []const u8,
     automation_root: []const u8,
@@ -1430,7 +1547,7 @@ fn expectWritabilityDiagnostic(
 ) !void {
     var blocked: DoctorDiagnostics = .{};
     defer blocked.deinit(allocator);
-    try inspectMutationWritability(allocator, db_path, automation_root, &blocked);
+    try inspectMutationWritability(operation, allocator, db_path, automation_root, &blocked);
     for (blocked.rows.items) |row| {
         if (std.mem.eql(u8, row.code, expected_code)) return;
     }
@@ -1439,16 +1556,19 @@ fn expectWritabilityDiagnostic(
 
 fn databaseFilePermissionBlocks(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db_path: []const u8,
     automation_root: []const u8,
 ) !bool {
-    var db_file = try std.Io.Dir.cwd().openFile(io, db_path, .{ .mode = .read_write });
-    defer db_file.close(io);
-    try db_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o400));
-    defer ignoreError(db_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o600)));
-    std.Io.Dir.cwd().access(io, db_path, .{ .write = true }) catch {
+    var db_file = try operation.cwd.openFile(operation.io, db_path, .{ .mode = .read_write });
+    defer db_file.close(operation.io);
+    try db_file.setPermissions(operation.io, std.Io.File.Permissions.fromMode(0o400));
+    defer ignoreError(
+        db_file.setPermissions(operation.io, std.Io.File.Permissions.fromMode(0o600)),
+    );
+    operation.cwd.access(operation.io, db_path, .{ .write = true }) catch {
         try expectWritabilityDiagnostic(
+            operation,
             allocator,
             db_path,
             automation_root,
@@ -1461,33 +1581,47 @@ fn databaseFilePermissionBlocks(
 
 fn directoryPermissionBlocks(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db_path: []const u8,
     automation_root: []const u8,
     directory_path: []const u8,
     expected_code: []const u8,
 ) !bool {
-    var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{ .iterate = true });
-    defer directory.close(io);
-    try directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
-    defer ignoreError(directory.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)));
-    std.Io.Dir.cwd().access(
-        io,
+    var directory = try operation.cwd.openDir(operation.io, directory_path, .{ .iterate = true });
+    defer directory.close(operation.io);
+    try directory.setPermissions(operation.io, std.Io.File.Permissions.fromMode(0o500));
+    defer ignoreError(
+        directory.setPermissions(operation.io, std.Io.File.Permissions.fromMode(0o700)),
+    );
+    operation.cwd.access(
+        operation.io,
         directory_path,
         .{ .write = true, .execute = true },
     ) catch {
-        try expectWritabilityDiagnostic(allocator, db_path, automation_root, expected_code);
+        try expectWritabilityDiagnostic(
+            operation,
+            allocator,
+            db_path,
+            automation_root,
+            expected_code,
+        );
         return true;
     };
     return false;
 }
 
 test "mutation writability checks database owner and automation root without writes" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     if (comptime builtin.target.os.tag == .windows or
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "store");
@@ -1504,16 +1638,16 @@ test "mutation writability checks database owner and automation root without wri
 
     var writable: DoctorDiagnostics = .{};
     defer writable.deinit(alloc);
-    try inspectMutationWritability(alloc, db_path, automation_root, &writable);
+    try inspectMutationWritability(operation, alloc, db_path, automation_root, &writable);
     try std.testing.expect(!writable.hasError());
 
     var permission_checks_exercised: usize = 0;
-    if (try databaseFilePermissionBlocks(alloc, io, db_path, automation_root)) {
+    if (try databaseFilePermissionBlocks(alloc, operation, db_path, automation_root)) {
         permission_checks_exercised += 1;
     }
     if (try directoryPermissionBlocks(
         alloc,
-        io,
+        operation,
         db_path,
         automation_root,
         store_owner,
@@ -1523,7 +1657,7 @@ test "mutation writability checks database owner and automation root without wri
     }
     if (try directoryPermissionBlocks(
         alloc,
-        io,
+        operation,
         db_path,
         automation_root,
         automation_root,
@@ -1537,10 +1671,16 @@ test "mutation writability checks database owner and automation root without wri
 }
 
 test "mutation writability inspection diagnoses missing owners without creating them" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root);
     const db_path = try std.fs.path.join(alloc, &.{ root, "missing-store", "codex-dev.db" });
@@ -1550,7 +1690,7 @@ test "mutation writability inspection diagnoses missing owners without creating 
 
     var diagnostics: DoctorDiagnostics = .{};
     defer diagnostics.deinit(alloc);
-    try inspectMutationWritability(alloc, db_path, automation_root, &diagnostics);
+    try inspectMutationWritability(operation, alloc, db_path, automation_root, &diagnostics);
     try std.testing.expect(diagnostics.hasError());
     try std.testing.expectError(
         error.FileNotFound,
@@ -1562,8 +1702,12 @@ test "mutation writability inspection diagnoses missing owners without creating 
     );
 }
 
-fn seedMalformedAutomation(allocator: std.mem.Allocator, db_path: []const u8) !void {
-    var db = try Db.open(allocator, db_path);
+fn seedMalformedAutomation(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+) !void {
+    var db = try Db.open(operation, allocator, db_path);
     defer db.close();
     try createTestSchema(allocator, &db);
     try db.exec(
@@ -1578,8 +1722,14 @@ fn seedMalformedAutomation(allocator: std.mem.Allocator, db_path: []const u8) !v
 }
 
 test "doctor emits complete JSON when an automation row has malformed cwds" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
@@ -1598,10 +1748,10 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
     const report_path = try std.fs.path.join(alloc, &.{ root, "doctor.json" });
     defer alloc.free(report_path);
 
-    try seedMalformedAutomation(alloc, db_path);
+    try seedMalformedAutomation(operation, alloc, db_path);
 
-    automation_files.setAutomationRootOverride(automation_root);
-    defer automation_files.setAutomationRootOverride(null);
+    operation.automation_root = automation_root;
+
     {
         const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
         if (saved_fd < 0) return error.SystemResources;
@@ -1614,7 +1764,7 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
         if (std.c.dup2(report_file.handle, std.posix.STDOUT_FILENO) < 0) {
             return error.SystemResources;
         }
-        try cmdDoctor(alloc, io, db_path, .{ .json = true });
+        try cmdDoctor(alloc, operation, db_path, .{ .json = true });
     }
 
     const report = try std.Io.Dir.cwd().readFileAlloc(
@@ -1643,8 +1793,14 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
 }
 
 test "doctor emits blocked JSON when the automation root is a regular file" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
@@ -1659,13 +1815,13 @@ test "doctor emits blocked JSON when the automation root is a regular file" {
     defer alloc.free(report_path);
 
     {
-        var db = try Db.open(alloc, db_path);
+        var db = try Db.open(operation, alloc, db_path);
         defer db.close();
         try createTestSchema(alloc, &db);
     }
 
-    automation_files.setAutomationRootOverride(automation_root);
-    defer automation_files.setAutomationRootOverride(null);
+    operation.automation_root = automation_root;
+
     {
         const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
         if (saved_fd < 0) return error.SystemResources;
@@ -1678,7 +1834,7 @@ test "doctor emits blocked JSON when the automation root is a regular file" {
         if (std.c.dup2(report_file.handle, std.posix.STDOUT_FILENO) < 0) {
             return error.SystemResources;
         }
-        try cmdDoctor(alloc, io, db_path, .{ .json = true });
+        try cmdDoctor(alloc, operation, db_path, .{ .json = true });
     }
 
     const report = try std.Io.Dir.cwd().readFileAlloc(
@@ -1701,8 +1857,14 @@ test "doctor emits blocked JSON when the automation root is a regular file" {
 }
 
 test "transaction rollback preserves the pre-mutation row" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
@@ -1710,7 +1872,7 @@ test "transaction rollback preserves the pre-mutation row" {
     defer alloc.free(root);
     const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
     defer alloc.free(db_path);
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try createTestSchema(alloc, &db);
     try db.begin(alloc);
@@ -1765,18 +1927,23 @@ fn createDryRunTestSchema(allocator: std.mem.Allocator, db: *Db) !void {
 }
 
 test "runDueAutomation dry-run is read-only" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
     const root_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root_abs);
     const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
     defer alloc.free(db_path);
 
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
 
     try createDryRunTestSchema(alloc, &db);
@@ -1804,7 +1971,7 @@ test "runDueAutomation dry-run is read-only" {
     const before_last = row.last_run_at;
     const before_next = row.next_run_at;
 
-    const result = try runDueAutomation(alloc, io, &db, &row, "codex", true);
+    const result = try runDueAutomation(alloc, operation, &db, &row, "codex", true);
     defer alloc.free(result.thread_id);
     defer alloc.free(result.cwd);
     if (result.err) |err_text| alloc.free(err_text);
@@ -1831,18 +1998,30 @@ test "runDueAutomation dry-run is read-only" {
 }
 
 test "runDueAutomation non-dry-run finalizes run row with provided io" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
     const root_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root_abs);
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("HOME", root_abs);
+    operation.environment = &environment;
+    operation.cwd_path = root_abs;
+    operation.cwd = tmp.dir;
     const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
     defer alloc.free(db_path);
 
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try createTestSchema(alloc, &db);
 
@@ -1867,9 +2046,7 @@ test "runDueAutomation non-dry-run finalizes run row with provided io" {
     var row = try getAutomationById(alloc, &db, "run-due-id");
     defer row.deinit(alloc);
 
-    var threaded = std.Io.Threaded.init(alloc, .{});
-    defer threaded.deinit();
-    const result = try runDueAutomation(alloc, threaded.io(), &db, &row, "/bin/echo", false);
+    const result = try runDueAutomation(alloc, operation, &db, &row, "/bin/echo", false);
     defer alloc.free(result.thread_id);
     defer alloc.free(result.cwd);
     if (result.err) |err_text| alloc.free(err_text);
@@ -1889,34 +2066,52 @@ test "runDueAutomation non-dry-run finalizes run row with provided io" {
 }
 
 test "runPerfCase covers residual automation command families" {
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root_abs);
-    try runPerfCase(alloc, .show, root_abs);
-    try runPerfCase(alloc, .create, root_abs);
-    try runPerfCase(alloc, .update, root_abs);
-    try runPerfCase(alloc, .enable, root_abs);
-    try runPerfCase(alloc, .disable, root_abs);
-    try runPerfCase(alloc, .run_now, root_abs);
-    try runPerfCase(alloc, .run_due, root_abs);
-    try runPerfCase(alloc, .delete, root_abs);
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("HOME", root_abs);
+    operation.environment = &environment;
+    operation.cwd_path = root_abs;
+    operation.cwd = tmp.dir;
+    try runPerfCase(operation, alloc, .show, root_abs);
+    try runPerfCase(operation, alloc, .create, root_abs);
+    try runPerfCase(operation, alloc, .update, root_abs);
+    try runPerfCase(operation, alloc, .enable, root_abs);
+    try runPerfCase(operation, alloc, .disable, root_abs);
+    try runPerfCase(operation, alloc, .run_now, root_abs);
+    try runPerfCase(operation, alloc, .run_due, root_abs);
+    try runPerfCase(operation, alloc, .delete, root_abs);
 
     const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
     defer alloc.free(db_path);
-    var db = try Db.open(alloc, db_path);
+    var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try std.testing.expectError(error.UserInput, getAutomationById(alloc, &db, "cron-001"));
 }
 
 test "lock acquisition is fail-closed while lock exists" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1928,18 +2123,18 @@ test "lock acquisition is fail-closed while lock exists" {
     const lock_path = try std.fs.path.join(alloc, &.{ lock_dir, "run.lock" });
     defer alloc.free(lock_path);
 
-    var first = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    var first = try acquireExclusiveLockWithStaleRetry(operation, alloc, lock_path);
     try std.testing.expect(first != null);
 
-    const second = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    const second = try acquireExclusiveLockWithStaleRetry(operation, alloc, lock_path);
     try std.testing.expect(second == null);
 
-    releaseRunLock(alloc, first);
+    releaseRunLock(operation, alloc, first);
     first = null;
 
-    const third = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    const third = try acquireExclusiveLockWithStaleRetry(operation, alloc, lock_path);
     try std.testing.expect(third != null);
-    releaseRunLock(alloc, third);
+    releaseRunLock(operation, alloc, third);
 }
 
 test "parseCommand recognizes the exported command surface" {
@@ -1957,7 +2152,13 @@ test "parseSchedulerCommand recognizes exported scheduler actions" {
 }
 
 test "scheduler label parser retains JSON output selection" {
-    const parsed = try parseSchedulerLabelArgs(&.{
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
+    const parsed = try parseSchedulerLabelArgs(operation, &.{
         "--label",
         "com.example.scheduler",
         "--json",
@@ -1967,44 +2168,59 @@ test "scheduler label parser retains JSON output selection" {
 }
 
 test "doctor CLI keeps scheduler identity environment-only" {
-    const json = try parseDoctorArgs(&.{"--json"});
+    const json = try parseDoctorArgs(std.testing.io, &.{"--json"});
     try std.testing.expect(json.json);
     try std.testing.expectError(
         error.UserInput,
-        parseDoctorArgs(&.{ "--label", "com.example.scheduler" }),
+        parseDoctorArgs(std.testing.io, &.{ "--label", "com.example.scheduler" }),
     );
 }
 
 test "run-due limits remain positive and fit the SQLite integer domain" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const label_args = &.{ "--lock-label", "com.example.numeric-test" };
-    try std.testing.expectEqual(@as(i64, 10), (try parseRunDueArgs(label_args)).limit);
-    try std.testing.expectEqual(@as(i64, 1), (try parseRunDueArgs(&.{
+    try std.testing.expectEqual(@as(i64, 10), (try parseRunDueArgs(operation, label_args)).limit);
+    try std.testing.expectEqual(@as(i64, 1), (try parseRunDueArgs(operation, &.{
         "--limit", "1", "--lock-label", "com.example.numeric-test",
     })).limit);
-    try std.testing.expectEqual(std.math.maxInt(i64), (try parseRunDueArgs(&.{
+    try std.testing.expectEqual(std.math.maxInt(i64), (try parseRunDueArgs(operation, &.{
         "--limit", "9223372036854775807", "--lock-label", "com.example.numeric-test",
     })).limit);
     for ([_][]const u8{ "0", "-1", "9223372036854775808", "18446744073709551615" }) |raw| {
-        try std.testing.expectError(error.UserInput, parseRunDueArgs(&.{
+        try std.testing.expectError(error.UserInput, parseRunDueArgs(operation, &.{
             "--limit", raw, "--lock-label", "com.example.numeric-test",
         }));
     }
 }
 
 test "automation timestamp projection uses store-owned admission" {
-    try std.testing.expectEqual(@as(i64, -1000), try parseUnixTimestampMs("-1"));
-    try std.testing.expectError(error.UserInput, parseUnixTimestampMs("-9223372036854775808"));
+    try std.testing.expectEqual(@as(i64, -1000), try parseUnixTimestampMs(std.testing.io, "-1"));
+    try std.testing.expectError(
+        error.UserInput,
+        parseUnixTimestampMs(std.testing.io, "-9223372036854775808"),
+    );
 }
 
 test "due selection binds the largest positive SQLite limit without narrowing" {
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "db", .data = "" });
     const path = try tmp.dir.realPathFileAlloc(io, "db", allocator);
     defer allocator.free(path);
-    var db = try Db.open(allocator, path);
+    var db = try Db.open(operation, allocator, path);
     defer db.close();
     try createTestSchema(allocator, &db);
     var rows = try selectDueAutomations(allocator, &db, 0, std.math.maxInt(i64), null);
@@ -2024,4 +2240,179 @@ test "due selection binds the largest positive SQLite limit without narrowing" {
         -1,
         null,
     ));
+}
+
+test "automation operations keep interleaved directories and environments independent" {
+    const allocator = std.testing.allocator;
+    const sync_files = automation_store.syncAutomationFilesAfterCommit;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const first_path = try first.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(second_path);
+    var first_environment = std.process.Environ.Map.init(allocator);
+    defer first_environment.deinit();
+    try first_environment.put("HOME", first_path);
+    var second_environment = std.process.Environ.Map.init(allocator);
+    defer second_environment.deinit();
+    try second_environment.put("HOME", second_path);
+    const first_operation: Operation = .{
+        .io = io,
+        .cwd = first.dir,
+        .cwd_path = first_path,
+        .environment = &first_environment,
+    };
+    const second_operation: Operation = .{
+        .io = io,
+        .cwd = second.dir,
+        .cwd_path = second_path,
+        .environment = &second_environment,
+    };
+    try first.dir.writeFile(io, .{ .sub_path = "store.db", .data = "" });
+    try second.dir.writeFile(io, .{ .sub_path = "store.db", .data = "" });
+    var first_db = try Db.open(first_operation, allocator, "store.db");
+    defer first_db.close();
+    var second_db = try Db.open(second_operation, allocator, "store.db");
+    defer second_db.close();
+    try createTestSchema(allocator, &first_db);
+    try createTestSchema(allocator, &second_db);
+    const insert =
+        "insert into automations " ++
+        "(id,name,prompt,status,cwds,rrule,created_at,updated_at) " ++
+        "values ('shared',?,'prompt','ACTIVE','[]'," ++
+        "'RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0',1,1)";
+    try first_db.exec(allocator, insert, &.{.{ .text = "first" }});
+    try second_db.exec(allocator, insert, &.{.{ .text = "second" }});
+    try sync_files(first_operation, allocator, &first_db, "shared");
+    try sync_files(second_operation, allocator, &second_db, "shared");
+    try first_db.exec(
+        allocator,
+        "update automations set name='first again' where id='shared'",
+        &.{},
+    );
+    try sync_files(first_operation, allocator, &first_db, "shared");
+
+    try expectIndependentAutomationOutputs(
+        allocator,
+        first_operation,
+        second_operation,
+        &first_db,
+        &second_db,
+    );
+}
+
+fn expectIndependentAutomationOutputs(
+    allocator: std.mem.Allocator,
+    first_operation: Operation,
+    second_operation: Operation,
+    first_db: *Db,
+    second_db: *Db,
+) !void {
+    const io = first_operation.io;
+    const first_toml = try first_operation.cwd.readFileAlloc(
+        io,
+        ".codex/automations/shared/automation.toml",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(first_toml);
+    const second_toml = try second_operation.cwd.readFileAlloc(
+        io,
+        ".codex/automations/shared/automation.toml",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(second_toml);
+    try std.testing.expect(std.mem.indexOf(u8, first_toml, "name = \"first again\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_toml, "name = \"second\"") != null);
+    var first_row = try getAutomationById(allocator, first_db, "shared");
+    defer first_row.deinit(allocator);
+    var second_row = try getAutomationById(allocator, second_db, "shared");
+    defer second_row.deinit(allocator);
+    try std.testing.expectEqualStrings("first again", first_row.name);
+    try std.testing.expectEqualStrings("second", second_row.name);
+
+    try second_operation.cwd.createDir(io, "nested", .default_dir);
+    const link_target = try std.fs.path.join(allocator, &.{ second_operation.cwd_path, "nested" });
+    defer allocator.free(link_target);
+    try first_operation.cwd.symLink(io, link_target, "linked", .{});
+    var linked_db = try Db.open(first_operation, allocator, "linked/../store.db");
+    defer linked_db.close();
+    var linked_row = try getAutomationById(allocator, &linked_db, "shared");
+    defer linked_row.deinit(allocator);
+    try std.testing.expectEqualStrings("second", linked_row.name);
+
+    try expectIndependentPrompts(allocator, first_operation, second_operation);
+}
+
+fn expectIndependentPrompts(
+    allocator: std.mem.Allocator,
+    first_operation: Operation,
+    second_operation: Operation,
+) !void {
+    const io = first_operation.io;
+    try first_operation.cwd.writeFile(io, .{ .sub_path = "prompt", .data = "first prompt" });
+    try second_operation.cwd.writeFile(io, .{ .sub_path = "prompt", .data = "second prompt" });
+    const first_prompt = try automation_files.readPrompt(
+        first_operation,
+        allocator,
+        null,
+        "prompt",
+    );
+    defer allocator.free(first_prompt);
+    const second_prompt = try automation_files.readPrompt(
+        second_operation,
+        allocator,
+        null,
+        "prompt",
+    );
+    defer allocator.free(second_prompt);
+    try std.testing.expectEqualStrings("first prompt", first_prompt);
+    try std.testing.expectEqualStrings("second prompt", second_prompt);
+}
+
+fn openDatabaseWithAllocator(allocator: std.mem.Allocator, operation: Operation) !void {
+    var db = try Db.open(operation, allocator, "store.db");
+    defer db.close();
+}
+
+test "automation admission honors injected cancellation and retains borrowed handles" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "store.db", .data = "" });
+    const operation: Operation = .{
+        .io = io,
+        .cwd = tmp.dir,
+        .cwd_path = path,
+        .environment = &.init(allocator),
+    };
+    const CanceledAccess = struct {
+        fn access(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.AccessOptions,
+        ) std.Io.Dir.AccessError!void {
+            return error.Canceled;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.dirAccess = CanceledAccess.access;
+    var canceled = operation;
+    canceled.io.vtable = &vtable;
+    try std.testing.expectError(error.UserInput, Db.open(canceled, allocator, "store.db"));
+    try @import("test_support").checkAllAllocationFailures(
+        allocator,
+        openDatabaseWithAllocator,
+        .{operation},
+    );
+    try tmp.dir.access(io, "store.db", .{});
 }

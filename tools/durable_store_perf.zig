@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const durable_store = @import("durable_store");
 
-const Io = std.Io.Threaded.global_single_threaded;
 const default_fixture_bytes: usize = 60 * 1024 * 1024;
 const rounds: usize = 3;
 const target_name = std.fmt.comptimePrint("{s}-{s}-{s}", .{
@@ -146,30 +145,30 @@ const PeakAllocator = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    durable_store.installRuntimeIo(init.io);
+    const fs = durable_store.Fs.init(init.io, .cwd());
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const cli = parseCli(argv) catch return error.InvalidArguments;
 
     const fixture_dir = try allocator.print(
         ".perf-local/durable-store-{d}",
-        .{std.Io.Clock.awake.now(Io.io()).nanoseconds},
+        .{std.Io.Clock.awake.now(fs.io).nanoseconds},
     );
     defer allocator.free(fixture_dir);
-    try std.Io.Dir.cwd().createDirPath(Io.io(), fixture_dir);
-    defer cleanupFixture(fixture_dir);
+    try fs.directory().createDirPath(fs.io, fixture_dir);
+    defer cleanupFixture(fs, fixture_dir);
 
     const fixture_path = try std.fs.path.join(
         allocator,
         &.{ fixture_dir, "events.jsonl" },
     );
     defer allocator.free(fixture_path);
-    const measurements = try measureFixture(fixture_path, cli.fixture_bytes);
-    try writeReport(allocator, cli, measurements);
+    const measurements = try measureFixture(fs, fixture_path, cli.fixture_bytes);
+    try writeReport(fs, allocator, cli, measurements);
 }
 
-fn cleanupFixture(path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(Io.io(), path) catch |err| {
+fn cleanupFixture(fs: durable_store.Fs, path: []const u8) void {
+    fs.directory().deleteTree(fs.io, path) catch |err| {
         std.debug.print(
             "durable-store performance fixture cleanup failed: {s}\n",
             .{@errorName(err)},
@@ -177,16 +176,20 @@ fn cleanupFixture(path: []const u8) void {
     };
 }
 
-fn measureFixture(fixture_path: []const u8, fixture_bytes: usize) !Measurements {
-    const fixture = try writeFixture(fixture_path, fixture_bytes);
+fn measureFixture(
+    fs: durable_store.Fs,
+    fixture_path: []const u8,
+    fixture_bytes: usize,
+) !Measurements {
+    const fixture = try writeFixture(fs, fixture_path, fixture_bytes);
     const actual_bytes = fixture.actual_bytes;
 
     var samples: [rounds]Round = undefined;
-    for (&samples) |*sample| sample.* = try measureScan(fixture_path, actual_bytes);
+    for (&samples) |*sample| sample.* = try measureScan(fs, fixture_path, actual_bytes);
     var append_samples: [rounds]Round = undefined;
     for (&append_samples) |*sample| {
-        _ = try writeFixture(fixture_path, fixture_bytes);
-        sample.* = try measureAppend(fixture_path, actual_bytes);
+        _ = try writeFixture(fs, fixture_path, fixture_bytes);
+        sample.* = try measureAppend(fs, fixture_path, actual_bytes);
     }
 
     var elapsed: [rounds]u64 = undefined;
@@ -220,27 +223,29 @@ fn measureFixture(fixture_path: []const u8, fixture_bytes: usize) !Measurements 
 }
 
 fn writeReport(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cli: Cli,
     measurements: Measurements,
 ) !void {
-    var stdout_writer = std.Io.File.stdout().writer(Io.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(fs.io, &.{});
     const stdout = &stdout_writer.interface;
     if (cli.baseline_path) |baseline_path| {
-        try writeMeasuredReport(allocator, stdout, baseline_path, cli, measurements);
+        try writeMeasuredReport(fs, allocator, stdout, baseline_path, cli, measurements);
     } else {
         try writeUnmeasuredReport(stdout, cli, measurements);
     }
 }
 
 fn writeMeasuredReport(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     stdout: *std.Io.Writer,
     baseline_path: []const u8,
     cli: Cli,
     measurements: Measurements,
 ) !void {
-    const baseline = try loadBaseline(allocator, baseline_path, measurements);
+    const baseline = try loadBaseline(fs, allocator, baseline_path, measurements);
     const scan_alloc_reduction = reductionPct(
         baseline.scan_peak_live_bytes,
         measurements.scan_peak_live_bytes,
@@ -365,17 +370,17 @@ fn parseCli(argv: []const []const u8) !Cli {
     return cli;
 }
 
-fn writeFixture(path: []const u8, minimum_bytes: usize) !Fixture {
-    var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .truncate = true });
-    defer file.close(Io.io());
+fn writeFixture(fs: durable_store.Fs, path: []const u8, minimum_bytes: usize) !Fixture {
+    var file = try fs.directory().createFile(fs.io, path, .{ .truncate = true });
+    defer file.close(fs.io);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var written: usize = 0;
     while (written < minimum_bytes) {
-        try file.writeStreamingAll(Io.io(), fixture_line);
+        try file.writeStreamingAll(fs.io, fixture_line);
         hasher.update(fixture_line);
         written += fixture_line.len;
     }
-    try file.sync(Io.io());
+    try file.sync(fs.io);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return .{
@@ -386,21 +391,21 @@ fn writeFixture(path: []const u8, minimum_bytes: usize) !Fixture {
 
 fn ignoreEvent(_: *anyopaque, _: durable_store.EventRecordView) !void {}
 
-fn measureScan(path: []const u8, fixture_bytes: usize) !Round {
+fn measureScan(fs: durable_store.Fs, path: []const u8, fixture_bytes: usize) !Round {
     var debug_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = debug_allocator.deinit();
     var peak = PeakAllocator.init(debug_allocator.allocator());
     const allocator = peak.allocator();
 
-    var backend = durable_store.PersistentEventStore.init(path);
+    var backend = durable_store.PersistentEventStore.init(fs, path);
     var ignored: u8 = 0;
-    const started = std.Io.Clock.awake.now(Io.io()).nanoseconds;
+    const started = std.Io.Clock.awake.now(fs.io).nanoseconds;
     var summary = try backend.eventStore().scan(allocator, fixture_bytes, .{
         .context = &ignored,
         .visitFn = ignoreEvent,
     });
     const elapsed_ns: u64 = @intCast(@max(
-        std.Io.Clock.awake.now(Io.io()).nanoseconds - started,
+        std.Io.Clock.awake.now(fs.io).nanoseconds - started,
         1,
     ));
     const record_count = summary.record_count;
@@ -413,21 +418,22 @@ fn measureScan(path: []const u8, fixture_bytes: usize) !Round {
     };
 }
 
-fn measureAppend(path: []const u8, fixture_bytes: usize) !Round {
+fn measureAppend(fs: durable_store.Fs, path: []const u8, fixture_bytes: usize) !Round {
     var debug_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = debug_allocator.deinit();
     var peak = PeakAllocator.init(debug_allocator.allocator());
     const allocator = peak.allocator();
 
-    const started = std.Io.Clock.awake.now(Io.io()).nanoseconds;
+    const started = std.Io.Clock.awake.now(fs.io).nanoseconds;
     try durable_store.appendLineAtomic(
+        fs,
         allocator,
         path,
         "{\"schema\":\"event/v1\",\"sequence\":2}",
         fixture_bytes + 1,
     );
     const elapsed_ns: u64 = @intCast(@max(
-        std.Io.Clock.awake.now(Io.io()).nanoseconds - started,
+        std.Io.Clock.awake.now(fs.io).nanoseconds - started,
         1,
     ));
     if (peak.live_bytes != 0) return error.BenchmarkLeak;
@@ -439,12 +445,13 @@ fn measureAppend(path: []const u8, fixture_bytes: usize) !Round {
 }
 
 fn loadBaseline(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     path: []const u8,
     measurements: Measurements,
 ) !Baseline {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        Io.io(),
+    const bytes = try fs.directory().readFileAlloc(
+        fs.io,
         path,
         allocator,
         .limited(1024 * 1024),

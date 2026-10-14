@@ -16,6 +16,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build",
         "apps",
         "libs",
         "tools",

@@ -95,7 +95,8 @@ for token in \
 done
 
 for token in \
-  '"libs/definition_compat/**"' \
+  '"libs/**"' \
+  '"build/**"' \
   '"tools/perf_contract.zig"' \
   'perf=${selected[seq]:-false}' \
   '${selected[cas]:-false}' \
@@ -155,6 +156,10 @@ for changed_path in build.zig tools/perf_hub.zig tools/perf_contract.zig tools/s
 done
 expect_perf_selection true apps/seq/src/main.zig seq
 expect_perf_selection true apps/cas/src/main.zig cas
+expect_perf_selection true build/apps/seq.zig seq
+expect_perf_selection true build/apps/cas.zig cas
+expect_perf_selection true build/support.zig seq
+expect_perf_selection true build/unknown.zig seq
 expect_perf_selection false README.md
 
 echo "Seq CI proof matrix is valid."

@@ -27,7 +27,8 @@ Release contract:
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
-   - `build.zig` and `build.zig.zon` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
+   - `build/apps/<cli>.zig` owns each app's root-build assembly and counts for that CLI.
+   - Root `build.zig`, `build.zig.zon`, shared `build/support.zig`, and unknown `build/**` or `libs/**` paths count for every shipped CLI. Classification uses both sides of renamed or moved paths; root-build diff text is never interpreted as ownership.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
    - shared install admission (`apps/seq/build_support.zig` and `tools/install_guard.zig`) counts for every shipped CLI, regardless of its source directory.
    - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
@@ -39,6 +40,19 @@ Release contract:
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; the workflow qualifies both release targets before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.
 4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Direct Zig downloads must match the pinned archive checksum; setup-zig verifies the upstream signature. Clean runners prepare the package-cache directory before fetching dependencies. macOS artifacts require macOS 15 and use the explicit `aarch64-macos.15.0` target; tap formulas must declare the same minimum.
+
+Root build assembly creates the shared modules once through `build/support.zig` and
+passes them to the six `build/apps/<cli>.zig` owners. The root package includes the
+whole `build/` directory; PR CI, Auto Release, cache inputs, and lint cover it.
+The install guard remains in `apps/seq/build_support.zig` so both root and standalone
+Seq builds share the same make-time admission. Releases build the repository checkout
+and package the same executable names and CAS sibling layout.
+
+`affected` selects release-relevant applications, `ci-affected` additionally selects
+all applications for CI/classifier changes, and `version-changed` selects only edited
+application VERSION files. Documentation-only and established tool-only changes
+retain their existing treatment. Root/package edits are intentionally conservative,
+even when their text mentions only one product or a retired application.
 
 Release tags must match file versions:
 

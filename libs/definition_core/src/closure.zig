@@ -28,6 +28,7 @@ pub const AdmittedLocation = struct {
 };
 
 pub fn admittedLocation(
+    io: std.Io,
     absolute_path: []const u8,
     current_root: []const u8,
     collection_basename: []const u8,
@@ -37,7 +38,8 @@ pub fn admittedLocation(
     {
         return error.DefinitionRootNotAbsolute;
     }
-    const root = canonicalPackageRoot(
+    const root = try canonicalPackageRoot(
+        io,
         absolute_path,
         collection_basename,
     ) orelse
@@ -53,13 +55,15 @@ pub fn admittedLocation(
 }
 
 pub fn admittedPackageLocation(
+    io: std.Io,
     absolute_path: []const u8,
     collection_basename: []const u8,
 ) !?AdmittedLocation {
     if (!std.fs.path.isAbsolute(absolute_path)) {
         return error.DefinitionRootNotAbsolute;
     }
-    const root = canonicalPackageRoot(
+    const root = try canonicalPackageRoot(
+        io,
         absolute_path,
         collection_basename,
     ) orelse return null;
@@ -70,9 +74,10 @@ pub fn admittedPackageLocation(
 }
 
 fn canonicalPackageRoot(
+    io: std.Io,
     absolute_path: []const u8,
     collection_basename: []const u8,
-) ?[]const u8 {
+) !?[]const u8 {
     if (collection_basename.len == 0 or
         std.mem.indexOfScalar(u8, collection_basename, std.fs.path.sep) != null)
     {
@@ -81,7 +86,7 @@ fn canonicalPackageRoot(
     var cursor = std.fs.path.dirname(absolute_path) orelse return null;
     for (0..package_ancestor_count_max) |_| {
         if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
-            if (!hasRegularPackageManifest(cursor)) return null;
+            if (!try hasRegularPackageManifest(io, cursor)) return null;
             const package = std.fs.path.dirname(cursor) orelse return null;
             const collection = std.fs.path.dirname(package) orelse return null;
             if (!std.mem.eql(
@@ -103,17 +108,20 @@ fn canonicalPackageRoot(
     return null;
 }
 
-fn hasRegularPackageManifest(definitions_root: []const u8) bool {
+fn hasRegularPackageManifest(io: std.Io, definitions_root: []const u8) !bool {
     const manifest_path = std.fs.path.join(
         std.heap.page_allocator,
         &.{ definitions_root, "manifest.json" },
     ) catch return false;
     defer std.heap.page_allocator.free(manifest_path);
     const stat = std.Io.Dir.cwd().statFile(
-        defaultIo(),
+        io,
         manifest_path,
         .{ .follow_symlinks = false },
-    ) catch return false;
+    ) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return false,
+    };
     return stat.kind == .file;
 }
 
@@ -198,6 +206,7 @@ const ImportFrame = struct {
 };
 
 const Builder = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     root: *std.Io.Dir,
     limits: Limits,
@@ -287,6 +296,7 @@ const Builder = struct {
         relative_path: []const u8,
     ) !LoadedDefinition {
         const raw = try readAdmittedFileAlloc(
+            self.io,
             self.root,
             relative_path,
             self.allocator,
@@ -384,6 +394,7 @@ fn canonicalDefinitionAlloc(
 }
 
 pub fn load(
+    io: std.Io,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -391,15 +402,16 @@ pub fn load(
 ) !Closure {
     try limits.validate();
     if (!std.fs.path.isAbsolute(admitted_root)) return error.DefinitionRootNotAbsolute;
-    try rejectAbsoluteSymlinkComponents(admitted_root);
-    var root = try std.Io.Dir.openDirAbsolute(defaultIo(), admitted_root, .{
+    try rejectAbsoluteSymlinkComponents(io, admitted_root);
+    var root = try std.Io.Dir.openDirAbsolute(io, admitted_root, .{
         .follow_symlinks = false,
     });
-    defer root.close(defaultIo());
-    return loadFromDir(allocator, &root, entry_path, limits);
+    defer root.close(io);
+    return loadFromDir(io, allocator, &root, entry_path, limits);
 }
 
 pub fn loadFromDir(
+    io: std.Io,
     allocator: std.mem.Allocator,
     root: *std.Io.Dir,
     entry_path: []const u8,
@@ -408,6 +420,7 @@ pub fn loadFromDir(
     try limits.validate();
     const normalized_entry = try normalizeRelativeAlloc(allocator, "", entry_path);
     var builder = Builder{
+        .io = io,
         .allocator = allocator,
         .root = root,
         .limits = limits,
@@ -561,6 +574,7 @@ fn cloneCanonicalFile(
 }
 
 pub fn verifySourceManifest(
+    io: std.Io,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     files: anytype,
@@ -573,11 +587,11 @@ pub fn verifySourceManifest(
     if (files.len == 0 or files.len > limits.max_files) {
         return error.TooManyDefinitionFiles;
     }
-    try rejectAbsoluteSymlinkComponents(admitted_root);
-    var root = try std.Io.Dir.openDirAbsolute(defaultIo(), admitted_root, .{
+    try rejectAbsoluteSymlinkComponents(io, admitted_root);
+    var root = try std.Io.Dir.openDirAbsolute(io, admitted_root, .{
         .follow_symlinks = false,
     });
-    defer root.close(defaultIo());
+    defer root.close(io);
 
     var total_bytes: usize = 0;
     var prior_path: ?[]const u8 = null;
@@ -594,18 +608,20 @@ pub fn verifySourceManifest(
             file.source_bytes,
             limits,
         );
-        try verifySourceFile(allocator, &root, file, limits);
+        try verifySourceFile(io, allocator, &root, file, limits);
     }
     return total_bytes;
 }
 
 fn verifySourceFile(
+    io: std.Io,
     allocator: std.mem.Allocator,
     root: *std.Io.Dir,
     file: anytype,
     limits: Limits,
 ) !void {
     const raw = try readAdmittedFileAlloc(
+        io,
         root,
         file.path,
         allocator,
@@ -626,13 +642,14 @@ fn verifySourceFile(
 }
 
 fn readAdmittedFileAlloc(
+    io: std.Io,
     root: *std.Io.Dir,
     relative_path: []const u8,
     allocator: std.mem.Allocator,
     max_file_bytes: usize,
 ) ![]u8 {
-    try rejectSymlinkComponents(root, relative_path);
-    var source = root.openFile(defaultIo(), relative_path, .{
+    try rejectSymlinkComponents(io, root, relative_path);
+    var source = root.openFile(io, relative_path, .{
         .allow_directory = false,
         .follow_symlinks = false,
         .resolve_beneath = true,
@@ -640,8 +657,8 @@ fn readAdmittedFileAlloc(
         error.IsDir => return error.DefinitionNotRegularFile,
         else => return err,
     };
-    defer source.close(defaultIo());
-    const stat = try source.stat(defaultIo());
+    defer source.close(io);
+    const stat = try source.stat(io);
     if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
     if (stat.kind != .file) return error.DefinitionNotRegularFile;
     if (stat.size > max_file_bytes) return error.DefinitionFileTooLarge;
@@ -650,12 +667,16 @@ fn readAdmittedFileAlloc(
         max_file_bytes,
         1,
     ) catch return error.DefinitionFileTooLarge;
-    var reader = source.reader(defaultIo(), &.{});
+    var reader = source.reader(io, &.{});
     const raw = reader.interface.allocRemaining(
         allocator,
         .limited(read_limit),
     ) catch |err| switch (err) {
         error.StreamTooLong => return error.DefinitionFileTooLarge,
+        error.ReadFailed => {
+            const cause = reader.err orelse return err;
+            return if (cause == error.Canceled) cause else err;
+        },
         else => return err,
     };
     errdefer allocator.free(raw);
@@ -901,8 +922,9 @@ pub fn normalizeRelativeAlloc(
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     for (components.items, 0..) |component, index| {
-        if (index != 0) try out.writer.writeByte('/');
-        try out.writer.writeAll(component);
+        // This sink can fail only when its backing allocator fails.
+        if (index != 0) out.writer.writeByte('/') catch return error.OutOfMemory;
+        out.writer.writeAll(component) catch return error.OutOfMemory;
     }
     const normalized = try out.toOwnedSlice();
     if (!std.mem.endsWith(u8, normalized, ".json")) {
@@ -929,20 +951,20 @@ fn appendNormalizedComponents(
     }
 }
 
-fn rejectSymlinkComponents(root: *std.Io.Dir, relative_path: []const u8) !void {
+fn rejectSymlinkComponents(io: std.Io, root: *std.Io.Dir, relative_path: []const u8) !void {
     var iterator = std.fs.path.componentIterator(relative_path);
     while (iterator.next()) |component| {
-        const stat = try root.statFile(defaultIo(), component.path, .{
+        const stat = try root.statFile(io, component.path, .{
             .follow_symlinks = false,
         });
         if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
     }
 }
 
-fn rejectAbsoluteSymlinkComponents(path: []const u8) !void {
+fn rejectAbsoluteSymlinkComponents(io: std.Io, path: []const u8) !void {
     var iterator = std.fs.path.componentIterator(path);
     while (iterator.next()) |component| {
-        const stat = try std.Io.Dir.cwd().statFile(defaultIo(), component.path, .{
+        const stat = try std.Io.Dir.cwd().statFile(io, component.path, .{
             .follow_symlinks = false,
         });
         if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
@@ -978,10 +1000,6 @@ fn lessThanClosureFile(_: void, left: ClosureFile, right: ClosureFile) bool {
     return std.mem.lessThan(u8, left.path, right.path);
 }
 
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
-
 test "canonical definition archives preserve exact JSON numbers" {
     const source = ClosureFile{
         .path = @constCast("definition.json"),
@@ -1000,6 +1018,7 @@ test "canonical definition archives preserve exact JSON numbers" {
 
 test "unrecognized definition folders do not widen the admitted root" {
     const external = try admittedLocation(
+        std.testing.io,
         "/opt/config/packages/first/definitions/artifacts/record.json",
         "/workspace/target",
         "skills",
@@ -1013,10 +1032,12 @@ test "unrecognized definition folders do not widen the admitted root" {
         external.entry,
     );
     try std.testing.expect((try admittedPackageLocation(
+        std.testing.io,
         "/opt/config/packages/first/definitions/artifacts/record.json",
         "skills",
     )) == null);
     const containing_cwd = try admittedLocation(
+        std.testing.io,
         "/opt/config/packages/first/definitions/artifacts/record.json",
         "/opt/config",
         "skills",
@@ -1027,6 +1048,7 @@ test "unrecognized definition folders do not widen the admitted root" {
         containing_cwd.entry,
     );
     const root_safe = try admittedLocation(
+        std.testing.io,
         "/tmp/definitions/standalone.json",
         "/workspace/target",
         "skills",
@@ -1037,6 +1059,7 @@ test "unrecognized definition folders do not widen the admitted root" {
     );
     try std.testing.expectEqualStrings("standalone.json", root_safe.entry);
     const standalone = try admittedLocation(
+        std.testing.io,
         "/tmp/standalone.json",
         "/workspace/target",
         "skills",
@@ -1067,6 +1090,7 @@ test "manifested definition packages admit cross-package imports" {
     );
     defer std.testing.allocator.free(absolute);
     const location = (try admittedPackageLocation(
+        std.testing.io,
         absolute,
         "packages",
     )).?;
@@ -1115,6 +1139,7 @@ test "closure resolves explicit imports across admitted packages" {
         ,
     });
     var closure = try loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "first/definitions/artifacts/root.json",
@@ -1146,7 +1171,13 @@ test "closure is canonical, deterministically ordered, and content addressed" {
         .data = "{\"value\":2,\"schema\":\"example-import/v1\"}",
     });
 
-    var closure = try loadFromDir(std.testing.allocator, &tmp.dir, "root.json", .{});
+    var closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "root.json",
+        .{},
+    );
     defer closure.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), closure.files.len);
     try std.testing.expectEqualStrings("a.json", closure.files[0].path);
@@ -1160,7 +1191,13 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     );
     try std.testing.expect(canonical_json.isFingerprint(closure.digestSlice()));
 
-    var repeated = try loadFromDir(std.testing.allocator, &tmp.dir, "./root.json", .{});
+    var repeated = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "./root.json",
+        .{},
+    );
     defer repeated.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(closure.digestSlice(), repeated.digestSlice());
 }
@@ -1183,6 +1220,7 @@ test "source manifest verifies unchanged files without reparsing definitions" {
     );
     defer std.testing.allocator.free(root);
     var closure = try load(
+        std.testing.io,
         std.testing.allocator,
         root,
         "root.json",
@@ -1192,6 +1230,7 @@ test "source manifest verifies unchanged files without reparsing definitions" {
     try std.testing.expectEqual(
         closure.total_definition_bytes,
         try verifySourceManifest(
+            std.testing.io,
             std.testing.allocator,
             root,
             closure.files,
@@ -1206,6 +1245,7 @@ test "source manifest verifies unchanged files without reparsing definitions" {
     try std.testing.expectError(
         error.DefinitionSourceSizeMismatch,
         verifySourceManifest(
+            std.testing.io,
             std.testing.allocator,
             root,
             closure.files,
@@ -1227,11 +1267,11 @@ test "closure rejects cycles, root escapes, duplicate fields, and bounds" {
     });
     try std.testing.expectError(
         error.ImportCycle,
-        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", .{}),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "a.json", .{}),
     );
     try std.testing.expectError(
         error.DefinitionPathEscapesRoot,
-        loadFromDir(std.testing.allocator, &tmp.dir, "../a.json", .{}),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "../a.json", .{}),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{
@@ -1240,11 +1280,11 @@ test "closure rejects cycles, root escapes, duplicate fields, and bounds" {
     });
     try std.testing.expectError(
         error.DuplicateDefinitionField,
-        loadFromDir(std.testing.allocator, &tmp.dir, "duplicate.json", .{}),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "duplicate.json", .{}),
     );
     try std.testing.expectError(
         error.DefinitionFileTooLarge,
-        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", .{
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "a.json", .{
             .max_file_bytes = 1,
             .max_total_bytes = 1,
         }),
@@ -1261,12 +1301,12 @@ test "closure rejects symlink traversal and non-regular files" {
     try tmp.dir.symLink(std.testing.io, "real.json", "link.json", .{});
     try std.testing.expectError(
         error.SymlinkDefinitionPath,
-        loadFromDir(std.testing.allocator, &tmp.dir, "link.json", .{}),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "link.json", .{}),
     );
     try tmp.dir.createDir(std.testing.io, "directory.json", .default_dir);
     try std.testing.expectError(
         error.DefinitionNotRegularFile,
-        loadFromDir(std.testing.allocator, &tmp.dir, "directory.json", .{}),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "directory.json", .{}),
     );
 }
 
@@ -1314,7 +1354,13 @@ test "iterative import traversal preserves deep source and canonical closure byt
         });
     }
     const limits: Limits = .{ .max_import_depth = 96, .max_files = 96 };
-    var loaded = try loadFromDir(std.testing.allocator, &tmp.dir, "f000.json", limits);
+    var loaded = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "f000.json",
+        limits,
+    );
     defer loaded.deinit(std.testing.allocator);
     var canonical = try fromCanonicalFiles(
         std.testing.allocator,
@@ -1328,7 +1374,7 @@ test "iterative import traversal preserves deep source and canonical closure byt
     const shallow: Limits = .{ .max_import_depth = 95 };
     try std.testing.expectError(
         error.ImportDepthExceeded,
-        loadFromDir(std.testing.allocator, &tmp.dir, "f000.json", shallow),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "f000.json", shallow),
     );
     try std.testing.expectError(
         error.ImportDepthExceeded,
@@ -1350,7 +1396,7 @@ test "import depth precedes cycles and cycles precede new-file admission" {
     const shallow: Limits = .{ .max_import_depth = 1, .max_files = 1 };
     try std.testing.expectError(
         error.ImportDepthExceeded,
-        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", shallow),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "a.json", shallow),
     );
     try std.testing.expectError(
         error.ImportDepthExceeded,
@@ -1359,7 +1405,7 @@ test "import depth precedes cycles and cycles precede new-file admission" {
     const deep: Limits = .{ .max_import_depth = 2, .max_files = 1 };
     try std.testing.expectError(
         error.ImportCycle,
-        loadFromDir(std.testing.allocator, &tmp.dir, "a.json", deep),
+        loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "a.json", deep),
     );
     try std.testing.expectError(
         error.ImportCycle,
@@ -1368,7 +1414,13 @@ test "import depth precedes cycles and cycles precede new-file admission" {
 }
 
 fn loadChainForAllocationFailure(allocator: std.mem.Allocator, root: *std.Io.Dir) !void {
-    var loaded = loadFromDir(allocator, root, "f000.json", .{}) catch |err| switch (err) {
+    var loaded = loadFromDir(
+        std.testing.io,
+        allocator,
+        root,
+        "f000.json",
+        .{},
+    ) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };
@@ -1417,5 +1469,83 @@ test "import frames free pending siblings at every failed allocation" {
         std.testing.allocator,
         canonicalChainForAllocationFailure,
         .{source.files},
+    );
+}
+
+test "closure operations retain supplied I/O cancellation" {
+    const Canceled = struct {
+        fn stat(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.StatFileOptions,
+        ) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            return error.Canceled;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirStatFile = Canceled.stat;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var root = std.Io.Dir.cwd();
+    try std.testing.expectError(
+        error.Canceled,
+        loadFromDir(io, std.testing.allocator, &root, "entry.json", .{}),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        load(io, std.testing.allocator, "/unused", "entry.json", .{}),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        admittedPackageLocation(io, "/packages/one/definitions/entry.json", "packages"),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        admittedLocation(io, "/packages/one/definitions/entry.json", "/current", "packages"),
+    );
+}
+
+test "closures from independent directory authorities do not exchange files" {
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    try first.dir.writeFile(std.testing.io, .{ .sub_path = "entry.json", .data = "{\"value\":1}" });
+    try second.dir.writeFile(
+        std.testing.io,
+        .{ .sub_path = "entry.json", .data = "{\"value\":2}" },
+    );
+    var first_closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &first.dir,
+        "entry.json",
+        .{},
+    );
+    defer first_closure.deinit(std.testing.allocator);
+    var second_closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &second.dir,
+        "entry.json",
+        .{},
+    );
+    defer second_closure.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"value\":1}", first_closure.files[0].canonical_json);
+    try std.testing.expectEqualStrings("{\"value\":2}", second_closure.files[0].canonical_json);
+    try std.testing.expect(!std.mem.eql(u8, &first_closure.digest, &second_closure.digest));
+}
+
+fn checkNormalizedPathAllocation(allocator: std.mem.Allocator) !void {
+    const path = try normalizeRelativeAlloc(allocator, "parent/child", "../definition.json");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("parent/definition.json", path);
+}
+
+test "path normalization preserves allocation failure as OutOfMemory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNormalizedPathAllocation,
+        .{},
     );
 }

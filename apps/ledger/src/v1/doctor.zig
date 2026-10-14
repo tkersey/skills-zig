@@ -55,6 +55,7 @@ pub const Result = struct {
 };
 
 pub fn execute(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
@@ -62,13 +63,14 @@ pub fn execute(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    if (!storage_root.validRepoRoot(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!storage_root.validRepoRoot(scope, repo_root)) return error.RepositoryRootNotAbsolute;
     const transactions_dir = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions_dir);
     const pending_transactions = try durable_store.countPendingTransactions(
+        scope.fs,
         allocator,
         transactions_dir,
     );
@@ -90,6 +92,7 @@ pub fn execute(
     var healthy = pending_transactions == 0;
     for (resolved_storage.slotSlice(), 0..) |slot, index| {
         slots[index] = inspectSlot(
+            scope,
             allocator,
             definition_plan,
             repo_root,
@@ -122,6 +125,7 @@ fn classifySlotError(
 }
 
 fn inspectSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
@@ -130,6 +134,7 @@ fn inspectSlot(
     protocol_required: bool,
 ) !SlotStatus {
     if (slot.isSegmented()) return inspectSegmentedEventSlot(
+        scope,
         allocator,
         definition_plan,
         repo_root,
@@ -139,6 +144,7 @@ fn inspectSlot(
     );
     if (slot.kind == .event_log) {
         return inspectEventSlot(
+            scope,
             allocator,
             definition_plan,
             repo_root,
@@ -148,6 +154,7 @@ fn inspectSlot(
         );
     }
     var snapshot = try custody.readSlotOrMissing(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -156,6 +163,7 @@ fn inspectSlot(
     defer snapshot.deinit(allocator);
     if (!snapshot.exists) return error.StoreSlotMissing;
     var replay_stats = try replay.validateSlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -183,6 +191,7 @@ fn inspectSlot(
 }
 
 fn inspectSegmentedEventSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
@@ -191,20 +200,23 @@ fn inspectSegmentedEventSlot(
     protocol_required: bool,
 ) !SlotStatus {
     var snapshot = try segmented_event_log.Snapshot.load(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
     );
     defer snapshot.deinit(allocator);
     try segmented_event_log.requireMigratedCustody(
+        scope,
         allocator,
         repo_root,
         slot.relative_path,
         snapshot.head_exists,
     );
     if (!snapshot.head_exists) return error.StoreSlotMissing;
-    try segmented_event_log.auditHistory(allocator, &snapshot);
+    try segmented_event_log.auditHistory(scope, allocator, &snapshot);
     try replay.validateSegmentedHistory(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -227,6 +239,7 @@ fn inspectSegmentedEventSlot(
     );
     defer binding.deinit(allocator);
     var replay_stats = try replay.validateSegmentedSnapshot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -267,6 +280,7 @@ fn segmentedSlotStatus(
 }
 
 fn inspectEventSlot(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
@@ -274,15 +288,12 @@ fn inspectEventSlot(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
-    var snapshot = try custody.readReplaySlotOrMissing(
-        allocator,
-        repo_root,
-        definition_plan.id,
-        slot,
-    );
+    var snapshot =
+        try custody.readReplaySlotOrMissing(scope, allocator, repo_root, definition_plan.id, slot);
     defer snapshot.deinit(allocator);
     if (!snapshot.exists) return error.StoreSlotMissing;
     var replay_stats = replay.validateReplaySlot(
+        scope,
         allocator,
         repo_root,
         definition_plan.id,
@@ -294,6 +305,7 @@ fn inspectEventSlot(
     ) catch |err| switch (err) {
         error.ReplayRequiresMaterializedHistory => materialized_replay: {
             var materialized = try custody.readSlot(
+                scope,
                 allocator,
                 repo_root,
                 definition_plan.id,
@@ -301,6 +313,7 @@ fn inspectEventSlot(
             );
             defer materialized.deinit(allocator);
             break :materialized_replay try replay.validateSlot(
+                scope,
                 allocator,
                 repo_root,
                 definition_plan.id,
@@ -377,6 +390,8 @@ const doctor_definition_json =
 ;
 
 test "missing declared storage is a healthy initial state" {
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
     try definition_tmp.dir.writeFile(std.testing.io, .{
@@ -384,6 +399,7 @@ test "missing declared storage is a healthy initial state" {
         .data = doctor_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
+        scope.fs.io,
         std.testing.allocator,
         &definition_tmp.dir,
         "protocol.json",
@@ -416,6 +432,7 @@ test "missing declared storage is a healthy initial state" {
     );
     defer std.testing.allocator.free(repo_root);
     var result = try execute(
+        scope,
         std.testing.allocator,
         &definition_plan,
         &storage_plan,

@@ -2945,6 +2945,7 @@ test "observation steps compile field names and parameters to native indices" {
         .data = plan_filter_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "observation.json",
@@ -2998,6 +2999,7 @@ test "external relations compile to the same typed native stage schema" {
         .data = external_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "observation.json",
@@ -3035,6 +3037,7 @@ test "sort and distinct plans cache compiled field indices" {
         .data = order_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
         std.testing.allocator,
         &tmp.dir,
         "observation.json",

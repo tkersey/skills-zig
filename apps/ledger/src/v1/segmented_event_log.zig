@@ -627,11 +627,12 @@ pub const Paths = struct {
     legacy_binding: []u8,
 
     pub fn init(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         logical_path: []const u8,
     ) !Paths {
-        if (!storage_root.validRepoRoot(repo_root)) {
+        if (!storage_root.validRepoRoot(scope, repo_root)) {
             return error.RepositoryRootNotAbsolute;
         }
         const digest = try definition_core.canonical_json.digestBytesAlloc(
@@ -641,7 +642,7 @@ pub const Paths = struct {
         defer allocator.free(digest);
         const root = try std.fs.path.join(
             allocator,
-            &.{ repo_root, storage_root.controlComponent(), ".segments", digest[7..] },
+            &.{ repo_root, storage_root.controlComponent(scope), ".segments", digest[7..] },
         );
         errdefer allocator.free(root);
         const manifest = try std.fs.path.join(
@@ -663,10 +664,11 @@ pub const Paths = struct {
         errdefer allocator.free(checkpoints);
         const legacy_event = try std.fs.path.join(
             allocator,
-            &.{ repo_root, storage_root.controlComponent(), logical_path },
+            &.{ repo_root, storage_root.controlComponent(scope), logical_path },
         );
         errdefer allocator.free(legacy_event);
         const legacy_binding = try custody.bindingPathAlloc(
+            scope,
             allocator,
             repo_root,
             logical_path,
@@ -719,6 +721,7 @@ pub const Paths = struct {
 };
 
 pub const Snapshot = struct {
+    scope: *storage_root.Scope,
     paths: Paths,
     head_exists: bool,
     head_bytes: []u8,
@@ -737,23 +740,24 @@ pub const Snapshot = struct {
     checkpoint_digest: ?[]u8,
 
     pub fn load(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         logical_path: []const u8,
     ) !Snapshot {
-        var paths = try Paths.init(allocator, repo_root, logical_path);
+        var paths = try Paths.init(scope, allocator, repo_root, logical_path);
         errdefer paths.deinit(allocator);
-        var head_read = try readOptionalFile(allocator, paths.manifest, 64 * 1024);
+        var head_read = try readOptionalFile(scope, allocator, paths.manifest, 64 * 1024);
         errdefer head_read.deinit(allocator);
         var head = if (head_read.exists)
             try Head.decode(allocator, head_read.bytes)
         else
             try Head.init(allocator, logical_path);
         errdefer head.deinit(allocator);
-        if (!std.mem.eql(u8, head.logical_path, logical_path)) {
+        if (!std.mem.eql(u8, head.logical_path, logical_path))
             return error.SegmentedLogicalPathMismatch;
-        }
         var absent_custody = try acquireAbsentHeadCustody(
+            scope,
             allocator,
             &paths,
             logical_path,
@@ -762,17 +766,19 @@ pub const Snapshot = struct {
         );
         defer if (absent_custody) |*value| value.deinit();
         var generation = try acquireStableGeneration(
+            scope,
             allocator,
             &paths,
             &head,
             &head_read,
         );
         defer if (generation) |*value| value.deinit();
-        const active = try ActiveFiles.load(allocator, &paths, &head);
+        const active = try ActiveFiles.load(scope, allocator, &paths, &head);
         errdefer active.deinit(allocator);
-        const checkpoint_file = try CheckpointFile.load(allocator, &paths, &head);
+        const checkpoint_file = try CheckpointFile.load(scope, allocator, &paths, &head);
         errdefer checkpoint_file.deinit(allocator);
         try validateAbsentHeadStable(
+            scope,
             allocator,
             &paths,
             head_read.exists,
@@ -784,6 +790,7 @@ pub const Snapshot = struct {
             null;
         errdefer if (head_digest) |digest| allocator.free(digest);
         return .{
+            .scope = scope,
             .paths = paths,
             .head_exists = head_read.exists,
             .head_bytes = head_read.bytes,
@@ -822,6 +829,7 @@ pub const Snapshot = struct {
 };
 
 fn acquireAbsentHeadCustody(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     paths: *const Paths,
     logical_path: []const u8,
@@ -829,10 +837,12 @@ fn acquireAbsentHeadCustody(
     head: *Head,
 ) !?durable_store.CasReadLockPair {
     if (head_read.exists or !try durable_store.casAdvisoryLockExists(
+        scope.fs,
         allocator,
         paths.manifest,
     )) return null;
     var custody_lock = durable_store.acquireCasReadLockPair(
+        scope.fs,
         allocator,
         paths.manifest,
         paths.manifest,
@@ -845,6 +855,7 @@ fn acquireAbsentHeadCustody(
         return error.SegmentedGenerationCustodyMissing;
     }
     var checked_head = try readOptionalFile(
+        scope,
         allocator,
         paths.manifest,
         64 * 1024,
@@ -867,15 +878,17 @@ fn acquireAbsentHeadCustody(
 }
 
 fn acquireStableGeneration(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     paths: *const Paths,
     head: *const Head,
     head_read: *OptionalFile,
 ) !?ReadGeneration {
     if (!head_read.exists) return null;
-    var generation = try ReadGeneration.acquire(allocator, paths, head);
+    var generation = try ReadGeneration.acquire(scope, allocator, paths, head);
     errdefer generation.deinit();
     const locked_head = try readOptionalFile(
+        scope,
         allocator,
         paths.manifest,
         64 * 1024,
@@ -892,6 +905,7 @@ fn acquireStableGeneration(
 }
 
 fn validateAbsentHeadStable(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     paths: *const Paths,
     head_exists: bool,
@@ -899,13 +913,14 @@ fn validateAbsentHeadStable(
 ) !void {
     if (head_exists) return;
     var final_head = try readOptionalFile(
+        scope,
         allocator,
         paths.manifest,
         64 * 1024,
     );
     defer final_head.deinit(allocator);
     if (final_head.exists or (!has_custody and
-        try durable_store.casAdvisoryLockExists(allocator, paths.manifest)))
+        try durable_store.casAdvisoryLockExists(scope.fs, allocator, paths.manifest)))
     {
         return error.SegmentedSnapshotGenerationChanged;
     }
@@ -916,6 +931,7 @@ const ReadGeneration = struct {
     second: durable_store.CasReadLockPair,
 
     fn acquire(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         paths: *const Paths,
         head: *const Head,
@@ -947,20 +963,24 @@ const ReadGeneration = struct {
             }
         }.lessThan);
         const expected = try expectedReadCustodyCount(
+            scope,
             allocator,
             &ordered,
         );
         if (expected == 0 or !try durable_store.casAdvisoryLockExists(
+            scope.fs,
             allocator,
             paths.manifest,
         )) return error.SegmentedGenerationCustodyMissing;
         var first = try durable_store.acquireCasReadLockPair(
+            scope.fs,
             allocator,
             ordered[0],
             ordered[1],
         );
         errdefer first.deinit();
         var second = try durable_store.acquireCasReadLockPair(
+            scope.fs,
             allocator,
             ordered[2],
             ordered[3],
@@ -980,6 +1000,7 @@ const ReadGeneration = struct {
 };
 
 fn expectedReadCustodyCount(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     ordered: []const []const u8,
 ) !usize {
@@ -989,6 +1010,7 @@ fn expectedReadCustodyCount(
             continue;
         }
         result += @intFromBool(try durable_store.casAdvisoryLockExists(
+            scope.fs,
             allocator,
             path,
         ));
@@ -997,6 +1019,7 @@ fn expectedReadCustodyCount(
 }
 
 pub fn requireMigratedCustody(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     logical_path: []const u8,
@@ -1004,10 +1027,11 @@ pub fn requireMigratedCustody(
 ) !void {
     const event_path = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), logical_path },
+        &.{ repo_root, storage_root.controlComponent(scope), logical_path },
     );
     defer allocator.free(event_path);
     const binding_path = try custody.bindingPathAlloc(
+        scope,
         allocator,
         repo_root,
         logical_path,
@@ -1015,30 +1039,34 @@ pub fn requireMigratedCustody(
     defer allocator.free(binding_path);
     if (head_exists) {
         try requireLegacyTombstone(
+            scope,
             allocator,
             event_path,
             legacy_event_tombstone,
         );
         try requireLegacyTombstone(
+            scope,
             allocator,
             binding_path,
             legacy_binding_tombstone,
         );
         return;
     }
-    if (try legacyFileExists(event_path, legacy_event_max_bytes) or
-        try legacyFileExists(binding_path, custody.binding_max_bytes))
+    if (try legacyFileExists(scope, event_path, legacy_event_max_bytes) or
+        try legacyFileExists(scope, binding_path, custody.binding_max_bytes))
     {
         return error.SegmentedMigrationRequired;
     }
 }
 
 fn requireLegacyTombstone(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     expected: []const u8,
 ) !void {
     const bytes = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         expected.len,
@@ -1049,10 +1077,10 @@ fn requireLegacyTombstone(
     }
 }
 
-fn legacyFileExists(path: []const u8, maximum: usize) !bool {
-    try durable_store.rejectSymlinkComponents(path);
-    const stat = std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
+fn legacyFileExists(scope: *storage_root.Scope, path: []const u8, maximum: usize) !bool {
+    try durable_store.rejectSymlinkComponents(scope.fs, path);
+    const stat = scope.fs.directory().statFile(
+        scope.fs.io,
         path,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
@@ -1066,20 +1094,24 @@ fn legacyFileExists(path: []const u8, maximum: usize) !bool {
 }
 
 pub fn auditHistory(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     snapshot: *const Snapshot,
 ) !void {
     try rejectFutureSegmentFiles(
+        scope,
         snapshot.paths.events,
         snapshot.head.event_index,
         ".jsonl",
     );
     try rejectFutureSegmentFiles(
+        scope,
         snapshot.paths.bindings,
         snapshot.head.binding_index,
         ".jsonl",
     );
     try rejectFutureSegmentFiles(
+        scope,
         snapshot.paths.checkpoints,
         if (snapshot.head.checkpoint_exists)
             snapshot.head.checkpoint_index
@@ -1088,6 +1120,7 @@ pub fn auditHistory(
         ".bin",
     );
     const events = try auditSegmentSequence(
+        scope,
         allocator,
         &snapshot.paths,
         snapshot.head.event_index,
@@ -1095,6 +1128,7 @@ pub fn auditHistory(
         .events,
     );
     const bindings = try auditSegmentSequence(
+        scope,
         allocator,
         &snapshot.paths,
         snapshot.head.binding_index,
@@ -1122,6 +1156,7 @@ pub const EventHistoryIterator = struct {
     summary: HistorySummary = .{},
 
     pub fn next(self: *EventHistoryIterator) !?[]u8 {
+        const scope = self.snapshot.scope;
         if (self.index > self.snapshot.head.event_index) return null;
         const bytes = if (self.index == self.snapshot.head.event_index)
             try self.allocator.dupe(u8, self.snapshot.event_bytes)
@@ -1132,6 +1167,7 @@ pub const EventHistoryIterator = struct {
             );
             defer self.allocator.free(path);
             break :blk try durable_store.readRegularFileNoSymlink(
+                scope.fs,
                 self.allocator,
                 path,
                 event_segment_bytes,
@@ -1168,6 +1204,7 @@ pub const BindingHistoryIterator = struct {
     summary: HistorySummary = .{},
 
     pub fn next(self: *BindingHistoryIterator) !?[]u8 {
+        const scope = self.snapshot.scope;
         if (self.index > self.snapshot.head.binding_index) return null;
         const bytes = if (self.index == self.snapshot.head.binding_index)
             try self.allocator.dupe(u8, self.snapshot.binding_bytes)
@@ -1178,6 +1215,7 @@ pub const BindingHistoryIterator = struct {
             );
             defer self.allocator.free(path);
             break :blk try durable_store.readRegularFileNoSymlink(
+                scope.fs,
                 self.allocator,
                 path,
                 binding_segment_bytes,
@@ -1216,6 +1254,7 @@ const HistorySummary = struct {
 };
 
 fn auditSegmentSequence(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     paths: *const Paths,
     active_index: u64,
@@ -1235,6 +1274,7 @@ fn auditSegmentSequence(
             .bindings => binding_segment_bytes,
         };
         const bytes = try durable_store.readRegularFileNoSymlink(
+            scope.fs,
             allocator,
             path,
             maximum,
@@ -1307,18 +1347,19 @@ fn lineRecordCount(bytes: []const u8) usize {
 }
 
 fn rejectFutureSegmentFiles(
+    scope: *storage_root.Scope,
     directory: []const u8,
     maximum_index: ?u64,
     extension: []const u8,
 ) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = scope.fs.io;
     var dir = (if (std.fs.path.isAbsolute(directory))
         std.Io.Dir.openDirAbsolute(io, directory, .{
             .iterate = true,
             .follow_symlinks = false,
         })
     else
-        std.Io.Dir.cwd().openDir(io, directory, .{
+        scope.fs.directory().openDir(io, directory, .{
             .iterate = true,
             .follow_symlinks = false,
         })) catch |err| switch (err) {
@@ -1356,6 +1397,7 @@ const CheckpointFile = struct {
     digest: ?[]u8,
 
     fn load(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         paths: *const Paths,
         head: *const Head,
@@ -1374,6 +1416,7 @@ const CheckpointFile = struct {
         );
         errdefer allocator.free(path);
         const file = try readOptionalFile(
+            scope,
             allocator,
             path,
             checkpoint.max_checkpoint_bytes,
@@ -1408,6 +1451,7 @@ const ActiveFiles = struct {
     binding_digest: ?[]u8,
 
     fn load(
+        scope: *storage_root.Scope,
         allocator: std.mem.Allocator,
         paths: *const Paths,
         head: *const Head,
@@ -1415,6 +1459,7 @@ const ActiveFiles = struct {
         const event_path = try paths.eventSegmentAlloc(allocator, head.event_index);
         errdefer allocator.free(event_path);
         const event = try readOptionalFile(
+            scope,
             allocator,
             event_path,
             event_segment_bytes,
@@ -1426,6 +1471,7 @@ const ActiveFiles = struct {
         );
         errdefer allocator.free(binding_path);
         const binding = try readOptionalFile(
+            scope,
             allocator,
             binding_path,
             binding_segment_bytes,
@@ -1465,11 +1511,13 @@ const OptionalFile = struct {
 };
 
 fn readOptionalFile(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     path: []const u8,
     maximum: usize,
 ) !OptionalFile {
     const bytes = durable_store.readRegularFileNoSymlink(
+        scope.fs,
         allocator,
         path,
         maximum,
@@ -1559,12 +1607,16 @@ fn segmentPathAlloc(
 }
 
 test "segmented paths are deterministic and collision isolated" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
-    var left = try Paths.init(allocator, "/repo", "actuation/a/events.jsonl");
+    var left = try Paths.init(scope, allocator, "/repo", "actuation/a/events.jsonl");
     defer left.deinit(allocator);
-    var same = try Paths.init(allocator, "/repo", "actuation/a/events.jsonl");
+    var same = try Paths.init(scope, allocator, "/repo", "actuation/a/events.jsonl");
     defer same.deinit(allocator);
-    var right = try Paths.init(allocator, "/repo", "actuation/b/events.jsonl");
+    var right = try Paths.init(scope, allocator, "/repo", "actuation/b/events.jsonl");
     defer right.deinit(allocator);
     try std.testing.expectEqualStrings(left.root, same.root);
     try std.testing.expect(!std.mem.eql(u8, left.root, right.root));
@@ -1726,17 +1778,21 @@ test "checkpoint admission jointly bounds both streams and record suffix" {
 }
 
 test "segmented snapshot reads only the active bounded files" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const logical_path = "actuation/a/events.jsonl";
-    var paths = try Paths.init(allocator, root, logical_path);
+    var paths = try Paths.init(scope, allocator, root, logical_path);
     defer paths.deinit(allocator);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.checkpoints);
     var head = try Head.init(allocator, logical_path);
     defer head.deinit(allocator);
     const event = "{\"sequence\":1}\n";
@@ -1750,7 +1806,7 @@ test "segmented snapshot reads only the active bounded files" {
     defer allocator.free(binding_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".transactions" },
+        &.{ root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     const writes = [_]durable_store.TransactionMutation{
@@ -1774,13 +1830,14 @@ test "segmented snapshot reads only the active bounded files" {
         },
     };
     var receipt = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         &writes,
         .{ .owner = .{ .process_id = 1, .session_id = "snapshot-fixture", .executor = "test" } },
     );
     defer receipt.deinit(allocator);
-    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    var snapshot = try Snapshot.load(scope, allocator, root, logical_path);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqualStrings(event, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding, snapshot.binding_bytes);
@@ -1788,17 +1845,21 @@ test "segmented snapshot reads only the active bounded files" {
 }
 
 test "segmented snapshot counts persistent active-file sidecars" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const logical_path = "actuation/sidecars/events.jsonl";
-    var paths = try Paths.init(allocator, root, logical_path);
+    var paths = try Paths.init(scope, allocator, root, logical_path);
     defer paths.deinit(allocator);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.checkpoints);
     var head = try Head.init(allocator, logical_path);
     defer head.deinit(allocator);
     try head.installCheckpoint("checkpoint");
@@ -1808,7 +1869,7 @@ test "segmented snapshot counts persistent active-file sidecars" {
     defer allocator.free(checkpoint_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".transactions" },
+        &.{ root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     const writes = [_]durable_store.TransactionMutation{
@@ -1826,6 +1887,7 @@ test "segmented snapshot counts persistent active-file sidecars" {
         },
     };
     var receipt = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         &writes,
@@ -1841,17 +1903,14 @@ test "segmented snapshot counts persistent active-file sidecars" {
     const binding_path = try paths.bindingSegmentAlloc(allocator, 1);
     defer allocator.free(binding_path);
     for ([_][]const u8{ event_path, binding_path }) |path| {
-        const sidecar = try allocator.print(
-            "{s}.cas.lock.advisory",
-            .{path},
-        );
+        const sidecar = try allocator.print("{s}.cas.lock.advisory", .{path});
         defer allocator.free(sidecar);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        try scope.fs.directory().writeFile(std.testing.io, .{
             .sub_path = sidecar,
             .data = "",
         });
     }
-    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    var snapshot = try Snapshot.load(scope, allocator, root, logical_path);
     defer snapshot.deinit(allocator);
     try expectSidecarSnapshot(&snapshot);
 }
@@ -1863,6 +1922,10 @@ fn expectSidecarSnapshot(snapshot: *const Snapshot) !void {
 }
 
 test "oversized legacy log routes to explicit migration" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1871,10 +1934,11 @@ test "oversized legacy log routes to explicit migration" {
     const logical_path = "actuation/legacy/events.jsonl";
     const event_path = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), logical_path },
+        &.{ root, storage_root.controlComponent(scope), logical_path },
     );
     defer allocator.free(event_path);
     try durable_store.ensureDirectoryPathNoSymlinks(
+        scope.fs,
         std.fs.path.dirname(event_path).?,
     );
     var file = try std.Io.Dir.createFileAbsolute(
@@ -1890,11 +1954,12 @@ test "oversized legacy log routes to explicit migration" {
     );
     try std.testing.expectError(
         error.SegmentedMigrationRequired,
-        requireMigratedCustody(allocator, root, logical_path, false),
+        requireMigratedCustody(scope, allocator, root, logical_path, false),
     );
 }
 
 const GenerationWriterContext = struct {
+    scope: *storage_root.Scope,
     transactions: []const u8,
     event_path: []const u8,
     binding_path: []const u8,
@@ -1908,6 +1973,7 @@ const GenerationWriterContext = struct {
 };
 
 fn runGenerationWriter(context: *GenerationWriterContext) void {
+    const scope = context.scope;
     context.started.store(1, .release);
     const mutations = [_]durable_store.TransactionMutation{
         .{
@@ -1930,6 +1996,7 @@ fn runGenerationWriter(context: *GenerationWriterContext) void {
         },
     };
     var receipt = durable_store.commitTextTransaction(
+        scope.fs,
         std.heap.smp_allocator,
         context.transactions,
         &mutations,
@@ -1944,6 +2011,7 @@ fn runGenerationWriter(context: *GenerationWriterContext) void {
 }
 
 fn commitInitialGeneration(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     transactions: []const u8,
     event_path: []const u8,
@@ -1972,6 +2040,7 @@ fn commitInitialGeneration(
         },
     };
     return durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         &initial,
@@ -2004,13 +2073,17 @@ fn expectGenerationWriterBlocked(
 }
 
 test "segmented snapshot custody excludes mixed writer generations" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const logical_path = "actuation/generation/events.jsonl";
-    var paths = try Paths.init(allocator, root, logical_path);
+    var paths = try Paths.init(scope, allocator, root, logical_path);
     defer paths.deinit(allocator);
     const event_path = try paths.eventSegmentAlloc(allocator, 0);
     defer allocator.free(event_path);
@@ -2018,7 +2091,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     defer allocator.free(binding_path);
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ root, storage_root.controlComponent(), ".transactions" },
+        &.{ root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     var predecessor = try Head.init(allocator, logical_path);
@@ -2029,6 +2102,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     const predecessor_head = try predecessor.encodeAlloc(allocator);
     defer allocator.free(predecessor_head);
     var initial_receipt = try commitInitialGeneration(
+        scope,
         allocator,
         transactions,
         event_path,
@@ -2037,7 +2111,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
         predecessor_head,
     );
     defer initial_receipt.deinit(allocator);
-    var generation = try ReadGeneration.acquire(allocator, &paths, &predecessor);
+    var generation = try ReadGeneration.acquire(scope, allocator, &paths, &predecessor);
     var successor = try predecessor.clone(allocator);
     defer successor.deinit(allocator);
     const event_bytes = first_event ++ "{\"sequence\":2}\n";
@@ -2046,6 +2120,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     const successor_head = try successor.encodeAlloc(allocator);
     defer allocator.free(successor_head);
     var context: GenerationWriterContext = .{
+        .scope = scope,
         .transactions = transactions,
         .event_path = event_path,
         .binding_path = binding_path,
@@ -2058,7 +2133,7 @@ test "segmented snapshot custody excludes mixed writer generations" {
     const retry = try std.Thread.spawn(.{}, runGenerationWriter, .{&context});
     retry.join();
     if (context.result) |err| return err;
-    var snapshot = try Snapshot.load(allocator, root, logical_path);
+    var snapshot = try Snapshot.load(scope, allocator, root, logical_path);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqualStrings(event_bytes, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding_bytes, snapshot.binding_bytes);
@@ -2066,12 +2141,17 @@ test "segmented snapshot custody excludes mixed writer generations" {
 }
 
 test "segmented snapshot accepts an absent head with stale advisory custody" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     var paths = try Paths.init(
+        scope,
         allocator,
         root,
         "actuation/initial-writer/events.jsonl",
@@ -2083,13 +2163,15 @@ test "segmented snapshot accepts an absent head with stale advisory custody" {
     );
     defer allocator.free(advisory_path);
     try durable_store.ensureDirectoryPathNoSymlinks(
+        scope.fs,
         std.fs.path.dirname(advisory_path) orelse return error.InvalidPath,
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = advisory_path,
         .data = "",
     });
     var snapshot = try Snapshot.load(
+        scope,
         allocator,
         root,
         "actuation/initial-writer/events.jsonl",
@@ -2099,16 +2181,20 @@ test "segmented snapshot accepts an absent head with stale advisory custody" {
 }
 
 test "segmented falsifier detects corruption in a sealed segment" {
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
+    const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
-    var paths = try Paths.init(allocator, root, "actuation/a/events.jsonl");
+    var paths = try Paths.init(scope, allocator, root, "actuation/a/events.jsonl");
     defer paths.deinit(allocator);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.events);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.bindings);
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.checkpoints);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.events);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.bindings);
+    try durable_store.ensureDirectoryPathNoSymlinks(scope.fs, paths.checkpoints);
     var head = try Head.init(allocator, "actuation/a/events.jsonl");
     defer head.deinit(allocator);
     const sealed_event = "{\"sequence\":1}\n";
@@ -2119,6 +2205,7 @@ test "segmented falsifier detects corruption in a sealed segment" {
     const active_binding = "{\"binding\":2}\n";
     _ = try head.append(active_event, active_binding);
     try writeHistoryFixture(
+        scope,
         allocator,
         root,
         &paths,
@@ -2129,39 +2216,41 @@ test "segmented falsifier detects corruption in a sealed segment" {
         active_binding,
     );
     var snapshot = try Snapshot.load(
+        scope,
         allocator,
         root,
         "actuation/a/events.jsonl",
     );
     defer snapshot.deinit(allocator);
-    try auditHistory(allocator, &snapshot);
+    try auditHistory(scope, allocator, &snapshot);
     const sealed_path = try paths.eventSegmentAlloc(allocator, 0);
     defer allocator.free(sealed_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = sealed_path,
         .data = "{\"sequence\":9}\n",
     });
     try std.testing.expectError(
         error.SegmentedHistoryMismatch,
-        auditHistory(allocator, &snapshot),
+        auditHistory(scope, allocator, &snapshot),
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = sealed_path,
         .data = sealed_event,
     });
     const sealed_binding_path = try paths.bindingSegmentAlloc(allocator, 0);
     defer allocator.free(sealed_binding_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try scope.fs.directory().writeFile(std.testing.io, .{
         .sub_path = sealed_binding_path,
         .data = "{\"binding\":9}\n",
     });
     try std.testing.expectError(
         error.SegmentedHistoryMismatch,
-        auditHistory(allocator, &snapshot),
+        auditHistory(scope, allocator, &snapshot),
     );
 }
 
 fn writeHistoryFixture(
+    scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     paths: *const Paths,
@@ -2205,10 +2294,11 @@ fn writeHistoryFixture(
     };
     const transactions = try std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(), ".transactions" },
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
     );
     defer allocator.free(transactions);
     var receipt = try durable_store.commitTextTransaction(
+        scope.fs,
         allocator,
         transactions,
         &mutations,

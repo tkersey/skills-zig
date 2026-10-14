@@ -4,8 +4,6 @@ const diff = @import("diff.zig");
 const limits = @import("limits.zig");
 const repository = @import("repository.zig");
 
-const Io = std.Io.Threaded.global_single_threaded;
-
 const usage =
     \\tiger_style
     \\
@@ -21,15 +19,18 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
-    var stdout_writer = std.Io.File.stdout().writer(Io.io(), &.{});
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
     const stdout = &stdout_writer.interface;
-    var stderr_writer = std.Io.File.stderr().writer(Io.io(), &.{});
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
     const stderr = &stderr_writer.interface;
 
     if (argv.len < 2 or isHelp(argv[1])) {
         try stdout.writeAll(usage);
         return;
     }
+
+    const dir = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
+    defer dir.close(init.io);
 
     var audit = audit_module.Audit{};
     if (std.mem.eql(u8, argv[1], "audit-diff")) {
@@ -40,16 +41,16 @@ pub fn main(init: std.process.Init) !void {
             );
             std.process.exit(64);
         };
-        try diff.run(allocator, init.io, stderr, options, &audit);
+        try diff.run(allocator, init.io, dir, stderr, options, &audit);
     } else if (std.mem.eql(u8, argv[1], "audit-files")) {
-        try runAuditFiles(allocator, init.io, stderr, argv, &audit);
+        try runAuditFiles(allocator, init.io, dir, stderr, argv, &audit);
     } else if (std.mem.eql(u8, argv[1], "audit-repository")) {
         if (argv.len != 2) {
             try stderr.writeAll("audit-repository accepts no arguments\n\n");
             try stderr.writeAll(usage);
             std.process.exit(64);
         }
-        const result = try repository.run(allocator, init.io, stderr);
+        const result = try repository.run(allocator, init.io, dir, stderr);
         try writeRepositorySummary(stderr, result);
         if (result.diagnostics > 0) std.process.exit(2);
         return;
@@ -82,6 +83,7 @@ fn writeRepositorySummary(
 fn runAuditFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     writer: anytype,
     argv: []const []const u8,
     audit: *audit_module.Audit,
@@ -92,7 +94,7 @@ fn runAuditFiles(
         std.process.exit(64);
     }
     for (argv[2..]) |path| {
-        try audit_module.file(allocator, io, writer, path, audit, true);
+        try audit_module.file(allocator, io, dir, writer, path, audit, true);
     }
 }
 

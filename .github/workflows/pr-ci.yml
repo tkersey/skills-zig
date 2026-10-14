@@ -5,20 +5,10 @@ on:
     paths:
       - "build.zig"
       - "build.zig.zon"
+      - "build/**"
       - "README.md"
-      - "apps/seq/**"
-      - "apps/lift/**"
-      - "apps/cas/**"
-      - "apps/ledger/**"
-      - "apps/memory-note/**"
-      - "apps/typesafe/**"
-      - "libs/core/**"
-      - "libs/cas_runtime/**"
-      - "libs/definition_core/**"
-      - "libs/definition_compat/**"
-      - "libs/durable_store/**"
-      - "libs/jsonl_core/**"
-      - "libs/trace_core/**"
+      - "apps/**"
+      - "libs/**"
       - "scripts/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
@@ -156,7 +146,7 @@ jobs:
           path: |
             .zig-cache
             .zig-cache-global
-          key: zig-seq-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
+          key: zig-seq-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
           restore-keys: |
             zig-seq-${{ runner.os }}-0.17.0-
       - name: Build seq integration surface

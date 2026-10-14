@@ -3830,6 +3830,7 @@ const TestPlan = struct {
             .data = source,
         });
         var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
             std.testing.allocator,
             &tmp.dir,
             "definition.json",

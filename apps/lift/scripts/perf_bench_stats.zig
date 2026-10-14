@@ -74,42 +74,80 @@ const CountingAllocator = core_perf.CountingAllocator;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
+    const dir = std.Io.Dir.cwd();
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    const stdout = &stdout_writer.interface;
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
+    const stderr = &stderr_writer.interface;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(stdout, argv, HelpSurface, Version)) return;
 
-    var cli = parseCliOptions(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    var cli = parseCliOptions(allocator, argv) catch |err| switch (err) {
+        error.HelpRequested => return core_cli.printHelpSurface(stdout, HelpSurface, Version),
+        error.VersionRequested => return core_cli.printVersion(stdout, Version),
+        else => {
+            core_cli.printUsageFailureWithHelp(
+                stderr,
+                HelpSurface,
+                Version,
+                @errorName(err),
+                null,
+            ) catch std.process.exit(1);
+            std.process.exit(2);
+        },
     };
     defer freeCliOptions(allocator, &cli);
 
-    const config = loadConfig(allocator, cli.config_path) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), cli.config_path);
+    const config = loadConfig(io, dir, allocator, cli.config_path) catch |err| {
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            cli.config_path,
+        ) catch std.process.exit(1);
+        std.process.exit(2);
     };
-    if (config.rounds < 3) core_cli.exitUsageFailure(
-        HelpSurface,
-        Version,
-        "InvalidRounds",
-        cli.config_path,
-    );
-    if (config.iterations < 100) core_cli.exitUsageFailure(
-        HelpSurface,
-        Version,
-        "InvalidIterations",
-        cli.config_path,
-    );
+    if (config.rounds < 3) {
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InvalidRounds",
+            cli.config_path,
+        ) catch std.process.exit(1);
+        std.process.exit(2);
+    }
+    if (config.iterations < 100) {
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InvalidIterations",
+            cli.config_path,
+        ) catch std.process.exit(1);
+        std.process.exit(2);
+    }
 
-    const summary = try benchmarkBenchStats(allocator, config.iterations, config.rounds);
+    return runBenchmark(io, dir, allocator, cli, config, stdout);
+}
+
+fn runBenchmark(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    cli: CliOptions,
+    config: PerfConfig,
+    stdout: *std.Io.Writer,
+) !void {
+    const summary = try benchmarkBenchStats(io, allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
     const previous_artifact = if (cli.artifact_path) |artifact_path|
-        try loadArtifact(allocator, artifact_path)
+        try loadArtifact(io, dir, allocator, artifact_path)
     else
         null;
 
-    var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
-        &.{},
-    );
-    const stdout = &stdout_writer.interface;
     try stdout.print("rounds={d}\n", .{summary.rounds});
     try stdout.print("line_count={d}\n", .{summary.line_count});
     try stdout.print("p50_ns_per_line={d}\n", .{summary.p50_ns_per_line});
@@ -135,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cli.artifact_path) |artifact_path| {
-        try writeArtifact(artifact_path, summary);
+        try writeArtifact(io, dir, artifact_path, summary);
     }
 
     try stdout.writeAll("status=PASS\n");
@@ -150,24 +188,10 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-            std.process.exit(0);
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printVersion(stdout, Version);
-            std.process.exit(0);
-        }
+        if (core_cli.isHelpArg(arg)) return error.HelpRequested;
+        if (core_cli.isVersionArg(
+            arg,
+        ) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
         if (std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= argv.len) return error.MissingConfigPath;
@@ -209,9 +233,14 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
     if (cli.artifact_path) |path| allocator.free(path);
 }
 
-fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
-    const data = try std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+fn loadConfig(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PerfConfig {
+    const data = try dir.readFileAlloc(
+        io,
         path,
         allocator,
         .limited(1 * 1024 * 1024),
@@ -242,6 +271,7 @@ fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
 }
 
 fn benchmarkBenchStats(
+    io: std.Io,
     allocator: std.mem.Allocator,
     iterations: usize,
     rounds: usize,
@@ -257,7 +287,7 @@ fn benchmarkBenchStats(
     var line_count: usize = 0;
     var round_idx: usize = 0;
     while (round_idx < rounds) : (round_idx += 1) {
-        const stats = try runRound(allocator, iterations);
+        const stats = try runRound(io, allocator, iterations);
         line_count = stats.line_count;
         try ns_per_line_samples.append(
             allocator,
@@ -278,7 +308,7 @@ fn benchmarkBenchStats(
     };
 }
 
-fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
+fn runRound(io: std.Io, allocator: std.mem.Allocator, iterations: usize) !RoundStats {
     var counting = CountingAllocator.init(allocator);
     const bench_allocator = counting.allocator();
 
@@ -286,14 +316,14 @@ fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
     defer values.deinit(bench_allocator);
     try values.ensureTotalCapacity(bench_allocator, try expectedParsedValueCount(iterations));
 
-    const start_ns = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+    const start_ns = std.Io.Clock.awake.now(io).nanoseconds;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const line = sample_lines[i % sample_lines.len];
         try bench_stats.parseNumbersFromLine(line, true, bench_allocator, &values);
     }
     std.mem.sort(f64, values.items, {}, comptime std.sort.asc(f64));
-    const elapsed_ns_signed = std.Io.Clock.awake.now(defaultIo()).nanoseconds - start_ns;
+    const elapsed_ns_signed = std.Io.Clock.awake.now(io).nanoseconds - start_ns;
     const elapsed_ns: u64 = @intCast(if (elapsed_ns_signed > 0) elapsed_ns_signed else 1);
 
     return .{
@@ -343,9 +373,14 @@ fn allowedWithTolerance(base: u64, tolerance_pct: f64) u64 {
     return core_perf.allowedUpperBoundWithTolerance(base, tolerance_pct);
 }
 
-fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
-    const data = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+fn loadArtifact(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?BenchmarkArtifact {
+    const data = dir.readFileAlloc(
+        io,
         path,
         allocator,
         .limited(1 * 1024 * 1024),
@@ -372,14 +407,14 @@ fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtif
     };
 }
 
-fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
+fn writeArtifact(io: std.Io, dir: std.Io.Dir, path: []const u8, summary: PerfSummary) !void {
     var payload: [256]u8 = undefined;
     const rendered = try std.fmt.bufPrint(
         &payload,
         "{{\"p95_ns_per_line\":{d},\"p50_alloc_calls_per_round\":{d}}}\n",
         .{ summary.p95_ns_per_line, summary.p50_alloc_calls_per_round },
     );
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+    try dir.writeFile(io, .{
         .sub_path = path,
         .data = rendered,
     });
@@ -437,14 +472,10 @@ test "trend gate rejects alloc regression" {
 }
 
 test "benchmark summary has sane values" {
-    const summary = try benchmarkBenchStats(std.testing.allocator, 500, 3);
+    const summary = try benchmarkBenchStats(std.testing.io, std.testing.allocator, 500, 3);
     try std.testing.expectEqual(@as(usize, 3), summary.rounds);
     try std.testing.expectEqual(@as(usize, 500), summary.line_count);
     try std.testing.expect(summary.p95_ns_per_line >= summary.p50_ns_per_line);
-}
-
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn parseRepeatedOptions(allocator: std.mem.Allocator) !void {
@@ -469,6 +500,18 @@ test "invalid CLI option releases previously parsed paths" {
     try std.testing.expectError(error.UnknownArgument, parseCliOptions(std.testing.allocator, &.{
         "perf", "--config", "first", "--artifact", "one", "--unknown",
     }));
+}
+
+test "help and version outcomes release already allocated CLI paths" {
+    try std.testing.expectError(error.HelpRequested, parseCliOptions(std.testing.allocator, &.{
+        "perf", "--config", "first", "--artifact", "one", "--help",
+    }));
+    try std.testing.expectError(error.VersionRequested, parseCliOptions(std.testing.allocator, &.{
+        "perf", "--artifact", "one", "--config", "first", "version",
+    }));
+    var options = try parseCliOptions(std.testing.allocator, &.{ "perf", "--config", "--help" });
+    defer freeCliOptions(std.testing.allocator, &options);
+    try std.testing.expectEqualStrings("--help", options.config_path);
 }
 
 test "benchmark capacity reports arithmetic overflow before allocation" {

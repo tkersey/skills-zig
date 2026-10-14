@@ -45,13 +45,14 @@ pub fn countFile(audit: *Audit) !void {
 pub fn file(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     writer: anytype,
     path: []const u8,
     audit: *Audit,
     count_file: bool,
 ) !void {
     if (count_file) try countFile(audit);
-    const input = try std.Io.Dir.cwd().readFileAlloc(
+    const input = try dir.readFileAlloc(
         io,
         path,
         allocator,
@@ -60,6 +61,30 @@ pub fn file(
     defer allocator.free(input);
 
     try source(writer, path, input, audit);
+}
+
+test "file auditing uses the supplied directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "supplied.zig",
+        .data = "while (true) {}\n",
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var audit = Audit{};
+    try file(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        &output.writer,
+        "supplied.zig",
+        &audit,
+        true,
+    );
+    try std.testing.expectEqual(@as(u32, 1), audit.files);
+    try std.testing.expectEqual(@as(u32, 1), audit.diagnostics);
+    try std.testing.expect(std.mem.startsWith(u8, output.written(), "supplied.zig:1:"));
 }
 
 pub fn source(

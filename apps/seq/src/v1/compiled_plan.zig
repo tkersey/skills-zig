@@ -70,8 +70,10 @@ pub const PlanSet = struct {
 };
 
 const Locator = source_cache.Locator;
+const VerifiedLocator = source_cache.VerifiedLocator;
 
 pub fn load(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -84,12 +86,13 @@ pub fn load(
     if (!std.fs.path.isAbsolute(admitted_root)) {
         return error.DefinitionRootNotAbsolute;
     }
-    const start_ns = monotonicNanoseconds();
+    const start_ns = monotonicNanoseconds(fs.io);
     if (options.cache_dir) |cache_dir| {
         if (!std.fs.path.isAbsolute(cache_dir)) {
             return error.CacheRootNotAbsolute;
         }
         const cached = tryLoadCache(
+            fs,
             allocator,
             admitted_root,
             entry_path,
@@ -99,26 +102,29 @@ pub fn load(
             cache_dir,
             options.closure_limits,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.Canceled => return err,
             else => null,
         };
         if (cached) |value| {
             var result = value;
-            result.stats.compile_ns = elapsedNanoseconds(start_ns);
+            result.stats.compile_ns = elapsedNanoseconds(fs.io, start_ns);
             return result;
         }
     }
 
     var compiled = try compileFromSource(
+        fs,
         allocator,
         admitted_root,
         entry_path,
         request,
         options.closure_limits,
     );
-    compiled.stats.compile_ns = elapsedNanoseconds(start_ns);
+    errdefer compiled.deinit(allocator);
+    compiled.stats.compile_ns = elapsedNanoseconds(fs.io, start_ns);
     if (options.cache_dir) |cache_dir| {
         writeCache(
+            fs,
             allocator,
             cache_dir,
             admitted_root,
@@ -126,7 +132,9 @@ pub fn load(
             runtime_version,
             source_adapter_version,
             &compiled,
-        ) catch {
+        ) catch |err| {
+            // Cancellation ends the operation, even when the cache is optional.
+            if (err == error.Canceled) return err;
             compiled.stats.cache_write_failed = true;
         };
     }
@@ -134,6 +142,7 @@ pub fn load(
 }
 
 fn compileFromSource(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -141,6 +150,7 @@ fn compileFromSource(
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
     var closure = try definition_core.closure.load(
+        fs.io,
         allocator,
         admitted_root,
         entry_path,
@@ -173,6 +183,7 @@ fn compileFromSource(
 }
 
 fn tryLoadCache(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
     entry_path: []const u8,
@@ -182,6 +193,8 @@ fn tryLoadCache(
     cache_dir: []const u8,
     closure_limits: definition_core.closure.Limits,
 ) !?PlanSet {
+    var cache_root = try durable_store.PrivateDirectory.open(fs, cache_dir, .read_only);
+    defer cache_root.deinit();
     const locator_key = locatorKey(
         admitted_root,
         entry_path,
@@ -191,7 +204,7 @@ fn tryLoadCache(
     );
     const cached_locator = try loadLocator(
         allocator,
-        cache_dir,
+        &cache_root,
         locator_key,
         admitted_root,
         closure_limits,
@@ -200,7 +213,7 @@ fn tryLoadCache(
     defer locator.deinit(allocator);
     return @as(?PlanSet, try loadCachedPlan(
         allocator,
-        cache_dir,
+        &cache_root,
         entry_path,
         request,
         runtime_version,
@@ -212,21 +225,17 @@ fn tryLoadCache(
 
 fn loadLocator(
     allocator: std.mem.Allocator,
-    cache_dir: []const u8,
+    cache_root: *const durable_store.PrivateDirectory,
     locator_key: [32]u8,
     admitted_root: []const u8,
     closure_limits: definition_core.closure.Limits,
-) !?Locator {
-    const locator_path = try cachePathAlloc(
+) !?VerifiedLocator {
+    var entries = try cache_root.openChild("locators", .read_only);
+    defer entries.deinit();
+    const leaf = cacheLeaf(locator_key);
+    const locator_entry = entries.readAlloc(
         allocator,
-        cache_dir,
-        "locators",
-        locator_key,
-    );
-    defer allocator.free(locator_path);
-    const locator_entry = durable_store.readPrivateRegularFileNoSymlink(
-        allocator,
-        locator_path,
+        &leaf,
         locator_limits.max_entry_bytes,
     ) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -238,42 +247,32 @@ fn loadLocator(
         locator_entry,
         locator_limits,
     );
-    var locator = try decodeLocator(allocator, locator_payload);
-    errdefer locator.deinit(allocator);
-    _ = try definition_core.closure.verifySourceManifest(
+    return try source_cache.verifyLocator(
+        cache_root.io,
         allocator,
         admitted_root,
-        locator.files,
+        try decodeLocator(allocator, locator_payload),
         closure_limits,
     );
-    return locator;
 }
 
 fn loadCachedPlan(
     allocator: std.mem.Allocator,
-    cache_dir: []const u8,
+    cache_root: *const durable_store.PrivateDirectory,
     entry_path: []const u8,
     request: Request,
     runtime_version: []const u8,
     source_adapter_version: []const u8,
-    locator: *const Locator,
+    locator: *const VerifiedLocator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
-    const plan_path = try cachePathAlloc(
-        allocator,
-        cache_dir,
-        "plans",
-        locator.plan_key,
-    );
-    defer allocator.free(plan_path);
-    const plan_entry = try durable_store.readPrivateRegularFileNoSymlink(
-        allocator,
-        plan_path,
-        cache_limits.max_entry_bytes,
-    );
+    var entries = try cache_root.openChild("plans", .read_only);
+    defer entries.deinit();
+    const leaf = cacheLeaf(locator.value.plan_key);
+    const plan_entry = try entries.readAlloc(allocator, &leaf, cache_limits.max_entry_bytes);
     defer allocator.free(plan_entry);
     const plan_payload = try definition_core.cache.decode(
-        locator.plan_key,
+        locator.value.plan_key,
         plan_entry,
         cache_limits,
     );
@@ -288,15 +287,18 @@ fn loadCachedPlan(
     if (!std.mem.eql(
         u8,
         &result.closure.digest,
-        &locator.closure_digest,
+        &locator.value.closure_digest,
     )) return error.CacheClosureDigestMismatch;
+    if (result.closure.files.len != locator.value.files.len or
+        result.closure.total_definition_bytes != locator.source_bytes)
+        return error.CacheClosureManifestMismatch;
     const expected_plan_key = planKey(
         runtime_version,
         source_adapter_version,
         request,
         &result.definition_plan,
     );
-    if (!std.mem.eql(u8, &expected_plan_key, &locator.plan_key)) {
+    if (!std.mem.eql(u8, &expected_plan_key, &locator.value.plan_key)) {
         return error.CachePlanKeyMismatch;
     }
     result.stats.cache_hit = true;
@@ -304,6 +306,7 @@ fn loadCachedPlan(
 }
 
 fn writeCache(
+    fs: durable_store.Fs,
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     admitted_root: []const u8,
@@ -312,23 +315,11 @@ fn writeCache(
     source_adapter_version: []const u8,
     plan_set: *const PlanSet,
 ) !void {
-    const plans_dir = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, "plans" },
-    );
-    defer allocator.free(plans_dir);
-    const locators_dir = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, "locators" },
-    );
-    defer allocator.free(locators_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(plans_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(locators_dir);
-
+    var cache_root = try durable_store.PrivateDirectory.open(fs, cache_dir, .create);
+    defer cache_root.deinit();
     const plan_key = try writePlanEntry(
         allocator,
-        cache_dir,
+        &cache_root,
         runtime_version,
         source_adapter_version,
         request,
@@ -336,7 +327,7 @@ fn writeCache(
     );
     try writeLocatorEntry(
         allocator,
-        cache_dir,
+        &cache_root,
         admitted_root,
         runtime_version,
         source_adapter_version,
@@ -348,7 +339,7 @@ fn writeCache(
 
 fn writePlanEntry(
     allocator: std.mem.Allocator,
-    cache_dir: []const u8,
+    cache_root: *const durable_store.PrivateDirectory,
     runtime_version: []const u8,
     source_adapter_version: []const u8,
     request: Request,
@@ -366,29 +357,18 @@ fn writePlanEntry(
     );
     defer plan_encoder.deinit();
     try encodePlanSet(plan_set, &plan_encoder);
-    const plan_payload = try plan_encoder.toOwnedSlice();
-    defer allocator.free(plan_payload);
-    const plan_entry = try definition_core.cache.encodeAlloc(
-        allocator,
-        plan_key,
-        plan_payload,
-        cache_limits,
-    );
-    defer allocator.free(plan_entry);
-    const plan_path = try cachePathAlloc(
-        allocator,
-        cache_dir,
-        "plans",
-        plan_key,
-    );
-    defer allocator.free(plan_path);
-    try durable_store.writeTextAtomicPrivate(allocator, plan_path, plan_entry);
+    const plan_payload = plan_encoder.written();
+    const header = try definition_core.cache.encodeHeader(plan_key, plan_payload, cache_limits);
+    var entries = try cache_root.openChild("plans", .create);
+    defer entries.deinit();
+    const leaf = cacheLeaf(plan_key);
+    try entries.replace(&leaf, &.{ &header, plan_payload });
     return plan_key;
 }
 
 fn writeLocatorEntry(
     allocator: std.mem.Allocator,
-    cache_dir: []const u8,
+    cache_root: *const durable_store.PrivateDirectory,
     admitted_root: []const u8,
     runtime_version: []const u8,
     source_adapter_version: []const u8,
@@ -409,27 +389,16 @@ fn writeLocatorEntry(
     );
     defer locator_encoder.deinit();
     try encodeLocator(plan_set, plan_key, &locator_encoder);
-    const locator_payload = try locator_encoder.toOwnedSlice();
-    defer allocator.free(locator_payload);
-    const locator_entry = try definition_core.cache.encodeAlloc(
-        allocator,
+    const locator_payload = locator_encoder.written();
+    const header = try definition_core.cache.encodeHeader(
         locator_key,
         locator_payload,
         locator_limits,
     );
-    defer allocator.free(locator_entry);
-    const locator_path = try cachePathAlloc(
-        allocator,
-        cache_dir,
-        "locators",
-        locator_key,
-    );
-    defer allocator.free(locator_path);
-    try durable_store.writeTextAtomicPrivate(
-        allocator,
-        locator_path,
-        locator_entry,
-    );
+    var entries = try cache_root.openChild("locators", .create);
+    defer entries.deinit();
+    const leaf = cacheLeaf(locator_key);
+    try entries.replace(&leaf, &.{ &header, locator_payload });
 }
 
 fn encodePlanSet(
@@ -618,6 +587,14 @@ fn projectionSetDigest(request: Request) [32]u8 {
     return digest;
 }
 
+fn cacheLeaf(cache_key: [32]u8) [68]u8 {
+    const hex = definition_core.cache.keyHex(cache_key);
+    var leaf: [68]u8 = undefined;
+    @memcpy(leaf[0..64], &hex);
+    @memcpy(leaf[64..], ".bin");
+    return leaf;
+}
+
 fn cachePathAlloc(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
@@ -636,19 +613,15 @@ fn cachePathAlloc(
     );
 }
 
-fn monotonicNanoseconds() u64 {
-    const now = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+fn monotonicNanoseconds(io: std.Io) u64 {
+    const now = std.Io.Clock.awake.now(io).nanoseconds;
     if (now <= 0) return 0;
     return std.math.cast(u64, now) orelse std.math.maxInt(u64);
 }
 
-fn elapsedNanoseconds(start: u64) u64 {
-    const now = monotonicNanoseconds();
+fn elapsedNanoseconds(io: std.Io, start: u64) u64 {
+    const now = monotonicNanoseconds(io);
     return if (now > start) now - start else 0;
-}
-
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn decodePlanSetForAllocationFailure(
@@ -656,16 +629,13 @@ fn decodePlanSetForAllocationFailure(
     payload: []const u8,
     request: Request,
 ) !void {
-    var plan_set = decodePlanSet(
+    var plan_set = try decodePlanSet(
         allocator,
         payload,
         "observation.json",
         request,
         .{},
-    ) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
+    );
     defer plan_set.deinit(allocator);
 }
 
@@ -706,6 +676,7 @@ fn cacheHitKey(
     request: Request,
 ) ![32]u8 {
     var cold = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -731,6 +702,7 @@ fn cacheHitKey(
     );
 
     var warm = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -771,6 +743,7 @@ fn repairCache(
         .data = "corrupt",
     });
     var rebuilt = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -782,6 +755,7 @@ fn repairCache(
     defer rebuilt.deinit(std.testing.allocator);
     try std.testing.expect(!rebuilt.stats.cache_hit);
     var repaired_hit = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -806,6 +780,7 @@ fn invalidateCache(
         .data = "\n" ++ cached_observation_definition,
     });
     var source_miss = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -818,6 +793,7 @@ fn invalidateCache(
     try std.testing.expect(!source_miss.stats.cache_hit);
 
     var adapter_miss = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -840,6 +816,7 @@ fn invalidateCache(
     );
     defer std.testing.allocator.free(blocked_cache);
     var write_failure = try load(
+        durable_store.Fs.init(std.testing.io, .cwd()),
         std.testing.allocator,
         source_root,
         "observation.json",
@@ -898,4 +875,247 @@ test "projection cache selection is canonical and explicit" {
         &projectionSetDigest(.{ .projection_names = &.{"rows"} }),
         &projectionSetDigest(.{ .projection_names = &.{"summary"} }),
     ));
+}
+
+test "failed locator publication leaves a complete unadvertised plan and a usable source result" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fs = durable_store.Fs.init(io, .cwd());
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    try source.dir.writeFile(
+        io,
+        .{ .sub_path = "observation.json", .data = cached_observation_definition },
+    );
+    const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(source_root);
+    var cache = std.testing.tmpDir(.{});
+    defer cache.cleanup();
+    try cache.dir.writeFile(io, .{ .sub_path = "locators", .data = "obstruction" });
+    const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cache_root);
+    const request: Request = .{ .projection_names = &.{"rows"} };
+    var result = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(result.stats.cache_write_failed);
+    try std.testing.expect(!result.stats.cache_hit);
+    var root = try durable_store.PrivateDirectory.open(fs, cache_root, .read_only);
+    defer root.deinit();
+    var plans = try root.openChild("plans", .read_only);
+    defer plans.deinit();
+    const key = planKey("1", "trace/v1", request, &result.definition_plan);
+    const leaf = cacheLeaf(key);
+    const entry = try plans.readAlloc(allocator, &leaf, cache_limits.max_entry_bytes);
+    defer allocator.free(entry);
+    _ = try definition_core.cache.decode(key, entry, cache_limits);
+    try cache.dir.deleteFile(io, "locators");
+    var repaired = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
+    defer repaired.deinit(allocator);
+    try std.testing.expect(!repaired.stats.cache_hit);
+    try std.testing.expect(!repaired.stats.cache_write_failed);
+    var warm = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
+    defer warm.deinit(allocator);
+    try std.testing.expect(warm.stats.cache_hit);
+}
+
+const CacheCancellationProbe = struct {
+    var cancel_read = false;
+    var cancel_rename: usize = 0;
+    var rename_count: usize = 0;
+    var cancellations: usize = 0;
+    var cancel_read_file: usize = 0;
+    var read_count: usize = 0;
+
+    fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+        if (cancel_read) {
+            cancel_read = false;
+            cancellations += 1;
+            return error.Canceled;
+        }
+        return std.testing.io.vtable.checkCancel(userdata);
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        if (offset == 0) {
+            read_count += 1;
+            if (read_count == cancel_read_file) {
+                cancellations += 1;
+                return error.Canceled;
+            }
+        }
+        return std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        old_dir: std.Io.Dir,
+        old_name: []const u8,
+        new_dir: std.Io.Dir,
+        new_name: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        rename_count += 1;
+        if (rename_count == cancel_rename) {
+            cancellations += 1;
+            return error.Canceled;
+        }
+        return std.testing.io.vtable.dirRename(userdata, old_dir, old_name, new_dir, new_name);
+    }
+};
+
+test "optional cache cancellation stops reads and both publication phases without leaking plans" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    try source.dir.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = cached_observation_definition,
+    });
+    const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(source_root);
+    // Zero cancels cache admission; one and two cancel plan and locator publication.
+    for (0..3) |phase| {
+        var cache = std.testing.tmpDir(.{});
+        defer cache.cleanup();
+        const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(cache_root);
+        CacheCancellationProbe.cancel_read = phase == 0;
+        CacheCancellationProbe.cancel_rename = phase;
+        CacheCancellationProbe.rename_count = 0;
+        CacheCancellationProbe.cancellations = 0;
+        var vtable = io.vtable.*;
+        vtable.checkCancel = CacheCancellationProbe.checkCancel;
+        vtable.dirRename = CacheCancellationProbe.rename;
+        const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const fs = durable_store.Fs.init(injected, .cwd());
+        try std.testing.expectError(error.Canceled, load(
+            fs,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .projection_names = &.{"rows"} },
+            "1",
+            "trace/v1",
+            .{ .cache_dir = cache_root },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
+        try std.testing.expectEqual(phase, CacheCancellationProbe.rename_count);
+        // The one-shot signal is consumed: later independent work remains valid.
+        CacheCancellationProbe.cancel_rename = 0;
+        var recovered = try load(
+            fs,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .projection_names = &.{"rows"} },
+            "1",
+            "trace/v1",
+            .{ .cache_dir = cache_root },
+        );
+        defer recovered.deinit(allocator);
+        try std.testing.expect(!recovered.stats.cache_hit);
+        try std.testing.expect(!recovered.stats.cache_write_failed);
+        var warm = try load(
+            fs,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .projection_names = &.{"rows"} },
+            "1",
+            "trace/v1",
+            .{ .cache_dir = cache_root },
+        );
+        defer warm.deinit(allocator);
+        try std.testing.expect(warm.stats.cache_hit);
+    }
+}
+
+test "warm cache cancellation survives the locator source and plan reader adapters" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fs = durable_store.Fs.init(io, .cwd());
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    try source.dir.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = cached_observation_definition,
+    });
+    const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(source_root);
+    var cache = std.testing.tmpDir(.{});
+    defer cache.cleanup();
+    const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cache_root);
+    var cold = try load(
+        fs,
+        allocator,
+        source_root,
+        "definition.json",
+        .{ .projection_names = &.{"rows"} },
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
+    defer cold.deinit(allocator);
+    try std.testing.expect(!cold.stats.cache_write_failed);
+    // Warm lookup reads the locator, its source manifest, and then the plan.
+    for (1..4) |file_number| {
+        CacheCancellationProbe.read_count = 0;
+        CacheCancellationProbe.cancellations = 0;
+        CacheCancellationProbe.cancel_read_file = file_number;
+        defer CacheCancellationProbe.cancel_read_file = 0;
+        CacheCancellationProbe.rename_count = 0;
+        CacheCancellationProbe.cancel_rename = 0;
+        var vtable = io.vtable.*;
+        vtable.fileReadPositional = CacheCancellationProbe.read;
+        vtable.dirRename = CacheCancellationProbe.rename;
+        const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const injected_fs = durable_store.Fs.init(injected, .cwd());
+        try std.testing.expectError(error.Canceled, load(
+            injected_fs,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .projection_names = &.{"rows"} },
+            "1",
+            "trace/v1",
+            .{ .cache_dir = cache_root },
+        ));
+        try std.testing.expectEqual(file_number, CacheCancellationProbe.read_count);
+        try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
+        try std.testing.expectEqual(@as(usize, 0), CacheCancellationProbe.rename_count);
+    }
 }
