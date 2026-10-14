@@ -27,7 +27,6 @@ pub const forceKillProcessGroup = websocket.forceKillProcessGroup;
 pub const currentBootIdAlloc = websocket.currentBootIdAlloc;
 pub const waitForProcessExit = websocket.waitForProcessExit;
 pub const terminateProcess = websocket.terminateProcess;
-pub const retireDetachedServer = websocket.retireDetachedServer;
 
 test {
     _ = websocket;

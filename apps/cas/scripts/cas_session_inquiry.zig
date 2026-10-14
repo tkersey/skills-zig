@@ -1104,7 +1104,7 @@ fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !vo
             .failed = 1,
             .failure_hint = @errorName(err),
         };
-        cas_websocket.retireDetachedServer(op.fs.io, loaded.managed_server_pid);
+        if (was_alive) cas_websocket.terminateProcess(loaded.managed_server_pid);
     }
     const cleanup_path = try inquiryPathJoin(
         op,
@@ -2938,6 +2938,7 @@ fn executeLiveInquiry(
         preflight.codex_path,
         hook_policy,
         options.code_mode_host,
+        null,
     );
     defer managed_server.kill();
     defer managed_server.deinit(allocator);
@@ -3070,6 +3071,7 @@ fn launchDetachedInquiry(run: InquiryExecution) !RunOutput {
         run.preflight.codex_path,
         hook_policy,
         options.code_mode_host,
+        run.receipt_dir,
     );
     defer managed_server.deinit(allocator);
 
@@ -3356,12 +3358,38 @@ fn startInquiryManagedServer(
     codex_path: []const u8,
     hook_policy: cas_client.hooks.HookPolicy,
     code_mode_host_raw: ?[]const u8,
+    owner_receipt_dir: ?[]const u8,
 ) !cas_websocket.ManagedServer {
     var code_mode_host: ?cas_client.app_server_launch.CodeModeHost = if (code_mode_host_raw) |raw|
         try cas_client.app_server_launch.CodeModeHost.init(allocator, raw)
     else
         null;
     defer if (code_mode_host) |*host| host.deinit();
+    if (owner_receipt_dir) |receipt_dir| {
+        if (code_mode_host) |*host| {
+            return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
+                allocator,
+                cwd,
+                receipt_dir,
+                codex_path,
+                hook_policy,
+                host,
+                op.fs.io,
+                op.fs.directory(),
+                op.environ,
+            );
+        }
+        return cas_websocket.startOwnerLivedLoopbackServer(
+            allocator,
+            cwd,
+            receipt_dir,
+            codex_path,
+            hook_policy,
+            op.fs.io,
+            op.fs.directory(),
+            op.environ,
+        );
+    }
     if (code_mode_host) |*host| return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
         allocator,
         cwd,
@@ -7472,10 +7500,10 @@ test "inquiry server survives launcher teardown and cleanup retires its descenda
     var op = testOperation();
     op.fs = .init(threaded.io(), .cwd());
     op.environ = &environ;
-    var managed = try startInquiryManagedServer(op, allocator, root, wrapper, .inherit, null);
+    var managed = try startInquiryManagedServer(op, allocator, root, wrapper, .inherit, null, root);
     var deinitialized = false;
     defer if (!deinitialized) managed.deinit(allocator);
-    try std.testing.expect(managed.owner_control == null);
+    try std.testing.expect(managed.owner_control != null);
     const url = try allocator.dupe(u8, managed.listen_url);
     defer allocator.free(url);
     var child = managed.child;
@@ -7512,7 +7540,7 @@ test "inquiry server survives launcher teardown and cleanup retires its descenda
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
     try std.testing.expect(parsed.value.object.contains("result"));
     connection.close();
-    cas_websocket.retireDetachedServer(std.testing.io, pid);
+    cas_websocket.terminateProcess(pid);
     _ = try child.wait(std.testing.io);
     try std.testing.expect(cas_websocket.waitForProcessExit(std.testing.io, descendant, 2_000));
 }
