@@ -1104,9 +1104,7 @@ fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !vo
             .failed = 1,
             .failure_hint = @errorName(err),
         };
-        if (was_alive) {
-            cas_websocket.retireDetachedServer(op.fs.io, loaded.managed_server_pid);
-        }
+        cas_websocket.retireDetachedServer(op.fs.io, loaded.managed_server_pid);
     }
     const cleanup_path = try inquiryPathJoin(
         op,

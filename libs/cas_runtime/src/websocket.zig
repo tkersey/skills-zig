@@ -2460,6 +2460,43 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
 
 const OwnerProcessIds = struct { server: u64, descendant: u64 };
 
+test "detached cleanup retires descendants after the server leader exits" {
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
+    defer allocator.free(pid_path);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "sleep 600 & descendant=$!; pid_tmp=\"$1.tmp\"; " ++
+                "printf '%s %s\\n' \"$$\" \"$descendant\" > \"$pid_tmp\"; " ++
+                "mv \"$pid_tmp\" \"$1\"; exit 0",
+            "cas-exited-server-test",
+            pid_path,
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const pid: u64 = @intCast(child.id.?);
+    defer retireProcessChild(io, &child, pid);
+    const ids = try awaitOwnerProcessIds(allocator, io, tmp.dir, pid_path);
+    try std.testing.expectEqual(pid, ids.server);
+    _ = try child.wait(io);
+    try std.testing.expect(!processAlive(pid));
+    try std.testing.expect(processAlive(ids.descendant));
+    retireDetachedServer(io, pid);
+    try std.testing.expect(waitForProcessExit(io, ids.descendant, 2_000));
+}
+
 test "detached cleanup preserves legacy watchdog descendant retirement" {
     if (builtin.target.os.tag == .windows or
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
