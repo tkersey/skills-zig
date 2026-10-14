@@ -1068,7 +1068,11 @@ fn spawnOwnerPipeWithReceipt(
     var watchdog_argv: std.ArrayList([]const u8) = .empty;
     defer watchdog_argv.deinit(allocator);
     try watchdog_argv.appendSlice(allocator, &.{
-        "/bin/sh",
+        // Noninteractive job control must give the server its own process group.
+        // Linux /bin/sh may be dash; /bin/bash is required by supported Homebrew hosts.
+        "/bin/bash",
+        // Keep inherited shell startup files and functions out of the watchdog.
+        "-p",
         "-c",
         owner_watchdog_script,
         "cas-app-server-watchdog",
@@ -2407,6 +2411,10 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
+    const startup_path = try std.fs.path.join(allocator, &.{ root, "watchdog-startup.sh" });
+    defer allocator.free(startup_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "watchdog-startup.sh", .data = "exit 71\n" });
+    try environ.put("BASH_ENV", startup_path);
     const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
     defer allocator.free(pid_path);
     const listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1");
@@ -2565,9 +2573,14 @@ test "detached cleanup preserves legacy watchdog descendant retirement" {
     defer managed.deinit(allocator);
     const ids = try awaitOwnerProcessIds(allocator, io, tmp.dir, pid_path);
     terminateProcess(managed.processId());
+    // The legacy launcher releases this descriptor when its process exits.
+    // Observe watchdog completion, rather than time an asynchronous signal.
+    managed.owner_control.?.close(io);
+    managed.owner_control = null;
+    _ = try managed.child.wait(io);
+    managed.process_state = .stopped;
     try std.testing.expect(waitForProcessExit(io, ids.server, 2_000));
     try std.testing.expect(waitForProcessExit(io, ids.descendant, 2_000));
-    managed.kill();
     try verifyShutdownReceipt(
         allocator,
         io,
