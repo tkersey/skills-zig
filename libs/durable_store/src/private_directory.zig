@@ -14,14 +14,17 @@ pub const PrivateDirectory = struct {
     pub fn open(fs: authority.Fs, path: []const u8, mode: Mode) !PrivateDirectory {
         if (path.len == 0) return error.InvalidPath;
         if (mode == .create) try filesystem.ensureDirectoryPathNoSymlinks(fs, path);
-        var directory = if (std.fs.path.isAbsolute(path))
-            try std.Io.Dir.openDirAbsolute(fs.io, "/", .{ .follow_symlinks = false })
-        else
-            try fs.directory().openDir(fs.io, ".", .{ .follow_symlinks = false });
+        var directory = try openSearchDirectory(
+            fs.io,
+            fs.directory(),
+            if (std.fs.path.isAbsolute(path)) "/" else ".",
+        );
         errdefer directory.close(fs.io);
         var components = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
         while (components.next()) |component| {
-            const child = try directory.openDir(fs.io, component, .{ .follow_symlinks = false });
+            if (mode == .create and components.peek() == null)
+                try repairPrivateChild(fs.io, directory, component);
+            const child = try openSearchDirectory(fs.io, directory, component);
             directory.close(fs.io);
             directory = child;
         }
@@ -50,8 +53,9 @@ pub const PrivateDirectory = struct {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
+            try repairPrivateChild(self.io, self.directory, leaf);
         }
-        const directory = try self.directory.openDir(self.io, leaf, .{ .follow_symlinks = false });
+        const directory = try openSearchDirectory(self.io, self.directory, leaf);
         errdefer directory.close(self.io);
         try admit(self.io, directory, mode);
         return .{ .io = self.io, .directory = directory };
@@ -114,6 +118,61 @@ pub const PrivateDirectory = struct {
         }
     }
 };
+
+fn repairPrivateChild(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !void {
+    const stat = try parent.statFile(io, leaf, .{ .follow_symlinks = false });
+    if (stat.kind != .directory) return error.NotDir;
+    if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+        try parent.setFilePermissions(io, leaf, privatePermissions(0o700), .{
+            .follow_symlinks = false,
+        });
+}
+
+fn openSearchDirectory(io: std.Io, parent: std.Io.Dir, path: []const u8) !std.Io.Dir {
+    try io.checkCancel();
+    if (@import("builtin").os.tag != .macos)
+        return parent.openDir(io, path, .{ .follow_symlinks = false });
+
+    // Read only the static vtable, never the undefined backend instance. A
+    // substituted opener keeps its own admission/failure policy and handles.
+    const native_opener = comptime std.Io.Threaded.io(undefined).vtable.dirOpenDir;
+    if (io.vtable.dirOpenDir != native_opener)
+        return parent.openDir(io, path, .{ .follow_symlinks = false });
+
+    // Zig's Darwin directory opener requires read permission even when iteration
+    // is not requested. O_SEARCH (available on our macOS 15 minimum) supplies
+    // precisely the traversal capability used here. There is no alternate I/O
+    // backend: cancellation uses the caller's I/O, and openat uses its parent.
+    // Remove this bridge when std.Io exposes search-only directory admission.
+    if (path.len >= std.posix.PATH_MAX) return error.NameTooLong;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
+    var buffer: [std.posix.PATH_MAX]u8 = undefined;
+    @memcpy(buffer[0..path.len], path);
+    buffer[path.len] = 0;
+    const base_flags: std.c.O = .{ .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const flags: std.c.O = @bitCast(@as(u32, @bitCast(base_flags)) | 0x40000000);
+    // Interrupted syscalls retry until cancellation or a result.
+    while (true) { // tiger: event-loop
+        try io.checkCancel();
+        const result = std.c.openat(parent.handle, buffer[0..path.len :0], flags);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => return .{ .handle = result },
+            .INTR => continue,
+            .INVAL, .ILSEQ => return error.BadPathName,
+            .ACCES => return error.AccessDenied,
+            .LOOP => return error.SymLinkLoop,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NODEV, .NXIO => return error.NoDevice,
+            .NOENT => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
+            .NOTDIR => return error.NotDir,
+            .PERM => return error.PermissionDenied,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
 
 fn privatePermissions(mode: u32) std.Io.File.Permissions {
     return if (@hasDecl(
@@ -215,19 +274,34 @@ test "private cache paths reject shared permissions" {
     );
 }
 
-test "private directory repair supports Linux path-only handles without read permission" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+test "private directory repair admits owner-restricted roots and children" {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(io, "cache", .fromMode(0o300));
-    var cache = try PrivateDirectory.open(.init(io, tmp.dir), "cache", .create);
+    try tmp.dir.createDir(io, "cache", .fromMode(0o700));
+    for ([_]u32{ 0o300, 0o100, 0o000, 0o700 }) |mode| {
+        try tmp.dir.setFilePermissions(io, "cache", .fromMode(@intCast(mode)), .{});
+        defer restoreTestPermissions(io, tmp.dir, "cache");
+        try expectPrivateRepair(io, tmp.dir);
+    }
+}
+
+fn expectPrivateRepair(io: std.Io, parent: std.Io.Dir) !void {
+    var cache = try PrivateDirectory.open(.init(io, parent), "cache", .create);
     defer cache.deinit();
     try std.testing.expectEqual(
         @as(u32, 0o700),
         (try cache.directory.stat(io)).permissions.toMode() & 0o777,
     );
-    try cache.directory.createDir(io, "entries", .fromMode(0o300));
+    cache.directory.createDir(io, "entries", .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    // In particular, mode 000 cannot be repaired by resolving "." through
+    // the restricted child's handle; the parent must authorize that repair.
+    try cache.directory.setFilePermissions(io, "entries", .fromMode(0o000), .{});
+    defer restoreTestPermissions(io, cache.directory, "entries");
     var entries = try cache.openChild("entries", .create);
     defer entries.deinit();
     try std.testing.expectEqual(
@@ -238,4 +312,99 @@ test "private directory repair supports Linux path-only handles without read per
     const data = try entries.readAlloc(std.testing.allocator, "entry", 7);
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("private", data);
+}
+
+test "private directory traversal preserves search-only ancestors and readers" {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "ancestor/cache");
+    try tmp.dir.setFilePermissions(io, "ancestor", .fromMode(0o100), .{});
+    defer restoreTestPermissions(io, tmp.dir, "ancestor");
+    var cache = try PrivateDirectory.open(.init(io, tmp.dir), "ancestor/cache", .create);
+    defer cache.deinit();
+    try cache.replace("entry", &.{"private"});
+    try tmp.dir.setFilePermissions(io, "ancestor/cache", .fromMode(0o100), .{});
+    defer restoreTestPermissions(io, tmp.dir, "ancestor/cache");
+    var reader = try PrivateDirectory.open(.init(io, tmp.dir), "ancestor/cache", .read_only);
+    defer reader.deinit();
+    const bytes = try reader.readAlloc(std.testing.allocator, "entry", 7);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("private", bytes);
+    for ([_][]const u8{ "ancestor", "ancestor/cache" }) |path| {
+        const stat = try tmp.dir.statFile(io, path, .{});
+        try std.testing.expectEqual(@as(u32, 0o100), stat.permissions.toMode() & 0o777);
+    }
+}
+
+test "private directory repair rejects symlinks without changing their targets" {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try PrivateDirectory.open(.init(io, tmp.dir), "cache", .create);
+    defer cache.deinit();
+    try cache.directory.createDir(io, "target", .fromMode(0o755));
+    try cache.directory.symLink(io, "target", "alias", .{ .is_directory = true });
+    try std.testing.expectError(error.NotDir, cache.openChild("alias", .create));
+    const stat = try cache.directory.statFile(io, "target", .{});
+    try std.testing.expectEqual(@as(u32, 0o755), stat.permissions.toMode() & 0o777);
+}
+
+test "private directory admission retains supplied cancellation and permission failures" {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return error.SkipZigTest;
+    const Failure = struct {
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenOptions,
+        ) std.Io.Dir.OpenError!std.Io.Dir {
+            return error.AccessDenied;
+        }
+        fn permissions(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.File.Permissions,
+            _: std.Io.Dir.SetFilePermissionsOptions,
+        ) std.Io.Dir.SetFilePermissionsError!void {
+            return error.AccessDenied;
+        }
+    };
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = io.vtable.*;
+    vtable.checkCancel = Failure.cancel;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    try std.testing.expectError(
+        error.Canceled,
+        PrivateDirectory.open(.init(injected, tmp.dir), ".", .read_only),
+    );
+    vtable = io.vtable.*;
+    vtable.dirOpenDir = Failure.open;
+    try std.testing.expectError(
+        error.AccessDenied,
+        PrivateDirectory.open(.init(injected, tmp.dir), ".", .read_only),
+    );
+    vtable = io.vtable.*;
+    vtable.dirSetFilePermissions = Failure.permissions;
+    try tmp.dir.createDir(io, "cache", .fromMode(0o300));
+    defer restoreTestPermissions(io, tmp.dir, "cache");
+    try std.testing.expectError(
+        error.AccessDenied,
+        PrivateDirectory.open(.init(injected, tmp.dir), "cache", .create),
+    );
+    const stat = try tmp.dir.statFile(io, "cache", .{});
+    try std.testing.expectEqual(@as(u32, 0o300), stat.permissions.toMode() & 0o777);
+}
+
+fn restoreTestPermissions(io: std.Io, dir: std.Io.Dir, path: []const u8) void {
+    dir.setFilePermissions(io, path, .fromMode(0o700), .{}) catch |err|
+        std.debug.panic("restore test directory permissions: {s}", .{@errorName(err)});
 }
