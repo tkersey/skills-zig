@@ -130,15 +130,24 @@ fn repairPrivateChild(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !void {
 
 fn openSearchDirectory(io: std.Io, parent: std.Io.Dir, path: []const u8) !std.Io.Dir {
     try io.checkCancel();
-    if (@import("builtin").os.tag != .macos)
-        return parent.openDir(io, path, .{ .follow_symlinks = false });
+    return parent.openDir(io, path, .{ .follow_symlinks = false }) catch |err| {
+        if (@import("builtin").os.tag != .macos) return err;
+        if (err != error.AccessDenied) return err;
+        // Read only the static vtable, never the undefined backend instance. A
+        // substituted opener keeps its own admission/failure policy and handles.
+        const native_opener = comptime std.Io.Threaded.io(undefined).vtable.dirOpenDir;
+        if (io.vtable.dirOpenDir != native_opener) return err;
+        return openDarwinSearchDirectory(io, parent, path);
+    };
+}
 
-    // Read only the static vtable, never the undefined backend instance. A
-    // substituted opener keeps its own admission/failure policy and handles.
-    const native_opener = comptime std.Io.Threaded.io(undefined).vtable.dirOpenDir;
-    if (io.vtable.dirOpenDir != native_opener)
-        return parent.openDir(io, path, .{ .follow_symlinks = false });
-
+// Keep the exceptional search-only path and its path buffer out of ordinary
+// directory admission, including its caller's resident code and stack pages.
+noinline fn openDarwinSearchDirectory(
+    io: std.Io,
+    parent: std.Io.Dir,
+    path: []const u8,
+) !std.Io.Dir {
     // Zig's Darwin directory opener requires read permission even when iteration
     // is not requested. O_SEARCH (available on our macOS 15 minimum) supplies
     // precisely the traversal capability used here. There is no alternate I/O
