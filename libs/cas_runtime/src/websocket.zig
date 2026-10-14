@@ -1476,6 +1476,15 @@ pub fn terminateProcess(process_id: u64) void {
     }
 }
 
+/// Managed server constructors make the recorded PID the process-group leader.
+/// Give legacy watchdogs time to stop their child group before retiring the
+/// server's own group, which also contains ordinary-server descendants.
+pub fn retireDetachedServer(io: std.Io, process_id: u64) void {
+    terminateProcess(process_id);
+    _ = waitForProcessExit(io, process_id, 2 * owner_watchdog_shutdown_grace_ms);
+    retireProcessGroup(io, process_id);
+}
+
 const ParsedWsUrl = struct {
     host: []const u8,
     host_header: []const u8,
@@ -2450,6 +2459,57 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
 }
 
 const OwnerProcessIds = struct { server: u64, descendant: u64 };
+
+test "detached cleanup preserves legacy watchdog descendant retirement" {
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
+    defer allocator.free(pid_path);
+    const listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1");
+    var managed = spawnOwnerPipeManagedServer(
+        allocator,
+        ".",
+        "receipts",
+        &.{
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; sleep 600 & descendant=$!; pid_tmp=\"$1.tmp\"; " ++
+                "printf '%s %s\\n' \"$$\" \"$descendant\" > \"$pid_tmp\"; " ++
+                "mv \"$pid_tmp\" \"$1\"; wait",
+            "cas-detached-legacy-test",
+            pid_path,
+        },
+        listen_url,
+        null,
+        io,
+        tmp.dir,
+        &environ,
+    ) catch |err| {
+        allocator.free(listen_url);
+        return err;
+    };
+    defer managed.deinit(allocator);
+    const ids = try awaitOwnerProcessIds(allocator, io, tmp.dir, pid_path);
+    retireDetachedServer(io, managed.processId());
+    try std.testing.expect(waitForProcessExit(io, ids.server, 2_000));
+    try std.testing.expect(waitForProcessExit(io, ids.descendant, 2_000));
+    try verifyShutdownReceipt(
+        allocator,
+        io,
+        tmp.dir,
+        managed.shutdownReceiptPath().?,
+        managed.shutdownReceiptToken().?,
+    );
+}
 
 fn awaitOwnerProcessIds(
     allocator: std.mem.Allocator,

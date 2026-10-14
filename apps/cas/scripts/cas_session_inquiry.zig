@@ -1105,7 +1105,7 @@ fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !vo
             .failure_hint = @errorName(err),
         };
         if (was_alive) {
-            cas_websocket.terminateProcess(loaded.managed_server_pid);
+            cas_websocket.retireDetachedServer(op.fs.io, loaded.managed_server_pid);
         }
     }
     const cleanup_path = try inquiryPathJoin(
@@ -7450,26 +7450,49 @@ fn nowMillis(op: Operation) i128 {
     );
 }
 
-test "inquiry server survives detached launcher I/O teardown and accepts reconnect" {
+test "inquiry server survives launcher teardown and cleanup retires its descendants" {
     const allocator = std.testing.allocator;
     var environ = try std.testing.environ.createMap(allocator);
     defer environ.deinit();
     const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const wrapper = try std.fs.path.join(allocator, &.{ root, "codex-wrapper" });
+    defer allocator.free(wrapper);
+    try environ.put("CAS_INQUIRY_TEST_CODEX", codex_bin);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "codex-wrapper",
+        .data = "#!/bin/sh\n/bin/sleep 600 &\nprintf '%s' \"$!\" > descendant.pid\n" ++
+            "exec \"$CAS_INQUIRY_TEST_CODEX\" \"$@\"\n",
+    });
+    try tmp.dir.setFilePermissions(std.testing.io, "codex-wrapper", .fromMode(0o700), .{});
     var threaded = std.Io.Threaded.init(allocator, .{});
     var io_deinitialized = false;
     defer if (!io_deinitialized) threaded.deinit();
     var op = testOperation();
     op.fs = .init(threaded.io(), .cwd());
     op.environ = &environ;
-    var managed = try startInquiryManagedServer(op, allocator, ".", codex_bin, .inherit, null);
+    var managed = try startInquiryManagedServer(op, allocator, root, wrapper, .inherit, null);
     var deinitialized = false;
     defer if (!deinitialized) managed.deinit(allocator);
     try std.testing.expect(managed.owner_control == null);
     const url = try allocator.dupe(u8, managed.listen_url);
     defer allocator.free(url);
     var child = managed.child;
+    const pid = managed.processId();
     const group_id = managed.processGroupId();
     defer @import("cas_runtime").websocket.retireProcessChild(std.testing.io, &child, group_id);
+    const descendant_raw = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "descendant.pid",
+        allocator,
+        .limited(128),
+    );
+    defer allocator.free(descendant_raw);
+    const descendant = try std.fmt.parseInt(u64, descendant_raw, 10);
+    try std.testing.expect(cas_websocket.processAlive(descendant));
     try managed.detach();
     managed.deinit(allocator);
     deinitialized = true;
@@ -7490,6 +7513,10 @@ test "inquiry server survives detached launcher I/O teardown and accepts reconne
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
     try std.testing.expect(parsed.value.object.contains("result"));
+    connection.close();
+    cas_websocket.retireDetachedServer(std.testing.io, pid);
+    _ = try child.wait(std.testing.io);
+    try std.testing.expect(cas_websocket.waitForProcessExit(std.testing.io, descendant, 2_000));
 }
 
 test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
