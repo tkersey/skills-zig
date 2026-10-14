@@ -5704,9 +5704,9 @@ const SpawnArguments = struct {
 fn destroySpawnActions(io: std.Io, actions: *std.c.posix_spawn_file_actions_t) void {
     const rc = std.c.posix_spawn_file_actions_destroy(actions);
     if (rc != 0) {
-        printDiagnostic(
+        warnDiagnostic(
             io,
-            "warning: spawn action cleanup failed error={s}\n",
+            "spawn action cleanup failed error={s}",
             .{@errorName(posixSpawnError(rc))},
         );
     }
@@ -5828,9 +5828,9 @@ fn releaseTempRoot(
             fs.io,
             path,
         ) catch |err| {
-            printDiagnostic(
+            warnDiagnostic(
                 fs.io,
-                "warning: temp-root cleanup failed path={s} error={s}\n",
+                "temp-root cleanup failed path={s} error={s}",
                 .{ path, @errorName(err) },
             );
         };
@@ -5925,9 +5925,9 @@ fn reportAutomationDbError(io: std.Io, message: [*:0]const u8) !void {
 
 fn closeAutomationDb(io: std.Io, db: *Sqlite.sqlite3) void {
     const rc = Sqlite.sqlite3_close(db);
-    if (rc != Sqlite.SQLITE_OK) printDiagnostic(
+    if (rc != Sqlite.SQLITE_OK) warnDiagnostic(
         io,
-        "warning: automation database cleanup failed code={d}\n",
+        "automation database cleanup failed code={d}",
         .{rc},
     );
 }
@@ -7062,8 +7062,22 @@ fn writeJsonString(writer: anytype, text: []const u8) !void {
 }
 
 fn printDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
-    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
-    stderr_writer.interface.print(format, args) catch return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = io.lockStderr(&buffer, null) catch return;
+    defer io.unlockStderr();
+    stderr.file_writer.interface.print(format, args) catch return;
+}
+
+fn warnDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
+    if (comptime !std.log.logEnabled(.warn, .default)) return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
+    defer io.unlockStderr();
+    std.log.defaultLogFileTerminal(.warn, .default, format, args, stderr) catch return;
 }
 
 fn restoreTestCwd(io: std.Io, path: []const u8) void {

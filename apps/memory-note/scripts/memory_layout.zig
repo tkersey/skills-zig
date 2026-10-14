@@ -96,10 +96,18 @@ fn retireConfigChild(io: std.Io, child: *std.process.Child) void {
 }
 
 fn warnConfigChildKill(io: std.Io, err: anyerror) void {
-    var diagnostic = std.Io.File.stderr().writer(io, &.{});
-    diagnostic.interface.print(
-        "warning: could not kill Codex config child: {s}\n",
+    if (comptime !std.log.logEnabled(.warn, .default)) return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
+    defer io.unlockStderr();
+    std.log.defaultLogFileTerminal(
+        .warn,
+        .default,
+        "could not kill Codex config child: {s}",
         .{@errorName(err)},
+        stderr,
     ) catch return;
 }
 

@@ -103,14 +103,8 @@ pub fn publishNote(
     switch (outcome) {
         .complete => {},
         .not_published, .publication_unknown => |failure| {
-            var diagnostic = std.Io.File.stderr().writer(fs.io, &.{});
             if (failure.cleanup) |cleanup| {
-                diagnostic.interface.print(
-                    "warning: memory-note staging cleanup failed for {s}: {s}\n",
-                    .{
-                        cleanup.stage_name, @errorName(cleanup.cause),
-                    },
-                ) catch return failure.cause;
+                warnStagingCleanup(fs.io, &cleanup.stage_name, cleanup.cause);
             }
             return failure.cause;
         },
@@ -118,6 +112,22 @@ pub fn publishNote(
         // later stronger mode introduces a failure after the name is visible.
         .published_unsynced => return error.NotePublishedDurabilityUnconfirmed,
     }
+}
+
+fn warnStagingCleanup(io: std.Io, name: []const u8, err: anyerror) void {
+    if (comptime !std.log.logEnabled(.warn, .default)) return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
+    defer io.unlockStderr();
+    std.log.defaultLogFileTerminal(
+        .warn,
+        .default,
+        "memory-note staging cleanup failed for {s}: {s}",
+        .{ name, @errorName(err) },
+        stderr,
+    ) catch return;
 }
 
 test "extension lock is exclusive reusable and leaves its recognized marker" {

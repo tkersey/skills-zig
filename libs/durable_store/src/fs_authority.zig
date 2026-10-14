@@ -33,52 +33,117 @@ pub fn warn(io: std.Io, comptime format: []const u8, args: anytype) void {
     const previous = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(previous);
     var buffer: [256]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(io, &buffer);
-    stderr.interface.print("warning: " ++ format ++ "\n", args) catch return;
-    stderr.interface.flush() catch return;
+    const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
+    defer io.unlockStderr();
+    std.log.defaultLogFileTerminal(.warn, .default, format, args, stderr) catch return;
 }
 
-test "cleanup diagnostics write through the supplied I/O implementation" {
-    const Capture = struct {
-        bytes: [1024]u8 = undefined,
-        len: usize = 0,
-        fn append(self: *@This(), bytes: []const u8) void {
-            @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
-            self.len += bytes.len;
+const DiagnosticCapture = struct {
+    bytes: [1024]u8 = undefined,
+    len: usize = 0,
+    writer: std.Io.File.Writer = undefined,
+    protection: std.Io.CancelProtection = .unblocked,
+    locks: usize = 0,
+    unlocks: usize = 0,
+    fn append(self: *@This(), bytes: []const u8) void {
+        @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+    fn writeStreaming(
+        context: ?*anyopaque,
+        _: std.Io.File,
+        header: []const u8,
+        data: []const []const u8,
+        splat: usize,
+    ) usize {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const before = self.len;
+        self.append(header);
+        if (data.len != 0) {
+            for (data[0 .. data.len - 1]) |bytes| self.append(bytes);
+            for (0..splat) |_| self.append(data[data.len - 1]);
         }
-        fn write(
-            context: ?*anyopaque,
-            _: std.Io.File,
-            header: []const u8,
-            data: []const []const u8,
-            splat: usize,
-            _: u64,
-        ) std.Io.File.WritePositionalError!usize {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            const before = self.len;
-            self.append(header);
-            if (data.len != 0) {
-                for (data[0 .. data.len - 1]) |bytes| self.append(bytes);
-                for (0..splat) |_| self.append(data[data.len - 1]);
-            }
-            return self.len - before;
-        }
-        fn protect(_: ?*anyopaque, _: std.Io.CancelProtection) std.Io.CancelProtection {
-            return .unblocked;
-        }
-    };
-    var capture = Capture{};
+        return self.len - before;
+    }
+    fn writePositional(
+        context: ?*anyopaque,
+        file: std.Io.File,
+        header: []const u8,
+        data: []const []const u8,
+        splat: usize,
+        offset: u64,
+    ) std.Io.File.WritePositionalError!usize {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const end = self.len;
+        self.len = @intCast(offset);
+        const written = writeStreaming(context, file, header, data, splat);
+        self.len = @max(self.len, end);
+        return written;
+    }
+    fn operate(
+        context: ?*anyopaque,
+        operation: std.Io.Operation,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
+        const write = operation.file_write_streaming;
+        return .{ .file_write_streaming = writeStreaming(
+            context,
+            write.file,
+            write.header,
+            write.data,
+            write.splat,
+        ) };
+    }
+    fn lock(
+        context: ?*anyopaque,
+        _: ?std.Io.Terminal.Mode,
+    ) std.Io.Cancelable!std.Io.LockedStderr {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        std.debug.assert(self.protection == .blocked);
+        self.locks += 1;
+        return .{ .file_writer = &self.writer, .terminal_mode = .no_color };
+    }
+    fn unlock(context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.writer.interface.flush() catch |err| {
+            std.debug.panic("diagnostic fixture flush: {s}", .{@errorName(err)});
+        };
+        self.writer.interface.buffer = &.{};
+        self.unlocks += 1;
+    }
+    fn protect(
+        context: ?*anyopaque,
+        protection: std.Io.CancelProtection,
+    ) std.Io.CancelProtection {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const previous = self.protection;
+        self.protection = protection;
+        return previous;
+    }
+};
+
+test "cleanup diagnostics preserve preceding output through supplied locked stderr" {
+    var capture = DiagnosticCapture{};
     var vtable = std.testing.io.vtable.*;
-    vtable.fileWritePositional = Capture.write;
-    vtable.swapCancelProtection = Capture.protect;
+    vtable.fileWritePositional = DiagnosticCapture.writePositional;
+    vtable.operate = DiagnosticCapture.operate;
+    vtable.lockStderr = DiagnosticCapture.lock;
+    vtable.unlockStderr = DiagnosticCapture.unlock;
+    vtable.swapCancelProtection = DiagnosticCapture.protect;
+    const io: std.Io = .{ .userdata = &capture, .vtable = &vtable };
+    capture.writer = std.Io.File.stderr().writerStreaming(io, &.{});
+    capture.append("earlier diagnostic\n");
     warn(
-        .{ .userdata = &capture, .vtable = &vtable },
+        io,
         "lock release failed for {s}: {s}; inspect and remove stale lock",
         .{ "events.lock", "AccessDenied" },
     );
+    warn(io, "second warning", .{});
     try std.testing.expectEqualStrings(
-        "warning: lock release failed for events.lock: Acce" ++
-            "ssDenied; inspect and remove stale lock\n",
+        "earlier diagnostic\nwarning: lock release failed for events.lock: Acce" ++
+            "ssDenied; inspect and remove stale lock\nwarning: second warning\n",
         capture.bytes[0..capture.len],
     );
+    try std.testing.expectEqual(@as(usize, 2), capture.locks);
+    try std.testing.expectEqual(capture.locks, capture.unlocks);
+    try std.testing.expectEqual(std.Io.CancelProtection.unblocked, capture.protection);
 }
