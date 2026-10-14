@@ -132,3 +132,34 @@ test "private entry directory binds reads and multipart publication across root 
         try std.testing.expectError(error.InsecurePrivateDirectory, plans.replace("entry", &.{"x"}));
     }
 }
+
+test "private cache paths reject shared permissions" {
+    const fs = authority.Fs.init(std.testing.io, std.Io.Dir.cwd());
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const private_dir = try std.fs.path.join(allocator, &.{ root, "private" });
+    defer allocator.free(private_dir);
+    try filesystem.ensurePrivateDirectoryPathNoSymlinks(fs, private_dir);
+    const private_path = try std.fs.path.join(allocator, &.{ private_dir, "entry.bin" });
+    defer allocator.free(private_path);
+    var entries = try PrivateDirectory.open(fs, private_dir, .read_only);
+    defer entries.deinit();
+    try entries.replace("entry.bin", &.{"plan"});
+    const bytes = try entries.readAlloc(allocator, "entry.bin", 16);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("plan", bytes);
+    try fs.directory().setFilePermissions(
+        std.testing.io,
+        private_path,
+        std.Io.File.Permissions.fromMode(0o644),
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectError(
+        error.InsecurePrivateFile,
+        entries.readAlloc(allocator, "entry.bin", 16),
+    );
+}

@@ -95,7 +95,6 @@ pub const ensureDirectoryPathNoSymlinksObserved = filesystem.ensureDirectoryPath
 pub const ensurePrivateDirectoryPathNoSymlinks = filesystem.ensurePrivateDirectoryPathNoSymlinks;
 pub const validatePrivateDirectoryPathNoSymlinks = filesystem.validatePrivateDirectoryPathNoSymlinks;
 pub const readRegularFileNoSymlink = filesystem.readRegularFileNoSymlink;
-pub const readPrivateRegularFileNoSymlink = filesystem.readPrivateRegularFileNoSymlink;
 pub const freeStringList = filesystem.freeStringList;
 pub const listSortedRegularFilesNoSymlink = filesystem.listSortedRegularFilesNoSymlink;
 pub const writeTextCreateNew = filesystem.writeTextCreateNew;

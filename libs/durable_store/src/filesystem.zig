@@ -2057,38 +2057,6 @@ pub fn readRegularFileNoSymlink(
     return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
 }
 
-pub fn readPrivateRegularFileNoSymlink(
-    fs: Fs,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    max_bytes: usize,
-) ![]u8 {
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(
-            fs.io,
-            path,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        )
-    else
-        try fs.directory().openFile(
-            fs.io,
-            path,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        );
-    defer file.close(fs.io);
-    const stat = try file.stat(fs.io);
-    if (stat.kind != .file) return error.NotFile;
-    if (stat.nlink != 1) return error.HardlinkTarget;
-    if (@hasDecl(std.Io.File.Permissions, "toMode") and
-        stat.permissions.toMode() & 0o077 != 0)
-    {
-        return error.InsecurePrivateFile;
-    }
-    if (stat.size > max_bytes) return error.FileTooBig;
-    var reader = file.reader(fs.io, &.{});
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
-}
-
 pub fn freeStringList(allocator: std.mem.Allocator, list: []const []u8) void {
     for (list) |item| allocator.free(item);
     allocator.free(list);
@@ -3198,35 +3166,6 @@ test "listSortedRegularFilesNoSymlink sorts and rejects symlink entries" {
     try std.testing.expectError(
         error.SymlinkComponent,
         listSortedRegularFilesNoSymlink(fs, std.testing.allocator, dir_path, 10, 10),
-    );
-}
-
-test "private cache paths reject shared permissions" {
-    const fs = Fs.init(std.testing.io, std.Io.Dir.cwd());
-    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const allocator = std.testing.allocator;
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(root);
-    const private_dir = try std.fs.path.join(allocator, &.{ root, "private" });
-    defer allocator.free(private_dir);
-    try ensurePrivateDirectoryPathNoSymlinks(fs, private_dir);
-    const private_path = try std.fs.path.join(allocator, &.{ private_dir, "entry.bin" });
-    defer allocator.free(private_path);
-    try writeTextAtomicMode(fs, allocator, private_path, "plan", 0o600);
-    const bytes = try readPrivateRegularFileNoSymlink(fs, allocator, private_path, 16);
-    defer allocator.free(bytes);
-    try std.testing.expectEqualStrings("plan", bytes);
-    try fs.directory().setFilePermissions(
-        std.testing.io,
-        private_path,
-        std.Io.File.Permissions.fromMode(0o644),
-        .{ .follow_symlinks = false },
-    );
-    try std.testing.expectError(
-        error.InsecurePrivateFile,
-        readPrivateRegularFileNoSymlink(fs, allocator, private_path, 16),
     );
 }
 
