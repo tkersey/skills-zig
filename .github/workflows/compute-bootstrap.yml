@@ -54,5 +54,6 @@ jobs:
           name: compute-linux-development-inputs
           path: /tmp/compute-inputs/
           if-no-files-found: error
-          retention-days: 1
+          # Temporary editor inputs only; remove this workflow from the final PR.
+          retention-days: 3
           compression-level: 0
