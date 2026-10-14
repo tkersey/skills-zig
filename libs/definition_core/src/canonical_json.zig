@@ -60,7 +60,7 @@ pub fn writeCanonicalJson(
 }
 
 const WriteFrame = struct {
-    value: std.json.Value,
+    value: *const std.json.Value,
     keys: std.ArrayList([]const u8) = .empty,
     index: usize = 0,
     started: bool = false,
@@ -78,7 +78,7 @@ const WriteFrame = struct {
         depth: usize,
     ) !bool {
         self.started = true;
-        switch (self.value) {
+        switch (self.value.*) {
             .null => try writer.writeAll("null"),
             .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
             .integer => |number| try writer.print("{d}", .{number}),
@@ -98,15 +98,15 @@ const WriteFrame = struct {
         return false;
     }
 
-    fn next(self: *WriteFrame, writer: *std.Io.Writer) !?std.json.Value {
-        switch (self.value) {
+    fn next(self: *WriteFrame, writer: *std.Io.Writer) !?*const std.json.Value {
+        switch (self.value.*) {
             .array => |items| {
                 if (self.index == items.items.len) {
                     try writer.writeByte(']');
                     return null;
                 }
                 if (self.index != 0) try writer.writeByte(',');
-                const item = items.items[self.index];
+                const item = &items.items[self.index];
                 self.index += 1;
                 return item;
             },
@@ -121,7 +121,7 @@ const WriteFrame = struct {
                 try writeCanonicalString(writer, key);
                 try writer.writeByte(':');
                 self.index += 1;
-                return map.get(key).?;
+                return map.getPtr(key).?;
             },
             else => unreachable,
         }
@@ -154,8 +154,10 @@ fn writeCanonicalJsonWithOmission(
     omission: Omission,
 ) !void {
     // The root has depth zero; one slot covers each admitted nesting level.
+    // Frames borrow the unchanged input graph for this synchronous traversal;
+    // only sorted key lists are owned, so the bounded stack need not copy values.
     var frames: [max_nesting_depth + 1]WriteFrame = undefined;
-    frames[0] = .{ .value = value };
+    frames[0] = .{ .value = &value };
     var count: usize = 1;
     defer for (frames[0..count]) |*frame| frame.deinit(allocator);
     while (count != 0) {

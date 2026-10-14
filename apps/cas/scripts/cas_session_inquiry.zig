@@ -612,8 +612,12 @@ fn usageFailure(io: std.Io, err_token: []const u8, detail: ?[]const u8) !noretur
 }
 
 fn printDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
-    var stderr = std.Io.File.stderr().writer(io, &.{});
-    stderr.interface.print(format, args) catch return;
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    var buffer: [64]u8 = undefined;
+    const stderr = io.lockStderr(&buffer, null) catch return;
+    defer io.unlockStderr();
+    stderr.file_writer.interface.print(format, args) catch return;
 }
 
 fn testOperation() Operation {
