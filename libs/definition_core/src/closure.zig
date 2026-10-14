@@ -915,7 +915,14 @@ pub fn normalizeRelativeAlloc(
     try appendNormalizedComponents(allocator, &components, raw_path);
     if (components.items.len == 0) return error.InvalidDefinitionPath;
 
-    const normalized = try std.mem.join(allocator, "/", components.items);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (components.items, 0..) |component, index| {
+        // This sink can fail only when its backing allocator fails.
+        if (index != 0) out.writer.writeByte('/') catch return error.OutOfMemory;
+        out.writer.writeAll(component) catch return error.OutOfMemory;
+    }
+    const normalized = try out.toOwnedSlice();
     if (!std.mem.endsWith(u8, normalized, ".json")) {
         allocator.free(normalized);
         return error.DefinitionPathNotJson;
