@@ -433,7 +433,8 @@ fn digestWithOmissionAlloc(
     value: std.json.Value,
     omission: Omission,
 ) ![]u8 {
-    var buffer: [4096]u8 = undefined;
+    // Batch small writes without retaining a page-sized buffer in digest callers.
+    var buffer: [512]u8 = undefined;
     var sink = DigestWriter.init(&buffer);
     try writeCanonicalJsonWithOmission(allocator, &sink.writer, value, omission);
     try sink.writer.flush();

@@ -210,8 +210,7 @@ fn admit(io: std.Io, directory: std.Io.Dir, mode: PrivateDirectory.Mode) !void {
         return error.InsecurePrivateDirectory;
 }
 
-// Keep fixed-length digest names from unrolling this scan into every cache operation.
-noinline fn validateLeaf(leaf: []const u8) !void {
+fn validateLeaf(leaf: []const u8) !void {
     if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..") or
         std.mem.indexOfAny(u8, leaf, "/\\\x00") != null) return error.InvalidPath;
 }
