@@ -2446,7 +2446,9 @@ fn waitFileWritableUntil(io: std.Io, file: std.Io.File, deadline_ms: i64) !void 
 }
 
 fn waitFileEventUntil(io: std.Io, file: std.Io.File, deadline_ms: i64, events: i16) !void {
-    const poll_quantum_ms: i64 = 1_000;
+    // Closing a pipe from another thread need not wake an in-flight poll on
+    // macOS. Recheck the descriptor within the actor's sub-second shutdown bound.
+    const poll_quantum_ms: i64 = 100;
     var now_ms = monotonicMillis(io);
     while (now_ms < deadline_ms) : (now_ms = monotonicMillis(io)) {
         const remaining_ms = deadline_ms - now_ms;
