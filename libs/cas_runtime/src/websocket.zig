@@ -190,13 +190,10 @@ pub const Connection = struct {
         });
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
             const stream = address.connect(io, .{ .mode = .stream }) catch |err| {
+                if (err == error.Canceled) return err;
                 const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
                 if (now_ms - started_ms >= timeout_ms) return err;
-                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch |ignored_error| {
-                    switch (ignored_error) {
-                        else => {},
-                    }
-                };
+                try std.Io.sleep(io, .fromMilliseconds(50), .awake);
                 continue;
             };
 
@@ -243,13 +240,7 @@ pub const Connection = struct {
                 error.FileNotFound, error.WouldBlock => {
                     const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
                     if (now_ms - started_ms >= timeout_ms) return err;
-                    std.Io.sleep(
-                        io,
-                        .fromMilliseconds(25),
-                        .awake,
-                    ) catch |sleep_err| switch (sleep_err) {
-                        else => {},
-                    };
+                    try std.Io.sleep(io, .fromMilliseconds(25), .awake);
                     continue;
                 },
                 else => return err,
@@ -287,9 +278,12 @@ pub const Connection = struct {
     pub fn sendText(self: *Connection, payload: []const u8) !void {
         if (!self.usable.load(.acquire)) return error.ConnectionPoisoned;
         if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
-        writeClientFrame(self, 0x1, payload, null) catch |err| {
-            self.poison();
-            return err;
+        writeClientFrame(self, 0x1, payload, null) catch |err| switch (err) {
+            error.WebSocketWriteLockCanceled => return error.Canceled,
+            else => {
+                self.poison();
+                return err;
+            },
         };
     }
 
@@ -311,6 +305,7 @@ pub const Connection = struct {
         if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
         writeClientFrame(self, 0x1, payload, deadline) catch |err| switch (err) {
             error.WebSocketWriteLockTimeout => return error.Timeout,
+            error.WebSocketWriteLockCanceled => return error.Canceled,
             else => {
                 self.poison();
                 return err;
@@ -434,14 +429,14 @@ pub const Connection = struct {
                     return self.protocolFailure(error.WebSocketInvalidClosePayload);
                 writeClientFrame(self, 0x8, frame.payload.?, deadline) catch |err| {
                     self.poison();
-                    return err;
+                    return if (err == error.WebSocketWriteLockCanceled) error.Canceled else err;
                 };
                 self.close();
                 return .closed;
             },
             0x9 => writeClientFrame(self, 0xA, frame.payload.?, deadline) catch |err| {
                 self.poison();
-                return err;
+                return if (err == error.WebSocketWriteLockCanceled) error.Canceled else err;
             },
             0xA => {},
             else => return self.protocolFailure(error.WebSocketUnexpectedOpcode),
@@ -894,10 +889,9 @@ fn requireReady(io: std.Io, url: []const u8, timeout_ms: u32) !void {
         const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
         if (now_ms - started_ms >= timeout_ms) return error.Timeout;
         const remaining: u32 = @intCast(timeout_ms - @as(u32, @intCast(now_ms - started_ms)));
-        checkReadyOnce(io, address, remaining) catch {
-            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch |sleep_err| switch (sleep_err) {
-                else => {},
-            };
+        checkReadyOnce(io, address, remaining) catch |err| {
+            if (err == error.Canceled) return err;
+            try std.Io.sleep(io, .fromMilliseconds(25), .awake);
             continue;
         };
         return;
@@ -1639,10 +1633,8 @@ fn writeClientFrame(
                 return error.WebSocketWriteLockTimeout;
             }
         }
-        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch |ignored_error| {
-            switch (ignored_error) {
-                else => {},
-            }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {
+            return error.WebSocketWriteLockCanceled;
         };
     }
     defer self.write_mutex.unlock();
@@ -1866,6 +1858,148 @@ test "server frame protocol violations poison before allocation" {
     }
     try expectRawServerFrameError(error.WebSocketTooManyFragments, &fragments);
     try expectRawServerClose(&.{ 0x88, 0x02, 0x03, 0xE8 });
+}
+
+const RetryCancellationProbe = struct {
+    cancel_at: enum { connect, sleep, never },
+    connect_calls: usize = 0,
+    sleep_calls: usize = 0,
+    elapsed_ns: i96 = 0,
+
+    fn io(self: *RetryCancellationProbe, vtable: *std.Io.VTable) std.Io {
+        vtable.* = std.testing.io.vtable.*;
+        vtable.now = now;
+        vtable.sleep = sleep;
+        vtable.netConnectIp = connectIp;
+        vtable.netConnectUnix = connectUnix;
+        return .{ .userdata = self, .vtable = vtable };
+    }
+
+    fn state(userdata: ?*anyopaque) *RetryCancellationProbe {
+        return @ptrCast(@alignCast(userdata.?));
+    }
+
+    fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+        const self = state(userdata);
+        self.elapsed_ns += 1_000_000;
+        return .{ .nanoseconds = self.elapsed_ns };
+    }
+
+    fn sleep(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self = state(userdata);
+        self.sleep_calls += 1;
+        self.elapsed_ns += 50_000_000;
+        if (self.cancel_at == .sleep and self.sleep_calls == 1) return error.Canceled;
+    }
+
+    fn connectIp(
+        userdata: ?*anyopaque,
+        _: *const std.Io.net.IpAddress,
+        _: std.Io.net.IpAddress.ConnectOptions,
+    ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+        const self = state(userdata);
+        self.connect_calls += 1;
+        if (self.cancel_at == .connect and self.connect_calls == 1) return error.Canceled;
+        return error.ConnectionRefused;
+    }
+
+    fn connectUnix(
+        userdata: ?*anyopaque,
+        _: *const std.Io.net.UnixAddress,
+    ) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
+        const self = state(userdata);
+        self.connect_calls += 1;
+        if (self.cancel_at == .connect and self.connect_calls == 1) return error.Canceled;
+        return error.FileNotFound;
+    }
+};
+
+test "connection and readiness retries preserve one-shot cancellation" {
+    for ([_]bool{ false, true }) |cancel_sleep| {
+        for (0..3) |operation| {
+            var probe = RetryCancellationProbe{
+                .cancel_at = if (cancel_sleep) .sleep else .connect,
+            };
+            var vtable: std.Io.VTable = undefined;
+            const io = probe.io(&vtable);
+            switch (operation) {
+                0 => try std.testing.expectError(error.Canceled, Connection.connect(
+                    std.testing.allocator,
+                    io,
+                    "ws://127.0.0.1:1",
+                    500,
+                )),
+                1 => try std.testing.expectError(error.Canceled, Connection.connectUnix(
+                    std.testing.allocator,
+                    io,
+                    "/tmp/cas-canceled.sock",
+                    500,
+                )),
+                2 => try std.testing.expectError(error.Canceled, requireReady(
+                    io,
+                    "http://127.0.0.1:1/readyz",
+                    500,
+                )),
+                else => unreachable,
+            }
+            try std.testing.expectEqual(@as(usize, 1), probe.connect_calls);
+            try std.testing.expectEqual(@as(usize, @intFromBool(cancel_sleep)), probe.sleep_calls);
+        }
+    }
+}
+
+test "ordinary connection failures still retry until their deadline" {
+    for (0..3) |operation| {
+        var probe = RetryCancellationProbe{ .cancel_at = .never };
+        var vtable: std.Io.VTable = undefined;
+        const io = probe.io(&vtable);
+        switch (operation) {
+            0 => try std.testing.expectError(error.ConnectionRefused, Connection.connect(
+                std.testing.allocator,
+                io,
+                "ws://127.0.0.1:1",
+                500,
+            )),
+            1 => try std.testing.expectError(error.FileNotFound, Connection.connectUnix(
+                std.testing.allocator,
+                io,
+                "/tmp/cas-canceled.sock",
+                500,
+            )),
+            2 => try std.testing.expectError(error.Timeout, requireReady(
+                io,
+                "http://127.0.0.1:1/readyz",
+                500,
+            )),
+            else => unreachable,
+        }
+        try std.testing.expect(probe.connect_calls > 1);
+        try std.testing.expect(probe.sleep_calls > 1);
+    }
+}
+
+test "canceling a queued frame leaves the holder and connection usable" {
+    for ([_]bool{ false, true }) |with_deadline| {
+        var probe = RetryCancellationProbe{ .cancel_at = .sleep };
+        var vtable: std.Io.VTable = undefined;
+        var connection = Connection{
+            .io = probe.io(&vtable),
+            .allocator = std.testing.allocator,
+            // No socket operation is permitted before acquiring the held lock.
+            .stream = undefined,
+        };
+        try std.testing.expect(connection.write_mutex.tryLock());
+        defer connection.write_mutex.unlock();
+        if (with_deadline) {
+            try std.testing.expectError(error.Canceled, connection.sendTextTimeout("queued", 500));
+        } else {
+            try std.testing.expectError(error.Canceled, connection.sendText("queued"));
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.sleep_calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.connect_calls);
+        try std.testing.expect(connection.usable.load(.acquire));
+        try std.testing.expect(!connection.write_mutex.tryLock());
+    }
 }
 
 test "client write mutex acquisition obeys the caller deadline" {

@@ -748,7 +748,7 @@ test "unix websocket performs RFC6455 upgrade on slash localhost" {
     connection.close();
 }
 
-test "managed websocket asks Codex for port zero and reaches readiness" {
+test "managed websocket resolves port zero and remains usable after detach" {
     const io = std.testing.io;
     var environ = try std.testing.environ.createMap(std.testing.allocator);
     defer environ.deinit();
@@ -779,6 +779,28 @@ test "managed websocket asks Codex for port zero and reaches readiness" {
     );
     defer connection.deinit();
     connection.close();
+    var detached_child = server.child;
+    try server.detach();
+    defer websocket.retireProcessChild(io, &detached_child, server.processGroupId());
+    var resumed = try websocket.Connection.connect(
+        std.testing.allocator,
+        io,
+        server.listen_url,
+        2_000,
+    );
+    defer resumed.deinit();
+    defer resumed.close();
+    try resumed.sendTextTimeout(
+        "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":" ++
+            "{\"name\":\"cas-detach-test\",\"version\":\"1\"},\"capabilities\":{}}}",
+        2_000,
+    );
+    const response = (try resumed.readTextAllocTimeout(2_000)) orelse return error.EndOfStream;
+    defer std.testing.allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+    try std.testing.expect(parsed.value.object.contains("result"));
 }
 
 test "owner-lived managed websocket also resolves port zero before return" {
