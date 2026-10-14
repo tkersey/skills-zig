@@ -2937,7 +2937,6 @@ fn executeLiveInquiry(
         op,
         allocator,
         inquiry_cwd,
-        null,
         preflight.codex_path,
         hook_policy,
         options.code_mode_host,
@@ -3070,13 +3069,11 @@ fn launchDetachedInquiry(run: InquiryExecution) !RunOutput {
         op,
         allocator,
         run.inquiry_cwd,
-        run.receipt_dir,
         run.preflight.codex_path,
         hook_policy,
         options.code_mode_host,
     );
-    var keep_server = false;
-    defer if (!keep_server) managed_server.deinit(allocator);
+    defer managed_server.deinit(allocator);
 
     var client = try startDetachedInquiryClient(run, hook_policy, managed_server.listen_url);
     defer {
@@ -3088,7 +3085,7 @@ fn launchDetachedInquiry(run: InquiryExecution) !RunOutput {
     try startDetachedLanes(run, &client);
     try persistDetachedTransport(run, managed_server);
     try startDetachedWaiter(run, managed_server);
-    keep_server = true;
+    try managed_server.detach();
     return .{
         .inquiry_id = run.rip.inquiry_id,
         .state = @tagName(InquiryState.turn_running),
@@ -3358,7 +3355,6 @@ fn startInquiryManagedServer(
     op: Operation,
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    owner_receipt_dir: ?[]const u8,
     codex_path: []const u8,
     hook_policy: cas_client.hooks.HookPolicy,
     code_mode_host_raw: ?[]const u8,
@@ -3368,31 +3364,6 @@ fn startInquiryManagedServer(
     else
         null;
     defer if (code_mode_host) |*host| host.deinit();
-    if (owner_receipt_dir) |receipt_dir| {
-        if (code_mode_host) |*host| {
-            return cas_websocket.startOwnerLivedLoopbackServerWithCodeModeHost(
-                allocator,
-                cwd,
-                receipt_dir,
-                codex_path,
-                hook_policy,
-                host,
-                op.fs.io,
-                op.fs.directory(),
-                op.environ,
-            );
-        }
-        return cas_websocket.startOwnerLivedLoopbackServer(
-            allocator,
-            cwd,
-            receipt_dir,
-            codex_path,
-            hook_policy,
-            op.fs.io,
-            op.fs.directory(),
-            op.environ,
-        );
-    }
     if (code_mode_host) |*host| return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
         allocator,
         cwd,
@@ -7477,6 +7448,48 @@ fn nowMillis(op: Operation) i128 {
         std.Io.Clock.real.now(op.fs.io).nanoseconds,
         1_000_000,
     );
+}
+
+test "inquiry server survives detached launcher I/O teardown and accepts reconnect" {
+    const allocator = std.testing.allocator;
+    var environ = try std.testing.environ.createMap(allocator);
+    defer environ.deinit();
+    const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    var io_deinitialized = false;
+    defer if (!io_deinitialized) threaded.deinit();
+    var op = testOperation();
+    op.fs = .init(threaded.io(), .cwd());
+    op.environ = &environ;
+    var managed = try startInquiryManagedServer(op, allocator, ".", codex_bin, .inherit, null);
+    var deinitialized = false;
+    defer if (!deinitialized) managed.deinit(allocator);
+    try std.testing.expect(managed.owner_control == null);
+    const url = try allocator.dupe(u8, managed.listen_url);
+    defer allocator.free(url);
+    var child = managed.child;
+    const group_id = managed.processGroupId();
+    defer @import("cas_runtime").websocket.retireProcessChild(std.testing.io, &child, group_id);
+    try managed.detach();
+    managed.deinit(allocator);
+    deinitialized = true;
+    threaded.deinit();
+    io_deinitialized = true;
+
+    var connection = try cas_websocket.Connection.connect(allocator, std.testing.io, url, 2_000);
+    defer connection.deinit();
+    defer connection.close();
+    try connection.sendTextTimeout(
+        "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":" ++
+            "{\"name\":\"cas-inquiry-detach-test\",\"version\":\"1\"},\"capabilities\":{}}}",
+        2_000,
+    );
+    const response = (try connection.readTextAllocTimeout(2_000)) orelse return error.EndOfStream;
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+    try std.testing.expect(parsed.value.object.contains("result"));
 }
 
 test "parseArgs accepts safe common flags and rejects unsafe sandbox" {

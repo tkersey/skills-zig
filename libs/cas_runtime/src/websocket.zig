@@ -693,7 +693,6 @@ fn startOwnerLivedServer(
     const mkfifo = try std.process.run(allocator, io, .{
         .exe = .{ .path = dir },
         .argv = &.{ "/usr/bin/mkfifo", capture_path },
-        .cwd = .{ .dir = dir },
         .environ_map = environ,
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(4096),

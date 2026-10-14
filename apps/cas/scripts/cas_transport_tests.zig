@@ -803,13 +803,11 @@ test "managed websocket resolves port zero and remains usable after detach" {
     try std.testing.expect(parsed.value.object.contains("result"));
 }
 
-test "owner-lived managed websocket also resolves port zero before return" {
+test "owner-lived websocket accepts cwd sentinel and pinned directory authority" {
     const io = std.testing.io;
     var environ = try std.testing.environ.createMap(std.testing.allocator);
     defer environ.deinit();
     const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
-    const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
-    defer dir.close(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
@@ -819,26 +817,28 @@ test "owner-lived managed websocket also resolves port zero before return" {
         &.{ root, "fresh", "receipts" },
     );
     defer std.testing.allocator.free(receipt_dir);
-    var server = try websocket.startOwnerLivedLoopbackServer(
-        std.testing.allocator,
-        ".",
-        receipt_dir,
-        codex_bin,
-        .inherit,
-        io,
-        dir,
-        &environ,
-    );
-    defer server.deinit(std.testing.allocator);
-    try std.testing.expect(!std.mem.endsWith(u8, server.listen_url, ":0"));
-    var connection = try websocket.Connection.connect(
-        std.testing.allocator,
-        io,
-        server.listen_url,
-        2_000,
-    );
-    defer connection.deinit();
-    connection.close();
+    for ([_]std.Io.Dir{ .cwd(), tmp.dir }) |dir| {
+        var server = try websocket.startOwnerLivedLoopbackServer(
+            std.testing.allocator,
+            ".",
+            receipt_dir,
+            codex_bin,
+            .inherit,
+            io,
+            dir,
+            &environ,
+        );
+        defer server.deinit(std.testing.allocator);
+        try std.testing.expect(!std.mem.endsWith(u8, server.listen_url, ":0"));
+        var connection = try websocket.Connection.connect(
+            std.testing.allocator,
+            io,
+            server.listen_url,
+            2_000,
+        );
+        defer connection.deinit();
+        connection.close();
+    }
 }
 
 fn providerRequestFakeCodexScriptAlloc(
