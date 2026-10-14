@@ -576,6 +576,21 @@ const LiveReviewNotificationState = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) !u8 {
+    execute(init) catch |err| return switch (err) {
+        error.CommandReportedSuccess => 0,
+        error.CommandReportedFailure => 1,
+        error.CommandReportedRejection => 2,
+        else => err,
+    };
+    return 0;
+}
+
+fn execute(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
@@ -592,8 +607,8 @@ pub fn main(init: std.process.Init) !void {
             Version,
             @errorName(err),
             review_cli.usageDetailForParseError(err),
-        ) catch std.process.exit(1);
-        std.process.exit(2);
+        ) catch return error.CommandReportedFailure;
+        return error.CommandReportedRejection;
     };
     defer parsed.deinit(allocator);
     const environment_store_root = init.environ_map.get("CAS_STORE_ROOT");
@@ -940,7 +955,7 @@ fn cmdStart(operation: Operation, allocator: std.mem.Allocator, parsed: ParsedAr
     const cwd = try startReviewCwdAlloc(operation, allocator, parsed, workflow_binding);
     defer allocator.free(cwd);
     if (workflowBoundStartAdmissionFailure(parsed, workflow_binding)) |failure| {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "start",
@@ -954,7 +969,7 @@ fn cmdStart(operation: Operation, allocator: std.mem.Allocator, parsed: ParsedAr
     var gate = try startReviewRuntimeGate(operation, allocator, parsed, cwd);
     defer gate.deinit(allocator);
     validateThreadStartOptionsForGate(allocator, operation.fs.io, parsed, gate) catch |err| {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "start",
@@ -1027,7 +1042,7 @@ fn startReviewCwdAlloc(
 ) ![]const u8 {
     return repoRealpathAlloc(operation, allocator, parsed.cwd.?) catch |err| {
         if (workflow_binding != null) {
-            try renderErrorAndExit(
+            try renderCommandError(
                 operation,
                 parsed.json,
                 "start",
@@ -1059,7 +1074,7 @@ fn startReviewRuntimeGate(
         parsed.codex_path,
         parsed.code_mode_host,
     ) catch |err| {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "start",
@@ -1088,7 +1103,7 @@ fn startReviewCodeModeHost(
 ) !?cas.app_server_launch.CodeModeHost {
     const raw = parsed.code_mode_host orelse return null;
     return cas.app_server_launch.CodeModeHost.init(allocator, raw) catch |err| {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "start",
@@ -1228,7 +1243,7 @@ const ReviewStart = struct {
         message: []const u8,
         failure: FailureInfo,
     ) !noreturn {
-        return renderErrorAndExit(
+        return renderCommandError(
             self.operation,
             self.parsed.json,
             "start",
@@ -1386,7 +1401,7 @@ const ReviewStart = struct {
         self.receipt.account_fingerprint_reduced_protection =
             self.tuple.?.account_fingerprint_reduced_protection;
         self.receipt.codex_thread_id = self.tuple.?.codex_thread_id;
-        self.lock_bundle = try acquireReviewTupleStartLockOrExit(
+        self.lock_bundle = try acquireReviewTupleStartLock(
             self.operation,
             self.allocator,
             self.parsed.json,
@@ -1524,7 +1539,7 @@ const ReviewStart = struct {
             "pre_review_start_failed";
         self.updateLock(state, failure_for_lock.code);
         if (self.workflow_binding != null) self.managed_server.?.kill();
-        return renderErrorAndExit(
+        return renderCommandError(
             self.operation,
             self.parsed.json,
             "start",
@@ -1685,7 +1700,7 @@ const ReviewStart = struct {
             var status = try makeDisconnectedReviewStatus(self.allocator);
             defer status.deinit(self.allocator);
             try self.printJsonResult(status, false, true, failure);
-            std.process.exit(1);
+            return error.CommandReportedFailure;
         };
         self.updateLock("review_started", null);
     }
@@ -1824,13 +1839,13 @@ const ReviewStart = struct {
         if (self.workflow_binding != null) {
             self.terminalize(disposition.failure);
             try self.printJsonResult(status, true, true, disposition.failure);
-            std.process.exit(1);
+            return error.CommandReportedFailure;
         }
         self.record.?.last_observed_status = timeoutStatusString(&status);
         try writeSessionRecord(self.operation, self.allocator, self.record_path.?, self.record.?);
         self.updateLock(disposition.lock_state, disposition.failure.code);
         try self.printResult(status, true, true, disposition.failure);
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn waitFailure(self: *ReviewStart, err: anyerror) !noreturn {
@@ -1848,7 +1863,7 @@ const ReviewStart = struct {
                 .{ failure.hint, failure.code, self.record_path.? },
             );
         }
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn persistTerminal(self: *ReviewStart, latest: ReviewStatus) !void {
@@ -1860,7 +1875,7 @@ const ReviewStart = struct {
             self.receipt.error_review_attempt_phase = "review_terminal";
             self.receipt.error_review_attempt_exists = true;
             if (self.parsed.json) try self.printJsonResult(latest, false, true, failure);
-            std.process.exit(1);
+            return error.CommandReportedFailure;
         };
     }
 
@@ -1884,7 +1899,7 @@ const ReviewStart = struct {
         self.updateLock(state, failure.code);
         if (self.workflow_binding != null) self.managed_server.?.kill();
         try self.printResult(latest, false, true, failure);
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn finishResult(self: *ReviewStart, latest: ReviewStatus) !void {
@@ -1941,10 +1956,10 @@ const ReviewStart = struct {
             self.record_path,
             self.event_log_path,
         );
-        // Renderers may exit, so owner cleanup precedes the terminal render.
+        // Stop the owner before rendering the terminal result.
         if (self.workflow_binding != null) self.managed_server.?.kill();
         try self.printResult(latest, false, true, failure);
-        if (failure != null) std.process.exit(1);
+        if (failure != null) return error.CommandReportedFailure;
     }
 };
 fn cmdWait(initial_operation: Operation, allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
@@ -1957,7 +1972,7 @@ fn cmdWait(initial_operation: Operation, allocator: std.mem.Allocator, parsed: P
     defer stored_identity.deinit(allocator);
     const deadline_ms = monotonicMilliseconds(operation.fs.io) + @as(i64, parsed.timeout_ms);
     if (try recordHasTerminalFailureReplayCandidate(operation, allocator, record, loaded.record_path)) {
-        try replayTerminalRecordAndExit(
+        try replayTerminalRecord(
             operation,
             allocator,
             parsed.json,
@@ -2033,7 +2048,7 @@ fn waitRuntimeGate(
         record.resolved_codex_path,
         null,
     ) catch |err| {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "wait",
@@ -2063,7 +2078,7 @@ fn waitRuntimeGate(
     if (!std.mem.eql(u8, record.codex_binary_digest orelse "", gate.binary_digest) or
         !reviewRecordContractSupported(record.app_server_contract_id))
     {
-        try renderErrorAndExit(
+        try renderCommandError(
             operation,
             parsed.json,
             "wait",
@@ -2105,7 +2120,7 @@ const HistoricalWaitContext = struct {
     deadline_ms: i64,
 
     fn replay(self: HistoricalWaitContext) !void {
-        try replayTerminalRecordAndExit(
+        try replayTerminalRecord(
             self.operation,
             self.allocator,
             self.parsed.json,
@@ -2131,7 +2146,7 @@ const HistoricalWaitContext = struct {
             null,
             failure,
         );
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn connect(self: HistoricalWaitContext, deadline_ms: i64) !cas.Client {
@@ -2246,7 +2261,7 @@ const HistoricalWaitContext = struct {
     }
 
     fn historicalTimeout(self: HistoricalWaitContext, tuple: ReviewTupleIdentity) !void {
-        try emitHistoricalWaitTimeoutAndExit(
+        try emitHistoricalWaitTimeout(
             self.operation,
             self.allocator,
             self.parsed,
@@ -2439,7 +2454,7 @@ const HistoricalWaitContext = struct {
                 .{ self.parsed.timeout_ms, self.record.review_thread_id },
             );
         }
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn missingResult(
@@ -2478,7 +2493,7 @@ const HistoricalWaitContext = struct {
                 .{self.record.review_thread_id},
             );
         }
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     }
 
     fn printStatus(
@@ -2584,7 +2599,7 @@ const HistoricalWaitContext = struct {
                 },
             );
         }
-        if (failure != null) std.process.exit(1);
+        if (failure != null) return error.CommandReportedFailure;
     }
 };
 
@@ -5834,7 +5849,7 @@ fn makeDisconnectedReviewStatus(allocator: std.mem.Allocator) !ReviewStatus {
     };
 }
 
-fn emitHistoricalWaitTimeoutAndExit(
+fn emitHistoricalWaitTimeout(
     operation: Operation,
     allocator: std.mem.Allocator,
     parsed: ParsedArgs,
@@ -5859,7 +5874,7 @@ fn emitHistoricalWaitTimeoutAndExit(
         "waiting",
         failure.code,
     )) {
-        try replayTerminalRecordAndExit(
+        try replayTerminalRecord(
             operation,
             allocator,
             parsed.json,
@@ -5903,7 +5918,7 @@ fn emitHistoricalWaitTimeoutAndExit(
             .{ parsed.timeout_ms, record.review_thread_id },
         );
     }
-    std.process.exit(1);
+    return error.CommandReportedFailure;
 }
 
 fn printRecordedReviewFailureJson(
@@ -6605,7 +6620,7 @@ fn recordTerminalOwnerFailure(
     return terminalReviewOwnerFailure(lock_code);
 }
 
-fn replayNormalizedRecordAndExit(
+fn replayNormalizedRecord(
     operation: Operation,
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -6646,10 +6661,10 @@ fn replayNormalizedRecordAndExit(
     // A completed review is a successful wait operation even when its
     // semantic verdict contains findings. Review credit is adjudicated by
     // the caller; replay must preserve the live wait command's exit law.
-    std.process.exit(0);
+    return error.CommandReportedSuccess;
 }
 
-fn replayTerminalRecordAndExit(
+fn replayTerminalRecord(
     operation: Operation,
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -6665,7 +6680,7 @@ fn replayTerminalRecordAndExit(
     );
     defer loaded.deinit(allocator);
     if (std.mem.eql(u8, loaded.record.state, "normalized")) {
-        try replayNormalizedRecordAndExit(operation, allocator, json_mode, record, record_path, identity);
+        try replayNormalizedRecord(operation, allocator, json_mode, record, record_path, identity);
     }
 
     const terminal = std.mem.eql(u8, loaded.record.state, "terminal") or
@@ -6707,7 +6722,7 @@ fn replayTerminalRecordAndExit(
             .{ failure.hint, failure.code, record_path },
         );
     }
-    std.process.exit(1);
+    return error.CommandReportedFailure;
 }
 
 const WorkflowBoundRecordOwnerState = enum {
@@ -8003,7 +8018,7 @@ fn replayExistingReviewTuple(
         try writeReceiptObject(stdout, normalized);
     }
     try stdout.writeAll("\n");
-    std.process.exit(if (normalizedReceiptCommandSucceeded(normalized)) 0 else 1);
+    return if (normalizedReceiptCommandSucceeded(normalized)) error.CommandReportedSuccess else error.CommandReportedFailure;
 }
 
 fn writeReviewTupleShadowBestEffort(
@@ -8037,7 +8052,7 @@ fn writeReviewTupleShadowBestEffort(
     defer allocator.free(path);
 }
 
-fn printReviewTupleLockExistingAndExit(
+fn printReviewTupleLockExisting(
     operation: Operation,
     allocator: std.mem.Allocator,
     action_name: []const u8,
@@ -8074,7 +8089,7 @@ fn printReviewTupleLockExistingAndExit(
     }
     var writer = std.Io.File.stdout().writer(operation.fs.io, &.{});
     try writer.interface.print("{s}\n", .{payload_json});
-    std.process.exit(1);
+    return error.CommandReportedFailure;
 }
 
 fn writeRunNormalizedReceiptObject(
@@ -8312,7 +8327,7 @@ fn printBlockedReviewTupleJson(
     try writer.interface.print("{s}\n", .{payload});
 }
 
-fn emitReviewTupleLockBlockedAndExit(
+fn emitReviewTupleLockBlocked(
     operation: Operation,
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -8344,7 +8359,7 @@ fn emitReviewTupleLockBlockedAndExit(
             .{ decision.asString(), status.failure.hint },
         );
     }
-    std.process.exit(1);
+    return error.CommandReportedFailure;
 }
 
 const ReviewTupleStartLockBundle = struct {
@@ -8384,7 +8399,7 @@ const ReviewTupleLockAcquisition = struct {
         decision: ReviewTupleLockAction,
     ) !noreturn {
         killManagedServerBeforeTupleLockExit(self.managed_server);
-        return emitReviewTupleLockBlockedAndExit(
+        return emitReviewTupleLockBlocked(
             self.operation,
             self.allocator,
             self.json_mode,
@@ -8429,7 +8444,7 @@ const ReviewTupleLockAcquisition = struct {
         switch (decision) {
             .return_existing, .normalize_existing => {
                 killManagedServerBeforeTupleLockExit(self.managed_server);
-                try printReviewTupleLockExistingAndExit(
+                try printReviewTupleLockExisting(
                     self.operation,
                     self.allocator,
                     self.action_name,
@@ -8543,7 +8558,7 @@ const ReviewTupleLockAcquisition = struct {
     }
 };
 
-fn acquireReviewTupleStartLockOrExit(
+fn acquireReviewTupleStartLock(
     operation: Operation,
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -8670,7 +8685,7 @@ fn transitionReviewTupleLockForRecordOrReplay(
         state,
         failure_code,
     )) return;
-    try replayTerminalRecordAndExit(
+    try replayTerminalRecord(
         operation,
         allocator,
         json_mode,
@@ -8796,7 +8811,7 @@ const ErrorReviewVerdict = struct {
     workflowBinding: ?WorkflowBinding,
     findings: []const std.json.Value = &.{},
 };
-fn renderErrorAndExit(
+fn renderCommandError(
     operation: Operation,
     json_mode: bool,
     action: []const u8,
@@ -8816,7 +8831,7 @@ fn renderErrorAndExit(
         const stderr = &stderr_writer.interface;
         try stderr.print("{s}: {s} ({s})\n", .{ method, message, failure.code });
     }
-    std.process.exit(1);
+    return error.CommandReportedFailure;
 }
 
 fn renderErrorReceipt(
@@ -9736,7 +9751,7 @@ fn writeStartNormalizedReceipt(
         output.receipt.fresh_attempt_required,
     );
     try writer.writeByte('\n');
-    if (!normalizedReceiptCommandSucceeded(normalized)) std.process.exit(1);
+    if (!normalizedReceiptCommandSucceeded(normalized)) return error.CommandReportedFailure;
     return true;
 }
 
@@ -19921,4 +19936,58 @@ test "review behavioral gate rejects missing failed or duplicate required probes
     );
     defer failed.deinit();
     try std.testing.expect(!reviewBehavioralProbesPassed(failed.value));
+}
+
+test "command runner returns status and remains callable after a rejected command" {
+    const Hooks = struct {
+        var written: usize = 0;
+        var fail_writes: bool = false;
+        fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            switch (operation) {
+                .file_write_streaming => |write| {
+                    if (fail_writes) return .{ .file_write_streaming = error.InputOutput };
+                    var count = write.header.len;
+                    for (write.data, 0..) |bytes, i| {
+                        count += bytes.len * (if (i + 1 == write.data.len) write.splat else 1);
+                    }
+                    written += count;
+                    return .{ .file_write_streaming = count };
+                },
+                else => return std.testing.io.vtable.operate(userdata, operation),
+            }
+        }
+    };
+    Hooks.written = 0;
+    Hooks.fail_writes = false;
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = Hooks.operate;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ = try std.testing.environ.createMap(std.testing.allocator);
+    defer environ.deinit();
+    var init: std.process.Init = .{
+        .minimal = .{ .environ = std.testing.environ, .args = .{ .vector = &.{ "cas_review_session", "--unknown" } } },
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable },
+        .environ_map = &environ,
+        .preopens = .empty,
+    };
+    try std.testing.expectEqual(@as(u8, 2), try runCommand(init));
+    try std.testing.expect(Hooks.written > 0);
+    Hooks.fail_writes = true;
+    try std.testing.expectEqual(@as(u8, 1), try runCommand(init));
+    Hooks.fail_writes = false;
+    try std.testing.expectError(error.CommandReportedFailure, renderCommandError(
+        .{ .fs = .init(init.io, .cwd()), .environ = &environ },
+        false,
+        "start",
+        "review/start",
+        "fixture rejection",
+        null,
+        .{},
+        .{ .code = "fixture_failure", .hint = "fixture" },
+    ));
+    init.minimal.args.vector = &.{ "cas_review_session", "--version" };
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(init));
 }

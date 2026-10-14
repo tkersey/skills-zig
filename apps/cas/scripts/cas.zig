@@ -130,6 +130,11 @@ const InstalledBinarySet =
     "cas_app_server_preflight";
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
     const io = init.io;
     const environ = init.environ_map;
     const allocator = init.gpa;
@@ -141,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
+        return 0;
     }
 
     if (delegate.isVersionRequested(argv)) {
@@ -151,12 +156,11 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     if (std.mem.eql(u8, argv[1], "capabilities")) {
-        try printCapabilities(io, argv[2..]);
-        return;
+        return printCapabilities(io, argv[2..]);
     }
 
     var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -174,17 +178,17 @@ pub fn main(init: std.process.Init) !void {
                 "failed to launch Codex app-server: {s}\n",
                 .{@errorName(err)},
             );
-            std.process.exit(1);
+            return 1;
         };
-        std.process.exit(exit_code);
+        return exit_code;
     }
 
     return runSelectedTarget(directory, environ, allocator, init.io, argv);
 }
 
-fn runSelectedTarget(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+fn runSelectedTarget(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
     const target_name = resolveTarget(argv[1]) orelse {
-        exitUsageFailure(io, "UnknownSubcommand", argv[1]);
+        return usageFailure(io, "UnknownSubcommand", argv[1]);
     };
 
     const target_exec = blk: {
@@ -216,9 +220,9 @@ fn runSelectedTarget(directory: std.Io.Dir, environ: *const std.process.Environ.
                 "binary set beside `cas` ({s})\n",
             .{ target_name, @errorName(err), InstalledBinarySet },
         );
-        std.process.exit(1);
+        return 1;
     };
-    std.process.exit(exit_code);
+    return exit_code;
 }
 
 fn runAppServerDelegate(
@@ -405,7 +409,7 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     return null;
 }
 
-fn printCapabilities(io: std.Io, args: []const []const u8) !void {
+fn printCapabilities(io: std.Io, args: []const []const u8) !u8 {
     var json = false;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
@@ -423,9 +427,9 @@ fn printCapabilities(io: std.Io, args: []const []const u8) !void {
                 \\  cas capabilities [--json]
                 \\
             );
-            return;
+            return 0;
         } else {
-            exitUsageFailure(io, "UnknownFlag", arg);
+            return usageFailure(io, "UnknownFlag", arg);
         }
     }
     var stdout_writer = std.Io.File.stdout().writer(
@@ -434,6 +438,7 @@ fn printCapabilities(io: std.Io, args: []const []const u8) !void {
     );
     const stdout = &stdout_writer.interface;
     try writeCapabilities(stdout, json);
+    return 0;
 }
 
 fn writeCapabilities(writer: *std.Io.Writer, json: bool) !void {
@@ -665,10 +670,10 @@ test "capabilities publish current contract features" {
     }
 }
 
-fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    return 2;
 }
 
 test "delegated process uses the supplied directory and environment" {

@@ -125,26 +125,37 @@ const FailureOut = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
     const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
 
     const opts = parseArgs(argv) catch |err| {
-        exitUsageFailure(io, @errorName(err), null);
+        return usageFailure(io, @errorName(err), null);
     };
 
-    if (opts.show_version) return printVersion(io);
-    if (opts.show_help) return printHelp(io);
-    if (opts.command == null) exitUsageFailure(
+    if (opts.show_version) {
+        try printVersion(io);
+        return 0;
+    }
+    if (opts.show_help) {
+        try printHelp(io);
+        return 0;
+    }
+    if (opts.command == null) return usageFailure(
         io,
         "MissingCommand",
         "status",
     );
 
     const cwd = opts.cwd orelse {
-        exitUsageFailure(io, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
 
     var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -152,14 +163,15 @@ pub fn main(init: std.process.Init) !void {
     const environ = init.environ_map;
 
     var account_client = startAccountClient(directory, environ, allocator, opts, cwd, init.io) catch |err| {
-        try fail(io, allocator, opts, "transportFailure", @errorName(err), 1);
+        return fail(io, allocator, opts, "transportFailure", @errorName(err), 1);
     };
     defer account_client.deinit(allocator);
 
     runStatus(io, allocator, opts, &account_client.client) catch |err| {
         const code = classifyFailure(err);
-        try fail(io, allocator, opts, code, failureHint(code), 1);
+        return fail(io, allocator, opts, code, failureHint(code), 1);
     };
+    return 0;
 }
 
 fn runStatus(io: std.Io, allocator: std.mem.Allocator, opts: ParsedArgs, client: *cas.Client) !void {
@@ -649,7 +661,7 @@ fn fail(
     code: []const u8,
     hint: ?[]const u8,
     exit_code: u8,
-) !noreturn {
+) !u8 {
     if (opts.json) {
         const payload = FailureOut{
             .failureCode = code,
@@ -674,7 +686,7 @@ fn fail(
         ) else try stderr.print("cas_account status: {s}\n", .{code});
     }
     _ = allocator;
-    std.process.exit(exit_code);
+    return exit_code;
 }
 
 fn printVersion(io: std.Io) !void {
@@ -867,8 +879,8 @@ test "usage search handles deep and wide JSON without recursion" {
     ));
 }
 
-fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    return 2;
 }

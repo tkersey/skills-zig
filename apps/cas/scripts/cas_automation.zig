@@ -240,23 +240,28 @@ const SchedulerLabelArgs = automation_scheduler.SchedulerLabelArgs;
 const DoctorArgs = automation_store.DoctorArgs;
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
         try printUsage(init.io);
-        return;
+        return 0;
     }
     if (isHelpArg(argv[1])) {
         try printUsage(init.io);
-        return;
+        return 0;
     }
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
         var stdout_file = std.Io.File.stdout();
         var stdout_writer = stdout_file.writer(init.io, &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     var cwd = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
@@ -265,14 +270,15 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(cwd_path);
     const operation: Operation = .{ .io = init.io, .cwd = cwd, .cwd_path = cwd_path, .environment = init.environ_map };
     run(allocator, operation, argv[1..]) catch |err| {
-        if (err == error.UserInput) std.process.exit(1);
+        if (err == error.UserInput) return 1;
 
         var stderr_file = std.Io.File.stderr();
         var stderr_writer = stderr_file.writer(operation.io, &.{});
         const stderr = &stderr_writer.interface;
         ignoreError(stderr.print("error: {s}: {s}\n", .{ @errorName(err), SourceFile }));
-        std.process.exit(1);
+        return 1;
     };
+    return 0;
 }
 
 fn run(allocator: std.mem.Allocator, operation: Operation, raw_args: []const []const u8) !void {

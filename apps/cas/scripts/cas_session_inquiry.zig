@@ -547,12 +547,27 @@ const ThreadHistorySnapshot = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) !u8 {
+    execute(init) catch |err| return switch (err) {
+        error.CommandReportedSuccess => 0,
+        error.CommandReportedFailure => 1,
+        error.CommandReportedRejection => 2,
+        else => err,
+    };
+    return 0;
+}
+
+fn execute(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var stdout = std.Io.File.stdout().writer(init.io, &.{});
     if (try core_cli.handleDefaultHelpAndVersionSurface(&stdout.interface, argv, HelpSurface, Version)) return;
     var options = parseArgs(argv) catch |err| {
-        exitUsageFailure(init.io, @errorName(err), null);
+        try usageFailure(init.io, @errorName(err), null);
     };
     options.home = init.environ_map.get("HOME") orelse "";
     options.path_env = init.environ_map.get("PATH") orelse "";
@@ -576,10 +591,10 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn exitUsageFailure(io: std.Io, err_token: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, err_token: []const u8, detail: ?[]const u8) !noreturn {
     var stderr = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&stderr.interface, HelpSurface, Version, err_token, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&stderr.interface, HelpSurface, Version, err_token, detail) catch return error.CommandReportedFailure;
+    return error.CommandReportedRejection;
 }
 
 fn printDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
@@ -729,11 +744,11 @@ fn isSafePathComponent(value: []const u8) bool {
 fn cmdPreflight(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const result = runPreflight(op, allocator, options) catch |err| {
         try printPreflightFailure(op, allocator, options, err);
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     };
     defer deinitPreflightResult(allocator, result);
     try printJsonValue(op, allocator, .{ .session_inquiry_preflight = result });
-    if (!result.inquiry_allowed) std.process.exit(2);
+    if (!result.inquiry_allowed) return error.CommandReportedRejection;
 }
 
 const RunPaths = struct {
@@ -746,27 +761,27 @@ const RunPaths = struct {
     receipt_dir: []const u8,
 };
 
-fn requiredRunFlag(op: Operation, value: ?[]const u8, flag: []const u8) []const u8 {
-    return value orelse exitUsageFailure(op.fs.io, "MissingFlag", flag);
+fn requiredRunFlag(op: Operation, value: ?[]const u8, flag: []const u8) ![]const u8 {
+    return value orelse try usageFailure(op.fs.io, "MissingFlag", flag);
 }
 
-fn requiredRunPaths(op: Operation, options: Options) RunPaths {
+fn requiredRunPaths(op: Operation, options: Options) !RunPaths {
     return .{
-        .capsule = requiredRunFlag(op, options.capsule_path, "--capsule"),
-        .capsule_validation = requiredRunFlag(
+        .capsule = try requiredRunFlag(op, options.capsule_path, "--capsule"),
+        .capsule_validation = try requiredRunFlag(
             op,
             options.capsule_validation_path,
             "--capsule-validation",
         ),
-        .capsule_definition = requiredRunFlag(
+        .capsule_definition = try requiredRunFlag(
             op,
             options.capsule_definition_path,
             "--capsule-definition",
         ),
-        .plan = requiredRunFlag(op, options.plan_path, "--plan"),
-        .plan_validation = requiredRunFlag(op, options.plan_validation_path, "--plan-validation"),
-        .plan_definition = requiredRunFlag(op, options.plan_definition_path, "--plan-definition"),
-        .receipt_dir = requiredRunFlag(op, options.receipt_dir, "--receipt-dir"),
+        .plan = try requiredRunFlag(op, options.plan_path, "--plan"),
+        .plan_validation = try requiredRunFlag(op, options.plan_validation_path, "--plan-validation"),
+        .plan_definition = try requiredRunFlag(op, options.plan_definition_path, "--plan-definition"),
+        .receipt_dir = try requiredRunFlag(op, options.receipt_dir, "--receipt-dir"),
     };
 }
 
@@ -792,7 +807,7 @@ fn bindRunInput(
 ) !BoundRunInput {
     const absolute = absoluteLexicalPathAlloc(op, allocator, definition_path) catch |err| {
         try printFailureJson(op, allocator, failure, @errorName(err));
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
     errdefer allocator.free(absolute);
     const validated = validateLedgerInput(
@@ -804,13 +819,13 @@ fn bindRunInput(
         input_name,
     ) catch |err| {
         try printFailureJson(op, allocator, failure, @errorName(err));
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
     return .{ .definition_path = absolute, .validated = validated };
 }
 
 fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detached: bool) !void {
-    const paths = requiredRunPaths(op, options);
+    const paths = try requiredRunPaths(op, options);
     var capsule = try bindRunInput(
         op,
         allocator,
@@ -824,7 +839,7 @@ fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detache
     defer capsule.deinit(allocator);
     const dcp = loadDcpBytes(allocator, capsule.validated.input) catch |err| {
         try printFailureJson(op, allocator, .capsule_invalid, @errorName(err));
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
     defer deinitDcp(allocator, dcp);
     var plan = try bindRunInput(
@@ -840,7 +855,7 @@ fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detache
     defer plan.deinit(allocator);
     const rip = loadRipBytes(allocator, plan.validated.input) catch |err| {
         try printFailureJson(op, allocator, .plan_invalid, @errorName(err));
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
     defer deinitRip(allocator, rip);
     var bound_options = options;
@@ -850,9 +865,9 @@ fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detache
     bound_options.plan_definition_path = plan.definition_path;
     bound_options.plan_bytes = plan.validated.input;
     bound_options.plan_validation_bytes = plan.validated.receipt;
-    try validateRunOrExit(op, allocator, bound_options, dcp, rip, paths.receipt_dir, detached);
+    try validateRunForCommand(op, allocator, bound_options, dcp, rip, paths.receipt_dir, detached);
     const preflight_allocator = std.heap.page_allocator;
-    const preflight = try runPreflightOrExit(
+    const preflight = try runPreflightForCommand(
         op,
         preflight_allocator,
         bound_options,
@@ -875,10 +890,10 @@ fn cmdRun(op: Operation, allocator: std.mem.Allocator, options: Options, detache
     );
     defer deinitRunOutput(run_allocator, result);
     try printJsonValue(op, allocator, .{ .session_inquiry = result });
-    if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
+    if (!std.mem.eql(u8, result.failure_code, "")) return error.CommandReportedRejection;
 }
 
-fn validateRunOrExit(
+fn validateRunForCommand(
     op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
@@ -894,16 +909,16 @@ fn validateRunOrExit(
             .plan_invalid,
             "RIP source_capsule does not match DCP packet_id",
         );
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     }
     const gate = validateInquiryInputs(op, allocator, dcp, rip, options);
     if (gate.valid) return;
     try persistInvalidRunArtifacts(op, allocator, options, dcp, rip, receipt_dir, gate, detached);
     try printFailureJson(op, allocator, gate.failure_code orelse .receipt_invalid, gate.hint);
-    std.process.exit(2);
+    return error.CommandReportedRejection;
 }
 
-fn runPreflightOrExit(
+fn runPreflightForCommand(
     op: Operation,
     allocator: std.mem.Allocator,
     options: Options,
@@ -920,7 +935,7 @@ fn runPreflightOrExit(
         };
         try persistInvalidRunArtifacts(op, allocator, options, dcp, rip, receipt_dir, failed, detached);
         try printFailureJson(op, allocator, .codex_incompatible, @errorName(err));
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     };
     errdefer deinitPreflightResult(allocator, preflight);
     const lineage_supported = if (dcp.source_thread_id != null)
@@ -940,7 +955,7 @@ fn runPreflightOrExit(
     };
     try persistInvalidRunArtifacts(op, allocator, options, dcp, rip, receipt_dir, failed, detached);
     try printFailureJson(op, allocator, .codex_incompatible, failed.hint);
-    std.process.exit(2);
+    return error.CommandReportedRejection;
 }
 
 fn runInquiryOrRecordFailure(
@@ -979,12 +994,12 @@ fn runInquiryOrRecordFailure(
 
 fn cmdStatus(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        exitUsageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
     const path = try stateRecordPath(op, allocator, options.home, inquiry_id);
     const raw = readFileAlloc(op, allocator, path, MaxInputBytes) catch |err| {
         try printFailureJson(op, allocator, FailureCode.receipt_invalid, @errorName(err));
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     };
     defer allocator.free(raw);
     try printRawJson(op, raw);
@@ -992,20 +1007,20 @@ fn cmdStatus(op: Operation, allocator: std.mem.Allocator, options: Options) !voi
 
 fn cmdWait(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        exitUsageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
     const result = waitDetachedInquiry(op, allocator, options, inquiry_id) catch |err| {
         try printFailureJson(op, allocator, failureCodeForError(err), @errorName(err));
-        std.process.exit(1);
+        return error.CommandReportedFailure;
     };
     defer deinitRunOutput(allocator, result);
     try printJsonValue(op, allocator, .{ .session_inquiry = result });
-    if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
+    if (!std.mem.eql(u8, result.failure_code, "")) return error.CommandReportedRejection;
 }
 
 fn cmdInterrupt(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        exitUsageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
     const result = interruptDetachedInquiry(op, allocator, options, inquiry_id) catch |err| {
         try printJsonValue(op, allocator, .{
@@ -1016,15 +1031,15 @@ fn cmdInterrupt(op: Operation, allocator: std.mem.Allocator, options: Options) !
                 .failure_hint = @errorName(err),
             },
         });
-        std.process.exit(2);
+        return error.CommandReportedRejection;
     };
     try printJsonValue(op, allocator, result);
-    if (!result.session_inquiry_interrupt.interrupted) std.process.exit(2);
+    if (!result.session_inquiry_interrupt.interrupted) return error.CommandReportedRejection;
 }
 
 fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const inquiry_id = options.inquiry_id orelse {
-        exitUsageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
+        try usageFailure(op.fs.io, "MissingFlag", "--inquiry-id");
     };
     const maybe_record = loadDetachedRecordAlloc(op, allocator, options.home, inquiry_id) catch null;
     defer if (maybe_record) |loaded| freeDetachedRecord(allocator, loaded);
@@ -1215,7 +1230,7 @@ fn cleanupForkThreadIdWithMethod(
 
 fn cmdReceipt(op: Operation, allocator: std.mem.Allocator, options: Options) !void {
     const glob = options.receipt_glob orelse {
-        exitUsageFailure(op.fs.io, "MissingFlag", "--glob");
+        try usageFailure(op.fs.io, "MissingFlag", "--glob");
     };
     const files = try expandSimpleGlobAlloc(op, allocator, glob);
     var valid: usize = 0;
@@ -1244,7 +1259,7 @@ fn cmdReceipt(op: Operation, allocator: std.mem.Allocator, options: Options) !vo
         const stdout = &stdout_writer.interface;
         try stdout.print("files valid invalid\n{d} {d} {d}\n", .{ files.len, valid, invalid });
     }
-    if (invalid > 0) std.process.exit(2);
+    if (invalid > 0) return error.CommandReportedRejection;
 }
 
 fn runPreflight(op: Operation, allocator: std.mem.Allocator, options: Options) !PreflightResult {
@@ -8902,4 +8917,51 @@ fn freeDetachedRecord(allocator: std.mem.Allocator, record: DetachedRecord) void
     allocator.free(record.cwd);
     allocator.free(record.failure_code);
     allocator.free(record.failure_hint);
+}
+
+test "command runner returns status and remains callable after a rejected command" {
+    const Hooks = struct {
+        var written: usize = 0;
+        var fail_writes: bool = false;
+        fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            switch (operation) {
+                .file_write_streaming => |write| {
+                    if (fail_writes) return .{ .file_write_streaming = error.InputOutput };
+                    var count = write.header.len;
+                    for (write.data, 0..) |bytes, i| {
+                        count += bytes.len * (if (i + 1 == write.data.len) write.splat else 1);
+                    }
+                    written += count;
+                    return .{ .file_write_streaming = count };
+                },
+                else => return std.testing.io.vtable.operate(userdata, operation),
+            }
+        }
+    };
+    Hooks.written = 0;
+    Hooks.fail_writes = false;
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = Hooks.operate;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ = try std.testing.environ.createMap(std.testing.allocator);
+    defer environ.deinit();
+    var init: std.process.Init = .{
+        .minimal = .{ .environ = std.testing.environ, .args = .{ .vector = &.{ "cas_session_inquiry", "--unknown" } } },
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable },
+        .environ_map = &environ,
+        .preopens = .empty,
+    };
+    try std.testing.expectEqual(@as(u8, 2), try runCommand(init));
+    try std.testing.expect(Hooks.written > 0);
+    Hooks.fail_writes = true;
+    try std.testing.expectEqual(@as(u8, 1), try runCommand(init));
+    Hooks.fail_writes = false;
+    var operation = testOperation();
+    operation.fs = .init(init.io, .cwd());
+    try std.testing.expectError(error.CommandReportedRejection, cmdStatus(operation, std.testing.allocator, .{ .command = .status }));
+    init.minimal.args.vector = &.{ "cas_session_inquiry", "--version" };
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(init));
 }

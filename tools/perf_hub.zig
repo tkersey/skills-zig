@@ -1135,15 +1135,20 @@ const ParsedArgs = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+fn runCommand(init: std.process.Init) !u8 {
     const environ = init.environ_map;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&stdout_writer.interface, argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&stdout_writer.interface, argv, HelpSurface, Version)) return 0;
     const parsed = parseArgs(argv[1..]) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
-        core_cli.printUsageFailureWithHelp(&stderr_writer.interface, HelpSurface, Version, @errorName(err), null) catch std.process.exit(1);
-        std.process.exit(2);
+        core_cli.printUsageFailureWithHelp(&stderr_writer.interface, HelpSurface, Version, @errorName(err), null) catch return 1;
+        return 2;
     };
     switch (parsed.command) {
         .list => try cmdList(init.io, parsed.target),
@@ -1155,12 +1160,13 @@ pub fn main(init: std.process.Init) !void {
             defer root_dir.close(init.io);
             const fs = durable_store.Fs.init(init.io, root_dir);
             if (parsed.command == .compare) {
-                try cmdCompare(fs, environ, allocator, parsed.target);
+                return cmdCompare(fs, environ, allocator, parsed.target);
             } else {
                 try cmdReport(fs, environ, allocator);
             }
         },
     }
+    return 0;
 }
 
 fn parseArgs(args: []const []const u8) !ParsedArgs {
@@ -1444,7 +1450,7 @@ fn invalidateCurrentCapsule(fs: durable_store.Fs, allocator: std.mem.Allocator, 
     );
 }
 
-fn cmdCompare(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, target: ?[]const u8) !void {
+fn cmdCompare(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, target: ?[]const u8) !u8 {
     const expected_rows = matchingCaseCount(target);
     if (expected_rows == 0) return error.NoMatchingPerfCases;
     const machine_dir = try ensureCurrentMachineDir(fs, allocator);
@@ -1481,7 +1487,7 @@ fn cmdCompare(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, al
     }
     if (!comparisonSummaryComplete(environ, target, expected_rows, rows.items)) any_fail = true;
     try writeCompareSummaryRows(fs, environ, allocator, machine_dir, target, expected_rows, rows.items);
-    if (any_fail) std.process.exit(1);
+    return if (any_fail) 1 else 0;
 }
 
 fn comparisonStatusFailed(status: []const u8) bool {

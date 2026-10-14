@@ -82,14 +82,19 @@ const CodeModeHostReport = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
     const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        exitUsageFailure(io, @errorName(err), null);
+        return usageFailure(io, @errorName(err), null);
     };
     defer allocator.free(parsed.opt_out_methods);
 
@@ -100,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     if (parsed.show_help) {
@@ -110,11 +115,11 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
+        return 0;
     }
 
     const cwd = parsed.cwd orelse {
-        exitUsageFailure(io, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
 
     var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -130,12 +135,12 @@ fn runConfiguredSmoke(
     io: std.Io,
     parsed: ParsedArgs,
     cwd: []const u8,
-) !void {
+) !u8 {
     const validated_transport = launch.validateTransport(
         parsed.requested_transport,
         parsed.transport_endpoint,
     ) catch |err| {
-        exitUsageFailure(
+        return usageFailure(
             io,
             @errorName(err),
             "--app-server-transport/--app-server-endpoint",
@@ -143,7 +148,7 @@ fn runConfiguredSmoke(
     };
     var code_mode_host = if (parsed.code_mode_host) |raw|
         launch.CodeModeHost.init(allocator, raw) catch |err| {
-            exitUsageFailure(io, @errorName(err), "--code-mode-host");
+            return usageFailure(io, @errorName(err), "--code-mode-host");
         }
     else
         null;
@@ -159,7 +164,7 @@ fn runConfiguredSmoke(
         validated_transport,
         if (code_mode_host) |*host| host else null,
     ) catch |err| {
-        exitUsageFailure(io, @errorName(err), "app-server transport");
+        return usageFailure(io, @errorName(err), "app-server transport");
     };
     defer acquired.deinit();
 
@@ -182,7 +187,7 @@ fn runSmokeChecks(
     cwd: []const u8,
     acquired: *AcquiredClient,
     code_mode_host: ?*const launch.CodeModeHost,
-) !void {
+) !u8 {
     var checks: std.ArrayList(CheckResult) = .empty;
     defer checks.deinit(allocator);
 
@@ -234,7 +239,7 @@ fn runSmokeChecks(
         captured_notifications.items,
         hook_log_path,
     );
-    std.process.exit(if (ok) 0 else 1);
+    return if (ok) 0 else 1;
 }
 
 fn reportSmokeChecks(
@@ -1032,8 +1037,8 @@ test "parseArgs rejects timeout outside the client integer domain" {
     }));
 }
 
-fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    return 2;
 }

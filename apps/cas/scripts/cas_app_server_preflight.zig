@@ -117,17 +117,24 @@ fn validCodeModeProbeNonce(nonce: []const u8) bool {
 }
 
 pub fn main(init: std.process.Init) void {
+    const code = runCommand(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn runCommand(init: std.process.Init) u8 {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch |err|
-        fatal(init.io, err, false);
+        return fatal(init.io, err, false);
     const fixture = internalModelFixtureOptions(argv, init.environ_map) catch |err|
-        fatal(init.io, err, false);
-    if (fixture == null) exitForRootRequest(init.io, argv[1..]);
+        return fatal(init.io, err, false);
+    if (fixture == null) {
+        if (rootRequest(init.io, argv[1..])) |code| return code;
+    }
     const parsed_options: ?Options = if (fixture == null)
-        parseArgs(argv[1..]) catch |err| fatal(init.io, err, jsonRequested(argv[1..]))
+        parseArgs(argv[1..]) catch |err| return fatal(init.io, err, jsonRequested(argv[1..]))
     else
         null;
     const dir = std.Io.Dir.cwd().openDir(init.io, ".", .{}) catch |err|
-        fatal(init.io, err, if (parsed_options) |options| options.json else false);
+        return fatal(init.io, err, if (parsed_options) |options| options.json else false);
     defer dir.close(init.io);
     if (fixture) |options| {
         serveInternalModelFixture(
@@ -138,13 +145,13 @@ pub fn main(init: std.process.Init) void {
             options.evidence_path,
             options.mode,
             options.nonce,
-        ) catch |err| fatal(init.io, err, false);
-        return;
+        ) catch |err| return fatal(init.io, err, false);
+        return 0;
     }
     const options = parsed_options.?;
     const compatible = run(init.gpa, init.io, dir, init.environ_map, options) catch |err|
-        fatal(init.io, err, options.json);
-    if (!compatible) std.process.exit(1);
+        return fatal(init.io, err, options.json);
+    return if (compatible) 0 else 1;
 }
 
 fn run(
@@ -2661,15 +2668,15 @@ fn parseArgs(args: []const []const u8) !Options {
     return options;
 }
 
-fn exitForRootRequest(io: std.Io, args: []const []const u8) void {
+fn rootRequest(io: std.Io, args: []const []const u8) ?u8 {
     if (isRootHelpRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(
             io,
             &.{},
         );
-        stdout_writer.interface.writeAll(Usage) catch |err| fatal(io, err, false);
-        stdout_writer.interface.flush() catch |err| fatal(io, err, false);
-        std.process.exit(0);
+        stdout_writer.interface.writeAll(Usage) catch |err| return fatal(io, err, false);
+        stdout_writer.interface.flush() catch |err| return fatal(io, err, false);
+        return 0;
     }
     if (isRootVersionRequest(args)) {
         var stdout_writer = std.Io.File.stdout().writer(
@@ -2677,10 +2684,11 @@ fn exitForRootRequest(io: std.Io, args: []const []const u8) void {
             &.{},
         );
         stdout_writer.interface.print("{s}\n", .{app_meta.version}) catch |err|
-            fatal(io, err, false);
-        stdout_writer.interface.flush() catch |err| fatal(io, err, false);
-        std.process.exit(0);
+            return fatal(io, err, false);
+        stdout_writer.interface.flush() catch |err| return fatal(io, err, false);
+        return 0;
     }
+    return null;
 }
 
 fn reportProbeCleanupFailure(path: []const u8, err: anyerror) void {
@@ -2765,22 +2773,22 @@ fn probeTransport(value: proxy.app_server_launch.RequestedTransport) contract.Pr
     };
 }
 
-fn fatal(io: std.Io, err: anyerror, json: bool) noreturn {
+fn fatal(io: std.Io, err: anyerror, json: bool) u8 {
     var stderr_writer = std.Io.File.stderr().writer(io, &.{});
     if (json) {
         stderr_writer.interface.print(
             "{{\"schema\":\"cas-app-server-error/v1\",\"status\":\"error\"," ++
                 "\"failureCode\":\"preflight_error\",\"failureHint\":\"{s}\"}}\n",
             .{@errorName(err)},
-        ) catch std.process.exit(2);
+        ) catch return 2;
     } else {
         stderr_writer.interface.print(
             "cas app-server: {s}\n{s}",
             .{ @errorName(err), Usage },
-        ) catch std.process.exit(2);
+        ) catch return 2;
     }
-    stderr_writer.interface.flush() catch std.process.exit(2);
-    std.process.exit(2);
+    stderr_writer.interface.flush() catch return 2;
+    return 2;
 }
 
 test "parser accepts exact profile transport and endpoint vocabulary" {

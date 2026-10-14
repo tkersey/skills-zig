@@ -345,20 +345,27 @@ fn wipeSecretCarrier(allocator: std.mem.Allocator, carrier: ?[]u8) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
     const io = init.io;
     const environ = init.environ_map;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
 
     const opts = parseArgs(allocator, argv) catch |err| {
-        exitUsageFailure(
+        return usageFailure(
             io,
             @errorName(err),
             usageDetailForParseError(err),
         );
     };
+
+    defer allocator.free(opts.opt_out_methods);
 
     if (opts.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(
@@ -367,7 +374,7 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     if (opts.show_help) {
@@ -377,13 +384,12 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
+        return 0;
     }
 
     const cwd = opts.cwd orelse {
-        exitUsageFailure(io, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
-    defer allocator.free(opts.opt_out_methods);
 
     var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer directory.close(io);
@@ -397,7 +403,7 @@ fn runConfiguredInstances(
     directory: std.Io.Dir,
     opts: ParsedArgs,
     cwd: []const u8,
-) !void {
+) !u8 {
     if (opts.instances > 1 and opts.state_file_dir == null) {
         var stderr_writer = std.Io.File.stderr().writer(
             io,
@@ -479,7 +485,7 @@ const InstanceRun = struct {
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 };
 
-fn runInstances(ctx: InstanceRun) !void {
+fn runInstances(ctx: InstanceRun) !u8 {
     const io = ctx.io;
     const allocator = ctx.allocator;
     const opts = ctx.opts;
@@ -537,7 +543,7 @@ fn runInstances(ctx: InstanceRun) !void {
         after_start,
         after_requests,
     );
-    std.process.exit(if (ok) 0 else 1);
+    return if (ok) 0 else 1;
 }
 
 fn startSlots(
@@ -1530,10 +1536,10 @@ test "parseArgs rejects timeout values outside the client integer domain" {
     }));
 }
 
-fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    return 2;
 }
 
 test "relative parameter and secret files use the supplied directory" {

@@ -135,14 +135,21 @@ const ScenarioResult = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+pub fn run(init: std.process.Init) !u8 {
     const io = init.io;
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        exitUsageFailure(io, @errorName(err), null);
+        return usageFailure(io, @errorName(err), null);
     };
 
     if (parsed.show_version) {
@@ -152,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
-        return;
+        return 0;
     }
 
     if (parsed.show_help) {
@@ -162,11 +169,11 @@ pub fn main(init: std.process.Init) !void {
         );
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
+        return 0;
     }
 
     const cwd = parsed.cwd orelse {
-        exitUsageFailure(io, "MissingValue", "--cwd");
+        return usageFailure(io, "MissingValue", "--cwd");
     };
 
     var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -193,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
     return runScenarios(allocator, parsed, ctx);
 }
 
-fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) !void {
+fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) !u8 {
     const smoke_preflight = if (parsed.skip_smoke_check)
         SmokePreflightResult{
             .status = "skipped",
@@ -219,7 +226,7 @@ fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) 
     }
 
     try writeScenarioReport(ctx.io, parsed.json, ctx.cwd, smoke_preflight, results.items, overall_ok);
-    std.process.exit(if (overall_ok) 0 else 1);
+    return if (overall_ok) 0 else 1;
 }
 
 fn writeScenarioReport(
@@ -1288,8 +1295,8 @@ fn verifyRetryWireLog(
     if (index - 1 != wire_attempts) return error.RetryAttemptCountMismatch;
 }
 
-fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
-    std.process.exit(2);
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    return 2;
 }
