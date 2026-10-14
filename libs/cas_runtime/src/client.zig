@@ -120,7 +120,11 @@ pub const MultiAgentModeSupport = enum {
 
 pub const ClientOptions = struct {
     cwd: []const u8,
-    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    // Borrowed invocation authority; launch consumes these dependencies without
+    // retaining the directory or environment. The client retains io until deinit.
+    io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     // Kept for API compatibility with prior Node-backed client.
     proxy_script: ?[]const u8 = null,
     state_file: ?[]const u8 = null,
@@ -171,7 +175,7 @@ pub const RequestSendObserver = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    io: std.Io,
     transport_kind: TransportKind,
     child: ?std.process.Child,
     process_group_id: ?u64 = null,
@@ -218,17 +222,30 @@ pub const Client = struct {
             ),
             .unix_socket => |maybe_path| {
                 if (maybe_path) |path| {
+                    const cwd = try absolutePathFromDirAlloc(
+                        allocator,
+                        opts.io,
+                        opts.dir,
+                        opts.cwd,
+                    );
+                    defer allocator.free(cwd);
                     const resolved = try app_server_launch.resolveUnixPathAlloc(
                         allocator,
-                        opts.cwd,
+                        cwd,
                         path,
                     );
                     defer allocator.free(resolved);
                     return startUnix(allocator, opts, overload_retry_seed, resolved);
                 }
-                const path = try app_server_launch.defaultUnixPathAlloc(allocator);
+                const path = try app_server_launch.defaultUnixPathAlloc(
+                    allocator,
+                    opts.environ.get("CODEX_HOME"),
+                    opts.environ.get("HOME"),
+                );
                 defer allocator.free(path);
-                return startUnix(allocator, opts, overload_retry_seed, path);
+                const resolved = try absolutePathFromDirAlloc(allocator, opts.io, opts.dir, path);
+                defer allocator.free(resolved);
+                return startUnix(allocator, opts, overload_retry_seed, resolved);
             },
             .auto, .managed_websocket => return error.TransportLaunchRequired,
         };
@@ -255,15 +272,23 @@ pub const Client = struct {
         opts: ClientOptions,
         overload_retry_seed: u64,
     ) !Client {
-        const resolved_codex_path = try resolveExecutableAlloc(allocator, opts.codex_path);
+        const resolved_codex_path = try resolveExecutableAlloc(
+            allocator,
+            opts.io,
+            opts.dir,
+            opts.environ.get("PATH"),
+            opts.codex_path,
+        );
         defer allocator.free(resolved_codex_path);
         const startup_deadline_ms = @min(
             opts.request_deadline_ms orelse std.math.maxInt(i64),
-            monotonicMillis() + handshake_timeout_ms,
+            monotonicMillis(opts.io) + handshake_timeout_ms,
         );
         try hooks.ensureLaunchSupportsPolicyUntil(
             allocator,
             opts.io,
+            opts.dir,
+            opts.child_environment orelse opts.environ,
             resolved_codex_path,
             opts.cwd,
             opts.hook_policy,
@@ -322,10 +347,13 @@ pub const Client = struct {
             opts.code_mode_host,
         );
 
+        const child_dir = try opts.dir.openDir(opts.io, opts.cwd, .{});
+        defer child_dir.close(opts.io);
         return std.process.spawn(opts.io, .{
+            .exe = .{ .explicit = .{ .dir = opts.dir, .path = resolved_codex_path } },
             .argv = argv.items,
-            .cwd = .{ .path = opts.cwd },
-            .environ_map = opts.child_environment,
+            .cwd = .{ .dir = child_dir },
+            .environ_map = opts.child_environment orelse opts.environ,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -385,6 +413,7 @@ pub const Client = struct {
     ) !Client {
         const websocket = try websocket_transport.Connection.connect(
             allocator,
+            opts.io,
             url,
             opts.websocket_connect_timeout_ms,
         );
@@ -406,6 +435,7 @@ pub const Client = struct {
     ) !Client {
         const websocket = try websocket_transport.Connection.connectUnix(
             allocator,
+            opts.io,
             path,
             opts.websocket_connect_timeout_ms,
         );
@@ -490,6 +520,7 @@ pub const Client = struct {
         } else if (process_group_id) |group_id| {
             websocket_transport.forceKillProcessGroup(group_id);
             _ = websocket_transport.waitForProcessGroupExit(
+                self.io,
                 group_id,
                 websocket_transport.owner_watchdog_shutdown_grace_ms,
             );
@@ -574,7 +605,7 @@ pub const Client = struct {
         try validateOverloadRetryPolicy(self.overload_retry_policy);
         const previous_deadline_ms = self.request_deadline_ms;
         if (previous_deadline_ms == null) {
-            self.request_deadline_ms = monotonicMillis() + default_request_timeout_ms;
+            self.request_deadline_ms = monotonicMillis(self.io) + default_request_timeout_ms;
         }
         defer self.request_deadline_ms = previous_deadline_ms;
         self.request_send_started = false;
@@ -584,7 +615,8 @@ pub const Client = struct {
         var retry_index: u32 = 0;
         // The retry policy and request deadline bound this request-attempt loop.
         while (true) { // tiger: event-loop
-            if (monotonicMillis() >= self.request_deadline_ms.?) return error.ConnectionTimedOut;
+            if (monotonicMillis(self.io) >= self.request_deadline_ms.?)
+                return error.ConnectionTimedOut;
             const request_id = self.next_request_id;
             self.next_request_id += 1;
             if (self.overload_retry_telemetry) |telemetry| telemetry.wire_attempts += 1;
@@ -632,7 +664,7 @@ pub const Client = struct {
             telemetry.delay_count += 1;
             telemetry.retries += 1;
         }
-        const remaining_ms = self.request_deadline_ms.? - monotonicMillis();
+        const remaining_ms = self.request_deadline_ms.? - monotonicMillis(self.io);
         if (remaining_ms <= 0 or delay_ms > remaining_ms) return error.ConnectionTimedOut;
         try std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake);
     }
@@ -736,7 +768,7 @@ pub const Client = struct {
     fn handshake(self: *Client, opts: ClientOptions) !void {
         const handshake_id: i64 = -1;
         const previous_deadline_ms = self.request_deadline_ms;
-        const bounded_handshake_deadline = monotonicMillis() + handshake_timeout_ms;
+        const bounded_handshake_deadline = monotonicMillis(self.io) + handshake_timeout_ms;
         if (previous_deadline_ms == null or previous_deadline_ms.? > bounded_handshake_deadline)
             self.request_deadline_ms = bounded_handshake_deadline;
         defer self.request_deadline_ms = previous_deadline_ms;
@@ -757,7 +789,7 @@ pub const Client = struct {
         defer self.allocator.free(initialize);
         try self.sendPayload(initialize, null, null, true);
 
-        while (monotonicMillis() < self.request_deadline_ms.?) {
+        while (monotonicMillis(self.io) < self.request_deadline_ms.?) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -851,12 +883,12 @@ pub const Client = struct {
                 if (send_observer) |observer| try observer.before_send(observer.context);
                 self.request_send_started = true;
                 const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
-                    monotonicMillis() + default_request_timeout_ms;
-                writeFileAllUntil(self.stdin_file.?, payload, deadline_ms) catch |err| {
+                    monotonicMillis(self.io) + default_request_timeout_ms;
+                writeFileAllUntil(self.io, self.stdin_file.?, payload, deadline_ms) catch |err| {
                     if (close_on_failure) self.close();
                     return err;
                 };
-                writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms) catch |err| {
+                writeFileAllUntil(self.io, self.stdin_file.?, "\n", deadline_ms) catch |err| {
                     if (close_on_failure) self.close();
                     return err;
                 };
@@ -921,9 +953,9 @@ pub const Client = struct {
         switch (self.transport_kind) {
             .stdio => {
                 const deadline_ms = self.request_deadline_ms orelse
-                    monotonicMillis() + default_request_timeout_ms;
-                try writeFileAllUntil(self.stdin_file.?, payload, deadline_ms);
-                try writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms);
+                    monotonicMillis(self.io) + default_request_timeout_ms;
+                try writeFileAllUntil(self.io, self.stdin_file.?, payload, deadline_ms);
+                try writeFileAllUntil(self.io, self.stdin_file.?, "\n", deadline_ms);
             },
             .websocket, .unix_socket => try self.sendWebSocket(payload, null, null),
         }
@@ -936,15 +968,15 @@ pub const Client = struct {
         send_deadline_ms: ?i64,
     ) !void {
         const deadline_ms = send_deadline_ms orelse self.request_deadline_ms orelse
-            monotonicMillis() + default_request_timeout_ms;
-        if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
+            monotonicMillis(self.io) + default_request_timeout_ms;
+        if (deadline_ms <= monotonicMillis(self.io)) return error.ConnectionTimedOut;
         if (send_observer) |observer| {
             try observer.before_send(observer.context);
             // Crossing the durable observer boundary owns every subsequent
             // outcome, including a deadline that expires before socket write.
             self.request_send_started = true;
         }
-        if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
+        if (deadline_ms <= monotonicMillis(self.io)) return error.ConnectionTimedOut;
         if (send_observer == null) self.request_send_started = true;
         self.websocket.?.sendTextDeadline(
             payload,
@@ -979,7 +1011,7 @@ pub const Client = struct {
             .websocket, .unix_socket => {
                 const deadline_ms = self.request_deadline_ms orelse
                     return try self.websocket.?.readTextAlloc();
-                if (deadline_ms <= monotonicMillis()) return error.ConnectionTimedOut;
+                if (deadline_ms <= monotonicMillis(self.io)) return error.ConnectionTimedOut;
                 return self.websocket.?.readTextAllocDeadline(
                     awakeDeadline(deadline_ms),
                 ) catch |err| switch (err) {
@@ -1008,7 +1040,7 @@ pub const Client = struct {
 
             var tmp: [1]u8 = undefined;
             if (self.request_deadline_ms) |deadline_ms| {
-                try waitFileReadableUntil(self.stdout_file.?, deadline_ms);
+                try waitFileReadableUntil(self.io, self.stdout_file.?, deadline_ms);
             }
             var reader = self.stdout_file.?.reader(self.io, &.{});
             const n = try reader.interface.readSliceShort(tmp[0..]);
@@ -1367,10 +1399,10 @@ pub const Actor = struct {
         defer actorReleaseCall(state);
         const budget_ms = timeout_ms orelse state.default_request_timeout_ms;
         if (budget_ms == 0) return error.InvalidRequestDeadline;
-        const deadline = monotonicMillis() + @as(i64, budget_ms);
+        const deadline = monotonicMillis(state.client.io) + @as(i64, budget_ms);
         var retry_index: u32 = 0;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
-            const remaining_ms = deadline - monotonicMillis();
+            const remaining_ms = deadline - monotonicMillis(state.client.io);
             if (remaining_ms <= 0) return error.RequestDeadlineExceeded;
             const response = try requestOnce(
                 state,
@@ -1391,7 +1423,7 @@ pub const Actor = struct {
                 retry_index,
                 state.overload_retry_seed,
             );
-            if (@as(i64, delay_ms) >= deadline - monotonicMillis()) {
+            if (@as(i64, delay_ms) >= deadline - monotonicMillis(state.client.io)) {
                 return error.RequestDeadlineExceeded;
             }
             try std.Io.sleep(state.client.io, .fromMilliseconds(delay_ms), .awake);
@@ -1411,7 +1443,7 @@ pub const Actor = struct {
         timeout_ms: u32,
     ) !Response {
         if (timeout_ms == 0) return error.InvalidRequestDeadline;
-        const deadline = monotonicMillis() + @as(i64, timeout_ms);
+        const deadline = monotonicMillis(state.client.io) + @as(i64, timeout_ms);
         var pending: ActorPending = .{};
 
         state.mutex.lock();
@@ -1452,7 +1484,7 @@ pub const Actor = struct {
                 state.mutex.unlock();
                 return actorTerminalError(terminal);
             }
-            if (monotonicMillis() >= deadline) {
+            if (monotonicMillis(state.client.io) >= deadline) {
                 const transmission_started = pending.transmission_started;
                 _ = state.pending.remove(request_id);
                 if (transmission_started) state.terminal = .poisoned;
@@ -1606,7 +1638,7 @@ fn actorWriterMain(state: *ActorState) void {
         if (maybe_item) |item| {
             defer state.allocator.free(item.payload);
             if (!transmission_claimed) continue;
-            if (item.request_id == null and actorOutboundExpired(item)) {
+            if (item.request_id == null and actorOutboundExpired(state.client.io, item)) {
                 if (item.poison_on_expiry) {
                     actorSetTerminal(state, .poisoned);
                     actorCloseTransportOnce(state);
@@ -1629,8 +1661,8 @@ fn actorWriterMain(state: *ActorState) void {
     }
 }
 
-fn actorOutboundExpired(item: ActorOutbound) bool {
-    return monotonicMillis() >= item.deadline_ms;
+fn actorOutboundExpired(io: std.Io, item: ActorOutbound) bool {
+    return monotonicMillis(io) >= item.deadline_ms;
 }
 
 /// Claims the request's transport lease while the actor mutex still owns both
@@ -1642,7 +1674,7 @@ fn actorClaimOutboundTransmissionLocked(state: *ActorState, item: ActorOutbound)
     if (state.terminal != .running) return false;
     const request_id = item.request_id orelse return true;
     const pending = state.pending.get(request_id) orelse return false;
-    if (monotonicMillis() >= item.deadline_ms) return false;
+    if (monotonicMillis(state.client.io) >= item.deadline_ms) return false;
     pending.transmission_started = true;
     return true;
 }
@@ -1736,7 +1768,7 @@ fn actorReaderMain(state: *ActorState) void {
             actorCloseTransportOnce(state);
             return;
         };
-        const received_ms = monotonicMillis();
+        const received_ms = monotonicMillis(state.client.io);
         defer state.allocator.free(line);
         actorRouteLineAt(state, line, received_ms) catch {
             actorSetTerminal(state, .poisoned);
@@ -1796,7 +1828,7 @@ fn actorNotificationMain(state: *ActorState) void {
 }
 
 fn actorRouteLine(state: *ActorState, line: []const u8) !void {
-    return actorRouteLineAt(state, line, monotonicMillis());
+    return actorRouteLineAt(state, line, monotonicMillis(state.client.io));
 }
 
 fn actorRouteLineAt(state: *ActorState, line: []const u8, received_ms: i64) !void {
@@ -1948,7 +1980,8 @@ fn actorDispatchServerRequest(
         .integer, .string => {},
         else => return error.InvalidAppServerEnvelope,
     }
-    const deadline_ms = monotonicMillis() + @as(i64, state.server_request_timeout_ms);
+    const deadline_ms = monotonicMillis(state.client.io) +
+        @as(i64, state.server_request_timeout_ms);
     var work = try actorServerRequestAlloc(state, method, id_value, line, deadline_ms);
     var work_owned = true;
     defer if (work_owned) work.deinit(state.allocator);
@@ -2026,7 +2059,7 @@ fn actorServerRequestAlloc(
 }
 
 fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void {
-    if (monotonicMillis() >= work.deadline_ms) return error.RequestDeadlineExceeded;
+    if (monotonicMillis(state.client.io) >= work.deadline_ms) return error.RequestDeadlineExceeded;
     var parsed_id = try std.json.parseFromSlice(
         std.json.Value,
         state.allocator,
@@ -2046,6 +2079,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
         .deadline_ms = work.deadline_ms,
     };
     var watchdog = ServerHandlerWatchdog{
+        .io = state.client.io,
         .handler = work.handler,
         .deadline_ms = work.deadline_ms,
     };
@@ -2063,7 +2097,7 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
             work.deadline_ms,
         );
     defer state.allocator.free(result_json);
-    if (monotonicMillis() >= work.deadline_ms) return error.RequestDeadlineExceeded;
+    if (monotonicMillis(state.client.io) >= work.deadline_ms) return error.RequestDeadlineExceeded;
     const payload = actorServerResultPayloadAlloc(
         state.allocator,
         parsed_id.value,
@@ -2082,14 +2116,15 @@ fn actorHandleServerRequest(state: *ActorState, work: ActorServerRequest) !void 
 }
 
 const ServerHandlerWatchdog = struct {
+    io: std.Io,
     handler: protocol.ServerRequestHandler,
     deadline_ms: i64,
     finished: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *ServerHandlerWatchdog) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         while (!self.finished.load(.acquire)) {
-            const remaining_ms = self.deadline_ms - monotonicMillis();
+            const remaining_ms = self.deadline_ms - monotonicMillis(io);
             if (remaining_ms <= 0) {
                 self.handler.cancel(self.handler.context);
                 return;
@@ -2271,7 +2306,7 @@ fn actorEnqueueOwned(
             state.mutex.unlock();
             return actorTerminalError(terminal);
         }
-        if (monotonicMillis() >= deadline_ms) {
+        if (monotonicMillis(state.client.io) >= deadline_ms) {
             state.mutex.unlock();
             return error.RequestDeadlineExceeded;
         }
@@ -2387,30 +2422,32 @@ fn addCapturedNotificationBytes(current: usize, additional: usize) !usize {
     return current + additional;
 }
 
-fn waitFileReadableUntil(file: std.Io.File, deadline_ms: i64) !void {
+fn waitFileReadableUntil(io: std.Io, file: std.Io.File, deadline_ms: i64) !void {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
     try waitFileEventUntil(
+        io,
         file,
         deadline_ms,
         std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
     );
 }
 
-fn waitFileWritableUntil(file: std.Io.File, deadline_ms: i64) !void {
+fn waitFileWritableUntil(io: std.Io, file: std.Io.File, deadline_ms: i64) !void {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
     try waitFileEventUntil(
+        io,
         file,
         deadline_ms,
         std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP,
     );
 }
 
-fn waitFileEventUntil(file: std.Io.File, deadline_ms: i64, events: i16) !void {
+fn waitFileEventUntil(io: std.Io, file: std.Io.File, deadline_ms: i64, events: i16) !void {
     const poll_quantum_ms: i64 = 1_000;
-    var now_ms = monotonicMillis();
-    while (now_ms < deadline_ms) : (now_ms = monotonicMillis()) {
+    var now_ms = monotonicMillis(io);
+    while (now_ms < deadline_ms) : (now_ms = monotonicMillis(io)) {
         const remaining_ms = deadline_ms - now_ms;
         var fds = [_]std.posix.pollfd{.{
             .fd = file.handle,
@@ -2425,7 +2462,7 @@ fn waitFileEventUntil(file: std.Io.File, deadline_ms: i64, events: i16) !void {
     return error.ConnectionTimedOut;
 }
 
-fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !void {
+fn writeFileAllUntil(io: std.Io, file: std.Io.File, bytes: []const u8, deadline_ms: i64) !void {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         return error.StdioDeadlineUnsupported;
 
@@ -2457,7 +2494,7 @@ fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !vo
 
     var offset: usize = 0;
     while (offset < bytes.len) {
-        try waitFileWritableUntil(file, deadline_ms);
+        try waitFileWritableUntil(io, file, deadline_ms);
         const rc = std.posix.system.write(file.handle, bytes[offset..].ptr, bytes.len - offset);
         switch (std.posix.errno(rc)) {
             .SUCCESS => {
@@ -2560,51 +2597,18 @@ fn validateServerRequestOptions(allocator: std.mem.Allocator, opts: ClientOption
     );
 }
 
-pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (value.len == 0) return error.MissingExecutable;
+pub const resolveExecutableAlloc = app_server_launch.resolveExecutableAlloc;
 
-    if (std.mem.indexOfScalar(u8, value, '/') != null) {
-        const resolved = std.Io.Dir.cwd().realPathFileAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
-            value,
-            allocator,
-        ) catch return error.ExecutableNotFound;
-        defer allocator.free(resolved);
-        return allocator.dupe(u8, resolved);
-    }
-
-    const exe_dir =
-        std.process.executableDirPathAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
-            allocator,
-        ) catch null;
-    if (exe_dir) |dir| {
-        defer allocator.free(dir);
-        const sibling = try allocator.print(
-            "{s}/{s}",
-            .{ dir, value },
-        );
-        errdefer allocator.free(sibling);
-        if (pathExists(sibling)) return sibling;
-        allocator.free(sibling);
-    }
-
-    const path_env = std.Io.Threaded.global_single_threaded.environString("PATH") orelse
-        return error.ExecutableNotFound;
-    var iter = std.mem.splitScalar(u8, path_env, ':');
-    while (iter.next()) |dir| {
-        if (dir.len == 0) continue;
-        const candidate = try allocator.print(
-            "{s}/{s}",
-            .{ dir, value },
-        );
-        errdefer allocator.free(candidate);
-        if (pathExists(candidate)) return candidate;
-        allocator.free(candidate);
-    }
-
-    return error.ExecutableNotFound;
+fn absolutePathFromDirAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const root_path = try dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    return std.fs.path.resolve(allocator, &.{ root_path, path });
 }
 
 test "slash executable resolution is absolute across later cwd changes" {
@@ -2619,26 +2623,14 @@ test "slash executable resolution is absolute across later cwd changes" {
     defer allocator.free(cwd);
     const relative = try std.fs.path.relative(allocator, cwd, null, cwd, absolute);
     defer allocator.free(relative);
-    const resolved = try resolveExecutableAlloc(allocator, relative);
+    const resolved = try resolveExecutableAlloc(allocator, io, std.Io.Dir.cwd(), null, relative);
     defer allocator.free(resolved);
     try std.testing.expect(std.fs.path.isAbsolute(resolved));
     try std.testing.expectEqualStrings(absolute, resolved);
 }
 
-fn monotonicMillis() i64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn monotonicMillis(io: std.Io) i64 {
     return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
-}
-
-fn pathExists(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch
-            return false;
-        return true;
-    }
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch
-        return false;
-    return true;
 }
 
 pub const ObjectMap = core_json.ObjectMap;
@@ -2659,9 +2651,12 @@ pub fn intField(obj: ObjectMap, key: []const u8) ?i64 {
     return core_json.intField(obj, key);
 }
 
+const test_environment = std.process.Environ.Map.init(std.testing.allocator);
+
 fn serverRequestTestClient() Client {
     return .{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .stdio,
         .child = null,
         .stdin_file = null,
@@ -2917,6 +2912,8 @@ test "stdio handshake failure reaps the spawned app-server" {
 
     try std.testing.expectError(error.UnsupportedServerRequest, Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
     }));
@@ -2959,14 +2956,16 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
         .{},
     );
 
-    const started_ms = monotonicMillis();
+    const started_ms = monotonicMillis(std.testing.io);
     try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
         .request_deadline_ms = started_ms + 500,
     }));
-    try std.testing.expect(monotonicMillis() - started_ms < 1_000);
+    try std.testing.expect(monotonicMillis(std.testing.io) - started_ms < 1_000);
 
     const pid_bytes = try tmp.dir.readFileAlloc(io, "silent.pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
@@ -3001,15 +3000,17 @@ test "stdio startup deadline includes the hook capability probe" {
         .data = "#!/bin/sh\nprintf '%s' \"$$\" > pid\nexec sleep 600\n",
     });
     try tmp.dir.setFilePermissions(io, "codex", .fromMode(0o755), .{});
-    const started_ms = monotonicMillis();
+    const started_ms = monotonicMillis(std.testing.io);
     try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
         .hook_policy = .off,
         .request_deadline_ms = started_ms + 500,
     }));
-    try std.testing.expect(monotonicMillis() - started_ms < 2_000);
+    try std.testing.expect(monotonicMillis(std.testing.io) - started_ms < 2_000);
     const pid_bytes = try tmp.dir.readFileAlloc(io, "pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
     const pid = try std.fmt.parseInt(u64, pid_bytes, 10);
@@ -3035,9 +3036,11 @@ test "stdio hook admission and handshake restore the caller request deadline" {
             "while IFS= read -r request; do :; done\n",
     });
     try tmp.dir.setFilePermissions(io, "codex", .fromMode(0o755), .{});
-    const deadline = monotonicMillis() + @as(i64, std.math.maxInt(u32)) + 1_000;
+    const deadline = monotonicMillis(std.testing.io) + @as(i64, std.math.maxInt(u32)) + 1_000;
     var client = try Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
         .hook_policy = .off,
@@ -3086,15 +3089,17 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
     const large_title = try allocator.alloc(u8, 1024 * 1024);
     defer allocator.free(large_title);
     @memset(large_title, 'x');
-    const started_ms = monotonicMillis();
+    const started_ms = monotonicMillis(std.testing.io);
     try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
         .client_title = large_title,
         .request_deadline_ms = started_ms + 500,
     }));
-    try std.testing.expect(monotonicMillis() - started_ms < 1_000);
+    try std.testing.expect(monotonicMillis(std.testing.io) - started_ms < 1_000);
 
     const pid_bytes = try tmp.dir.readFileAlloc(io, "blocked.pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
@@ -3227,22 +3232,39 @@ test "deprecated approval methods return schema-valid denial results" {
 }
 
 test "openai form capability requires an exact configured response policy" {
-    try std.testing.expect(!hasExactOpenaiFormPolicy(.{ .cwd = "." }));
+    try std.testing.expect(!hasExactOpenaiFormPolicy(.{
+        .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
+    }));
     try std.testing.expect(hasExactOpenaiFormPolicy(.{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .elicitation_action = "decline",
     }));
     try std.testing.expect(!hasExactOpenaiFormPolicy(.{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .elicitation_action = "accept",
     }));
     try std.testing.expect(hasExactOpenaiFormPolicy(.{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .elicitation_action = "accept",
         .elicitation_content_json = "{}",
     }));
     try std.testing.expect(hasExactOpenaiFormPolicy(.{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .elicitation_response_json = "{\"action\":\"decline\"}",
     }));
 }
@@ -3281,9 +3303,17 @@ test "initialize capability builder has one typed owner and preserves additive f
             .additional_json = "{\"future\":1,\"future\":2}",
         }).validate(std.testing.allocator),
     );
-    try std.testing.expect(!initializeCapabilities(.{ .cwd = "." }).request_attestation);
+    try std.testing.expect(!initializeCapabilities(.{
+        .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
+    }).request_attestation);
     try std.testing.expect(initializeCapabilities(.{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .attestation_response_json = "{\"token\":\"exact\"}",
     }).request_attestation);
 }
@@ -3346,6 +3376,9 @@ test "auth refresh and attestation providers return only exact validated carrier
     const attestation = "{ \"token\":\"SECRET_ATTESTATION\", \"future\":1 }";
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .auth_refresh_response_json = auth,
         .attestation_response_json = attestation,
     });
@@ -3372,6 +3405,9 @@ test "auth refresh and attestation providers return only exact validated carrier
         error.InvalidAuthRefreshResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .auth_refresh_response_json = "{\"accessToken\":\"x\"}",
         }),
     );
@@ -3379,6 +3415,9 @@ test "auth refresh and attestation providers return only exact validated carrier
         error.InvalidAttestationResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .attestation_response_json = "{\"token\":\"\"}",
         }),
     );
@@ -3415,6 +3454,9 @@ test "exact input response carriers are shape checked before launch" {
         error.InvalidServerRequestPolicy,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .exec_approval = "auto",
         }),
     );
@@ -3422,6 +3464,9 @@ test "exact input response carriers are shape checked before launch" {
         error.InvalidServerRequestCarrierJson,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .request_user_input_response_json = "{",
         }),
     );
@@ -3429,6 +3474,9 @@ test "exact input response carriers are shape checked before launch" {
         error.InvalidRequestUserInputResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .request_user_input_response_json = "{\"answers\":[]}",
         }),
     );
@@ -3436,11 +3484,17 @@ test "exact input response carriers are shape checked before launch" {
         error.InvalidRequestUserInputResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .request_user_input_response_json = "{\"answers\":{\"q\":{\"answers\":[\"yes\",1]}}}",
         }),
     );
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .request_user_input_response_json = "{\"answers\":{\"q\":{\"answers\":[\"yes\",\"no\"]}}}",
     });
 }
@@ -3450,6 +3504,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
         error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .dynamic_tool_response_json = "{\"success\":true}",
         }),
     );
@@ -3457,6 +3514,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
         error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .dynamic_tool_response_json = "{\"contentItems\":[" ++
                 "{\"type\":\"futureItem\",\"text\":\"x\"}]," ++
                 "\"success\":true}",
@@ -3466,6 +3526,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
         error.InvalidDynamicToolResponse,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .dynamic_tool_response_json = "{\"contentItems\":[" ++
                 "{\"type\":\"inputImage\",\"imageUrl\":1}]," ++
                 "\"success\":true}",
@@ -3473,6 +3536,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
     );
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .dynamic_tool_response_json = "{\"contentItems\":[" ++
             "{\"type\":\"inputText\",\"text\":\"t\"}," ++
             "{\"type\":\"inputImage\",\"imageUrl\":\"file:///i\"}," ++
@@ -3486,6 +3552,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
         error.ServerRequestCarrierTooLarge,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .elicitation_content_json = oversized,
         }),
     );
@@ -3493,6 +3562,9 @@ test "exact dynamic response carriers are bounded and shape checked before launc
         error.UnsupportedServerRequestTimeout,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .server_request_timeout_ms = 1,
         }),
     );
@@ -3504,6 +3576,9 @@ test "full MCP response carrier preserves opaque meta and never crosses url or f
         "\"_meta\": {\"opaque\":[1,2]} }";
     try validateServerRequestOptions(std.testing.allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .elicitation_response_json = exact,
     });
     var client = serverRequestTestClient();
@@ -3564,6 +3639,9 @@ test "full MCP response carrier rejects malformed actions content and policy con
             error.InvalidElicitationResponse,
             validateServerRequestOptions(std.testing.allocator, .{
                 .cwd = ".",
+                .io = std.testing.io,
+                .dir = std.Io.Dir.cwd(),
+                .environ = &test_environment,
                 .elicitation_response_json = raw,
             }),
         );
@@ -3572,6 +3650,9 @@ test "full MCP response carrier rejects malformed actions content and policy con
         error.ConflictingElicitationResponsePolicies,
         validateServerRequestOptions(std.testing.allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .elicitation_action = "decline",
             .elicitation_response_json = "{\"action\":\"decline\"}",
         }),
@@ -3581,6 +3662,7 @@ test "full MCP response carrier rejects malformed actions content and policy con
 test "expired request deadline remains pre-send" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .websocket,
         .child = null,
         .stdin_file = null,
@@ -3597,7 +3679,7 @@ test "expired request deadline remains pre-send" {
         .elicitation_content_json = null,
         .dynamic_tool_response_json = null,
         .read_only = true,
-        .request_deadline_ms = monotonicMillis() - 1,
+        .request_deadline_ms = monotonicMillis(std.testing.io) - 1,
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
@@ -3626,7 +3708,7 @@ const SendObserverProbe = struct {
         const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
         probe.calls += 1;
         std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+            std.testing.io,
             .fromMilliseconds(100),
             .awake,
         ) catch |err| switch (err) {
@@ -3713,9 +3795,11 @@ fn runRetryIntegrationCase(mode: []const u8) !void {
     var telemetry: OverloadRetryTelemetry = .{};
     var client = try Client.start(allocator, .{
         .cwd = root,
+        .dir = tmp.dir,
+        .environ = &test_environment,
         .io = io,
         .codex_path = executable,
-        .request_deadline_ms = monotonicMillis() + 2_000,
+        .request_deadline_ms = monotonicMillis(std.testing.io) + 2_000,
         .overload_retry_policy = policy,
         .overload_retry_seed = 17,
         .overload_retry_telemetry = &telemetry,
@@ -4076,6 +4160,8 @@ const ActorFixture = struct {
     fn start(self: *ActorFixture, options: ActorOptions) !Actor {
         return Client.startActor(self.allocator, .{
             .cwd = self.root,
+            .dir = self.tmp.dir,
+            .environ = &test_environment,
             .io = std.testing.io,
             .codex_path = self.executable,
         }, options);
@@ -4552,7 +4638,7 @@ test "actor server request deadline cooperatively cancels handler and bounds shu
             .cancel = CancellableServerRequestProbe.cancel,
         },
     });
-    const started = monotonicMillis();
+    const started = monotonicMillis(std.testing.io);
     const request_result = actor.requestJson("actor/server-request", "{}", 2_000);
     if (request_result) |result| {
         allocator.free(result);
@@ -4560,7 +4646,7 @@ test "actor server request deadline cooperatively cancels handler and bounds shu
     } else |_| {}
     actor.deinit();
     try std.testing.expect(probe.cancelled.load(.acquire));
-    try std.testing.expect(monotonicMillis() - started < 1_000);
+    try std.testing.expect(monotonicMillis(std.testing.io) - started < 1_000);
 }
 
 test "actor falsifier notification callbacks may issue nested requests" {
@@ -4646,9 +4732,9 @@ test "actor terminal close interrupts a writer blocked by a non-reading peer" {
         try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
     try std.testing.expect(writer_blocked);
-    const started = monotonicMillis();
+    const started = monotonicMillis(std.testing.io);
     actor.deinit();
-    const elapsed_ms = monotonicMillis() - started;
+    const elapsed_ms = monotonicMillis(std.testing.io) - started;
     thread.join();
     if (call.result) |result| allocator.free(result);
     try std.testing.expect(call.failure != null);
@@ -4884,7 +4970,7 @@ test "actor queue byte budget rejects one oversized payload below item capacity"
     const payload = try allocator.dupe(u8, "12345");
     try std.testing.expectError(
         error.ActorQueuePayloadTooLarge,
-        actorEnqueueOwned(&state, payload, monotonicMillis() + 100, false, null),
+        actorEnqueueOwned(&state, payload, monotonicMillis(std.testing.io) + 100, false, null),
     );
     try std.testing.expectEqual(@as(usize, 0), state.outbound.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.outbound_bytes);
@@ -4907,16 +4993,16 @@ test "actor falsifier saturated stalled writer consumes the request deadline" {
     defer state.deinit();
     try state.outbound.append(allocator, .{
         .payload = try allocator.dupe(u8, "stalled"),
-        .deadline_ms = monotonicMillis() + 1_000,
+        .deadline_ms = monotonicMillis(std.testing.io) + 1_000,
         .poison_on_expiry = false,
     });
     var actor = Actor{ .state = &state };
-    const started = monotonicMillis();
+    const started = monotonicMillis(std.testing.io);
     try std.testing.expectError(
         error.RequestDeadlineExceeded,
         actor.requestJson("actor/blocked", null, 20),
     );
-    try std.testing.expect(monotonicMillis() - started < 500);
+    try std.testing.expect(monotonicMillis(std.testing.io) - started < 500);
     try std.testing.expectEqual(@as(usize, 0), state.pending.count());
 }
 
@@ -4942,7 +5028,7 @@ test "actor request lease drops expired unsent work and admits the next request"
     state.mutex.lock();
     const expired_claimed = actorClaimOutboundTransmissionLocked(&state, .{
         .payload = @constCast("expired"),
-        .deadline_ms = monotonicMillis() - 1,
+        .deadline_ms = monotonicMillis(std.testing.io) - 1,
         .poison_on_expiry = false,
         .request_id = 7,
     });
@@ -4956,7 +5042,7 @@ test "actor request lease drops expired unsent work and admits the next request"
     state.mutex.lock();
     const next_claimed = actorClaimOutboundTransmissionLocked(&state, .{
         .payload = @constCast("next"),
-        .deadline_ms = monotonicMillis() + 1_000,
+        .deadline_ms = monotonicMillis(std.testing.io) + 1_000,
         .poison_on_expiry = false,
         .request_id = 8,
     });
@@ -4989,13 +5075,13 @@ test "actor terminal state rejects every queued outbound transport claim" {
     state.mutex.lock();
     const request_claimed = actorClaimOutboundTransmissionLocked(&state, .{
         .payload = @constCast("queued-request"),
-        .deadline_ms = monotonicMillis() + 1_000,
+        .deadline_ms = monotonicMillis(std.testing.io) + 1_000,
         .poison_on_expiry = false,
         .request_id = 9,
     });
     const reply_claimed = actorClaimOutboundTransmissionLocked(&state, .{
         .payload = @constCast("queued-reply"),
-        .deadline_ms = monotonicMillis() + 1_000,
+        .deadline_ms = monotonicMillis(std.testing.io) + 1_000,
         .poison_on_expiry = true,
     });
     state.mutex.unlock();
@@ -5008,10 +5094,10 @@ test "actor terminal state rejects every queued outbound transport claim" {
 test "actor falsifier expired outbound work is never eligible for transport" {
     const item = ActorOutbound{
         .payload = @constCast("expired"),
-        .deadline_ms = monotonicMillis() - 1,
+        .deadline_ms = monotonicMillis(std.testing.io) - 1,
         .poison_on_expiry = false,
     };
-    try std.testing.expect(actorOutboundExpired(item));
+    try std.testing.expect(actorOutboundExpired(std.testing.io, item));
 }
 
 test "actor falsifier expired server work never invokes its handler" {
@@ -5038,7 +5124,7 @@ test "actor falsifier expired server work never invokes its handler" {
         .id_json = try allocator.dupe(u8, "1"),
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
-        .deadline_ms = monotonicMillis() - 1,
+        .deadline_ms = monotonicMillis(std.testing.io) - 1,
         .handler = .{
             .context = &probe,
             .handle = ServerRequestProbe.handle,
@@ -5079,7 +5165,7 @@ test "actor server work retains its admitted handler identity" {
         .id_json = try allocator.dupe(u8, "1"),
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
-        .deadline_ms = monotonicMillis() + 100,
+        .deadline_ms = monotonicMillis(std.testing.io) + 100,
         .handler = .{
             .context = &admitted_probe,
             .handle = ServerRequestProbe.handle,
@@ -5147,7 +5233,7 @@ test "actor closes transport when a server handler returns after deadline" {
         .id_json = try allocator.dupe(u8, "1"),
         .method = try allocator.dupe(u8, "item/tool/call"),
         .raw_json = try allocator.dupe(u8, "{}"),
-        .deadline_ms = monotonicMillis() + 1,
+        .deadline_ms = monotonicMillis(std.testing.io) + 1,
         .handler = .{
             .context = &probe,
             .handle = LateServerRequestProbe.handle,
@@ -5246,6 +5332,7 @@ test "transport kinds preserve unix identity and frame behavior" {
     inline for (.{ TransportKind.websocket, TransportKind.unix_socket }) |kind| {
         var client = Client{
             .allocator = std.testing.allocator,
+            .io = std.testing.io,
             .transport_kind = kind,
             .child = null,
             .stdin_file = null,
@@ -5262,7 +5349,7 @@ test "transport kinds preserve unix identity and frame behavior" {
             .elicitation_content_json = null,
             .dynamic_tool_response_json = null,
             .read_only = true,
-            .request_deadline_ms = monotonicMillis() - 1,
+            .request_deadline_ms = monotonicMillis(std.testing.io) - 1,
         };
         defer client.line_buf.deinit(std.testing.allocator);
         try std.testing.expectError(error.ConnectionTimedOut, client.readLineAlloc());
@@ -5284,6 +5371,7 @@ test "transport kinds preserve unix identity and frame behavior" {
 test "request send observer runs before transport send attribution" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .stdio,
         .child = null,
         .stdin_file = null,
@@ -5318,6 +5406,7 @@ test "request send observer runs before transport send attribution" {
 test "request send ownership survives deadline expiry after durable observer" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .websocket,
         .child = null,
         .stdin_file = null,
@@ -5334,7 +5423,7 @@ test "request send ownership survives deadline expiry after durable observer" {
         .elicitation_content_json = null,
         .dynamic_tool_response_json = null,
         .read_only = true,
-        .request_deadline_ms = monotonicMillis() + 50,
+        .request_deadline_ms = monotonicMillis(std.testing.io) + 50,
     };
     defer client.line_buf.deinit(std.testing.allocator);
     var probe = SendObserverProbe{};
@@ -5390,6 +5479,9 @@ test "code mode host cannot be silently ignored by existing endpoint transports"
         error.CodeModeHostRequiresManagedLaunch,
         validateTransportOptions(.{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .code_mode_host = &host,
             .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
         }),
@@ -5398,6 +5490,9 @@ test "code mode host cannot be silently ignored by existing endpoint transports"
         error.CodeModeHostRequiresManagedLaunch,
         validateTransportOptions(.{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .code_mode_host = &host,
             .transport = .{ .unix_socket = null },
         }),
@@ -5406,6 +5501,9 @@ test "code mode host cannot be silently ignored by existing endpoint transports"
         error.ConflictingTransportOptions,
         validateTransportOptions(.{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .websocket_url = "ws://127.0.0.1:1",
             .transport = .stdio,
         }),
@@ -5443,17 +5541,26 @@ test "diagnostic Codex feature arguments are bounded and stdio-only" {
     );
     try validateClientOptions(allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .codex_enable_features = &.{ "deferred_executor", "executor_capability_discovery" },
         .transport = .stdio,
     });
     try std.testing.expectError(error.InvalidCodexEnableFeature, validateClientOptions(allocator, .{
         .cwd = ".",
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
         .codex_enable_features = &.{"../feature"},
     }));
     try std.testing.expectError(
         error.CodexEnableFeaturesRequireStdio,
         validateClientOptions(allocator, .{
             .cwd = ".",
+            .io = std.testing.io,
+            .dir = std.Io.Dir.cwd(),
+            .environ = &test_environment,
             .codex_enable_features = &.{"deferred_executor"},
             .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" },
         }),
@@ -5539,7 +5646,12 @@ fn exerciseHandshakeAllocations(allocator: std.mem.Allocator) !void {
     client.stdin_file = sink;
     defer client.deinit();
     try client.line_buf.appendSlice(allocator, "not-json\n{\"id\":-1,\"result\":{}}\n");
-    try client.handshake(.{ .cwd = ".", .io = io });
+    try client.handshake(.{
+        .cwd = ".",
+        .io = io,
+        .dir = std.Io.Dir.cwd(),
+        .environ = &test_environment,
+    });
     try std.testing.expectEqualStrings("{}", client.initialize_response_json.?);
 }
 
@@ -5556,8 +5668,14 @@ test "far future websocket deadlines preserve immediate successful requests and 
     var client = serverRequestTestClient();
     client.io = io;
     client.transport_kind = .websocket;
-    client.websocket = .{ .allocator = allocator, .stream = stream, .read_buf = .empty };
-    client.request_deadline_ms = monotonicMillis() + @as(i64, std.math.maxInt(u32)) + 1_000;
+    client.websocket = .{
+        .allocator = allocator,
+        .io = io,
+        .stream = stream,
+        .read_buf = .empty,
+    };
+    client.request_deadline_ms = monotonicMillis(std.testing.io) +
+        @as(i64, std.math.maxInt(u32)) + 1_000;
     defer {
         client.close();
         client.deinit();
@@ -5580,6 +5698,7 @@ test "far future websocket deadlines preserve immediate successful requests and 
 test "resolveExecDecision honors read_only and explicit approvals" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .stdio,
         .child = null,
         .stdin_file = null,
@@ -5633,6 +5752,7 @@ test "resolveExecDecision honors read_only and explicit approvals" {
 test "resolvePermissionsApproval honors explicit grants and read_only" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .stdio,
         .child = null,
         .stdin_file = null,
@@ -5671,6 +5791,7 @@ test "resolvePermissionsApproval honors explicit grants and read_only" {
 test "resolveElicitationAction defaults to decline" {
     var client = Client{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .transport_kind = .stdio,
         .child = null,
         .stdin_file = null,
@@ -5704,4 +5825,117 @@ test "resolveElicitationAction defaults to decline" {
         server_requests.Policy.McpElicitationResponseAction.cancel,
         client.serverRequestPolicy().resolveElicitationAction(),
     );
+}
+
+test "clients retain independent supplied launch directories and environments" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    try writeAuthorityCodex(first.dir, io);
+    try writeAuthorityCodex(second.dir, io);
+    var first_environment = std.process.Environ.Map.init(allocator);
+    defer first_environment.deinit();
+    try first_environment.put("CAS_AUTHORITY_MARKER", "first");
+    var second_environment = std.process.Environ.Map.init(allocator);
+    defer second_environment.deinit();
+    try second_environment.put("CAS_AUTHORITY_MARKER", "second");
+
+    var first_client = try Client.start(allocator, .{
+        .cwd = ".",
+        .io = io,
+        .dir = first.dir,
+        .environ = &second_environment,
+        .child_environment = &first_environment,
+        .codex_path = "./authority-codex",
+    });
+    defer {
+        first_client.close();
+        first_client.deinit();
+    }
+    var second_client = try Client.start(allocator, .{
+        .cwd = ".",
+        .io = io,
+        .dir = second.dir,
+        .environ = &second_environment,
+        .codex_path = "./authority-codex",
+    });
+    defer {
+        second_client.close();
+        second_client.deinit();
+    }
+    const first_path = try first.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(second_path);
+    const cases = .{
+        .{ first_client.initializeResponseJson().?, "first", first_path },
+        .{ second_client.initializeResponseJson().?, "second", second_path },
+    };
+    inline for (cases) |case| {
+        var response = try std.json.parseFromSlice(std.json.Value, allocator, case[0], .{});
+        defer response.deinit();
+        try std.testing.expectEqualStrings(
+            case[1],
+            core_json.stringField(response.value.object, "marker").?,
+        );
+        try std.testing.expectEqualStrings(
+            case[2],
+            core_json.stringField(response.value.object, "cwd").?,
+        );
+    }
+}
+
+test "client launch propagates cancellation from its supplied I/O" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
+        return error.SkipZigTest;
+    const Cancel = struct {
+        fn spawn(
+            _: ?*anyopaque,
+            options: std.process.SpawnOptions,
+        ) std.process.SpawnError!std.process.Child {
+            if (options.cwd != .dir or options.exe != .explicit or options.environ_map == null)
+                return error.Unexpected;
+            return error.Canceled;
+        }
+    };
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+    try writeAuthorityCodex(root.dir, std.testing.io);
+    var vtable = std.testing.io.vtable.*;
+    vtable.processSpawn = Cancel.spawn;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    if (Client.start(std.testing.allocator, .{
+        .cwd = ".",
+        .io = io,
+        .dir = root.dir,
+        .environ = &test_environment,
+        .codex_path = "./authority-codex",
+        .overload_retry_seed = 7,
+    })) |value| {
+        var client = value;
+        defer client.close();
+        defer client.deinit();
+        return error.ExpectedCancellation;
+    } else |err| {
+        try std.testing.expectEqual(error.Canceled, err);
+    }
+}
+
+fn writeAuthorityCodex(dir: std.Io.Dir, io: std.Io) !void {
+    try dir.writeFile(io, .{
+        .sub_path = "authority-codex",
+        .data =
+        \\#!/bin/sh
+        \\IFS= read -r request
+        \\printf '{"id":-1,"result":{"marker":"%s","cwd":"%s"}}\n' "$CAS_AUTHORITY_MARKER" "$PWD"
+        \\while IFS= read -r request; do :; done
+        \\
+        ,
+    });
+    try dir.setFilePermissions(io, "authority-codex", .fromMode(0o755), .{});
 }

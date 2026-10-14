@@ -1,3 +1,4 @@
+const Operation = @import("operation.zig").Operation;
 const output = @import("output.zig");
 const builtin = @import("builtin");
 const std = @import("std");
@@ -64,7 +65,7 @@ const CommandRunner = struct {
     run_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
-        std.Io,
+        Operation,
         []const []const u8,
         bool,
     ) anyerror!CommandCapture,
@@ -72,23 +73,23 @@ const CommandRunner = struct {
     fn run(
         self: CommandRunner,
         allocator: std.mem.Allocator,
-        io: std.Io,
+        operation: Operation,
         argv: []const []const u8,
         fail_on_nonzero: bool,
     ) !CommandCapture {
-        return self.run_fn(self.context, allocator, io, argv, fail_on_nonzero);
+        return self.run_fn(self.context, allocator, operation, argv, fail_on_nonzero);
     }
 };
 
 const system_command_runner: CommandRunner = .{ .run_fn = runSystemCommandCapture };
 
-pub fn validateSchedulerLabel(raw: []const u8) ![]const u8 {
+pub fn validateSchedulerLabel(io: std.Io, raw: []const u8) ![]const u8 {
     const label = std.mem.trim(u8, raw, " \t\r\n");
-    if (label.len == 0) return userErrorFmt("label must not be empty", .{});
+    if (label.len == 0) return userErrorFmt(io, "label must not be empty", .{});
 
     for (label) |ch| {
         if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_') continue;
-        return userErrorFmt("invalid label: {s} (allowed: [A-Za-z0-9._-])", .{label});
+        return userErrorFmt(io, "invalid label: {s} (allowed: [A-Za-z0-9._-])", .{label});
     }
     return label;
 }
@@ -334,9 +335,7 @@ fn programArgumentsEqual(left: []const []u8, right: []const []u8) bool {
     return true;
 }
 
-fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
-    return output.userErrorFmt(fmt, args);
-}
+const userErrorFmt = output.userErrorFmt;
 
 const LaunchctlQuery = struct {
     observation: LaunchctlObservation,
@@ -364,13 +363,13 @@ fn isExactLaunchctlNotFound(capture: CommandCapture, target: []const u8) bool {
 
 fn queryLaunchctl(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     runner: CommandRunner,
     target: []const u8,
 ) !LaunchctlQuery {
     const capture = runner.run(
         allocator,
-        io,
+        operation,
         &.{ "launchctl", "print", target },
         false,
     ) catch |err| {
@@ -469,7 +468,7 @@ fn initSchedulerStatus(
 
 fn readSchedulerStatusAtPath(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     label: []const u8,
     plist_path: []const u8,
     target: ?[]const u8,
@@ -478,13 +477,13 @@ fn readSchedulerStatusAtPath(
     var status = try initSchedulerStatus(allocator, label, plist_path);
     errdefer status.deinit(allocator);
 
-    const plist = try readSchedulerPlist(allocator, plist_path);
+    const plist = try readSchedulerPlist(operation, allocator, plist_path);
     defer if (plist) |bytes| allocator.free(bytes);
     status.installed = plist != null;
     if (plist != null) {
         const converted = try runner.run(
             allocator,
-            io,
+            operation,
             &.{ "plutil", "-convert", "json", "-o", "-", plist_path },
             true,
         );
@@ -499,12 +498,13 @@ fn readSchedulerStatusAtPath(
     }
 
     if (target) |launchctl_target| {
-        var query = try queryLaunchctl(allocator, io, runner, launchctl_target);
+        var query = try queryLaunchctl(allocator, operation, runner, launchctl_target);
         defer query.deinit(allocator);
         switch (query.observation) {
             .loaded, .not_found => {},
             .not_queried, .spawn_failed, .command_failed, .invalid_output => {
                 return userErrorFmt(
+                    operation.io,
                     "launchd scheduler state is unavailable: {s}",
                     .{launchctlObservationName(query.observation)},
                 );
@@ -524,6 +524,7 @@ fn readSchedulerStatusAtPath(
 }
 
 fn requireTrustedInstallState(
+    io: std.Io,
     status: SchedulerStatus,
     cas_path: []const u8,
     replace: bool,
@@ -532,6 +533,7 @@ fn requireTrustedInstallState(
         .loaded, .not_found => {},
         .not_queried, .spawn_failed, .command_failed, .invalid_output => {
             return userErrorFmt(
+                io,
                 "refusing scheduler install because launchd state is {s}",
                 .{launchctlObservationName(status.launchctl_observation)},
             );
@@ -540,6 +542,7 @@ fn requireTrustedInstallState(
     if (replace) return;
     if (!status.sources_agree) {
         return userErrorFmt(
+            io,
             "refusing to replace disagreeing persisted and loaded schedulers without --replace",
             .{},
         );
@@ -548,6 +551,7 @@ fn requireTrustedInstallState(
         !schedulerArgumentsMatchCas(status.persisted_program_arguments.items, cas_path))
     {
         return userErrorFmt(
+            io,
             "refusing to replace non-matching persisted scheduler without --replace",
             .{},
         );
@@ -556,6 +560,7 @@ fn requireTrustedInstallState(
         !schedulerArgumentsMatchCas(status.loaded_program_arguments.items, cas_path))
     {
         return userErrorFmt(
+            io,
             "refusing to replace non-matching loaded scheduler without --replace",
             .{},
         );
@@ -564,14 +569,14 @@ fn requireTrustedInstallState(
 
 pub fn cmdSchedulerInstall(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     args: SchedulerInstallArgs,
 ) !void {
     if (builtin.target.os.tag != .macos) {
-        return userErrorFmt("scheduler commands are supported on macOS only", .{});
+        return userErrorFmt(operation.io, "scheduler commands are supported on macOS only", .{});
     }
 
-    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
 
     const launch_agents = try allocator.print("{s}/Library/LaunchAgents", .{home});
     defer allocator.free(launch_agents);
@@ -588,12 +593,12 @@ pub fn cmdSchedulerInstall(
     defer allocator.free(plist_path);
 
     const self_path = try std.process.executablePathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        operation.io,
         allocator,
     );
     defer allocator.free(self_path);
     const executable_dir = std.fs.path.dirname(self_path) orelse
-        return userErrorFmt("failed to resolve cas executable directory", .{});
+        return userErrorFmt(operation.io, "failed to resolve cas executable directory", .{});
     const cas_path = try std.fs.path.join(allocator, &.{ executable_dir, "cas" });
     defer allocator.free(cas_path);
 
@@ -608,7 +613,7 @@ pub fn cmdSchedulerInstall(
 
     try installSchedulerAtPaths(
         allocator,
-        io,
+        operation,
         args,
         launch_agents,
         log_dir,
@@ -621,7 +626,7 @@ pub fn cmdSchedulerInstall(
     );
 
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(operation.io, &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("installed and started: {s}\n", .{args.label});
     try stdout.print("plist: {s}\n", .{plist_path});
@@ -630,7 +635,7 @@ pub fn cmdSchedulerInstall(
 
 fn installSchedulerAtPaths(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     args: SchedulerInstallArgs,
     launch_agents: []const u8,
     log_dir: []const u8,
@@ -643,35 +648,35 @@ fn installSchedulerAtPaths(
 ) !void {
     var status = try readSchedulerStatusAtPath(
         allocator,
-        io,
+        operation,
         args.label,
         plist_path,
         target,
         runner,
     );
     defer status.deinit(allocator);
-    try requireTrustedInstallState(status, cas_path, args.replace);
+    try requireTrustedInstallState(operation.io, status, cas_path, args.replace);
     try ensureSchedulerAbsent(
         allocator,
-        io,
+        operation,
         target,
         status.launchctl_observation,
         runner,
     );
-    try std.Io.Dir.cwd().createDirPath(
-        std.Io.Threaded.global_single_threaded.io(),
+    try operation.cwd.createDirPath(
+        operation.io,
         launch_agents,
     );
-    try std.Io.Dir.cwd().createDirPath(
-        std.Io.Threaded.global_single_threaded.io(),
+    try operation.cwd.createDirPath(
+        operation.io,
         log_dir,
     );
-    if (try schedulerPlistChanged(allocator, plist_path, plist)) {
-        try output.writeFileAtomic(allocator, plist_path, plist);
+    if (try schedulerPlistChanged(operation, allocator, plist_path, plist)) {
+        try output.writeFileAtomic(operation, allocator, plist_path, plist);
     }
     try activateScheduler(
         allocator,
-        io,
+        operation,
         domain,
         target,
         plist_path,
@@ -754,18 +759,20 @@ fn buildSchedulerPlist(
 }
 
 fn schedulerPlistChanged(
+    operation: Operation,
     allocator: std.mem.Allocator,
     plist_path: []const u8,
     plist: []const u8,
 ) !bool {
-    const existing = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const existing = operation.cwd.readFileAlloc(
+        operation.io,
         plist_path,
         allocator,
         .limited(MaxCommandOutputBytes),
     ) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
         else => return userErrorFmt(
+            operation.io,
             "failed to read existing plist ({s}): {s}",
             .{ plist_path, @errorName(err) },
         ),
@@ -777,18 +784,19 @@ fn schedulerPlistChanged(
 
 fn ensureSchedulerAbsent(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     target: []const u8,
     observed: LaunchctlObservation,
     runner: CommandRunner,
 ) !void {
     if (observed == .loaded) {
-        try runCommandChecked(allocator, io, runner, &.{ "launchctl", "bootout", target });
+        try runCommandChecked(allocator, operation, runner, &.{ "launchctl", "bootout", target });
     }
-    var verified = try queryLaunchctl(allocator, io, runner, target);
+    var verified = try queryLaunchctl(allocator, operation, runner, target);
     defer verified.deinit(allocator);
     if (verified.observation != .not_found) {
         return userErrorFmt(
+            operation.io,
             "scheduler absence was not verified after bootout: {s}",
             .{launchctlObservationName(verified.observation)},
         );
@@ -797,44 +805,45 @@ fn ensureSchedulerAbsent(
 
 fn runCommandChecked(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     runner: CommandRunner,
     argv: []const []const u8,
 ) !void {
-    const capture = try runner.run(allocator, io, argv, true);
+    const capture = try runner.run(allocator, operation, argv, true);
     allocator.free(capture.stdout);
     allocator.free(capture.stderr);
 }
 
 fn activateScheduler(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     domain: []const u8,
     target: []const u8,
     plist_path: []const u8,
     cas_path: []const u8,
     runner: CommandRunner,
 ) !void {
-    try runCommandChecked(allocator, io, runner, &.{ "plutil", "-lint", plist_path });
-    try runCommandChecked(allocator, io, runner, &.{ "launchctl", "enable", target });
+    try runCommandChecked(allocator, operation, runner, &.{ "plutil", "-lint", plist_path });
+    try runCommandChecked(allocator, operation, runner, &.{ "launchctl", "enable", target });
     try runCommandChecked(
         allocator,
-        io,
+        operation,
         runner,
         &.{ "launchctl", "bootstrap", domain, plist_path },
     );
     try runCommandChecked(
         allocator,
-        io,
+        operation,
         runner,
         &.{ "launchctl", "kickstart", "-k", target },
     );
-    var loaded = try queryLaunchctl(allocator, io, runner, target);
+    var loaded = try queryLaunchctl(allocator, operation, runner, target);
     defer loaded.deinit(allocator);
     if (loaded.observation != .loaded or
         !schedulerArgumentsMatchCas(loaded.program_arguments.items, cas_path))
     {
         return userErrorFmt(
+            operation.io,
             "scheduler replacement did not load cas automation program arguments",
             .{},
         );
@@ -843,14 +852,14 @@ fn activateScheduler(
 
 pub fn cmdSchedulerUninstall(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     args: SchedulerLabelArgs,
 ) !void {
     if (builtin.target.os.tag != .macos) {
-        return userErrorFmt("scheduler commands are supported on macOS only", .{});
+        return userErrorFmt(operation.io, "scheduler commands are supported on macOS only", .{});
     }
 
-    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
     const plist = try allocator.print(
         "{s}/Library/LaunchAgents/{s}.plist",
         .{ home, args.label },
@@ -863,7 +872,7 @@ pub fn cmdSchedulerUninstall(
 
     const existed = try uninstallSchedulerAtPath(
         allocator,
-        io,
+        operation,
         args.label,
         plist,
         target,
@@ -871,7 +880,7 @@ pub fn cmdSchedulerUninstall(
     );
 
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(operation.io, &.{});
     const stdout = &stdout_writer.interface;
     if (args.json) {
         try writeSchedulerUninstallJson(stdout, args.label, existed);
@@ -893,7 +902,7 @@ fn writeSchedulerUninstallJson(writer: anytype, label: []const u8, removed: bool
 
 fn uninstallSchedulerAtPath(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     label: []const u8,
     plist_path: []const u8,
     target: []const u8,
@@ -901,7 +910,7 @@ fn uninstallSchedulerAtPath(
 ) !bool {
     var status = try readSchedulerStatusAtPath(
         allocator,
-        io,
+        operation,
         label,
         plist_path,
         target,
@@ -912,7 +921,7 @@ fn uninstallSchedulerAtPath(
         .loaded => {
             try runCommandChecked(
                 allocator,
-                io,
+                operation,
                 runner,
                 &.{ "launchctl", "bootout", target },
             );
@@ -920,34 +929,37 @@ fn uninstallSchedulerAtPath(
         .not_found => {},
         .not_queried, .spawn_failed, .command_failed, .invalid_output => {
             return userErrorFmt(
+                operation.io,
                 "refusing scheduler uninstall because launchd state is {s}",
                 .{launchctlObservationName(status.launchctl_observation)},
             );
         },
     }
 
-    var verified = try queryLaunchctl(allocator, io, runner, target);
+    var verified = try queryLaunchctl(allocator, operation, runner, target);
     defer verified.deinit(allocator);
     if (verified.observation != .not_found) {
         return userErrorFmt(
+            operation.io,
             "scheduler absence was not verified before plist removal: {s}",
             .{launchctlObservationName(verified.observation)},
         );
     }
     try runCommandChecked(
         allocator,
-        io,
+        operation,
         runner,
         &.{ "launchctl", "disable", target },
     );
 
     const removed = status.installed or status.loaded;
-    std.Io.Dir.cwd().deleteFile(
-        std.Io.Threaded.global_single_threaded.io(),
+    operation.cwd.deleteFile(
+        operation.io,
         plist_path,
     ) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return userErrorFmt(
+            operation.io,
             "failed to remove plist ({s}): {s}",
             .{ plist_path, @errorName(err) },
         ),
@@ -957,18 +969,18 @@ fn uninstallSchedulerAtPath(
 
 pub fn cmdSchedulerStatus(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     args: SchedulerLabelArgs,
 ) !void {
     if (builtin.target.os.tag != .macos) {
-        return userErrorFmt("scheduler commands are supported on macOS only", .{});
+        return userErrorFmt(operation.io, "scheduler commands are supported on macOS only", .{});
     }
 
-    var status = try readSchedulerStatus(allocator, io, args.label);
+    var status = try readSchedulerStatus(allocator, operation, args.label);
     defer status.deinit(allocator);
 
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(operation.io, &.{});
     const stdout = &stdout_writer.interface;
     if (args.json) {
         try writeSchedulerStatusJson(stdout, status);
@@ -991,10 +1003,10 @@ pub fn cmdSchedulerStatus(
 
 pub fn readSchedulerStatus(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     label: []const u8,
 ) !SchedulerStatus {
-    const plist_path = try schedulerPlistPath(allocator, envString("HOME"), label);
+    const plist_path = try schedulerPlistPath(operation.io, allocator, operation.environment.get("HOME"), label);
     defer allocator.free(plist_path);
     var target: ?[]u8 = null;
     defer if (target) |value| allocator.free(value);
@@ -1004,7 +1016,7 @@ pub fn readSchedulerStatus(
     }
     return readSchedulerStatusAtPath(
         allocator,
-        io,
+        operation,
         label,
         plist_path,
         target,
@@ -1013,20 +1025,21 @@ pub fn readSchedulerStatus(
 }
 
 fn schedulerPlistPath(
+    io: std.Io,
     allocator: std.mem.Allocator,
     home: ?[]const u8,
     label: []const u8,
 ) ![]u8 {
-    const value = home orelse return userErrorFmt("HOME is not set", .{});
+    const value = home orelse return userErrorFmt(io, "HOME is not set", .{});
     return allocator.print(
         "{s}/Library/LaunchAgents/{s}.plist",
         .{ value, label },
     );
 }
 
-fn readSchedulerPlist(allocator: std.mem.Allocator, plist_path: []const u8) !?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+fn readSchedulerPlist(operation: Operation, allocator: std.mem.Allocator, plist_path: []const u8) !?[]u8 {
+    return operation.cwd.readFileAlloc(
+        operation.io,
         plist_path,
         allocator,
         .limited(2 * 1024 * 1024),
@@ -1038,22 +1051,24 @@ fn readSchedulerPlist(allocator: std.mem.Allocator, plist_path: []const u8) !?[]
 
 pub fn runCommandCapture(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     argv: []const []const u8,
     fail_on_nonzero: bool,
 ) !CommandCapture {
-    return runSystemCommandCapture(null, allocator, io, argv, fail_on_nonzero);
+    return runSystemCommandCapture(null, allocator, operation, argv, fail_on_nonzero);
 }
 
 fn runSystemCommandCapture(
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     argv: []const []const u8,
     fail_on_nonzero: bool,
 ) !CommandCapture {
     _ = context;
-    const child = try std.process.run(allocator, io, .{
+    const child = try std.process.run(allocator, operation.io, .{
+        .cwd = .{ .dir = operation.cwd },
+        .environ_map = operation.environment,
         .argv = argv,
         .stdout_limit = .limited(MaxCommandOutputBytes),
         .stderr_limit = .limited(MaxCommandOutputBytes),
@@ -1072,17 +1087,13 @@ fn runSystemCommandCapture(
         defer allocator.free(child.stdout);
         defer allocator.free(child.stderr);
         return userErrorFmt(
+            operation.io,
             "command failed ({s}): {s}",
             .{ argv[0], std.mem.trim(u8, child.stderr, " \t\r\n") },
         );
     }
 
     return .{ .exit_code = exit_code, .stdout = child.stdout, .stderr = child.stderr };
-}
-
-fn envString(key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    return std.mem.span(value);
 }
 
 const ScriptStep = struct {
@@ -1105,11 +1116,11 @@ const ScriptedRunner = struct {
     fn run(
         runner_context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        io: std.Io,
+        operation: Operation,
         argv: []const []const u8,
         fail_on_nonzero: bool,
     ) !CommandCapture {
-        _ = io;
+        _ = operation;
         const self: *ScriptedRunner = @ptrCast(@alignCast(runner_context orelse
             return error.MissingScriptContext));
         if (self.next_step >= self.steps.len or argv.len < 2) {
@@ -1243,12 +1254,12 @@ fn expectPlistPreserved(io: std.Io, tmp: *std.testing.TmpDir) !void {
 }
 
 fn expectPlistPreservedAtPath(
-    io: std.Io,
+    operation: Operation,
     plist_path: []const u8,
     expected: []const u8,
 ) !void {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(
-        io,
+    const contents = try operation.cwd.readFileAlloc(
+        operation.io,
         plist_path,
         std.testing.allocator,
         .limited(4096),
@@ -1259,7 +1270,7 @@ fn expectPlistPreservedAtPath(
 
 fn runTestSchedulerInstall(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     root: []const u8,
     log_dir: []const u8,
     plist_path: []const u8,
@@ -1274,7 +1285,7 @@ fn runTestSchedulerInstall(
     };
     try installSchedulerAtPaths(
         allocator,
-        io,
+        operation,
         args,
         root,
         log_dir,
@@ -1305,8 +1316,9 @@ test "scheduler surface requires the exact CAS argument tuple" {
 }
 
 test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plist_path = try testPlistPath(allocator, io, &tmp);
@@ -1318,7 +1330,7 @@ test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
     } };
     var status = try readSchedulerStatusAtPath(
         allocator,
-        io,
+        operation,
         "com.example.scheduler",
         plist_path,
         "gui/501/com.example.scheduler",
@@ -1376,8 +1388,9 @@ test "scheduler uninstall JSON reports its exact result contract" {
 }
 
 test "persisted scheduler plist requires well formed XML and exact label" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1400,7 +1413,7 @@ test "persisted scheduler plist requires well formed XML and exact label" {
         error.ScriptedNonZero,
         readSchedulerStatusAtPath(
             allocator,
-            io,
+            operation,
             "com.example.scheduler",
             plist_path,
             null,
@@ -1416,7 +1429,7 @@ test "persisted scheduler plist requires well formed XML and exact label" {
         error.SchedulerLabelMismatch,
         readSchedulerStatusAtPath(
             allocator,
-            io,
+            operation,
             "com.example.scheduler",
             plist_path,
             null,
@@ -1427,8 +1440,9 @@ test "persisted scheduler plist requires well formed XML and exact label" {
 }
 
 test "install rejects extra persisted arguments before effects" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{
@@ -1456,7 +1470,7 @@ test "install rejects extra persisted arguments before effects" {
     };
     try std.testing.expectError(error.UserInput, installSchedulerAtPaths(
         allocator,
-        io,
+        operation,
         args,
         launch_agents,
         log_dir,
@@ -1470,12 +1484,12 @@ test "install rejects extra persisted arguments before effects" {
     try script.expectComplete();
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "LaunchAgents", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "Logs", .{}));
-    try expectPlistPreservedAtPath(io, plist_path, TestCasExtraArgumentPlist);
+    try expectPlistPreservedAtPath(operation, plist_path, TestCasExtraArgumentPlist);
 }
 
 test "launchctl query distinguishes exact absence from query failures" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     const target = "gui/501/com.example.scheduler";
     const not_found =
         "Could not find service \"com.example.scheduler\" " ++
@@ -1491,24 +1505,25 @@ test "launchctl query distinguishes exact absence from query failures" {
         .{ .verb = "print", .exit_code = 113, .stderr = not_found },
     } };
 
-    var spawn_failed = try queryLaunchctl(allocator, io, script.commandRunner(), target);
+    var spawn_failed = try queryLaunchctl(allocator, operation, script.commandRunner(), target);
     defer spawn_failed.deinit(allocator);
     try std.testing.expectEqual(LaunchctlObservation.spawn_failed, spawn_failed.observation);
-    var command_failed = try queryLaunchctl(allocator, io, script.commandRunner(), target);
+    var command_failed = try queryLaunchctl(allocator, operation, script.commandRunner(), target);
     defer command_failed.deinit(allocator);
     try std.testing.expectEqual(LaunchctlObservation.command_failed, command_failed.observation);
-    var wrong_label = try queryLaunchctl(allocator, io, script.commandRunner(), target);
+    var wrong_label = try queryLaunchctl(allocator, operation, script.commandRunner(), target);
     defer wrong_label.deinit(allocator);
     try std.testing.expectEqual(LaunchctlObservation.command_failed, wrong_label.observation);
-    var absent = try queryLaunchctl(allocator, io, script.commandRunner(), target);
+    var absent = try queryLaunchctl(allocator, operation, script.commandRunner(), target);
     defer absent.deinit(allocator);
     try std.testing.expectEqual(LaunchctlObservation.not_found, absent.observation);
     try script.expectComplete();
 }
 
 test "scheduler status propagates launchctl query failure" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1523,7 +1538,7 @@ test "scheduler status propagates launchctl query failure" {
         error.UserInput,
         readSchedulerStatusAtPath(
             allocator,
-            io,
+            operation,
             "com.example.scheduler",
             plist_path,
             "gui/501/com.example.scheduler",
@@ -1534,8 +1549,9 @@ test "scheduler status propagates launchctl query failure" {
 }
 
 test "loaded CAS with extra arguments requires explicit replacement" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1561,7 +1577,7 @@ test "loaded CAS with extra arguments requires explicit replacement" {
         error.UserInput,
         installSchedulerAtPaths(
             allocator,
-            io,
+            operation,
             args,
             launch_agents,
             log_dir,
@@ -1579,8 +1595,9 @@ test "loaded CAS with extra arguments requires explicit replacement" {
 }
 
 test "replace adopts the exact same-label standalone Cron scheduler" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1634,7 +1651,7 @@ test "replace adopts the exact same-label standalone Cron scheduler" {
     };
     try installSchedulerAtPaths(
         allocator,
-        io,
+        operation,
         args,
         root,
         log_dir,
@@ -1646,12 +1663,13 @@ test "replace adopts the exact same-label standalone Cron scheduler" {
         script.commandRunner(),
     );
     try script.expectComplete();
-    try expectPlistPreservedAtPath(io, plist_path, TestCasPlist);
+    try expectPlistPreservedAtPath(operation, plist_path, TestCasPlist);
 }
 
 test "failed or unverified bootout preserves the scheduler plist" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plist_path = try testPlistPath(allocator, io, &tmp);
@@ -1666,7 +1684,7 @@ test "failed or unverified bootout preserves the scheduler plist" {
         error.ScriptedNonZero,
         ensureSchedulerAbsent(
             allocator,
-            io,
+            operation,
             target,
             .loaded,
             failed_bootout.commandRunner(),
@@ -1683,7 +1701,7 @@ test "failed or unverified bootout preserves the scheduler plist" {
         error.UserInput,
         ensureSchedulerAbsent(
             allocator,
-            io,
+            operation,
             target,
             .loaded,
             unverified_bootout.commandRunner(),
@@ -1694,8 +1712,9 @@ test "failed or unverified bootout preserves the scheduler plist" {
 }
 
 test "uninstall removes the plist only after verified launchd absence" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plist_path = try testPlistPath(allocator, io, &tmp);
@@ -1712,7 +1731,7 @@ test "uninstall removes the plist only after verified launchd absence" {
     } };
     try std.testing.expect(try uninstallSchedulerAtPath(
         allocator,
-        io,
+        operation,
         "com.example.scheduler",
         plist_path,
         "gui/501/com.example.scheduler",
@@ -1726,8 +1745,9 @@ test "uninstall removes the plist only after verified launchd absence" {
 }
 
 test "uninstall reports a loaded-only scheduler as removed" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1742,7 +1762,7 @@ test "uninstall reports a loaded-only scheduler as removed" {
     } };
     try std.testing.expect(try uninstallSchedulerAtPath(
         allocator,
-        io,
+        operation,
         "com.example.scheduler",
         plist_path,
         "gui/501/com.example.scheduler",
@@ -1752,8 +1772,9 @@ test "uninstall reports a loaded-only scheduler as removed" {
 }
 
 test "uninstall rejects a persisted plist with the wrong label before effects" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plist_path = try testPlistPath(allocator, io, &tmp);
@@ -1766,7 +1787,7 @@ test "uninstall rejects a persisted plist with the wrong label before effects" {
         error.SchedulerLabelMismatch,
         uninstallSchedulerAtPath(
             allocator,
-            io,
+            operation,
             "com.example.scheduler",
             plist_path,
             "gui/501/com.example.scheduler",
@@ -1778,8 +1799,9 @@ test "uninstall rejects a persisted plist with the wrong label before effects" {
 }
 
 test "scheduler install succeeds after uninstall disabled the same label" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1791,7 +1813,7 @@ test "scheduler install succeeds after uninstall disabled the same label" {
     const target = "gui/501/com.example.scheduler";
 
     var first_install = ScriptedRunner{ .steps = &TestInstallSteps };
-    try runTestSchedulerInstall(allocator, io, root, log_dir, plist_path, &first_install);
+    try runTestSchedulerInstall(allocator, operation, root, log_dir, plist_path, &first_install);
 
     var uninstall_script = ScriptedRunner{ .steps = &.{
         .{ .verb = "-convert", .stdout = TestCasPlistJson },
@@ -1802,7 +1824,7 @@ test "scheduler install succeeds after uninstall disabled the same label" {
     } };
     try std.testing.expect(try uninstallSchedulerAtPath(
         allocator,
-        io,
+        operation,
         "com.example.scheduler",
         plist_path,
         target,
@@ -1811,13 +1833,14 @@ test "scheduler install succeeds after uninstall disabled the same label" {
     try uninstall_script.expectComplete();
 
     var second_install = ScriptedRunner{ .steps = &TestInstallSteps };
-    try runTestSchedulerInstall(allocator, io, root, log_dir, plist_path, &second_install);
-    try expectPlistPreservedAtPath(io, plist_path, TestCasPlist);
+    try runTestSchedulerInstall(allocator, operation, root, log_dir, plist_path, &second_install);
+    try expectPlistPreservedAtPath(operation, plist_path, TestCasPlist);
 }
 
 test "uninstall verification failure preserves the scheduler plist" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plist_path = try testPlistPath(allocator, io, &tmp);
@@ -1832,7 +1855,7 @@ test "uninstall verification failure preserves the scheduler plist" {
         error.UserInput,
         uninstallSchedulerAtPath(
             allocator,
-            io,
+            operation,
             "com.example.scheduler",
             plist_path,
             "gui/501/com.example.scheduler",
@@ -1844,10 +1867,11 @@ test "uninstall verification failure preserves the scheduler plist" {
 }
 
 fn expectSchedulerPlistReadFailure(
+    operation: Operation,
     allocator: std.mem.Allocator,
     plist_path: []const u8,
 ) !void {
-    const unexpected = readSchedulerPlist(allocator, plist_path) catch |err| {
+    const unexpected = readSchedulerPlist(operation, allocator, plist_path) catch |err| {
         try std.testing.expect(err != error.FileNotFound);
         return;
     };
@@ -1856,8 +1880,9 @@ fn expectSchedulerPlistReadFailure(
 }
 
 test "scheduler plist inspection distinguishes absence from read failures" {
+    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -1865,15 +1890,15 @@ test "scheduler plist inspection distinguishes absence from read failures" {
 
     try std.testing.expectError(
         error.UserInput,
-        schedulerPlistPath(allocator, null, "com.example.scheduler"),
+        schedulerPlistPath(std.testing.io, allocator, null, "com.example.scheduler"),
     );
 
     const missing_path = try std.fs.path.join(allocator, &.{ root, "missing.plist" });
     defer allocator.free(missing_path);
-    const missing = try readSchedulerPlist(allocator, missing_path);
+    const missing = try readSchedulerPlist(operation, allocator, missing_path);
     try std.testing.expect(missing == null);
 
-    try expectSchedulerPlistReadFailure(allocator, root);
+    try expectSchedulerPlistReadFailure(operation, allocator, root);
 
     const oversized_path = try std.fs.path.join(allocator, &.{ root, "oversized.plist" });
     defer allocator.free(oversized_path);
@@ -1881,7 +1906,7 @@ test "scheduler plist inspection distinguishes absence from read failures" {
     defer allocator.free(oversized);
     @memset(oversized, 'x');
     try tmp.dir.writeFile(io, .{ .sub_path = "oversized.plist", .data = oversized });
-    try expectSchedulerPlistReadFailure(allocator, oversized_path);
+    try expectSchedulerPlistReadFailure(operation, allocator, oversized_path);
 }
 
 const ArgumentParserCase = enum { plist, launchctl, json };

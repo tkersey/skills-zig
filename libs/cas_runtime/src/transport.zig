@@ -149,25 +149,215 @@ pub fn resolveUnixPathAlloc(
     return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
-pub fn defaultUnixPathAlloc(allocator: std.mem.Allocator) ![]u8 {
+pub fn defaultUnixPathAlloc(
+    allocator: std.mem.Allocator,
+    codex_home: ?[]const u8,
+    home: ?[]const u8,
+) ![]u8 {
     return switch (@import("builtin").os.tag) {
         .windows, .wasi => error.UnixSocketUnsupported,
         else => blk: {
-            const environ = std.Io.Threaded.global_single_threaded.environ.process_environ;
-            if (std.process.Environ.getPosix(environ, "CODEX_HOME")) |value| {
+            if (codex_home) |value| {
                 break :blk std.fs.path.join(
                     allocator,
                     &.{ value, "app-server-control", "app-server-control.sock" },
                 );
             }
-            const home = std.process.Environ.getPosix(environ, "HOME") orelse
+            const home_value = home orelse
                 return error.HomeNotSet;
             break :blk std.fs.path.join(
                 allocator,
-                &.{ home, ".codex", "app-server-control", "app-server-control.sock" },
+                &.{ home_value, ".codex", "app-server-control", "app-server-control.sock" },
             );
         },
     };
+}
+
+/// Resolves from the invocation directory, trying packaged siblings before PATH.
+/// File existence is sufficient here; spawning owns executable-permission checks.
+pub fn resolveExecutableAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path_env: ?[]const u8,
+    raw: []const u8,
+) ![]u8 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return error.MissingExecutable;
+
+    if (std.mem.indexOfScalar(u8, value, '/') != null) {
+        return try resolveCandidateAlloc(allocator, io, dir, value) orelse error.ExecutableNotFound;
+    }
+
+    const exe_dir = std.process.executableDirPathAlloc(io, allocator) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => null,
+    };
+    if (exe_dir) |directory| {
+        defer allocator.free(directory);
+        const sibling = try allocator.print("{s}/{s}", .{ directory, value });
+        errdefer allocator.free(sibling);
+        if (try pathExists(io, dir, sibling)) return sibling;
+        allocator.free(sibling);
+    }
+
+    var iter = std.mem.splitScalar(u8, path_env orelse return error.ExecutableNotFound, ':');
+    while (iter.next()) |directory| {
+        if (directory.len == 0) continue;
+        const candidate = try allocator.print("{s}/{s}", .{ directory, value });
+        errdefer allocator.free(candidate);
+        if (try pathExists(io, dir, candidate)) {
+            if (std.fs.path.isAbsolute(candidate)) return candidate;
+            const root_path = dir.realPathFileAlloc(io, ".", allocator) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => return err,
+                else => {
+                    allocator.free(candidate);
+                    continue;
+                },
+            };
+            defer allocator.free(root_path);
+            const absolute = try std.fs.path.join(allocator, &.{ root_path, candidate });
+            allocator.free(candidate);
+            return absolute;
+        }
+        allocator.free(candidate);
+    }
+
+    return error.ExecutableNotFound;
+}
+
+fn resolveCandidateAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+) !?[]u8 {
+    const resolved = dir.realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => return null,
+    };
+    defer allocator.free(resolved);
+    return try allocator.dupe(u8, resolved);
+}
+
+fn pathExists(io: std.Io, dir: std.Io.Dir, path: []const u8) !bool {
+    dir.access(io, path, .{}) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return false,
+    };
+    return true;
+}
+
+test "default Unix path uses supplied home values and preserves precedence" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        try std.testing.expectError(error.UnixSocketUnsupported, defaultUnixPathAlloc(
+            std.testing.allocator,
+            "/codex",
+            "/home",
+        ));
+        return;
+    }
+    const cases = .{
+        .{ @as(?[]const u8, "/codex"), @as(?[]const u8, "/home"), "/codex/app-server-control/app-server-control.sock" },
+        .{ @as(?[]const u8, null), @as(?[]const u8, "/home"), "/home/.codex/app-server-control/app-server-control.sock" },
+        .{ @as(?[]const u8, ""), @as(?[]const u8, "/home"), "app-server-control/app-server-control.sock" },
+    };
+    inline for (cases) |case| {
+        const actual = try defaultUnixPathAlloc(std.testing.allocator, case[0], case[1]);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case[2], actual);
+    }
+    try std.testing.expectError(error.HomeNotSet, defaultUnixPathAlloc(std.testing.allocator, null, null));
+}
+
+test "executable resolution uses independent supplied directories and PATH values" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const name = "cas-explicit-path-fixture";
+    for ([_]std.Io.Dir{ first.dir, second.dir }) |dir| {
+        try dir.writeFile(io, .{ .sub_path = name, .data = "fixture" });
+        const absolute = try dir.realPathFileAlloc(io, name, allocator);
+        defer allocator.free(absolute);
+        const by_path = try resolveExecutableAlloc(allocator, io, dir, ":missing:.:", name);
+        defer allocator.free(by_path);
+        const by_path_real = try dir.realPathFileAlloc(io, by_path, allocator);
+        defer allocator.free(by_path_real);
+        try std.testing.expect(std.fs.path.isAbsolute(by_path));
+        try std.testing.expectEqualStrings(absolute, by_path_real);
+        const by_slash = try resolveExecutableAlloc(allocator, io, dir, null, "./" ++ name);
+        defer allocator.free(by_slash);
+        try std.testing.expectEqualStrings(absolute, by_slash);
+        try std.testing.expectError(error.ExecutableNotFound, resolveExecutableAlloc(allocator, io, dir, "::", name));
+        try std.testing.expectError(error.ExecutableNotFound, resolveExecutableAlloc(allocator, io, dir, null, name));
+    }
+}
+
+test "PATH executable resolution preserves symlink spelling" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "target", .default_dir);
+    try dir.dir.writeFile(io, .{ .sub_path = "target/cas-symlink-fixture", .data = "fixture" });
+    try dir.dir.symLink(io, "target", "alias", .{ .is_directory = true });
+    const root_path = try dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    const path_env = try std.fs.path.join(allocator, &.{ root_path, "alias" });
+    defer allocator.free(path_env);
+    const expected = try std.fs.path.join(allocator, &.{ path_env, "cas-symlink-fixture" });
+    defer allocator.free(expected);
+    for ([_][]const u8{ "alias", path_env }) |path| {
+        const resolved = try resolveExecutableAlloc(allocator, io, dir.dir, path, "cas-symlink-fixture");
+        defer allocator.free(resolved);
+        try std.testing.expectEqualStrings(expected, resolved);
+    }
+}
+
+test "executable resolution propagates supplied I/O cancellation" {
+    const Canceled = struct {
+        fn realPath(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []u8) std.Io.Dir.RealPathFileError!usize {
+            return error.Canceled;
+        }
+
+        fn access(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.AccessOptions) std.Io.Dir.AccessError!void {
+            return error.Canceled;
+        }
+    };
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirRealPathFile = Canceled.realPath;
+    vtable.dirAccess = Canceled.access;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, resolveExecutableAlloc(std.testing.allocator, io, dir.dir, null, "./codex"));
+    try std.testing.expectError(error.Canceled, resolveExecutableAlloc(std.testing.allocator, io, dir.dir, ".", "codex"));
+}
+
+test "executable resolution propagates allocation failure" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "cas-allocation-fixture", .data = "fixture" });
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExecutableAllocations,
+        .{dir.dir},
+    );
+}
+
+fn exerciseExecutableAllocations(allocator: std.mem.Allocator, dir: std.Io.Dir) !void {
+    const slash = try resolveExecutableAlloc(allocator, std.testing.io, dir, null, "./cas-allocation-fixture");
+    defer allocator.free(slash);
+    const path = try resolveExecutableAlloc(allocator, std.testing.io, dir, ".", "cas-allocation-fixture");
+    defer allocator.free(path);
+    try std.testing.expect(std.fs.path.isAbsolute(slash));
+    try std.testing.expect(std.fs.path.isAbsolute(path));
 }
 
 pub const CodeModeHost = struct {

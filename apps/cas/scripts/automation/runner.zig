@@ -1,3 +1,4 @@
+const Operation = @import("operation.zig").Operation;
 const files = @import("files.zig");
 const output_mod = @import("output.zig");
 const rrule = @import("rrule.zig");
@@ -90,43 +91,43 @@ pub fn collapseWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 
 
 pub fn cmdRunDue(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db_path: []const u8,
     args: anytype,
 ) !void {
-    const maybe_lock = try acquireRunLock(allocator, args.lock_label);
-    defer releaseRunLock(allocator, maybe_lock);
+    const maybe_lock = try acquireRunLock(operation, allocator, args.lock_label);
+    defer releaseRunLock(operation, allocator, maybe_lock);
 
     if (maybe_lock == null) {
-        try printRunLockHeld(allocator);
+        try printRunLockHeld(operation.io, allocator);
         return;
     }
 
-    var db = try store.Db.open(allocator, db_path);
+    var db = try store.Db.open(operation, allocator, db_path);
     defer db.close();
     try store.requireStoreSchema(allocator, &db);
 
-    const now = store.nowMs();
+    const now = store.nowMs(operation.io);
     var due = try selectDueAutomations(allocator, &db, now, args.limit, args.automation_id);
     defer {
         for (due.items) |*row| row.deinit(allocator);
         due.deinit(allocator);
     }
 
-    try validateDueBatch(allocator, due.items, now);
+    try validateDueBatch(operation.io, allocator, due.items, now);
 
     if (due.items.len == 0) {
-        try printNoDueAutomations();
+        try printNoDueAutomations(operation.io);
         return;
     }
 
     const codex_exe = if (args.dry_run)
         null
     else
-        try store.resolveExecutable(allocator, args.codex_bin);
+        try store.resolveExecutable(operation, allocator, args.codex_bin);
     defer if (codex_exe) |p| allocator.free(p);
     if (!args.dry_run and codex_exe == null) {
-        return userErrorFmt("codex executable not found: {s}", .{args.codex_bin});
+        return userErrorFmt(operation.io, "codex executable not found: {s}", .{args.codex_bin});
     }
 
     var results = std.ArrayList(RunResult).empty;
@@ -141,7 +142,7 @@ pub fn cmdRunDue(
 
     try appendRunDueResults(
         allocator,
-        io,
+        operation,
         &db,
         due.items,
         codex_exe orelse "",
@@ -149,27 +150,27 @@ pub fn cmdRunDue(
         &results,
     );
 
-    try printRunDueResults(allocator, results.items);
+    try printRunDueResults(operation.io, allocator, results.items);
 }
 
-fn printRunLockHeld(allocator: std.mem.Allocator) !void {
+fn printRunLockHeld(io: std.Io, allocator: std.mem.Allocator) !void {
     var stderr_file = std.Io.File.stderr();
-    var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stderr_writer = stderr_file.writer(io, &.{});
     const stderr = &stderr_writer.interface;
-    const ts = try rrule.timestampStringUtc(allocator, store.nowMs());
+    const ts = try rrule.timestampStringUtc(allocator, store.nowMs(io));
     defer allocator.free(ts);
     try stderr.print("{s} skip: lock held\n", .{ts});
 }
 
-fn printNoDueAutomations() !void {
+fn printNoDueAutomations(io: std.Io) !void {
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(io, &.{});
     try stdout_writer.interface.writeAll("no due automations\n");
 }
 
-fn printRunDueResults(allocator: std.mem.Allocator, results: []const RunResult) !void {
+fn printRunDueResults(io: std.Io, allocator: std.mem.Allocator, results: []const RunResult) !void {
     var stdout_file = std.Io.File.stdout();
-    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    var stdout_writer = stdout_file.writer(io, &.{});
     const json_text = try output_mod.buildRunResultsJsonAlloc(allocator, results);
     defer allocator.free(json_text);
     try stdout_writer.interface.writeAll(json_text);
@@ -177,7 +178,7 @@ fn printRunDueResults(allocator: std.mem.Allocator, results: []const RunResult) 
 
 fn appendRunDueResults(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db: *store.Db,
     due: []store.AutomationRow,
     codex_exe: []const u8,
@@ -187,7 +188,7 @@ fn appendRunDueResults(
     for (due) |*row| {
         const result = runDueAutomation(
             allocator,
-            io,
+            operation,
             db,
             row,
             codex_exe,
@@ -220,7 +221,8 @@ pub fn selectDueAutomations(
     limit: i64,
     automation_id: ?[]const u8,
 ) !std.ArrayList(store.AutomationRow) {
-    if (limit < 1) return userErrorFmt("--limit must be >= 1", .{});
+    const io = db.io;
+    if (limit < 1) return userErrorFmt(io, "--limit must be >= 1", .{});
     var rows = std.ArrayList(store.AutomationRow).empty;
 
     if (automation_id) |id_value| {
@@ -271,50 +273,51 @@ pub fn selectDueAutomations(
 }
 
 pub fn validateDueBatch(
+    io: std.Io,
     allocator: std.mem.Allocator,
     rows: []const store.AutomationRow,
     now: i64,
 ) !void {
     for (rows) |*row| {
         if (!std.mem.eql(u8, row.status, "ACTIVE")) {
-            return userErrorFmt("due automation {s} is not ACTIVE", .{row.id});
+            return userErrorFmt(io, "due automation {s} is not ACTIVE", .{row.id});
         }
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, row.cwds_json, .{}) catch {
-            return userErrorFmt("due automation {s} has malformed cwds JSON", .{row.id});
+            return userErrorFmt(io, "due automation {s} has malformed cwds JSON", .{row.id});
         };
         defer parsed.deinit();
         if (parsed.value != .array) {
-            return userErrorFmt("due automation {s} cwds is not an array", .{row.id});
+            return userErrorFmt(io, "due automation {s} cwds is not an array", .{row.id});
         }
         for (parsed.value.array.items) |item| {
             if (item != .string or std.mem.trim(u8, item.string, " \t\r\n").len == 0) {
-                return userErrorFmt("due automation {s} has an invalid cwd", .{row.id});
+                return userErrorFmt(io, "due automation {s} has an invalid cwd", .{row.id});
             }
         }
-        _ = try rrule.computeNextRunAt(allocator, row, now);
+        _ = try rrule.computeNextRunAt(io, allocator, row, now);
     }
 }
 
 pub fn runDueAutomation(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db: *store.Db,
     row: *store.AutomationRow,
     codex_bin: []const u8,
     dry_run: bool,
 ) !RunResult {
-    const started = store.nowMs();
-    const next_run = try rrule.computeNextRunAt(allocator, row, started);
+    const started = store.nowMs(operation.io);
+    const next_run = try rrule.computeNextRunAt(operation.io, allocator, row, started);
 
     if (!dry_run) {
         try closeStaleRunningRows(allocator, db, row.id, started);
     }
 
-    var cwds = try files.parseCwdsJson(allocator, row.cwds_json);
+    var cwds = try files.parseCwdsJson(operation.io, allocator, row.cwds_json);
     defer files.freeOwnedStrings(allocator, cwds);
 
     if (cwds.items.len == 0) {
-        const cwd = try store.currentPathOwned(allocator);
+        const cwd = try store.currentPathOwned(operation, allocator);
         try cwds.append(allocator, cwd);
     }
 
@@ -332,7 +335,7 @@ pub fn runDueAutomation(
     for (cwds.items) |cwd| {
         const outcome = try runAutomationCwd(
             allocator,
-            io,
+            operation,
             db,
             row,
             codex_bin,
@@ -353,6 +356,7 @@ pub fn runDueAutomation(
     if (dry_run) return dryRunResult(row, final_thread_id, final_cwd, next_run);
 
     return finalizeAutomationRun(
+        operation,
         allocator,
         db,
         row,
@@ -390,7 +394,7 @@ const CwdRunOutcome = struct {
 
 fn runAutomationCwd(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     db: *store.Db,
     row: *const store.AutomationRow,
     codex_bin: []const u8,
@@ -398,7 +402,7 @@ fn runAutomationCwd(
     started: i64,
     dry_run: bool,
 ) !CwdRunOutcome {
-    const thread_id = try store.generateUuidV4(allocator);
+    const thread_id = try store.generateUuidV4(operation.io, allocator);
     errdefer allocator.free(thread_id);
     const owned_cwd = try allocator.dupe(u8, cwd);
     errdefer allocator.free(owned_cwd);
@@ -408,7 +412,7 @@ fn runAutomationCwd(
 
     const exec_result = runCodexExec(
         allocator,
-        io,
+        operation,
         codex_bin,
         cwd,
         row.prompt,
@@ -427,7 +431,7 @@ fn runAutomationCwd(
             "FAILED",
             summary,
             summary,
-            store.nowMs(),
+            store.nowMs(operation.io),
         );
         const failure = try allocator.print(
             "{s} ({s})",
@@ -456,6 +460,7 @@ fn persistCodexRunResult(
     cwd: []const u8,
     result: CodexRunResult,
 ) !?[]u8 {
+    const io = db.io;
     const core_text = if (std.mem.trim(u8, result.output_text, " \t\r\n").len > 0)
         result.output_text
     else if (std.mem.trim(u8, result.stdout, " \t\r\n").len > 0)
@@ -498,7 +503,7 @@ fn persistCodexRunResult(
         status,
         summary,
         details,
-        store.nowMs(),
+        store.nowMs(io),
     );
     if (result.exit_code == 0) return null;
     const failure = try allocator.print(
@@ -509,6 +514,7 @@ fn persistCodexRunResult(
 }
 
 fn finalizeAutomationRun(
+    operation: Operation,
     allocator: std.mem.Allocator,
     db: *store.Db,
     row: *const store.AutomationRow,
@@ -520,7 +526,7 @@ fn finalizeAutomationRun(
     final_cwd: []u8,
 ) !RunResult {
     try updateAutomationTimes(allocator, db, row.id, started, next_run);
-    try store.syncAutomationFilesAfterCommit(allocator, db, row.id);
+    try store.syncAutomationFilesAfterCommit(operation, allocator, db, row.id);
 
     const summary_text = if (failures_count == 0)
         try allocator.print("Completed {d} run(s)", .{cwds_count})
@@ -530,7 +536,7 @@ fn finalizeAutomationRun(
             .{ failures_count, cwds_count },
         );
     defer allocator.free(summary_text);
-    try files.writeMemorySummary(allocator, row.id, summary_text, started);
+    try files.writeMemorySummary(operation, allocator, row.id, summary_text, started);
 
     if (failures_count > 0) {
         const err_text = try allocator.print(
@@ -670,13 +676,14 @@ pub fn updateAutomationTimes(
     run_started_ms: i64,
     next_run_at: i64,
 ) !void {
+    const io = db.io;
     try db.exec(
         allocator,
         "update automations set last_run_at = ?, next_run_at = ?, updated_at = ? where id = ?",
         &.{
             .{ .int = run_started_ms },
             .{ .int = next_run_at },
-            .{ .int = store.nowMs() },
+            .{ .int = store.nowMs(io) },
             .{ .text = automation_id },
         },
     );
@@ -684,16 +691,16 @@ pub fn updateAutomationTimes(
 
 pub fn runCodexExec(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    operation: Operation,
     codex_bin: []const u8,
     cwd: []const u8,
     prompt: []const u8,
     thread_id: []const u8,
 ) !CodexRunResult {
-    const tmp_dir = try tmpAutomationRunnerDir(allocator);
+    const tmp_dir = try tmpAutomationRunnerDir(operation, allocator);
     defer allocator.free(tmp_dir);
-    try std.Io.Dir.cwd().createDirPath(
-        std.Io.Threaded.global_single_threaded.io(),
+    try operation.cwd.createDirPath(
+        operation.io,
         tmp_dir,
     );
 
@@ -714,20 +721,23 @@ pub fn runCodexExec(
         prompt,
     };
 
-    const child = try std.process.run(allocator, io, .{
+    const child = try std.process.run(allocator, operation.io, .{
+        .cwd = .{ .dir = operation.cwd },
+        .environ_map = operation.environment,
         .argv = &argv,
         .stdout_limit = .limited(MaxCommandOutputBytes),
         .stderr_limit = .limited(MaxCommandOutputBytes),
     });
 
-    const output_text = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+    const output_text = operation.cwd.readFileAlloc(
+        operation.io,
         output_path,
         allocator,
         .limited(MaxCommandOutputBytes),
     ) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
         else => return userErrorFmt(
+            operation.io,
             "failed to read codex output file ({s}): {s}",
             .{ output_path, @errorName(err) },
         ),
@@ -751,8 +761,8 @@ pub fn runCodexExec(
     };
 }
 
-pub fn tmpAutomationRunnerDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
+pub fn tmpAutomationRunnerDir(operation: Operation, allocator: std.mem.Allocator) ![]u8 {
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
     return allocator.print("{s}/.codex/tmp/automation-runner", .{home});
 }
 
@@ -761,67 +771,72 @@ pub const RunLock = struct {
     path: []u8,
 };
 
-pub fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
-    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
-    const validated_label = try scheduler.validateSchedulerLabel(label);
+pub fn acquireRunLock(operation: Operation, allocator: std.mem.Allocator, label: []const u8) !?RunLock {
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+    const validated_label = try scheduler.validateSchedulerLabel(operation.io, label);
 
     const lock_dir = try allocator.print(
         "{s}/Library/Caches/{s}",
         .{ home, validated_label },
     );
     defer allocator.free(lock_dir);
-    try std.Io.Dir.cwd().createDirPath(
-        std.Io.Threaded.global_single_threaded.io(),
+    try operation.cwd.createDirPath(
+        operation.io,
         lock_dir,
     );
 
     const lock_path = try allocator.print("{s}/run.lock", .{lock_dir});
     defer allocator.free(lock_path);
 
-    return acquireExclusiveLockWithStaleRetry(allocator, lock_path);
+    return acquireExclusiveLockWithStaleRetry(operation, allocator, lock_path);
 }
 
 pub fn acquireExclusiveLockWithStaleRetry(
+    operation: Operation,
     allocator: std.mem.Allocator,
     lock_path: []const u8,
 ) !?RunLock {
-    return acquireExclusiveLockWithAttempt(allocator, lock_path, false);
+    return acquireExclusiveLockWithAttempt(operation, allocator, lock_path, false);
 }
 
 pub fn acquireExclusiveLockWithAttempt(
+    operation: Operation,
     allocator: std.mem.Allocator,
     lock_path: []const u8,
     _: bool,
 ) !?RunLock {
-    var file = std.Io.Dir.cwd().createFile(
-        std.Io.Threaded.global_single_threaded.io(),
+    var file = operation.cwd.createFile(
+        operation.io,
         lock_path,
         .{ .exclusive = true, .read = true, .truncate = false },
     ) catch |err| switch (err) {
         error.PathAlreadyExists => return null,
         else => return userErrorFmt(
+            operation.io,
             "unable to create lock ({s}): {s}",
             .{ lock_path, @errorName(err) },
         ),
     };
 
     var buf: [64]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, "started_ms={d}\n", .{store.nowMs()});
+    const text = try std.fmt.bufPrint(&buf, "started_ms={d}\n", .{store.nowMs(operation.io)});
     file.writeStreamingAll(
-        std.Io.Threaded.global_single_threaded.io(),
+        operation.io,
         text,
     ) catch |err| {
-        file.close(std.Io.Threaded.global_single_threaded.io());
-        std.Io.Dir.cwd().deleteFile(
-            std.Io.Threaded.global_single_threaded.io(),
+        file.close(operation.io);
+        operation.cwd.deleteFile(
+            operation.io,
             lock_path,
         ) catch |delete_err| {
             return userErrorFmt(
+                operation.io,
                 "unable to remove unwritten lock ({s}): {s}",
                 .{ lock_path, @errorName(delete_err) },
             );
         };
         return userErrorFmt(
+            operation.io,
             "unable to write lock ({s}): {s}",
             .{ lock_path, @errorName(err) },
         );
@@ -830,14 +845,15 @@ pub fn acquireExclusiveLockWithAttempt(
     return .{ .file = file, .path = try allocator.dupe(u8, lock_path) };
 }
 
-pub fn releaseRunLock(allocator: std.mem.Allocator, lock: ?RunLock) void {
+pub fn releaseRunLock(operation: Operation, allocator: std.mem.Allocator, lock: ?RunLock) void {
     if (lock) |state| {
-        state.file.close(std.Io.Threaded.global_single_threaded.io());
-        std.Io.Dir.cwd().deleteFile(
-            std.Io.Threaded.global_single_threaded.io(),
+        state.file.close(operation.io);
+        operation.cwd.deleteFile(
+            operation.io,
             state.path,
         ) catch |err| {
             const report_err = output_mod.userErrorFmt(
+                operation.io,
                 "unable to remove lock ({s}): {s}",
                 .{ state.path, @errorName(err) },
             );
@@ -847,11 +863,4 @@ pub fn releaseRunLock(allocator: std.mem.Allocator, lock: ?RunLock) void {
     }
 }
 
-fn envString(key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    return std.mem.span(value);
-}
-
-fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
-    return output_mod.userErrorFmt(fmt, args);
-}
+const userErrorFmt = output_mod.userErrorFmt;

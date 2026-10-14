@@ -130,11 +130,13 @@ const InstalledBinarySet =
     "cas_app_server_preflight";
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const environ = init.environ_map;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -144,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (delegate.isVersionRequested(argv)) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -153,16 +155,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, argv[1], "capabilities")) {
-        try printCapabilities(argv[2..]);
+        try printCapabilities(io, argv[2..]);
         return;
     }
+
+    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer directory.close(io);
 
     if (std.mem.eql(u8, argv[1], "app-server") and argv.len > 2 and
         (std.mem.eql(u8, argv[2], "session") or std.mem.eql(u8, argv[2], "daemon")))
     {
-        const exit_code = runAppServerDelegate(allocator, init.io, argv[2..]) catch |err| {
+        const exit_code = runAppServerDelegate(directory, environ, allocator, init.io, argv[2..]) catch |err| {
             var stderr_writer = std.Io.File.stderr().writer(
-                std.Io.Threaded.global_single_threaded.io(),
+                io,
                 &.{},
             );
             try stderr_writer.interface.print(
@@ -174,17 +179,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(exit_code);
     }
 
-    return runSelectedTarget(allocator, init.io, argv);
+    return runSelectedTarget(directory, environ, allocator, init.io, argv);
 }
 
-fn runSelectedTarget(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+fn runSelectedTarget(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     const target_name = resolveTarget(argv[1]) orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSubcommand", argv[1]);
+        exitUsageFailure(io, "UnknownSubcommand", argv[1]);
     };
 
     const target_exec = blk: {
         const exe_dir = std.process.executableDirPathAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             allocator,
         ) catch null;
         if (exe_dir) |dir| {
@@ -200,9 +205,9 @@ fn runSelectedTarget(allocator: std.mem.Allocator, io: std.Io, argv: []const []c
     try child_argv.append(allocator, target_exec);
     try child_argv.appendSlice(allocator, argv[2..]);
 
-    const exit_code = runCommand(allocator, io, child_argv.items) catch |err| {
+    const exit_code = runCommand(directory, environ, allocator, io, child_argv.items) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stderr = &stderr_writer.interface;
@@ -217,6 +222,8 @@ fn runSelectedTarget(allocator: std.mem.Allocator, io: std.Io, argv: []const []c
 }
 
 fn runAppServerDelegate(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     args: []const []const u8,
@@ -224,7 +231,7 @@ fn runAppServerDelegate(
     var child_argv: std.ArrayList([]const u8) = .empty;
     defer child_argv.deinit(allocator);
     try appendAppServerDelegateArgs(allocator, &child_argv, args);
-    return runCommand(allocator, io, child_argv.items);
+    return runCommand(directory, environ, allocator, io, child_argv.items);
 }
 
 fn appendAppServerDelegateArgs(
@@ -257,15 +264,18 @@ fn appendAppServerDelegateArgs(
     }
 }
 
-fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
-    if (builtin.target.os.tag == .macos) return runCommandPosixSpawn(allocator, args);
+fn runCommand(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
+    if (builtin.target.os.tag == .macos) return runCommandPosixSpawn(directory, environ, allocator, args);
 
     var child = try std.process.spawn(io, .{
         .argv = args,
+        .environ_map = environ,
+        .cwd = .{ .dir = directory },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     });
+    errdefer child.kill(io);
     const term = try child.wait(io);
     return switch (term) {
         .exited => |code| code,
@@ -274,7 +284,7 @@ fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     };
 }
 
-fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+fn runCommandPosixSpawn(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
     if (args.len == 0) return error.FileNotFound;
 
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
@@ -293,12 +303,26 @@ fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) 
         argv_buf[i] = arg_storage[i].ptr;
     }
 
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
+    defer {
+        const destroyed = std.c.posix_spawn_file_actions_destroy(&actions);
+        std.debug.assert(destroyed == 0);
+    }
+    if (std.c.posix_spawn_file_actions_addfchdir_np(&actions, directory.handle) != 0)
+        return error.SpawnFileActionsFailed;
+
     var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    // Keep the temporary POSIX environment under one owner, including partial
+    // construction failure (Zig 0.17 frees a partial pointer-array extent).
+    var environment_arena = std.heap.ArenaAllocator.init(allocator);
+    defer environment_arena.deinit();
+    const environment = try environ.createPosixBlock(environment_arena.allocator(), .{});
+    const envp = environment.slice.ptr;
     const spawn_rc = if (std.mem.indexOfScalar(u8, args[0], '/') == null)
-        std.c.posix_spawnp(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp)
+        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
     else
-        std.c.posix_spawn(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp);
+        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
     if (spawn_rc != 0) return posixSpawnError(spawn_rc);
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
@@ -381,14 +405,14 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     return null;
 }
 
-fn printCapabilities(args: []const []const u8) !void {
+fn printCapabilities(io: std.Io, args: []const []const u8) !void {
     var json = false;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             json = true;
         } else if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
+                io,
                 &.{},
             );
             const stdout = &stdout_writer.interface;
@@ -401,11 +425,11 @@ fn printCapabilities(args: []const []const u8) !void {
             );
             return;
         } else {
-            core_cli.exitUsageFailure(HelpSurface, Version, "UnknownFlag", arg);
+            exitUsageFailure(io, "UnknownFlag", arg);
         }
     }
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     const stdout = &stdout_writer.interface;
@@ -639,4 +663,29 @@ test "capabilities publish current contract features" {
         ) != null);
         try std.testing.expect(features.get(capability).?.bool);
     }
+}
+
+fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
+    std.process.exit(2);
+}
+
+test "delegated process uses the supplied directory and environment" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+    try root.dir.writeFile(io, .{ .sub_path = "authority.txt", .data = "owned" });
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("CAS_AUTHORITY_TEST", "supplied");
+    const exit_code = try runCommand(root.dir, &environ, allocator, io, &.{
+        "/bin/sh",
+        "-c",
+        "test \"$CAS_AUTHORITY_TEST\" = supplied && test -f authority.txt && exit 7; exit 23",
+    });
+    try std.testing.expectEqual(@as(u8, 7), exit_code);
 }

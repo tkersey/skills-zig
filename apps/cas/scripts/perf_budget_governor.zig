@@ -36,6 +36,7 @@ const PerfConfig = struct {
 };
 
 const CliOptions = struct {
+    action: enum { run, help, version } = .run,
     config_path: []u8,
     artifact_path: ?[]u8 = null,
     trend_tolerance_override: ?f64 = null,
@@ -94,40 +95,54 @@ const sample_payloads = [_][]const u8{
 const CountingAllocator = core_perf.CountingAllocator;
 
 pub fn main(init: std.process.Init) !void {
+    const code = try run(init);
+    if (code != 0) std.process.exit(code);
+}
+
+fn run(init: std.process.Init) !u8 {
+    const io = init.io;
+    const dir = std.Io.Dir.cwd();
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    var error_writer = std.Io.File.stderr().writer(io, &.{});
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
 
     var cli = parseCliOptions(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, @errorName(err), null);
+        return 2;
     };
     defer freeCliOptions(allocator, &cli);
+    switch (cli.action) {
+        .help => {
+            try core_cli.printHelpSurface(&help_writer.interface, HelpSurface, Version);
+            return 0;
+        },
+        .version => {
+            try core_cli.printVersion(&help_writer.interface, Version);
+            return 0;
+        },
+        .run => {},
+    }
 
-    const config = loadConfig(allocator, cli.config_path) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), cli.config_path);
+    const config = loadConfig(io, dir, allocator, cli.config_path) catch |err| {
+        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, @errorName(err), cli.config_path);
+        return 2;
     };
-    if (config.rounds < 3) core_cli.exitUsageFailure(
-        HelpSurface,
-        Version,
-        "InvalidRounds",
-        cli.config_path,
-    );
-    if (config.iterations < 100) core_cli.exitUsageFailure(
-        HelpSurface,
-        Version,
-        "InvalidIterations",
-        cli.config_path,
-    );
+    if (config.rounds < 3 or config.iterations < 100) {
+        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, if (config.rounds < 3) "InvalidRounds" else "InvalidIterations", cli.config_path);
+        return 2;
+    }
 
-    const summary = try benchmarkGovernor(allocator, config.iterations, config.rounds);
+    const summary = try benchmarkGovernor(io, allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
     const previous_artifact = if (cli.artifact_path) |artifact_path|
-        try loadArtifact(allocator, artifact_path)
+        try loadArtifact(io, dir, allocator, artifact_path)
     else
         null;
 
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     const stdout = &stdout_writer.interface;
@@ -155,9 +170,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cli.artifact_path) |artifact_path| {
-        try writeArtifact(artifact_path, summary);
+        try writeArtifact(io, dir, artifact_path, summary);
     }
     try stdout.writeAll("status=PASS\n");
+    return 0;
 }
 
 fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions {
@@ -165,41 +181,34 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
         .config_path = try allocator.dupe(u8, "perf/budget_governor/workload_config.json"),
     };
 
+    errdefer freeCliOptions(allocator, &out);
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-            std.process.exit(0);
+            out.action = .help;
+            return out;
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.Io.File.stdout().writer(
-                std.Io.Threaded.global_single_threaded.io(),
-                &.{},
-            );
-            const stdout = &stdout_writer.interface;
-            try core_cli.printVersion(stdout, Version);
-            std.process.exit(0);
+            out.action = .version;
+            return out;
         }
         if (std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= argv.len) return error.MissingConfigPath;
             const path = argv[i];
+            const owned = try allocator.dupe(u8, path);
             allocator.free(out.config_path);
-            out.config_path = try allocator.dupe(u8, path);
+            out.config_path = owned;
             continue;
         }
         if (std.mem.eql(u8, arg, "--artifact")) {
             i += 1;
             if (i >= argv.len) return error.MissingArtifactPath;
             const path = argv[i];
+            const owned = try allocator.dupe(u8, path);
             if (out.artifact_path) |existing| allocator.free(existing);
-            out.artifact_path = try allocator.dupe(u8, path);
+            out.artifact_path = owned;
             continue;
         }
         if (std.mem.eql(u8, arg, "--trend-tolerance-pct")) {
@@ -225,9 +234,9 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
     if (cli.artifact_path) |path| allocator.free(path);
 }
 
-fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
-    const data = try std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+fn loadConfig(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
+    const data = try dir.readFileAlloc(
+        io,
         path,
         allocator,
         .limited(1 * 1024 * 1024),
@@ -254,7 +263,7 @@ fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
     return out;
 }
 
-fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: usize) !PerfSummary {
+fn benchmarkGovernor(io: std.Io, allocator: std.mem.Allocator, iterations: usize, rounds: usize) !PerfSummary {
     const ns_per_eval_samples = try allocator.alloc(u64, rounds);
     defer allocator.free(ns_per_eval_samples);
     const alloc_calls_per_eval_samples = try allocator.alloc(u64, rounds);
@@ -262,7 +271,7 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
 
     var eval_count: ?usize = null;
     for (0..rounds) |i| {
-        const round = try runRound(iterations);
+        const round = try runRound(io, iterations);
         const eval_count_u64: u64 = @intCast(round.eval_count);
         if (eval_count_u64 == 0) return error.EmptyRound;
         ns_per_eval_samples[i] = @divFloor(round.elapsed_ns, eval_count_u64);
@@ -284,7 +293,7 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
     };
 }
 
-fn runRound(iterations: usize) !RoundStats {
+fn runRound(io: std.Io, iterations: usize) !RoundStats {
     var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer std.debug.assert(gpa_state.deinit() == 0);
 
@@ -292,7 +301,7 @@ fn runRound(iterations: usize) !RoundStats {
     const alloc = counting.allocator();
 
     const start_ns =
-        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+        std.Io.Clock.awake.now(io).nanoseconds;
     var ok_count: usize = 0;
     for (0..iterations) |i| {
         const payload = sample_payloads[i % sample_payloads.len];
@@ -301,7 +310,7 @@ fn runRound(iterations: usize) !RoundStats {
         if (out.value.ok) ok_count += 1;
     }
     const elapsed_ns: u64 = @intCast(@max(
-        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns,
+        std.Io.Clock.awake.now(io).nanoseconds - start_ns,
         1,
     ));
     if (ok_count == 0) return error.AllEvaluationsFailed;
@@ -328,9 +337,9 @@ fn enforceTrendGate(summary: PerfSummary, previous: BenchmarkArtifact, tolerance
         return error.TrendRegression;
 }
 
-fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
-    const data = std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+fn loadArtifact(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
+    const data = dir.readFileAlloc(
+        io,
         path,
         allocator,
         .limited(1 * 1024 * 1024),
@@ -357,13 +366,12 @@ fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtif
     };
 }
 
-fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn writeArtifact(io: std.Io, dir: std.Io.Dir, path: []const u8, summary: PerfSummary) !void {
     if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len > 0) try std.Io.Dir.cwd().createDirPath(io, dir_path);
+        if (dir_path.len > 0) try dir.createDirPath(io, dir_path);
     }
 
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    const file = try dir.createFile(io, path, .{ .truncate = true });
     defer file.close(io);
 
     var writer = file.writer(io, &.{});
@@ -375,7 +383,7 @@ fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
             @as(
                 i64,
                 @intCast(@divFloor(
-                    std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+                    std.Io.Clock.real.now(io).nanoseconds,
                     1_000_000_000,
                 )),
             ),
@@ -416,10 +424,10 @@ test "enforceTrendGate rejects values outside tolerance" {
 }
 
 test "benchmarkGovernor summarizes captured rounds and retains empty-round errors" {
-    const summary = try benchmarkGovernor(std.testing.allocator, 1, 3);
+    const summary = try benchmarkGovernor(std.testing.io, std.testing.allocator, 1, 3);
     try std.testing.expectEqual(@as(usize, 3), summary.rounds);
     try std.testing.expectEqual(@as(usize, 1), summary.eval_count);
     try std.testing.expect(summary.p50_ns_per_eval <= summary.p95_ns_per_eval);
     try std.testing.expect(summary.p50_alloc_calls_per_eval > 0);
-    try std.testing.expectError(error.EmptySamples, benchmarkGovernor(std.testing.allocator, 1, 0));
+    try std.testing.expectError(error.EmptySamples, benchmarkGovernor(std.testing.io, std.testing.allocator, 1, 0));
 }

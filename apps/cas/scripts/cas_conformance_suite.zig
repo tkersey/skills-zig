@@ -94,6 +94,8 @@ const ParsedArgs = struct {
 
 const Context = struct {
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     cwd: []const u8,
     smoke_binary: []const u8,
     preflight_binary: []const u8 = "cas_app_server_preflight",
@@ -133,17 +135,19 @@ const ScenarioResult = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        exitUsageFailure(io, @errorName(err), null);
     };
 
     if (parsed.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -153,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (parsed.show_help) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -162,14 +166,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cwd = parsed.cwd orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
+        exitUsageFailure(io, "MissingValue", "--cwd");
     };
 
+    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer directory.close(io);
     const ctx = Context{
-        .io = init.io,
+        .io = io,
+        .dir = directory,
+        .environ = init.environ_map,
         .cwd = cwd,
-        .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
+        .smoke_binary = try resolveExecutable(io, directory, allocator, parsed.smoke_binary, "cas_smoke_check"),
         .preflight_binary = try resolveExecutable(
+            io,
+            directory,
             allocator,
             parsed.preflight_binary,
             "cas_app_server_preflight",
@@ -208,11 +218,12 @@ fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) 
         if (!result.ok) overall_ok = false;
     }
 
-    try writeScenarioReport(parsed.json, ctx.cwd, smoke_preflight, results.items, overall_ok);
+    try writeScenarioReport(ctx.io, parsed.json, ctx.cwd, smoke_preflight, results.items, overall_ok);
     std.process.exit(if (overall_ok) 0 else 1);
 }
 
 fn writeScenarioReport(
+    io: std.Io,
     json: bool,
     cwd: []const u8,
     smoke_preflight: SmokePreflightResult,
@@ -220,7 +231,7 @@ fn writeScenarioReport(
     overall_ok: bool,
 ) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     const stdout = &stdout_writer.interface;
@@ -328,6 +339,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 }
 
 fn resolveExecutable(
+    io: std.Io,
+    directory: std.Io.Dir,
     allocator: std.mem.Allocator,
     explicit: ?[]const u8,
     fallback_name: []const u8,
@@ -335,30 +348,30 @@ fn resolveExecutable(
     if (explicit) |path| return allocator.dupe(u8, path);
 
     const exe_dir = std.process.executableDirPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         allocator,
     ) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
         const sibling = try allocator.print("{s}/{s}", .{ dir, fallback_name });
-        if (pathExists(sibling)) return sibling;
+        if (pathExists(io, directory, sibling)) return sibling;
         allocator.free(sibling);
     }
 
     return allocator.dupe(u8, fallback_name);
 }
 
-fn pathExists(path: []const u8) bool {
+fn pathExists(io: std.Io, directory: std.Io.Dir, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             path,
             .{},
         ) catch return false;
         return true;
     }
-    std.Io.Dir.cwd().access(
-        std.Io.Threaded.global_single_threaded.io(),
+    directory.access(
+        io,
         path,
         .{},
     ) catch return false;
@@ -366,15 +379,30 @@ fn pathExists(path: []const u8) bool {
 }
 
 fn runCommandCapture(
+    ctx: Context,
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     argv: []const []const u8,
 ) !CommandCapture {
-    if (builtin.target.os.tag == .macos) return runCommandCapturePosixSpawn(allocator, cwd, argv);
+    const io = ctx.io;
+    if (argv.len == 0) return error.FileNotFound;
+    const executable = if (std.mem.indexOfScalar(u8, argv[0], '/') != null)
+        try allocator.dupe(u8, argv[0])
+    else
+        cas_proxy_client.resolveExecutableAlloc(allocator, io, ctx.dir, ctx.environ.get("PATH"), argv[0]) catch |err| switch (err) {
+            error.ExecutableNotFound, error.MissingExecutable => return error.FileNotFound,
+            else => return err,
+        };
+    defer allocator.free(executable);
+    const resolved_argv = try allocator.dupe([]const u8, argv);
+    defer allocator.free(resolved_argv);
+    resolved_argv[0] = executable;
+    if (builtin.target.os.tag == .macos) return runCommandCapturePosixSpawn(ctx, allocator, cwd, resolved_argv);
 
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
-        .argv = argv,
-        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+    const result = try std.process.run(allocator, io, .{
+        .argv = resolved_argv,
+        .environ_map = ctx.environ,
+        .cwd = if (cwd) |path| .{ .path = path } else .{ .dir = ctx.dir },
         .stdout_limit = .limited(MaxCommandOutputBytes),
         .stderr_limit = .limited(MaxCommandOutputBytes / 2),
     });
@@ -391,16 +419,17 @@ fn runCommandCapture(
 }
 
 fn runCommandCapturePosixSpawn(
+    ctx: Context,
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     argv: []const []const u8,
 ) !CommandCapture {
+    const io = ctx.io;
     if (argv.len == 0) return error.FileNotFound;
 
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const temp_root = try makeTempRoot(allocator, "cas-capture");
+    const temp_root = try makeTempRoot(io, allocator, "cas-capture");
     defer {
-        cleanupTempRoot(temp_root);
+        cleanupTempRoot(io, temp_root);
         allocator.free(temp_root);
     }
 
@@ -423,6 +452,8 @@ fn runCommandCapturePosixSpawn(
     defer stderr_file.close(io);
 
     const exit_code = try spawnCapturedCommand(
+        ctx.dir,
+        ctx.environ,
         allocator,
         cwd,
         argv,
@@ -431,8 +462,8 @@ fn runCommandCapturePosixSpawn(
     );
     return .{
         .exit_code = exit_code,
-        .stdout = try readFileAbsoluteAlloc(allocator, stdout_path, MaxCommandOutputBytes),
-        .stderr = try readFileAbsoluteAlloc(allocator, stderr_path, MaxCommandOutputBytes / 2),
+        .stdout = try readFileAbsoluteAlloc(io, allocator, stdout_path, MaxCommandOutputBytes),
+        .stderr = try readFileAbsoluteAlloc(io, allocator, stderr_path, MaxCommandOutputBytes / 2),
     };
 }
 
@@ -461,17 +492,17 @@ fn statusToExitCode(status: u32) u8 {
     return 1;
 }
 
-fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+fn readFileAbsoluteAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
     const base = std.fs.path.basename(path);
     var dir = try std.Io.Dir.openDirAbsolute(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         parent,
         .{},
     );
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    defer dir.close(io);
     return dir.readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         base,
         allocator,
         .limited(max_bytes),
@@ -487,7 +518,7 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
         ctx.hook_policy.asString(),
         "--json",
     };
-    const capture = runCommandCapture(allocator, null, &argv) catch |err| {
+    const capture = runCommandCapture(ctx, allocator, null, &argv) catch |err| {
         return .{
             .status = "fail",
             .ok = false,
@@ -599,7 +630,7 @@ fn scenarioAppServerFeatures(allocator: std.mem.Allocator, ctx: Context) !Scenar
     if (ctx.codex_path) |codex_path| {
         try argv.appendSlice(allocator, &.{ "--codex-path", codex_path });
     }
-    const capture = try runCommandCapture(allocator, null, argv.items);
+    const capture = try runCommandCapture(ctx, allocator, null, argv.items);
     const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout_trimmed, .{}) catch
         return error.InvalidAppServerPreflightJson;
@@ -666,6 +697,7 @@ fn summarizeAppServerFeatureProbes(rows: []const std.json.Value) FeatureProbeSum
 }
 
 fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !ScenarioResult {
+    const io = ctx.io;
     const success_policy = cas_proxy_client.OverloadRetryPolicy{
         .max_retries = ctx.max_retries,
         .base_delay_ms = ctx.backoff_base_ms,
@@ -673,9 +705,9 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
     try cas_proxy_client.validateOverloadRetryPolicy(success_policy);
     if (success_policy.max_retries < 2) return error.InsufficientRetriesForConformanceFixture;
 
-    const temp_root = try makeTempRoot(allocator, "cas-overload-conformance");
+    const temp_root = try makeTempRoot(io, allocator, "cas-overload-conformance");
     defer {
-        deleteTreeAbsolute(temp_root) catch |err| {
+        deleteTreeAbsolute(io, temp_root) catch |err| {
             std.log.warn(
                 "failed to delete temporary conformance root {s}: {s}",
                 .{ temp_root, @errorName(err) },
@@ -684,6 +716,7 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         allocator.free(temp_root);
     }
     const success = try runProductionRetryCase(
+        ctx,
         allocator,
         ctx.io,
         temp_root,
@@ -697,6 +730,7 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         .jitter_percent = 25,
     };
     const nonoverload = try runProductionRetryCase(
+        ctx,
         allocator,
         ctx.io,
         temp_root,
@@ -704,6 +738,7 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
         tiny_policy,
     );
     const exhaustion = try runProductionRetryCase(
+        ctx,
         allocator,
         ctx.io,
         temp_root,
@@ -780,6 +815,7 @@ fn retryFixtureScriptAlloc(
 }
 
 fn runProductionRetryCase(
+    ctx: Context,
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
@@ -796,13 +832,8 @@ fn runProductionRetryCase(
         var script_file = try std.Io.Dir.createFileAbsolute(io, executable, .{ .truncate = true });
         defer script_file.close(io);
         try script_file.writeStreamingAll(io, script);
+        try script_file.setPermissions(io, .fromMode(0o755));
     }
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        executable,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{},
-    );
 
     var telemetry: cas_proxy_client.OverloadRetryTelemetry = .{};
     const deadline_ms: i64 = @intCast(
@@ -811,6 +842,8 @@ fn runProductionRetryCase(
     var client = try cas_proxy_client.Client.start(allocator, .{
         .cwd = root,
         .io = io,
+        .dir = ctx.dir,
+        .environ = ctx.environ,
         .codex_path = executable,
         .request_deadline_ms = deadline_ms,
         .overload_retry_policy = policy,
@@ -877,19 +910,19 @@ fn boolField(obj: core_json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
-fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+fn makeTempRoot(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
     const base = "/tmp";
     var attempt: usize = 0;
     while (attempt < 32) : (attempt += 1) {
         const candidate = try allocator.print(
             "{s}/{s}-{d}-{d}",
             .{ base, prefix, @divFloor(
-                std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+                std.Io.Clock.real.now(io).nanoseconds,
                 1_000_000_000,
             ), attempt },
         );
         std.Io.Dir.createDirAbsolute(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             candidate,
             @fromBackingInt(@intCast(0o700)),
         ) catch |err| switch (err) {
@@ -904,20 +937,20 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
     return error.TempDirCreationFailed;
 }
 
-fn deleteTreeAbsolute(path: []const u8) !void {
+fn deleteTreeAbsolute(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     const base = std.fs.path.basename(path);
     var dir = try std.Io.Dir.openDirAbsolute(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         parent,
         .{},
     );
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    try dir.deleteTree(std.Io.Threaded.global_single_threaded.io(), base);
+    defer dir.close(io);
+    try dir.deleteTree(io, base);
 }
 
-fn cleanupTempRoot(path: []const u8) void {
-    deleteTreeAbsolute(path) catch |err| {
+fn cleanupTempRoot(io: std.Io, path: []const u8) void {
+    deleteTreeAbsolute(io, path) catch |err| {
         std.debug.print("failed to clean temporary root {s}: {s}\n", .{ path, @errorName(err) });
     };
 }
@@ -959,12 +992,13 @@ test "parseArgs accepts scenarios and retry knobs" {
 }
 
 test "makeTempRoot never aliases an existing same-second root" {
-    const first = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
+    const io = std.testing.io;
+    const first = try makeTempRoot(io, std.testing.allocator, "cas-conformance-unique-test");
     defer std.testing.allocator.free(first);
-    defer cleanupTempRoot(first);
-    const second = try makeTempRoot(std.testing.allocator, "cas-conformance-unique-test");
+    defer cleanupTempRoot(io, first);
+    const second = try makeTempRoot(io, std.testing.allocator, "cas-conformance-unique-test");
     defer std.testing.allocator.free(second);
-    defer cleanupTempRoot(second);
+    defer cleanupTempRoot(io, second);
 
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
@@ -1031,8 +1065,14 @@ test "overload classification delegates to structured proxy policy" {
 test "overload scenario route drives production proxy retry integration" {
     if (builtin.target.os.tag == .windows or
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var environment = try std.testing.environ.createMap(std.testing.allocator);
+    defer environment.deinit();
+    var directory = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{});
+    defer directory.close(std.testing.io);
     const ctx = Context{
         .io = std.testing.io,
+        .dir = directory,
+        .environ = &environment,
         .cwd = "/tmp",
         .smoke_binary = "unused",
         .hook_policy = .inherit,
@@ -1084,6 +1124,8 @@ fn parseValueArg(out: *ParsedArgs, arg: []const u8, value: []const u8) !void {
 }
 
 fn spawnCapturedCommand(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     argv: []const []const u8,
@@ -1115,6 +1157,8 @@ fn spawnCapturedCommand(
             &actions,
             cwd_storage.?.ptr,
         ) != 0) return error.SpawnFileActionsFailed;
+    } else if (std.c.posix_spawn_file_actions_addfchdir_np(&actions, directory.handle) != 0) {
+        return error.SpawnFileActionsFailed;
     }
 
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
@@ -1132,11 +1176,13 @@ fn spawnCapturedCommand(
     }
 
     var pid: std.c.pid_t = undefined;
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
-        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
-    else
-        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
+    // Keep the temporary POSIX environment under one owner, including partial
+    // construction failure (Zig 0.17 frees a partial pointer-array extent).
+    var environment_arena = std.heap.ArenaAllocator.init(allocator);
+    defer environment_arena.deinit();
+    const environment = try environ.createPosixBlock(environment_arena.allocator(), .{});
+    const envp = environment.slice.ptr;
+    const spawn_rc = std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
     if (spawn_rc != 0) return posixSpawnError(spawn_rc);
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
@@ -1218,13 +1264,7 @@ fn verifyRetryWireLog(
     log_path: []const u8,
     wire_attempts: u32,
 ) !void {
-    const requests = try std.Io.Dir.readFileAlloc(
-        std.Io.Dir.cwd(),
-        io,
-        log_path,
-        allocator,
-        .limited(64 * 1024),
-    );
+    const requests = try readFileAbsoluteAlloc(io, allocator, log_path, 64 * 1024);
     defer allocator.free(requests);
     var lines = std.mem.tokenizeScalar(u8, requests, '\n');
     var index: i64 = 1;
@@ -1246,4 +1286,10 @@ fn verifyRetryWireLog(
         if (core_json.intField(params, "value") != 7) return error.InvalidRetryRequest;
     }
     if (index - 1 != wire_attempts) return error.RetryAttemptCountMismatch;
+}
+
+fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
+    std.process.exit(2);
 }

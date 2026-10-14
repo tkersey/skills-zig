@@ -65,36 +65,43 @@ const GoalClient = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
 
     const opts = goal_core.parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        exitUsageFailure(io, @errorName(err), null);
     };
 
-    if (opts.show_version) return printVersion();
-    if (opts.show_help) return printHelp();
+    if (opts.show_version) return printVersion(io);
+    if (opts.show_help) return printHelp(io);
 
     const cwd = opts.cwd orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
+        exitUsageFailure(io, "MissingValue", "--cwd");
     };
     goal_core.validateArgs(opts) catch |err| {
-        try fail(allocator, opts, @errorName(err), null, 2);
+        try fail(io, allocator, opts, @errorName(err), null, 2);
     };
 
-    var goal_client = startGoalClient(allocator, opts, cwd, init.io) catch |err| {
-        try fail(allocator, opts, "transportFailure", @errorName(err), 1);
+    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer directory.close(io);
+    const environ = init.environ_map;
+
+    var goal_client = startGoalClient(directory, environ, allocator, opts, cwd, init.io) catch |err| {
+        try fail(io, allocator, opts, "transportFailure", @errorName(err), 1);
     };
     defer goal_client.deinit(allocator);
 
-    runCommand(allocator, opts, cwd, &goal_client.client) catch |err| {
+    runCommand(io, allocator, opts, cwd, &goal_client.client) catch |err| {
         const detail = goal_client.client.lastError() orelse @errorName(err);
-        try fail(allocator, opts, classifyError(detail), detail, 1);
+        try fail(io, allocator, opts, classifyError(detail), detail, 1);
     };
 }
 
 fn runCommand(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -104,17 +111,18 @@ fn runCommand(
         .resolve => {
             const target = try resolveTarget(allocator, client, opts, cwd, false);
             defer goal_core.freeTarget(allocator, target);
-            try emitTarget(allocator, opts, target, null);
+            try emitTarget(io, allocator, opts, target, null);
         },
-        .get => try runGet(allocator, opts, cwd, client),
-        .set => try runSet(allocator, opts, cwd, client),
-        .clear => try runClear(allocator, opts, cwd, client),
-        .status => try runStatus(allocator, opts, cwd, client),
-        .wait => try runWait(allocator, opts, cwd, client),
+        .get => try runGet(io, allocator, opts, cwd, client),
+        .set => try runSet(io, allocator, opts, cwd, client),
+        .clear => try runClear(io, allocator, opts, cwd, client),
+        .status => try runStatus(io, allocator, opts, cwd, client),
+        .wait => try runWait(io, allocator, opts, cwd, client),
     }
 }
 
 fn runGet(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -122,13 +130,14 @@ fn runGet(
 ) !void {
     const target = try resolveTarget(allocator, client, opts, cwd, false);
     defer goal_core.freeTarget(allocator, target);
-    if (opts.dry_run) return emitTarget(allocator, opts, target, "thread/goal/get");
+    if (opts.dry_run) return emitTarget(io, allocator, opts, target, "thread/goal/get");
     const goal = try requestGoalGet(allocator, client, target.thread_id.?);
     defer goal_core.freeGoalEnvelope(allocator, goal);
-    try emitGoal(allocator, opts, target, goal, "ok", 0);
+    try emitGoal(io, allocator, opts, target, goal, "ok", 0);
 }
 
 fn runSet(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -137,6 +146,7 @@ fn runSet(
     var target = try resolveTarget(allocator, client, opts, cwd, true);
     defer goal_core.freeTarget(allocator, target);
     if (opts.dry_run) return emitTarget(
+        io,
         allocator,
         opts,
         target,
@@ -151,10 +161,11 @@ fn runSet(
     try requestGoalSet(allocator, client, target.thread_id.?, opts);
     const goal = try requestGoalGet(allocator, client, target.thread_id.?);
     defer goal_core.freeGoalEnvelope(allocator, goal);
-    try emitGoal(allocator, opts, target, goal, "ok", 0);
+    try emitGoal(io, allocator, opts, target, goal, "ok", 0);
 }
 
 fn runClear(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -162,15 +173,16 @@ fn runClear(
 ) !void {
     const target = try resolveTarget(allocator, client, opts, cwd, false);
     defer goal_core.freeTarget(allocator, target);
-    if (opts.dry_run) return emitTarget(allocator, opts, target, "thread/goal/clear");
+    if (opts.dry_run) return emitTarget(io, allocator, opts, target, "thread/goal/clear");
     const before = try requestGoalGet(allocator, client, target.thread_id.?);
     defer goal_core.freeGoalEnvelope(allocator, before);
     const clear_json = try requestGoalClear(allocator, client, target.thread_id.?);
     defer allocator.free(clear_json);
-    try emitClear(allocator, opts, target, clear_json);
+    try emitClear(io, allocator, opts, target, clear_json);
 }
 
 fn runStatus(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -178,10 +190,11 @@ fn runStatus(
 ) !void {
     const target = try resolveTarget(allocator, client, opts, cwd, false);
     defer goal_core.freeTarget(allocator, target);
-    if (opts.dry_run) return emitTarget(allocator, opts, target, "thread/goal/set");
+    if (opts.dry_run) return emitTarget(io, allocator, opts, target, "thread/goal/set");
     const before = try requestGoalGet(allocator, client, target.thread_id.?);
     defer goal_core.freeGoalEnvelope(allocator, before);
     if (std.mem.eql(u8, before.goal_json, "null")) try fail(
+        io,
         allocator,
         opts,
         "goalNotFound",
@@ -191,10 +204,11 @@ fn runStatus(
     try requestGoalSet(allocator, client, target.thread_id.?, opts);
     const goal = try requestGoalGet(allocator, client, target.thread_id.?);
     defer goal_core.freeGoalEnvelope(allocator, goal);
-    try emitGoal(allocator, opts, target, goal, "ok", 0);
+    try emitGoal(io, allocator, opts, target, goal, "ok", 0);
 }
 
 fn runWait(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -202,12 +216,14 @@ fn runWait(
 ) !void {
     const target = try resolveTarget(allocator, client, opts, cwd, false);
     defer goal_core.freeTarget(allocator, target);
-    if (opts.dry_run) return emitTarget(allocator, opts, target, "thread/resume + thread/goal/get");
+    if (opts.dry_run) return emitTarget(io, allocator, opts, target, "thread/resume + thread/goal/get");
     try resumeThread(allocator, client, target.thread_id.?);
-    try waitForGoal(allocator, opts, client, target);
+    try waitForGoal(io, allocator, opts, client, target);
 }
 
 fn startGoalClient(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     cwd: []const u8,
@@ -215,21 +231,18 @@ fn startGoalClient(
 ) !GoalClient {
     const resolved_codex_path = cas.resolveExecutableAlloc(
         allocator,
+        io,
+        directory,
+        environ.get("PATH"),
         opts.codex_path,
     ) catch opts.codex_path;
     defer if (resolved_codex_path.ptr != opts.codex_path.ptr) allocator.free(resolved_codex_path);
 
-    var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(
-        allocator,
-        cwd,
-        resolved_codex_path,
-        opts.hook_policy,
-        io,
-    ) catch null;
+    var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(allocator, cwd, resolved_codex_path, opts.hook_policy, io, directory, environ) catch null;
     const client = if (managed_server) |server|
         cas.Client.start(
             allocator,
-            clientOptions(opts, cwd, io, resolved_codex_path, server.listen_url),
+            clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, server.listen_url),
         ) catch blk: {
             var owned_server = server;
             defer owned_server.deinit(allocator);
@@ -237,16 +250,18 @@ fn startGoalClient(
             managed_server = null;
             break :blk try cas.Client.start(
                 allocator,
-                clientOptions(opts, cwd, io, resolved_codex_path, null),
+                clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null),
             );
         }
     else
-        try cas.Client.start(allocator, clientOptions(opts, cwd, io, resolved_codex_path, null));
+        try cas.Client.start(allocator, clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null));
 
     return .{ .client = client, .managed_server = managed_server };
 }
 
 fn clientOptions(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     opts: ParsedArgs,
     cwd: []const u8,
     io: std.Io,
@@ -256,6 +271,8 @@ fn clientOptions(
     return .{
         .cwd = cwd,
         .io = io,
+        .dir = directory,
+        .environ = environ,
         .codex_path = codex_path,
         .client_name = "cas-goal",
         .client_title = "CAS Goal",
@@ -376,12 +393,13 @@ fn resumeThread(allocator: std.mem.Allocator, client: *cas.Client, thread_id: []
 }
 
 fn waitForGoal(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     client: *cas.Client,
     target: SelectedTarget,
 ) !void {
-    const started_ms = millisNow();
+    const started_ms = millisNow(io);
     std.debug.assert(opts.poll_ms > 0);
     // Include the initial request and the final request after crossing the deadline.
     const maximum_polls = @as(u64, opts.timeout_ms) / opts.poll_ms + 2;
@@ -389,15 +407,16 @@ fn waitForGoal(
         const goal = try requestGoalGet(allocator, client, target.thread_id.?);
         defer goal_core.freeGoalEnvelope(allocator, goal);
         const status = goal.status orelse {
-            try emitGoal(allocator, opts, target, goal, "goalCleared", 3);
+            try emitGoal(io, allocator, opts, target, goal, "goalCleared", 3);
             std.process.exit(3);
         };
         if (!std.mem.eql(u8, status, "active")) {
             const exit_code: u8 = if (std.mem.eql(u8, status, "complete")) 0 else 3;
-            try emitGoal(allocator, opts, target, goal, status, exit_code);
+            try emitGoal(io, allocator, opts, target, goal, status, exit_code);
             std.process.exit(exit_code);
         }
-        if (millisNow() - started_ms >= opts.timeout_ms) try fail(
+        if (millisNow(io) - started_ms >= opts.timeout_ms) try fail(
+            io,
             allocator,
             opts,
             "timeout",
@@ -405,15 +424,16 @@ fn waitForGoal(
             124,
         );
         try std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             .fromMilliseconds(opts.poll_ms),
             .awake,
         );
     }
-    try fail(allocator, opts, "timeout", "wait timed out before terminal goal status", 124);
+    try fail(io, allocator, opts, "timeout", "wait timed out before terminal goal status", 124);
 }
 
 fn emitTarget(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     target: SelectedTarget,
@@ -446,10 +466,11 @@ fn emitTarget(
         },
     );
     defer allocator.free(output);
-    try writeOutput(output);
+    try writeOutput(io, output);
 }
 
 fn emitGoal(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     target: SelectedTarget,
@@ -484,10 +505,11 @@ fn emitGoal(
         },
     );
     defer allocator.free(output);
-    try writeOutput(output);
+    try writeOutput(io, output);
 }
 
 fn emitClear(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     target: SelectedTarget,
@@ -504,10 +526,11 @@ fn emitClear(
         .{ opts.command.text(), thread_id_json, selected_by_json, cleared },
     );
     defer allocator.free(output);
-    try writeOutput(output);
+    try writeOutput(io, output);
 }
 
 fn fail(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: ParsedArgs,
     code: []const u8,
@@ -527,10 +550,10 @@ fn fail(
             .{ opts.command.text(), code_json, detail_json },
         );
         defer allocator.free(output);
-        try writeOutput(output);
+        try writeOutput(io, output);
     } else {
         var stderr_writer = std.Io.File.stderr().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         if (detail) |raw| try stderr_writer.interface.print(
@@ -552,37 +575,43 @@ fn classifyError(detail: []const u8) []const u8 {
     return "requestFailed";
 }
 
-fn writeOutput(output: []const u8) !void {
+fn writeOutput(io: std.Io, output: []const u8) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     try stdout_writer.interface.writeAll(output);
 }
 
-fn printVersion() !void {
+fn printVersion(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     try core_cli.printVersion(&stdout_writer.interface, Version);
 }
 
-fn printHelp() !void {
+fn printHelp(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     try core_cli.printHelpSurface(&stdout_writer.interface, HelpSurface, Version);
 }
 
-fn millisNow() i64 {
+fn millisNow(io: std.Io) i64 {
     return @intCast(@divFloor(
-        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     ));
 }
 
 test {
     _ = goal_core;
+}
+
+fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
+    std.process.exit(2);
 }

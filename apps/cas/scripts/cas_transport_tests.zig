@@ -6,12 +6,15 @@ const websocket = proxy.websocket_transport;
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len != 3) return error.InvalidFixtureArguments;
-    try serveCodeModeHostFixture(init.gpa, init.io, argv[1], argv[2]);
+    const dir = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
+    defer dir.close(init.io);
+    try serveCodeModeHostFixture(init.gpa, init.io, dir, argv[1], argv[2]);
 }
 
 fn serveCodeModeHostFixture(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     ready_path: []const u8,
     evidence_path: []const u8,
 ) !void {
@@ -21,7 +24,7 @@ fn serveCodeModeHostFixture(
     const port = listener.socket.address.getPort();
     const url = try allocator.print("ws://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ready_path, .data = url });
+    try dir.writeFile(io, .{ .sub_path = ready_path, .data = url });
 
     var stream = try listener.accept(io);
     defer stream.close(io);
@@ -64,7 +67,7 @@ fn serveCodeModeHostFixture(
     var writer = stream.writer(io, &.{});
     try writer.interface.writeAll(response);
     try writer.interface.flush();
-    try serveCodeModeProtocol(allocator, io, &stream, evidence_path);
+    try serveCodeModeProtocol(allocator, io, dir, &stream, evidence_path);
 }
 
 const max_code_mode_fixture_message_bytes: usize = 8 * 1024 * 1024;
@@ -72,6 +75,7 @@ const max_code_mode_fixture_message_bytes: usize = 8 * 1024 * 1024;
 const CodeModeFixtureState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     stream: *std.Io.net.Stream,
     evidence_path: []const u8,
     evidence: *std.Io.Writer.Allocating,
@@ -82,6 +86,7 @@ const CodeModeFixtureState = struct {
 fn serveCodeModeProtocol(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     stream: *std.Io.net.Stream,
     evidence_path: []const u8,
 ) !void {
@@ -106,6 +111,7 @@ fn serveCodeModeProtocol(
         var state: CodeModeFixtureState = .{
             .allocator = allocator,
             .io = io,
+            .dir = dir,
             .stream = stream,
             .evidence_path = evidence_path,
             .evidence = &evidence,
@@ -242,7 +248,7 @@ fn handleCodeModeShutdown(
 fn writeCodeModeEvidence(state: *CodeModeFixtureState) !void {
     const evidence_bytes = try state.evidence.toOwnedSlice();
     defer state.allocator.free(evidence_bytes);
-    try std.Io.Dir.cwd().writeFile(state.io, .{
+    try state.dir.writeFile(state.io, .{
         .sub_path = state.evidence_path,
         .data = evidence_bytes,
     });
@@ -407,6 +413,7 @@ fn receiveExact(
 }
 
 const UnixFixture = struct {
+    io: std.Io,
     path: []const u8,
     ready: std.atomic.Value(u8) = .init(0),
 
@@ -415,9 +422,7 @@ const UnixFixture = struct {
     }
 
     fn serveFallible(self: *UnixFixture) !void {
-        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer threaded.deinit();
-        const io = threaded.io();
+        const io = self.io;
         const address = try std.Io.net.UnixAddress.init(self.path);
         var listener = try address.listen(io, .{});
         defer listener.deinit(io);
@@ -704,22 +709,23 @@ test "unix websocket rejects an overlong socket before connect" {
     var too_long: [104]u8 = @splat('x');
     try std.testing.expectError(
         error.UnixSocketPathTooLong,
-        websocket.Connection.connectUnix(std.testing.allocator, &too_long, 1),
+        websocket.Connection.connectUnix(std.testing.allocator, std.testing.io, &too_long, 1),
     );
 }
 
 test "unix websocket performs RFC6455 upgrade on slash localhost" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         ".",
         std.testing.allocator,
     );
     defer std.testing.allocator.free(root);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "cas.sock" });
     defer std.testing.allocator.free(path);
-    var fixture = UnixFixture{ .path = path };
+    var fixture = UnixFixture{ .io = io, .path = path };
     const thread = try std.Thread.spawn(.{}, UnixFixture.serve, .{&fixture});
     defer thread.join();
     for (0..100) |_| {
@@ -727,13 +733,14 @@ test "unix websocket performs RFC6455 upgrade on slash localhost" {
         if (state == 1) break;
         if (state == 2) return error.UnixFixtureFailed;
         try std.Io.sleep(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             .fromMilliseconds(10),
             .awake,
         );
     } else return error.UnixFixtureTimeout;
     var connection = try websocket.Connection.connectUnix(
         std.testing.allocator,
+        io,
         path,
         2_000,
     );
@@ -742,16 +749,20 @@ test "unix websocket performs RFC6455 upgrade on slash localhost" {
 }
 
 test "managed websocket asks Codex for port zero and reaches readiness" {
-    const codex_bin_z = std.c.getenv("CODEX_BIN") orelse return error.SkipZigTest;
-    const codex_bin = std.mem.span(codex_bin_z);
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
+    const io = std.testing.io;
+    var environ = try std.testing.environ.createMap(std.testing.allocator);
+    defer environ.deinit();
+    const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
+    const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer dir.close(io);
     var server = try websocket.startManagedLoopbackServer(
         std.testing.allocator,
         ".",
         codex_bin,
         .inherit,
-        threaded.io(),
+        io,
+        dir,
+        &environ,
     );
     defer server.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.startsWith(
@@ -762,6 +773,7 @@ test "managed websocket asks Codex for port zero and reaches readiness" {
     try std.testing.expect(!std.mem.endsWith(u8, server.listen_url, ":0"));
     var connection = try websocket.Connection.connect(
         std.testing.allocator,
+        io,
         server.listen_url,
         2_000,
     );
@@ -770,13 +782,15 @@ test "managed websocket asks Codex for port zero and reaches readiness" {
 }
 
 test "owner-lived managed websocket also resolves port zero before return" {
-    const codex_bin_z = std.c.getenv("CODEX_BIN") orelse return error.SkipZigTest;
-    const codex_bin = std.mem.span(codex_bin_z);
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
+    const io = std.testing.io;
+    var environ = try std.testing.environ.createMap(std.testing.allocator);
+    defer environ.deinit();
+    const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
+    const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer dir.close(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(threaded.io(), ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const receipt_dir = try std.fs.path.join(
         std.testing.allocator,
@@ -789,12 +803,15 @@ test "owner-lived managed websocket also resolves port zero before return" {
         receipt_dir,
         codex_bin,
         .inherit,
-        threaded.io(),
+        io,
+        dir,
+        &environ,
     );
     defer server.deinit(std.testing.allocator);
     try std.testing.expect(!std.mem.endsWith(u8, server.listen_url, ":0"));
     var connection = try websocket.Connection.connect(
         std.testing.allocator,
+        io,
         server.listen_url,
         2_000,
     );
@@ -838,6 +855,9 @@ fn runProviderRequestUnavailableCase(method: []const u8) !void {
     }
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin:/bin");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -853,9 +873,9 @@ fn runProviderRequestUnavailableCase(method: []const u8) !void {
     );
     defer allocator.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "provider-codex", .data = script });
-    try std.Io.Dir.cwd().setFilePermissions(
+    try tmp.dir.setFilePermissions(
         io,
-        executable,
+        "provider-codex",
         std.Io.File.Permissions.fromMode(0o755),
         .{},
     );
@@ -863,6 +883,8 @@ fn runProviderRequestUnavailableCase(method: []const u8) !void {
     var client = try proxy.Client.start(allocator, .{
         .cwd = root,
         .io = io,
+        .dir = tmp.dir,
+        .environ = &environ,
         .codex_path = executable,
     });
     defer {

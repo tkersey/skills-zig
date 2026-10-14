@@ -90,7 +90,7 @@ pub fn defaultTimeoutMsForAction(parsed: ParsedArgs) u32 {
     };
 }
 
-pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
+pub fn parseArgs(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var receipt_paths: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -111,7 +111,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Parsed
         const value = argv[i];
         if (try parseReviewLocationOption(&out, arg, value)) continue;
         if (try parseReviewTargetOption(&out, arg, value)) continue;
-        if (try parseReviewInputOption(allocator, &out, arg, value)) continue;
+        if (try parseReviewInputOption(io, directory, allocator, &out, arg, value)) continue;
         if (try parseReviewTimingOption(&out, arg, value)) continue;
         if (parseReviewApprovalOption(&out, arg, value)) continue;
         if (try parseReviewStoreOption(&out, arg, value)) continue;
@@ -198,6 +198,8 @@ fn parseReviewTargetOption(out: *ParsedArgs, arg: []const u8, value: []const u8)
 }
 
 fn parseReviewInputOption(
+    io: std.Io,
+    directory: std.Io.Dir,
     allocator: std.mem.Allocator,
     out: *ParsedArgs,
     arg: []const u8,
@@ -205,7 +207,7 @@ fn parseReviewInputOption(
 ) !bool {
     if (std.mem.eql(u8, arg, "--custom-instructions")) {
         if (out.custom_instructions_arg != null) return error.DuplicateCustomInstructions;
-        const instructions = try loadCustomInstructionsAlloc(allocator, value);
+        const instructions = try loadCustomInstructionsAlloc(io, directory, allocator, value);
         if (!workflowBindingStringValid(instructions)) {
             allocator.free(instructions);
             return error.InvalidCustomInstructions;
@@ -217,7 +219,7 @@ fn parseReviewInputOption(
         if (value.len == 0 or std.mem.eql(u8, value, "-") or std.mem.eql(u8, value, "@")) {
             return error.InvalidThreadStartParams;
         }
-        const raw = try loadCustomInstructionsAlloc(allocator, value);
+        const raw = try loadCustomInstructionsAlloc(io, directory, allocator, value);
         defer allocator.free(raw);
         out.thread_start_options = try review_options.ThreadStartOptions.init(allocator, raw);
     } else if (std.mem.eql(u8, arg, "--workflow-binding-json")) {
@@ -262,6 +264,8 @@ fn parseReviewApprovalOption(out: *ParsedArgs, arg: []const u8, value: []const u
 }
 
 test "review duration options reject values outside their stored range" {
+    var directory = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{});
+    defer directory.close(std.testing.io);
     for ([_][]const u8{ "--timeout-ms", "--poll-interval-ms" }) |flag| {
         const expected = if (std.mem.eql(u8, flag, "--timeout-ms"))
             error.InvalidTimeout
@@ -271,13 +275,13 @@ test "review duration options reject values outside their stored range" {
             const argv = [_][]const u8{
                 "cas_review_session", "run", "--cwd", "/tmp", "--uncommitted", flag, invalid,
             };
-            try std.testing.expectError(expected, parseArgs(std.testing.allocator, &argv));
+            try std.testing.expectError(expected, parseArgs(std.testing.io, directory, std.testing.allocator, &argv));
         }
         for ([_][]const u8{ "1", "4294967295" }) |valid| {
             const argv = [_][]const u8{
                 "cas_review_session", "run", "--cwd", "/tmp", "--uncommitted", flag, valid,
             };
-            const parsed = try parseArgs(std.testing.allocator, &argv);
+            const parsed = try parseArgs(std.testing.io, directory, std.testing.allocator, &argv);
             defer parsed.deinit(std.testing.allocator);
             const observed = if (std.mem.eql(u8, flag, "--timeout-ms"))
                 parsed.timeout_ms
@@ -413,14 +417,14 @@ fn setTarget(parsed: *ParsedArgs, target: ReviewTarget) !void {
     parsed.target = target;
 }
 
-fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+fn loadCustomInstructionsAlloc(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (std.mem.eql(u8, raw, "-")) {
-        var reader = std.Io.File.stdin().reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var reader = std.Io.File.stdin().reader(io, &.{});
         return reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     }
     if (std.mem.startsWith(u8, raw, "@")) {
-        return std.Io.Dir.cwd().readFileAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
+        return directory.readFileAlloc(
+            io,
             raw[1..],
             allocator,
             .limited(1024 * 1024),
@@ -434,20 +438,22 @@ pub fn workflowBindingStringValid(value: []const u8) bool {
 }
 
 test "CLI target admission keeps title scoped to the selected commit" {
+    var directory = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{});
+    defer directory.close(std.testing.io);
     const allocator = std.testing.allocator;
-    const committed = try parseArgs(allocator, &.{
+    const committed = try parseArgs(std.testing.io, directory, allocator, &.{
         "cas_review_session", "run", "--cwd", ".", "--commit", "HEAD", "--title", "exact title",
     });
     defer committed.deinit(allocator);
     try std.testing.expectEqualStrings("HEAD", committed.target.?.commit.sha);
     try std.testing.expectEqualStrings("exact title", committed.target.?.commit.title.?);
-    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(allocator, &.{
+    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(std.testing.io, directory, allocator, &.{
         "cas_review_session", "run", "--cwd", ".", "--base", "main", "--title", "title",
     }));
-    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(allocator, &.{
+    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(std.testing.io, directory, allocator, &.{
         "cas_review_session", "run", "--cwd", ".", "--title", "title", "--commit", "HEAD",
     }));
-    try std.testing.expectError(error.MultipleTargetSelectors, parseArgs(allocator, &.{
+    try std.testing.expectError(error.MultipleTargetSelectors, parseArgs(std.testing.io, directory, allocator, &.{
         "cas_review_session", "run", "--cwd", ".", "--commit", "HEAD", "--uncommitted",
     }));
 }

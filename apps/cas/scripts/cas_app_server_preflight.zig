@@ -121,10 +121,19 @@ pub fn main(init: std.process.Init) void {
         fatal(init.io, err, false);
     const fixture = internalModelFixtureOptions(argv, init.environ_map) catch |err|
         fatal(init.io, err, false);
+    if (fixture == null) exitForRootRequest(init.io, argv[1..]);
+    const parsed_options: ?Options = if (fixture == null)
+        parseArgs(argv[1..]) catch |err| fatal(init.io, err, jsonRequested(argv[1..]))
+    else
+        null;
+    const dir = std.Io.Dir.cwd().openDir(init.io, ".", .{}) catch |err|
+        fatal(init.io, err, if (parsed_options) |options| options.json else false);
+    defer dir.close(init.io);
     if (fixture) |options| {
         serveInternalModelFixture(
             init.gpa,
             init.io,
+            dir,
             options.ready_path,
             options.evidence_path,
             options.mode,
@@ -132,10 +141,8 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| fatal(init.io, err, false);
         return;
     }
-    exitForRootRequest(init.io, argv[1..]);
-    const options = parseArgs(argv[1..]) catch |err|
-        fatal(init.io, err, jsonRequested(argv[1..]));
-    const compatible = run(init.gpa, init.io, init.environ_map, options) catch |err|
+    const options = parsed_options.?;
+    const compatible = run(init.gpa, init.io, dir, init.environ_map, options) catch |err|
         fatal(init.io, err, options.json);
     if (!compatible) std.process.exit(1);
 }
@@ -143,10 +150,11 @@ pub fn main(init: std.process.Init) void {
 fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environment: *std.process.Environ.Map,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     options: Options,
 ) !bool {
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cwd, allocator);
+    const cwd = try dir.realPathFileAlloc(io, options.cwd, allocator);
     defer allocator.free(cwd);
     const cache_root = try contract.defaultCacheRootAlloc(allocator, environment);
     defer allocator.free(cache_root);
@@ -162,7 +170,7 @@ fn run(
         options.app_server_endpoint,
     );
 
-    var schemas = try contract.ensureSchemaCache(allocator, io, .{
+    var schemas = try contract.ensureSchemaCache(allocator, io, dir, environment, .{
         .cache_root = cache_root,
         .codex_path = options.codex_path,
         .refresh = options.refresh_schema,
@@ -195,6 +203,7 @@ fn run(
     return runInspected(
         allocator,
         io,
+        dir,
         environment,
         options,
         cwd,
@@ -336,7 +345,8 @@ fn externalEndpointTransport(transport: contract.ProbeTransport) bool {
 fn runInspected(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environment: *std.process.Environ.Map,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     options: Options,
     cwd: []const u8,
     cache_root: []const u8,
@@ -348,6 +358,7 @@ fn runInspected(
     var state = try collectProbeState(
         allocator,
         io,
+        dir,
         environment,
         options,
         cwd,
@@ -402,7 +413,8 @@ fn probeInputs(
 fn collectProbeState(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environment: *std.process.Environ.Map,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     options: Options,
     cwd: []const u8,
     cache_root: []const u8,
@@ -419,6 +431,8 @@ fn collectProbeState(
             &state,
             allocator,
             io,
+            dir,
+            environment,
             cwd,
             code_mode_host,
             validated_transport,
@@ -429,6 +443,7 @@ fn collectProbeState(
                 codeModeHostOwnerProbe(
                     allocator,
                     io,
+                    dir,
                     environment,
                     cache_root,
                     cwd,
@@ -449,6 +464,7 @@ fn collectProbeState(
             state.setFeatures(runIsolatedFullProbes(
                 allocator,
                 io,
+                dir,
                 environment,
                 cache_root,
                 cwd,
@@ -463,6 +479,7 @@ fn collectProbeState(
 fn codeModeHostOwnerProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     cache_root: []const u8,
     cwd: []const u8,
@@ -472,6 +489,7 @@ fn codeModeHostOwnerProbe(
     const observed = codeModeHostOwnerProbeFallible(
         allocator,
         io,
+        dir,
         parent_environment,
         cache_root,
         cwd,
@@ -499,6 +517,7 @@ fn codeModeHostOwnerProbe(
 fn codeModeHostOwnerProbeFallible(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     cache_root: []const u8,
     cwd: []const u8,
@@ -517,13 +536,14 @@ fn codeModeHostOwnerProbeFallible(
         .{ cache_root, now },
     );
     defer allocator.free(probe_root);
-    try std.Io.Dir.cwd().createDir(io, probe_root, .default_dir);
-    errdefer std.Io.Dir.cwd().deleteTree(io, probe_root) catch |err|
+    try dir.createDir(io, probe_root, .default_dir);
+    errdefer dir.deleteTree(io, probe_root) catch |err|
         reportProbeCleanupFailure(probe_root, err);
 
     const observed = try codeModeHostOwnerProbeInRoot(
         allocator,
         io,
+        dir,
         parent_environment,
         probe_root,
         cwd,
@@ -531,13 +551,14 @@ fn codeModeHostOwnerProbeFallible(
         host,
         nonce,
     );
-    try std.Io.Dir.cwd().deleteTree(io, probe_root);
+    try dir.deleteTree(io, probe_root);
     return observed;
 }
 
 fn codeModeHostOwnerProbeInRoot(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     probe_root: []const u8,
     cwd: []const u8,
@@ -551,7 +572,7 @@ fn codeModeHostOwnerProbeInRoot(
     defer allocator.free(evidence_path);
     const codex_home = try std.fs.path.join(allocator, &.{ probe_root, "codex-home" });
     defer allocator.free(codex_home);
-    try std.Io.Dir.cwd().createDir(io, codex_home, .default_dir);
+    try dir.createDir(io, codex_home, .default_dir);
     const missing_host = try std.fs.path.join(
         allocator,
         &.{ probe_root, "selected-host-flag-was-not-forwarded" },
@@ -563,6 +584,7 @@ fn codeModeHostOwnerProbeInRoot(
     var model_fixture = try spawnInternalModelFixture(
         allocator,
         io,
+        dir,
         parent_environment,
         self_path,
         cwd,
@@ -574,7 +596,7 @@ fn codeModeHostOwnerProbeInRoot(
     var model_fixture_running = true;
     defer if (model_fixture_running) model_fixture.kill(io);
 
-    try configureCodeModeOwnerProbe(allocator, io, ready_path, codex_home);
+    try configureCodeModeOwnerProbe(allocator, io, dir, ready_path, codex_home);
 
     var child_environment = try codeModeProbeEnvironment(
         allocator,
@@ -586,6 +608,7 @@ fn codeModeHostOwnerProbeInRoot(
     const observed = try runCodeModeOwnerTurn(
         allocator,
         io,
+        dir,
         cwd,
         codex_path,
         host,
@@ -601,12 +624,14 @@ fn codeModeHostOwnerProbeInRoot(
 fn configureCodeModeOwnerProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     ready_path: []const u8,
     codex_home: []const u8,
 ) !void {
     const model_base_url = try waitForBoundedFileAlloc(
         allocator,
         io,
+        dir,
         ready_path,
         1024,
         5_000,
@@ -615,6 +640,7 @@ fn configureCodeModeOwnerProbe(
     try createCodeModeOwnerProbeConfig(
         allocator,
         io,
+        dir,
         codex_home,
         std.mem.trim(u8, model_base_url, " \t\r\n"),
     );
@@ -623,6 +649,7 @@ fn configureCodeModeOwnerProbe(
 fn spawnInternalModelFixture(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     self_path: []const u8,
     cwd: []const u8,
@@ -643,9 +670,11 @@ fn spawnInternalModelFixture(
     try environment.put(internal_model_fixture_ready_path, ready_path);
     try environment.put(internal_model_fixture_evidence_path, evidence_path);
     if (nonce) |value| try environment.put(internal_model_fixture_nonce, value);
+    const child_dir = try dir.openDir(io, cwd, .{});
+    defer child_dir.close(io);
     return std.process.spawn(io, .{
         .argv = &.{self_path},
-        .cwd = .{ .path = cwd },
+        .cwd = .{ .dir = child_dir },
         .environ_map = &environment,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -674,6 +703,7 @@ fn codeModeProbeEnvironment(
 fn runCodeModeOwnerTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     cwd: []const u8,
     codex_path: []const u8,
     host: *const proxy.app_server_launch.CodeModeHost,
@@ -683,6 +713,8 @@ fn runCodeModeOwnerTurn(
     var client = try proxy.Client.start(allocator, .{
         .cwd = cwd,
         .io = io,
+        .dir = dir,
+        .environ = child_environment,
         .codex_path = codex_path,
         .client_name = "cas-code-mode-host-probe",
         .client_title = "CAS Code Mode Host Probe",
@@ -726,6 +758,7 @@ fn runCodeModeOwnerTurn(
     const evidence = try waitForBoundedFileAlloc(
         allocator,
         io,
+        dir,
         evidence_path,
         4096,
         code_mode_probe_timeout_ms,
@@ -737,6 +770,7 @@ fn runCodeModeOwnerTurn(
 fn createCodeModeOwnerProbeConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     codex_home: []const u8,
     model_base_url: []const u8,
 ) !void {
@@ -764,7 +798,7 @@ fn createCodeModeOwnerProbeConfig(
         .{model_base_url},
     );
     defer allocator.free(contents);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    try dir.writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
 fn stringifyJsonAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
@@ -799,6 +833,7 @@ fn responseThreadIdAlloc(
 fn waitForBoundedFileAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     path: []const u8,
     max_bytes: usize,
     timeout_ms: i64,
@@ -806,8 +841,8 @@ fn waitForBoundedFileAlloc(
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     var elapsed_ms: i128 = 0;
     while (elapsed_ms <= timeout_ms) {
-        if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
-            return std.Io.Dir.cwd().readFileAlloc(
+        if (dir.access(io, path, .{})) |_| {
+            return dir.readFileAlloc(
                 io,
                 path,
                 allocator,
@@ -854,6 +889,7 @@ const RawHttpRequest = struct {
 fn serveInternalModelFixture(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     ready_path: []const u8,
     evidence_path: []const u8,
     mode: InternalModelFixtureMode,
@@ -867,7 +903,7 @@ fn serveInternalModelFixture(
         .{listener.socket.address.getPort()},
     );
     defer allocator.free(base_url);
-    try writeAtomicFileAlloc(allocator, io, ready_path, base_url);
+    try writeAtomicFileAlloc(allocator, io, dir, ready_path, base_url);
 
     var responses_seen: usize = 0;
     for (0..max_model_fixture_requests) |_| {
@@ -879,6 +915,7 @@ fn serveInternalModelFixture(
         const complete = try handleInternalModelRequest(
             allocator,
             io,
+            dir,
             &stream,
             &request,
             evidence_path,
@@ -894,6 +931,7 @@ fn serveInternalModelFixture(
 fn handleInternalModelRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     stream: *std.Io.net.Stream,
     request: *const RawHttpRequest,
     evidence_path: []const u8,
@@ -929,12 +967,9 @@ fn handleInternalModelRequest(
         const body = try reviewModelSseAlloc(allocator);
         defer allocator.free(body);
         try writeHttpResponse(allocator, io, stream, "text/event-stream", body);
-        try writeAtomicFileAlloc(
-            allocator,
-            io,
-            evidence_path,
-            "{\"schema\":\"cas-structured-review-model-evidence/v1\",\"status\":\"passed\"}",
-        );
+        const evidence = "{\"schema\":\"cas-structured-review-model-evidence/v1\"," ++
+            "\"status\":\"passed\"}";
+        try writeAtomicFileAlloc(allocator, io, dir, evidence_path, evidence);
         return true;
     }
     const code_mode_nonce = nonce orelse return error.InvalidInternalFixtureEnvironment;
@@ -957,7 +992,7 @@ fn handleInternalModelRequest(
         "{\"schema\":\"cas-code-mode-model-evidence/v1\",\"status\":\"passed\"}"
     else
         "{\"schema\":\"cas-code-mode-model-evidence/v1\",\"status\":\"failed\"}";
-    try writeAtomicFileAlloc(allocator, io, evidence_path, evidence);
+    try writeAtomicFileAlloc(allocator, io, dir, evidence_path, evidence);
     return true;
 }
 
@@ -1220,25 +1255,34 @@ fn pushJsonValue(
 fn writeAtomicFileAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     path: []const u8,
     bytes: []const u8,
 ) !void {
     const staging = try allocator.print("{s}.tmp", .{path});
     defer allocator.free(staging);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = bytes });
-    try std.Io.Dir.renameAbsolute(staging, path, io);
+    try dir.writeFile(io, .{ .sub_path = staging, .data = bytes });
+    try dir.rename(staging, dir, path, io);
 }
 
 fn collectLifecycle(
     state: *ProbeState,
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
     validated_transport: proxy.app_server_launch.ValidatedTransport,
     schemas: *const contract.CachedSchemas,
 ) !void {
-    contract.verifyExecutableIdentity(allocator, io, &schemas.executable) catch |err| {
+    contract.verifyExecutableIdentity(
+        allocator,
+        io,
+        dir,
+        environment,
+        &schemas.executable,
+    ) catch |err| {
         state.lifecycle_failure_code = "codex_executable_changed";
         state.lifecycle_failure_hint = @errorName(err);
     };
@@ -1246,6 +1290,8 @@ fn collectLifecycle(
     var acquired = acquireLifecycleClient(
         allocator,
         io,
+        dir,
+        environment,
         cwd,
         schemas.executable.resolved_path,
         validated_transport,
@@ -1272,7 +1318,13 @@ fn collectLifecycle(
         state.lifecycle_failure_hint = @errorName(err);
         return;
     };
-    contract.verifyExecutableIdentity(allocator, io, &schemas.executable) catch |err| {
+    contract.verifyExecutableIdentity(
+        allocator,
+        io,
+        dir,
+        environment,
+        &schemas.executable,
+    ) catch |err| {
         state.lifecycle_failure_code = "codex_executable_changed";
         state.lifecycle_failure_hint = @errorName(err);
     };
@@ -1480,16 +1532,28 @@ const LifecycleClient = struct {
 fn acquireLifecycleClient(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     codex_path: []const u8,
     transport: proxy.app_server_launch.ValidatedTransport,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
 ) !LifecycleClient {
     return switch (transport) {
-        .stdio => startStdioLifecycle(allocator, io, cwd, codex_path, code_mode_host),
+        .stdio => startStdioLifecycle(
+            allocator,
+            io,
+            dir,
+            environment,
+            cwd,
+            codex_path,
+            code_mode_host,
+        ),
         .managed_websocket => startManagedLifecycle(
             allocator,
             io,
+            dir,
+            environment,
             cwd,
             codex_path,
             code_mode_host,
@@ -1497,6 +1561,8 @@ fn acquireLifecycleClient(
         .explicit_websocket => |url| startExplicitLifecycle(
             allocator,
             io,
+            dir,
+            environment,
             cwd,
             url,
             code_mode_host,
@@ -1504,17 +1570,29 @@ fn acquireLifecycleClient(
         .unix_socket => |path| startUnixLifecycle(
             allocator,
             io,
+            dir,
+            environment,
             cwd,
             path,
             code_mode_host,
         ),
-        .auto => startAutoLifecycle(allocator, io, cwd, codex_path, code_mode_host),
+        .auto => startAutoLifecycle(
+            allocator,
+            io,
+            dir,
+            environment,
+            cwd,
+            codex_path,
+            code_mode_host,
+        ),
     };
 }
 
 fn startManagedLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     codex_path: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
@@ -1522,16 +1600,20 @@ fn startManagedLifecycle(
     const server = try startManagedLifecycleServer(
         allocator,
         io,
+        dir,
+        environment,
         cwd,
         codex_path,
         code_mode_host,
     );
-    return connectManagedLifecycle(allocator, io, cwd, server);
+    return connectManagedLifecycle(allocator, io, dir, environment, cwd, server);
 }
 
 fn startExplicitLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     url: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
@@ -1542,7 +1624,7 @@ fn startExplicitLifecycle(
     return .{
         .client = try proxy.Client.start(
             allocator,
-            lifecycleClientOptions(io, cwd, .{ .explicit_websocket = url }),
+            lifecycleClientOptions(io, dir, environment, cwd, .{ .explicit_websocket = url }),
         ),
         .selected_transport = .explicit_websocket,
         .endpoint_identity = endpoint_identity,
@@ -1552,6 +1634,8 @@ fn startExplicitLifecycle(
 fn startUnixLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     maybe_path: ?[]const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
@@ -1560,7 +1644,11 @@ fn startUnixLifecycle(
     const resolved_path = if (maybe_path) |path|
         try proxy.app_server_launch.resolveUnixPathAlloc(allocator, cwd, path)
     else
-        try proxy.app_server_launch.defaultUnixPathAlloc(allocator);
+        try proxy.app_server_launch.defaultUnixPathAlloc(
+            allocator,
+            environment.get("CODEX_HOME"),
+            environment.get("HOME"),
+        );
     defer allocator.free(resolved_path);
     const endpoint_identity = try allocator.print(
         "unix://{s}",
@@ -1570,7 +1658,7 @@ fn startUnixLifecycle(
     return .{
         .client = try proxy.Client.start(
             allocator,
-            lifecycleClientOptions(io, cwd, .{ .unix_socket = resolved_path }),
+            lifecycleClientOptions(io, dir, environment, cwd, .{ .unix_socket = resolved_path }),
         ),
         .selected_transport = .unix_socket,
         .endpoint_identity = endpoint_identity,
@@ -1580,6 +1668,8 @@ fn startUnixLifecycle(
 fn startAutoLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     codex_path: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
@@ -1587,6 +1677,8 @@ fn startAutoLifecycle(
     const server = startManagedLifecycleServer(
         allocator,
         io,
+        dir,
+        environment,
         cwd,
         codex_path,
         code_mode_host,
@@ -1598,21 +1690,33 @@ fn startAutoLifecycle(
             .before_first_rpc,
             true,
         )) return err;
-        return startStdioLifecycle(allocator, io, cwd, codex_path, code_mode_host);
+        return startStdioLifecycle(
+            allocator,
+            io,
+            dir,
+            environment,
+            cwd,
+            codex_path,
+            code_mode_host,
+        );
     };
     // Connecting performs initialize. Once the managed server is ready, a
     // connection failure is observable protocol work, not a stdio retry.
-    return connectManagedLifecycle(allocator, io, cwd, server);
+    return connectManagedLifecycle(allocator, io, dir, environment, cwd, server);
 }
 
 fn lifecycleClientOptions(
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     transport: proxy.app_server_launch.ValidatedTransport,
 ) proxy.ClientOptions {
     return .{
         .cwd = cwd,
         .io = io,
+        .dir = dir,
+        .environ = environment,
         .client_name = "cas-app-server-preflight",
         .client_title = "CAS App Server Preflight",
         .client_version = app_meta.version,
@@ -1624,13 +1728,15 @@ fn lifecycleClientOptions(
 fn startStdioLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     codex_path: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
 ) !LifecycleClient {
     const endpoint_identity = try allocator.dupe(u8, "stdio://");
     errdefer allocator.free(endpoint_identity);
-    var options = lifecycleClientOptions(io, cwd, .stdio);
+    var options = lifecycleClientOptions(io, dir, environment, cwd, .stdio);
     options.codex_path = codex_path;
     options.code_mode_host = code_mode_host;
     return .{
@@ -1643,6 +1749,8 @@ fn startStdioLifecycle(
 fn startManagedLifecycleServer(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     codex_path: []const u8,
     code_mode_host: ?*const proxy.app_server_launch.CodeModeHost,
@@ -1655,14 +1763,26 @@ fn startManagedLifecycleServer(
             .inherit,
             host,
             io,
+            dir,
+            environment,
         )
     else
-        websocket.startManagedLoopbackServer(allocator, cwd, codex_path, .inherit, io);
+        websocket.startManagedLoopbackServer(
+            allocator,
+            cwd,
+            codex_path,
+            .inherit,
+            io,
+            dir,
+            environment,
+        );
 }
 
 fn connectManagedLifecycle(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
     cwd: []const u8,
     server_value: websocket.ManagedServer,
 ) !LifecycleClient {
@@ -1673,7 +1793,13 @@ fn connectManagedLifecycle(
     return .{
         .client = try proxy.Client.start(
             allocator,
-            lifecycleClientOptions(io, cwd, .{ .explicit_websocket = server.listen_url }),
+            lifecycleClientOptions(
+                io,
+                dir,
+                environment,
+                cwd,
+                .{ .explicit_websocket = server.listen_url },
+            ),
         ),
         .managed_server = server,
         .selected_transport = .managed_websocket,
@@ -1694,6 +1820,7 @@ const FeatureWitnesses = struct {
 fn runIsolatedFullProbes(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     cache_root: []const u8,
     cwd: []const u8,
@@ -1706,18 +1833,27 @@ fn runIsolatedFullProbes(
         .{ cache_root, nonce },
     );
     defer allocator.free(requested_codex_home);
-    try std.Io.Dir.cwd().createDir(io, requested_codex_home, .default_dir);
-    errdefer std.Io.Dir.cwd().deleteTree(io, requested_codex_home) catch |err|
+    try dir.createDir(io, requested_codex_home, .default_dir);
+    errdefer dir.deleteTree(io, requested_codex_home) catch |err|
         reportProbeCleanupFailure(requested_codex_home, err);
-    const codex_home = try std.Io.Dir.cwd().realPathFileAlloc(io, requested_codex_home, allocator);
+    const codex_home = try dir.realPathFileAlloc(io, requested_codex_home, allocator);
     defer allocator.free(codex_home);
     const review_required = profile == .review or profile == .full;
     const witnesses = if (review_required)
-        try runIsolatedReviewProbes(allocator, io, parent_environment, codex_home, cwd, codex_path)
+        try runIsolatedReviewProbes(
+            allocator,
+            io,
+            dir,
+            parent_environment,
+            codex_home,
+            cwd,
+            codex_path,
+        )
     else
         try runConfiguredIsolatedProbes(
             allocator,
             io,
+            dir,
             parent_environment,
             codex_home,
             cwd,
@@ -1725,13 +1861,14 @@ fn runIsolatedFullProbes(
             "http://127.0.0.1:1/v1",
             false,
         );
-    try std.Io.Dir.cwd().deleteTree(io, codex_home);
+    try dir.deleteTree(io, codex_home);
     return witnesses;
 }
 
 fn runIsolatedReviewProbes(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     codex_home: []const u8,
     cwd: []const u8,
@@ -1746,6 +1883,7 @@ fn runIsolatedReviewProbes(
     var model_fixture = try spawnInternalModelFixture(
         allocator,
         io,
+        dir,
         parent_environment,
         self_path,
         cwd,
@@ -1756,11 +1894,19 @@ fn runIsolatedReviewProbes(
     );
     var model_fixture_running = true;
     defer if (model_fixture_running) model_fixture.kill(io);
-    const model_base_url_raw = try waitForBoundedFileAlloc(allocator, io, ready_path, 1024, 5_000);
+    const model_base_url_raw = try waitForBoundedFileAlloc(
+        allocator,
+        io,
+        dir,
+        ready_path,
+        1024,
+        5_000,
+    );
     defer allocator.free(model_base_url_raw);
     const witnesses = try runConfiguredIsolatedProbes(
         allocator,
         io,
+        dir,
         parent_environment,
         codex_home,
         cwd,
@@ -1772,6 +1918,7 @@ fn runIsolatedReviewProbes(
     const evidence = try waitForBoundedFileAlloc(
         allocator,
         io,
+        dir,
         evidence_path,
         4096,
         code_mode_probe_timeout_ms,
@@ -1787,6 +1934,7 @@ fn runIsolatedReviewProbes(
 fn runConfiguredIsolatedProbes(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     parent_environment: *const std.process.Environ.Map,
     codex_home: []const u8,
     cwd: []const u8,
@@ -1797,6 +1945,7 @@ fn runConfiguredIsolatedProbes(
     try createIsolatedProbeConfig(
         allocator,
         io,
+        dir,
         codex_home,
         model_base_url,
     );
@@ -1813,6 +1962,7 @@ fn runConfiguredIsolatedProbes(
     return runIsolatedFixtureProbes(
         allocator,
         io,
+        dir,
         &child_environment,
         codex_home,
         cwd,
@@ -1824,14 +1974,15 @@ fn runConfiguredIsolatedProbes(
 fn runIsolatedFixtureProbes(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     child_environment: *const std.process.Environ.Map,
     codex_home: []const u8,
     cwd: []const u8,
     codex_path: []const u8,
     review_required: bool,
 ) !FeatureWitnesses {
-    try createPinningProbeRollout(allocator, io, codex_home, cwd);
-    try createPaginatedForkProbeRollout(allocator, io, codex_home, cwd);
+    try createPinningProbeRollout(allocator, io, dir, codex_home, cwd);
+    try createPaginatedForkProbeRollout(allocator, io, dir, codex_home, cwd);
     const executor_root = try std.fs.path.join(allocator, &.{ codex_home, "executor-root" });
     defer allocator.free(executor_root);
     const executor_skill = try std.fs.path.join(
@@ -1846,11 +1997,18 @@ fn runIsolatedFixtureProbes(
         &.{ executor_skill, "resources", "probe.txt" },
     );
     defer allocator.free(executor_resource);
-    try createExecutorSkillProbeFixture(io, executor_skill, executor_manifest, executor_resource);
+    try createExecutorSkillProbeFixture(
+        io,
+        dir,
+        executor_skill,
+        executor_manifest,
+        executor_resource,
+    );
 
     return runIsolatedWitnessClient(
         allocator,
         io,
+        dir,
         cwd,
         codex_path,
         child_environment,
@@ -1864,6 +2022,7 @@ fn runIsolatedFixtureProbes(
 fn runIsolatedWitnessClient(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     cwd: []const u8,
     codex_path: []const u8,
     child_environment: *const std.process.Environ.Map,
@@ -1875,6 +2034,8 @@ fn runIsolatedWitnessClient(
     var client = try proxy.Client.start(allocator, .{
         .cwd = cwd,
         .io = io,
+        .dir = dir,
+        .environ = child_environment,
         .codex_path = codex_path,
         .client_name = "cas-app-server-preflight-isolated",
         .client_title = "CAS App Server Preflight Isolated Probes",
@@ -1910,7 +2071,7 @@ fn runIsolatedWitnessClient(
             executor_resource,
         ),
         .structured_review = if (review_required)
-            probes.structuredReviewProbe(allocator, io, &client, cwd)
+            probes.structuredReviewProbe(allocator, io, dir, &client, cwd)
         else
             .{},
         .external_import_history = probes.externalImportHistoryProbe(allocator, &client, cwd),
@@ -1920,6 +2081,7 @@ fn runIsolatedWitnessClient(
 fn createIsolatedProbeConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     codex_home: []const u8,
     model_base_url: []const u8,
 ) !void {
@@ -1939,19 +2101,20 @@ fn createIsolatedProbeConfig(
         .{model_base_url},
     );
     defer allocator.free(contents);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    try dir.writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
 fn createExecutorSkillProbeFixture(
     io: std.Io,
+    dir: std.Io.Dir,
     skill_root: []const u8,
     manifest_path: []const u8,
     resource_path: []const u8,
 ) !void {
     const resources_path = std.fs.path.dirname(resource_path) orelse
         return error.InvalidExecutorResourcePath;
-    try std.Io.Dir.cwd().createDirPath(io, skill_root);
-    try std.Io.Dir.cwd().createDirPath(io, resources_path);
+    try dir.createDirPath(io, skill_root);
+    try dir.createDirPath(io, resources_path);
     const manifest =
         "---\n" ++
         "name: " ++ probes.ExecutorSkillFixture.name ++ "\n" ++
@@ -1959,8 +2122,8 @@ fn createExecutorSkillProbeFixture(
         "---\n\n" ++
         "# CAS executor skill probe\n\n" ++
         "Read `resources/probe.txt` without copying it into the caller repository.\n";
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
-    try std.Io.Dir.cwd().writeFile(io, .{
+    try dir.writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+    try dir.writeFile(io, .{
         .sub_path = resource_path,
         .data = probes.ExecutorSkillFixture.resource_bytes,
     });
@@ -1969,6 +2132,7 @@ fn createExecutorSkillProbeFixture(
 fn createPinningProbeRollout(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     codex_home: []const u8,
     cwd: []const u8,
 ) !void {
@@ -1980,10 +2144,10 @@ fn createPinningProbeRollout(
     defer allocator.free(month);
     const day = try allocator.print("{s}/04", .{month});
     defer allocator.free(day);
-    try std.Io.Dir.cwd().createDir(io, sessions, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, year, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, month, .default_dir);
-    try std.Io.Dir.cwd().createDir(io, day, .default_dir);
+    try dir.createDir(io, sessions, .default_dir);
+    try dir.createDir(io, year, .default_dir);
+    try dir.createDir(io, month, .default_dir);
+    try dir.createDir(io, day, .default_dir);
 
     const timestamp = "2026-08-04T00:00:00Z";
     const meta = try stringifyProbeJsonAlloc(allocator, .{
@@ -2020,18 +2184,19 @@ fn createPinningProbeRollout(
         .{ day, section_probe_thread_id },
     );
     defer allocator.free(path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    try dir.writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
 fn createPaginatedForkProbeRollout(
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
     codex_home: []const u8,
     cwd: []const u8,
 ) !void {
     const sessions = try allocator.print("{s}/sessions/2026/08/04", .{codex_home});
     defer allocator.free(sessions);
-    try std.Io.Dir.cwd().createDirPath(io, sessions);
+    try dir.createDirPath(io, sessions);
 
     const timestamp = "2026-08-04T00:00:01Z";
     var contents: std.Io.Writer.Allocating = .init(allocator);
@@ -2044,7 +2209,7 @@ fn createPaginatedForkProbeRollout(
         .{ sessions, probes.PaginatedForkFixture.thread_id },
     );
     defer allocator.free(path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents.written() });
+    try dir.writeFile(io, .{ .sub_path = path, .data = contents.written() });
 }
 
 fn writePaginatedProbeHeader(
@@ -2419,25 +2584,26 @@ test "fixture readiness reads exact bounded content and expires missing paths" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const dir = tmp.dir;
     try tmp.dir.writeFile(io, .{ .sub_path = "ready", .data = "ready" });
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const ready = try std.fs.path.join(allocator, &.{ root, "ready" });
     defer allocator.free(ready);
-    const contents = try waitForBoundedFileAlloc(allocator, io, ready, 6, 0);
+    const contents = try waitForBoundedFileAlloc(allocator, io, dir, ready, 6, 0);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("ready", contents);
     for ([_]usize{ 4, 5 }) |limit| {
         try std.testing.expectError(
             error.StreamTooLong,
-            waitForBoundedFileAlloc(allocator, io, ready, limit, 0),
+            waitForBoundedFileAlloc(allocator, io, dir, ready, limit, 0),
         );
     }
     const absent = try std.fs.path.join(allocator, &.{ root, "absent" });
     defer allocator.free(absent);
     try std.testing.expectError(
         error.ModelFixtureTimedOut,
-        waitForBoundedFileAlloc(allocator, io, absent, 5, 0),
+        waitForBoundedFileAlloc(allocator, io, dir, absent, 5, 0),
     );
 }
 

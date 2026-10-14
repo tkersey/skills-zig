@@ -128,6 +128,9 @@ const CodeModeIdentity = struct {
 };
 
 fn clientOptions(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    io: std.Io,
     opts: ParsedArgs,
     cwd: []const u8,
     codex_path: []const u8,
@@ -138,6 +141,9 @@ fn clientOptions(
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) cas.ClientOptions {
     return .{
+        .io = io,
+        .dir = directory,
+        .environ = environ,
         .cwd = cwd,
         .state_file = state_file,
         .codex_path = codex_path,
@@ -163,6 +169,8 @@ fn clientOptions(
 }
 
 fn startInstance(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     opts: ParsedArgs,
@@ -176,6 +184,9 @@ fn startInstance(
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) !InstanceSlot {
     var direct = clientOptions(
+        directory,
+        environ,
+        io,
         opts,
         cwd,
         codex_path,
@@ -190,6 +201,8 @@ fn startInstance(
     switch (selected_transport) {
         .auto, .managed_websocket => {
             var server = startManagedServer(
+                directory,
+                environ,
                 allocator,
                 io,
                 cwd,
@@ -208,6 +221,8 @@ fn startInstance(
                 return .{ .client = try cas.Client.start(allocator, direct), .transport = "stdio" };
             };
             return finishManagedStart(
+                directory,
+                environ,
                 allocator,
                 io,
                 opts,
@@ -233,6 +248,8 @@ fn startInstance(
 }
 
 fn startManagedServer(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
@@ -241,19 +258,14 @@ fn startManagedServer(
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) !cas_websocket.ManagedServer {
     if (code_mode_host) |host| {
-        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
-            allocator,
-            cwd,
-            codex_path,
-            hook_policy,
-            host,
-            io,
-        );
+        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, codex_path, hook_policy, host, io, directory, environ);
     }
-    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
+    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io, directory, environ);
 }
 
 fn finishManagedStart(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
     opts: ParsedArgs,
@@ -270,6 +282,9 @@ fn finishManagedStart(
         server.deinit(allocator);
     }
     var socket = clientOptions(
+        directory,
+        environ,
+        io,
         opts,
         cwd,
         codex_path,
@@ -288,7 +303,7 @@ fn finishManagedStart(
     };
 }
 
-fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, source: []const u8) ![]u8 {
+fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, source: []const u8) ![]u8 {
     if (std.mem.eql(u8, source, "-")) {
         var reader = std.Io.File.stdin().reader(io, &.{});
         return reader.interface.allocRemaining(
@@ -303,7 +318,7 @@ fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, source: []co
             .{ .follow_symlinks = false, .allow_directory = false },
         )
     else
-        try std.Io.Dir.cwd().openFile(
+        try directory.openFile(
             io,
             source,
             .{ .follow_symlinks = false, .allow_directory = false },
@@ -330,14 +345,16 @@ fn wipeSecretCarrier(allocator: std.mem.Allocator, carrier: ?[]u8) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const environ = init.environ_map;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    var help_writer = std.Io.File.stdout().writer(io, &.{});
+    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return;
 
     const opts = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(
-            HelpSurface,
-            Version,
+        exitUsageFailure(
+            io,
             @errorName(err),
             usageDetailForParseError(err),
         );
@@ -345,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -355,7 +372,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.show_help) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -364,22 +381,26 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cwd = opts.cwd orelse {
-        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
+        exitUsageFailure(io, "MissingValue", "--cwd");
     };
     defer allocator.free(opts.opt_out_methods);
 
-    return runConfiguredInstances(allocator, init.io, opts, cwd);
+    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer directory.close(io);
+    return runConfiguredInstances(environ, allocator, io, directory, opts, cwd);
 }
 
 fn runConfiguredInstances(
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
+    directory: std.Io.Dir,
     opts: ParsedArgs,
     cwd: []const u8,
 ) !void {
     if (opts.instances > 1 and opts.state_file_dir == null) {
         var stderr_writer = std.Io.File.stderr().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stderr = &stderr_writer.interface;
@@ -388,7 +409,7 @@ fn runConfiguredInstances(
             "state isolation.\n");
     }
 
-    const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
+    const params = try buildParamsJson(io, directory, allocator, opts.method, opts.params_json, opts.params_file);
     defer allocator.free(params);
     const selected_transport = try cas.app_server_launch.validateTransport(
         opts.requested_transport,
@@ -399,20 +420,23 @@ fn runConfiguredInstances(
     else
         null;
     defer if (code_mode_host) |*host| host.deinit();
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, opts.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, io, directory, environ.get("PATH"), opts.codex_path);
     defer allocator.free(resolved_codex_path);
     const auth_refresh_response = if (opts.auth_refresh_response_source) |source|
-        try loadSecretCarrierAlloc(allocator, io, source)
+        try loadSecretCarrierAlloc(allocator, io, directory, source)
     else
         null;
     defer wipeSecretCarrier(allocator, auth_refresh_response);
     const attestation_response = if (opts.attestation_response_source) |source|
-        try loadSecretCarrierAlloc(allocator, io, source)
+        try loadSecretCarrierAlloc(allocator, io, directory, source)
     else
         null;
     defer wipeSecretCarrier(allocator, attestation_response);
 
     var validation_options = clientOptions(
+        directory,
+        environ,
+        io,
         opts,
         cwd,
         resolved_codex_path,
@@ -427,6 +451,8 @@ fn runConfiguredInstances(
     return runInstances(.{
         .allocator = allocator,
         .io = io,
+        .dir = directory,
+        .environ = environ,
         .opts = opts,
         .cwd = cwd,
         .params = params,
@@ -441,6 +467,8 @@ fn runConfiguredInstances(
 const InstanceRun = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    dir: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     opts: ParsedArgs,
     cwd: []const u8,
     params: []const u8,
@@ -452,6 +480,7 @@ const InstanceRun = struct {
 };
 
 fn runInstances(ctx: InstanceRun) !void {
+    const io = ctx.io;
     const allocator = ctx.allocator;
     const opts = ctx.opts;
     const hook_log_path = if (opts.hook_policy.shouldCaptureNotifications())
@@ -488,15 +517,15 @@ fn runInstances(ctx: InstanceRun) !void {
     }
 
     const started_at = @divFloor(
-        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     );
 
     try startSlots(ctx, slots, &start_failures);
-    const after_start = monotonicMillis();
+    const after_start = monotonicMillis(io);
 
     try requestSlots(ctx, slots, &request_results, notification_capture);
-    const after_requests = monotonicMillis();
+    const after_requests = monotonicMillis(io);
 
     const ok = try reportInstances(
         ctx,
@@ -516,6 +545,9 @@ fn startSlots(
     slots: []?InstanceSlot,
     start_failures: *std.ArrayList(StartFailure),
 ) !void {
+    const io = ctx.io;
+    const directory = ctx.dir;
+    const environ = ctx.environ;
     const allocator = ctx.allocator;
     const opts = ctx.opts;
     // Phase 1: start all clients.
@@ -538,6 +570,8 @@ fn startSlots(
         defer allocator.free(client_name);
 
         slots[i] = startInstance(
+            directory,
+            environ,
             allocator,
             ctx.io,
             opts,
@@ -560,7 +594,7 @@ fn startSlots(
             };
             if (opts.verbose) {
                 var stderr_writer = std.Io.File.stderr().writer(
-                    std.Io.Threaded.global_single_threaded.io(),
+                    io,
                     &.{},
                 );
                 const stderr = &stderr_writer.interface;
@@ -570,7 +604,7 @@ fn startSlots(
         };
         if (opts.verbose) {
             var stderr_writer = std.Io.File.stderr().writer(
-                std.Io.Threaded.global_single_threaded.io(),
+                io,
                 &.{},
             );
             const stderr = &stderr_writer.interface;
@@ -585,6 +619,7 @@ fn requestSlots(
     request_results: *std.ArrayList(RequestResult),
     notification_capture: ?*std.ArrayList([]u8),
 ) !void {
+    const io = ctx.io;
     const allocator = ctx.allocator;
     const opts = ctx.opts;
     // Phase 2: run requests for started clients.
@@ -611,7 +646,7 @@ fn requestSlots(
                 .transport = slot.transport,
                 .@"error" = summary,
             });
-            if (opts.verbose) try logRequestFailure(instance_num, slot.transport, summary);
+            if (opts.verbose) try logRequestFailure(io, instance_num, slot.transport, summary);
             continue;
         };
         defer allocator.free(result_json);
@@ -624,7 +659,7 @@ fn requestSlots(
         ));
         if (opts.verbose) {
             var stderr_writer = std.Io.File.stderr().writer(
-                std.Io.Threaded.global_single_threaded.io(),
+                io,
                 &.{},
             );
             const stderr = &stderr_writer.interface;
@@ -655,7 +690,7 @@ fn reportInstances(
     const sample_results = request_results[0..@min(opts.sample, request_results.len)];
     var hook_accumulator = cas.hooks.HookAccumulator.init(
         opts.hook_policy,
-        if (hook_log_path) |path| .{ .io = ctx.io, .path = path } else null,
+        if (hook_log_path) |path| .{ .io = ctx.io, .dir = ctx.dir, .path = path } else null,
     );
     try hook_accumulator.absorbLines(allocator, captured_notifications);
     const hook_summary = hook_accumulator.summary();
@@ -697,14 +732,14 @@ fn reportInstances(
         .sample_results = sample_results,
     };
 
-    try writeRunReport(opts, payload);
+    try writeRunReport(ctx.io, opts, payload);
     return requests_failed == 0 and start_failures.len == 0 and hook_summary.failureCode == null;
 }
 
-fn writeRunReport(opts: ParsedArgs, payload: anytype) !void {
+fn writeRunReport(io: std.Io, opts: ParsedArgs, payload: anytype) !void {
     if (opts.json) {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -712,7 +747,7 @@ fn writeRunReport(opts: ParsedArgs, payload: anytype) !void {
         try stdout.writeAll("\n");
     } else {
         var stdout_writer = std.Io.File.stdout().writer(
-            std.Io.Threaded.global_single_threaded.io(),
+            io,
             &.{},
         );
         const stdout = &stdout_writer.interface;
@@ -946,6 +981,8 @@ fn usageDetailForParseError(err: anyerror) ?[]const u8 {
 }
 
 fn buildParamsJson(
+    io: std.Io,
+    directory: std.Io.Dir,
     allocator: std.mem.Allocator,
     method: []const u8,
     params_json: ?[]const u8,
@@ -957,12 +994,13 @@ fn buildParamsJson(
         return allocator.dupe(u8, raw);
     }
     if (params_file) |path| {
-        const raw = try std.Io.Dir.cwd().readFileAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
+        const raw = try directory.readFileAlloc(
+            io,
             path,
             allocator,
             .limited(4 * 1024 * 1024),
         );
+        errdefer allocator.free(raw);
         var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed_json.deinit();
         return raw;
@@ -1113,8 +1151,7 @@ fn summarizeTurnStart(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap
     });
 }
 
-fn monotonicMillis() i64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn monotonicMillis(io: std.Io) i64 {
     return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
 }
 
@@ -1292,7 +1329,7 @@ test "secret carrier files must be regular and owner only" {
     var secure_file = try tmp.dir.openFile(io, "secure.json", .{});
     try secure_file.setPermissions(io, .fromMode(0o600));
     secure_file.close(io);
-    const secure = try loadSecretCarrierAlloc(std.testing.allocator, io, secure_path);
+    const secure = try loadSecretCarrierAlloc(std.testing.allocator, io, tmp.dir, secure_path);
     defer wipeSecretCarrier(std.testing.allocator, secure);
     try std.testing.expectEqualStrings("{\"token\":\"SECRET\"}", secure);
 
@@ -1304,7 +1341,7 @@ test "secret carrier files must be regular and owner only" {
     insecure_file.close(io);
     try std.testing.expectError(
         error.InsecureSecretCarrierPermissions,
-        loadSecretCarrierAlloc(std.testing.allocator, io, insecure_path),
+        loadSecretCarrierAlloc(std.testing.allocator, io, tmp.dir, insecure_path),
     );
 }
 
@@ -1361,6 +1398,8 @@ test "parseArgs rejects removed multi-agent mode for thread list" {
 
 test "buildParamsJson preserves caller-owned raw parameters" {
     const params = try buildParamsJson(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         "turn/start",
         "{\"threadId\":\"thr_1\",\"input\":[]}",
@@ -1377,6 +1416,8 @@ test "buildParamsJson preserves caller-owned raw parameters" {
 
 test "buildParamsJson leaves generic raw multiAgentMode caller-owned" {
     const params = try buildParamsJson(
+        std.testing.io,
+        std.Io.Dir.cwd(),
         std.testing.allocator,
         "thread/start",
         "{\"multiAgentMode\":\"explicitRequestOnly\"}",
@@ -1425,9 +1466,9 @@ test "summarizeResult returns turn/start compact summary" {
     );
 }
 
-fn logRequestFailure(instance_num: usize, transport: []const u8, summary: []const u8) !void {
+fn logRequestFailure(io: std.Io, instance_num: usize, transport: []const u8, summary: []const u8) !void {
     var stderr_writer = std.Io.File.stderr().writer(
-        std.Io.Threaded.global_single_threaded.io(),
+        io,
         &.{},
     );
     const stderr = &stderr_writer.interface;
@@ -1487,4 +1528,35 @@ test "parseArgs rejects timeout values outside the client integer domain" {
     try std.testing.expectError(error.InvalidServerTimeout, parseArgs(std.testing.allocator, &.{
         "cas_instance_runner", "--server-request-timeout-ms", "4294967296",
     }));
+}
+
+fn exitUsageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) noreturn {
+    var writer = std.Io.File.stderr().writer(io, &.{});
+    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch std.process.exit(1);
+    std.process.exit(2);
+}
+
+test "relative parameter and secret files use the supplied directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var left = std.testing.tmpDir(.{});
+    defer left.cleanup();
+    var right = std.testing.tmpDir(.{});
+    defer right.cleanup();
+    const roots = [_]std.Io.Dir{ left.dir, right.dir };
+    const values = [_][]const u8{ "{\"root\":\"left\"}", "{\"root\":\"right\"}" };
+    for (roots, values) |dir, value| {
+        try dir.writeFile(io, .{ .sub_path = "params.json", .data = value });
+        var secret = try dir.createFile(io, "secret.json", .{ .permissions = .fromMode(0o600) });
+        defer secret.close(io);
+        try secret.writeStreamingAll(io, value);
+    }
+    for (roots, values) |dir, value| {
+        const params = try buildParamsJson(io, dir, allocator, "thread/start", null, "params.json");
+        defer allocator.free(params);
+        try std.testing.expectEqualStrings(value, params);
+        const carrier = try loadSecretCarrierAlloc(allocator, io, dir, "secret.json");
+        defer wipeSecretCarrier(allocator, carrier);
+        try std.testing.expectEqualStrings(value, carrier);
+    }
 }
