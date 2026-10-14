@@ -16,6 +16,7 @@ const CasRuntimeModules = struct {
 
     fn init(ctx: BuildContext, shared: SharedModules) CasRuntimeModules {
         const cas_runtime_root = ctx.module("libs/cas_runtime/src/root.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
         });
         const cas_proxy_client_root = ctx.module("apps/cas/scripts/cas_proxy_client.zig", &.{
@@ -57,6 +58,7 @@ const CasRuntimeModules = struct {
             },
         );
         const cas_transport_tests_root = ctx.module("apps/cas/scripts/cas_transport_tests.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         });
@@ -87,18 +89,21 @@ const CasCommandModules = struct {
         cas_meta: *std.Build.Module,
     ) CasCommandModules {
         const cas_smoke_root = ctx.module("apps/cas/scripts/cas_smoke_check.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "app_meta", .module = cas_meta },
             .{ .name = "cas_runtime", .module = runtime.runtime },
         });
         const cas_runner_root = ctx.module("apps/cas/scripts/cas_instance_runner.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "app_meta", .module = cas_meta },
             .{ .name = "cas_runtime", .module = runtime.runtime },
         });
         const cas_review_session_root = ctx.module("apps/cas/scripts/cas_review_session.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "cas_proxy_client", .module = runtime.proxy },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
@@ -111,12 +116,14 @@ const CasCommandModules = struct {
         });
         const cas_session_inquiry_root = inquiryModule(ctx, shared, runtime, cas_meta);
         const cas_conformance_root = ctx.module("apps/cas/scripts/cas_conformance_suite.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "app_meta", .module = cas_meta },
             .{ .name = "cas_proxy_client", .module = runtime.proxy },
         });
         const cas_goal_root = ctx.module("apps/cas/scripts/cas_goal.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "app_meta", .module = cas_meta },
@@ -147,6 +154,7 @@ const CasCommandModules = struct {
         cas_meta: *std.Build.Module,
     ) *std.Build.Module {
         return ctx.module("apps/cas/scripts/cas_session_inquiry.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_json", .module = shared.json },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "core_path", .module = shared.path },
@@ -179,6 +187,7 @@ const CasAdminModules = struct {
         const cas_app_server_preflight_root = ctx.module(
             "apps/cas/scripts/cas_app_server_preflight.zig",
             &.{
+                .{ .name = "core_io", .module = shared.io },
                 .{ .name = "app_meta", .module = cas_meta },
                 .{ .name = "cas_app_server_contract", .module = runtime.contract },
                 .{ .name = "cas_app_server_probes", .module = runtime.probes },
@@ -199,11 +208,13 @@ const CasAdminModules = struct {
             .{ .name = "app_meta", .module = cas_meta },
         });
         const cas_root = ctx.module("apps/cas/scripts/cas.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_delegate", .module = shared.delegate },
             .{ .name = "core_cli", .module = shared.cli },
             .{ .name = "app_meta", .module = cas_meta },
         });
         const cas_automation_root = ctx.module("apps/cas/scripts/cas_automation.zig", &.{
+            .{ .name = "core_io", .module = shared.io },
             .{ .name = "core_calendar", .module = shared.calendar },
             .{ .name = "core_delegate", .module = shared.delegate },
             .{ .name = "core_cli", .module = shared.cli },

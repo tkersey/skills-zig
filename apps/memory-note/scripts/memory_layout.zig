@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 
 // Configuration is read by Codex, which owns layering, profiles, and project trust.
@@ -39,7 +40,7 @@ pub fn selectedVersion(
     const executable = env.get("CODEX_BIN") orelse "codex";
     // Spawn requires an actual directory handle; Dir.cwd() may be a sentinel.
     // Keep this handle through both child startup and the config request.
-    var child_cwd = try cwd.openDir(io, ".", .{});
+    var child_cwd = try core_io.openSearchDirectory(io, cwd, ".", .{});
     defer child_cwd.close(io);
     var child = std.process.spawn(io, .{
         .argv = &.{ executable, "app-server" },

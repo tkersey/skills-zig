@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 const app_meta = @import("app_meta");
 const contract = @import("cas_app_server_contract");
@@ -133,7 +134,7 @@ pub fn runCommand(init: std.process.Init) u8 {
         parseArgs(argv[1..]) catch |err| return fatal(init.io, err, jsonRequested(argv[1..]))
     else
         null;
-    const dir = std.Io.Dir.cwd().openDir(init.io, ".", .{}) catch |err|
+    const dir = core_io.openSearchDirectory(init.io, .cwd(), ".", .{}) catch |err|
         return fatal(init.io, err, if (parsed_options) |options| options.json else false);
     defer dir.close(init.io);
     if (fixture) |options| {
@@ -677,7 +678,7 @@ fn spawnInternalModelFixture(
     try environment.put(internal_model_fixture_ready_path, ready_path);
     try environment.put(internal_model_fixture_evidence_path, evidence_path);
     if (nonce) |value| try environment.put(internal_model_fixture_nonce, value);
-    const child_dir = try dir.openDir(io, cwd, .{});
+    const child_dir = try core_io.openSearchDirectory(io, dir, cwd, .{});
     defer child_dir.close(io);
     return std.process.spawn(io, .{
         .argv = &.{self_path},

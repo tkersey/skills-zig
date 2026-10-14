@@ -60,6 +60,7 @@ pub const SharedModules = struct {
         const core_perf_contract = ctx.module("tools/perf_contract.zig", &.{});
         const jsonl_core = ctx.module("libs/jsonl_core/src/lib.zig", &.{});
         const durable_store = ctx.module("libs/durable_store/src/lib.zig", &.{
+            .{ .name = "core_io", .module = core_io },
             .{ .name = "jsonl_core", .module = jsonl_core },
         });
         const definition_compat = ctx.module("libs/definition_compat/src/root.zig", &.{});
@@ -70,7 +71,9 @@ pub const SharedModules = struct {
             .{ .name = "jsonl_core", .module = jsonl_core },
         });
         const jsonl_fast = ctx.fast().module("libs/jsonl_core/src/lib.zig", &.{});
+        const core_io_fast = ctx.fast().module("libs/core/src/io_helpers.zig", &.{});
         const durable_fast = ctx.fast().module("libs/durable_store/src/lib.zig", &.{
+            .{ .name = "core_io", .module = core_io_fast },
             .{ .name = "jsonl_core", .module = jsonl_fast },
         });
         const canonical_fast = ctx.fast().module(

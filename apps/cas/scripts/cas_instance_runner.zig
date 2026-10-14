@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const cas = @import("cas_runtime");
 const cas_websocket = cas.websocket;
@@ -422,7 +423,7 @@ pub fn run(init: std.process.Init) !u8 {
         return usageFailure(io, "MissingValue", "--cwd");
     };
 
-    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer directory.close(io);
     return runConfiguredInstances(environ, allocator, io, directory, opts, cwd);
 }

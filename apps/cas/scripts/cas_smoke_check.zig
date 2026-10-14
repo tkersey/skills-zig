@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
 const core_cli = @import("core_cli");
@@ -127,7 +128,7 @@ pub fn run(init: std.process.Init) !u8 {
         return usageFailure(io, "MissingValue", "--cwd");
     };
 
-    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer directory.close(io);
     const environ = init.environ_map;
     return runConfiguredSmoke(directory, environ, allocator, init.io, parsed, cwd);

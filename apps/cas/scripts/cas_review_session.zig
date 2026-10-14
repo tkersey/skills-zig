@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client");
 const contract = @import("cas_app_server_contract");
@@ -187,7 +188,7 @@ const TestOperation = struct {
         errdefer environ.deinit();
         return .{
             .environ = environ,
-            .directory = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{}),
+            .directory = try core_io.openSearchDirectory(std.testing.io, .cwd(), ".", .{}),
         };
     }
 
@@ -600,7 +601,7 @@ fn execute(init: std.process.Init) !void {
         HelpSurface,
         Version,
     )) return;
-    var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
+    var directory = try core_io.openSearchDirectory(init.io, .cwd(), ".", .{});
     defer directory.close(init.io);
     const fs = durable_store.Fs.init(init.io, directory);
 
@@ -1018,8 +1019,7 @@ fn cmdStart(operation: Operation, allocator: std.mem.Allocator, parsed: ParsedAr
     try start.prepareRecord();
     try start.persistStarted();
     if (parsed.wait_after_start) return start.waitAndFinish();
-    try start.printResult(null, false, false, null);
-    try start.managed_server.?.detach();
+    try start.finishDetachedStart();
 }
 
 fn threadStartParamsDigest(parsed: ParsedArgs) ?[]const u8 {
@@ -1724,6 +1724,11 @@ const ReviewStart = struct {
         self.updateLock("review_started", null);
     }
 
+    fn finishDetachedStart(self: *ReviewStart) !void {
+        try self.managed_server.?.detach();
+        try self.printResult(null, false, false, null);
+    }
+
     fn printJsonResult(
         self: *const ReviewStart,
         status: ?ReviewStatus,
@@ -1867,8 +1872,8 @@ const ReviewStart = struct {
         self.record.?.last_observed_status = timeoutStatusString(&status);
         try writeSessionRecord(self.operation, self.allocator, self.record_path.?, self.record.?);
         self.updateLock(disposition.lock_state, disposition.failure.code);
-        try self.printResult(status, true, true, disposition.failure);
         try self.managed_server.?.detach();
+        try self.printResult(status, true, true, disposition.failure);
         return error.CommandReportedFailure;
     }
 
@@ -19986,6 +19991,13 @@ test "terminal timeout session replays only through its exact tuple lock" {
 }
 
 const TimeoutTestOutput = struct {
+    fn fail(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .file_write_streaming and
+            op.file_write_streaming.file.handle == std.Io.File.stdout().handle)
+            return .{ .file_write_streaming = error.BrokenPipe };
+        return operate(userdata, op);
+    }
+
     fn operate(
         userdata: ?*anyopaque,
         op: std.Io.Operation,
@@ -20004,14 +20016,43 @@ const TimeoutTestOutput = struct {
     }
 };
 
-test "unbound wait timeout preserves the server after command cleanup" {
+test "resumable review handoff survives every output surface and output failure" {
+    for ([_]review_cli.Action{ .start, .run }) |action| {
+        for ([_]bool{ false, true }) |json| {
+            for ([_]bool{ false, true }) |fail_output| {
+                try checkReviewHandoff(action, json, fail_output, true, null);
+            }
+        }
+    }
+    for ([_]bool{ false, true }) |json| {
+        for ([_]bool{ false, true }) |fail_output| {
+            try checkReviewHandoff(.start, json, fail_output, false, null);
+        }
+    }
+}
+
+test "bound timeout retires the server before successful or failed reporting" {
+    for ([_]review_cli.Action{ .start, .run }) |action| {
+        for ([_]bool{ false, true }) |fail_output| {
+            try checkReviewHandoff(action, true, fail_output, true, testWorkflowBinding());
+        }
+    }
+}
+
+fn checkReviewHandoff(
+    action: review_cli.Action,
+    json: bool,
+    fail_output: bool,
+    timed_out: bool,
+    binding: ?WorkflowBinding,
+) !void {
     if (builtin.target.os.tag == .windows or
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var operation_fixture = try TestOperation.init();
     defer operation_fixture.deinit();
 
     var vtable = std.testing.io.vtable.*;
-    vtable.operate = TimeoutTestOutput.operate;
+    vtable.operate = if (fail_output) TimeoutTestOutput.fail else TimeoutTestOutput.operate;
     var operation = operation_fixture.operation();
     operation.fs.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
     const allocator = std.testing.allocator;
@@ -20020,6 +20061,7 @@ test "unbound wait timeout preserves the server after command cleanup" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
+    operation.store = .{ .explicit = root };
     var child = try cas_websocket.spawnDetachedProcess(
         allocator,
         root,
@@ -20029,17 +20071,17 @@ test "unbound wait timeout preserves the server after command cleanup" {
         operation.environ,
     );
     const pid: u64 = @intCast(child.id.?);
-    var released = false;
-    defer if (released) child.kill(io);
+    defer if (cas_websocket.processAlive(pid)) child.kill(io);
     // This stage follows grace-status observation and never uses the RPC gate.
     var unused_gate: ReviewRuntimeGate = undefined;
     var start = ReviewStart{
         .operation = operation,
         .allocator = allocator,
-        .parsed = .{ .timeout_ms = 1 },
+        .parsed = .{ .timeout_ms = 1, .action = action, .json = json },
+        .receipt = .{ .surface_action = @tagName(action), .workflow_binding = binding },
         .cwd = root,
         .gate = &unused_gate,
-        .workflow_binding = null,
+        .workflow_binding = binding,
         .code_mode_host = null,
         .managed_server = .{
             .io = io,
@@ -20049,20 +20091,54 @@ test "unbound wait timeout preserves the server after command cleanup" {
     };
     var deinitialized = false;
     defer if (!deinitialized) start.deinit();
+    try prepareHandoffTestRecord(&start, root, pid);
+    try checkHandoffReport(&start, timed_out, fail_output);
+    start.deinit();
+    deinitialized = true;
+    try std.testing.expectEqual(binding == null, cas_websocket.processAlive(pid));
+}
+
+fn checkHandoffReport(start: *ReviewStart, timed_out: bool, fail_output: bool) !void {
+    const allocator = start.allocator;
+    const binding = start.workflow_binding;
+    const status = try makeDisconnectedReviewStatus(allocator);
+    defer status.deinit(allocator);
+    const result = if (timed_out)
+        start.finishWaitTimeout(status) catch |err| @as(anyerror!void, err)
+    else
+        start.finishDetachedStart();
+    if (fail_output) {
+        try std.testing.expectError(error.WriteFailed, result);
+    } else if (timed_out) {
+        try std.testing.expectError(error.CommandReportedFailure, result);
+    } else {
+        try result;
+    }
+    if (timed_out and binding == null) try checkUnboundTimeoutState(start);
+    if (binding != null) {
+        try std.testing.expectEqualStrings(
+            "review_transport_timeout",
+            start.record.?.terminal_failure_code.?,
+        );
+    }
+}
+
+fn prepareHandoffTestRecord(start: *ReviewStart, root: []const u8, pid: u64) !void {
+    const allocator = start.allocator;
     start.record_path = try std.fs.path.join(allocator, &.{ root, "review.json" });
     start.review_thread_id = try allocator.dupe(u8, "thr");
     start.review_turn_id = try allocator.dupe(u8, "turn");
     start.record = testCurrentSessionRecord();
+    start.parent_thread_id = try allocator.dupe(u8, "parent");
+    start.event_log_path = try std.fs.path.join(allocator, &.{ root, "events.ndjson" });
+    start.canonical_target = .{ .value = .{ .base_branch = "main" } };
+    start.identity = .{
+        .head_sha = try allocator.dupe(u8, "head"),
+        .base_sha = try allocator.dupe(u8, "base"),
+        .fingerprint = try allocator.dupe(u8, "fp"),
+    };
     start.record.?.managed_server_pid = pid;
     start.lock_bundle = try testUnboundWaitLock(allocator, root);
-    const status = try makeDisconnectedReviewStatus(allocator);
-    defer status.deinit(allocator);
-    try std.testing.expectError(error.CommandReportedFailure, start.finishWaitTimeout(status));
-    released = true;
-    try checkUnboundTimeoutState(&start);
-    start.deinit();
-    deinitialized = true;
-    try std.testing.expect(cas_websocket.processAlive(pid));
 }
 
 fn checkUnboundTimeoutState(start: *ReviewStart) !void {

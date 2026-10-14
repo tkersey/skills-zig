@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
@@ -101,7 +102,7 @@ pub fn run(init: std.process.Init) !u8 {
         return fail(io, allocator, opts, @errorName(err), null, 2);
     };
 
-    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer directory.close(io);
     const environ = init.environ_map;
 

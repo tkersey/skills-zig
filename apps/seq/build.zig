@@ -62,14 +62,7 @@ fn createCoreModules(
         .target = target,
         .optimize = optimize,
     });
-    const durable_store = b.createModule(.{
-        .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "jsonl_core", .module = jsonl_core },
-        },
-    });
+    const durable_store = createDurableStoreModule(b, target, optimize, jsonl_core);
     const definition_compat = b.createModule(.{
         .root_source_file = b.path("../../libs/definition_compat/src/root.zig"),
         .target = target,
@@ -118,6 +111,28 @@ fn createCoreModules(
         .seq_core = seq_core,
         .test_support = test_support,
     };
+}
+
+fn createDurableStoreModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    jsonl_core: *std.Build.Module,
+) *std.Build.Module {
+    const core_io = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/io_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    return b.createModule(.{
+        .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_io", .module = core_io },
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
+    });
 }
 
 fn createTimeModule(

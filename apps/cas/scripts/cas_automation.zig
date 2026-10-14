@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 pub const Operation = @import("automation/operation.zig").Operation;
 const app_meta = @import("app_meta");
 const automation_files = @import("automation/files.zig");
@@ -278,7 +279,7 @@ pub fn runCommand(init: std.process.Init) !u8 {
         return 0;
     }
 
-    var cwd = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
+    var cwd = try core_io.openSearchDirectory(init.io, .cwd(), ".", .{});
     defer cwd.close(init.io);
     const cwd_path = try cwd.realPathFileAlloc(init.io, ".", init.gpa);
     defer init.gpa.free(cwd_path);

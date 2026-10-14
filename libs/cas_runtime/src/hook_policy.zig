@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const core_json = @import("core_json");
 const std = @import("std");
 const app_server_launch = @import("transport.zig");
@@ -285,7 +286,7 @@ fn helpOutputUntil(
         );
     defer if (owned_codex_path) |path| allocator.free(path);
     const resolved_codex_path = owned_codex_path orelse codex_path;
-    const child_cwd = try dir.openDir(io, cwd, .{});
+    const child_cwd = try core_io.openSearchDirectory(io, dir, cwd, .{});
     defer child_cwd.close(io);
     var child = try std.process.spawn(io, .{
         .exe = .{ .explicit = .{ .dir = dir, .path = resolved_codex_path } },

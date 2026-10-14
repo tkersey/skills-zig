@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const builtin = @import("builtin");
 const std = @import("std");
 const delegate = @import("core_delegate");
@@ -163,7 +164,7 @@ pub fn run(init: std.process.Init) !u8 {
         return printCapabilities(io, argv[2..]);
     }
 
-    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer directory.close(io);
 
     if (std.mem.eql(u8, argv[1], "app-server") and argv.len > 2 and

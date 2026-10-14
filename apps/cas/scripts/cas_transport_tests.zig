@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 const proxy = @import("cas_proxy_client");
 const launch = proxy.app_server_launch;
@@ -6,7 +7,7 @@ const websocket = proxy.websocket_transport;
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len != 3) return error.InvalidFixtureArguments;
-    const dir = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
+    const dir = try core_io.openSearchDirectory(init.io, .cwd(), ".", .{});
     defer dir.close(init.io);
     try serveCodeModeHostFixture(init.gpa, init.io, dir, argv[1], argv[2]);
 }
@@ -753,7 +754,7 @@ test "managed websocket resolves port zero and remains usable after detach" {
     var environ = try std.testing.environ.createMap(std.testing.allocator);
     defer environ.deinit();
     const codex_bin = environ.get("CODEX_BIN") orelse return error.SkipZigTest;
-    const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    const dir = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer dir.close(io);
     var server = try websocket.startManagedLoopbackServer(
         std.testing.allocator,

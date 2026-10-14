@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
@@ -1481,7 +1482,7 @@ fn invokeSharedInquiryPreflight(
     options: Options,
     argv: []const []const u8,
 ) !SharedSessionInquiryPreflight {
-    var child_cwd = try op.fs.directory().openDir(op.fs.io, options.cwd, .{});
+    var child_cwd = try core_io.openSearchDirectory(op.fs.io, op.fs.directory(), options.cwd, .{});
     defer child_cwd.close(op.fs.io);
     var child = std.process.spawn(op.fs.io, .{
         .argv = argv,

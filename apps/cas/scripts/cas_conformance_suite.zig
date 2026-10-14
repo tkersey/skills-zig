@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const cas_proxy_client = @import("cas_proxy_client");
@@ -180,7 +181,7 @@ pub fn run(init: std.process.Init) !u8 {
         return usageFailure(io, "MissingValue", "--cwd");
     };
 
-    var directory = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    var directory = try core_io.openSearchDirectory(io, .cwd(), ".", .{});
     defer directory.close(io);
     const ctx = Context{
         .io = io,
@@ -1107,7 +1108,7 @@ test "overload scenario route drives production proxy retry integration" {
         builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var environment = try std.testing.environ.createMap(std.testing.allocator);
     defer environment.deinit();
-    var directory = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{});
+    var directory = try core_io.openSearchDirectory(std.testing.io, .cwd(), ".", .{});
     defer directory.close(std.testing.io);
     const ctx = Context{
         .io = std.testing.io,

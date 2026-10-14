@@ -12,6 +12,7 @@ pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
     const memory_note_root = ctx.module("apps/memory-note/scripts/memory_note.zig", &.{
         .{ .name = "core_calendar", .module = shared.calendar },
         .{ .name = "core_cli", .module = shared.cli },
+        .{ .name = "core_io", .module = shared.io },
         .{ .name = "durable_store", .module = shared.durable },
         .{ .name = "app_meta", .module = memory_note_meta },
     });

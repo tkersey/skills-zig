@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -749,7 +750,7 @@ fn startOrdinaryServer(
     if (argv.len == 0) return error.FileNotFound;
     const executable = try spawnExecutableAlloc(allocator, io, dir, environ, argv[0]);
     defer allocator.free(executable);
-    var child_dir = try dir.openDir(io, cwd, .{});
+    var child_dir = try core_io.openSearchDirectory(io, dir, cwd, .{});
     defer child_dir.close(io);
     var child = try std.process.spawn(io, .{
         .exe = .{ .explicit = .{ .dir = dir, .path = executable } },
@@ -1063,7 +1064,7 @@ fn spawnOwnerPipeWithReceipt(
     if (server_argv.len == 0) return error.FileNotFound;
     const executable = try spawnExecutableAlloc(allocator, io, dir, environ, server_argv[0]);
     defer allocator.free(executable);
-    var child_dir = try dir.openDir(io, cwd, .{});
+    var child_dir = try core_io.openSearchDirectory(io, dir, cwd, .{});
     defer child_dir.close(io);
     var watchdog_argv: std.ArrayList([]const u8) = .empty;
     defer watchdog_argv.deinit(allocator);
@@ -1271,7 +1272,7 @@ pub fn spawnDetachedProcess(
     if (argv.len == 0) return error.FileNotFound;
     const executable = try spawnExecutableAlloc(allocator, io, dir, environ, argv[0]);
     defer allocator.free(executable);
-    var child_dir = try dir.openDir(io, cwd, .{});
+    var child_dir = try core_io.openSearchDirectory(io, dir, cwd, .{});
     defer child_dir.close(io);
     if (builtin.target.os.tag == .macos and builtin.link_libc) {
         return spawnManagedServerPosix(allocator, io, dir, child_dir, environ, executable, argv);

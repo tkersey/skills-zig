@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const core_json = @import("core_json");
 const legacy_hooks = @import("hook_policy.zig");
 pub const app_server_launch = @import("transport.zig");
@@ -347,7 +348,7 @@ pub const Client = struct {
             opts.code_mode_host,
         );
 
-        const child_dir = try opts.dir.openDir(opts.io, opts.cwd, .{});
+        const child_dir = try core_io.openSearchDirectory(opts.io, opts.dir, opts.cwd, .{});
         defer child_dir.close(opts.io);
         return std.process.spawn(opts.io, .{
             .exe = .{ .explicit = .{ .dir = opts.dir, .path = resolved_codex_path } },

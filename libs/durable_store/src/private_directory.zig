@@ -1,3 +1,4 @@
+const core_io = @import("core_io");
 const std = @import("std");
 const authority = @import("fs_authority.zig");
 const filesystem = @import("filesystem.zig");
@@ -14,17 +15,20 @@ pub const PrivateDirectory = struct {
     pub fn open(fs: authority.Fs, path: []const u8, mode: Mode) !PrivateDirectory {
         if (path.len == 0) return error.InvalidPath;
         if (mode == .create) try filesystem.ensureDirectoryPathNoSymlinks(fs, path);
-        var directory = try openSearchDirectory(
+        var directory = try core_io.openSearchDirectory(
             fs.io,
             fs.directory(),
             if (std.fs.path.isAbsolute(path)) "/" else ".",
+            .{ .follow_symlinks = false },
         );
         errdefer directory.close(fs.io);
         var components = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
         while (components.next()) |component| {
             if (mode == .create and components.peek() == null)
                 try repairPrivateChild(fs.io, directory, component);
-            const child = try openSearchDirectory(fs.io, directory, component);
+            const child = try core_io.openSearchDirectory(fs.io, directory, component, .{
+                .follow_symlinks = false,
+            });
             directory.close(fs.io);
             directory = child;
         }
@@ -55,7 +59,9 @@ pub const PrivateDirectory = struct {
             };
             try repairPrivateChild(self.io, self.directory, leaf);
         }
-        const directory = try openSearchDirectory(self.io, self.directory, leaf);
+        const directory = try core_io.openSearchDirectory(self.io, self.directory, leaf, .{
+            .follow_symlinks = false,
+        });
         errdefer directory.close(self.io);
         try admit(self.io, directory, mode);
         return .{ .io = self.io, .directory = directory };
@@ -132,61 +138,6 @@ fn repairPrivateChild(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !void {
         try parent.setFilePermissions(io, leaf, privatePermissions(0o700), .{
             .follow_symlinks = false,
         });
-}
-
-fn openSearchDirectory(io: std.Io, parent: std.Io.Dir, path: []const u8) !std.Io.Dir {
-    try io.checkCancel();
-    return parent.openDir(io, path, .{ .follow_symlinks = false }) catch |err| {
-        if (@import("builtin").os.tag != .macos) return err;
-        if (err != error.AccessDenied) return err;
-        // Read only the static vtable, never the undefined backend instance. A
-        // substituted opener keeps its own admission/failure policy and handles.
-        const native_opener = comptime std.Io.Threaded.io(undefined).vtable.dirOpenDir;
-        if (io.vtable.dirOpenDir != native_opener) return err;
-        return openDarwinSearchDirectory(io, parent, path);
-    };
-}
-
-// Keep the exceptional search-only path and its path buffer out of ordinary
-// directory admission, including its caller's resident code and stack pages.
-noinline fn openDarwinSearchDirectory(
-    io: std.Io,
-    parent: std.Io.Dir,
-    path: []const u8,
-) !std.Io.Dir {
-    // Zig's Darwin directory opener requires read permission even when iteration
-    // is not requested. O_SEARCH (available on our macOS 15 minimum) supplies
-    // precisely the traversal capability used here. There is no alternate I/O
-    // backend: cancellation uses the caller's I/O, and openat uses its parent.
-    // Remove this bridge when std.Io exposes search-only directory admission.
-    if (path.len >= std.posix.PATH_MAX) return error.NameTooLong;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
-    var buffer: [std.posix.PATH_MAX]u8 = undefined;
-    @memcpy(buffer[0..path.len], path);
-    buffer[path.len] = 0;
-    const base_flags: std.c.O = .{ .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
-    const flags: std.c.O = @bitCast(@as(u32, @bitCast(base_flags)) | 0x40000000);
-    // Interrupted syscalls retry until cancellation or a result.
-    while (true) { // tiger: event-loop
-        try io.checkCancel();
-        const result = std.c.openat(parent.handle, buffer[0..path.len :0], flags);
-        switch (std.posix.errno(result)) {
-            .SUCCESS => return .{ .handle = result },
-            .INTR => continue,
-            .INVAL, .ILSEQ => return error.BadPathName,
-            .ACCES => return error.AccessDenied,
-            .LOOP => return error.SymLinkLoop,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NAMETOOLONG => return error.NameTooLong,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NODEV, .NXIO => return error.NoDevice,
-            .NOENT => return error.FileNotFound,
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
-            else => |err| return std.posix.unexpectedErrno(err),
-        }
-    }
 }
 
 fn privatePermissions(mode: u32) std.Io.File.Permissions {
