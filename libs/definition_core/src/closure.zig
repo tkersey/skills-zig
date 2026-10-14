@@ -915,13 +915,7 @@ pub fn normalizeRelativeAlloc(
     try appendNormalizedComponents(allocator, &components, raw_path);
     if (components.items.len == 0) return error.InvalidDefinitionPath;
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    for (components.items, 0..) |component, index| {
-        if (index != 0) try out.writer.writeByte('/');
-        try out.writer.writeAll(component);
-    }
-    const normalized = try out.toOwnedSlice();
+    const normalized = try std.mem.join(allocator, "/", components.items);
     if (!std.mem.endsWith(u8, normalized, ".json")) {
         allocator.free(normalized);
         return error.DefinitionPathNotJson;
@@ -1473,4 +1467,14 @@ test "closures from independent directory authorities do not exchange files" {
     try std.testing.expectEqualStrings("{\"value\":1}", first_closure.files[0].canonical_json);
     try std.testing.expectEqualStrings("{\"value\":2}", second_closure.files[0].canonical_json);
     try std.testing.expect(!std.mem.eql(u8, &first_closure.digest, &second_closure.digest));
+}
+
+fn checkNormalizedPathAllocation(allocator: std.mem.Allocator) !void {
+    const path = try normalizeRelativeAlloc(allocator, "parent/child", "../definition.json");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("parent/definition.json", path);
+}
+
+test "path normalization preserves allocation failure as OutOfMemory" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNormalizedPathAllocation, .{});
 }

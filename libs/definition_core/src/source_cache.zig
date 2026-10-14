@@ -27,6 +27,38 @@ pub const Locator = struct {
     }
 };
 
+/// Operation-local ownership of a locator whose source files were just read
+/// and verified. This is not permission to reuse a previous verification.
+pub const VerifiedLocator = struct {
+    value: Locator,
+    source_bytes: usize,
+
+    pub fn deinit(self: *VerifiedLocator, allocator: std.mem.Allocator) void {
+        self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Consumes the locator on both success and failure.
+pub fn verifyLocator(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    admitted_root: []const u8,
+    locator: Locator,
+    limits: closure.Limits,
+) !VerifiedLocator {
+    var owned = locator;
+    errdefer owned.deinit(allocator);
+    const source_bytes = try closure.verifySourceManifest(
+        io,
+        allocator,
+        admitted_root,
+        owned.files,
+        limits,
+    );
+    return .{ .value = owned, .source_bytes = source_bytes };
+}
+
 pub const ManifestLimits = struct {
     min_files: usize = 0,
     max_files: usize = 128,
@@ -239,10 +271,7 @@ test "decoded source cache ownership survives destruction of input bytes" {
 
 fn decodeClosureFixture(allocator: std.mem.Allocator, bytes: []const u8) !void {
     var decoder = cache.Decoder.init(bytes);
-    var decoded = decodeClosure(allocator, &decoder, "a.json", .{}) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
+    var decoded = try decodeClosure(allocator, &decoder, "a.json", .{});
     defer decoded.deinit(allocator);
     try decoder.finish();
 }
@@ -311,4 +340,40 @@ test "locator minimum file policy remains caller selected before trailing valida
         error.TooManyDefinitionFiles,
         decodeLocatorBody(std.testing.allocator, &decoder, .{ .min_files = 1 }),
     );
+}
+
+fn testSourceLocator(allocator: std.mem.Allocator, raw: []const u8) !Locator {
+    const files = try allocator.alloc(SourceManifestFile, 1);
+    errdefer allocator.free(files);
+    const path = try allocator.dupe(u8, "definition.json");
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &source_digest, .{});
+    files[0] = .{ .path = path, .source_digest = source_digest, .source_bytes = raw.len };
+    return .{ .plan_key = @splat(0), .closure_digest = fixture_digest.*, .files = files };
+}
+
+fn testVerifyLocatorAllocation(allocator: std.mem.Allocator, root: []const u8) !void {
+    var verified = try verifyLocator(std.testing.io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{});
+    defer verified.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), verified.source_bytes);
+}
+
+test "verified source locator owns its manifest and rereads bytes despite unchanged timestamps" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "definition.json", .data = "{}\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try std.testing.checkAllAllocationFailures(allocator, testVerifyLocatorAllocation, .{root});
+    const stat = try tmp.dir.statFile(io, "definition.json", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "definition.json", .data = "[]\n" });
+    var file = try tmp.dir.openFile(io, "definition.json", .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setTimestamps(io, .{ .access_timestamp = .init(stat.atime), .modify_timestamp = .{ .new = stat.mtime } });
+    try std.testing.expectEqual(stat.mtime, (try file.stat(io)).mtime);
+    try std.testing.expectError(error.DefinitionSourceDigestMismatch, verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}));
+    try tmp.dir.deleteFile(io, "definition.json");
+    try std.testing.expectError(error.FileNotFound, verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}));
 }
