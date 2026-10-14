@@ -7,6 +7,12 @@ const record_codec = @import("record_codec.zig");
 const filesystem = @import("filesystem.zig");
 const transactions = @import("transactions.zig");
 
+const staged_file = @import("staged_file.zig");
+pub const PublicationOutcome = staged_file.PublicationOutcome;
+pub const PublicationOptions = staged_file.PublicationOptions;
+pub const publishReplacement = staged_file.publishReplacement;
+pub const publishCreateNew = staged_file.publishCreateNew;
+pub const PrivateDirectory = @import("private_directory.zig").PrivateDirectory;
 pub const Fs = fs_authority.Fs;
 pub const JsonlIssue = record_codec.JsonlIssue;
 pub const JsonlValidation = record_codec.JsonlValidation;
@@ -95,7 +101,6 @@ pub const listSortedRegularFilesNoSymlink = filesystem.listSortedRegularFilesNoS
 pub const writeTextCreateNew = filesystem.writeTextCreateNew;
 pub const writeTextCreateNewAtomic = filesystem.writeTextCreateNewAtomic;
 pub const writeTextAtomic = filesystem.writeTextAtomic;
-pub const writeTextAtomicPrivate = filesystem.writeTextAtomicPrivate;
 pub const appendLineAtomic = filesystem.appendLineAtomic;
 pub const appendLineStreaming = filesystem.appendLineStreaming;
 pub const ensureNoPendingTransactions = transactions.ensureNoPendingTransactions;
@@ -113,6 +118,8 @@ pub const findGitRootAlloc = filesystem.findGitRootAlloc;
 pub const ensureLockSidecarGitignored = filesystem.ensureLockSidecarGitignored;
 
 test {
+    _ = @import("private_directory.zig");
+    _ = @import("staged_file.zig");
     _ = @import("event.zig");
     _ = @import("memory.zig");
     _ = @import("jsonl.zig");

@@ -3,7 +3,6 @@ const durable_store = @import("durable_store");
 
 const Fs = durable_store.Fs;
 const lock_marker = "memory-note-extension-lock/v1\n";
-const stage_attempts_max = 16;
 
 pub const ExtensionLock = struct {
     io: std.Io,
@@ -69,45 +68,6 @@ fn prepareLockMarker(fs: Fs, allocator: std.mem.Allocator, path: []const u8) !bo
     return true;
 }
 
-const Stage = struct {
-    file: std.Io.File,
-    name: [32]u8,
-    file_open: bool = true,
-    exists: bool = true,
-
-    fn deinit(self: *Stage, io: std.Io, directory: std.Io.Dir) void {
-        if (self.file_open) self.file.close(io);
-        if (self.exists) directory.deleteFile(io, &self.name) catch |err| {
-            var diagnostic = std.Io.File.stderr().writer(io, &.{});
-            diagnostic.interface.print("warning: memory-note staging cleanup failed for {s}: {s}\n", .{
-                self.name, @errorName(err),
-            }) catch {};
-        };
-        self.* = undefined;
-    }
-};
-
-fn createStage(io: std.Io, directory: std.Io.Dir) !Stage {
-    for (0..stage_attempts_max) |_| {
-        var random: [16]u8 = undefined;
-        io.random(&random);
-        const name = std.fmt.bytesToHex(random, .lower);
-        const file = directory.createFile(io, &name, .{
-            .exclusive = true,
-            .read = true,
-            .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
-                std.Io.File.Permissions.fromMode(0o600)
-            else
-                .default_file,
-        }) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return err,
-        };
-        return .{ .file = file, .name = name };
-    }
-    return error.StagingNameExhausted;
-}
-
 /// Stage outside notes, including on systems without unnamed temporary files.
 /// A killed writer can leave control bytes here, never a partial admission in
 /// the inventory. Publication preserves both the final name and existing files.
@@ -133,14 +93,28 @@ pub fn publishNote(
         .follow_symlinks = false,
     });
     defer staging_dir.close(fs.io);
-    var stage = try createStage(fs.io, staging_dir);
-    defer stage.deinit(fs.io, staging_dir);
-    try stage.file.writeStreamingAll(fs.io, raw);
-    try stage.file.sync(fs.io);
-    stage.file.close(fs.io);
-    stage.file_open = false;
-    try staging_dir.renamePreserve(&stage.name, notes_dir, base, fs.io);
-    stage.exists = false;
+    const outcome = durable_store.publishCreateNew(fs.io, staging_dir, notes_dir, base, &.{raw}, .{
+        .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+            std.Io.File.Permissions.fromMode(0o600)
+        else
+            .default_file,
+        .durability = .file_synced,
+    });
+    switch (outcome) {
+        .complete => {},
+        .not_published, .publication_unknown => |failure| {
+            var diagnostic = std.Io.File.stderr().writer(fs.io, &.{});
+            if (failure.cleanup) |cleanup| {
+                diagnostic.interface.print("warning: memory-note staging cleanup failed for {s}: {s}\n", .{
+                    cleanup.stage_name, @errorName(cleanup.cause),
+                }) catch {};
+            }
+            return failure.cause;
+        },
+        // This mode has no post-rename sync. Keep publication explicit if a
+        // later stronger mode introduces a failure after the name is visible.
+        .published_unsynced => return error.NotePublishedDurabilityUnconfirmed,
+    }
 }
 
 test "extension lock is exclusive reusable and leaves its recognized marker" {
@@ -281,7 +255,23 @@ test "publication sync failure uses caller I/O and removes the incomplete stage"
     defer allocator.free(path);
     var vtable = io.vtable.*;
     vtable.fileSync = struct {
-        fn sync(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
+        fn sync(_: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const size = file.realPath(std.testing.io, &path_buffer) catch return error.Unexpected;
+            const stage_path = path_buffer[0..size];
+            const staging_path = std.fs.path.dirname(stage_path) orelse return error.Unexpected;
+            std.testing.expectEqualStrings(".memory-note-staging", std.fs.path.basename(staging_path)) catch
+                return error.Unexpected;
+            const extension_path = std.fs.path.dirname(staging_path) orelse return error.Unexpected;
+            var extension = std.Io.Dir.openDirAbsolute(std.testing.io, extension_path, .{}) catch
+                return error.Unexpected;
+            defer extension.close(std.testing.io);
+            var notes = extension.openDir(std.testing.io, "notes", .{ .iterate = true }) catch
+                return error.Unexpected;
+            defer notes.close(std.testing.io);
+            var entries = notes.iterate();
+            if ((entries.next(std.testing.io) catch return error.Unexpected) != null)
+                return error.Unexpected;
             return error.InputOutput;
         }
     }.sync;

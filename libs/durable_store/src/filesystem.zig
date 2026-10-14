@@ -1,3 +1,4 @@
+const staged_file = @import("staged_file.zig");
 const std = @import("std");
 const jsonl_core = @import("jsonl_core");
 const fs_authority = @import("fs_authority.zig");
@@ -2260,28 +2261,15 @@ pub fn writeTextCreateNewAtomic(
         try fs.directory().openDir(fs.io, parent, .{ .follow_symlinks = false });
     defer dir.close(fs.io);
 
-    var atomic_file = try dir.createFileAtomic(fs.io, base, .{
+    try publicationResult(fs.io, staged_file.publishCreateNew(fs.io, dir, dir, base, &.{text}, .{
         .permissions = filePermissionsFromMode(options.file_mode),
-        .replace = false,
-    });
-    defer atomic_file.deinit(fs.io);
-    try atomic_file.file.writeStreamingAll(fs.io, text);
-    if (options.sync) try atomic_file.file.sync(fs.io);
-    try atomic_file.link(fs.io);
+        .durability = if (options.sync) .file_synced else .atomic_visibility,
+    }));
     _ = allocator;
 }
 
 pub fn writeTextAtomic(fs: Fs, allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     return writeTextAtomicMode(fs, allocator, path, text, null);
-}
-
-pub fn writeTextAtomicPrivate(
-    fs: Fs,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    text: []const u8,
-) !void {
-    return writeTextAtomicMode(fs, allocator, path, text, 0o600);
 }
 
 fn writeTextAtomicMode(
@@ -2294,45 +2282,25 @@ fn writeTextAtomicMode(
     const base = std.fs.path.basename(path);
     const parent = std.fs.path.dirname(path) orelse ".";
     try ensureDirectoryPathNoSymlinks(fs, parent);
-    const tmp_name = try allocator.print(
-        ".{s}.{d}.tmp",
-        .{ base, std.Io.Clock.awake.now(fs.io).nanoseconds },
-    );
-    defer allocator.free(tmp_name);
-
-    if (std.fs.path.isAbsolute(path)) {
-        var dir = try std.Io.Dir.openDirAbsolute(fs.io, parent, .{});
-        defer dir.close(fs.io);
-        try writeTempAndRename(fs, &dir, tmp_name, base, text, file_mode);
-        return;
-    }
-
-    var dir = try fs.directory().openDir(fs.io, parent, .{});
+    var dir = try fs.directory().openDir(fs.io, parent, .{ .follow_symlinks = false });
     defer dir.close(fs.io);
-    try writeTempAndRename(fs, &dir, tmp_name, base, text, file_mode);
+    try publicationResult(fs.io, staged_file.publishReplacement(fs.io, dir, dir, base, &.{text}, .{
+        .permissions = filePermissionsFromMode(file_mode),
+    }));
+    _ = allocator;
 }
 
-fn writeTempAndRename(
-    fs: Fs,
-    dir: *std.Io.Dir,
-    tmp_name: []const u8,
-    base: []const u8,
-    text: []const u8,
-    file_mode: ?u32,
-) !void {
-    var file = try dir.createFile(fs.io, tmp_name, .{
-        .truncate = true,
-        .read = true,
-        .permissions = filePermissionsFromMode(file_mode),
-    });
-    var close_file = true;
-    errdefer if (close_file) file.close(fs.io);
-    try file.writeStreamingAll(fs.io, text);
-    try file.sync(fs.io);
-    file.close(fs.io);
-    close_file = false;
-    errdefer deleteFileAfterFailure(fs, dir.*, tmp_name);
-    try dir.rename(tmp_name, dir.*, base, fs.io);
+// Preserve path-wrapper errors without treating an error as proof of no change.
+// Transaction callers retain their journal and recovery responsibilities.
+fn publicationResult(io: std.Io, outcome: staged_file.PublicationOutcome) !void {
+    switch (outcome) {
+        .complete => {},
+        .not_published, .publication_unknown => |failure| {
+            if (failure.cleanup) |cleanup| fs_authority.warn(io, "rollback file removal failed for {s}: {s}; inspect and remove the leftover file", .{ cleanup.stage_name, @errorName(cleanup.cause) });
+            return failure.cause;
+        },
+        .published_unsynced => |err| return err,
+    }
 }
 
 pub fn deleteFileAfterFailure(fs: Fs, dir: std.Io.Dir, path: []const u8) void {
@@ -3246,7 +3214,7 @@ test "private cache paths reject shared permissions" {
     try ensurePrivateDirectoryPathNoSymlinks(fs, private_dir);
     const private_path = try std.fs.path.join(allocator, &.{ private_dir, "entry.bin" });
     defer allocator.free(private_path);
-    try writeTextAtomicPrivate(fs, allocator, private_path, "plan");
+    try writeTextAtomicMode(fs, allocator, private_path, "plan", 0o600);
     const bytes = try readPrivateRegularFileNoSymlink(fs, allocator, private_path, 16);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("plan", bytes);

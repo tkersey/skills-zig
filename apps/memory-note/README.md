@@ -107,6 +107,8 @@ publication. An interrupted copy can leave complete copied notes; rerunning
 skips those identities and continues. Source originals remain the recovery copy.
 Complete envelopes are staged in the extension's `.memory-note-staging/`
 directory, outside `notes/`, then published by an atomic nonreplacing rename.
+The staged file is flushed before rename; the publication contract does not
+promise that the destination directory entry survives power loss.
 An interrupted writer can leave partial control files in staging; ordinary reads
 and migration inventories never treat them as admissions. Rerunning does not
 require deleting those files or a recognized lock marker.
