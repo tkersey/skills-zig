@@ -75,7 +75,12 @@ test "persistent mutation enforces shared lock ignore admission" {
     var exclusive = try backend.eventStore().acquireExclusive(std.testing.allocator);
     exclusive.release();
 
-    try writeTextAtomic(fs, std.testing.allocator, gitignore, "*.jsonl.lock\n.durable-store-locks/\n");
+    try writeTextAtomic(
+        fs,
+        std.testing.allocator,
+        gitignore,
+        "*.jsonl.lock\n.durable-store-locks/\n",
+    );
     const prospective_path = try std.fs.path.join(
         std.testing.allocator,
         &.{ root, "missing", "nested", "prospective.jsonl" },
@@ -155,8 +160,20 @@ const GrowingEventScanProbe = struct {
         self.count += 1;
         if (self.expanded) return;
         self.expanded = true;
-        try appendLineStreaming(fs, std.testing.allocator, self.path, "{\"n\":2}", .{ .sync = false });
-        try appendLineStreaming(fs, std.testing.allocator, self.path, "{\"n\":3}", .{ .sync = false });
+        try appendLineStreaming(
+            fs,
+            std.testing.allocator,
+            self.path,
+            "{\"n\":2}",
+            .{ .sync = false },
+        );
+        try appendLineStreaming(
+            fs,
+            std.testing.allocator,
+            self.path,
+            "{\"n\":3}",
+            .{ .sync = false },
+        );
     }
 
     fn visitor(self: *GrowingEventScanProbe) EventRecordVisitor {
@@ -920,7 +937,11 @@ test "EventStore prospective case identity follows the host filesystem" {
         root,
         "Events.jsonl",
     );
-    const canonical_advisory = try eventStoreLockPathAlloc(fs, std.testing.allocator, canonical_path);
+    const canonical_advisory = try eventStoreLockPathAlloc(
+        fs,
+        std.testing.allocator,
+        canonical_path,
+    );
     defer std.testing.allocator.free(canonical_advisory);
     const alias_advisory = try eventStoreLockPathAlloc(fs, std.testing.allocator, case_alias);
     defer std.testing.allocator.free(alias_advisory);
@@ -992,7 +1013,10 @@ test "EventStore exclusive sessions bridge public lock protocols" {
     var exclusive = try store.acquireExclusive(std.testing.allocator);
     try std.testing.expect(fileExists(fs, public_lock_path));
     try std.testing.expect(fileExists(fs, advisory_path));
-    try std.testing.expectError(error.PathAlreadyExists, acquireLock(fs, std.testing.allocator, path));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        acquireLock(fs, std.testing.allocator, path),
+    );
     try std.testing.expectError(
         error.LockBusy,
         acquireLeaseLock(fs, std.testing.allocator, path, lease_options),
@@ -1167,7 +1191,12 @@ test "independent filesystem authorities retain roots during nested event operat
         fn visit(context: *anyopaque, record: EventRecordView) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
             try std.testing.expectEqualStrings("{\"root\":\"left\"}", record.payload);
-            var receipt = try self.other.append(std.testing.allocator, "{\"nested\":true}", .{}, 4096);
+            var receipt = try self.other.append(
+                std.testing.allocator,
+                "{\"nested\":true}",
+                .{},
+                4096,
+            );
             defer receipt.deinit(std.testing.allocator);
             self.visited += 1;
         }
@@ -1205,7 +1234,12 @@ test "pinned authority keeps data and lock cleanup on a renamed root" {
     try tmp.dir.createDir(io, "selected", .default_dir);
     var replacement = try tmp.dir.openDir(io, "selected", .{});
     defer replacement.close(io);
-    try writeTextAtomic(Fs.init(io, replacement), allocator, "events.jsonl", "{\"replacement\":true}\n");
+    try writeTextAtomic(
+        Fs.init(io, replacement),
+        allocator,
+        "events.jsonl",
+        "{\"replacement\":true}\n",
+    );
     const after_lock = try eventStoreLockPathAlloc(fs, allocator, "events.jsonl");
     defer allocator.free(after_lock);
     try std.testing.expectEqualStrings(before_lock, after_lock);
@@ -1216,7 +1250,12 @@ test "pinned authority keeps data and lock cleanup on a renamed root" {
     var snapshot = try backend.eventStore().snapshot(allocator, 4096);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), snapshot.records.len);
-    const replacement_bytes = try readFileAlloc(Fs.init(io, replacement), allocator, "events.jsonl", 4096);
+    const replacement_bytes = try readFileAlloc(
+        Fs.init(io, replacement),
+        allocator,
+        "events.jsonl",
+        4096,
+    );
     defer allocator.free(replacement_bytes);
     try std.testing.expectEqualStrings("{\"replacement\":true}\n", replacement_bytes);
 }
@@ -1230,7 +1269,12 @@ test "canceled filesystem authority releases partially acquired event custody" {
     try writeTextAtomic(fs, allocator, "events.jsonl", "{\"before\":true}\n");
     var vtable = io.vtable.*;
     vtable.dirOpenFile = struct {
-        fn open(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn open(
+            userdata: ?*anyopaque,
+            dir: std.Io.Dir,
+            path: []const u8,
+            options: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             if (std.mem.eql(u8, path, "events.jsonl")) return error.Canceled;
             return std.testing.io.vtable.dirOpenFile(userdata, dir, path, options);
         }

@@ -655,20 +655,38 @@ fn expectDigestMatchesBytes(value: std.json.Value) !void {
 test "streaming digests preserve canonical bytes and root omission" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{
-        "null",                                                            "[]",                                "{}",                                "[true,false,0,-0,1e2,1.2300e-2]",
-        "[9223372036854775807,-9223372036854775808,9007199254740992.1]",   "{\"z\":1,\"a\":{\"z\":2,\"a\":3}}", "{\"a\":{\"a\":3,\"z\":2},\"z\":1}",
+        "null",
+        "[]",
+        "{}",
+        "[true,false,0,-0,1e2,1.2300e-2]",
+        "[9223372036854775807,-9223372036854775808,9007199254740992.1]",
+        "{\"z\":1,\"a\":{\"z\":2,\"a\":3}}",
+        "{\"a\":{\"a\":3,\"z\":2},\"z\":1}",
         "{\"\\ue000\":1,\"\\ud800\\udc00\":2,\"é\":3}",
         "{\"fingerprint\":\"root\",\"child\":{\"fingerprint\":\"keep\"}}",
     }) |input| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{ .parse_numbers = false });
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            input,
+            .{ .parse_numbers = false },
+        );
         defer parsed.deinit();
         try expectDigestMatchesBytes(parsed.value);
         if (parsed.value == .object) {
-            const bytes = try canonicalObjectOmittingKeyAlloc(allocator, parsed.value, "fingerprint");
+            const bytes = try canonicalObjectOmittingKeyAlloc(
+                allocator,
+                parsed.value,
+                "fingerprint",
+            );
             defer allocator.free(bytes);
             const expected = try digestBytesAlloc(allocator, bytes);
             defer allocator.free(expected);
-            const actual = try fingerprintObjectOmittingAlloc(allocator, parsed.value, "fingerprint");
+            const actual = try fingerprintObjectOmittingAlloc(
+                allocator,
+                parsed.value,
+                "fingerprint",
+            );
             defer allocator.free(actual);
             try std.testing.expectEqualStrings(expected, actual);
         }
@@ -676,10 +694,22 @@ test "streaming digests preserve canonical bytes and root omission" {
     for ([_]f64{ 0, -0.0, 1.0e-7, 1.0e20, 9.223372036854776e18 }) |number| {
         try expectDigestMatchesBytes(.{ .float = number });
     }
-    try std.testing.expectError(error.ExpectedObject, fingerprintObjectOmittingAlloc(allocator, .null, "x"));
-    try std.testing.expectError(error.InvalidUtf8, digestValueAlloc(allocator, .{ .string = "\xff" }));
-    try std.testing.expectError(error.InvalidNumber, digestValueAlloc(allocator, .{ .number_string = "01" }));
-    try std.testing.expectError(error.NonFiniteNumber, digestValueAlloc(allocator, .{ .float = std.math.inf(f64) }));
+    try std.testing.expectError(
+        error.ExpectedObject,
+        fingerprintObjectOmittingAlloc(allocator, .null, "x"),
+    );
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        digestValueAlloc(allocator, .{ .string = "\xff" }),
+    );
+    try std.testing.expectError(
+        error.InvalidNumber,
+        digestValueAlloc(allocator, .{ .number_string = "01" }),
+    );
+    try std.testing.expectError(
+        error.NonFiniteNumber,
+        digestValueAlloc(allocator, .{ .float = std.math.inf(f64) }),
+    );
 }
 
 test "digest sink includes vectors repeated writes and buffered tails" {

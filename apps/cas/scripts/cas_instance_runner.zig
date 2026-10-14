@@ -176,7 +176,7 @@ fn startInstance(
     opts: ParsedArgs,
     cwd: []const u8,
     codex_path: []const u8,
-    selected_transport: cas.app_server_launch.ValidatedTransport,
+    transport: cas.app_server_launch.ValidatedTransport,
     state_file: ?[]const u8,
     client_name: []const u8,
     auth_refresh_response: ?[]const u8,
@@ -196,9 +196,8 @@ fn startInstance(
         attestation_response,
         code_mode_host,
     );
-    direct.io = io;
-    direct.transport = selected_transport;
-    switch (selected_transport) {
+    direct.transport = transport;
+    switch (transport) {
         .auto, .managed_websocket => {
             var server = startManagedServer(
                 directory,
@@ -211,7 +210,7 @@ fn startInstance(
                 code_mode_host,
             ) catch |err| {
                 if (!cas.app_server_launch.autoMayFallback(
-                    if (selected_transport == .auto) .auto else .managed_websocket,
+                    if (transport == .auto) .auto else .managed_websocket,
                     .managed_websocket,
                     .stdio,
                     .before_first_rpc,
@@ -235,16 +234,21 @@ fn startInstance(
                 &server,
             );
         },
-        .stdio, .explicit_websocket, .unix_socket => {
-            const identity: []const u8 = switch (selected_transport) {
-                .stdio => "stdio",
-                .explicit_websocket => "websocket",
-                .unix_socket => "unix_socket",
-                else => unreachable,
-            };
-            return .{ .client = try cas.Client.start(allocator, direct), .transport = identity };
-        },
+        .stdio, .explicit_websocket, .unix_socket => return startDirectInstance(allocator, direct),
     }
+}
+
+fn startDirectInstance(
+    allocator: std.mem.Allocator,
+    direct: cas.ClientOptions,
+) !InstanceSlot {
+    const identity: []const u8 = switch (direct.transport.?) {
+        .stdio => "stdio",
+        .explicit_websocket => "websocket",
+        .unix_socket => "unix_socket",
+        else => unreachable,
+    };
+    return .{ .client = try cas.Client.start(allocator, direct), .transport = identity };
 }
 
 fn startManagedServer(
@@ -258,9 +262,26 @@ fn startManagedServer(
     code_mode_host: ?*const cas.app_server_launch.CodeModeHost,
 ) !cas_websocket.ManagedServer {
     if (code_mode_host) |host| {
-        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, codex_path, hook_policy, host, io, directory, environ);
+        return cas_websocket.startManagedLoopbackServerWithCodeModeHost(
+            allocator,
+            cwd,
+            codex_path,
+            hook_policy,
+            host,
+            io,
+            directory,
+            environ,
+        );
     }
-    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io, directory, environ);
+    return cas_websocket.startManagedLoopbackServer(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        io,
+        directory,
+        environ,
+    );
 }
 
 fn finishManagedStart(
@@ -303,7 +324,12 @@ fn finishManagedStart(
     };
 }
 
-fn loadSecretCarrierAlloc(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, source: []const u8) ![]u8 {
+fn loadSecretCarrierAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    source: []const u8,
+) ![]u8 {
     if (std.mem.eql(u8, source, "-")) {
         var reader = std.Io.File.stdin().reader(io, &.{});
         return reader.interface.allocRemaining(
@@ -355,7 +381,12 @@ pub fn run(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
 
     const opts = parseArgs(allocator, argv) catch |err| {
         return usageFailure(
@@ -404,18 +435,16 @@ fn runConfiguredInstances(
     opts: ParsedArgs,
     cwd: []const u8,
 ) !u8 {
-    if (opts.instances > 1 and opts.state_file_dir == null) {
-        var stderr_writer = std.Io.File.stderr().writer(
-            io,
-            &.{},
-        );
-        const stderr = &stderr_writer.interface;
-        try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel " ++
-            "instances may share it. Use --state-file-dir for per-instance " ++
-            "state isolation.\n");
-    }
+    try warnSharedInstanceState(io, opts);
 
-    const params = try buildParamsJson(io, directory, allocator, opts.method, opts.params_json, opts.params_file);
+    const params = try buildParamsJson(
+        io,
+        directory,
+        allocator,
+        opts.method,
+        opts.params_json,
+        opts.params_file,
+    );
     defer allocator.free(params);
     const selected_transport = try cas.app_server_launch.validateTransport(
         opts.requested_transport,
@@ -426,7 +455,13 @@ fn runConfiguredInstances(
     else
         null;
     defer if (code_mode_host) |*host| host.deinit();
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, io, directory, environ.get("PATH"), opts.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        opts.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     const auth_refresh_response = if (opts.auth_refresh_response_source) |source|
         try loadSecretCarrierAlloc(allocator, io, directory, source)
@@ -439,22 +474,7 @@ fn runConfiguredInstances(
         null;
     defer wipeSecretCarrier(allocator, attestation_response);
 
-    var validation_options = clientOptions(
-        directory,
-        environ,
-        io,
-        opts,
-        cwd,
-        resolved_codex_path,
-        "cas-instance-validation",
-        null,
-        auth_refresh_response,
-        attestation_response,
-        if (code_mode_host) |*host| host else null,
-    );
-    validation_options.transport = selected_transport;
-    try cas.validateClientOptions(allocator, validation_options);
-    return runInstances(.{
+    const ctx: InstanceRun = .{
         .allocator = allocator,
         .io = io,
         .dir = directory,
@@ -467,7 +487,40 @@ fn runConfiguredInstances(
         .auth_refresh_response = auth_refresh_response,
         .attestation_response = attestation_response,
         .code_mode_host = if (code_mode_host) |*host| host else null,
-    });
+    };
+    try validateInstanceRun(ctx);
+    return runInstances(ctx);
+}
+
+fn validateInstanceRun(ctx: InstanceRun) !void {
+    var validation_options = clientOptions(
+        ctx.dir,
+        ctx.environ,
+        ctx.io,
+        ctx.opts,
+        ctx.cwd,
+        ctx.codex_path,
+        "cas-instance-validation",
+        null,
+        ctx.auth_refresh_response,
+        ctx.attestation_response,
+        ctx.code_mode_host,
+    );
+    validation_options.transport = ctx.transport;
+    try cas.validateClientOptions(ctx.allocator, validation_options);
+}
+
+fn warnSharedInstanceState(io: std.Io, opts: ParsedArgs) !void {
+    if (opts.instances > 1 and opts.state_file_dir == null) {
+        var stderr_writer = std.Io.File.stderr().writer(
+            io,
+            &.{},
+        );
+        const stderr = &stderr_writer.interface;
+        try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel " ++
+            "instances may share it. Use --state-file-dir for per-instance " ++
+            "state isolation.\n");
+    }
 }
 
 const InstanceRun = struct {
@@ -568,13 +621,11 @@ fn startSlots(
         else
             null;
         defer if (state_file) |owned| allocator.free(owned);
-
         const client_name = try allocator.print(
             "{s}-{d}",
             .{ opts.client_prefix, instance_num },
         );
         defer allocator.free(client_name);
-
         slots[i] = startInstance(
             directory,
             environ,
@@ -599,20 +650,14 @@ fn startSlots(
                 return append_err;
             };
             if (opts.verbose) {
-                var stderr_writer = std.Io.File.stderr().writer(
-                    io,
-                    &.{},
-                );
+                var stderr_writer = std.Io.File.stderr().writer(io, &.{});
                 const stderr = &stderr_writer.interface;
                 try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
             }
             continue;
         };
         if (opts.verbose) {
-            var stderr_writer = std.Io.File.stderr().writer(
-                io,
-                &.{},
-            );
+            var stderr_writer = std.Io.File.stderr().writer(io, &.{});
             const stderr = &stderr_writer.interface;
             try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, slots[i].?.transport });
         }
@@ -664,10 +709,7 @@ fn requestSlots(
             result_json,
         ));
         if (opts.verbose) {
-            var stderr_writer = std.Io.File.stderr().writer(
-                io,
-                &.{},
-            );
+            var stderr_writer = std.Io.File.stderr().writer(io, &.{});
             const stderr = &stderr_writer.interface;
             try stderr.print("[request:{d}] ok ({s})\n", .{ instance_num, slot.transport });
         }
@@ -1472,7 +1514,12 @@ test "summarizeResult returns turn/start compact summary" {
     );
 }
 
-fn logRequestFailure(io: std.Io, instance_num: usize, transport: []const u8, summary: []const u8) !void {
+fn logRequestFailure(
+    io: std.Io,
+    instance_num: usize,
+    transport: []const u8,
+    summary: []const u8,
+) !void {
     var stderr_writer = std.Io.File.stderr().writer(
         io,
         &.{},
@@ -1538,7 +1585,13 @@ test "parseArgs rejects timeout values outside the client integer domain" {
 
 fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
     return 2;
 }
 

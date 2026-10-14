@@ -103,13 +103,26 @@ pub fn main(init: std.process.Init) !void {
 
     const args = parseArgs(argv) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
-        core_cli.printUsageFailureWithHelp(&stderr_writer.interface, HelpSurface, Version, @errorName(err), null) catch {
+        core_cli.printUsageFailureWithHelp(
+            &stderr_writer.interface,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            null,
+        ) catch {
             std.process.exit(1);
         };
         std.process.exit(2);
     };
 
-    const code = run(Fs.init(init.io, .cwd()), allocator, std.Io.File.stdin(), stdout, init.environ_map, args) catch |err| {
+    const code = run(
+        Fs.init(init.io, .cwd()),
+        allocator,
+        std.Io.File.stdin(),
+        stdout,
+        init.environ_map,
+        args,
+    ) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("memory-note: {s}\n", .{@errorName(err)});
@@ -118,7 +131,11 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(code);
 }
 
-fn handleHelpAndVersion(allocator: std.mem.Allocator, stdout: *std.Io.Writer, argv: []const []const u8) !bool {
+fn handleHelpAndVersion(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    argv: []const []const u8,
+) !bool {
     if (argv.len <= 1) {
         try writeHelp(allocator, stdout);
         return true;
@@ -292,7 +309,14 @@ fn validatedAppendInput(
     return parsed;
 }
 
-fn cmdAppend(fs: Fs, stdin: std.Io.File, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: []const u8, args: Args) !u8 {
+fn cmdAppend(
+    fs: Fs,
+    stdin: std.Io.File,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     const kind = args.kind orelse return error.MissingKind;
     const json_path = args.json_path orelse return error.MissingJson;
@@ -317,15 +341,8 @@ fn cmdAppend(fs: Fs, stdin: std.Io.File, allocator: std.mem.Allocator, stdout: *
     defer allocator.free(slug);
     const filename = try filenameAlloc(allocator, now, kind, slug, fp16);
     defer allocator.free(filename);
-    const note = try renderEnvelopeAlloc(
-        allocator,
-        id,
-        now,
-        extension,
-        kind,
-        fingerprint,
-        parsed.value,
-    );
+    const note =
+        try renderEnvelopeAlloc(allocator, id, now, extension, kind, fingerprint, parsed.value);
     defer allocator.free(note);
     if (note.len > MaxNoteBytes) return error.OutputTooLarge;
 
@@ -346,7 +363,7 @@ fn cmdAppend(fs: Fs, stdin: std.Io.File, allocator: std.mem.Allocator, stdout: *
     if (try findFingerprint(fs, allocator, notes_dir, fingerprint)) |existing| {
         defer allocator.free(existing.id);
         defer allocator.free(existing.path);
-        try writeDuplicateSkip(allocator, stdout, extension, kind, existing.id, fingerprint, existing.path);
+        try writeDuplicateSkip(allocator, stdout, extension, kind, existing, fingerprint);
         return 0;
     }
 
@@ -360,7 +377,13 @@ fn cmdAppend(fs: Fs, stdin: std.Io.File, allocator: std.mem.Allocator, stdout: *
     return 0;
 }
 
-fn cmdList(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: []const u8, args: Args) !u8 {
+fn cmdList(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
     const notes_dir = try notesDirAlloc(allocator, home, args, extension);
@@ -412,7 +435,13 @@ fn cmdList(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: [
     return 0;
 }
 
-fn cmdShow(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: []const u8, args: Args) !u8 {
+fn cmdShow(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     const id = args.id orelse return error.MissingId;
     try validateExtension(extension);
@@ -551,7 +580,13 @@ fn doctorNoteCounts(
     return .{ .checked = checked, .issues = issues };
 }
 
-fn cmdPath(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: []const u8, args: Args) !u8 {
+fn cmdPath(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
     const version = args.memory_version.?;
@@ -588,7 +623,13 @@ fn cmdPath(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: [
     return 0;
 }
 
-fn cmdMigrate(fs: Fs, allocator: std.mem.Allocator, stdout: *std.Io.Writer, home: []const u8, args: Args) !u8 {
+fn cmdMigrate(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    home: []const u8,
+    args: Args,
+) !u8 {
     const extension = args.extension orelse return error.MissingExtension;
     try validateExtension(extension);
     const from = args.from_memory_version orelse return error.MissingFromMemoryVersion;
@@ -860,7 +901,12 @@ fn oneOfAsciiLower(value: []const u8, comptime values: []const []const u8) bool 
     return false;
 }
 
-fn readJsonInput(fs: Fs, stdin: std.Io.File, allocator: std.mem.Allocator, json_path: []const u8) ![]u8 {
+fn readJsonInput(
+    fs: Fs,
+    stdin: std.Io.File,
+    allocator: std.mem.Allocator,
+    json_path: []const u8,
+) ![]u8 {
     if (std.mem.eql(u8, json_path, "-")) {
         var reader = stdin.reader(fs.io, &.{});
         return reader.interface.allocRemaining(allocator, .limited(MaxInputBytes + 1));
@@ -1170,15 +1216,14 @@ fn writeDuplicateSkip(
     stdout: *std.Io.Writer,
     extension: []const u8,
     kind: []const u8,
-    id: []const u8,
+    existing: ExistingFingerprint,
     fingerprint: []const u8,
-    path: []const u8,
 ) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
     try w.writeAll("{\"command\":\"append\",\"status\":\"duplicate_skip\",\"id\":");
-    try writeJsonString(w, id);
+    try writeJsonString(w, existing.id);
     try w.writeAll(",\"extension\":");
     try writeJsonString(w, extension);
     try w.writeAll(",\"kind\":");
@@ -1186,7 +1231,7 @@ fn writeDuplicateSkip(
     try w.writeAll(",\"fingerprint\":");
     try writeJsonString(w, fingerprint);
     try w.writeAll(",\"path\":");
-    try writeJsonString(w, path);
+    try writeJsonString(w, existing.path);
     try w.writeAll("}\n");
     try writeOutputAlloc(allocator, stdout, &out);
 }
@@ -1260,7 +1305,11 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, w);
 }
 
-fn writeOutputAlloc(allocator: std.mem.Allocator, stdout: *std.Io.Writer, out: *std.Io.Writer.Allocating) !void {
+fn writeOutputAlloc(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    out: *std.Io.Writer.Allocating,
+) !void {
     const payload = try out.toOwnedSlice();
     defer allocator.free(payload);
     try stdout.writeAll(payload);
@@ -1532,7 +1581,11 @@ const LookupNoteFixture =
     "\"extension\":\"harness\",\"kind\":\"harness-rule\",\"operation\":\"assert\"," ++
     "\"summary\":\"test\",\"fingerprint\":\"fixture-fingerprint\"}";
 
-fn lookupFingerprintWithAllocator(allocator: std.mem.Allocator, fs: Fs, notes_dir: []const u8) !void {
+fn lookupFingerprintWithAllocator(
+    allocator: std.mem.Allocator,
+    fs: Fs,
+    notes_dir: []const u8,
+) !void {
     const found = try findFingerprint(fs, allocator, notes_dir, "fixture-fingerprint") orelse
         return error.MissingFingerprint;
     defer allocator.free(found.id);
@@ -1572,7 +1625,10 @@ test "show releases a retained matching note when a later duplicate is rejected"
     defer allocator.free(home);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.testing.expectError(error.DuplicateId, cmdShow(Fs.init(std.testing.io, .cwd()), allocator, &output.writer, home, .{
+    try std.testing.expectError(error.DuplicateId, cmdShow(Fs.init(
+        std.testing.io,
+        .cwd(),
+    ), allocator, &output.writer, home, .{
         .command = .show,
         .codex_home = home,
         .memory_version = .v1,
@@ -1596,23 +1652,39 @@ test "input reads use independent supplied directories and propagate canceled I/
     try right.dir.writeFile(io, .{ .sub_path = "input.json", .data = "right" });
     const left_bytes = try readJsonInput(Fs.init(io, left.dir), .stdin(), allocator, "input.json");
     defer allocator.free(left_bytes);
-    const right_bytes = try readJsonInput(Fs.init(io, right.dir), .stdin(), allocator, "input.json");
+    const right_bytes = try readJsonInput(
+        Fs.init(io, right.dir),
+        .stdin(),
+        allocator,
+        "input.json",
+    );
     defer allocator.free(right_bytes);
     try std.testing.expectEqualStrings("left", left_bytes);
     try std.testing.expectEqualStrings("right", right_bytes);
     var vtable = io.vtable.*;
     vtable.dirOpenFile = struct {
-        fn open(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             return error.Canceled;
         }
     }.open;
     const canceled = Fs.init(.{ .userdata = io.userdata, .vtable = &vtable }, left.dir);
-    try std.testing.expectError(error.Canceled, readJsonInput(canceled, .stdin(), allocator, "input.json"));
+    try std.testing.expectError(
+        error.Canceled,
+        readJsonInput(canceled, .stdin(), allocator, "input.json"),
+    );
 }
 
 test "help rendering propagates writer failure without terminating the host" {
     var writer = std.Io.Writer.fixed(&.{});
-    try std.testing.expectError(error.WriteFailed, handleHelpAndVersion(std.testing.allocator, &writer, &.{"memory-note"}));
+    try std.testing.expectError(
+        error.WriteFailed,
+        handleHelpAndVersion(std.testing.allocator, &writer, &.{"memory-note"}),
+    );
 }
 
 test "home selection remains explicit override then Codex home then user home" {

@@ -84,7 +84,12 @@ fn run(init: std.process.Init) !u8 {
     if (api_key.len == 0 or std.mem.indexOfAny(u8, api_key, "\r\n") != null)
         return fail(init.io, error.InvalidApiKey);
     const directory = std.Io.Dir.cwd();
-    const rubric = if (opts.rubric_path) |path| loadRubric(allocator, init.io, directory, path) catch |err|
+    const rubric = if (opts.rubric_path) |path| loadRubric(
+        allocator,
+        init.io,
+        directory,
+        path,
+    ) catch |err|
         return fail(init.io, err) else default_rubric;
     validateRubric(rubric) catch |err| return fail(init.io, err);
 
@@ -93,7 +98,16 @@ fn run(init: std.process.Init) !u8 {
     try client.initDefaultProxies(allocator, init.environ_map);
     var transport = HttpTransport{ .client = &client };
     var output = std.Io.File.stdout().writerStreaming(init.io, &.{});
-    const result = runDocuments(init.gpa, init.io, directory, opts.documents, rubric, api_key, &transport, &output.interface) catch |err| {
+    const result = runDocuments(
+        init.gpa,
+        init.io,
+        directory,
+        opts.documents,
+        rubric,
+        api_key,
+        &transport,
+        &output.interface,
+    ) catch |err| {
         if (output.err) |write_error| {
             if (core_io.isClosedPipeError(write_error)) return 0;
             return write_error;
@@ -184,7 +198,12 @@ fn parseArgs(argv: []const []const u8) !Options {
     return .{ .rubric_path = rubric_path, .documents = documents };
 }
 
-fn loadRubric(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, path: []const u8) !Rubric {
+fn loadRubric(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    path: []const u8,
+) !Rubric {
     const bytes = try directory.readFileAlloc(io, path, allocator, .limited(64 * 1024));
     const parsed = try std.json.parseFromSlice(Rubric, allocator, bytes, .{});
     return parsed.value;
@@ -210,7 +229,12 @@ fn validateRubric(rubric: Rubric) !void {
     }
 }
 
-fn readDocument(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, path: []const u8) ![]u8 {
+fn readDocument(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    path: []const u8,
+) ![]u8 {
     const bytes = if (std.mem.eql(u8, path, "-")) stdin: {
         var reader = std.Io.File.stdin().reader(io, &.{});
         break :stdin try reader.interface.allocRemaining(allocator, .limited(max_document_bytes));
@@ -256,7 +280,10 @@ const Questions = struct {
 const HttpTransport = struct {
     client: *std.http.Client,
 
-    fn fetch(self: *HttpTransport, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    fn fetch(
+        self: *HttpTransport,
+        options: std.http.Client.FetchOptions,
+    ) !std.http.Client.FetchResult {
         return self.client.fetch(options);
     }
 
@@ -459,11 +486,20 @@ const FakeTransport = struct {
     document_allocations: ?*std.testing.FailingAllocator = null,
     live_at_fetch: ?usize = null,
 
-    fn fetch(self: *FakeTransport, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    fn fetch(
+        self: *FakeTransport,
+        options: std.http.Client.FetchOptions,
+    ) !std.http.Client.FetchResult {
         try std.testing.expectEqualStrings(endpoint, options.location.url);
         try std.testing.expectEqual(std.http.Method.POST, options.method.?);
-        try std.testing.expectEqualStrings("Bearer test-key", options.headers.authorization.override);
-        try std.testing.expectEqualStrings("application/json", options.headers.content_type.override);
+        try std.testing.expectEqualStrings(
+            "Bearer test-key",
+            options.headers.authorization.override,
+        );
+        try std.testing.expectEqualStrings(
+            "application/json",
+            options.headers.content_type.override,
+        );
         try std.testing.expect(options.redirect_behavior.? == .not_allowed);
         try std.testing.expect(options.payload != null);
         if (self.document_allocations) |allocations| {
@@ -503,7 +539,11 @@ const CheckingOutput = struct {
         self.bytes.deinit(std.testing.allocator);
     }
 
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *CheckingOutput = @alignCast(@fieldParentPtr("writer", writer));
         if (self.document_allocations) |allocations| {
             std.debug.assert(allocations.allocated_bytes > allocations.freed_bytes);
@@ -514,7 +554,10 @@ const CheckingOutput = struct {
             self.bytes.appendSlice(std.testing.allocator, bytes) catch return error.WriteFailed;
         }
         for (0..splat) |_| {
-            self.bytes.appendSlice(std.testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+            self.bytes.appendSlice(
+                std.testing.allocator,
+                data[data.len - 1],
+            ) catch return error.WriteFailed;
         }
         return std.Io.Writer.countSplat(data, splat);
     }
@@ -529,10 +572,16 @@ test "request writes dynamic questions directly with exact escaping and field or
         .levels = &.{ "low", "high" },
         .review_below = 0.5,
     }};
-    const request = try makeRequest(arena.allocator(), "a\".md", "text\n\\é", .{ .dimensions = &dimensions });
+    const request = try makeRequest(
+        arena.allocator(),
+        "a\".md",
+        "text\n\\é",
+        .{ .dimensions = &dimensions },
+    );
     try std.testing.expectEqualStrings(
         "{\"state\":{\"document\":{\"name\":\"a\\\".md\",\"text\":\"text\\n\\\\é\"}}," ++
-            "\"model\":\"jev-latest\",\"questions\":{\"a\":{\"type\":\"score\",\"instructions\":\"quote\\\"\\n\"," ++
+            "\"model\":\"jev-latest\",\"questions\":{\"a\":{\"t" ++
+            "ype\":\"score\",\"instructions\":\"quote\\\"\\n\"," ++
             "\"criteria\":[\"low\",\"high\"]}}}",
         request,
     );
@@ -545,12 +594,26 @@ test "one and 32 documents release each arena after writing its report" {
     for ([_]usize{ 1, 32 }) |count| {
         // Force relocation so backing-memory size is independent of whether
         // the test allocator happens to grow its last bucket in place.
-        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var tracking = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .resize_fail_index = 0 },
+        );
         var transport = FakeTransport{ .document_allocations = &tracking };
         var output = CheckingOutput{ .document_allocations = &tracking };
         defer output.deinit();
         const paths: [32][]const u8 = @splat("a.md");
-        try std.testing.expect(try runDocuments(tracking.allocator(), std.testing.io, tmp.dir, paths[0..count], default_rubric, "test-key", &transport, &output.writer) == .complete);
+        try std.testing.expect(
+            try runDocuments(
+                tracking.allocator(),
+                std.testing.io,
+                tmp.dir,
+                paths[0..count],
+                default_rubric,
+                "test-key",
+                &transport,
+                &output.writer,
+            ) == .complete,
+        );
         try std.testing.expectEqual(count, transport.calls);
         try std.testing.expectEqual(count, output.writes);
         try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
@@ -558,11 +621,22 @@ test "one and 32 documents release each arena after writing its report" {
         var lines = std.mem.tokenizeScalar(u8, output.bytes.items, '\n');
         var line_count: usize = 0;
         while (lines.next()) |line| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                std.testing.allocator,
+                line,
+                .{},
+            );
             defer parsed.deinit();
-            try std.testing.expectEqualStrings("a.md", parsed.value.object.get("document").?.string);
+            try std.testing.expectEqualStrings(
+                "a.md",
+                parsed.value.object.get("document").?.string,
+            );
             try std.testing.expect(parsed.value.object.get("needs_review").?.bool);
-            try std.testing.expectEqual(@as(f64, 1.5), parsed.value.object.get("dimensions").?.array.items[0].object.get("score").?.float);
+            try std.testing.expectEqual(
+                @as(f64, 1.5),
+                parsed.value.object.get("dimensions").?.array.items[0].object.get("score").?.float,
+            );
             line_count += 1;
         }
         try std.testing.expectEqual(count, line_count);
@@ -573,16 +647,26 @@ test "HTTP retries retain request policy and bounded response handling" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var transport = FakeTransport{ .statuses = &.{ .too_many_requests, @fromBackingInt(@intCast(529)), .ok } };
+    var transport = FakeTransport{ .statuses = &.{
+        .too_many_requests,
+        @fromBackingInt(@intCast(529)),
+        .ok,
+    } };
     const response = try callTypeSafe(allocator, &transport, "test-key", "{}");
     try std.testing.expectEqualStrings(test_response, response);
     try std.testing.expectEqual(@as(usize, 3), transport.calls);
     try std.testing.expectEqualSlices(i64, &.{ 250, 500 }, &transport.delays);
     var oversized = FakeTransport{ .oversized = true };
-    try std.testing.expectError(error.ResponseTooLarge, callTypeSafe(allocator, &oversized, "test-key", "{}"));
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        callTypeSafe(allocator, &oversized, "test-key", "{}"),
+    );
     try std.testing.expectEqual(@as(usize, 1), oversized.calls);
     var canceled = FakeTransport{ .statuses = &.{.too_many_requests}, .fail_sleep = true };
-    try std.testing.expectError(error.Canceled, callTypeSafe(allocator, &canceled, "test-key", "{}"));
+    try std.testing.expectError(
+        error.Canceled,
+        callTypeSafe(allocator, &canceled, "test-key", "{}"),
+    );
     for ([_]struct { status: std.http.Status, err: anyerror, calls: usize }{
         .{ .status = .unauthorized, .err = error.TypeSafeUnauthorized, .calls = 1 },
         .{ .status = .unprocessable_entity, .err = error.TypeSafeInvalidRequest, .calls = 1 },
@@ -609,7 +693,16 @@ test "batch failure reclaims document state and stops later requests" {
         };
         var output = CheckingOutput{ .fail_at = if (case == 3) 0 else null };
         defer output.deinit();
-        const result = runDocuments(tracking.allocator(), std.testing.io, tmp.dir, &.{ "a.md", "a.md", "a.md" }, default_rubric, "test-key", &transport, &output.writer);
+        const result = runDocuments(
+            tracking.allocator(),
+            std.testing.io,
+            tmp.dir,
+            &.{ "a.md", "a.md", "a.md" },
+            default_rubric,
+            "test-key",
+            &transport,
+            &output.writer,
+        );
         if (case == 3) {
             try std.testing.expectError(error.WriteFailed, result);
         } else {
@@ -630,7 +723,10 @@ test "CLI parser preserves option-looking values and product aliases" {
     const opts = try parseArgs(&.{ "typesafe", "--rubric", "--help", "a.md" });
     try std.testing.expectEqualStrings("--help", opts.rubric_path.?);
     try std.testing.expectError(error.MissingRubricPath, parseArgs(&.{ "typesafe", "--rubric" }));
-    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "typesafe", "--rubric", "x", "--rubric", "y", "a" }));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "typesafe", "--rubric", "x", "--rubric", "y", "a" }),
+    );
     for ([_][]const u8{ "-h", "-V", "--unknown", "--" }) |arg| {
         try std.testing.expectError(error.InvalidDocumentPath, parseArgs(&.{ "typesafe", arg }));
     }
@@ -664,7 +760,16 @@ fn batchAllocationProbe(allocator: std.mem.Allocator, directory: std.Io.Dir) !vo
     var transport = FakeTransport{};
     var output = CheckingOutput{};
     defer output.deinit();
-    const result = runDocuments(allocator, std.testing.io, directory, &.{ "a.md", "a.md" }, default_rubric, "test-key", &transport, &output.writer) catch |err| {
+    const result = runDocuments(
+        allocator,
+        std.testing.io,
+        directory,
+        &.{ "a.md", "a.md" },
+        default_rubric,
+        "test-key",
+        &transport,
+        &output.writer,
+    ) catch |err| {
         // This stage's allocating JSON writer can only fail from OOM.
         if (err == error.WriteFailed) return error.OutOfMemory;
         return err;
@@ -679,5 +784,9 @@ test "document arenas release partial state at every allocation failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.md", .data = "text" });
-    try @import("test_support").checkAllAllocationFailures(std.testing.allocator, batchAllocationProbe, .{tmp.dir});
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        batchAllocationProbe,
+        .{tmp.dir},
+    );
 }

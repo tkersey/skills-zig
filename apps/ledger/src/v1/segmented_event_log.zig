@@ -754,9 +754,8 @@ pub const Snapshot = struct {
         else
             try Head.init(allocator, logical_path);
         errdefer head.deinit(allocator);
-        if (!std.mem.eql(u8, head.logical_path, logical_path)) {
+        if (!std.mem.eql(u8, head.logical_path, logical_path))
             return error.SegmentedLogicalPathMismatch;
-        }
         var absent_custody = try acquireAbsentHeadCustody(
             scope,
             allocator,
@@ -1608,7 +1607,9 @@ fn segmentPathAlloc(
 }
 
 test "segmented paths are deterministic and collision isolated" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var left = try Paths.init(scope, allocator, "/repo", "actuation/a/events.jsonl");
@@ -1777,7 +1778,9 @@ test "checkpoint admission jointly bounds both streams and record suffix" {
 }
 
 test "segmented snapshot reads only the active bounded files" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1842,7 +1845,9 @@ test "segmented snapshot reads only the active bounded files" {
 }
 
 test "segmented snapshot counts persistent active-file sidecars" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1898,10 +1903,7 @@ test "segmented snapshot counts persistent active-file sidecars" {
     const binding_path = try paths.bindingSegmentAlloc(allocator, 1);
     defer allocator.free(binding_path);
     for ([_][]const u8{ event_path, binding_path }) |path| {
-        const sidecar = try allocator.print(
-            "{s}.cas.lock.advisory",
-            .{path},
-        );
+        const sidecar = try allocator.print("{s}.cas.lock.advisory", .{path});
         defer allocator.free(sidecar);
         try scope.fs.directory().writeFile(std.testing.io, .{
             .sub_path = sidecar,
@@ -1920,7 +1922,9 @@ fn expectSidecarSnapshot(snapshot: *const Snapshot) !void {
 }
 
 test "oversized legacy log routes to explicit migration" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2069,7 +2073,9 @@ fn expectGenerationWriterBlocked(
 }
 
 test "segmented snapshot custody excludes mixed writer generations" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2135,7 +2141,9 @@ test "segmented snapshot custody excludes mixed writer generations" {
 }
 
 test "segmented snapshot accepts an absent head with stale advisory custody" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2173,7 +2181,9 @@ test "segmented snapshot accepts an absent head with stale advisory custody" {
 }
 
 test "segmented falsifier detects corruption in a sealed segment" {
-    var test_scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var test_scope = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &test_scope;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

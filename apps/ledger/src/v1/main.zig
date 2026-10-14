@@ -16,7 +16,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer selection.deinit(init.gpa);
     var scope = selection.invocationScope(std.Io.Dir.cwd());
-    const code = cli.runWithArgv(&scope, &selection, init.gpa, init.environ_map, selection.argv) catch |err| blk: {
+    const code = cli.runWithArgv(
+        &scope,
+        &selection,
+        init.gpa,
+        init.environ_map,
+        selection.argv,
+    ) catch |err| blk: {
         cli.emitCommandError(&scope, err) catch |write_err| {
             if (cli.isClosedPipe(write_err)) return;
             return write_err;

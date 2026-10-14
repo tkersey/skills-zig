@@ -106,10 +106,21 @@ fn run(init: std.process.Init) !u8 {
     var error_writer = std.Io.File.stderr().writer(io, &.{});
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
 
     var cli = parseCliOptions(allocator, argv) catch |err| {
-        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, @errorName(err), null);
+        try core_cli.printUsageFailureWithHelp(
+            &error_writer.interface,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            null,
+        );
         return 2;
     };
     defer freeCliOptions(allocator, &cli);
@@ -126,14 +137,36 @@ fn run(init: std.process.Init) !u8 {
     }
 
     const config = loadConfig(io, dir, allocator, cli.config_path) catch |err| {
-        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, @errorName(err), cli.config_path);
+        try core_cli.printUsageFailureWithHelp(
+            &error_writer.interface,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            cli.config_path,
+        );
         return 2;
     };
     if (config.rounds < 3 or config.iterations < 100) {
-        try core_cli.printUsageFailureWithHelp(&error_writer.interface, HelpSurface, Version, if (config.rounds < 3) "InvalidRounds" else "InvalidIterations", cli.config_path);
+        try core_cli.printUsageFailureWithHelp(
+            &error_writer.interface,
+            HelpSurface,
+            Version,
+            if (config.rounds < 3) "InvalidRounds" else "InvalidIterations",
+            cli.config_path,
+        );
         return 2;
     }
 
+    return runBenchmark(io, dir, allocator, cli, config);
+}
+
+fn runBenchmark(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    cli: CliOptions,
+    config: PerfConfig,
+) !u8 {
     const summary = try benchmarkGovernor(io, allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
     const previous_artifact = if (cli.artifact_path) |artifact_path|
@@ -234,7 +267,12 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
     if (cli.artifact_path) |path| allocator.free(path);
 }
 
-fn loadConfig(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
+fn loadConfig(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PerfConfig {
     const data = try dir.readFileAlloc(
         io,
         path,
@@ -263,7 +301,12 @@ fn loadConfig(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: [
     return out;
 }
 
-fn benchmarkGovernor(io: std.Io, allocator: std.mem.Allocator, iterations: usize, rounds: usize) !PerfSummary {
+fn benchmarkGovernor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    iterations: usize,
+    rounds: usize,
+) !PerfSummary {
     const ns_per_eval_samples = try allocator.alloc(u64, rounds);
     defer allocator.free(ns_per_eval_samples);
     const alloc_calls_per_eval_samples = try allocator.alloc(u64, rounds);
@@ -337,7 +380,12 @@ fn enforceTrendGate(summary: PerfSummary, previous: BenchmarkArtifact, tolerance
         return error.TrendRegression;
 }
 
-fn loadArtifact(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
+fn loadArtifact(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?BenchmarkArtifact {
     const data = dir.readFileAlloc(
         io,
         path,
@@ -429,5 +477,8 @@ test "benchmarkGovernor summarizes captured rounds and retains empty-round error
     try std.testing.expectEqual(@as(usize, 1), summary.eval_count);
     try std.testing.expect(summary.p50_ns_per_eval <= summary.p95_ns_per_eval);
     try std.testing.expect(summary.p50_alloc_calls_per_eval > 0);
-    try std.testing.expectError(error.EmptySamples, benchmarkGovernor(std.testing.io, std.testing.allocator, 1, 0));
+    try std.testing.expectError(
+        error.EmptySamples,
+        benchmarkGovernor(std.testing.io, std.testing.allocator, 1, 0),
+    );
 }

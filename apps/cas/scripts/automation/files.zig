@@ -3,7 +3,11 @@ const core_calendar = @import("core_calendar");
 const output = @import("output.zig");
 const std = @import("std");
 
-pub fn parseCwdsJson(io: std.Io, allocator: std.mem.Allocator, raw_json: []const u8) !std.ArrayList([]u8) {
+pub fn parseCwdsJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+) !std.ArrayList([]u8) {
     var result = std.ArrayList([]u8).empty;
     errdefer freeOwnedStrings(allocator, result);
     var parsed = std.json.parseFromSlice(
@@ -20,7 +24,11 @@ pub fn parseCwdsJson(io: std.Io, allocator: std.mem.Allocator, raw_json: []const
         return userErrorFmt(io, "cwds_json must be a JSON array of strings", .{});
     }
     for (parsed.value.array.items) |item| {
-        if (item != .string) return userErrorFmt(io, "cwds_json must be a JSON array of strings", .{});
+        if (item != .string) return userErrorFmt(
+            io,
+            "cwds_json must be a JSON array of strings",
+            .{},
+        );
         const owned = try allocator.dupe(u8, item.string);
         errdefer allocator.free(owned);
         try result.append(allocator, owned);
@@ -80,11 +88,19 @@ pub fn renderAutomationTomlAlloc(io: std.Io, allocator: std.mem.Allocator, row: 
 
 pub fn defaultAutomationsDir(operation: Operation, allocator: std.mem.Allocator) ![]u8 {
     if (operation.automation_root) |override| return allocator.dupe(u8, override);
-    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(
+        operation.io,
+        "HOME is not set",
+        .{},
+    );
     return allocator.print("{s}/.codex/automations", .{home});
 }
 
-pub fn automationDirPath(operation: Operation, allocator: std.mem.Allocator, automation_id: []const u8) ![]u8 {
+pub fn automationDirPath(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    automation_id: []const u8,
+) ![]u8 {
     const base = try defaultAutomationsDir(operation, allocator);
     defer allocator.free(base);
     const safe_id = try validateAutomationId(operation.io, automation_id);
@@ -139,7 +155,11 @@ fn validateAutomationId(io: std.Io, raw: []const u8) ![]const u8 {
     return trimmed;
 }
 
-pub fn writeAutomationFilesForRow(operation: Operation, allocator: std.mem.Allocator, row: anytype) !void {
+pub fn writeAutomationFilesForRow(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    row: anytype,
+) !void {
     const target_dir = try automationDirPath(operation, allocator, row.id);
     defer allocator.free(target_dir);
     operation.cwd.createDirPath(
@@ -178,7 +198,11 @@ fn createMemoryFileIfMissing(operation: Operation, memory_path: []const u8) !voi
     file.close(operation.io);
 }
 
-pub fn deleteAutomationFiles(operation: Operation, allocator: std.mem.Allocator, automation_id: []const u8) !void {
+pub fn deleteAutomationFiles(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    automation_id: []const u8,
+) !void {
     const target_dir = try automationDirPath(operation, allocator, automation_id);
     defer allocator.free(target_dir);
     var dir = operation.cwd.openDir(
@@ -246,7 +270,11 @@ pub fn writeMemorySummary(
     try output.writeFileAtomic(operation, allocator, memory_path, merged);
 }
 
-fn readExistingMemory(operation: Operation, allocator: std.mem.Allocator, memory_path: []const u8) ![]u8 {
+fn readExistingMemory(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    memory_path: []const u8,
+) ![]u8 {
     const stat = operation.cwd.statFile(
         operation.io,
         memory_path,
@@ -323,7 +351,12 @@ fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
 const userErrorFmt = output.userErrorFmt;
 
 test "memory creation never follows a dangling symlink" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -366,7 +399,12 @@ test "memory creation never follows a dangling symlink" {
 }
 
 test "memory summary rejects symlink and non-file memory targets" {
-    var operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    var operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

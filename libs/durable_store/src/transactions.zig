@@ -502,7 +502,12 @@ fn writeNextFencingCounter(
 }
 
 fn readFencingCounter(fs: Fs, allocator: std.mem.Allocator, counter_path: []const u8) !u64 {
-    const bytes = readRegularFileNoSymlink(fs, allocator, counter_path, 64) catch |err| switch (err) {
+    const bytes = readRegularFileNoSymlink(
+        fs,
+        allocator,
+        counter_path,
+        64,
+    ) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
@@ -579,7 +584,12 @@ fn writeTextAtomicCasBoundedLocked(
     max_bytes: usize,
 ) !CasWriteReceipt {
     if (max_bytes == 0 or text.len > max_bytes) return error.FileTooBig;
-    const current = readRegularFileNoSymlink(fs, allocator, path, max_bytes) catch |err| switch (err) {
+    const current = readRegularFileNoSymlink(
+        fs,
+        allocator,
+        path,
+        max_bytes,
+    ) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
@@ -1468,9 +1478,13 @@ const TransactionCommit = struct {
                 });
             };
             syncDirectoryPath(fs, self.transactions_dir) catch |err| {
-                fs_authority.warn(fs.io, "journal rollback sync failed for {s}: {s}; run recovery", .{
-                    self.transactions_dir, @errorName(err),
-                });
+                fs_authority.warn(
+                    fs.io,
+                    "journal rollback sync failed for {s}: {s}; run recovery",
+                    .{
+                        self.transactions_dir, @errorName(err),
+                    },
+                );
             };
         };
         try ensureDirectoryPathNoSymlinks(fs, self.transaction_dir);
@@ -3024,10 +3038,14 @@ const TransactionRecovery = struct {
             leases,
             self.storage_mutated,
         ) catch |release_error| {
-            fs_authority.warn(fs.io, "recovery lease cleanup failed for {s}: {s}; inspect recovery locks", .{
-                self.transaction_dir,
-                @errorName(release_error),
-            });
+            fs_authority.warn(
+                fs.io,
+                "recovery lease cleanup failed for {s}: {s}; inspect recovery locks",
+                .{
+                    self.transaction_dir,
+                    @errorName(release_error),
+                },
+            );
         };
     }
 
@@ -3278,16 +3296,10 @@ fn recoverAndCompactTransactionsAccumulatingWithHashBudget(
 ) !void {
     const max_entries: usize = 4096;
     const max_record_bytes: usize = 16 * 1024 * 1024;
-    var dir = if (std.fs.path.isAbsolute(transactions_dir))
-        try std.Io.Dir.openDirAbsolute(fs.io, transactions_dir, .{
-            .iterate = true,
-            .follow_symlinks = false,
-        })
-    else
-        try fs.directory().openDir(fs.io, transactions_dir, .{
-            .iterate = true,
-            .follow_symlinks = false,
-        });
+    var dir = try fs.directory().openDir(fs.io, transactions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
     defer dir.close(fs.io);
     var recovery_lock = try acquireTransactionRecoveryLock(
         fs,
@@ -3767,9 +3779,13 @@ fn acquireLegacyTransactionRecoveryLeases(
                 &leases[index],
                 leases[index].fencing_token,
             ) catch |err| {
-                fs_authority.warn(fs.io, "lease rollback failed for {s}: {s}; run lease recovery", .{
-                    leases[index].path, @errorName(err),
-                });
+                fs_authority.warn(
+                    fs.io,
+                    "lease rollback failed for {s}: {s}; run lease recovery",
+                    .{
+                        leases[index].path, @errorName(err),
+                    },
+                );
                 leases[index].deinit(allocator);
             };
         }
@@ -3817,7 +3833,11 @@ fn acquireLegacyRecoveryLease(
             error.LockBusy => retry: {
                 const path = try lockPathAlloc(allocator, resource);
                 defer allocator.free(path);
-                var current = readLeaseLock(fs, allocator, path) catch |read_err| switch (read_err) {
+                var current = readLeaseLock(
+                    fs,
+                    allocator,
+                    path,
+                ) catch |read_err| switch (read_err) {
                     error.FileNotFound => break :retry try acquireLeaseLockObserved(
                         fs,
                         allocator,
@@ -5038,7 +5058,11 @@ fn incrementPending(pending: *usize, max_pending: usize) !void {
     pending.* += 1;
 }
 
-fn transactionDirectoryPending(fs: Fs, allocator: std.mem.Allocator, transaction_dir: []const u8) !bool {
+fn transactionDirectoryPending(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+) !bool {
     const record_path = try std.fs.path.join(allocator, &.{ transaction_dir, "transaction.json" });
     defer allocator.free(record_path);
     const commit_marker_path = try std.fs.path.join(
@@ -5107,7 +5131,15 @@ pub fn appendJsonlCheckpointTransaction(
         allocator.free(receipt.prepared_path);
         allocator.free(receipt.commit_path);
     }
-    try publishJsonlCheckpoint(fs, allocator, store_path, existing, checkpoint_line, options, receipt);
+    try publishJsonlCheckpoint(
+        fs,
+        allocator,
+        store_path,
+        existing,
+        checkpoint_line,
+        options,
+        receipt,
+    );
     return receipt;
 }
 
@@ -5244,13 +5276,21 @@ test "lease locks enforce fencing tokens and reclaim expired metadata" {
     try std.testing.expect(lock.fencing_token > 0);
     try std.testing.expect(fileExists(fs, lock.path));
     try std.testing.expect(!fileExists(fs, counter_lock));
-    try std.testing.expectError(error.LockBusy, acquireLeaseLock(fs, std.testing.allocator, resource, .{
-        .owner = owner,
-        .timeout_ms = 2,
-        .retry_interval_ms = 1,
-        .lease_ms = 1000,
-        .fencing_counter_path = counter,
-    }));
+    try std.testing.expectError(
+        error.LockBusy,
+        acquireLeaseLock(
+            fs,
+            std.testing.allocator,
+            resource,
+            .{
+                .owner = owner,
+                .timeout_ms = 2,
+                .retry_interval_ms = 1,
+                .lease_ms = 1000,
+                .fencing_counter_path = counter,
+            },
+        ),
+    );
 
     try std.testing.expectError(error.FencingTokenStale, refreshLease(
         fs,
@@ -5410,11 +5450,17 @@ test "cas writes and jsonl snapshots reject stale expectations" {
     try std.testing.expectEqual(@as(?u64, null), first.sequence_before);
     try std.testing.expectEqual(@as(?u64, 1), first.sequence_after);
 
-    var second = try writeTextAtomicCas(fs, std.testing.allocator, path, "{\"seq\":2,\"ok\":true}\n", .{
-        .expected_digest = first.digest_after,
-        .expected_sequence = 1,
-        .expected_exists = true,
-    });
+    var second = try writeTextAtomicCas(
+        fs,
+        std.testing.allocator,
+        path,
+        "{\"seq\":2,\"ok\":true}\n",
+        .{
+            .expected_digest = first.digest_after,
+            .expected_sequence = 1,
+            .expected_exists = true,
+        },
+    );
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u64, 1), second.sequence_before);
     try std.testing.expectEqual(@as(?u64, 2), second.sequence_after);
@@ -5972,7 +6018,14 @@ test "transaction publication binds staged bytes before target replacement" {
 
     try std.testing.expectError(
         error.TransactionCorrupt,
-        publishVerifiedStagedFile(fs, &staged_dir, "write-0.staged", expected_digest, 4096, &target),
+        publishVerifiedStagedFile(
+            fs,
+            &staged_dir,
+            "write-0.staged",
+            expected_digest,
+            4096,
+            &target,
+        ),
     );
     const current = try readFileAlloc(fs, std.testing.allocator, target_path, 4096);
     defer std.testing.allocator.free(current);
@@ -5982,7 +6035,14 @@ test "transaction publication binds staged bytes before target replacement" {
     try staged_dir.symLink(fs.io, target_path, "write-0.staged", .{});
     try std.testing.expectError(
         error.SymlinkComponent,
-        publishVerifiedStagedFile(fs, &staged_dir, "write-0.staged", expected_digest, 4096, &target),
+        publishVerifiedStagedFile(
+            fs,
+            &staged_dir,
+            "write-0.staged",
+            expected_digest,
+            4096,
+            &target,
+        ),
     );
     const after = try readFileAlloc(fs, std.testing.allocator, target_path, 4096);
     defer std.testing.allocator.free(after);
@@ -6082,7 +6142,13 @@ test "transaction recovery hashing consumes one aggregate budget" {
     var dir = try std.Io.Dir.openDirAbsolute(fs.io, root, .{ .follow_symlinks = false });
     defer dir.close(fs.io);
     var hash_bytes_remaining: usize = 7;
-    const first = try digestRecoveryFileAtAlloc(fs, allocator, &dir, "first", &hash_bytes_remaining);
+    const first = try digestRecoveryFileAtAlloc(
+        fs,
+        allocator,
+        &dir,
+        "first",
+        &hash_bytes_remaining,
+    );
     defer allocator.free(first);
     try std.testing.expectEqual(@as(usize, 3), hash_bytes_remaining);
     try std.testing.expectError(
@@ -6195,7 +6261,12 @@ test "durable transactions compare check-only participants without rewriting the
         },
     );
     defer receipt.deinit(std.testing.allocator);
-    const guarded_after = try readRegularFileNoSymlink(fs, std.testing.allocator, guarded_path, 4096);
+    const guarded_after = try readRegularFileNoSymlink(
+        fs,
+        std.testing.allocator,
+        guarded_path,
+        4096,
+    );
     defer std.testing.allocator.free(guarded_after);
     try std.testing.expectEqualStrings(guarded, guarded_after);
     const metadata = try readRegularFileNoSymlink(fs, std.testing.allocator, metadata_path, 4096);
@@ -6337,34 +6408,31 @@ test "durable transactions hold check-only CAS guards through publication" {
 }
 
 test "durable transactions commit and recover from prepared records" {
+    const allocator = std.testing.allocator;
     const fs = Fs.init(std.testing.io, std.Io.Dir.cwd());
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(fs.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const transactions_dir = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root, "transactions" },
-    );
-    defer std.testing.allocator.free(transactions_dir);
+    const root = try tmp.dir.realPathFileAlloc(fs.io, ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir =
+        try std.fs.path.join(allocator, &.{ root, "transactions" });
+    defer allocator.free(transactions_dir);
     try ensureDirectoryPathNoSymlinks(fs, transactions_dir);
-    const counter = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.counter" });
-    defer std.testing.allocator.free(counter);
+    const counter = try std.fs.path.join(allocator, &.{ root, "workspace.counter" });
+    defer allocator.free(counter);
     const owner: Owner = .{
         .process_id = 200,
         .session_id = "txn-session",
         .executor = "test",
     };
 
-    const workspace_path = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root, "workspace.jsonl" },
-    );
-    defer std.testing.allocator.free(workspace_path);
-    const plan_path = try std.fs.path.join(std.testing.allocator, &.{ root, "plan.jsonl" });
-    defer std.testing.allocator.free(plan_path);
-    try writeTextAtomic(fs, std.testing.allocator, workspace_path, "{\"seq\":1,\"workspace\":true}\n");
-    try writeTextAtomic(fs, std.testing.allocator, plan_path, "{\"seq\":1,\"plan\":true}\n");
+    const workspace_path =
+        try std.fs.path.join(allocator, &.{ root, "workspace.jsonl" });
+    defer allocator.free(workspace_path);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "plan.jsonl" });
+    defer allocator.free(plan_path);
+    try writeTextAtomic(fs, allocator, workspace_path, "{\"seq\":1,\"workspace\":true}\n");
+    try writeTextAtomic(fs, allocator, plan_path, "{\"seq\":1,\"plan\":true}\n");
     const mutations = [_]TransactionMutation{
         .{
             .path = plan_path,
@@ -6383,18 +6451,25 @@ test "durable transactions commit and recover from prepared records" {
             },
         },
     };
-    var receipt = try commitTextTransaction(fs, std.testing.allocator, transactions_dir, &mutations, .{
-        .owner = owner,
-        .fencing_counter_path = counter,
-    });
-    defer receipt.deinit(std.testing.allocator);
+    var receipt = try commitTextTransaction(
+        fs,
+        allocator,
+        transactions_dir,
+        &mutations,
+        .{
+            .owner = owner,
+            .fencing_counter_path = counter,
+        },
+    );
+    defer receipt.deinit(allocator);
     try std.testing.expectEqual(TransactionState.committed, receipt.state);
     try std.testing.expect(fileExists(fs, receipt.commit_marker_path));
     const workspace_data = try tryReadForTest(workspace_path);
-    defer std.testing.allocator.free(workspace_data);
+    defer allocator.free(workspace_data);
     try std.testing.expectEqualStrings("{\"seq\":2,\"workspace\":true}\n", workspace_data);
-    var committed_status = try inspectTransaction(fs, std.testing.allocator, receipt.transaction_dir);
-    defer committed_status.deinit(std.testing.allocator);
+    var committed_status =
+        try inspectTransaction(fs, allocator, receipt.transaction_dir);
+    defer committed_status.deinit(allocator);
     try std.testing.expectEqual(RecoveryDecision.already_committed, committed_status.decision);
 
     try assertPreparedUnpublishedRecovery(root, transactions_dir, owner);
@@ -6733,9 +6808,19 @@ test "transaction recovery reports recovery lock creation as mutation" {
     defer allocator.free(transactions_dir);
     try ensureDirectoryPathNoSymlinks(fs, transactions_dir);
 
-    const first = try recoverAndCompactTransactionsWithOptions(fs, allocator, transactions_dir, .{});
+    const first = try recoverAndCompactTransactionsWithOptions(
+        fs,
+        allocator,
+        transactions_dir,
+        .{},
+    );
     try std.testing.expect(first.storage_mutated);
-    const second = try recoverAndCompactTransactionsWithOptions(fs, allocator, transactions_dir, .{});
+    const second = try recoverAndCompactTransactionsWithOptions(
+        fs,
+        allocator,
+        transactions_dir,
+        .{},
+    );
     try std.testing.expect(!second.storage_mutated);
 
     const invalid_dir = try std.fs.path.join(allocator, &.{ transactions_dir, "invalid" });
@@ -6798,11 +6883,7 @@ test "committed legacy journals require syncable target parents before compactio
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
         ),
     );
     try std.testing.expect(fileExists(fs, transaction_dir));
@@ -6850,11 +6931,7 @@ fn assertLegacyRecoveryRequiresSyncableParents(
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
         ),
     );
     try std.testing.expect(fileExists(fs, transaction_dir));
@@ -6866,11 +6943,7 @@ fn assertLegacyRecoveryRequiresSyncableParents(
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
         ),
     );
     try std.testing.expect(fileExists(fs, transaction_dir));
@@ -7022,11 +7095,7 @@ fn assertLegacyTerminalRecoveryReclaimsLease(
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
         ),
     );
     try std.testing.expect(fileExists(fs, transaction_dir));
@@ -7124,11 +7193,7 @@ fn assertLegacyRecoveryWaitsForWriter(
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
             &busy_summary,
         ),
     );
@@ -8443,11 +8508,7 @@ test "legacy recovery cannot target its shared fencing authority" {
             fs,
             allocator,
             transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
+            .{ .legacy_fencing_authority = .{ .shared = counter_path } },
         ),
     );
     const counter = try tryReadForTest(counter_path);
@@ -8683,10 +8744,8 @@ test "legacy journals reject filesystem aliases into their directory" {
     );
     const target_path = try std.fs.path.join(allocator, &.{ transaction_alias, "victim.jsonl" });
     defer allocator.free(target_path);
-    const actual_target_path = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, "victim.jsonl" },
-    );
+    const actual_target_path =
+        try std.fs.path.join(allocator, &.{ transaction_dir, "victim.jsonl" });
     defer allocator.free(actual_target_path);
     const staged_path = try std.fs.path.join(allocator, &.{ transaction_dir, "write-0.staged" });
     defer allocator.free(staged_path);
@@ -9968,10 +10027,16 @@ test "transactions publish in canonical path order and reject duplicates" {
             .expectation = .{ .expected_sequence = 1, .expected_exists = true },
         },
     };
-    var receipt = try commitTextTransaction(fs, std.testing.allocator, transactions_dir, &reverse, .{
-        .owner = owner,
-        .fencing_counter_path = counter,
-    });
+    var receipt = try commitTextTransaction(
+        fs,
+        std.testing.allocator,
+        transactions_dir,
+        &reverse,
+        .{
+            .owner = owner,
+            .fencing_counter_path = counter,
+        },
+    );
     defer receipt.deinit(std.testing.allocator);
 
     const record = try readRegularFileNoSymlink(
@@ -10142,7 +10207,13 @@ test "appendJsonlCheckpointTransaction reports pending prepared recovery" {
         &.{ transactions_dir, "txn-orphan.prepared.json" },
     );
     defer std.testing.allocator.free(prepared_path);
-    try writeTextCreateNew(fs, std.testing.allocator, prepared_path, "{\"state\":\"prepared\"}\n", .{});
+    try writeTextCreateNew(
+        fs,
+        std.testing.allocator,
+        prepared_path,
+        "{\"state\":\"prepared\"}\n",
+        .{},
+    );
 
     try std.testing.expectError(error.TransactionRecoveryRequired, appendJsonlCheckpointTransaction(
         fs,
@@ -10422,7 +10493,12 @@ pub const TransactionAllocationFixture = struct {
 
     pub fn expectContent(self: TransactionAllocationFixture, expected: []const u8) !void {
         const fs = Fs.init(std.testing.io, std.Io.Dir.cwd());
-        const actual = try readRegularFileNoSymlink(fs, std.testing.allocator, self.target_path, 4096);
+        const actual = try readRegularFileNoSymlink(
+            fs,
+            std.testing.allocator,
+            self.target_path,
+            4096,
+        );
         defer std.testing.allocator.free(actual);
         try std.testing.expectEqualStrings(expected, actual);
     }
@@ -10704,6 +10780,13 @@ test "checkpoint sequences reject overflow before journal allocation" {
     const exhausted = "{\"seq\":9223372036854775807}";
     try std.testing.expectError(
         error.TransactionSequenceMismatch,
-        checkpointReceiptAlloc(fs, std.testing.allocator, "transactions", exhausted, exhausted, .{}),
+        checkpointReceiptAlloc(
+            fs,
+            std.testing.allocator,
+            "transactions",
+            exhausted,
+            exhausted,
+            .{},
+        ),
     );
 }

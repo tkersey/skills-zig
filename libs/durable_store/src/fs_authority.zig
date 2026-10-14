@@ -35,7 +35,7 @@ pub fn warn(io: std.Io, comptime format: []const u8, args: anytype) void {
     var buffer: [256]u8 = undefined;
     var stderr = std.Io.File.stderr().writer(io, &buffer);
     stderr.interface.print("warning: " ++ format ++ "\n", args) catch return;
-    stderr.interface.flush() catch {};
+    stderr.interface.flush() catch return;
 }
 
 test "cleanup diagnostics write through the supplied I/O implementation" {
@@ -46,7 +46,14 @@ test "cleanup diagnostics write through the supplied I/O implementation" {
             @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
             self.len += bytes.len;
         }
-        fn write(context: ?*anyopaque, _: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, _: u64) std.Io.File.WritePositionalError!usize {
+        fn write(
+            context: ?*anyopaque,
+            _: std.Io.File,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+            _: u64,
+        ) std.Io.File.WritePositionalError!usize {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             const before = self.len;
             self.append(header);
@@ -64,6 +71,14 @@ test "cleanup diagnostics write through the supplied I/O implementation" {
     var vtable = std.testing.io.vtable.*;
     vtable.fileWritePositional = Capture.write;
     vtable.swapCancelProtection = Capture.protect;
-    warn(.{ .userdata = &capture, .vtable = &vtable }, "lock release failed for {s}: {s}; inspect and remove stale lock", .{ "events.lock", "AccessDenied" });
-    try std.testing.expectEqualStrings("warning: lock release failed for events.lock: AccessDenied; inspect and remove stale lock\n", capture.bytes[0..capture.len]);
+    warn(
+        .{ .userdata = &capture, .vtable = &vtable },
+        "lock release failed for {s}: {s}; inspect and remove stale lock",
+        .{ "events.lock", "AccessDenied" },
+    );
+    try std.testing.expectEqualStrings(
+        "warning: lock release failed for events.lock: Acce" ++
+            "ssDenied; inspect and remove stale lock\n",
+        capture.bytes[0..capture.len],
+    );
 }

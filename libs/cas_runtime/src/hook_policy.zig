@@ -222,7 +222,16 @@ pub fn ensureLaunchSupportsPolicy(
         std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     ))) + app_server_launch.default_startup_timeout_ms;
-    return ensureLaunchSupportsPolicyUntil(allocator, io, dir, environ, codex_path, cwd, policy, deadline_ms);
+    return ensureLaunchSupportsPolicyUntil(
+        allocator,
+        io,
+        dir,
+        environ,
+        codex_path,
+        cwd,
+        policy,
+        deadline_ms,
+    );
 }
 
 pub fn ensureLaunchSupportsPolicyUntil(
@@ -267,7 +276,13 @@ fn helpOutputUntil(
     const owned_codex_path = if (std.fs.path.isAbsolute(codex_path))
         null
     else
-        try app_server_launch.resolveExecutableAlloc(allocator, io, dir, environ.get("PATH"), codex_path);
+        try app_server_launch.resolveExecutableAlloc(
+            allocator,
+            io,
+            dir,
+            environ.get("PATH"),
+            codex_path,
+        );
     defer if (owned_codex_path) |path| allocator.free(path);
     const resolved_codex_path = owned_codex_path orelse codex_path;
     const child_cwd = try dir.openDir(io, cwd, .{});

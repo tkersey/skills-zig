@@ -87,25 +87,60 @@ pub fn main(init: std.process.Init) !void {
         error.HelpRequested => return core_cli.printHelpSurface(stdout, HelpSurface, Version),
         error.VersionRequested => return core_cli.printVersion(stdout, Version),
         else => {
-            core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, @errorName(err), null) catch std.process.exit(1);
+            core_cli.printUsageFailureWithHelp(
+                stderr,
+                HelpSurface,
+                Version,
+                @errorName(err),
+                null,
+            ) catch std.process.exit(1);
             std.process.exit(2);
         },
     };
     defer freeCliOptions(allocator, &cli);
 
     const config = loadConfig(io, dir, allocator, cli.config_path) catch |err| {
-        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, @errorName(err), cli.config_path) catch std.process.exit(1);
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            cli.config_path,
+        ) catch std.process.exit(1);
         std.process.exit(2);
     };
     if (config.rounds < 3) {
-        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InvalidRounds", cli.config_path) catch std.process.exit(1);
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InvalidRounds",
+            cli.config_path,
+        ) catch std.process.exit(1);
         std.process.exit(2);
     }
     if (config.iterations < 100) {
-        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InvalidIterations", cli.config_path) catch std.process.exit(1);
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InvalidIterations",
+            cli.config_path,
+        ) catch std.process.exit(1);
         std.process.exit(2);
     }
 
+    return runBenchmark(io, dir, allocator, cli, config, stdout);
+}
+
+fn runBenchmark(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    cli: CliOptions,
+    config: PerfConfig,
+    stdout: *std.Io.Writer,
+) !void {
     const summary = try benchmarkBenchStats(io, allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
     const previous_artifact = if (cli.artifact_path) |artifact_path|
@@ -154,7 +189,9 @@ fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliO
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) return error.HelpRequested;
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
+        if (core_cli.isVersionArg(
+            arg,
+        ) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
         if (std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= argv.len) return error.MissingConfigPath;
@@ -196,7 +233,12 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
     if (cli.artifact_path) |path| allocator.free(path);
 }
 
-fn loadConfig(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
+fn loadConfig(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PerfConfig {
     const data = try dir.readFileAlloc(
         io,
         path,
@@ -331,7 +373,12 @@ fn allowedWithTolerance(base: u64, tolerance_pct: f64) u64 {
     return core_perf.allowedUpperBoundWithTolerance(base, tolerance_pct);
 }
 
-fn loadArtifact(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
+fn loadArtifact(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?BenchmarkArtifact {
     const data = dir.readFileAlloc(
         io,
         path,

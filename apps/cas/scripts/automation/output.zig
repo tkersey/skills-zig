@@ -16,7 +16,7 @@ pub fn warningFmt(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [64]u8 = undefined;
     const stderr = (io.lockStderr(&buffer, null) catch return).terminal();
     defer io.unlockStderr();
-    std.log.defaultLogFileTerminal(.warn, .default, fmt, args, stderr) catch {};
+    std.log.defaultLogFileTerminal(.warn, .default, fmt, args, stderr) catch return;
 }
 
 pub fn jsonWriteString(writer: anytype, value: []const u8) !void {
@@ -114,11 +114,19 @@ pub fn writeFileAtomic(
             tmp,
             .{},
         ) catch |err| {
-            return userErrorFmt(operation.io, "unable to create temp file ({s}): {s}", .{ tmp, @errorName(err) });
+            return userErrorFmt(
+                operation.io,
+                "unable to create temp file ({s}): {s}",
+                .{ tmp, @errorName(err) },
+            );
         };
         defer file.close(operation.io);
         file.writeStreamingAll(operation.io, contents) catch |err| {
-            return userErrorFmt(operation.io, "unable to write temp file ({s}): {s}", .{ tmp, @errorName(err) });
+            return userErrorFmt(
+                operation.io,
+                "unable to write temp file ({s}): {s}",
+                .{ tmp, @errorName(err) },
+            );
         };
     }
 

@@ -12,7 +12,12 @@ pub fn expandHomePath(allocator: std.mem.Allocator, home_opt: ?[]const u8, path:
     return allocator.dupe(u8, path);
 }
 
-pub fn toAbsolutePath(allocator: std.mem.Allocator, home: ?[]const u8, cwd_path: []const u8, path: []const u8) ![]u8 {
+pub fn toAbsolutePath(
+    allocator: std.mem.Allocator,
+    home: ?[]const u8,
+    cwd_path: []const u8,
+    path: []const u8,
+) ![]u8 {
     const expanded = try expandHomePath(allocator, home, path);
     defer allocator.free(expanded);
 
@@ -35,7 +40,10 @@ test "path expansion uses only the supplied home and cwd" {
         defer allocator.free(actual);
         try std.testing.expectEqualStrings(case[3], actual);
     }
-    try std.testing.expectError(error.EnvironmentVariableNotFound, expandHomePath(allocator, null, "~/file"));
+    try std.testing.expectError(
+        error.EnvironmentVariableNotFound,
+        expandHomePath(allocator, null, "~/file"),
+    );
 }
 
 fn expandWithAllocationFailure(allocator: std.mem.Allocator) !void {

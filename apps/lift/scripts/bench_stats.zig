@@ -109,7 +109,13 @@ pub fn main(init: std.process.Init) !void {
         error.HelpRequested => return core_cli.printHelpSurface(stdout, HelpSurface, Version),
         error.VersionRequested => return core_cli.printVersion(stdout, Version),
         else => {
-            core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, @errorName(err), null) catch std.process.exit(1);
+            core_cli.printUsageFailureWithHelp(
+                stderr,
+                HelpSurface,
+                Version,
+                @errorName(err),
+                null,
+            ) catch std.process.exit(1);
             std.process.exit(2);
         },
     };
@@ -117,7 +123,13 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.compare_path != null and cfg.compare_path.?.len == 0) cfg.compare_path = null;
 
     if (cfg.compare_path != null and !(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
-        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha") catch std.process.exit(1);
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InvalidCiAlpha",
+            "--ci-alpha",
+        ) catch std.process.exit(1);
         std.process.exit(2);
     }
 
@@ -133,13 +145,34 @@ pub fn main(init: std.process.Init) !void {
             error.CompareInputTooLarge => "compare input exceeds 16 MiB",
             else => return err,
         };
-        core_cli.printUsageFailureWithHelp(stderr, HelpSurface, Version, "InputTooLarge", detail) catch std.process.exit(1);
+        core_cli.printUsageFailureWithHelp(
+            stderr,
+            HelpSurface,
+            Version,
+            "InputTooLarge",
+            detail,
+        ) catch std.process.exit(1);
         std.process.exit(2);
     };
 }
 
-fn runComparison(io: std.Io, dir: std.Io.Dir, stdout: std.Io.File, allocator: std.mem.Allocator, cfg: Config, compare_path: []const u8) !void {
-    var baseline_values = try readSamples(io, dir, stdout, allocator, cfg, cfg.input_path, "baseline");
+fn runComparison(
+    io: std.Io,
+    dir: std.Io.Dir,
+    stdout: std.Io.File,
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    compare_path: []const u8,
+) !void {
+    var baseline_values = try readSamples(
+        io,
+        dir,
+        stdout,
+        allocator,
+        cfg,
+        cfg.input_path,
+        "baseline",
+    );
     defer baseline_values.deinit(allocator);
     var variant_values = try readSamples(io, dir, stdout, allocator, cfg, compare_path, "compare");
     defer variant_values.deinit(allocator);
@@ -147,7 +180,13 @@ fn runComparison(io: std.Io, dir: std.Io.Dir, stdout: std.Io.File, allocator: st
     const baseline_report = computeReport(baseline_values.items, cfg.unit);
     const variant_report = computeReport(variant_values.items, cfg.unit);
 
-    const ci = try comparisonIntervals(io, allocator, cfg, baseline_values.items, variant_values.items);
+    const ci = try comparisonIntervals(
+        io,
+        allocator,
+        cfg,
+        baseline_values.items,
+        variant_values.items,
+    );
 
     const output = try renderComparisonAlloc(allocator, cfg, baseline_report, variant_report, ci);
     defer allocator.free(output);
@@ -281,7 +320,11 @@ fn readSamples(
     comptime label: []const u8,
 ) !std.ArrayList(f64) {
     const input = readInputAlloc(io, dir, allocator, path) catch |err| switch (err) {
-        error.InputTooLarge => return if (comptime std.mem.eql(u8, label, "baseline")) error.BaselineInputTooLarge else error.CompareInputTooLarge,
+        error.InputTooLarge => return if (comptime std.mem.eql(
+            u8,
+            label,
+            "baseline",
+        )) error.BaselineInputTooLarge else error.CompareInputTooLarge,
         else => return err,
     };
     defer allocator.free(input);
@@ -300,7 +343,13 @@ fn readSamples(
     return values;
 }
 
-fn runSummary(io: std.Io, dir: std.Io.Dir, stdout: std.Io.File, allocator: std.mem.Allocator, cfg: Config) !void {
+fn runSummary(
+    io: std.Io,
+    dir: std.Io.Dir,
+    stdout: std.Io.File,
+    allocator: std.mem.Allocator,
+    cfg: Config,
+) !void {
     const input_text = try readInputAlloc(io, dir, allocator, cfg.input_path);
     defer allocator.free(input_text);
 
@@ -364,7 +413,9 @@ fn parseArgs(argv: []const []const u8) !Config {
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) return error.HelpRequested;
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
+        if (core_cli.isVersionArg(
+            arg,
+        ) or core_cli.isVersionSubcommand(arg)) return error.VersionRequested;
         if (std.mem.eql(u8, arg, "--all")) {
             cfg.parse_all = true;
             continue;
@@ -411,7 +462,12 @@ fn setValueArgument(cfg: *Config, arg: []const u8, value: []const u8) !void {
     } else unreachable; // isValueArgument admits the complete set above.
 }
 
-fn readInputAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
+fn readInputAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: ?[]const u8,
+) ![]u8 {
     if (path) |value| return readFileWithLimitAlloc(io, dir, allocator, value);
     return core_io.readStdinAlloc(io, allocator, MaxInputBytes) catch |err| switch (err) {
         error.StreamTooLong => error.InputTooLarge,
@@ -419,7 +475,12 @@ fn readInputAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, pat
     };
 }
 
-fn readFileWithLimitAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+fn readFileWithLimitAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
     return core_io.readFileAlloc(io, dir, allocator, path, MaxInputBytes) catch |err| switch (err) {
         error.FileTooBig => error.InputTooLarge,
         error.StreamTooLong => error.InputTooLarge,
@@ -995,9 +1056,18 @@ test "usage text references installed binary" {
 }
 
 test "parser reports command outcomes without swallowing option values or earlier errors" {
-    try std.testing.expectError(error.HelpRequested, parseArgs(&.{ "bench_stats", "--all", "--help" }));
-    try std.testing.expectError(error.VersionRequested, parseArgs(&.{ "bench_stats", "--json", "version" }));
-    try std.testing.expectError(error.UnknownArg, parseArgs(&.{ "bench_stats", "--unknown", "--help" }));
+    try std.testing.expectError(
+        error.HelpRequested,
+        parseArgs(&.{ "bench_stats", "--all", "--help" }),
+    );
+    try std.testing.expectError(
+        error.VersionRequested,
+        parseArgs(&.{ "bench_stats", "--json", "version" }),
+    );
+    try std.testing.expectError(
+        error.UnknownArg,
+        parseArgs(&.{ "bench_stats", "--unknown", "--help" }),
+    );
     const cfg = try parseArgs(&.{ "bench_stats", "--unit", "--help", "--unit", "-V" });
     try std.testing.expectEqualStrings("-V", cfg.unit);
 }

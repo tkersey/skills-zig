@@ -90,7 +90,12 @@ pub fn defaultTimeoutMsForAction(parsed: ParsedArgs) u32 {
     };
 }
 
-pub fn parseArgs(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
+pub fn parseArgs(
+    io: std.Io,
+    directory: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !ParsedArgs {
     var out = ParsedArgs{};
     var receipt_paths: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -275,7 +280,10 @@ test "review duration options reject values outside their stored range" {
             const argv = [_][]const u8{
                 "cas_review_session", "run", "--cwd", "/tmp", "--uncommitted", flag, invalid,
             };
-            try std.testing.expectError(expected, parseArgs(std.testing.io, directory, std.testing.allocator, &argv));
+            try std.testing.expectError(
+                expected,
+                parseArgs(std.testing.io, directory, std.testing.allocator, &argv),
+            );
         }
         for ([_][]const u8{ "1", "4294967295" }) |valid| {
             const argv = [_][]const u8{
@@ -417,7 +425,12 @@ fn setTarget(parsed: *ParsedArgs, target: ReviewTarget) !void {
     parsed.target = target;
 }
 
-fn loadCustomInstructionsAlloc(io: std.Io, directory: std.Io.Dir, allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+fn loadCustomInstructionsAlloc(
+    io: std.Io,
+    directory: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) ![]const u8 {
     if (std.mem.eql(u8, raw, "-")) {
         var reader = std.Io.File.stdin().reader(io, &.{});
         return reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
@@ -447,13 +460,37 @@ test "CLI target admission keeps title scoped to the selected commit" {
     defer committed.deinit(allocator);
     try std.testing.expectEqualStrings("HEAD", committed.target.?.commit.sha);
     try std.testing.expectEqualStrings("exact title", committed.target.?.commit.title.?);
-    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(std.testing.io, directory, allocator, &.{
-        "cas_review_session", "run", "--cwd", ".", "--base", "main", "--title", "title",
-    }));
-    try std.testing.expectError(error.TitleRequiresCommit, parseArgs(std.testing.io, directory, allocator, &.{
-        "cas_review_session", "run", "--cwd", ".", "--title", "title", "--commit", "HEAD",
-    }));
-    try std.testing.expectError(error.MultipleTargetSelectors, parseArgs(std.testing.io, directory, allocator, &.{
-        "cas_review_session", "run", "--cwd", ".", "--commit", "HEAD", "--uncommitted",
-    }));
+    try std.testing.expectError(
+        error.TitleRequiresCommit,
+        parseArgs(
+            std.testing.io,
+            directory,
+            allocator,
+            &.{
+                "cas_review_session", "run", "--cwd", ".", "--base", "main", "--title", "title",
+            },
+        ),
+    );
+    try std.testing.expectError(
+        error.TitleRequiresCommit,
+        parseArgs(
+            std.testing.io,
+            directory,
+            allocator,
+            &.{
+                "cas_review_session", "run", "--cwd", ".", "--title", "title", "--commit", "HEAD",
+            },
+        ),
+    );
+    try std.testing.expectError(
+        error.MultipleTargetSelectors,
+        parseArgs(
+            std.testing.io,
+            directory,
+            allocator,
+            &.{
+                "cas_review_session", "run", "--cwd", ".", "--commit", "HEAD", "--uncommitted",
+            },
+        ),
+    );
 }

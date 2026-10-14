@@ -102,7 +102,11 @@ pub fn recordJsonFromRootAlloc(
 /// review/start omits fields that do not belong to the selected variant.
 pub fn requestJsonAlloc(allocator: std.mem.Allocator, target: ReviewTarget) ![]u8 {
     return switch (target) {
-        .uncommitted => std.json.Stringify.valueAlloc(allocator, .{ .type = "uncommittedChanges" }, .{}),
+        .uncommitted => std.json.Stringify.valueAlloc(
+            allocator,
+            .{ .type = "uncommittedChanges" },
+            .{},
+        ),
         .base_branch => |branch| std.json.Stringify.valueAlloc(
             allocator,
             .{ .type = "baseBranch", .branch = branch },
@@ -133,7 +137,11 @@ pub fn startParamsJsonAlloc(
 ) ![]u8 {
     const target_json = try requestJsonAlloc(allocator, target);
     defer allocator.free(target_json);
-    const parent_thread_id_json = try std.json.Stringify.valueAlloc(allocator, parent_thread_id, .{});
+    const parent_thread_id_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        parent_thread_id,
+        .{},
+    );
     defer allocator.free(parent_thread_id_json);
     return allocator.print(
         "{{\"threadId\":{s},\"delivery\":\"inline\",\"target\":{s}}}",
@@ -151,12 +159,14 @@ test "review target variants retain exact request and historical record bytes" {
         .{
             .target = .uncommitted,
             .request = "{\"type\":\"uncommittedChanges\"}",
-            .record = "{\"type\":\"uncommittedChanges\",\"branch\":null,\"sha\":null,\"title\":null}",
+            .record = "{\"type\":\"uncommittedChanges\",\"branch\":null,\"" ++
+                "sha\":null,\"title\":null}",
         },
         .{
             .target = .{ .base_branch = "feature/\"quoted\"" },
             .request = "{\"type\":\"baseBranch\",\"branch\":\"feature/\\\"quoted\\\"\"}",
-            .record = "{\"type\":\"baseBranch\",\"branch\":\"feature/\\\"quoted\\\"\",\"sha\":null,\"title\":null}",
+            .record = "{\"type\":\"baseBranch\",\"branch\":\"feature/\\\"" ++
+                "quoted\\\"\",\"sha\":null,\"title\":null}",
         },
         .{
             .target = .{ .commit = .{ .sha = "abcdef" } },
@@ -166,7 +176,8 @@ test "review target variants retain exact request and historical record bytes" {
         .{
             .target = .{ .commit = .{ .sha = "abcdef", .title = "exact\ntitle" } },
             .request = "{\"type\":\"commit\",\"sha\":\"abcdef\",\"title\":\"exact\\ntitle\"}",
-            .record = "{\"type\":\"commit\",\"branch\":null,\"sha\":\"abcdef\",\"title\":\"exact\\ntitle\"}",
+            .record = "{\"type\":\"commit\",\"branch\":null,\"sha\":\"abc" ++
+                "def\",\"title\":\"exact\\ntitle\"}",
         },
     };
     const allocator = std.testing.allocator;
@@ -174,7 +185,11 @@ test "review target variants retain exact request and historical record bytes" {
         const actual_request = try requestJsonAlloc(allocator, case.target);
         defer allocator.free(actual_request);
         try std.testing.expectEqualStrings(case.request, actual_request);
-        const actual_record = try std.json.Stringify.valueAlloc(allocator, toRecord(case.target), .{});
+        const actual_record = try std.json.Stringify.valueAlloc(
+            allocator,
+            toRecord(case.target),
+            .{},
+        );
         defer allocator.free(actual_record);
         try std.testing.expectEqualStrings(case.record, actual_record);
         const restored = try fromRecord(toRecord(case.target));
@@ -206,7 +221,10 @@ test "historical target admission rejects invalid payload combinations" {
         .{ .type = "commit", .sha = "" },
         .{ .type = "commit", .sha = "abc", .branch = "main" },
     };
-    for (invalid) |record| try std.testing.expectError(error.InvalidSessionTarget, fromRecord(record));
+    for (invalid) |record| try std.testing.expectError(
+        error.InvalidSessionTarget,
+        fromRecord(record),
+    );
     // Historical admission preserves stored spelling. Only fresh execution
     // performs whitespace normalization and Git resolution.
     const branch = try fromRecord(.{ .type = "baseBranch", .branch = " main " });
@@ -220,7 +238,8 @@ test "historical target JSON retains strict field admission" {
     const invalid = [_][]const u8{
         "null",
         "{\"type\":\"uncommittedChanges\",\"branch\":null,\"sha\":null}",
-        "{\"type\":\"uncommittedChanges\",\"branch\":null,\"sha\":null,\"title\":null,\"extra\":null}",
+        "{\"type\":\"uncommittedChanges\",\"branch\":null,\"" ++
+            "sha\":null,\"title\":null,\"extra\":null}",
         "{\"type\":\"baseBranch\",\"branch\":false,\"sha\":null,\"title\":null}",
         "{\"type\":\"commit\",\"branch\":null,\"sha\":123,\"title\":null}",
     };
@@ -250,7 +269,8 @@ fn checkTargetSerializationAllocation(allocator: std.mem.Allocator) !void {
     } });
     defer allocator.free(params);
     try std.testing.expectEqualStrings(
-        "{\"threadId\":\"thread\",\"delivery\":\"inline\",\"target\":{\"type\":\"commit\",\"sha\":\"abc\",\"title\":\"title\"}}",
+        "{\"threadId\":\"thread\",\"delivery\":\"inline\",\"" ++
+            "target\":{\"type\":\"commit\",\"sha\":\"abc\",\"title\":\"title\"}}",
         params,
     );
 }

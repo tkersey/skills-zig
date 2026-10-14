@@ -91,7 +91,12 @@ pub fn run(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
         return usageFailure(io, @errorName(err), null);
@@ -404,7 +409,15 @@ fn acquireClient(
 ) !AcquiredClient {
     return switch (transport) {
         .stdio => acquireStdio(directory, environ, allocator, io, cwd, parsed, code_mode_host),
-        .managed_websocket => acquireManaged(directory, environ, allocator, io, cwd, parsed, code_mode_host),
+        .managed_websocket => acquireManaged(
+            directory,
+            environ,
+            allocator,
+            io,
+            cwd,
+            parsed,
+            code_mode_host,
+        ),
         .explicit_websocket => |url| blk: {
             if (code_mode_host != null) return error.CodeModeHostRequiresManagedLaunch;
             var options = baseClientOptions(directory, environ, io, cwd, parsed);
@@ -423,7 +436,11 @@ fn acquireClient(
             const path = if (maybe_path) |path|
                 try launch.resolveUnixPathAlloc(allocator, cwd, path)
             else
-                try launch.defaultUnixPathAlloc(allocator, environ.get("CODEX_HOME"), environ.get("HOME"));
+                try launch.defaultUnixPathAlloc(
+                    allocator,
+                    environ.get("CODEX_HOME"),
+                    environ.get("HOME"),
+                );
             defer allocator.free(path);
             const endpoint_identity = try allocator.print("unix://{s}", .{path});
             errdefer allocator.free(endpoint_identity);
@@ -449,7 +466,13 @@ fn acquireStdio(
     parsed: ParsedArgs,
     code_mode_host: ?*const launch.CodeModeHost,
 ) !AcquiredClient {
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, io, directory, environ.get("PATH"), parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     const endpoint_identity = try allocator.dupe(u8, "stdio://");
     errdefer allocator.free(endpoint_identity);
@@ -490,12 +513,35 @@ fn startManaged(
     parsed: ParsedArgs,
     code_mode_host: ?*const launch.CodeModeHost,
 ) !websocket.ManagedServer {
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, io, directory, environ.get("PATH"), parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     return if (code_mode_host) |host|
-        websocket.startManagedLoopbackServerWithCodeModeHost(allocator, cwd, resolved_codex_path, parsed.hook_policy, host, io, directory, environ)
+        websocket.startManagedLoopbackServerWithCodeModeHost(
+            allocator,
+            cwd,
+            resolved_codex_path,
+            parsed.hook_policy,
+            host,
+            io,
+            directory,
+            environ,
+        )
     else
-        websocket.startManagedLoopbackServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io, directory, environ);
+        websocket.startManagedLoopbackServer(
+            allocator,
+            cwd,
+            resolved_codex_path,
+            parsed.hook_policy,
+            io,
+            directory,
+            environ,
+        );
 }
 
 fn connectManaged(
@@ -511,7 +557,13 @@ fn connectManaged(
     errdefer server.deinit(allocator);
     const endpoint_identity = try allocator.dupe(u8, server.listen_url);
     errdefer allocator.free(endpoint_identity);
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, io, directory, environ.get("PATH"), parsed.codex_path);
+    const resolved_codex_path = try cas.resolveExecutableAlloc(
+        allocator,
+        io,
+        directory,
+        environ.get("PATH"),
+        parsed.codex_path,
+    );
     defer allocator.free(resolved_codex_path);
     const codex_path_identity = try allocator.dupe(u8, resolved_codex_path);
     errdefer allocator.free(codex_path_identity);
@@ -1039,6 +1091,12 @@ test "parseArgs rejects timeout outside the client integer domain" {
 
 fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
     return 2;
 }

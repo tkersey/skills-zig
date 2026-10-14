@@ -2258,7 +2258,11 @@ fn archiveReplayTestDefinitions(
     }
 }
 
-fn archiveInsertionAllocationCount(scope: *storage_root.Scope, repo_root: []const u8, digest: []const u8) !usize {
+fn archiveInsertionAllocationCount(
+    scope: *storage_root.Scope,
+    repo_root: []const u8,
+    digest: []const u8,
+) !usize {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .resize_fail_index = 0,
     });
@@ -2273,7 +2277,11 @@ fn archiveInsertionAllocationCount(scope: *storage_root.Scope, repo_root: []cons
     return failing.alloc_index;
 }
 
-fn expectArchiveInsertionAllocationFailure(scope: *storage_root.Scope, repo_root: []const u8, digest: []const u8) !void {
+fn expectArchiveInsertionAllocationFailure(
+    scope: *storage_root.Scope,
+    repo_root: []const u8,
+    digest: []const u8,
+) !void {
     const allocation_count = try archiveInsertionAllocationCount(scope, repo_root, digest);
     try std.testing.expect(allocation_count >= 2);
     // On an empty cache the final two allocations reserve its row and index owners.

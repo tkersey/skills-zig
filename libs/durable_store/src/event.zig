@@ -555,7 +555,10 @@ fn finishEventHashAlloc(allocator: std.mem.Allocator, hash: *EventHash) ![]u8 {
 
 pub fn ignoreEventRecord(_: *anyopaque, _: EventRecordView) !void {}
 
-pub fn validateEventExpectation(snapshot: EventScanSummary, expectation: EventAppendExpectation) !void {
+pub fn validateEventExpectation(
+    snapshot: EventScanSummary,
+    expectation: EventAppendExpectation,
+) !void {
     if (expectation.exists) |expected| {
         if (expected != snapshot.exists) return error.ExpectationMismatch;
     }
@@ -564,7 +567,11 @@ pub fn validateEventExpectation(snapshot: EventScanSummary, expectation: EventAp
     }
 }
 
-pub fn validateEventAppendFits(snapshot: EventScanSummary, payload_len: usize, max_bytes: usize) !void {
+pub fn validateEventAppendFits(
+    snapshot: EventScanSummary,
+    payload_len: usize,
+    max_bytes: usize,
+) !void {
     if (snapshot.extent_bytes > max_bytes or payload_len >= max_bytes) return error.StreamTooLong;
     const additional = payload_len + 1 + snapshot.append_separator_bytes;
     if (additional > max_bytes - snapshot.extent_bytes) return error.StreamTooLong;

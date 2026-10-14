@@ -440,7 +440,9 @@ pub fn recoverRepositoryTransactions(
 }
 
 test "startup recovery exposes control path mutations to its caller" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -504,7 +506,9 @@ fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
 }
 
 test "transaction startup retries transient recovery lock contention" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -556,7 +560,9 @@ test "transaction startup retries transient recovery lock contention" {
 }
 
 test "known recovery mutation survives later commit uncertainty" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -591,7 +597,9 @@ test "known recovery mutation survives later commit uncertainty" {
 }
 
 test "created control paths survive later recovery uncertainty" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -653,7 +661,9 @@ test "created control paths survive later recovery uncertainty" {
 }
 
 test "failed control path creation remains uncertain" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -742,12 +752,8 @@ fn transactValidated(
     transaction_generated: []const protocol.GeneratedOutput,
 ) !Result {
     scope.mutation_state = null;
-    var paths = try TransactionPaths.init(
-        scope,
-        allocator,
-        repo_root,
-        operationNeedsRevisionArchive(operation),
-    );
+    const needs_archive = operationNeedsRevisionArchive(operation);
+    var paths = try TransactionPaths.init(scope, allocator, repo_root, needs_archive);
     defer paths.deinit(allocator);
     scope.mutation_state = paths.created_control_paths or
         paths.recovery_mutated_storage;
@@ -5201,7 +5207,9 @@ fn expectBasicPendingRecovery(
 }
 
 test "transaction appends an event and binding in one durable transaction" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -5542,7 +5550,9 @@ fn expectChainedReplay(
 }
 
 test "transaction materializes passive event requests before chained append" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -5738,11 +5748,7 @@ fn expectPlainExistingBinding(
     defer bound.deinit(std.testing.allocator);
     try std.testing.expect(bound.storage_mutated);
     try std.testing.expectEqualStrings("bound", bound.effects[0].result);
-    var resolved = try storage.resolve(
-        std.testing.allocator,
-        cached_storage,
-        parameters,
-    );
+    var resolved = try storage.resolve(std.testing.allocator, cached_storage, parameters);
     defer resolved.deinit(std.testing.allocator);
     var snapshot = try custody.readReplaySlotOrMissing(
         scope,
@@ -5768,7 +5774,9 @@ fn expectPlainExistingBinding(
 }
 
 test "plain event materialization preserves declared bytes through replay and binding" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -5919,7 +5927,9 @@ fn expectCapabilityForbidden(
 }
 
 test "transaction keeps generated capabilities transient and checks retained custody" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -5990,7 +6000,9 @@ fn segmentedDefinitionBoundAlloc(allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "segmented definitions reject inputs that can exceed one event" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
@@ -6009,7 +6021,9 @@ test "segmented definitions reject inputs that can exceed one event" {
 }
 
 test "segmented bind existing maps its admitted source read only" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6167,7 +6181,9 @@ fn expectDefinitionBoundReplay(
 }
 
 test "transaction admits and replays a definition-bound event chain" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6204,7 +6220,9 @@ test "transaction admits and replays a definition-bound event chain" {
 }
 
 test "segmented transaction checkpoints and appends bounded active files" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
@@ -6251,7 +6269,9 @@ test "segmented transaction checkpoints and appends bounded active files" {
 }
 
 test "segmented record bound limits suffix replay rather than lifetime" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
@@ -6311,7 +6331,9 @@ test "segmented record bound limits suffix replay rather than lifetime" {
 }
 
 test "segmented transaction refuses unmigrated legacy custody" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     const source = try segmentedDefinitionBoundAlloc(std.testing.allocator);
     defer std.testing.allocator.free(source);
@@ -6350,7 +6372,9 @@ test "segmented transaction refuses unmigrated legacy custody" {
 }
 
 test "segmented compare append enforces its expected revision" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     const with_parameter = try std.mem.replaceOwned(
         u8,
@@ -6486,7 +6510,9 @@ fn appendWithRenamedPartition(
 }
 
 test "historical replay uses the parameter names archived with each row" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6585,7 +6611,9 @@ const parameter_bound_document_definition =
     "\"max_reducer_states\":4}}";
 
 test "transaction binds logical path parameters to validated input fields" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6779,7 +6807,9 @@ fn corruptDocumentRevision(
 }
 
 test "document replacements replay from immutable prior revisions" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6814,7 +6844,9 @@ const replaced_event_log_definition =
 ;
 
 test "transaction streaming replay owns and releases read custody" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6872,7 +6904,9 @@ test "transaction streaming replay owns and releases read custody" {
 }
 
 test "append falls back to materialized replay after an event-log replacement" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -6914,7 +6948,12 @@ test "append falls back to materialized replay after an event-log replacement" {
     try std.testing.expect(appended.storage_mutated);
     const store_path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ plans.repo_root, storage_root.controlComponent(scope), "example", "replaced-log.jsonl" },
+        &.{
+            plans.repo_root,
+            storage_root.controlComponent(scope),
+            "example",
+            "replaced-log.jsonl",
+        },
     );
     defer std.testing.allocator.free(store_path);
     const content = try durable_store.readRegularFileNoSymlink(
@@ -6946,7 +6985,9 @@ const unbound_store_definition =
     "\"max_diagnostics\":8,\"max_reducer_states\":4}}";
 
 test "transaction fails closed for an unbound existing store" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -7209,7 +7250,9 @@ fn expectContentEventCount(
 }
 
 test "plain event idempotency derives a transformed truncated digest with an explicit bypass" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var plans = try TransactionTestPlans.init(
         scope,
@@ -7250,7 +7293,11 @@ test "plain event idempotency derives a transformed truncated digest with an exp
     );
 }
 
-fn ensureTransactionDirectories(scope: *storage_root.Scope, self: *TransactionPaths, require_revisions: bool) !void {
+fn ensureTransactionDirectories(
+    scope: *storage_root.Scope,
+    self: *TransactionPaths,
+    require_revisions: bool,
+) !void {
     try durable_store.ensureDirectoryPathNoSymlinksObserved(
         scope.fs,
         self.ledger_root,

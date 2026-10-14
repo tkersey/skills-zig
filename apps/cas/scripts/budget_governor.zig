@@ -103,7 +103,12 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(init.io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersion(&help_writer.interface, argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersion(
+        &help_writer.interface,
+        argv,
+        UsageText,
+        Version,
+    )) return;
 
     const parsed = try parseArgs(argv);
     if (parsed.show_version) {
@@ -133,7 +138,13 @@ pub fn main(init: std.process.Init) !void {
     );
     defer allocator.free(input);
 
-    var owned = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec orelse @intCast(@divFloor(std.Io.Clock.real.now(init.io).nanoseconds, 1_000_000_000)));
+    var owned = try computeBudgetGovernorFromSlice(
+        allocator,
+        input,
+        parsed.now_sec orelse @intCast(
+            @divFloor(std.Io.Clock.real.now(init.io).nanoseconds, 1_000_000_000),
+        ),
+    );
     defer owned.deinit();
     const out = owned.value;
 

@@ -87,14 +87,19 @@ fn retireConfigChild(io: std.Io, child: *std.process.Child) void {
         else => if (child.id) |pid| {
             std.posix.kill(pid, std.posix.SIG.KILL) catch |err| switch (err) {
                 error.ProcessNotFound => {},
-                else => {
-                    var diagnostic = std.Io.File.stderr().writer(io, &.{});
-                    diagnostic.interface.print("warning: could not kill Codex config child: {s}\n", .{@errorName(err)}) catch {};
-                },
+                else => warnConfigChildKill(io, err),
             };
         },
     }
     child.kill(io);
+}
+
+fn warnConfigChildKill(io: std.Io, err: anyerror) void {
+    var diagnostic = std.Io.File.stderr().writer(io, &.{});
+    diagnostic.interface.print(
+        "warning: could not kill Codex config child: {s}\n",
+        .{@errorName(err)},
+    ) catch return;
 }
 
 const initialize_request =

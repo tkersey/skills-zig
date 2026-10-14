@@ -230,7 +230,11 @@ fn loadLocator(
     var entries = try cache_root.openChild("locators", .read_only);
     defer entries.deinit();
     const leaf = cacheLeaf(locator_key);
-    const locator_entry = entries.readAlloc(allocator, &leaf, locator_limits.max_entry_bytes) catch |err| switch (err) {
+    const locator_entry = entries.readAlloc(
+        allocator,
+        &leaf,
+        locator_limits.max_entry_bytes,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -383,7 +387,11 @@ fn writeLocatorEntry(
     defer locator_encoder.deinit();
     try encodeLocator(plan_set, plan_key, &locator_encoder);
     const locator_payload = locator_encoder.written();
-    const header = try definition_core.cache.encodeHeader(locator_key, locator_payload, locator_limits);
+    const header = try definition_core.cache.encodeHeader(
+        locator_key,
+        locator_payload,
+        locator_limits,
+    );
     var entries = try cache_root.openChild("locators", .create);
     defer entries.deinit();
     const leaf = cacheLeaf(locator_key);
@@ -872,7 +880,10 @@ test "failed locator publication leaves a complete unadvertised plan and a usabl
     const fs = durable_store.Fs.init(io, .cwd());
     var source = std.testing.tmpDir(.{});
     defer source.cleanup();
-    try source.dir.writeFile(io, .{ .sub_path = "observation.json", .data = cached_observation_definition });
+    try source.dir.writeFile(
+        io,
+        .{ .sub_path = "observation.json", .data = cached_observation_definition },
+    );
     const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(source_root);
     var cache = std.testing.tmpDir(.{});
@@ -881,7 +892,16 @@ test "failed locator publication leaves a complete unadvertised plan and a usabl
     const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(cache_root);
     const request: Request = .{ .projection_names = &.{"rows"} };
-    var result = try load(fs, allocator, source_root, "observation.json", request, "1", "trace/v1", .{ .cache_dir = cache_root });
+    var result = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
     defer result.deinit(allocator);
     try std.testing.expect(result.stats.cache_write_failed);
     try std.testing.expect(!result.stats.cache_hit);
@@ -895,11 +915,29 @@ test "failed locator publication leaves a complete unadvertised plan and a usabl
     defer allocator.free(entry);
     _ = try definition_core.cache.decode(key, entry, cache_limits);
     try cache.dir.deleteFile(io, "locators");
-    var repaired = try load(fs, allocator, source_root, "observation.json", request, "1", "trace/v1", .{ .cache_dir = cache_root });
+    var repaired = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
     defer repaired.deinit(allocator);
     try std.testing.expect(!repaired.stats.cache_hit);
     try std.testing.expect(!repaired.stats.cache_write_failed);
-    var warm = try load(fs, allocator, source_root, "observation.json", request, "1", "trace/v1", .{ .cache_dir = cache_root });
+    var warm = try load(
+        fs,
+        allocator,
+        source_root,
+        "observation.json",
+        request,
+        "1",
+        "trace/v1",
+        .{ .cache_dir = cache_root },
+    );
     defer warm.deinit(allocator);
     try std.testing.expect(warm.stats.cache_hit);
 }

@@ -100,36 +100,9 @@ fn executeBatch(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator) !void
 fn executeSeqObserve(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator) !void {
     const cwd = try dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(cwd);
-    const definition_root = try std.fs.path.join(
-        allocator,
-        &.{ cwd, "apps/seq/src/v1/fixtures" },
-    );
+    const definition_root = try std.fs.path.join(allocator, &.{ cwd, "apps/seq/src/v1/fixtures" });
     defer allocator.free(definition_root);
-    const projection_names = [_][]const u8{"rows"};
-    // The active driver is overlaid into archived product snapshots. Keep
-    // their original API usable without reintroducing ambient authority in
-    // current Seq modules or changing the frozen historical driver source.
-    var plans = if (comptime @typeInfo(@TypeOf(seq_v1.compiled_plan.load)).@"fn".param_types.len == 8)
-        try seq_v1.compiled_plan.load(
-            .init(io, dir),
-            allocator,
-            definition_root,
-            "message-observation.json",
-            .{ .projection_names = &projection_names },
-            "1.0.0",
-            "seq-source-adapter/v1",
-            .{},
-        )
-    else
-        try seq_v1.compiled_plan.load(
-            allocator,
-            definition_root,
-            "message-observation.json",
-            .{ .projection_names = &projection_names },
-            "1.0.0",
-            "seq-source-adapter/v1",
-            .{},
-        );
+    var plans = try loadObservePlans(io, dir, allocator, definition_root);
     defer plans.deinit(allocator);
     const parameter_inputs = [_]definition_core.parameters.Input{.{
         .name = "needle",
@@ -161,7 +134,9 @@ fn executeSeqObserve(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator) 
         &.{ definition_root, "rollout.jsonl" },
     );
     defer allocator.free(trace_path);
-    var observation = if (comptime @typeInfo(@TypeOf(seq_v1.trace_adapter.observeFile)).@"fn".param_types.len == 7)
+    var observation = if (comptime @typeInfo(
+        @TypeOf(seq_v1.trace_adapter.observeFile),
+    ).@"fn".param_types.len == 7)
         try seq_v1.trace_adapter.observeFile(
             io,
             dir,
@@ -191,7 +166,47 @@ fn executeSeqObserve(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator) 
     }
 }
 
-fn writeArtifact(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, metrics: Metrics) !void {
+fn loadObservePlans(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    definition_root: []const u8,
+) !seq_v1.compiled_plan.PlanSet {
+    const projection_names = [_][]const u8{"rows"};
+    // The active driver is overlaid into archived product snapshots. Keep
+    // their original API usable without reintroducing ambient authority in
+    // current Seq modules or changing the frozen historical driver source.
+    return if (comptime @typeInfo(
+        @TypeOf(seq_v1.compiled_plan.load),
+    ).@"fn".param_types.len == 8)
+        try seq_v1.compiled_plan.load(
+            .init(io, dir),
+            allocator,
+            definition_root,
+            "message-observation.json",
+            .{ .projection_names = &projection_names },
+            "1.0.0",
+            "seq-source-adapter/v1",
+            .{},
+        )
+    else
+        try seq_v1.compiled_plan.load(
+            allocator,
+            definition_root,
+            "message-observation.json",
+            .{ .projection_names = &projection_names },
+            "1.0.0",
+            "seq-source-adapter/v1",
+            .{},
+        );
+}
+
+fn writeArtifact(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    metrics: Metrics,
+) !void {
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const baseline_dir = try std.fs.path.join(
@@ -286,19 +301,30 @@ test "Seq replay driver artifact uses supplied directory and I/O" {
     defer allocator.free(artifact_path);
     const first_bytes = try first.dir.readFileAlloc(io, artifact_path, allocator, .limited(4096));
     defer allocator.free(first_bytes);
-    try std.testing.expectError(error.FileNotFound, second.dir.readFileAlloc(io, artifact_path, allocator, .limited(4096)));
+    try std.testing.expectError(
+        error.FileNotFound,
+        second.dir.readFileAlloc(io, artifact_path, allocator, .limited(4096)),
+    );
     try writeArtifact(io, second.dir, allocator, metrics);
     const second_bytes = try second.dir.readFileAlloc(io, artifact_path, allocator, .limited(4096));
     defer allocator.free(second_bytes);
     try std.testing.expectEqualSlices(u8, first_bytes, second_bytes);
 
     const Canceled = struct {
-        fn createDirPath(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.Permissions) std.Io.Dir.CreateDirPathError!std.Io.Dir.CreatePathStatus {
+        fn createDirPath(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.Permissions,
+        ) std.Io.Dir.CreateDirPathError!std.Io.Dir.CreatePathStatus {
             return error.Canceled;
         }
     };
     var vtable = io.vtable.*;
     vtable.dirCreateDirPath = Canceled.createDirPath;
     const canceled_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.Canceled, writeArtifact(canceled_io, first.dir, allocator, metrics));
+    try std.testing.expectError(
+        error.Canceled,
+        writeArtifact(canceled_io, first.dir, allocator, metrics),
+    );
 }

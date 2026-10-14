@@ -1167,7 +1167,13 @@ test "closure is canonical, deterministically ordered, and content addressed" {
         .data = "{\"value\":2,\"schema\":\"example-import/v1\"}",
     });
 
-    var closure = try loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "root.json", .{});
+    var closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "root.json",
+        .{},
+    );
     defer closure.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), closure.files.len);
     try std.testing.expectEqualStrings("a.json", closure.files[0].path);
@@ -1181,7 +1187,13 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     );
     try std.testing.expect(canonical_json.isFingerprint(closure.digestSlice()));
 
-    var repeated = try loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "./root.json", .{});
+    var repeated = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "./root.json",
+        .{},
+    );
     defer repeated.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(closure.digestSlice(), repeated.digestSlice());
 }
@@ -1338,7 +1350,13 @@ test "iterative import traversal preserves deep source and canonical closure byt
         });
     }
     const limits: Limits = .{ .max_import_depth = 96, .max_files = 96 };
-    var loaded = try loadFromDir(std.testing.io, std.testing.allocator, &tmp.dir, "f000.json", limits);
+    var loaded = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "f000.json",
+        limits,
+    );
     defer loaded.deinit(std.testing.allocator);
     var canonical = try fromCanonicalFiles(
         std.testing.allocator,
@@ -1392,7 +1410,13 @@ test "import depth precedes cycles and cycles precede new-file admission" {
 }
 
 fn loadChainForAllocationFailure(allocator: std.mem.Allocator, root: *std.Io.Dir) !void {
-    var loaded = loadFromDir(std.testing.io, allocator, root, "f000.json", .{}) catch |err| switch (err) {
+    var loaded = loadFromDir(
+        std.testing.io,
+        allocator,
+        root,
+        "f000.json",
+        .{},
+    ) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };
@@ -1446,7 +1470,12 @@ test "import frames free pending siblings at every failed allocation" {
 
 test "closure operations retain supplied I/O cancellation" {
     const Canceled = struct {
-        fn stat(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+        fn stat(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.StatFileOptions,
+        ) std.Io.Dir.StatFileError!std.Io.File.Stat {
             return error.Canceled;
         }
     };
@@ -1454,10 +1483,22 @@ test "closure operations retain supplied I/O cancellation" {
     vtable.dirStatFile = Canceled.stat;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
     var root = std.Io.Dir.cwd();
-    try std.testing.expectError(error.Canceled, loadFromDir(io, std.testing.allocator, &root, "entry.json", .{}));
-    try std.testing.expectError(error.Canceled, load(io, std.testing.allocator, "/unused", "entry.json", .{}));
-    try std.testing.expectError(error.Canceled, admittedPackageLocation(io, "/packages/one/definitions/entry.json", "packages"));
-    try std.testing.expectError(error.Canceled, admittedLocation(io, "/packages/one/definitions/entry.json", "/current", "packages"));
+    try std.testing.expectError(
+        error.Canceled,
+        loadFromDir(io, std.testing.allocator, &root, "entry.json", .{}),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        load(io, std.testing.allocator, "/unused", "entry.json", .{}),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        admittedPackageLocation(io, "/packages/one/definitions/entry.json", "packages"),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        admittedLocation(io, "/packages/one/definitions/entry.json", "/current", "packages"),
+    );
 }
 
 test "closures from independent directory authorities do not exchange files" {
@@ -1466,10 +1507,25 @@ test "closures from independent directory authorities do not exchange files" {
     var second = std.testing.tmpDir(.{});
     defer second.cleanup();
     try first.dir.writeFile(std.testing.io, .{ .sub_path = "entry.json", .data = "{\"value\":1}" });
-    try second.dir.writeFile(std.testing.io, .{ .sub_path = "entry.json", .data = "{\"value\":2}" });
-    var first_closure = try loadFromDir(std.testing.io, std.testing.allocator, &first.dir, "entry.json", .{});
+    try second.dir.writeFile(
+        std.testing.io,
+        .{ .sub_path = "entry.json", .data = "{\"value\":2}" },
+    );
+    var first_closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &first.dir,
+        "entry.json",
+        .{},
+    );
     defer first_closure.deinit(std.testing.allocator);
-    var second_closure = try loadFromDir(std.testing.io, std.testing.allocator, &second.dir, "entry.json", .{});
+    var second_closure = try loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &second.dir,
+        "entry.json",
+        .{},
+    );
     defer second_closure.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("{\"value\":1}", first_closure.files[0].canonical_json);
     try std.testing.expectEqualStrings("{\"value\":2}", second_closure.files[0].canonical_json);
@@ -1483,5 +1539,9 @@ fn checkNormalizedPathAllocation(allocator: std.mem.Allocator) !void {
 }
 
 test "path normalization preserves allocation failure as OutOfMemory" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNormalizedPathAllocation, .{});
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNormalizedPathAllocation,
+        .{},
+    );
 }

@@ -703,7 +703,6 @@ pub fn runCodexExec(
         operation.io,
         tmp_dir,
     );
-
     const output_path = try allocator.print(
         "{s}/{s}.txt",
         .{ tmp_dir, thread_id },
@@ -762,7 +761,11 @@ pub fn runCodexExec(
 }
 
 pub fn tmpAutomationRunnerDir(operation: Operation, allocator: std.mem.Allocator) ![]u8 {
-    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(
+        operation.io,
+        "HOME is not set",
+        .{},
+    );
     return allocator.print("{s}/.codex/tmp/automation-runner", .{home});
 }
 
@@ -771,8 +774,16 @@ pub const RunLock = struct {
     path: []u8,
 };
 
-pub fn acquireRunLock(operation: Operation, allocator: std.mem.Allocator, label: []const u8) !?RunLock {
-    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+pub fn acquireRunLock(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+) !?RunLock {
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(
+        operation.io,
+        "HOME is not set",
+        .{},
+    );
     const validated_label = try scheduler.validateSchedulerLabel(operation.io, label);
 
     const lock_dir = try allocator.print(

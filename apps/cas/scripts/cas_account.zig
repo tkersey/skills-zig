@@ -134,7 +134,12 @@ pub fn run(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
 
     const opts = parseArgs(argv) catch |err| {
         return usageFailure(io, @errorName(err), null);
@@ -162,7 +167,14 @@ pub fn run(init: std.process.Init) !u8 {
     defer directory.close(io);
     const environ = init.environ_map;
 
-    var account_client = startAccountClient(directory, environ, allocator, opts, cwd, init.io) catch |err| {
+    var account_client = startAccountClient(
+        directory,
+        environ,
+        allocator,
+        opts,
+        cwd,
+        init.io,
+    ) catch |err| {
         return fail(io, allocator, opts, "transportFailure", @errorName(err), 1);
     };
     defer account_client.deinit(allocator);
@@ -174,7 +186,12 @@ pub fn run(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn runStatus(io: std.Io, allocator: std.mem.Allocator, opts: ParsedArgs, client: *cas.Client) !void {
+fn runStatus(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    opts: ParsedArgs,
+    client: *cas.Client,
+) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -326,7 +343,10 @@ fn parseRateLimits(io: std.Io, allocator: std.mem.Allocator, json: []const u8) !
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-    const governor = budget_governor.computeBudgetGovernor(root, @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, 1_000_000_000)));
+    const governor = budget_governor.computeBudgetGovernor(
+        root,
+        @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, 1_000_000_000)),
+    );
     const bucket = selectedRateLimitBucket(root, governor);
     return .{
         .governor = governor,
@@ -386,11 +406,27 @@ fn startAccountClient(
     ) catch opts.codex_path;
     defer if (resolved_codex_path.ptr != opts.codex_path.ptr) allocator.free(resolved_codex_path);
 
-    var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(allocator, cwd, resolved_codex_path, opts.hook_policy, io, directory, environ) catch null;
+    var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(
+        allocator,
+        cwd,
+        resolved_codex_path,
+        opts.hook_policy,
+        io,
+        directory,
+        environ,
+    ) catch null;
     const client = if (managed_server) |server|
         cas.Client.start(
             allocator,
-            clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, server.listen_url),
+            clientOptions(
+                directory,
+                environ,
+                opts,
+                cwd,
+                io,
+                resolved_codex_path,
+                server.listen_url,
+            ),
         ) catch blk: {
             var owned_server = server;
             defer owned_server.deinit(allocator);
@@ -402,7 +438,10 @@ fn startAccountClient(
             );
         }
     else
-        try cas.Client.start(allocator, clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null));
+        try cas.Client.start(
+            allocator,
+            clientOptions(directory, environ, opts, cwd, io, resolved_codex_path, null),
+        );
 
     return .{ .client = client, .managed_server = managed_server };
 }
@@ -881,6 +920,12 @@ test "usage search handles deep and wide JSON without recursion" {
 
 fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
     return 2;
 }

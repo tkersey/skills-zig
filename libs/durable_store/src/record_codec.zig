@@ -901,7 +901,10 @@ pub fn renderTransactionRecordAlloc(
     return out.toOwnedSlice();
 }
 
-pub fn freeTransactionExpectedRows(allocator: std.mem.Allocator, expected: []TransactionExpected) void {
+pub fn freeTransactionExpectedRows(
+    allocator: std.mem.Allocator,
+    expected: []TransactionExpected,
+) void {
     for (expected) |row| {
         allocator.free(row.path);
         allocator.free(row.digest);

@@ -200,7 +200,11 @@ const RecoveryPaths = struct {
     }
 };
 
-fn resolveRepoRoot(scope: *storage_root.Scope, allocator: std.mem.Allocator, repo_path: []const u8) ![:0]u8 {
+fn resolveRepoRoot(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_path: []const u8,
+) ![:0]u8 {
     if (storage_root.isActive(scope)) {
         if (!std.mem.eql(u8, repo_path, ".")) return error.InvalidManagedRoot;
         return allocator.dupeSentinel(u8, ".", 0);
@@ -2611,7 +2615,9 @@ test "recovery parser separates inspection from exact witnessed reclaim" {
 }
 
 test "recovery paths reject symlinks in generated control components" {
-    var scope_value = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_value = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_value;
     if (@import("builtin").os.tag == .windows) {
         return error.SkipZigTest;

@@ -74,10 +74,13 @@ pub const deinitLegacyLeaseRecoveryCandidates = transactions.deinitLegacyLeaseRe
 pub const reclaimLegacyLease = transactions.reclaimLegacyLease;
 pub const recoverTransaction = transactions.recoverTransaction;
 pub const recoverTransactionWithOptions = transactions.recoverTransactionWithOptions;
-pub const recoverTransactionWithOptionsAccumulating = transactions.recoverTransactionWithOptionsAccumulating;
+pub const recoverTransactionWithOptionsAccumulating =
+    transactions.recoverTransactionWithOptionsAccumulating;
 pub const recoverAndCompactTransactions = transactions.recoverAndCompactTransactions;
-pub const recoverAndCompactTransactionsWithOptions = transactions.recoverAndCompactTransactionsWithOptions;
-pub const recoverAndCompactTransactionsAccumulating = transactions.recoverAndCompactTransactionsAccumulating;
+pub const recoverAndCompactTransactionsWithOptions =
+    transactions.recoverAndCompactTransactionsWithOptions;
+pub const recoverAndCompactTransactionsAccumulating =
+    transactions.recoverAndCompactTransactionsAccumulating;
 pub const max_event_record_bytes = event.max_event_record_bytes;
 pub const lockPathAlloc = record_codec.lockPathAlloc;
 pub const eventStoreLockPathAlloc = filesystem.eventStoreLockPathAlloc;
@@ -93,7 +96,8 @@ pub const rejectSymlinkComponents = filesystem.rejectSymlinkComponents;
 pub const ensureDirectoryPathNoSymlinks = filesystem.ensureDirectoryPathNoSymlinks;
 pub const ensureDirectoryPathNoSymlinksObserved = filesystem.ensureDirectoryPathNoSymlinksObserved;
 pub const ensurePrivateDirectoryPathNoSymlinks = filesystem.ensurePrivateDirectoryPathNoSymlinks;
-pub const validatePrivateDirectoryPathNoSymlinks = filesystem.validatePrivateDirectoryPathNoSymlinks;
+pub const validatePrivateDirectoryPathNoSymlinks =
+    filesystem.validatePrivateDirectoryPathNoSymlinks;
 pub const readRegularFileNoSymlink = filesystem.readRegularFileNoSymlink;
 pub const freeStringList = filesystem.freeStringList;
 pub const listSortedRegularFilesNoSymlink = filesystem.listSortedRegularFilesNoSymlink;

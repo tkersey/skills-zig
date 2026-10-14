@@ -146,8 +146,12 @@ pub fn run(init: std.process.Init) !u8 {
     const allocator = arena.allocator();
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var help_writer = std.Io.File.stdout().writer(io, &.{});
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&help_writer.interface, argv, HelpSurface, Version)) return 0;
-
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &help_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
     const parsed = parseArgs(allocator, argv) catch |err| {
         return usageFailure(io, @errorName(err), null);
     };
@@ -183,7 +187,13 @@ pub fn run(init: std.process.Init) !u8 {
         .dir = directory,
         .environ = init.environ_map,
         .cwd = cwd,
-        .smoke_binary = try resolveExecutable(io, directory, allocator, parsed.smoke_binary, "cas_smoke_check"),
+        .smoke_binary = try resolveExecutable(
+            io,
+            directory,
+            allocator,
+            parsed.smoke_binary,
+            "cas_smoke_check",
+        ),
         .preflight_binary = try resolveExecutable(
             io,
             directory,
@@ -225,7 +235,14 @@ fn runScenarios(allocator: std.mem.Allocator, parsed: ParsedArgs, ctx: Context) 
         if (!result.ok) overall_ok = false;
     }
 
-    try writeScenarioReport(ctx.io, parsed.json, ctx.cwd, smoke_preflight, results.items, overall_ok);
+    try writeScenarioReport(
+        ctx.io,
+        parsed.json,
+        ctx.cwd,
+        smoke_preflight,
+        results.items,
+        overall_ok,
+    );
     return if (overall_ok) 0 else 1;
 }
 
@@ -396,7 +413,13 @@ fn runCommandCapture(
     const executable = if (std.mem.indexOfScalar(u8, argv[0], '/') != null)
         try allocator.dupe(u8, argv[0])
     else
-        cas_proxy_client.resolveExecutableAlloc(allocator, io, ctx.dir, ctx.environ.get("PATH"), argv[0]) catch |err| switch (err) {
+        cas_proxy_client.resolveExecutableAlloc(
+            allocator,
+            io,
+            ctx.dir,
+            ctx.environ.get("PATH"),
+            argv[0],
+        ) catch |err| switch (err) {
             error.ExecutableNotFound, error.MissingExecutable => return error.FileNotFound,
             else => return err,
         };
@@ -404,7 +427,12 @@ fn runCommandCapture(
     const resolved_argv = try allocator.dupe([]const u8, argv);
     defer allocator.free(resolved_argv);
     resolved_argv[0] = executable;
-    if (builtin.target.os.tag == .macos) return runCommandCapturePosixSpawn(ctx, allocator, cwd, resolved_argv);
+    if (builtin.target.os.tag == .macos) return runCommandCapturePosixSpawn(
+        ctx,
+        allocator,
+        cwd,
+        resolved_argv,
+    );
 
     const result = try std.process.run(allocator, io, .{
         .argv = resolved_argv,
@@ -499,7 +527,12 @@ fn statusToExitCode(status: u32) u8 {
     return 1;
 }
 
-fn readFileAbsoluteAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+fn readFileAbsoluteAlloc(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
     const base = std.fs.path.basename(path);
     var dir = try std.Io.Dir.openDirAbsolute(
@@ -1155,7 +1188,6 @@ fn spawnCapturedCommand(
         stderr_handle,
         std.posix.STDERR_FILENO,
     ) != 0) return error.SpawnFileActionsFailed;
-
     var cwd_storage: ?[:0]u8 = null;
     defer if (cwd_storage) |path| allocator.free(path);
     if (cwd) |path| {
@@ -1167,7 +1199,6 @@ fn spawnCapturedCommand(
     } else if (std.c.posix_spawn_file_actions_addfchdir_np(&actions, directory.handle) != 0) {
         return error.SpawnFileActionsFailed;
     }
-
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
     defer allocator.free(argv_buf);
     var arg_storage = try allocator.alloc([:0]u8, argv.len);
@@ -1181,7 +1212,6 @@ fn spawnCapturedCommand(
         arg_count += 1;
         argv_buf[i] = arg_storage[i].ptr;
     }
-
     var pid: std.c.pid_t = undefined;
     // Keep the temporary POSIX environment under one owner, including partial
     // construction failure (Zig 0.17 frees a partial pointer-array extent).
@@ -1191,7 +1221,10 @@ fn spawnCapturedCommand(
     const envp = environment.slice.ptr;
     const spawn_rc = std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
     if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+    return waitCapturedCommand(pid);
+}
 
+fn waitCapturedCommand(pid: std.c.pid_t) !u8 {
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     // The owned child determines termination; interruptions only retry the wait.
     while (true) { // tiger: event-loop
@@ -1202,7 +1235,6 @@ fn spawnCapturedCommand(
             else => return error.WaitFailed,
         }
     }
-
     return statusToExitCode(@bitCast(status));
 }
 
@@ -1297,6 +1329,12 @@ fn verifyRetryWireLog(
 
 fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
     return 2;
 }

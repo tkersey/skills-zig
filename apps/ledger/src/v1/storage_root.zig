@@ -389,12 +389,21 @@ test "managed admission cleans up every partial allocation" {
     });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, prepareAllocationProbe, .{root});
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        prepareAllocationProbe,
+        .{root},
+    );
 }
 
 test "managed admission propagates supplied I/O cancellation" {
     const Cancelled = struct {
-        fn openDir(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+        fn openDir(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenOptions,
+        ) std.Io.Dir.OpenError!std.Io.Dir {
             return error.Canceled;
         }
     };

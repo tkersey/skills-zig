@@ -475,6 +475,10 @@ test "separate cache header preserves frozen envelope bytes and full payload bud
     try std.testing.expectError(error.CacheEntryTooLarge, encodeHeader(cache_key, payload, .{
         .max_entry_bytes = header_bytes + payload.len - 1,
     }));
-    const empty = try encodeHeader(cache_key, "", .{ .max_payload_bytes = 0, .max_entry_bytes = header_bytes });
+    const empty = try encodeHeader(
+        cache_key,
+        "",
+        .{ .max_payload_bytes = 0, .max_entry_bytes = header_bytes },
+    );
     try std.testing.expectEqualStrings("", try decode(cache_key, &empty, .{}));
 }

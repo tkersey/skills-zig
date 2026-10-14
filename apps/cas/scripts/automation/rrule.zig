@@ -77,7 +77,11 @@ pub const RRule = struct {
     }
 };
 
-pub fn parseAndCanonicalizeRrule(io: std.Io, allocator: std.mem.Allocator, raw_input: []const u8) ![]u8 {
+pub fn parseAndCanonicalizeRrule(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    raw_input: []const u8,
+) ![]u8 {
     var input = std.mem.trim(u8, raw_input, " \t\r\n");
     if (input.len == 0) return userErrorFmt(io, "rrule must not be empty", .{});
 
@@ -108,7 +112,11 @@ pub fn parseRrule(io: std.Io, allocator: std.mem.Allocator, raw_rule: []const u8
             return userErrorFmt(io, "rrule token missing key: {s}", .{part});
         const value_raw = kv.next() orelse
             return userErrorFmt(io, "rrule token missing value: {s}", .{part});
-        if (kv.next() != null) return userErrorFmt(io, "rrule token has multiple '=': {s}", .{part});
+        if (kv.next() != null) return userErrorFmt(
+            io,
+            "rrule token has multiple '=': {s}",
+            .{part},
+        );
 
         const key = std.mem.trim(u8, key_raw, " \t\r\n");
         const value = std.mem.trim(u8, value_raw, " \t\r\n");
@@ -280,7 +288,12 @@ pub fn dateStringUtc(allocator: std.mem.Allocator, ms: i64) ![]u8 {
     return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
 }
 
-pub fn computeNextRunAt(io: std.Io, allocator: std.mem.Allocator, row: anytype, run_started_ms: i64) !i64 {
+pub fn computeNextRunAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    row: anytype,
+    run_started_ms: i64,
+) !i64 {
     const raw = std.mem.trim(u8, row.rrule, " \t\r\n");
     if (raw.len == 0) return userErrorFmt(io, "automation {s} has empty rrule", .{row.id});
 
@@ -288,7 +301,11 @@ pub fn computeNextRunAt(io: std.Io, allocator: std.mem.Allocator, row: anytype, 
         std.mem.trim(u8, raw[6..], " \t\r\n")
     else
         raw;
-    if (rule_text.len == 0) return userErrorFmt(io, "automation {s} has malformed rrule", .{row.id});
+    if (rule_text.len == 0) return userErrorFmt(
+        io,
+        "automation {s} has malformed rrule",
+        .{row.id},
+    );
 
     var rule = try parseRrule(io, allocator, rule_text);
     defer rule.deinit(allocator);
@@ -311,7 +328,11 @@ pub fn computeNextRunAt(io: std.Io, allocator: std.mem.Allocator, row: anytype, 
 }
 
 pub fn nextHourly(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
-    const minute = rule.byminute orelse return userErrorFmt(io, "HOURLY rrule missing BYMINUTE", .{});
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "HOURLY rrule missing BYMINUTE",
+        .{},
+    );
 
     const base_sec = @divFloor(dtstart_ms, 1000);
     const anchor_sec = @divFloor(anchor_ms, 1000);
@@ -331,7 +352,11 @@ pub fn nextHourly(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64
 
 pub fn nextDaily(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
     const hour = rule.byhour orelse return userErrorFmt(io, "DAILY rrule missing BYHOUR", .{});
-    const minute = rule.byminute orelse return userErrorFmt(io, "DAILY rrule missing BYMINUTE", .{});
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "DAILY rrule missing BYMINUTE",
+        .{},
+    );
 
     const base_sec = @divFloor(dtstart_ms, 1000);
     const anchor_sec = @divFloor(anchor_ms, 1000);
@@ -351,7 +376,11 @@ pub fn nextDaily(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 
 
 pub fn nextWeekly(io: std.Io, rule: RRule, dtstart_ms: i64, anchor_ms: i64) !i64 {
     const hour = rule.byhour orelse return userErrorFmt(io, "WEEKLY rrule missing BYHOUR", .{});
-    const minute = rule.byminute orelse return userErrorFmt(io, "WEEKLY rrule missing BYMINUTE", .{});
+    const minute = rule.byminute orelse return userErrorFmt(
+        io,
+        "WEEKLY rrule missing BYMINUTE",
+        .{},
+    );
     if (rule.byday.items.len == 0) return userErrorFmt(io, "WEEKLY rrule missing BYDAY", .{});
 
     const base_sec = @divFloor(dtstart_ms, 1000);
@@ -396,7 +425,10 @@ fn checkedTimestampMillis(io: std.Io, seconds: i64) !i64 {
 test "minute alignment preserves negative floors and rejects an unrepresentable floor" {
     try std.testing.expectEqual(@as(i64, -60_000), try alignMsToMinute(std.testing.io, -1));
     try std.testing.expectEqual(@as(i64, 60_000), try alignMsToMinute(std.testing.io, 60_001));
-    try std.testing.expectError(error.UserInput, alignMsToMinute(std.testing.io, std.math.minInt(i64)));
+    try std.testing.expectError(
+        error.UserInput,
+        alignMsToMinute(std.testing.io, std.math.minInt(i64)),
+    );
 }
 
 test "hourly recurrence preserves the largest representable interval" {
@@ -435,6 +467,10 @@ test "recurrence parser releases accumulated days on allocation or shape failure
 test "recurrence parser rejects intervals that do not fit the stored representation" {
     try std.testing.expectError(
         error.UserInput,
-        parseRrule(std.testing.io, std.testing.allocator, "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296"),
+        parseRrule(
+            std.testing.io,
+            std.testing.allocator,
+            "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296",
+        ),
     );
 }

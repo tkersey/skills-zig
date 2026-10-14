@@ -576,7 +576,11 @@ pub fn cmdSchedulerInstall(
         return userErrorFmt(operation.io, "scheduler commands are supported on macOS only", .{});
     }
 
-    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(
+        operation.io,
+        "HOME is not set",
+        .{},
+    );
 
     const launch_agents = try allocator.print("{s}/Library/LaunchAgents", .{home});
     defer allocator.free(launch_agents);
@@ -859,7 +863,11 @@ pub fn cmdSchedulerUninstall(
         return userErrorFmt(operation.io, "scheduler commands are supported on macOS only", .{});
     }
 
-    const home = operation.environment.get("HOME") orelse return userErrorFmt(operation.io, "HOME is not set", .{});
+    const home = operation.environment.get("HOME") orelse return userErrorFmt(
+        operation.io,
+        "HOME is not set",
+        .{},
+    );
     const plist = try allocator.print(
         "{s}/Library/LaunchAgents/{s}.plist",
         .{ home, args.label },
@@ -1006,7 +1014,12 @@ pub fn readSchedulerStatus(
     operation: Operation,
     label: []const u8,
 ) !SchedulerStatus {
-    const plist_path = try schedulerPlistPath(operation.io, allocator, operation.environment.get("HOME"), label);
+    const plist_path = try schedulerPlistPath(
+        operation.io,
+        allocator,
+        operation.environment.get("HOME"),
+        label,
+    );
     defer allocator.free(plist_path);
     var target: ?[]u8 = null;
     defer if (target) |value| allocator.free(value);
@@ -1037,7 +1050,11 @@ fn schedulerPlistPath(
     );
 }
 
-fn readSchedulerPlist(operation: Operation, allocator: std.mem.Allocator, plist_path: []const u8) !?[]u8 {
+fn readSchedulerPlist(
+    operation: Operation,
+    allocator: std.mem.Allocator,
+    plist_path: []const u8,
+) !?[]u8 {
     return operation.cwd.readFileAlloc(
         operation.io,
         plist_path,
@@ -1316,7 +1333,12 @@ test "scheduler surface requires the exact CAS argument tuple" {
 }
 
 test "scheduler status preserves disagreeing persisted Cron and loaded CAS" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1388,7 +1410,12 @@ test "scheduler uninstall JSON reports its exact result contract" {
 }
 
 test "persisted scheduler plist requires well formed XML and exact label" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1440,7 +1467,12 @@ test "persisted scheduler plist requires well formed XML and exact label" {
 }
 
 test "install rejects extra persisted arguments before effects" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1488,7 +1520,12 @@ test "install rejects extra persisted arguments before effects" {
 }
 
 test "launchctl query distinguishes exact absence from query failures" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const target = "gui/501/com.example.scheduler";
     const not_found =
@@ -1521,7 +1558,12 @@ test "launchctl query distinguishes exact absence from query failures" {
 }
 
 test "scheduler status propagates launchctl query failure" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1549,7 +1591,12 @@ test "scheduler status propagates launchctl query failure" {
 }
 
 test "loaded CAS with extra arguments requires explicit replacement" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1595,7 +1642,12 @@ test "loaded CAS with extra arguments requires explicit replacement" {
 }
 
 test "replace adopts the exact same-label standalone Cron scheduler" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1608,6 +1660,16 @@ test "replace adopts the exact same-label standalone Cron scheduler" {
     defer allocator.free(log_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = "scheduler.plist", .data = TestCronPlist });
 
+    try expectCronReplacement(allocator, operation, root, log_dir, plist_path);
+}
+
+fn expectCronReplacement(
+    allocator: std.mem.Allocator,
+    operation: Operation,
+    root: []const u8,
+    log_dir: []const u8,
+    plist_path: []const u8,
+) !void {
     const target = "gui/501/com.example.scheduler";
     const domain = "gui/501";
     const convert_argv = [_][]const u8{
@@ -1667,7 +1729,12 @@ test "replace adopts the exact same-label standalone Cron scheduler" {
 }
 
 test "failed or unverified bootout preserves the scheduler plist" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1712,7 +1779,12 @@ test "failed or unverified bootout preserves the scheduler plist" {
 }
 
 test "uninstall removes the plist only after verified launchd absence" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1745,7 +1817,12 @@ test "uninstall removes the plist only after verified launchd absence" {
 }
 
 test "uninstall reports a loaded-only scheduler as removed" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1772,7 +1849,12 @@ test "uninstall reports a loaded-only scheduler as removed" {
 }
 
 test "uninstall rejects a persisted plist with the wrong label before effects" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1799,7 +1881,12 @@ test "uninstall rejects a persisted plist with the wrong label before effects" {
 }
 
 test "scheduler install succeeds after uninstall disabled the same label" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1838,7 +1925,12 @@ test "scheduler install succeeds after uninstall disabled the same label" {
 }
 
 test "uninstall verification failure preserves the scheduler plist" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1880,7 +1972,12 @@ fn expectSchedulerPlistReadFailure(
 }
 
 test "scheduler plist inspection distinguishes absence from read failures" {
-    const operation: Operation = .{ .io = std.testing.io, .cwd = std.Io.Dir.cwd(), .cwd_path = ".", .environment = &.init(std.testing.allocator) };
+    const operation: Operation = .{
+        .io = std.testing.io,
+        .cwd = std.Io.Dir.cwd(),
+        .cwd_path = ".",
+        .environment = &.init(std.testing.allocator),
+    };
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

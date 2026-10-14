@@ -353,7 +353,13 @@ fn testSourceLocator(allocator: std.mem.Allocator, raw: []const u8) !Locator {
 }
 
 fn testVerifyLocatorAllocation(allocator: std.mem.Allocator, root: []const u8) !void {
-    var verified = try verifyLocator(std.testing.io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{});
+    var verified = try verifyLocator(
+        std.testing.io,
+        allocator,
+        root,
+        try testSourceLocator(allocator, "{}\n"),
+        .{},
+    );
     defer verified.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), verified.source_bytes);
 }
@@ -371,9 +377,18 @@ test "verified source locator owns its manifest and rereads bytes despite unchan
     try tmp.dir.writeFile(io, .{ .sub_path = "definition.json", .data = "[]\n" });
     var file = try tmp.dir.openFile(io, "definition.json", .{ .mode = .read_write });
     defer file.close(io);
-    try file.setTimestamps(io, .{ .access_timestamp = .init(stat.atime), .modify_timestamp = .{ .new = stat.mtime } });
+    try file.setTimestamps(
+        io,
+        .{ .access_timestamp = .init(stat.atime), .modify_timestamp = .{ .new = stat.mtime } },
+    );
     try std.testing.expectEqual(stat.mtime, (try file.stat(io)).mtime);
-    try std.testing.expectError(error.DefinitionSourceDigestMismatch, verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}));
+    try std.testing.expectError(
+        error.DefinitionSourceDigestMismatch,
+        verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}),
+    );
     try tmp.dir.deleteFile(io, "definition.json");
-    try std.testing.expectError(error.FileNotFound, verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}));
+    try std.testing.expectError(
+        error.FileNotFound,
+        verifyLocator(io, allocator, root, try testSourceLocator(allocator, "{}\n"), .{}),
+    );
 }

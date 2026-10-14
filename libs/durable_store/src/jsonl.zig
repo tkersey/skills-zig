@@ -180,7 +180,11 @@ pub const JsonlEventStore = struct {
         }
         const exclusive = try allocator.create(ExclusiveContext);
         errdefer allocator.destroy(exclusive);
-        const lock = acquireEventStoreExclusiveLock(fs, allocator, self.path) catch |err| switch (err) {
+        const lock = acquireEventStoreExclusiveLock(
+            fs,
+            allocator,
+            self.path,
+        ) catch |err| switch (err) {
             error.WouldBlock => return error.EventStoreBusy,
             else => return err,
         };

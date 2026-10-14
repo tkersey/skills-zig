@@ -5,11 +5,22 @@ pub fn readStdinAlloc(io: std.Io, allocator: std.mem.Allocator, max_bytes: usize
     return reader.interface.allocRemaining(allocator, .limited(max_bytes));
 }
 
-pub fn readFileAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+pub fn readFileAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     return dir.readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
-pub fn realPathAlloc(io: std.Io, dir: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
+pub fn realPathAlloc(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![:0]u8 {
     return dir.realPathFileAlloc(io, path, allocator);
 }
 
@@ -60,14 +71,22 @@ test "filesystem helpers retain the supplied directory authority" {
 
 test "filesystem helpers propagate supplied I/O cancellation" {
     const Canceled = struct {
-        fn open(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             return error.Canceled;
         }
     };
     var vtable = std.testing.io.vtable.*;
     vtable.dirOpenFile = Canceled.open;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.Canceled, readFileAlloc(io, std.Io.Dir.cwd(), std.testing.allocator, "unused", 32));
+    try std.testing.expectError(
+        error.Canceled,
+        readFileAlloc(io, std.Io.Dir.cwd(), std.testing.allocator, "unused", 32),
+    );
 }
 
 test "terminal writes use supplied I/O and swallow only broken pipe" {
@@ -84,6 +103,12 @@ test "terminal writes use supplied I/O and swallow only broken pipe" {
     const io: std.Io = .{ .userdata = null, .vtable = &vtable };
     try writeToStreamAllowBrokenPipe(io, std.Io.File.stdout(), "closed");
     try writeAllAllowBrokenPipe(io, std.Io.File.stdout(), "closed");
-    try std.testing.expectError(error.InputOutput, writeToStreamAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"));
-    try std.testing.expectError(error.InputOutput, writeAllAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"));
+    try std.testing.expectError(
+        error.InputOutput,
+        writeToStreamAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"),
+    );
+    try std.testing.expectError(
+        error.InputOutput,
+        writeAllAllowBrokenPipe(std.Io.failing, std.Io.File.stdout(), "failed"),
+    );
 }

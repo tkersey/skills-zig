@@ -392,10 +392,7 @@ test "definition archive is deterministic and content addressed" {
         closure.digestSlice(),
     );
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        closure.digestSlice(),
-        loaded.closure.digestSlice(),
-    );
+    try std.testing.expectEqualStrings(closure.digestSlice(), loaded.closure.digestSlice());
     try std.testing.expectEqualStrings("root.json", loaded.entry_path);
     try std.testing.expectEqualStrings("example/archive", loaded.definition_id);
 }

@@ -83,7 +83,13 @@ const Stage = struct {
         }
     }
 
-    fn fail(self: *Stage, io: std.Io, directory: std.Io.Dir, err: anyerror, comptime attempted: bool) PublicationOutcome {
+    fn fail(
+        self: *Stage,
+        io: std.Io,
+        directory: std.Io.Dir,
+        err: anyerror,
+        comptime attempted: bool,
+    ) PublicationOutcome {
         self.close(io);
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
@@ -92,11 +98,18 @@ const Stage = struct {
             if (cleanup_err != error.FileNotFound)
                 failure.cleanup = .{ .cause = cleanup_err, .stage_name = self.name };
         };
-        return if (attempted) .{ .publication_unknown = failure } else .{ .not_published = failure };
+        return if (attempted) .{
+            .publication_unknown = failure,
+        } else .{ .not_published = failure };
     }
 };
 
-fn createStage(io: std.Io, directory: std.Io.Dir, leaf: []const u8, permissions: std.Io.File.Permissions) !Stage {
+fn createStage(
+    io: std.Io,
+    directory: std.Io.Dir,
+    leaf: []const u8,
+    permissions: std.Io.File.Permissions,
+) !Stage {
     for (0..stage_attempts_max) |_| {
         var random: [16]u8 = undefined;
         io.random(&random);
@@ -134,7 +147,12 @@ fn publish(
     var stage = createStage(io, staging_dir, leaf, options.permissions) catch |err|
         return .{ .not_published = .{ .cause = err } };
     for (parts) |part| {
-        stage.file.writeStreamingAll(io, part) catch |err| return stage.fail(io, staging_dir, err, false);
+        stage.file.writeStreamingAll(io, part) catch |err| return stage.fail(
+            io,
+            staging_dir,
+            err,
+            false,
+        );
     }
     if (options.durability != .atomic_visibility) {
         stage.file.sync(io) catch |err| return stage.fail(io, staging_dir, err, false);
@@ -165,7 +183,12 @@ fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
 }
 
 fn expectContents(directory: std.Io.Dir, leaf: []const u8, expected: []const u8) !void {
-    const raw = try directory.readFileAlloc(std.testing.io, leaf, std.testing.allocator, .limited(4096));
+    const raw = try directory.readFileAlloc(
+        std.testing.io,
+        leaf,
+        std.testing.allocator,
+        .limited(4096),
+    );
     defer std.testing.allocator.free(raw);
     try std.testing.expectEqualStrings(expected, raw);
 }
@@ -175,7 +198,7 @@ fn expectEmpty(directory: std.Io.Dir) !void {
     try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(std.testing.io));
 }
 
-test "staged publication preserves immutable targets and replaces complete chunks with private permissions" {
+test "staged publication preserves immutable targets and private complete replacements" {
     const io = std.testing.io;
     var staging = std.testing.tmpDir(.{ .iterate = true });
     defer staging.cleanup();
@@ -187,14 +210,45 @@ test "staged publication preserves immutable targets and replaces complete chunk
         else
             .default_file,
     };
-    try std.testing.expect(publishCreateNew(io, staging.dir, destination.dir, "entry", &.{ "first", "", " bytes" }, options) == .complete);
-    try std.testing.expectEqual(error.PathAlreadyExists, publishCreateNew(io, staging.dir, destination.dir, "entry", &.{"wrong"}, options).publication_unknown.cause);
+    try std.testing.expect(
+        publishCreateNew(
+            io,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{ "first", "", " bytes" },
+            options,
+        ) == .complete,
+    );
+    try std.testing.expectEqual(
+        error.PathAlreadyExists,
+        publishCreateNew(
+            io,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"wrong"},
+            options,
+        ).publication_unknown.cause,
+    );
     try expectContents(destination.dir, "entry", "first bytes");
-    try std.testing.expect(publishReplacement(io, staging.dir, destination.dir, "entry", &.{ "replacement", " bytes" }, options) == .complete);
+    try std.testing.expect(
+        publishReplacement(
+            io,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{ "replacement", " bytes" },
+            options,
+        ) == .complete,
+    );
     try expectContents(destination.dir, "entry", "replacement bytes");
     const stat = try destination.dir.statFile(io, "entry", .{});
     if (@hasDecl(std.Io.File.Permissions, "toMode"))
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+        try std.testing.expectEqual(
+            @as(std.posix.mode_t, 0o600),
+            stat.permissions.toMode() & 0o777,
+        );
     try expectEmpty(staging.dir);
 }
 
@@ -206,9 +260,24 @@ test "staged publication never follows a destination symlink" {
     defer destination.cleanup();
     try destination.dir.writeFile(io, .{ .sub_path = "target", .data = "untouched" });
     try destination.dir.symLink(io, "target", "entry", .{});
-    try std.testing.expectEqual(error.PathAlreadyExists, publishCreateNew(io, staging.dir, destination.dir, "entry", &.{"wrong"}, .{}).publication_unknown.cause);
-    try std.testing.expectEqual(.sym_link, (try destination.dir.statFile(io, "entry", .{ .follow_symlinks = false })).kind);
-    try std.testing.expect(publishReplacement(io, staging.dir, destination.dir, "entry", &.{"new"}, .{}) == .complete);
+    try std.testing.expectEqual(
+        error.PathAlreadyExists,
+        publishCreateNew(
+            io,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"wrong"},
+            .{},
+        ).publication_unknown.cause,
+    );
+    try std.testing.expectEqual(
+        .sym_link,
+        (try destination.dir.statFile(io, "entry", .{ .follow_symlinks = false })).kind,
+    );
+    try std.testing.expect(
+        publishReplacement(io, staging.dir, destination.dir, "entry", &.{"new"}, .{}) == .complete,
+    );
     try expectContents(destination.dir, "entry", "new");
     try expectContents(destination.dir, "target", "untouched");
     try expectEmpty(staging.dir);
@@ -217,9 +286,37 @@ test "staged publication never follows a destination symlink" {
 test "staged publication rejects invalid leaf names before creating a file" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    for ([_][]const u8{ "", ".", "..", "/absolute", "nested/leaf", "nested\\leaf", "nul\x00leaf" }) |leaf| {
-        try std.testing.expectEqual(error.InvalidPath, publishCreateNew(std.testing.io, tmp.dir, tmp.dir, leaf, &.{"bytes"}, .{}).not_published.cause);
-        try std.testing.expectEqual(error.InvalidPath, publishReplacement(std.testing.io, tmp.dir, tmp.dir, leaf, &.{"bytes"}, .{}).not_published.cause);
+    for ([_][]const u8{
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "nested/leaf",
+        "nested\\leaf",
+        "nul\x00leaf",
+    }) |leaf| {
+        try std.testing.expectEqual(
+            error.InvalidPath,
+            publishCreateNew(
+                std.testing.io,
+                tmp.dir,
+                tmp.dir,
+                leaf,
+                &.{"bytes"},
+                .{},
+            ).not_published.cause,
+        );
+        try std.testing.expectEqual(
+            error.InvalidPath,
+            publishReplacement(
+                std.testing.io,
+                tmp.dir,
+                tmp.dir,
+                leaf,
+                &.{"bytes"},
+                .{},
+            ).not_published.cause,
+        );
     }
     try expectEmpty(tmp.dir);
 }
@@ -231,7 +328,12 @@ test "staged publication bounds name collisions without changing existing files"
         fn random(_: ?*anyopaque, bytes: []u8) void {
             @memset(bytes, 0);
         }
-        fn create(userdata: ?*anyopaque, directory: std.Io.Dir, name: []const u8, options: std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn create(
+            userdata: ?*anyopaque,
+            directory: std.Io.Dir,
+            name: []const u8,
+            options: std.Io.Dir.CreateFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             attempts += 1;
             return std.testing.io.vtable.dirCreateFile(userdata, directory, name, options);
         }
@@ -245,7 +347,17 @@ test "staged publication bounds name collisions without changing existing files"
     defer tmp.cleanup();
     const collision = "00000000000000000000000000000000";
     try tmp.dir.writeFile(io, .{ .sub_path = collision, .data = "preserved" });
-    try std.testing.expectEqual(error.StagingNameExhausted, publishReplacement(injected, tmp.dir, tmp.dir, "entry", &.{"bytes"}, .{}).not_published.cause);
+    try std.testing.expectEqual(
+        error.StagingNameExhausted,
+        publishReplacement(
+            injected,
+            tmp.dir,
+            tmp.dir,
+            "entry",
+            &.{"bytes"},
+            .{},
+        ).not_published.cause,
+    );
     try std.testing.expectEqual(@as(usize, 16), Hooks.attempts);
     try expectContents(tmp.dir, collision, "preserved");
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "entry", .{}));
@@ -264,11 +376,26 @@ test "a stage never aliases its destination when both handles name the same dire
     defer tmp.cleanup();
     const alias = try tmp.dir.openDir(io, ".", .{});
     defer alias.close(io);
-    for ([_][]const u8{ "ffffffffffffffffffffffffffffffff", "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" }) |leaf| {
-        try std.testing.expectEqual(error.StagingNameExhausted, publishReplacement(injected, tmp.dir, alias, leaf, &.{"bytes"}, .{}).not_published.cause);
+    for ([_][]const u8{
+        "ffffffffffffffffffffffffffffffff",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    }) |leaf| {
+        try std.testing.expectEqual(
+            error.StagingNameExhausted,
+            publishReplacement(
+                injected,
+                tmp.dir,
+                alias,
+                leaf,
+                &.{"bytes"},
+                .{},
+            ).not_published.cause,
+        );
     }
     try expectEmpty(tmp.dir);
-    try std.testing.expect(publishCreateNew(injected, tmp.dir, alias, "entry", &.{}, .{}) == .complete);
+    try std.testing.expect(
+        publishCreateNew(injected, tmp.dir, alias, "entry", &.{}, .{}) == .complete,
+    );
     try expectContents(tmp.dir, "entry", "");
 }
 
@@ -276,7 +403,10 @@ test "partial write failure removes the stage and preserves the old destination"
     const io = std.testing.io;
     const Hooks = struct {
         var writes: usize = 0;
-        fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        fn operate(
+            userdata: ?*anyopaque,
+            operation: std.Io.Operation,
+        ) std.Io.Cancelable!std.Io.Operation.Result {
             switch (operation) {
                 .file_write_streaming => |write| {
                     writes += 1;
@@ -299,7 +429,17 @@ test "partial write failure removes the stage and preserves the old destination"
     var destination = std.testing.tmpDir(.{});
     defer destination.cleanup();
     try destination.dir.writeFile(io, .{ .sub_path = "entry", .data = "old" });
-    try std.testing.expectEqual(error.NoSpaceLeft, publishReplacement(injected, staging.dir, destination.dir, "entry", &.{"complete bytes"}, .{}).not_published.cause);
+    try std.testing.expectEqual(
+        error.NoSpaceLeft,
+        publishReplacement(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"complete bytes"},
+            .{},
+        ).not_published.cause,
+    );
     try std.testing.expectEqual(@as(usize, 2), Hooks.writes);
     try expectContents(destination.dir, "entry", "old");
     try expectEmpty(staging.dir);
@@ -318,10 +458,29 @@ test "file sync failure removes the stage while atomic visibility skips sync" {
     defer staging.cleanup();
     var destination = std.testing.tmpDir(.{ .iterate = true });
     defer destination.cleanup();
-    try std.testing.expectEqual(error.InputOutput, publishCreateNew(injected, staging.dir, destination.dir, "entry", &.{"bytes"}, .{}).not_published.cause);
+    try std.testing.expectEqual(
+        error.InputOutput,
+        publishCreateNew(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"bytes"},
+            .{},
+        ).not_published.cause,
+    );
     try expectEmpty(staging.dir);
     try expectEmpty(destination.dir);
-    try std.testing.expect(publishCreateNew(injected, staging.dir, destination.dir, "entry", &.{"bytes"}, .{ .durability = .atomic_visibility }) == .complete);
+    try std.testing.expect(
+        publishCreateNew(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"bytes"},
+            .{ .durability = .atomic_visibility },
+        ) == .complete,
+    );
     try expectContents(destination.dir, "entry", "bytes");
     try expectEmpty(staging.dir);
 }
@@ -339,7 +498,11 @@ test "cancellation still attempts stage cleanup under cancellation protection" {
         fn sync(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
             return error.Canceled;
         }
-        fn delete(userdata: ?*anyopaque, directory: std.Io.Dir, name: []const u8) std.Io.Dir.DeleteFileError!void {
+        fn delete(
+            userdata: ?*anyopaque,
+            directory: std.Io.Dir,
+            name: []const u8,
+        ) std.Io.Dir.DeleteFileError!void {
             protected = protection == .blocked;
             return std.testing.io.vtable.dirDeleteFile(userdata, directory, name);
         }
@@ -353,7 +516,10 @@ test "cancellation still attempts stage cleanup under cancellation protection" {
     const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try std.testing.expectEqual(error.Canceled, publishCreateNew(injected, tmp.dir, tmp.dir, "entry", &.{"bytes"}, .{}).not_published.cause);
+    try std.testing.expectEqual(
+        error.Canceled,
+        publishCreateNew(injected, tmp.dir, tmp.dir, "entry", &.{"bytes"}, .{}).not_published.cause,
+    );
     try std.testing.expect(Hooks.protected);
     try std.testing.expectEqual(.unblocked, Hooks.protection);
     try expectEmpty(tmp.dir);
@@ -363,12 +529,24 @@ test "rename failures never copy across devices and remove both operation stages
     const io = std.testing.io;
     var vtable = io.vtable.*;
     vtable.dirRename = struct {
-        fn rename(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir, _: []const u8) std.Io.Dir.RenameError!void {
+        fn rename(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir,
+            _: []const u8,
+        ) std.Io.Dir.RenameError!void {
             return error.AccessDenied;
         }
     }.rename;
     vtable.dirRenamePreserve = struct {
-        fn rename(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir, _: []const u8) std.Io.Dir.RenamePreserveError!void {
+        fn rename(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir,
+            _: []const u8,
+        ) std.Io.Dir.RenamePreserveError!void {
             return error.CrossDevice;
         }
     }.rename;
@@ -377,8 +555,28 @@ test "rename failures never copy across devices and remove both operation stages
     defer staging.cleanup();
     var destination = std.testing.tmpDir(.{ .iterate = true });
     defer destination.cleanup();
-    try std.testing.expectEqual(error.AccessDenied, publishReplacement(injected, staging.dir, destination.dir, "entry", &.{"bytes"}, .{}).publication_unknown.cause);
-    try std.testing.expectEqual(error.CrossDevice, publishCreateNew(injected, staging.dir, destination.dir, "entry", &.{"bytes"}, .{}).publication_unknown.cause);
+    try std.testing.expectEqual(
+        error.AccessDenied,
+        publishReplacement(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"bytes"},
+            .{},
+        ).publication_unknown.cause,
+    );
+    try std.testing.expectEqual(
+        error.CrossDevice,
+        publishCreateNew(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"bytes"},
+            .{},
+        ).publication_unknown.cause,
+    );
     try expectEmpty(staging.dir);
     try expectEmpty(destination.dir);
 }
@@ -387,14 +585,32 @@ test "rename may report failure after publication without claiming unchanged des
     const io = std.testing.io;
     var vtable = io.vtable.*;
     vtable.dirRename = struct {
-        fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8) std.Io.Dir.RenameError!void {
+        fn rename(
+            userdata: ?*anyopaque,
+            old_dir: std.Io.Dir,
+            old_name: []const u8,
+            new_dir: std.Io.Dir,
+            new_name: []const u8,
+        ) std.Io.Dir.RenameError!void {
             try std.testing.io.vtable.dirRename(userdata, old_dir, old_name, new_dir, new_name);
             return error.HardwareFailure;
         }
     }.rename;
     vtable.dirRenamePreserve = struct {
-        fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8) std.Io.Dir.RenamePreserveError!void {
-            try std.testing.io.vtable.dirRenamePreserve(userdata, old_dir, old_name, new_dir, new_name);
+        fn rename(
+            userdata: ?*anyopaque,
+            old_dir: std.Io.Dir,
+            old_name: []const u8,
+            new_dir: std.Io.Dir,
+            new_name: []const u8,
+        ) std.Io.Dir.RenamePreserveError!void {
+            try std.testing.io.vtable.dirRenamePreserve(
+                userdata,
+                old_dir,
+                old_name,
+                new_dir,
+                new_name,
+            );
             return error.HardwareFailure;
         }
     }.rename;
@@ -403,11 +619,25 @@ test "rename may report failure after publication without claiming unchanged des
     defer staging.cleanup();
     var destination = std.testing.tmpDir(.{});
     defer destination.cleanup();
-    const immutable = publishCreateNew(injected, staging.dir, destination.dir, "entry", &.{"first complete bytes"}, .{}).publication_unknown;
+    const immutable = publishCreateNew(
+        injected,
+        staging.dir,
+        destination.dir,
+        "entry",
+        &.{"first complete bytes"},
+        .{},
+    ).publication_unknown;
     try std.testing.expectEqual(error.HardwareFailure, immutable.cause);
     try std.testing.expect(immutable.cleanup == null);
     try expectContents(destination.dir, "entry", "first complete bytes");
-    const replacement = publishReplacement(injected, staging.dir, destination.dir, "entry", &.{"replacement complete bytes"}, .{}).publication_unknown;
+    const replacement = publishReplacement(
+        injected,
+        staging.dir,
+        destination.dir,
+        "entry",
+        &.{"replacement complete bytes"},
+        .{},
+    ).publication_unknown;
     try std.testing.expectEqual(error.HardwareFailure, replacement.cause);
     try std.testing.expect(replacement.cleanup == null);
     try expectContents(destination.dir, "entry", "replacement complete bytes");
@@ -435,7 +665,14 @@ test "directory sync failures report published complete bytes for either directo
     for ([_]usize{ 2, 3 }) |fail_at| {
         Hooks.sync_calls = 0;
         Hooks.fail_at = fail_at;
-        const result = publishReplacement(injected, staging.dir, destination.dir, "entry", &.{ "complete", " bytes" }, .{ .durability = .file_and_directories_synced });
+        const result = publishReplacement(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{ "complete", " bytes" },
+            .{ .durability = .file_and_directories_synced },
+        );
         try std.testing.expectEqual(error.InputOutput, result.published_unsynced);
         try std.testing.expectEqual(fail_at, Hooks.sync_calls);
         try expectContents(destination.dir, "entry", "complete bytes");
@@ -443,7 +680,16 @@ test "directory sync failures report published complete bytes for either directo
     }
     Hooks.sync_calls = 0;
     Hooks.fail_at = 0;
-    try std.testing.expect(publishReplacement(injected, staging.dir, destination.dir, "entry", &.{"durable"}, .{ .durability = .file_and_directories_synced }) == .complete);
+    try std.testing.expect(
+        publishReplacement(
+            injected,
+            staging.dir,
+            destination.dir,
+            "entry",
+            &.{"durable"},
+            .{ .durability = .file_and_directories_synced },
+        ) == .complete,
+    );
     try std.testing.expectEqual(@as(usize, 3), Hooks.sync_calls);
 }
 
@@ -453,16 +699,36 @@ test "retained staging and destination handles survive parent replacement" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "selected/staging");
     try tmp.dir.createDirPath(io, "selected/destination");
-    const staging = try tmp.dir.openDir(io, "selected/staging", .{ .iterate = true, .follow_symlinks = false });
+    const staging = try tmp.dir.openDir(
+        io,
+        "selected/staging",
+        .{ .iterate = true, .follow_symlinks = false },
+    );
     defer staging.close(io);
-    const destination = try tmp.dir.openDir(io, "selected/destination", .{ .follow_symlinks = false });
+    const destination = try tmp.dir.openDir(
+        io,
+        "selected/destination",
+        .{ .follow_symlinks = false },
+    );
     defer destination.close(io);
     try tmp.dir.rename("selected", tmp.dir, "retained", io);
     try tmp.dir.createDirPath(io, "selected/staging");
     try tmp.dir.createDirPath(io, "selected/destination");
-    try std.testing.expect(publishCreateNew(io, staging, destination, "entry", &.{"retained"}, .{ .durability = .file_and_directories_synced }) == .complete);
+    try std.testing.expect(
+        publishCreateNew(
+            io,
+            staging,
+            destination,
+            "entry",
+            &.{"retained"},
+            .{ .durability = .file_and_directories_synced },
+        ) == .complete,
+    );
     try expectContents(tmp.dir, "retained/destination/entry", "retained");
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "selected/destination/entry", .{}));
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "selected/destination/entry", .{}),
+    );
     try expectEmpty(staging);
 }
 
@@ -487,7 +753,14 @@ test "cleanup failure reports retained stage without publishing destination" {
     defer staging.cleanup();
     var destination = std.testing.tmpDir(.{ .iterate = true });
     defer destination.cleanup();
-    const failure = publishCreateNew(injected, staging.dir, destination.dir, "entry", &.{"bytes"}, .{}).not_published;
+    const failure = publishCreateNew(
+        injected,
+        staging.dir,
+        destination.dir,
+        "entry",
+        &.{"bytes"},
+        .{},
+    ).not_published;
     try std.testing.expectEqual(error.InputOutput, failure.cause);
     try std.testing.expectEqual(error.AccessDenied, failure.cleanup.?.cause);
     try std.testing.expect(Hooks.cleanup_attempted);

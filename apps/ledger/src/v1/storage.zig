@@ -5956,7 +5956,9 @@ test "storage path parameters compile once and resolve as safe components" {
 }
 
 test "matching storage enumeration excludes transaction control artifacts" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var test_plan = try StorageTestPlan.init(
         storage_parameterized_definition,

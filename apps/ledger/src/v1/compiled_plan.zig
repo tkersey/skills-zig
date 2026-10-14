@@ -353,7 +353,11 @@ fn tryLoadLocator(
     var entries = try cache_root.openChild("locators", .read_only);
     defer entries.deinit();
     const leaf = cacheLeaf(locator_key);
-    const locator_entry = entries.readAlloc(allocator, &leaf, locator_limits.max_entry_bytes) catch |err| switch (err) {
+    const locator_entry = entries.readAlloc(
+        allocator,
+        &leaf,
+        locator_limits.max_entry_bytes,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -498,7 +502,11 @@ fn writeLocatorCache(
     defer locator_encoder.deinit();
     try encodeLocator(plan_set, plan_key, &locator_encoder);
     const locator_payload = locator_encoder.written();
-    const header = try definition_core.cache.encodeHeader(locator_key, locator_payload, locator_limits);
+    const header = try definition_core.cache.encodeHeader(
+        locator_key,
+        locator_payload,
+        locator_limits,
+    );
     var entries = try cache_root.openChild("locators", .create);
     defer entries.deinit();
     const leaf = cacheLeaf(locator_key);
@@ -1297,7 +1305,13 @@ test "every cache route preserves the application plan across a private entry hi
     const allocator = std.testing.allocator;
     var source = std.testing.tmpDir(.{});
     defer source.cleanup();
-    try source.dir.writeFile(io, .{ .sub_path = "artifact.json", .data = @embedFile("fixtures/chained-event-definition.json") });
+    try source.dir.writeFile(
+        io,
+        .{
+            .sub_path = "artifact.json",
+            .data = @embedFile("fixtures/chained-event-definition.json"),
+        },
+    );
     const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(source_root);
     var cache = std.testing.tmpDir(.{});
@@ -1311,15 +1325,37 @@ test "every cache route preserves the application plan across a private entry hi
         .{ .kind = .doctor },                     .{ .kind = .migration },
     }) |route| {
         var scope = storage_root.Scope.init(.init(io, .cwd()));
-        var cold = try load(&scope, allocator, source_root, "artifact.json", route, "route-test", .{ .cache_dir = cache_root });
+        var cold = try load(
+            &scope,
+            allocator,
+            source_root,
+            "artifact.json",
+            route,
+            "route-test",
+            .{ .cache_dir = cache_root },
+        );
         defer cold.deinit(allocator);
-        var warm = try load(&scope, allocator, source_root, "artifact.json", route, "route-test", .{ .cache_dir = cache_root });
+        var warm = try load(
+            &scope,
+            allocator,
+            source_root,
+            "artifact.json",
+            route,
+            "route-test",
+            .{ .cache_dir = cache_root },
+        );
         defer warm.deinit(allocator);
         try std.testing.expect(!cold.stats.cache_hit);
         try std.testing.expect(warm.stats.cache_hit);
-        var cold_bytes = definition_core.cache.Encoder.init(allocator, cache_limits.max_payload_bytes);
+        var cold_bytes = definition_core.cache.Encoder.init(
+            allocator,
+            cache_limits.max_payload_bytes,
+        );
         defer cold_bytes.deinit();
-        var warm_bytes = definition_core.cache.Encoder.init(allocator, cache_limits.max_payload_bytes);
+        var warm_bytes = definition_core.cache.Encoder.init(
+            allocator,
+            cache_limits.max_payload_bytes,
+        );
         defer warm_bytes.deinit();
         try encodePlanSet(&cold, route, &cold_bytes);
         try encodePlanSet(&warm, route, &warm_bytes);

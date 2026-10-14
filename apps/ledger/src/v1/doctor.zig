@@ -288,13 +288,8 @@ fn inspectEventSlot(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
-    var snapshot = try custody.readReplaySlotOrMissing(
-        scope,
-        allocator,
-        repo_root,
-        definition_plan.id,
-        slot,
-    );
+    var snapshot =
+        try custody.readReplaySlotOrMissing(scope, allocator, repo_root, definition_plan.id, slot);
     defer snapshot.deinit(allocator);
     if (!snapshot.exists) return error.StoreSlotMissing;
     var replay_stats = replay.validateReplaySlot(

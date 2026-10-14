@@ -67,7 +67,13 @@ fn runSwap(
         .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"other\"}",
     });
     var scope = selection.invocationScope(temp_dir);
-    const code = try cli.runWithArgv(&scope, selection, allocator, init.environ_map, selection.argv);
+    const code = try cli.runWithArgv(
+        &scope,
+        selection,
+        allocator,
+        init.environ_map,
+        selection.argv,
+    );
     if (code != 0) return error.ManagedTransactionFailed;
     _ = try temp_dir.statFile(io, "moved/.ledger/example/plain.jsonl", .{});
     if (temp_dir.statFile(io, "managed/.ledger/example/plain.jsonl", .{})) |_| {
@@ -80,7 +86,13 @@ fn runSwap(
         .data = "{\"kind\":\"created\",\"value\":{\"id\":\"two\",\"revision\":1}}",
     });
     scope = selection.invocationScope(temp_dir);
-    const second_code = try cli.runWithArgv(&scope, selection, allocator, init.environ_map, selection.argv);
+    const second_code = try cli.runWithArgv(
+        &scope,
+        selection,
+        allocator,
+        init.environ_map,
+        selection.argv,
+    );
     if (second_code != 0) return error.ManagedTransactionFailed;
     const original = try temp_dir.readFileAlloc(
         io,
@@ -95,6 +107,19 @@ fn runSwap(
     if (temp_dir.statFile(io, "moved/.ledger/example/plain.jsonl", .{})) |_| {
         return error.ReplacementStoreMutated;
     } else |err| if (err != error.FileNotFound) return err;
+    try verifyIndependentScope(init, temp_dir, selection, definition_path, event_arg, original);
+}
+
+fn verifyIndependentScope(
+    init: std.process.Init,
+    temp_dir: std.Io.Dir,
+    selection: *const storage_root.Selection,
+    definition_path: []const u8,
+    event_arg: []const u8,
+    original: []const u8,
+) !void {
+    const allocator = init.gpa;
+    const io = init.io;
     // A second admitted root must remain independent while the original
     // selection still owns the directory moved away from its admission path.
     const replacement = try temp_dir.realPathFileAlloc(io, "managed", allocator);
@@ -134,7 +159,7 @@ fn runSwap(
     {
         return error.IndependentStoreNotIsolated;
     }
-    scope = selection.invocationScope(temp_dir);
+    var scope = selection.invocationScope(temp_dir);
     if (try cli.runWithArgv(&scope, selection, allocator, init.environ_map, &.{
         "ledger", "doctor", "--definition", definition_path,
         "--repo", ".",      "--format",     "json",

@@ -1891,7 +1891,12 @@ pub fn fileSize(fs: Fs, path: []const u8) !u64 {
     return stat.size;
 }
 
-pub fn readFileAlloc(fs: Fs, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+pub fn readFileAlloc(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(fs.io, path, .{})
     else
@@ -2236,7 +2241,12 @@ pub fn writeTextCreateNewAtomic(
     _ = allocator;
 }
 
-pub fn writeTextAtomic(fs: Fs, allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
+pub fn writeTextAtomic(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+) !void {
     return writeTextAtomicMode(fs, allocator, path, text, null);
 }
 
@@ -2264,7 +2274,11 @@ fn publicationResult(io: std.Io, outcome: staged_file.PublicationOutcome) !void 
     switch (outcome) {
         .complete => {},
         .not_published, .publication_unknown => |failure| {
-            if (failure.cleanup) |cleanup| fs_authority.warn(io, "rollback file removal failed for {s}: {s}; inspect and remove the leftover file", .{ cleanup.stage_name, @errorName(cleanup.cause) });
+            if (failure.cleanup) |cleanup| fs_authority.warn(
+                io,
+                "rollback file removal failed for {s}: {s}; inspect and remove the leftover file",
+                .{ cleanup.stage_name, @errorName(cleanup.cause) },
+            );
             return failure.cause;
         },
         .published_unsynced => |err| return err,
@@ -2303,7 +2317,14 @@ pub fn appendLineAtomic(
     line: []const u8,
     max_existing_bytes: usize,
 ) !void {
-    const receipt = try appendLineAtomicPrepared(fs, allocator, path, line, max_existing_bytes, null);
+    const receipt = try appendLineAtomicPrepared(
+        fs,
+        allocator,
+        path,
+        line,
+        max_existing_bytes,
+        null,
+    );
     std.debug.assert(receipt == null);
 }
 
@@ -2813,8 +2834,16 @@ pub fn acquireAbsoluteExclusiveLock(
     return .{ .path = path, .fs = fs };
 }
 
-pub fn acquireExclusiveLockPath(fs: Fs, allocator: std.mem.Allocator, path_raw: []const u8) !LockFile {
-    if (std.fs.path.isAbsolute(path_raw)) return acquireAbsoluteExclusiveLock(fs, allocator, path_raw);
+pub fn acquireExclusiveLockPath(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    path_raw: []const u8,
+) !LockFile {
+    if (std.fs.path.isAbsolute(path_raw)) return acquireAbsoluteExclusiveLock(
+        fs,
+        allocator,
+        path_raw,
+    );
     const path = try allocator.dupe(u8, path_raw);
     errdefer allocator.free(path);
     const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
@@ -3304,7 +3333,11 @@ test "EventStore advisory paths preserve existing filesystem case identity" {
     try std.testing.expectEqual(canonical_stat.inode, alias_stat.inode);
     try std.testing.expectEqual(@as(std.Io.File.NLink, 1), canonical_stat.nlink);
 
-    const canonical_advisory = try eventStoreLockPathAlloc(fs, std.testing.allocator, canonical_path);
+    const canonical_advisory = try eventStoreLockPathAlloc(
+        fs,
+        std.testing.allocator,
+        canonical_path,
+    );
     defer std.testing.allocator.free(canonical_advisory);
     const alias_advisory = try eventStoreLockPathAlloc(fs, std.testing.allocator, case_alias);
     defer std.testing.allocator.free(alias_advisory);
@@ -3335,7 +3368,12 @@ test "CAS read custody excludes writers across a canonical path pair" {
     var slot_writer = try acquireCasAdvisoryLock(fs, std.testing.allocator, slot_path);
     slot_writer.close(fs.io);
 
-    var read_custody = try acquireCasReadLockPair(fs, std.testing.allocator, slot_path, binding_path);
+    var read_custody = try acquireCasReadLockPair(
+        fs,
+        std.testing.allocator,
+        slot_path,
+        binding_path,
+    );
     defer read_custody.deinit();
     try std.testing.expectError(
         error.LockBusy,
@@ -3368,7 +3406,12 @@ test "CAS read custody holds the existing member of a partial advisory pair" {
     var binding_writer = try acquireCasAdvisoryLock(fs, std.testing.allocator, binding_path);
     binding_writer.close(fs.io);
 
-    var read_custody = try acquireCasReadLockPair(fs, std.testing.allocator, slot_path, binding_path);
+    var read_custody = try acquireCasReadLockPair(
+        fs,
+        std.testing.allocator,
+        slot_path,
+        binding_path,
+    );
     defer read_custody.deinit();
     try std.testing.expectEqual(@as(u2, 1), read_custody.count);
     try std.testing.expectError(
@@ -3587,7 +3630,10 @@ test "acquireLock is exclusive until released" {
     defer std.testing.allocator.free(path);
 
     var lock = try acquireLock(fs, std.testing.allocator, path);
-    try std.testing.expectError(error.PathAlreadyExists, acquireLock(fs, std.testing.allocator, path));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        acquireLock(fs, std.testing.allocator, path),
+    );
     lock.release(std.testing.allocator);
     var second = try acquireLock(fs, std.testing.allocator, path);
     second.release(std.testing.allocator);
@@ -3629,7 +3675,10 @@ test "injected sync failure uses supplied authority and cleans create-new stagin
         }
     }.sync;
     const failing = Fs.anchored(.{ .userdata = io.userdata, .vtable = &vtable }, tmp.dir);
-    try std.testing.expectError(error.InputOutput, writeTextCreateNewAtomic(failing, allocator, "admission.json", "{}", .{}));
+    try std.testing.expectError(
+        error.InputOutput,
+        writeTextCreateNewAtomic(failing, allocator, "admission.json", "{}", .{}),
+    );
     var entries = tmp.dir.iterate();
     try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(io));
     try writeTextCreateNewAtomic(Fs.anchored(io, tmp.dir), allocator, "admission.json", "{}", .{});
@@ -3651,10 +3700,18 @@ test "relative Git admission resolves from supplied nested directory authority" 
     defer allocator.free(git_result.stdout);
     defer allocator.free(git_result.stderr);
     try std.testing.expect(git_result.term == .exited and git_result.term.exited == 0);
-    try writeTextAtomic(Fs.init(io, tmp.dir), allocator, ".gitignore", "/nested/*.lock\n/nested/.durable-store-locks/\n");
+    try writeTextAtomic(
+        Fs.init(io, tmp.dir),
+        allocator,
+        ".gitignore",
+        "/nested/*.lock\n/nested/.durable-store-locks/\n",
+    );
     try tmp.dir.createDir(io, "nested", .default_dir);
     var nested = try tmp.dir.openDir(io, "nested", .{});
     defer nested.close(io);
     try ensureLockSidecarGitignored(Fs.anchored(io, nested), allocator, "events.jsonl");
-    try std.testing.expectError(error.LockSidecarNotGitignored, ensureLockSidecarGitignored(Fs.anchored(io, tmp.dir), allocator, "events.jsonl"));
+    try std.testing.expectError(
+        error.LockSidecarNotGitignored,
+        ensureLockSidecarGitignored(Fs.anchored(io, tmp.dir), allocator, "events.jsonl"),
+    );
 }

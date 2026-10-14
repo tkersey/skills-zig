@@ -1144,10 +1144,21 @@ fn runCommand(init: std.process.Init) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (try core_cli.handleDefaultHelpAndVersionSurface(&stdout_writer.interface, argv, HelpSurface, Version)) return 0;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(
+        &stdout_writer.interface,
+        argv,
+        HelpSurface,
+        Version,
+    )) return 0;
     const parsed = parseArgs(argv[1..]) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(init.io, &.{});
-        core_cli.printUsageFailureWithHelp(&stderr_writer.interface, HelpSurface, Version, @errorName(err), null) catch return 1;
+        core_cli.printUsageFailureWithHelp(
+            &stderr_writer.interface,
+            HelpSurface,
+            Version,
+            @errorName(err),
+            null,
+        ) catch return 1;
         return 2;
     };
     switch (parsed.command) {
@@ -1399,7 +1410,12 @@ const ReportCounts = struct {
     fail: usize = 0,
 };
 
-fn cmdDoctor(io: std.Io, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, target: ?[]const u8) !void {
+fn cmdDoctor(
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    target: ?[]const u8,
+) !void {
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const current_dir = try std.fs.path.join(allocator, &.{ ".perf-local", machine_name });
@@ -1409,7 +1425,11 @@ fn cmdDoctor(io: std.Io, environ: ?*const std.process.Environ.Map, allocator: st
     for (CompatCases) |case_cfg| {
         if (!matchesDescriptorTarget(case_cfg.descriptor, target)) continue;
         count += 1;
-        const binary_path = resolveBinaryPath(environ, allocator, case_cfg) catch return error.InvalidData;
+        const binary_path = resolveBinaryPath(
+            environ,
+            allocator,
+            case_cfg,
+        ) catch return error.InvalidData;
         allocator.free(binary_path);
     }
     for (DeepCases) |case_cfg| {
@@ -1428,7 +1448,11 @@ fn cmdDoctor(io: std.Io, environ: ?*const std.process.Environ.Map, allocator: st
     try stdout.print("machine_dir={s}\n", .{current_dir});
 }
 
-fn invalidateCurrentCapsule(fs: durable_store.Fs, allocator: std.mem.Allocator, machine_dir: []const u8) !void {
+fn invalidateCurrentCapsule(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+) !void {
     const reports_dir = try std.fs.path.join(
         allocator,
         &.{ machine_dir, "reports" },
@@ -1450,7 +1474,12 @@ fn invalidateCurrentCapsule(fs: durable_store.Fs, allocator: std.mem.Allocator, 
     );
 }
 
-fn cmdCompare(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, target: ?[]const u8) !u8 {
+fn cmdCompare(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    target: ?[]const u8,
+) !u8 {
     const expected_rows = matchingCaseCount(target);
     if (expected_rows == 0) return error.NoMatchingPerfCases;
     const machine_dir = try ensureCurrentMachineDir(fs, allocator);
@@ -1486,7 +1515,15 @@ fn cmdCompare(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, al
         if (comparisonStatusFailed(result.status)) any_fail = true;
     }
     if (!comparisonSummaryComplete(environ, target, expected_rows, rows.items)) any_fail = true;
-    try writeCompareSummaryRows(fs, environ, allocator, machine_dir, target, expected_rows, rows.items);
+    try writeCompareSummaryRows(
+        fs,
+        environ,
+        allocator,
+        machine_dir,
+        target,
+        expected_rows,
+        rows.items,
+    );
     return if (any_fail) 1 else 0;
 }
 
@@ -1777,7 +1814,11 @@ fn writeComparisonCapsule(
     try writer.writeAll("]}\n");
 }
 
-fn writeEnvironmentString(environ: ?*const std.process.Environ.Map, writer: *std.Io.Writer, name: []const u8) !void {
+fn writeEnvironmentString(
+    environ: ?*const std.process.Environ.Map,
+    writer: *std.Io.Writer,
+    name: []const u8,
+) !void {
     if (environ) |environment| {
         if (environment.get(name)) |value| {
             return std.json.Stringify.value(value, .{}, writer);
@@ -1868,7 +1909,11 @@ fn ensureCurrentMachineDir(fs: durable_store.Fs, allocator: std.mem.Allocator) !
     return dir_path;
 }
 
-fn resolveBinaryPath(environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
+fn resolveBinaryPath(
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+) ![]u8 {
     _ = case_cfg.builder;
     if (std.fs.path.isAbsolute(case_cfg.binary_path)) {
         return allocator.dupe(u8, case_cfg.binary_path);
@@ -1892,7 +1937,11 @@ fn resolveBinaryPath(environ: ?*const std.process.Environ.Map, allocator: std.me
     return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
 }
 
-fn resolveBinaryExecPath(environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
+fn resolveBinaryExecPath(
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+) ![]u8 {
     return resolveBinaryPath(environ, allocator, case_cfg);
 }
 
@@ -1907,7 +1956,11 @@ fn baseBinaryOverride(environ: ?*const std.process.Environ.Map, case_cfg: Compat
     return null;
 }
 
-fn requireExpectedPairedSources(environ: ?*const std.process.Environ.Map, baseline: BinaryEvidence, candidate: BinaryEvidence) !void {
+fn requireExpectedPairedSources(
+    environ: ?*const std.process.Environ.Map,
+    baseline: BinaryEvidence,
+    candidate: BinaryEvidence,
+) !void {
     const environment = environ orelse
         return error.ExpectedSourceShaRequired;
     try requireExpectedSourceShas(environment, baseline.source_sha, candidate.source_sha);
@@ -2019,11 +2072,7 @@ fn binaryEvidence(
 ) !BinaryEvidence {
     const resolved = try resolveBinaryExecPath(environ, allocator, case_cfg);
     defer allocator.free(resolved);
-    const original_path = try fs.directory().realPathFileAlloc(
-        fs.io,
-        resolved,
-        allocator,
-    );
+    const original_path = try fs.directory().realPathFileAlloc(fs.io, resolved, allocator);
     defer allocator.free(original_path);
     const source_root = try sourceRootForBinaryAlloc(fs, allocator, original_path);
     errdefer allocator.free(source_root);
@@ -2041,9 +2090,8 @@ fn binaryEvidence(
         source_sha,
         driverKindForCase(case_cfg.descriptor),
     );
-    if (!std.mem.eql(u8, isolated.source_tree_sha, source_tree_sha)) {
+    if (!std.mem.eql(u8, isolated.source_tree_sha, source_tree_sha))
         return error.ProductSourceChanged;
-    }
     var file = try (try isolated.executable(case_cfg.descriptor.binary)).clone(allocator);
     errdefer file.deinit(allocator);
     var source_archive = try isolated.source_archive.clone(allocator);
@@ -2051,9 +2099,7 @@ fn binaryEvidence(
     var compiler = try isolated.compiler.clone(allocator);
     errdefer compiler.deinit(allocator);
     const original_sha = try sha256BuildOutput(fs, original_path);
-    if (!std.mem.eql(u8, &original_sha, &file.sha256)) {
-        return error.ProductBinaryChanged;
-    }
+    if (!std.mem.eql(u8, &original_sha, &file.sha256)) return error.ProductBinaryChanged;
     const result = try runChildCaptureOutput(
         fs,
         environ,
@@ -2064,16 +2110,18 @@ fn binaryEvidence(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.BinaryVersionFailed;
-    const version = try allocator.dupe(
-        u8,
-        std.mem.trim(u8, result.stdout, " \t\r\n"),
-    );
+    const version = try allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
     errdefer allocator.free(version);
     const current_original_sha = try sha256BuildOutput(fs, original_path);
-    if (!std.mem.eql(u8, &current_original_sha, &file.sha256)) {
-        return error.ProductBinaryChanged;
-    }
-    try requireSourceIdentityUnchanged(fs, environ, allocator, source_root, source_sha, source_tree_sha);
+    if (!std.mem.eql(u8, &current_original_sha, &file.sha256)) return error.ProductBinaryChanged;
+    try requireSourceIdentityUnchanged(
+        fs,
+        environ,
+        allocator,
+        source_root,
+        source_sha,
+        source_tree_sha,
+    );
     return .{
         .file = file,
         .version = version,
@@ -2148,7 +2196,11 @@ fn requireBinaryUnchanged(fs: durable_store.Fs, evidence: BinaryEvidence) !void 
     verifySealedFile(fs, evidence.file) catch return error.ProductBinaryChanged;
 }
 
-fn requireCompilerDigestAtPath(fs: durable_store.Fs, path: []const u8, expected_digest: []const u8) !void {
+fn requireCompilerDigestAtPath(
+    fs: durable_store.Fs,
+    path: []const u8,
+    expected_digest: []const u8,
+) !void {
     if (expected_digest.len != 64) return error.CompilerBinaryChanged;
     const observed = try sha256FileBounded(fs, path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &observed, expected_digest)) {
@@ -2310,11 +2362,21 @@ fn verifySealedFile(fs: durable_store.Fs, file: SealedFile) !void {
     }
 }
 
-fn readRegularFileAlloc(fs: durable_store.Fs, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+fn readRegularFileAlloc(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     return readStableFileAlloc(fs, allocator, path, max_bytes, true);
 }
 
-fn readBuildOutputAlloc(fs: durable_store.Fs, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+fn readBuildOutputAlloc(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     return readStableFileAlloc(fs, allocator, path, max_bytes, false);
 }
 
@@ -2412,7 +2474,11 @@ fn caseConfigurationDigest(case_cfg: CompatCase) ![64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn sourceRootForBinaryAlloc(fs: durable_store.Fs, allocator: std.mem.Allocator, binary_path: []const u8) ![]u8 {
+fn sourceRootForBinaryAlloc(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+) ![]u8 {
     var cursor = std.fs.path.dirname(binary_path) orelse
         return error.BinarySourceUnavailable;
     for (0..16) |_| {
@@ -2432,7 +2498,12 @@ fn sourceRootForBinaryAlloc(fs: durable_store.Fs, allocator: std.mem.Allocator, 
     return error.BinarySourceUnavailable;
 }
 
-fn requireCleanSourceRoot(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, source_root: []const u8) !void {
+fn requireCleanSourceRoot(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+) !void {
     const result = try runChildCaptureOutput(
         fs,
         environ,
@@ -2455,7 +2526,12 @@ fn requireCleanSourceRoot(fs: durable_store.Fs, environ: ?*const std.process.Env
     }
 }
 
-fn sourceShaForRootAlloc(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, source_root: []const u8) ![]u8 {
+fn sourceShaForRootAlloc(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+) ![]u8 {
     const result = try runChildCaptureOutput(
         fs,
         environ,
@@ -2860,7 +2936,8 @@ fn runPairedMeasuredCases(
         candidate_root,
     );
     try requireExecutionParity(baseline_execution, candidate_execution);
-    const baseline_workload = try observedWorkloadDigest(fs, environ, allocator, baseline_case, baseline_root);
+    const baseline_workload =
+        try observedWorkloadDigest(fs, environ, allocator, baseline_case, baseline_root);
     const candidate_workload = try observedWorkloadDigest(
         fs,
         environ,
@@ -2868,7 +2945,13 @@ fn runPairedMeasuredCases(
         candidate_case,
         candidate_root,
     );
-    try requirePairedWorkload(fs.io, baseline_workload, candidate_workload, baseline_root, candidate_root);
+    try requirePairedWorkload(
+        fs.io,
+        baseline_workload,
+        candidate_workload,
+        baseline_root,
+        candidate_root,
+    );
     const measured = try measureCompatPair(
         fs,
         environ,
@@ -2929,9 +3012,21 @@ fn measureCompatPair(
     for (0..count) |sample_idx| {
         if (sample_idx % 2 == 0) {
             try baseline_samples.appendCompat(fs, environ, allocator, baseline_case, baseline_root);
-            try candidate_samples.appendCompat(fs, environ, allocator, candidate_case, candidate_root);
+            try candidate_samples.appendCompat(
+                fs,
+                environ,
+                allocator,
+                candidate_case,
+                candidate_root,
+            );
         } else {
-            try candidate_samples.appendCompat(fs, environ, allocator, candidate_case, candidate_root);
+            try candidate_samples.appendCompat(
+                fs,
+                environ,
+                allocator,
+                candidate_case,
+                candidate_root,
+            );
             try baseline_samples.appendCompat(fs, environ, allocator, baseline_case, baseline_root);
         }
     }
@@ -3024,7 +3119,13 @@ fn runSeqReplayMeasurements(
     if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
         return error.PerfWorkloadMismatch;
     }
-    const semantics = try deepSemanticPair(fs, environ, allocator, baseline_evidence, candidate_evidence);
+    const semantics = try deepSemanticPair(
+        fs,
+        environ,
+        allocator,
+        baseline_evidence,
+        candidate_evidence,
+    );
     var measured = try measureDeepPair(
         fs,
         environ,
@@ -3198,7 +3299,13 @@ fn requireOptimizationUnchanged(
     original: OptimizationOracle,
 ) !void {
     try requireDriverUnchanged(fs, driver);
-    const current = try optimizationOracle(fs, environ, allocator, driver.file, case_cfg.descriptor.case_id);
+    const current = try optimizationOracle(
+        fs,
+        environ,
+        allocator,
+        driver.file,
+        case_cfg.descriptor.case_id,
+    );
     try requireOptimizationParity(original, current);
     try requireDriverUnchanged(fs, driver);
 }
@@ -3265,22 +3372,86 @@ fn measureDeepPair(
     defer baseline_samples.deinit(allocator);
     var candidate_samples = try MetricSamples.init(allocator, count, count, rounds);
     defer candidate_samples.deinit(allocator);
-    primeSourceDeepCase(fs, environ, allocator, baseline_root, case_cfg, baseline_driver) catch |err|
-        return deepStageError(fs.io, "baseline-prime", err);
-    primeSourceDeepCase(fs, environ, allocator, candidate_root, case_cfg, candidate_driver) catch |err|
-        return deepStageError(fs.io, "candidate-prime", err);
+    try primeDeepPair(
+        fs,
+        environ,
+        allocator,
+        case_cfg,
+        baseline_root,
+        candidate_root,
+        baseline_driver,
+        candidate_driver,
+    );
     for (0..rounds) |round| {
         if (round % 2 == 0) {
-            try baseline_samples.appendDeep(fs, environ, allocator, case_cfg, baseline_root, baseline_driver);
-            try candidate_samples.appendDeep(fs, environ, allocator, case_cfg, candidate_root, candidate_driver);
+            try baseline_samples.appendDeep(
+                fs,
+                environ,
+                allocator,
+                case_cfg,
+                baseline_root,
+                baseline_driver,
+            );
+            try candidate_samples.appendDeep(
+                fs,
+                environ,
+                allocator,
+                case_cfg,
+                candidate_root,
+                candidate_driver,
+            );
         } else {
-            try candidate_samples.appendDeep(fs, environ, allocator, case_cfg, candidate_root, candidate_driver);
-            try baseline_samples.appendDeep(fs, environ, allocator, case_cfg, baseline_root, baseline_driver);
+            try candidate_samples.appendDeep(
+                fs,
+                environ,
+                allocator,
+                case_cfg,
+                candidate_root,
+                candidate_driver,
+            );
+            try baseline_samples.appendDeep(
+                fs,
+                environ,
+                allocator,
+                case_cfg,
+                baseline_root,
+                baseline_driver,
+            );
         }
     }
     var baseline = try baseline_samples.finish(allocator);
     errdefer baseline.deinit(allocator);
     return .{ .baseline = baseline, .candidate = try candidate_samples.finish(allocator) };
+}
+
+fn primeDeepPair(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    baseline_root: []const u8,
+    candidate_root: []const u8,
+    baseline_driver: DriverEvidence,
+    candidate_driver: DriverEvidence,
+) !void {
+    primeSourceDeepCase(
+        fs,
+        environ,
+        allocator,
+        baseline_root,
+        case_cfg,
+        baseline_driver,
+    ) catch |err|
+        return deepStageError(fs.io, "baseline-prime", err);
+    primeSourceDeepCase(
+        fs,
+        environ,
+        allocator,
+        candidate_root,
+        case_cfg,
+        candidate_driver,
+    ) catch |err|
+        return deepStageError(fs.io, "candidate-prime", err);
 }
 
 fn deepStageError(io: std.Io, stage: []const u8, err: anyerror) anyerror {
@@ -3400,8 +3571,8 @@ fn buildIsolatedSource(
     errdefer archive.deinit(allocator);
     const prefix = try std.fs.path.join(allocator, &.{ snapshot, "zig-out" });
     defer allocator.free(prefix);
-    const zig_path = compiler.approved_path;
-    try runIsolatedBuild(fs, environ, allocator, snapshot, staging, prefix, zig_path, "", kind);
+    const zig = compiler.approved_path;
+    try runIsolatedBuild(fs, environ, allocator, snapshot, staging, prefix, zig, "", kind);
     try requireBuildSourceUnchanged(fs, environ, allocator, root, revision, tree);
     try verifySealedFile(fs, compiler.file);
     try requireCompilerDigestAtPath(fs, compiler.approved_path, &compiler.file.sha256);
@@ -3411,7 +3582,7 @@ fn buildIsolatedSource(
     errdefer ledger.deinit(allocator);
     try overlayReplayDriver(fs, allocator, snapshot, driver_bytes, driver_file);
     if (build_file) |file| try overlayDriverBuild(fs, allocator, snapshot, file);
-    try runIsolatedBuild(fs, environ, allocator, snapshot, staging, prefix, zig_path, "driver-", kind);
+    try runIsolatedBuild(fs, environ, allocator, snapshot, staging, prefix, zig, "driver-", kind);
     try verifySealedFile(fs, driver_file);
     if (build_file) |file| try verifySealedFile(fs, file);
     try requireCompilerDigestAtPath(fs, compiler.approved_path, &compiler.file.sha256);
@@ -3525,7 +3696,11 @@ fn sourceStagingDir(
 
 fn removeBuildStaging(fs: durable_store.Fs, staging: []const u8) void {
     fs.directory().deleteTree(fs.io, staging) catch |err| {
-        printDiagnostic(fs.io, "perf_hub warning: remove staging directory: {s}\n", .{@errorName(err)});
+        printDiagnostic(
+            fs.io,
+            "perf_hub warning: remove staging directory: {s}\n",
+            .{@errorName(err)},
+        );
     };
 }
 
@@ -3718,7 +3893,12 @@ fn validFullRevision(revision: []const u8) bool {
     return true;
 }
 
-fn sourceTreeShaForRootAlloc(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, source_root: []const u8) ![]u8 {
+fn sourceTreeShaForRootAlloc(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+) ![]u8 {
     return revisionTreeShaForRootAlloc(
         fs,
         environ,
@@ -3884,7 +4064,13 @@ fn validateOptimizationCapture(
     case_cfg: DeepCase,
     driver: DriverEvidence,
 ) !void {
-    const oracle = try optimizationOracle(fs, environ, allocator, driver.file, case_cfg.descriptor.case_id);
+    const oracle = try optimizationOracle(
+        fs,
+        environ,
+        allocator,
+        driver.file,
+        case_cfg.descriptor.case_id,
+    );
     const workload = try artifactDigest(artifact, "workload_sha256");
     const output = try artifactDigest(artifact, "output_sha256");
     if (!std.mem.eql(u8, &workload, &oracle.workload_digest) or
@@ -4986,7 +5172,11 @@ fn prepareCompatCase(
     try prepareLedgerPerfStore(fs, environ, allocator, repo_path, definition_path, case_cfg);
 }
 
-fn prepareSeqPerfCorpus(fs: durable_store.Fs, allocator: std.mem.Allocator, temp_root: []const u8) !void {
+fn prepareSeqPerfCorpus(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    temp_root: []const u8,
+) !void {
     const session_dir = try std.fs.path.join(
         allocator,
         &.{ temp_root, "seq-sessions/2026/07/26" },
@@ -5007,7 +5197,11 @@ fn prepareSeqPerfCorpus(fs: durable_store.Fs, allocator: std.mem.Allocator, temp
     );
 }
 
-fn prepareLedgerPerfDefinition(fs: durable_store.Fs, allocator: std.mem.Allocator, temp_root: []const u8) ![]u8 {
+fn prepareLedgerPerfDefinition(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    temp_root: []const u8,
+) ![]u8 {
     const source = try fs.directory().readFileAlloc(
         fs.io,
         "apps/ledger/src/v1/fixtures/event-definition.json",
@@ -5149,7 +5343,13 @@ fn renderCompatRun(
         .ledger_project,
         .ledger_doctor,
         => try appendLedgerStoreArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
-        .cas_wrapper_smoke => return renderCasWrapperSmoke(fs, allocator, binary_path, temp_root, cwd),
+        .cas_wrapper_smoke => return renderCasWrapperSmoke(
+            fs,
+            allocator,
+            binary_path,
+            temp_root,
+            cwd,
+        ),
         .cas_automation_list => try appendCasAutomationListArgs(
             fs.io,
             allocator,
@@ -5504,7 +5704,11 @@ const SpawnArguments = struct {
 fn destroySpawnActions(io: std.Io, actions: *std.c.posix_spawn_file_actions_t) void {
     const rc = std.c.posix_spawn_file_actions_destroy(actions);
     if (rc != 0) {
-        printDiagnostic(io, "warning: spawn action cleanup failed error={s}\n", .{@errorName(posixSpawnError(rc))});
+        printDiagnostic(
+            io,
+            "warning: spawn action cleanup failed error={s}\n",
+            .{@errorName(posixSpawnError(rc))},
+        );
     }
 }
 
@@ -5613,7 +5817,12 @@ fn makeTempRoot(fs: durable_store.Fs, allocator: std.mem.Allocator, label: []con
     return base;
 }
 
-fn releaseTempRoot(fs: durable_store.Fs, allocator: std.mem.Allocator, path: []u8, retain: bool) void {
+fn releaseTempRoot(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    path: []u8,
+    retain: bool,
+) void {
     if (!retain) {
         fs.directory().deleteTree(
             fs.io,
@@ -5642,7 +5851,11 @@ fn makeExecutable(fs: durable_store.Fs, path: []const u8) !void {
     );
 }
 
-fn absolutePathForCwdRelative(fs: durable_store.Fs, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+fn absolutePathForCwdRelative(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     const cwd = try fs.directory().realPathFileAlloc(fs.io, ".", allocator);
     defer allocator.free(cwd);
@@ -5712,7 +5925,11 @@ fn reportAutomationDbError(io: std.Io, message: [*:0]const u8) !void {
 
 fn closeAutomationDb(io: std.Io, db: *Sqlite.sqlite3) void {
     const rc = Sqlite.sqlite3_close(db);
-    if (rc != Sqlite.SQLITE_OK) printDiagnostic(io, "warning: automation database cleanup failed code={d}\n", .{rc});
+    if (rc != Sqlite.SQLITE_OK) printDiagnostic(
+        io,
+        "warning: automation database cleanup failed code={d}\n",
+        .{rc},
+    );
 }
 
 fn allowedUpperBoundWithTolerance(base: u64, tolerance_pct: f64) u64 {
@@ -5846,7 +6063,11 @@ const CapsuleLocator = struct {
     status: ?[]const u8 = null,
 };
 
-fn cmdReport(fs: durable_store.Fs, environ: ?*const std.process.Environ.Map, allocator: std.mem.Allocator) !void {
+fn cmdReport(
+    fs: durable_store.Fs,
+    environ: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) !void {
     const data = try loadReportCapsuleBytes(fs, allocator);
     defer allocator.free(data);
     var parsed = std.json.parseFromSlice(
@@ -6146,7 +6367,13 @@ fn validateRetainedOptimization(
     const driver = side.driver orelse return error.IncompletePerfDriverEvidence;
     var retained_driver = try capsuleSealedFile(fs, allocator, driver.file);
     defer retained_driver.deinit(allocator);
-    const oracle = try optimizationOracle(fs, environ, allocator, retained_driver, case_cfg.descriptor.case_id);
+    const oracle = try optimizationOracle(
+        fs,
+        environ,
+        allocator,
+        retained_driver,
+        case_cfg.descriptor.case_id,
+    );
     try verifyCapsuleFile(fs, allocator, driver.source.file);
     try verifyCapsuleFile(
         fs,
@@ -6330,7 +6557,11 @@ fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
         }
         if ((driverSourceMatchesIdentity(source, legacy_optimization_summary_driver_v1) or
             driverSourceMatchesIdentity(source, legacy_summary_optimization_driver_v1)) and
-            std.mem.eql(u8, build_file.sha256, "sha256:" ++ legacy_optimization_summary_build_sha256))
+            std.mem.eql(
+                u8,
+                build_file.sha256,
+                "sha256:" ++ legacy_optimization_summary_build_sha256,
+            ))
         {
             return;
         }
@@ -6366,7 +6597,11 @@ fn driverSourceMatchesIdentity(source: CapsuleDriverSource, identity: DriverSour
         );
 }
 
-fn validateCompilerEvidence(fs: durable_store.Fs, allocator: std.mem.Allocator, compiler: CapsuleCompiler) !void {
+fn validateCompilerEvidence(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    compiler: CapsuleCompiler,
+) !void {
     if (!std.fs.path.isAbsolute(compiler.approved_path) or
         compiler.version.len == 0)
     {
@@ -6487,7 +6722,12 @@ fn isDeepCaseId(case_id: []const u8) bool {
     return deepCaseForId(case_id) != null;
 }
 
-fn loadCapsuleFileAlloc(fs: durable_store.Fs, allocator: std.mem.Allocator, file: CapsuleFile, max_bytes: usize) ![]u8 {
+fn loadCapsuleFileAlloc(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    file: CapsuleFile,
+    max_bytes: usize,
+) ![]u8 {
     try requireDigestIdentity(file.sha256);
     if (file.label.len == 0 or
         !std.mem.eql(u8, file.label, std.fs.path.basename(file.label)) or
@@ -6620,7 +6860,11 @@ fn verifyCapsuleFile(fs: durable_store.Fs, allocator: std.mem.Allocator, file: C
     allocator.free(data);
 }
 
-fn capsuleSealedFile(fs: durable_store.Fs, allocator: std.mem.Allocator, file: CapsuleFile) !SealedFile {
+fn capsuleSealedFile(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    file: CapsuleFile,
+) !SealedFile {
     try verifyCapsuleFile(fs, allocator, file);
     const blobs_root = try resolveCapsuleBlobsRoot(fs, allocator);
     defer allocator.free(blobs_root);
@@ -6641,7 +6885,11 @@ fn requireCutoverReportTuple(
     }
 }
 
-fn resolveMachineDir(fs: durable_store.Fs, allocator: std.mem.Allocator, perf_root: []const u8) ![]u8 {
+fn resolveMachineDir(
+    fs: durable_store.Fs,
+    allocator: std.mem.Allocator,
+    perf_root: []const u8,
+) ![]u8 {
     const current_name = try currentMachineDirName(allocator);
     defer allocator.free(current_name);
     const preferred = try std.fs.path.join(allocator, &.{ perf_root, current_name });
@@ -6815,7 +7063,7 @@ fn writeJsonString(writer: anytype, text: []const u8) !void {
 
 fn printDiagnostic(io: std.Io, comptime format: []const u8, args: anytype) void {
     var stderr_writer = std.Io.File.stderr().writer(io, &.{});
-    stderr_writer.interface.print(format, args) catch {};
+    stderr_writer.interface.print(format, args) catch return;
 }
 
 fn restoreTestCwd(io: std.Io, path: []const u8) void {
@@ -6837,13 +7085,18 @@ test "resolveMachineDir rejects a legacy-only directory" {
     try tmp.dir.createDirPath(io, ".perf-local/legacy-only");
     try std.testing.expectError(
         error.MissingMachineDir,
-        resolveMachineDir(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), alloc, ".perf-local"),
+        resolveMachineDir(
+            durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+            alloc,
+            ".perf-local",
+        ),
     );
 }
 
 test "capsule files are digest-addressed beneath the current machine root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const fs = durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd());
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const cwd_before = try std.process.currentPathAlloc(io, allocator);
@@ -6853,13 +7106,17 @@ test "capsule files are digest-addressed beneath the current machine root" {
     const tmp_root = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(tmp_root);
 
-    const machine_dir = try ensureCurrentMachineDir(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator);
+    const machine_dir = try ensureCurrentMachineDir(
+        fs,
+        allocator,
+    );
     defer allocator.free(machine_dir);
-    const absolute_machine_dir = try absoluteMachineDir(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator);
+    const absolute_machine_dir =
+        try absoluteMachineDir(fs, allocator);
     defer allocator.free(absolute_machine_dir);
     try std.testing.expect(std.fs.path.isAbsolute(absolute_machine_dir));
     var sealed = try sealEvidenceBytes(
-        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+        fs,
         allocator,
         machine_dir,
         "payload",
@@ -6867,34 +7124,44 @@ test "capsule files are digest-addressed beneath the current machine root" {
         0o600,
     );
     defer sealed.deinit(allocator);
-    const identity = try allocator.print(
-        "sha256:{s}",
-        .{sealed.sha256},
-    );
+    const identity = try allocator.print("sha256:{s}", .{sealed.sha256});
     defer allocator.free(identity);
     const valid = CapsuleFile{
         .label = "payload",
         .sha256 = identity,
     };
-    const bytes = try loadCapsuleFileAlloc(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator, valid, 64);
+    const bytes =
+        try loadCapsuleFileAlloc(fs, allocator, valid, 64);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("bound", bytes);
-    var reopened = try capsuleSealedFile(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator, valid);
+    var reopened = try capsuleSealedFile(
+        fs,
+        allocator,
+        valid,
+    );
     defer reopened.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &sealed.sha256, &reopened.sha256);
-    try verifySealedFile(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), reopened);
+    try verifySealedFile(fs, reopened);
 
-    try expectCapsuleRejectsLinkedRoot(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), tmp.dir, valid);
+    try expectCapsuleRejectsLinkedRoot(
+        fs,
+        tmp.dir,
+        valid,
+    );
     try std.testing.expectError(
         error.PerfEvidencePathOutsideCapsule,
         loadCapsuleFileAlloc(
-            durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+            fs,
             allocator,
             .{ .label = "../payload", .sha256 = identity },
             64,
         ),
     );
-    try expectCapsuleRejectsLinkedBlob(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), machine_dir, tmp_root);
+    try expectCapsuleRejectsLinkedBlob(
+        fs,
+        machine_dir,
+        tmp_root,
+    );
 }
 
 fn expectCapsuleRejectsLinkedRoot(fs: durable_store.Fs, dir: std.Io.Dir, valid: CapsuleFile) !void {
@@ -6925,7 +7192,11 @@ fn expectCapsuleRejectsLinkedRoot(fs: durable_store.Fs, dir: std.Io.Dir, valid: 
     );
 }
 
-fn expectCapsuleRejectsLinkedBlob(fs: durable_store.Fs, machine_dir: []const u8, tmp_root: []const u8) !void {
+fn expectCapsuleRejectsLinkedBlob(
+    fs: durable_store.Fs,
+    machine_dir: []const u8,
+    tmp_root: []const u8,
+) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var symlinked = try sealEvidenceBytes(
@@ -7150,7 +7421,17 @@ test "isolated product and driver builds use supported private compiler caches" 
     defer allocator.free(observed_path);
     inline for (.{ "", "driver-" }) |cache_prefix| {
         const kind: DriverKind = if (cache_prefix.len == 0) .seq_replay else .optimization;
-        try runIsolatedBuild(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), &environment, allocator, root, root, prefix, configured, cache_prefix, kind);
+        try runIsolatedBuild(
+            durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+            &environment,
+            allocator,
+            root,
+            root,
+            prefix,
+            configured,
+            cache_prefix,
+            kind,
+        );
         const observed = try std.Io.Dir.cwd().readFileAlloc(
             io,
             observed_path,
@@ -7358,7 +7639,10 @@ test "report errors clearly when compare summary is missing" {
     defer alloc.free(reports_path);
     try tmp.dir.createDirPath(std.testing.io, reports_path);
 
-    try std.testing.expectError(error.MissingCompareSummary, cmdReport(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), null, alloc));
+    try std.testing.expectError(
+        error.MissingCompareSummary,
+        cmdReport(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), null, alloc),
+    );
 }
 
 test "unmatched comparison target preserves prior evidence artifacts" {
@@ -7405,7 +7689,12 @@ test "unmatched comparison target preserves prior evidence artifacts" {
     );
     try std.testing.expectError(
         error.NoMatchingPerfCases,
-        cmdCompare(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), null, allocator, "definitely-no-such-case"),
+        cmdCompare(
+            durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+            null,
+            allocator,
+            "definitely-no-such-case",
+        ),
     );
     const bytes = try tmp.dir.readFileAlloc(
         std.testing.io,
@@ -7428,9 +7717,16 @@ test "matching comparison invalidation retires stale locator authority" {
     defer allocator.free(cwd_before);
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(std.testing.io, cwd_before);
-    const machine_dir = try ensureCurrentMachineDir(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator);
+    const machine_dir = try ensureCurrentMachineDir(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+        allocator,
+    );
     defer allocator.free(machine_dir);
-    try invalidateCurrentCapsule(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), allocator, machine_dir);
+    try invalidateCurrentCapsule(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+        allocator,
+        machine_dir,
+    );
     const locator_path = try std.fs.path.join(
         allocator,
         &.{ machine_dir, "reports", "current-capsule.json" },
@@ -7512,7 +7808,10 @@ test "report rejects malformed rows in a verified capsule" {
         0o600,
     );
 
-    try std.testing.expectError(error.InvalidCompareSummary, cmdReport(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), null, alloc));
+    try std.testing.expectError(
+        error.InvalidCompareSummary,
+        cmdReport(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), null, alloc),
+    );
 }
 
 test "capsule completeness and pass status are recomputed" {
@@ -7925,7 +8224,10 @@ test "sealed evidence rejects content substitution" {
     defer std.testing.allocator.free(real_path);
     var file: SealedFile = .{
         .path = try std.testing.allocator.dupeSentinel(u8, real_path, 0),
-        .sha256 = try sha256File(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), real_path),
+        .sha256 = try sha256File(
+            durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+            real_path,
+        ),
     };
     defer file.deinit(std.testing.allocator);
     try verifySealedFile(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), file);
@@ -7940,10 +8242,19 @@ test "sealed evidence rejects content substitution" {
 }
 
 test "temp-root release deletes storage before freeing its path" {
-    const root = try makeTempRoot(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), std.testing.allocator, "release-order");
+    const root = try makeTempRoot(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+        std.testing.allocator,
+        "release-order",
+    );
     const observed_root = try std.testing.allocator.dupe(u8, root);
     defer std.testing.allocator.free(observed_root);
-    releaseTempRoot(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()), std.testing.allocator, root, false);
+    releaseTempRoot(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+        std.testing.allocator,
+        root,
+        false,
+    );
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, observed_root, .{}),
@@ -8347,18 +8658,34 @@ test "sort-once summaries retain pre-change driver identities for capsule readba
     try validateDriverSourceMetadata(optimization_source);
     try std.testing.expect(!isOptimizationDriverSource(seq_source));
     try std.testing.expect(isOptimizationDriverSource(optimization_source));
-    try std.testing.expect(!std.mem.eql(u8, seq_source.revision, active_seq_replay_driver_v2.revision));
-    try std.testing.expect(!std.mem.eql(u8, optimization_source.revision, active_optimization_driver_v1.revision));
-    try std.testing.expectEqualStrings(legacy_optimization_summary_build_sha256, &optimization_build_sha256);
+    try std.testing.expect(
+        !std.mem.eql(u8, seq_source.revision, active_seq_replay_driver_v2.revision),
+    );
+    try std.testing.expect(
+        !std.mem.eql(u8, optimization_source.revision, active_optimization_driver_v1.revision),
+    );
+    try std.testing.expectEqualStrings(
+        legacy_optimization_summary_build_sha256,
+        &optimization_build_sha256,
+    );
     var mixed_seq = seq_source;
     mixed_seq.tree = active_seq_replay_driver_v2.tree;
-    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_seq));
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(mixed_seq),
+    );
     var mixed_optimization = optimization_source;
     mixed_optimization.tree = active_optimization_driver_v1.tree;
-    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_optimization));
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(mixed_optimization),
+    );
     mixed_optimization = optimization_source;
     mixed_optimization.build_file = null;
-    try std.testing.expectError(error.PerfEvidenceIdentityMismatch, validateDriverSourceMetadata(mixed_optimization));
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(mixed_optimization),
+    );
 }
 
 test "capsule readback preserves legacy percentile summaries and chronological samples" {
@@ -8383,7 +8710,10 @@ test "capsule readback preserves legacy percentile summaries and chronological s
     try std.testing.expectEqual(@as(u64, 3), counting.stats.free_calls);
     try std.testing.expectEqualSlices(u64, &captured_times, &times);
     metrics.p95_ns = 228;
-    try std.testing.expectError(error.InvalidPerfDerivedMetric, validateRetainedMetrics(std.testing.allocator, metrics, config, true));
+    try std.testing.expectError(
+        error.InvalidPerfDerivedMetric,
+        validateRetainedMetrics(std.testing.allocator, metrics, config, true),
+    );
 }
 
 test "child capture keeps supplied filesystem and environment authority" {
@@ -8404,7 +8734,11 @@ test "child capture keeps supplied filesystem and environment authority" {
             &environment,
             allocator,
             ".",
-            &.{ "/bin/sh", "-c", "IFS= read -r marker < marker; printf '%s|%s' \"$PERF_TEST_AUTHORITY\" \"$marker\"" },
+            &.{
+                "/bin/sh",
+                "-c",
+                "IFS= read -r marker < marker; printf '%s|%s' \"$PERF_TEST_AUTHORITY\" \"$marker\"",
+            },
         );
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
@@ -8434,18 +8768,34 @@ test "evidence operations use supplied I/O and retain independently admitted roo
     try std.testing.expectEqualStrings("second", second_bytes);
 
     const Canceled = struct {
-        fn openFile(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn openFile(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             return error.Canceled;
         }
     };
     var vtable = io.vtable.*;
     vtable.dirOpenFile = Canceled.openFile;
     const canceled_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.Canceled, readRegularFileAlloc(durable_store.Fs.init(canceled_io, first.dir), allocator, "evidence", 64));
+    try std.testing.expectError(
+        error.Canceled,
+        readRegularFileAlloc(
+            durable_store.Fs.init(canceled_io, first.dir),
+            allocator,
+            "evidence",
+            64,
+        ),
+    );
 }
 
 test "explicit I/O driver migration retains preceding summary source tuples" {
-    inline for (.{ legacy_summary_seq_replay_driver_v2, legacy_summary_optimization_driver_v1 }) |identity| {
+    inline for (.{
+        legacy_summary_seq_replay_driver_v2,
+        legacy_summary_optimization_driver_v1,
+    }) |identity| {
         const optimization = std.mem.eql(u8, identity.locator, "tools/optimization_driver.zig");
         const source = CapsuleDriverSource{
             .revision = identity.revision,
@@ -8475,7 +8825,11 @@ test "child capture releases directory and environment resources on allocation f
     );
 }
 
-fn expectChildCaptureAuthority(allocator: std.mem.Allocator, dir: std.Io.Dir, environment: *const std.process.Environ.Map) !void {
+fn expectChildCaptureAuthority(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+) !void {
     const result = try runChildCaptureOutput(
         durable_store.Fs.init(std.testing.io, dir),
         environment,

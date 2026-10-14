@@ -105,7 +105,7 @@ test "repository auditing uses the supplied directory" {
         defer std.testing.allocator.free(path);
         try tmp.dir.writeFile(std.testing.io, .{
             .sub_path = path,
-            .data = "libs/definition_core/**\n",
+            .data = "\"build/**\"\nlibs/definition_core/**\n",
         });
     }
     try tmp.dir.writeFile(std.testing.io, .{
@@ -119,6 +119,13 @@ test "repository auditing uses the supplied directory" {
     const result = try run(std.testing.allocator, std.testing.io, tmp.dir, &output.writer);
     try std.testing.expectEqual(@as(u32, 7), result.checks);
     try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+    try std.testing.expectEqualStrings(
+        ".github/workflows/pr-ci.yml:1: tiger-style/reposit" ++
+            "ory-contract: \"libs/**\" expected=1 actual=0\n" ++
+            ".github/workflows/auto-release.yml:1: tiger-style/" ++
+            "repository-contract: \"libs/**\" expected=1 actual=0\n",
+        output.written(),
+    );
 }
 
 fn checkSurfaceRules(

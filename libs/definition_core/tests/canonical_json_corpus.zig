@@ -50,7 +50,10 @@ test "broad deterministic f64 corpus is round-trip stable and byte locked" {
         defer std.testing.allocator.free(encoded);
         const expected_digest = try canonical_json.digestBytesAlloc(std.testing.allocator, encoded);
         defer std.testing.allocator.free(expected_digest);
-        const actual_digest = try canonical_json.digestValueAlloc(std.testing.allocator, .{ .float = number });
+        const actual_digest = try canonical_json.digestValueAlloc(
+            std.testing.allocator,
+            .{ .float = number },
+        );
         defer std.testing.allocator.free(actual_digest);
         try std.testing.expectEqualStrings(expected_digest, actual_digest);
         const reparsed = try std.fmt.parseFloat(f64, encoded);

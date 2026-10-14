@@ -259,16 +259,31 @@ test "default Unix path uses supplied home values and preserves precedence" {
         return;
     }
     const cases = .{
-        .{ @as(?[]const u8, "/codex"), @as(?[]const u8, "/home"), "/codex/app-server-control/app-server-control.sock" },
-        .{ @as(?[]const u8, null), @as(?[]const u8, "/home"), "/home/.codex/app-server-control/app-server-control.sock" },
-        .{ @as(?[]const u8, ""), @as(?[]const u8, "/home"), "app-server-control/app-server-control.sock" },
+        .{
+            @as(?[]const u8, "/codex"),
+            @as(?[]const u8, "/home"),
+            "/codex/app-server-control/app-server-control.sock",
+        },
+        .{
+            @as(?[]const u8, null),
+            @as(?[]const u8, "/home"),
+            "/home/.codex/app-server-control/app-server-control.sock",
+        },
+        .{
+            @as(?[]const u8, ""),
+            @as(?[]const u8, "/home"),
+            "app-server-control/app-server-control.sock",
+        },
     };
     inline for (cases) |case| {
         const actual = try defaultUnixPathAlloc(std.testing.allocator, case[0], case[1]);
         defer std.testing.allocator.free(actual);
         try std.testing.expectEqualStrings(case[2], actual);
     }
-    try std.testing.expectError(error.HomeNotSet, defaultUnixPathAlloc(std.testing.allocator, null, null));
+    try std.testing.expectError(
+        error.HomeNotSet,
+        defaultUnixPathAlloc(std.testing.allocator, null, null),
+    );
 }
 
 test "executable resolution uses independent supplied directories and PATH values" {
@@ -292,8 +307,14 @@ test "executable resolution uses independent supplied directories and PATH value
         const by_slash = try resolveExecutableAlloc(allocator, io, dir, null, "./" ++ name);
         defer allocator.free(by_slash);
         try std.testing.expectEqualStrings(absolute, by_slash);
-        try std.testing.expectError(error.ExecutableNotFound, resolveExecutableAlloc(allocator, io, dir, "::", name));
-        try std.testing.expectError(error.ExecutableNotFound, resolveExecutableAlloc(allocator, io, dir, null, name));
+        try std.testing.expectError(
+            error.ExecutableNotFound,
+            resolveExecutableAlloc(allocator, io, dir, "::", name),
+        );
+        try std.testing.expectError(
+            error.ExecutableNotFound,
+            resolveExecutableAlloc(allocator, io, dir, null, name),
+        );
     }
 }
 
@@ -314,7 +335,13 @@ test "PATH executable resolution preserves symlink spelling" {
     const expected = try std.fs.path.join(allocator, &.{ path_env, "cas-symlink-fixture" });
     defer allocator.free(expected);
     for ([_][]const u8{ "alias", path_env }) |path| {
-        const resolved = try resolveExecutableAlloc(allocator, io, dir.dir, path, "cas-symlink-fixture");
+        const resolved = try resolveExecutableAlloc(
+            allocator,
+            io,
+            dir.dir,
+            path,
+            "cas-symlink-fixture",
+        );
         defer allocator.free(resolved);
         try std.testing.expectEqualStrings(expected, resolved);
     }
@@ -322,11 +349,21 @@ test "PATH executable resolution preserves symlink spelling" {
 
 test "executable resolution propagates supplied I/O cancellation" {
     const Canceled = struct {
-        fn realPath(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []u8) std.Io.Dir.RealPathFileError!usize {
+        fn realPath(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: []u8,
+        ) std.Io.Dir.RealPathFileError!usize {
             return error.Canceled;
         }
 
-        fn access(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.AccessOptions) std.Io.Dir.AccessError!void {
+        fn access(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.AccessOptions,
+        ) std.Io.Dir.AccessError!void {
             return error.Canceled;
         }
     };
@@ -336,14 +373,23 @@ test "executable resolution propagates supplied I/O cancellation" {
     vtable.dirRealPathFile = Canceled.realPath;
     vtable.dirAccess = Canceled.access;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.Canceled, resolveExecutableAlloc(std.testing.allocator, io, dir.dir, null, "./codex"));
-    try std.testing.expectError(error.Canceled, resolveExecutableAlloc(std.testing.allocator, io, dir.dir, ".", "codex"));
+    try std.testing.expectError(
+        error.Canceled,
+        resolveExecutableAlloc(std.testing.allocator, io, dir.dir, null, "./codex"),
+    );
+    try std.testing.expectError(
+        error.Canceled,
+        resolveExecutableAlloc(std.testing.allocator, io, dir.dir, ".", "codex"),
+    );
 }
 
 test "executable resolution propagates allocation failure" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "cas-allocation-fixture", .data = "fixture" });
+    try dir.dir.writeFile(
+        std.testing.io,
+        .{ .sub_path = "cas-allocation-fixture", .data = "fixture" },
+    );
     try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         exerciseExecutableAllocations,
@@ -352,9 +398,21 @@ test "executable resolution propagates allocation failure" {
 }
 
 fn exerciseExecutableAllocations(allocator: std.mem.Allocator, dir: std.Io.Dir) !void {
-    const slash = try resolveExecutableAlloc(allocator, std.testing.io, dir, null, "./cas-allocation-fixture");
+    const slash = try resolveExecutableAlloc(
+        allocator,
+        std.testing.io,
+        dir,
+        null,
+        "./cas-allocation-fixture",
+    );
     defer allocator.free(slash);
-    const path = try resolveExecutableAlloc(allocator, std.testing.io, dir, ".", "cas-allocation-fixture");
+    const path = try resolveExecutableAlloc(
+        allocator,
+        std.testing.io,
+        dir,
+        ".",
+        "cas-allocation-fixture",
+    );
     defer allocator.free(path);
     try std.testing.expect(std.fs.path.isAbsolute(slash));
     try std.testing.expect(std.fs.path.isAbsolute(path));

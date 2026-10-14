@@ -105,9 +105,12 @@ pub fn publishNote(
         .not_published, .publication_unknown => |failure| {
             var diagnostic = std.Io.File.stderr().writer(fs.io, &.{});
             if (failure.cleanup) |cleanup| {
-                diagnostic.interface.print("warning: memory-note staging cleanup failed for {s}: {s}\n", .{
-                    cleanup.stage_name, @errorName(cleanup.cause),
-                }) catch {};
+                diagnostic.interface.print(
+                    "warning: memory-note staging cleanup failed for {s}: {s}\n",
+                    .{
+                        cleanup.stage_name, @errorName(cleanup.cause),
+                    },
+                ) catch return failure.cause;
             }
             return failure.cause;
         },
@@ -131,7 +134,10 @@ test "extension lock is exclusive reusable and leaves its recognized marker" {
         var first = try acquireExtensionLock(fs, allocator, path);
         defer first.release();
         try std.testing.expect(first.created);
-        try std.testing.expectError(error.MemoryNoteBusy, acquireExtensionLock(fs, allocator, path));
+        try std.testing.expectError(
+            error.MemoryNoteBusy,
+            acquireExtensionLock(fs, allocator, path),
+        );
     }
     const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, 64);
     defer allocator.free(raw);
@@ -152,10 +158,16 @@ test "extension lock does not steal legacy sentinels or follow symlinks" {
     const path = try std.fs.path.join(allocator, &.{ home, "legacy.lock" });
     defer allocator.free(path);
     try tmp.dir.writeFile(io, .{ .sub_path = "legacy.lock", .data = "" });
-    try std.testing.expectError(error.LegacyLockNeedsReview, acquireExtensionLock(fs, allocator, path));
+    try std.testing.expectError(
+        error.LegacyLockNeedsReview,
+        acquireExtensionLock(fs, allocator, path),
+    );
     try std.testing.expectEqual(@as(u64, 0), (try tmp.dir.statFile(io, "legacy.lock", .{})).size);
     try tmp.dir.writeFile(io, .{ .sub_path = "legacy.lock", .data = "unrecognized" });
-    try std.testing.expectError(error.LegacyLockNeedsReview, acquireExtensionLock(fs, allocator, path));
+    try std.testing.expectError(
+        error.LegacyLockNeedsReview,
+        acquireExtensionLock(fs, allocator, path),
+    );
     try tmp.dir.deleteFile(io, "legacy.lock");
     try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = lock_marker });
     try tmp.dir.symLink(io, "target", "legacy.lock", .{});
@@ -184,7 +196,10 @@ test "publication isolates abandoned staging and never replaces an admission" {
             @as(std.posix.mode_t, 0o600),
             stat.permissions.toMode() & 0o777,
         );
-    try std.testing.expectError(error.PathAlreadyExists, publishNote(fs, allocator, target, "changed"));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        publishNote(fs, allocator, target, "changed"),
+    );
     const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, target, 64);
     defer allocator.free(raw);
     try std.testing.expectEqualStrings("{\"complete\":true}\n", raw);
@@ -212,7 +227,10 @@ test "publication rejects a symlinked control staging directory" {
     defer allocator.free(home);
     const target = try std.fs.path.join(allocator, &.{ home, "extension", "notes", "note.md" });
     defer allocator.free(target);
-    try std.testing.expectError(error.SymlinkComponent, publishNote(fs, allocator, target, "complete"));
+    try std.testing.expectError(
+        error.SymlinkComponent,
+        publishNote(fs, allocator, target, "complete"),
+    );
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.statFile(io, "extension/notes/note.md", .{}),
@@ -231,7 +249,12 @@ test "extension lock cancellation uses the caller I/O and preserves the marker" 
     try tmp.dir.writeFile(io, .{ .sub_path = "extension.lock", .data = lock_marker });
     var vtable = io.vtable.*;
     vtable.dirOpenFile = struct {
-        fn open(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
             return error.Canceled;
         }
     }.open;
@@ -260,7 +283,10 @@ test "publication sync failure uses caller I/O and removes the incomplete stage"
             const size = file.realPath(std.testing.io, &path_buffer) catch return error.Unexpected;
             const stage_path = path_buffer[0..size];
             const staging_path = std.fs.path.dirname(stage_path) orelse return error.Unexpected;
-            std.testing.expectEqualStrings(".memory-note-staging", std.fs.path.basename(staging_path)) catch
+            std.testing.expectEqualStrings(
+                ".memory-note-staging",
+                std.fs.path.basename(staging_path),
+            ) catch
                 return error.Unexpected;
             const extension_path = std.fs.path.dirname(staging_path) orelse return error.Unexpected;
             var extension = std.Io.Dir.openDirAbsolute(std.testing.io, extension_path, .{}) catch
@@ -276,8 +302,14 @@ test "publication sync failure uses caller I/O and removes the incomplete stage"
         }
     }.sync;
     const failing = Fs.init(.{ .userdata = io.userdata, .vtable = &vtable }, tmp.dir);
-    try std.testing.expectError(error.InputOutput, publishNote(failing, allocator, path, "complete"));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "extension/notes/note.md", .{}));
+    try std.testing.expectError(
+        error.InputOutput,
+        publishNote(failing, allocator, path, "complete"),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "extension/notes/note.md", .{}),
+    );
     var staging = try tmp.dir.openDir(io, "extension/.memory-note-staging", .{ .iterate = true });
     defer staging.close(io);
     var entries = staging.iterate();

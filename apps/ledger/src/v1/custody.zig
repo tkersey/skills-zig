@@ -1327,7 +1327,9 @@ fn optionalUnsigned(
 }
 
 test "missing slot rejects an orphaned custody binding" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1500,7 +1502,9 @@ fn writeTestAdvisory(
 }
 
 test "sidecar-free bound slot remains materialization readable" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1545,7 +1549,9 @@ test "sidecar-free bound slot remains materialization readable" {
 }
 
 test "idle custody sidecars preserve stable missing slots" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1604,7 +1610,9 @@ test "idle custody sidecars preserve stable missing slots" {
 }
 
 test "existing slot without a binding fails custody integrity" {
-    var scope_storage = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    var scope_storage = storage_root.Scope.init(
+        durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()),
+    );
     const scope = &scope_storage;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

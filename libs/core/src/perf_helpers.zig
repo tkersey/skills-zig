@@ -229,13 +229,17 @@ test "percentile summaries preserve floor ranks, duplicates, extremes, and captu
     const samples = [_]u64{ 9, 0, 3, std.math.maxInt(u64), 3, 7, 1, 8, 2, 6 };
     const before = samples;
     const actual = try percentilesU64(std.testing.allocator, &samples, &.{ 0, 50, 95, 100, 101 });
-    try std.testing.expectEqualSlices(u64, &.{ 0, 3, 9, std.math.maxInt(u64), std.math.maxInt(u64) }, &actual);
+    try std.testing.expectEqualSlices(
+        u64,
+        &.{ 0, 3, 9, std.math.maxInt(u64), std.math.maxInt(u64) },
+        &actual,
+    );
     try std.testing.expectEqualSlices(u64, &before, &samples);
     const singleton = try percentilesU64(std.testing.allocator, &.{42}, &.{ 0, 50, 95, 100 });
     try std.testing.expectEqualSlices(u64, &.{ 42, 42, 42, 42 }, &singleton);
 }
 
-test "percentile summaries agree with legacy independent sorts at established and large sample counts" {
+test "percentile summaries agree with legacy sorts across sample counts" {
     var storage: [4097]u64 = undefined;
     for (&storage, 0..) |*sample, index| sample.* = @intCast((index * 37) % 113);
     const percentages = [_]usize{ 0, 1, 50, 95, 99, 100, 101, std.math.maxInt(usize) };
@@ -244,14 +248,20 @@ test "percentile summaries agree with legacy independent sorts at established an
         const actual = try percentilesU64(counting.allocator(), storage[0..count], &percentages);
         try std.testing.expectEqual(@as(u64, 1), counting.stats.alloc_calls);
         try std.testing.expectEqual(@as(u64, 1), counting.stats.free_calls);
-        try std.testing.expectEqual(@as(u64, count * @sizeOf(u64)), counting.stats.requested_alloc_bytes);
+        try std.testing.expectEqual(
+            @as(u64, count * @sizeOf(u64)),
+            counting.stats.requested_alloc_bytes,
+        );
         for (percentages, actual) |percent, result| {
             var legacy = storage;
             const sorted = legacy[0..count];
             std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
             const index = if (percent >= 100) count - 1 else ((count - 1) * percent) / 100;
             try std.testing.expectEqual(sorted[index], result);
-            try std.testing.expectEqual(result, try percentileU64(std.testing.allocator, storage[0..count], percent));
+            try std.testing.expectEqual(
+                result,
+                try percentileU64(std.testing.allocator, storage[0..count], percent),
+            );
         }
     }
 }
@@ -262,7 +272,10 @@ test "percentile summaries preserve empty-input and allocation failure behavior"
     try std.testing.expectError(error.EmptySamples, percentilesU64(allocator, &.{}, &.{ 50, 95 }));
     try std.testing.expectError(error.EmptySamples, percentileU64(allocator, &.{}, 50));
     var samples = [_]u64{ 9, 1, 3 };
-    try std.testing.expectError(error.OutOfMemory, percentilesU64(allocator, &samples, &.{ 50, 95 }));
+    try std.testing.expectError(
+        error.OutOfMemory,
+        percentilesU64(allocator, &samples, &.{ 50, 95 }),
+    );
     try std.testing.expectEqualSlices(u64, &.{ 9, 1, 3 }, &samples);
 }
 
@@ -277,7 +290,9 @@ test "allocation counters retain attempted calls and requested bytes on success 
     try std.testing.expect(allocator.rawResize(memory[0..8], alignment, 12, @returnAddress()));
     try std.testing.expect(!allocator.rawResize(memory[0..12], alignment, 32, @returnAddress()));
     const remapped = allocator.rawRemap(memory[0..12], alignment, 4, @returnAddress()).?;
-    try std.testing.expect(allocator.rawRemap(remapped[0..4], alignment, 32, @returnAddress()) == null);
+    try std.testing.expect(
+        allocator.rawRemap(remapped[0..4], alignment, 32, @returnAddress()) == null,
+    );
     allocator.rawFree(remapped[0..4], alignment, @returnAddress());
     try std.testing.expectEqual(AllocStats{
         .alloc_calls = 2,

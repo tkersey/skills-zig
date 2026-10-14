@@ -4955,12 +4955,8 @@ fn executeSegmentedProjection(
     slot: storage.ResolvedSlot,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
-    var snapshot = try segmented_event_log.Snapshot.load(
-        scope,
-        allocator,
-        repo_root,
-        slot.relative_path,
-    );
+    var snapshot =
+        try segmented_event_log.Snapshot.load(scope, allocator, repo_root, slot.relative_path);
     defer snapshot.deinit(allocator);
     try segmented_event_log.requireMigratedCustody(
         scope,
@@ -6356,11 +6352,7 @@ fn executeSelectedDocument(
         false,
     );
     defer replay_stats.deinit(allocator);
-    const effective_limit = try resolveLimit(
-        compiled.limit,
-        parameters,
-        plan.max_records,
-    );
+    const effective_limit = try resolveLimit(compiled.limit, parameters, plan.max_records);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     var stats: Stats = .{

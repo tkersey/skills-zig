@@ -169,7 +169,13 @@ pub fn run(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, argv[1], "app-server") and argv.len > 2 and
         (std.mem.eql(u8, argv[2], "session") or std.mem.eql(u8, argv[2], "daemon")))
     {
-        const exit_code = runAppServerDelegate(directory, environ, allocator, init.io, argv[2..]) catch |err| {
+        const exit_code = runAppServerDelegate(
+            directory,
+            environ,
+            allocator,
+            init.io,
+            argv[2..],
+        ) catch |err| {
             var stderr_writer = std.Io.File.stderr().writer(
                 io,
                 &.{},
@@ -186,7 +192,13 @@ pub fn run(init: std.process.Init) !u8 {
     return runSelectedTarget(directory, environ, allocator, init.io, argv);
 }
 
-fn runSelectedTarget(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
+fn runSelectedTarget(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !u8 {
     const target_name = resolveTarget(argv[1]) orelse {
         return usageFailure(io, "UnknownSubcommand", argv[1]);
     };
@@ -268,8 +280,19 @@ fn appendAppServerDelegateArgs(
     }
 }
 
-fn runCommand(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
-    if (builtin.target.os.tag == .macos) return runCommandPosixSpawn(directory, environ, allocator, args);
+fn runCommand(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+) !u8 {
+    if (builtin.target.os.tag == .macos) return runCommandPosixSpawn(
+        directory,
+        environ,
+        allocator,
+        args,
+    );
 
     var child = try std.process.spawn(io, .{
         .argv = args,
@@ -288,7 +311,12 @@ fn runCommand(directory: std.Io.Dir, environ: *const std.process.Environ.Map, al
     };
 }
 
-fn runCommandPosixSpawn(directory: std.Io.Dir, environ: *const std.process.Environ.Map, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+fn runCommandPosixSpawn(
+    directory: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+) !u8 {
     if (args.len == 0) return error.FileNotFound;
 
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
@@ -672,7 +700,13 @@ test "capabilities publish current contract features" {
 
 fn usageFailure(io: std.Io, code: []const u8, detail: ?[]const u8) u8 {
     var writer = std.Io.File.stderr().writer(io, &.{});
-    core_cli.printUsageFailureWithHelp(&writer.interface, HelpSurface, Version, code, detail) catch return 1;
+    core_cli.printUsageFailureWithHelp(
+        &writer.interface,
+        HelpSurface,
+        Version,
+        code,
+        detail,
+    ) catch return 1;
     return 2;
 }
 
