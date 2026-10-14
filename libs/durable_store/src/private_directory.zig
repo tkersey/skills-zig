@@ -34,11 +34,19 @@ pub const PrivateDirectory = struct {
         self.* = undefined;
     }
 
-    pub fn openChild(self: *const PrivateDirectory, leaf: []const u8, mode: Mode) !PrivateDirectory {
+    pub fn openChild(
+        self: *const PrivateDirectory,
+        leaf: []const u8,
+        mode: Mode,
+    ) !PrivateDirectory {
         try validateLeaf(leaf);
         try admit(self.io, self.directory, .read_only);
         if (mode == .create) {
-            self.directory.createDir(self.io, leaf, privatePermissions(0o700)) catch |err| switch (err) {
+            self.directory.createDir(
+                self.io,
+                leaf,
+                privatePermissions(0o700),
+            ) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
@@ -49,7 +57,12 @@ pub const PrivateDirectory = struct {
         return .{ .io = self.io, .directory = directory };
     }
 
-    pub fn readAlloc(self: *const PrivateDirectory, allocator: std.mem.Allocator, leaf: []const u8, max_bytes: usize) ![]u8 {
+    pub fn readAlloc(
+        self: *const PrivateDirectory,
+        allocator: std.mem.Allocator,
+        leaf: []const u8,
+        max_bytes: usize,
+    ) ![]u8 {
         try validateLeaf(leaf);
         try admit(self.io, self.directory, .read_only);
         const file = try self.directory.openFile(self.io, leaf, .{
@@ -69,16 +82,32 @@ pub const PrivateDirectory = struct {
 
     /// Optional caches may abandon a failed publication. Errors do not imply
     /// that the old destination remains present: a rename reply can be lost.
-    pub fn replace(self: *const PrivateDirectory, leaf: []const u8, parts: []const []const u8) !void {
+    pub fn replace(
+        self: *const PrivateDirectory,
+        leaf: []const u8,
+        parts: []const []const u8,
+    ) !void {
         try validateLeaf(leaf);
         try admit(self.io, self.directory, .read_only);
-        const outcome = staged.publishReplacement(self.io, self.directory, self.directory, leaf, parts, .{
-            .permissions = privatePermissions(0o600),
-        });
+        const outcome = staged.publishReplacement(
+            self.io,
+            self.directory,
+            self.directory,
+            leaf,
+            parts,
+            .{
+                .permissions = privatePermissions(0o600),
+            },
+        );
         switch (outcome) {
             .complete => {},
             .not_published, .publication_unknown => |failure| {
-                if (failure.cleanup) |cleanup| authority.warn(self.io, "rollback file removal failed for {s}: {s}; inspect and remove the leftover file", .{ cleanup.stage_name, @errorName(cleanup.cause) });
+                if (failure.cleanup) |cleanup| authority.warn(
+                    self.io,
+                    "rollback file removal failed for {s}: {s}; inspect" ++
+                        " and remove the leftover file",
+                    .{ cleanup.stage_name, @errorName(cleanup.cause) },
+                );
                 return failure.cause;
             },
             .published_unsynced => |err| return err,
@@ -87,12 +116,20 @@ pub const PrivateDirectory = struct {
 };
 
 fn privatePermissions(mode: u32) std.Io.File.Permissions {
-    return if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(@intCast(mode)) else .default_file;
+    return if (@hasDecl(
+        std.Io.File.Permissions,
+        "fromMode",
+    )) .fromMode(@intCast(mode)) else .default_file;
 }
 
 fn admit(io: std.Io, directory: std.Io.Dir, mode: PrivateDirectory.Mode) !void {
+    // Linux traversal handles use O_PATH and cannot be passed to fchmod.
+    // Resolve "." relative to the owned handle: the same admitted directory
+    // remains authoritative without requiring read access before repairing its mode.
     if (mode == .create and @hasDecl(std.Io.File.Permissions, "fromMode"))
-        try directory.setPermissions(io, privatePermissions(0o700));
+        try directory.setFilePermissions(io, ".", privatePermissions(0o700), .{
+            .follow_symlinks = false,
+        });
     const stat = try directory.stat(io);
     if (stat.kind != .directory) return error.NotDir;
     if (@hasDecl(std.Io.File.Permissions, "toMode") and stat.permissions.toMode() & 0o077 != 0)
@@ -120,16 +157,30 @@ test "private entry directory binds reads and multipart publication across root 
     const bytes = try plans.readAlloc(std.testing.allocator, "entry", 14);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("original owner", bytes);
-    try std.testing.expectError(error.FileTooBig, plans.readAlloc(std.testing.allocator, "entry", 13));
+    try std.testing.expectError(
+        error.FileTooBig,
+        plans.readAlloc(std.testing.allocator, "entry", 13),
+    );
     try std.testing.expectError(error.InvalidPath, plans.replace("../escape", &.{"x"}));
     try std.testing.expectError(error.FileNotFound, replacement.openChild("plans", .read_only));
     try tmp.dir.symLink(io, "original", "alias", .{ .is_directory = true });
-    try std.testing.expectError(error.NotDir, PrivateDirectory.open(.init(io, tmp.dir), "alias/plans", .read_only));
+    try std.testing.expectError(
+        error.NotDir,
+        PrivateDirectory.open(.init(io, tmp.dir), "alias/plans", .read_only),
+    );
     if (@hasDecl(std.Io.File.Permissions, "fromMode")) {
         try plans.directory.setFilePermissions(io, "entry", .fromMode(0o644), .{});
-        try std.testing.expectError(error.InsecurePrivateFile, plans.readAlloc(std.testing.allocator, "entry", 64));
-        try plans.directory.setPermissions(io, .fromMode(0o755));
-        try std.testing.expectError(error.InsecurePrivateDirectory, plans.replace("entry", &.{"x"}));
+        try std.testing.expectError(
+            error.InsecurePrivateFile,
+            plans.readAlloc(std.testing.allocator, "entry", 64),
+        );
+        try plans.directory.setFilePermissions(io, ".", .fromMode(0o755), .{
+            .follow_symlinks = false,
+        });
+        try std.testing.expectError(
+            error.InsecurePrivateDirectory,
+            plans.replace("entry", &.{"x"}),
+        );
     }
 }
 
@@ -162,4 +213,29 @@ test "private cache paths reject shared permissions" {
         error.InsecurePrivateFile,
         entries.readAlloc(allocator, "entry.bin", 16),
     );
+}
+
+test "private directory repair supports Linux path-only handles without read permission" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "cache", .fromMode(0o300));
+    var cache = try PrivateDirectory.open(.init(io, tmp.dir), "cache", .create);
+    defer cache.deinit();
+    try std.testing.expectEqual(
+        @as(u32, 0o700),
+        (try cache.directory.stat(io)).permissions.toMode() & 0o777,
+    );
+    try cache.directory.createDir(io, "entries", .fromMode(0o300));
+    var entries = try cache.openChild("entries", .create);
+    defer entries.deinit();
+    try std.testing.expectEqual(
+        @as(u32, 0o700),
+        (try entries.directory.stat(io)).permissions.toMode() & 0o777,
+    );
+    try entries.replace("entry", &.{"private"});
+    const data = try entries.readAlloc(std.testing.allocator, "entry", 7);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("private", data);
 }
