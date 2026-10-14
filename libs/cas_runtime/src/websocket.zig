@@ -42,11 +42,11 @@ pub const ManagedServer = struct {
     shutdown_receipt_token: ?[]u8 = null,
     process_group_id: ?u64 = null,
     boot_id: ?[]u8 = null,
-    stopped: bool = false,
+    process_state: enum { owned, stopped, detached } = .owned,
     stderr_drainer: ?*StderrDrainer = null,
 
     pub fn deinit(self: *ManagedServer, allocator: std.mem.Allocator) void {
-        if (!self.stopped) self.kill();
+        if (self.process_state == .owned) self.kill();
         if (self.stderr_drainer) |drainer| {
             drainer.joinAndDestroy();
             self.stderr_drainer = null;
@@ -82,9 +82,26 @@ pub const ManagedServer = struct {
         return self.boot_id;
     }
 
+    /// Release an ordinary server for a later process to reconnect. The stderr
+    /// task must finish before the caller releases its borrowed I/O or allocator.
+    /// Closing this pipe matches the original detached command's process exit.
+    pub fn detach(self: *ManagedServer) !void {
+        if (self.owner_control != null) return error.OwnerLivedServerCannotDetach;
+        switch (self.process_state) {
+            .stopped => return error.ManagedServerAlreadyStopped,
+            .detached => return,
+            .owned => {},
+        }
+        if (self.stderr_drainer) |drainer| {
+            drainer.cancelAndDestroy();
+            self.stderr_drainer = null;
+        }
+        self.process_state = .detached;
+    }
+
     pub fn kill(self: *ManagedServer) void {
-        if (self.stopped) return;
-        self.stopped = true;
+        if (self.process_state != .owned) return;
+        self.process_state = .stopped;
         const io = self.io;
         if (self.owner_control) |control| {
             control.close(io);
@@ -113,7 +130,7 @@ const StderrDrainer = struct {
     allocator: std.mem.Allocator,
     file: std.Io.File,
     io: std.Io,
-    thread: std.Thread,
+    task: std.Io.Future(void),
 
     fn start(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !*StderrDrainer {
         const state = try allocator.create(StderrDrainer);
@@ -122,22 +139,27 @@ const StderrDrainer = struct {
             .allocator = allocator,
             .file = file,
             .io = io,
-            .thread = undefined,
+            .task = undefined,
         };
-        state.thread = try std.Thread.spawn(.{}, drain, .{state});
+        state.task = try io.concurrent(drain, .{state});
         return state;
     }
 
     fn drain(self: *StderrDrainer) void {
         const io = self.io;
         var buffer: [4096]u8 = undefined;
-        var reader = self.file.reader(io, &.{});
+        var reader = self.file.readerStreaming(io, &.{});
         while (reader.interface.readSliceShort(&buffer) catch 0 != 0) {}
         self.file.close(io);
     }
 
     fn joinAndDestroy(self: *StderrDrainer) void {
-        self.thread.join();
+        self.task.await(self.io);
+        self.allocator.destroy(self);
+    }
+
+    fn cancelAndDestroy(self: *StderrDrainer) void {
+        self.task.cancel(self.io);
         self.allocator.destroy(self);
     }
 };
@@ -2278,6 +2300,8 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     try std.testing.expect(processAlive(watchdog_pid));
     try std.testing.expect(processAlive(server_pid));
     try std.testing.expect(processAlive(descendant_pid));
+    try std.testing.expectError(error.OwnerLivedServerCannotDetach, managed.detach());
+    try std.testing.expect(processAlive(watchdog_pid));
     const receipt_path = managed.shutdownReceiptPath().?;
     const receipt_token = managed.shutdownReceiptToken().?;
     const receipt_dir = try std.fs.path.join(allocator, &.{ root, "receipts" });
@@ -2406,6 +2430,68 @@ test "ordinary managed teardown retires its process group descendants" {
     try std.testing.expect(waitForProcessExit(io, process_ids.server, 2_000));
     try std.testing.expect(waitForProcessExit(io, process_ids.descendant, 2_000));
     try std.testing.expect(waitForProcessGroupExit(io, child_pid, 2_000));
+}
+
+test "ordinary detach joins the blocked stderr task and preserves the process" {
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const base_io = threaded.io();
+    const Probe = struct {
+        var base: std.Io = undefined;
+        var reading: std.atomic.Value(bool) = .init(false);
+
+        fn operate(
+            userdata: ?*anyopaque,
+            operation: std.Io.Operation,
+        ) std.Io.Cancelable!std.Io.Operation.Result {
+            if (operation == .file_read_streaming) reading.store(true, .release);
+            return base.vtable.operate(userdata, operation);
+        }
+    };
+    Probe.base = base_io;
+    Probe.reading.store(false, .release);
+    var vtable = base_io.vtable.*;
+    vtable.operate = Probe.operate;
+    const io: std.Io = .{ .userdata = base_io.userdata, .vtable = &vtable };
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec sleep 600" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    const pid: u64 = @intCast(child.id.?);
+    // The test owns the detached process after the command-like scope ends.
+    defer retireProcessChild(io, &child, pid);
+    const stderr_file = child.stderr.?;
+    child.stderr = null;
+    var stderr_owned = true;
+    defer if (stderr_owned) stderr_file.close(io);
+    const drainer = try StderrDrainer.start(allocator, io, stderr_file);
+    stderr_owned = false;
+    var managed = ManagedServer{
+        .io = io,
+        .child = child,
+        .listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1"),
+        .stderr_drainer = drainer,
+        .process_group_id = pid,
+    };
+    var deinitialized = false;
+    defer if (!deinitialized) managed.deinit(allocator);
+    for (0..100) |_| {
+        if (Probe.reading.load(.acquire)) break;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(Probe.reading.load(.acquire));
+    try managed.detach();
+    try managed.detach();
+    try std.testing.expect(managed.stderr_drainer == null);
+    managed.deinit(allocator);
+    deinitialized = true;
+    try std.testing.expect(processAlive(pid));
 }
 
 test "ordinary managed startup failure retires its process group descendants" {

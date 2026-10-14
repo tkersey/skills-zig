@@ -1019,6 +1019,7 @@ fn cmdStart(operation: Operation, allocator: std.mem.Allocator, parsed: ParsedAr
     try start.persistStarted();
     if (parsed.wait_after_start) return start.waitAndFinish();
     try start.printResult(null, false, false, null);
+    try start.managed_server.?.detach();
 }
 
 fn threadStartParamsDigest(parsed: ParsedArgs) ?[]const u8 {
@@ -1853,6 +1854,10 @@ const ReviewStart = struct {
             return status;
         }
         defer status.deinit(self.allocator);
+        return try self.finishWaitTimeout(status);
+    }
+
+    fn finishWaitTimeout(self: *ReviewStart, status: ReviewStatus) !noreturn {
         const disposition = reviewWaitTimeoutDisposition(self.workflow_binding != null);
         if (self.workflow_binding != null) {
             self.terminalize(disposition.failure);
@@ -1863,6 +1868,7 @@ const ReviewStart = struct {
         try writeSessionRecord(self.operation, self.allocator, self.record_path.?, self.record.?);
         self.updateLock(disposition.lock_state, disposition.failure.code);
         try self.printResult(status, true, true, disposition.failure);
+        try self.managed_server.?.detach();
         return error.CommandReportedFailure;
     }
 
@@ -19977,6 +19983,106 @@ test "terminal timeout session replays only through its exact tuple lock" {
     );
     defer std.testing.allocator.free(event_path);
     try checkTerminalReplayLifecycle(operation, root, store_root, record_path, event_path);
+}
+
+const TimeoutTestOutput = struct {
+    fn operate(
+        userdata: ?*anyopaque,
+        op: std.Io.Operation,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .file_write_streaming) {
+            const write = op.file_write_streaming;
+            if (write.file.handle == std.Io.File.stdout().handle) {
+                var count = write.header.len;
+                for (write.data, 0..) |bytes, i| {
+                    count += bytes.len * (if (i + 1 == write.data.len) write.splat else 1);
+                }
+                return .{ .file_write_streaming = count };
+            }
+        }
+        return std.testing.io.vtable.operate(userdata, op);
+    }
+};
+
+test "unbound wait timeout preserves the server after command cleanup" {
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var operation_fixture = try TestOperation.init();
+    defer operation_fixture.deinit();
+
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = TimeoutTestOutput.operate;
+    var operation = operation_fixture.operation();
+    operation.fs.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const allocator = std.testing.allocator;
+    const io = operation.fs.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var child = try cas_websocket.spawnDetachedProcess(
+        allocator,
+        root,
+        &.{ "/bin/sh", "-c", "exec sleep 600" },
+        io,
+        operation.fs.directory(),
+        operation.environ,
+    );
+    const pid: u64 = @intCast(child.id.?);
+    var released = false;
+    defer if (released) child.kill(io);
+    // This stage follows grace-status observation and never uses the RPC gate.
+    var unused_gate: ReviewRuntimeGate = undefined;
+    var start = ReviewStart{
+        .operation = operation,
+        .allocator = allocator,
+        .parsed = .{ .timeout_ms = 1 },
+        .cwd = root,
+        .gate = &unused_gate,
+        .workflow_binding = null,
+        .code_mode_host = null,
+        .managed_server = .{
+            .io = io,
+            .child = child,
+            .listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1"),
+        },
+    };
+    var deinitialized = false;
+    defer if (!deinitialized) start.deinit();
+    start.record_path = try std.fs.path.join(allocator, &.{ root, "review.json" });
+    start.review_thread_id = try allocator.dupe(u8, "thr");
+    start.review_turn_id = try allocator.dupe(u8, "turn");
+    start.record = testCurrentSessionRecord();
+    start.record.?.managed_server_pid = pid;
+    start.lock_bundle = try testUnboundWaitLock(allocator, root);
+    const status = try makeDisconnectedReviewStatus(allocator);
+    defer status.deinit(allocator);
+    try std.testing.expectError(error.CommandReportedFailure, start.finishWaitTimeout(status));
+    released = true;
+    try checkUnboundTimeoutState(&start);
+    start.deinit();
+    deinitialized = true;
+    try std.testing.expect(cas_websocket.processAlive(pid));
+}
+
+fn checkUnboundTimeoutState(start: *ReviewStart) !void {
+    const allocator = start.allocator;
+    const operation = start.operation;
+    var lock = (try loadReviewTupleLock(operation, allocator, start.lock_bundle.?.path)).?;
+    defer lock.deinit(allocator);
+    try std.testing.expectEqualStrings("waiting", lock.record.state);
+    try std.testing.expectEqualStrings("wait_timed_out", lock.record.lastFailureCode.?);
+    try std.testing.expect(start.record.?.terminal_failure_code == null);
+}
+
+fn testUnboundWaitLock(allocator: std.mem.Allocator, root: []const u8) !ReviewTupleStartLockBundle {
+    const tuple = testTupleIdentity("acct:test");
+    const hash = try reviewTupleHashAlloc(allocator, tuple);
+    errdefer allocator.free(hash);
+    return .{
+        .path = try allocator.print("{s}/{s}.json", .{ root, hash["sha256:".len..] }),
+        .lock = makeReviewTupleLock(hash, tuple, "waiting", 1, null, null),
+    };
 }
 
 test "terminal owner receipt survives persistence failure" {
