@@ -40,15 +40,15 @@ jobs:
           cp zig.tar.xz /tmp/compute-inputs/
           zig=/tmp/zig-x86_64-linux-0.17.0/zig
           "$zig" version
-          test "$("$zig" fetch 'git+https://github.com/tkersey/kosmos#fc6a5606421d6b6c65bc93f2a4847e41dc52711c')" = 'kosmos-7.0.0-vcJNB2-JDQAFtoFQV7jWwlCae5cB8DRjGJcBlKRqwK0e'
-          test "$("$zig" fetch 'git+https://github.com/tkersey/horos#bacdcaada3f09b1cbc4e787a45ba300d5fdbcb99')" = 'horos-4.0.0-flclaN-lOAC7YPSXxv0UqCmKSuXATnz4gEC-89VXksqw'
+          "$zig" fetch 'git+https://github.com/tkersey/kosmos#788f99045264bec248aacf8e8f25911fbeda3a68' | tee /tmp/compute-inputs/kosmos.hash
+          test "$("$zig" fetch 'git+https://github.com/tkersey/horos#906363321e2f5ce98be7e6ab54913e250d257069')" = 'horos-5.0.0-flclaG0VOwARS6ouOoR_Vk5qOnQlVdu0Oi_TCU6OhzSF'
           test "$("$zig" fetch 'git+https://github.com/kurtwagner/zlinter#4937a301d9bc06e013cf2f9fb3ee1fdc8793df1f')" = 'zlinter-0.0.1-OjQ08YxkFQBQNP_aoK_07mQdcOfv6eho-IPexfuOC4eh'
           test "$("$zig" fetch 'git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56')" = 'translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5'
           cd "$GITHUB_WORKSPACE"
           "$zig" build --help > /tmp/compute-inputs/build-help.txt
           tar -czf /tmp/compute-inputs/package-cache.tar.gz -C "$ZIG_GLOBAL_CACHE_DIR" p
           cd /tmp/compute-inputs
-          sha256sum skills-zig.tar zig.tar.xz package-cache.tar.gz > SHA256SUMS
+          sha256sum skills-zig.tar zig.tar.xz package-cache.tar.gz kosmos.hash > SHA256SUMS
       - uses: actions/upload-artifact@v6
         with:
           name: compute-linux-development-inputs
