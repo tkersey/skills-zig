@@ -673,6 +673,10 @@ fn readAdmittedFileAlloc(
         .limited(read_limit),
     ) catch |err| switch (err) {
         error.StreamTooLong => return error.DefinitionFileTooLarge,
+        error.ReadFailed => {
+            const cause = reader.err orelse return err;
+            return if (cause == error.Canceled) cause else err;
+        },
         else => return err,
     };
     errdefer allocator.free(raw);

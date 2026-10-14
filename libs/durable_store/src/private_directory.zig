@@ -81,7 +81,13 @@ pub const PrivateDirectory = struct {
             return error.InsecurePrivateFile;
         if (stat.size > max_bytes) return error.FileTooBig;
         var reader = file.reader(self.io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(max_bytes));
+        return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| {
+            if (err == error.ReadFailed) {
+                const cause = reader.err orelse return err;
+                if (cause == error.Canceled) return cause;
+            }
+            return err;
+        };
     }
 
     /// Optional caches may abandon a failed publication. Errors do not imply

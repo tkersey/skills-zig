@@ -118,7 +118,7 @@ pub fn load(
             cache_dir,
             options.closure_limits,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.Canceled => return err,
             else => null,
         };
         if (cached) |value| {
@@ -136,6 +136,7 @@ pub fn load(
         route,
         options.closure_limits,
     );
+    errdefer compiled.deinit(allocator);
     compiled.stats.compile_ns = elapsedNanoseconds(scope.fs.io, start_ns);
     if (options.cache_dir) |cache_dir| {
         writeCache(
@@ -147,8 +148,8 @@ pub fn load(
             runtime_version,
             &compiled,
         ) catch |err| {
-            // The cache is optional; a write failure cannot invalidate the plan.
-            _ = @errorName(err);
+            // Cancellation ends the operation; other cache failures leave a valid plan.
+            if (err == error.Canceled) return err;
             compiled.stats.cache_write_failed = true;
         };
     }
@@ -1360,5 +1361,175 @@ test "every cache route preserves the application plan across a private entry hi
         try encodePlanSet(&cold, route, &cold_bytes);
         try encodePlanSet(&warm, route, &warm_bytes);
         try std.testing.expectEqualSlices(u8, cold_bytes.written(), warm_bytes.written());
+    }
+}
+
+const CacheCancellationProbe = struct {
+    var cancel_read = false;
+    var cancel_rename: usize = 0;
+    var rename_count: usize = 0;
+    var cancellations: usize = 0;
+    var cancel_read_file: usize = 0;
+    var read_count: usize = 0;
+
+    fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+        if (cancel_read) {
+            cancel_read = false;
+            cancellations += 1;
+            return error.Canceled;
+        }
+        return std.testing.io.vtable.checkCancel(userdata);
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        if (offset == 0) {
+            read_count += 1;
+            if (read_count == cancel_read_file) {
+                cancellations += 1;
+                return error.Canceled;
+            }
+        }
+        return std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        old_dir: std.Io.Dir,
+        old_name: []const u8,
+        new_dir: std.Io.Dir,
+        new_name: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        rename_count += 1;
+        if (rename_count == cancel_rename) {
+            cancellations += 1;
+            return error.Canceled;
+        }
+        return std.testing.io.vtable.dirRename(userdata, old_dir, old_name, new_dir, new_name);
+    }
+};
+
+test "optional cache cancellation stops reads and both publication phases without leaking plans" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    try source.dir.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/chained-event-definition.json"),
+    });
+    const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(source_root);
+    // Zero cancels cache admission; one and two cancel plan and locator publication.
+    for (0..3) |phase| {
+        var cache = std.testing.tmpDir(.{});
+        defer cache.cleanup();
+        const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(cache_root);
+        CacheCancellationProbe.cancel_read = phase == 0;
+        CacheCancellationProbe.cancel_rename = phase;
+        CacheCancellationProbe.rename_count = 0;
+        CacheCancellationProbe.cancellations = 0;
+        var vtable = io.vtable.*;
+        vtable.checkCancel = CacheCancellationProbe.checkCancel;
+        vtable.dirRename = CacheCancellationProbe.rename;
+        const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        var scope = storage_root.Scope.init(.init(injected, .cwd()));
+        try std.testing.expectError(error.Canceled, load(
+            &scope,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .kind = .definition_check },
+            "1",
+            .{ .cache_dir = cache_root },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
+        try std.testing.expectEqual(phase, CacheCancellationProbe.rename_count);
+        // The one-shot signal is consumed: later independent work remains valid.
+        CacheCancellationProbe.cancel_rename = 0;
+        var recovered = try load(
+            &scope,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .kind = .definition_check },
+            "1",
+            .{ .cache_dir = cache_root },
+        );
+        defer recovered.deinit(allocator);
+        try std.testing.expect(!recovered.stats.cache_hit);
+        try std.testing.expect(!recovered.stats.cache_write_failed);
+        var warm = try load(
+            &scope,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .kind = .definition_check },
+            "1",
+            .{ .cache_dir = cache_root },
+        );
+        defer warm.deinit(allocator);
+        try std.testing.expect(warm.stats.cache_hit);
+    }
+}
+
+test "warm cache cancellation survives the locator source and plan reader adapters" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(io, .cwd()));
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    try source.dir.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/chained-event-definition.json"),
+    });
+    const source_root = try source.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(source_root);
+    var cache = std.testing.tmpDir(.{});
+    defer cache.cleanup();
+    const cache_root = try cache.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cache_root);
+    var cold = try load(
+        &scope,
+        allocator,
+        source_root,
+        "definition.json",
+        .{ .kind = .definition_check },
+        "1",
+        .{ .cache_dir = cache_root },
+    );
+    defer cold.deinit(allocator);
+    try std.testing.expect(!cold.stats.cache_write_failed);
+    // Warm lookup reads the locator, its source manifest, and then the plan.
+    for (1..4) |file_number| {
+        CacheCancellationProbe.read_count = 0;
+        CacheCancellationProbe.cancellations = 0;
+        CacheCancellationProbe.cancel_read_file = file_number;
+        defer CacheCancellationProbe.cancel_read_file = 0;
+        CacheCancellationProbe.rename_count = 0;
+        CacheCancellationProbe.cancel_rename = 0;
+        var vtable = io.vtable.*;
+        vtable.fileReadPositional = CacheCancellationProbe.read;
+        vtable.dirRename = CacheCancellationProbe.rename;
+        const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        var injected_scope = storage_root.Scope.init(.init(injected, .cwd()));
+        try std.testing.expectError(error.Canceled, load(
+            &injected_scope,
+            allocator,
+            source_root,
+            "definition.json",
+            .{ .kind = .definition_check },
+            "1",
+            .{ .cache_dir = cache_root },
+        ));
+        try std.testing.expectEqual(file_number, CacheCancellationProbe.read_count);
+        try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
+        try std.testing.expectEqual(@as(usize, 0), CacheCancellationProbe.rename_count);
     }
 }
