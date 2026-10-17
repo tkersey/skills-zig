@@ -8211,10 +8211,26 @@ test "retained utility cases preserve executable and setup pairing" {
         .{ .id = "bench-stats-help", .binary = "bench_stats", .setup = .bench_stats_help },
         .{ .id = "bench-stats-parse", .binary = "bench_stats", .setup = .bench_stats_parse },
         .{ .id = "cas-wrapper-smoke", .binary = "cas", .setup = .cas_wrapper_smoke },
-        .{ .id = "cas-smoke-check-help", .binary = "cas_smoke_check", .setup = .cas_smoke_check_help },
-        .{ .id = "cas-instance-runner-help", .binary = "cas_instance_runner", .setup = .cas_instance_runner_help },
-        .{ .id = "cas-review-session-help", .binary = "cas_review_session", .setup = .cas_review_session_help },
-        .{ .id = "cas-review-session-version", .binary = "cas_review_session", .setup = .cas_review_session_version },
+        .{
+            .id = "cas-smoke-check-help",
+            .binary = "cas_smoke_check",
+            .setup = .cas_smoke_check_help,
+        },
+        .{
+            .id = "cas-instance-runner-help",
+            .binary = "cas_instance_runner",
+            .setup = .cas_instance_runner_help,
+        },
+        .{
+            .id = "cas-review-session-help",
+            .binary = "cas_review_session",
+            .setup = .cas_review_session_help,
+        },
+        .{
+            .id = "cas-review-session-version",
+            .binary = "cas_review_session",
+            .setup = .cas_review_session_version,
+        },
     };
     try std.testing.expectEqual(expected.len, MiscCases.len);
     for (expected) |item| {
