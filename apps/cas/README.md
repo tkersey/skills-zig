@@ -333,3 +333,20 @@ bash apps/cas/scripts/perf/budget_governor_gate.sh
 .github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor \
   -Doptimize=safe --fuzz=100K --summary all
 ```
+
+## Development benchmark
+
+The production budget governor remains part of `cas_account`. Its performance
+harness is a development target and is not installed or packaged:
+
+```bash
+zig build bench-cas-budget-governor -Doptimize=fast -- --help
+bash apps/cas/scripts/perf/budget_governor_gate.sh
+```
+
+The workload is `apps/cas/perf/budget_governor/workload_config.json`; the retained
+baseline is `apps/cas/perf/budget_governor/artifacts/baseline.json`. Invoke the gate
+by absolute script path from another working directory. Overrides through
+`CAS_BUDGET_CONFIG_PATH`, `CAS_BUDGET_BASELINE_ARTIFACT`, and
+`CAS_BUDGET_TREND_ARTIFACT` are absolute or relative to `apps/cas`.
+For direct benchmark execution, pass absolute `--config` and `--artifact` paths.

@@ -466,15 +466,11 @@ const CompatSetup = enum {
     ledger_doctor,
     bench_stats_help,
     bench_stats_parse,
-    perf_report_help,
-    perf_report_render,
-    lift_bench_stats_driver,
     cas_wrapper_smoke,
     cas_smoke_check_help,
     cas_instance_runner_help,
     cas_review_session_help,
     cas_review_session_version,
-    cas_budget_governor_driver,
     cas_automation_help,
     cas_automation_list,
 };
@@ -763,30 +759,6 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
         .compat_case = true,
     },
     .{
-        .case_id = "perf-report-help",
-        .binary = "perf_report",
-        .family = "help",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "perf-report-render",
-        .binary = "perf_report",
-        .family = "render",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "lift-bench-stats-driver",
-        .binary = "bench_stats",
-        .family = "driver",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-        .compat_case = true,
-    },
-    .{
         .case_id = "cas-wrapper-smoke",
         .binary = "cas",
         .family = "wrapper",
@@ -824,14 +796,6 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
         .family = "version",
         .case_kind = .subprocess,
         .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-budget-governor-driver",
-        .binary = "cas",
-        .family = "driver",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
         .compat_case = true,
     },
 };
@@ -905,37 +869,13 @@ const CompatCases = [_]CompatCase{
     .{
         .descriptor = MiscCases[2],
         .builder = .root,
-        .build_step = "build-lift",
-        .binary_path = "zig-out/bin/perf_report",
-        .setup = .perf_report_help,
-        .tolerance_pct = 25.0,
-    },
-    .{
-        .descriptor = MiscCases[3],
-        .builder = .root,
-        .build_step = "build-lift",
-        .binary_path = "zig-out/bin/perf_report",
-        .setup = .perf_report_render,
-        .tolerance_pct = 25.0,
-    },
-    .{
-        .descriptor = MiscCases[4],
-        .builder = .root,
-        .build_step = "build-lift",
-        .binary_path = "zig-out/bin/lift-perf-bench-stats",
-        .setup = .lift_bench_stats_driver,
-        .tolerance_pct = 150.0,
-    },
-    .{
-        .descriptor = MiscCases[5],
-        .builder = .root,
         .build_step = "build-cas",
         .binary_path = "zig-out/bin/cas",
         .setup = .cas_wrapper_smoke,
         .tolerance_pct = 120.0,
     },
     .{
-        .descriptor = MiscCases[6],
+        .descriptor = MiscCases[3],
         .builder = .root,
         .build_step = "build-cas",
         .binary_path = "zig-out/bin/cas_smoke_check",
@@ -943,7 +883,7 @@ const CompatCases = [_]CompatCase{
         .tolerance_pct = 100.0,
     },
     .{
-        .descriptor = MiscCases[7],
+        .descriptor = MiscCases[4],
         .builder = .root,
         .build_step = "build-cas",
         .binary_path = "zig-out/bin/cas_instance_runner",
@@ -951,7 +891,7 @@ const CompatCases = [_]CompatCase{
         .tolerance_pct = 100.0,
     },
     .{
-        .descriptor = MiscCases[8],
+        .descriptor = MiscCases[5],
         .builder = .root,
         .build_step = "build-cas",
         .binary_path = "zig-out/bin/cas_review_session",
@@ -959,20 +899,12 @@ const CompatCases = [_]CompatCase{
         .tolerance_pct = 100.0,
     },
     .{
-        .descriptor = MiscCases[9],
+        .descriptor = MiscCases[6],
         .builder = .root,
         .build_step = "build-cas",
         .binary_path = "zig-out/bin/cas_review_session",
         .setup = .cas_review_session_version,
         .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = MiscCases[10],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas-perf-budget-governor",
-        .setup = .cas_budget_governor_driver,
-        .tolerance_pct = 45.0,
     },
     .{
         .descriptor = CasAutomationCases[0],
@@ -5357,7 +5289,7 @@ fn renderCompatRun(
             binary_path,
             temp_root,
         ),
-        else => try appendMiscCompatArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
+        else => try appendMiscCompatArgs(allocator, &args, case_cfg.setup, binary_path),
     }
     return .{ .cwd = cwd, .argv = try args.toOwnedSlice(allocator) };
 }
@@ -5491,11 +5423,9 @@ fn appendMiscCompatArgs(
     args: *std.ArrayList([]const u8),
     setup: CompatSetup,
     binary_path: []const u8,
-    temp_root: []const u8,
 ) !void {
     switch (setup) {
         .bench_stats_help,
-        .perf_report_help,
         .cas_smoke_check_help,
         .cas_instance_runner_help,
         .cas_review_session_help,
@@ -5514,13 +5444,6 @@ fn appendMiscCompatArgs(
                 &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" },
             );
             try args.appendSlice(allocator, &.{ binary_path, "--input", input_path, "--json" });
-        },
-        .perf_report_render => {
-            const output_path = try std.fs.path.join(allocator, &.{ temp_root, "perf-report.md" });
-            try args.appendSlice(allocator, &.{
-                binary_path, "--title",   "Perf", "--owner", "tk", "--system", "skills-zig",
-                "--output",  output_path,
-            });
         },
         else => return error.InvalidCommand,
     }
@@ -6916,17 +6839,6 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
-fn inferBinary(case_id: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
-    if (std.mem.startsWith(u8, case_id, "ledger-")) return "ledger";
-    if (std.mem.startsWith(u8, case_id, "cas-automation-")) return "cas";
-    if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";
-    if (std.mem.startsWith(u8, case_id, "lift-bench-stats")) return "bench_stats";
-    if (std.mem.startsWith(u8, case_id, "perf-report")) return "perf_report";
-    if (std.mem.startsWith(u8, case_id, "cas-")) return "cas";
-    return "unknown";
-}
-
 fn pathExists(fs: durable_store.Fs, path: []const u8) bool {
     fs.directory().access(
         fs.io,
@@ -8290,8 +8202,32 @@ test "compiler evidence retains sentinel path ownership" {
     evidence.deinit(allocator);
 }
 
-test "inferBinary maps lift driver case to bench_stats" {
-    try std.testing.expectEqualStrings("bench_stats", inferBinary("lift-bench-stats-driver"));
+test "retained utility cases preserve executable and setup pairing" {
+    const expected = [_]struct {
+        id: []const u8,
+        binary: []const u8,
+        setup: CompatSetup,
+    }{
+        .{ .id = "bench-stats-help", .binary = "bench_stats", .setup = .bench_stats_help },
+        .{ .id = "bench-stats-parse", .binary = "bench_stats", .setup = .bench_stats_parse },
+        .{ .id = "cas-wrapper-smoke", .binary = "cas", .setup = .cas_wrapper_smoke },
+        .{ .id = "cas-smoke-check-help", .binary = "cas_smoke_check", .setup = .cas_smoke_check_help },
+        .{ .id = "cas-instance-runner-help", .binary = "cas_instance_runner", .setup = .cas_instance_runner_help },
+        .{ .id = "cas-review-session-help", .binary = "cas_review_session", .setup = .cas_review_session_help },
+        .{ .id = "cas-review-session-version", .binary = "cas_review_session", .setup = .cas_review_session_version },
+    };
+    try std.testing.expectEqual(expected.len, MiscCases.len);
+    for (expected) |item| {
+        var matches: usize = 0;
+        for (CompatCases) |case| {
+            if (!std.mem.eql(u8, item.id, case.descriptor.case_id)) continue;
+            matches += 1;
+            try std.testing.expectEqualStrings(item.binary, case.descriptor.binary);
+            try std.testing.expectEqualStrings(item.binary, std.fs.path.basename(case.binary_path));
+            try std.testing.expectEqual(item.setup, case.setup);
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
 }
 
 test "incompatible paired comparisons fail closed" {
