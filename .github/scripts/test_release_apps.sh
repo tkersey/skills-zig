@@ -11,8 +11,8 @@ git init -q
 git config user.email test@example.invalid
 git config user.name release-apps-test
 
-apps=(seq lift cas ledger memory-note typesafe)
-all_apps=seq,lift,cas,ledger,memory-note,typesafe
+apps=(seq lift cas ledger memory-note)
+all_apps=seq,lift,cas,ledger,memory-note
 shared_build_paths=(apps/seq/build_support.zig tools/install_guard.zig)
 for path in "${shared_build_paths[@]}"; do
   mkdir -p "$(dirname "$path")"
@@ -163,17 +163,12 @@ write_ledger() {
   printf 'ledger\n' >apps/ledger/src/main.zig
 }
 
-write_typesafe() {
-  mkdir -p apps/typesafe/src
-  printf 'typesafe\n' >apps/typesafe/src/main.zig
+write_retired_build() {
+  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nfn buildRetired() void {\n  _ = "apps/retired/src/main.zig";\n}\n' >build.zig
 }
 
-write_typesafe_build() {
-  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nfn buildTypeSafe() void {\n  _ = "apps/typesafe/src/main.zig";\n}\n' >build.zig
-}
-
-write_mixed_memory_note_typesafe_build() {
-  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nconst memory_note_tests = .{ .path = "apps/memory-note", .test_deps = &.{} };\nfn buildTypeSafe() void {\n  _ = "apps/typesafe/src/main.zig";\n}\n' >build.zig
+write_mixed_memory_note_retired_build() {
+  printf 'const lift_meta = "apps/lift/VERSION";\npub fn build() void {}\nconst memory_note_tests = .{ .path = "apps/memory-note", .test_deps = &.{} };\nfn buildRetired() void {\n  _ = "apps/retired/src/main.zig";\n}\n' >build.zig
 }
 
 write_definition_core() {
@@ -351,8 +346,8 @@ write_frozen_cas_automation_fixture() {
 
 assert_affected seq write_seq
 for helper_path in "${shared_build_paths[@]}"; do
-  assert_affected seq,lift,cas,ledger,memory-note,typesafe write_shared_build_helper "$helper_path"
-  assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_shared_build_helper "$helper_path"
+  assert_affected seq,lift,cas,ledger,memory-note write_shared_build_helper "$helper_path"
+  assert_ci_affected seq,lift,cas,ledger,memory-note write_shared_build_helper "$helper_path"
 done
 assert_affected ledger write_ledger
 assert_affected cas write_frozen_cas_automation_fixture
@@ -363,11 +358,10 @@ assert_affected cas write_cas_runtime
 assert_affected cas write_cas_hook_policy_source
 assert_affected cas write_cas_launch_source
 assert_affected seq,cas,ledger,memory-note write_store_core
-assert_affected typesafe write_typesafe
-assert_affected "$all_apps" write_typesafe_build
-assert_affected "$all_apps" write_mixed_memory_note_typesafe_build
+assert_affected "$all_apps" write_retired_build
+assert_affected "$all_apps" write_mixed_memory_note_retired_build
 assert_affected seq,cas,ledger,memory-note write_jsonl_core
-assert_affected seq,lift,cas,ledger,memory-note,typesafe change_shared_perf_contract
+assert_affected seq,lift,cas,ledger,memory-note change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "$all_apps" write_perf_hub_build
@@ -375,7 +369,7 @@ assert_affected "$all_apps" write_seq_build
 assert_affected "$all_apps" write_cas_control_plane_build
 assert_affected "$all_apps" write_cas_runtime_only_build
 assert_affected "$all_apps" write_cas_hook_policy_only_build
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_bare_identifier_build
+assert_affected seq,lift,cas,ledger,memory-note write_unknown_bare_identifier_build
 assert_affected "$all_apps" write_ledger_build
 assert_affected "$all_apps" write_ledger_module_build
 assert_affected "$all_apps" write_ledger_filtered_test_build
@@ -383,14 +377,14 @@ assert_affected "$all_apps" write_mixed_unknown_before_ledger_build
 assert_affected "$all_apps" write_universalist_build
 assert_affected "$all_apps" write_seq_strip_build
 assert_affected "$all_apps" move_build_line
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_mixed_seq_unknown_build
+assert_affected seq,lift,cas,ledger,memory-note write_mixed_seq_unknown_build
 assert_affected "$all_apps" write_definition_package_path
 assert_affected "$all_apps" write_ledger_package_path
 assert_affected "$all_apps" write_learnings_package_path
 assert_affected "$all_apps" write_synesthesia_package_path
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_package_change
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_build_only
-assert_affected seq,lift,cas,ledger,memory-note,typesafe write_unknown_app
+assert_affected seq,lift,cas,ledger,memory-note write_unknown_package_change
+assert_affected seq,lift,cas,ledger,memory-note write_build_only
+assert_affected seq,lift,cas,ledger,memory-note write_unknown_app
 assert_affected "" write_readme
 assert_affected seq write_durable_store_perf
 assert_ci_affected seq,cas,ledger write_definition_guard
@@ -398,7 +392,7 @@ assert_ci_affected cas write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_affected "" write_ci_helper
-assert_ci_affected seq,lift,cas,ledger,memory-note,typesafe write_ci_helper
+assert_ci_affected seq,lift,cas,ledger,memory-note write_ci_helper
 assert_affected "" write_path .github/workflows/pr-ci.yml
 assert_ci_affected "$all_apps" write_path .github/workflows/pr-ci.yml
 
@@ -501,9 +495,9 @@ mv build.next build.zig
 git add build.zig
 git commit -qm unowned-dotted-dependency-import
 test "$(bash "$classifier" affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,cas,ledger,memory-note,typesafe
+  seq,lift,cas,ledger,memory-note
 test "$(bash "$classifier" ci-affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,cas,ledger,memory-note,typesafe
+  seq,lift,cas,ledger,memory-note
 
 # Adjacent functions and referenced helper names cannot narrow root ownership.
 git reset --hard -q "$base"
@@ -597,4 +591,26 @@ for app in "${apps[@]}"; do
   for mode in affected ci-affected version-changed; do
     test "$(bash "$classifier" "$mode" "$base" HEAD)" = "$app"
   done
+done
+
+# Exact TypeSafe retirement shape: the removed source/build/workflow/VERSION
+# must never re-enter any active dispatch set. Shared root changes still release
+# every surviving app, with an explicit version bump for each one.
+git reset --hard -q "$base"
+mkdir -p apps/typesafe/src .github/workflows
+printf '0.2.1\n' > apps/typesafe/VERSION
+printf '// retired TypeSafe source\n' > apps/typesafe/src/main.zig
+printf '// retired TypeSafe build owner\n' > build/apps/typesafe.zig
+printf '# retired TypeSafe release\n' > .github/workflows/release-typesafe.yml
+git add -A
+git commit -qm typesafe-retirement-baseline
+typesafe_retirement_base=$(git rev-parse HEAD)
+rm -r apps/typesafe
+rm build/apps/typesafe.zig .github/workflows/release-typesafe.yml
+write_build_only
+for app in "${apps[@]}"; do printf '1.1.0\n' > "apps/$app/VERSION"; done
+git add -A
+git commit -qm retire-typesafe-and-propagate-active-versions
+for mode in affected ci-affected version-changed; do
+  test "$(bash "$classifier" "$mode" "$typesafe_retirement_base" HEAD | paste -sd, -)" = "$all_apps"
 done

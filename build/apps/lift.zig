@@ -12,12 +12,6 @@ pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
         .{ .name = "core_cli", .module = shared.cli },
         .{ .name = "app_meta", .module = lift_meta },
     });
-    const lift_report_root = ctx.module("apps/lift/scripts/perf_report.zig", &.{
-        .{ .name = "core_calendar", .module = shared.calendar },
-        .{ .name = "core_io", .module = shared.io },
-        .{ .name = "core_cli", .module = shared.cli },
-        .{ .name = "app_meta", .module = lift_meta },
-    });
     const lift_bench_perf_root = ctx.module("apps/lift/scripts/perf_bench_stats.zig", &.{
         .{ .name = "core_io", .module = shared.io },
         .{ .name = "core_perf", .module = shared.perf },
@@ -25,26 +19,25 @@ pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
         .{ .name = "app_meta", .module = lift_meta },
     });
     const bench_stats = support.addInstalledExecutable(b, "bench_stats", lift_bench_root);
-    const perf_report = support.addInstalledExecutable(b, "perf_report", lift_report_root);
-    const lift_bench_perf = support.addInstalledExecutable(
+    const lift_bench_perf = support.addExecutable(
         b,
         "lift-perf-bench-stats",
         lift_bench_perf_root,
     );
     support.addBenchStep(
         b,
-        lift_bench_perf.exe,
+        lift_bench_perf,
         "bench-lift-bench-stats",
         "Run bench_stats performance harness",
     );
-    const test_lift = addLiftTests(b, lift_bench_root, lift_report_root, lift_bench_perf_root);
+    const test_lift = addLiftTests(b, lift_bench_root, lift_bench_perf_root);
     support.addRunStep(b, bench_stats.exe, "run-bench-stats", "Run bench_stats");
     return support.appSurface(b, .{
         .path = b.path("apps/lift"),
         .build_step_name = "build-lift",
         .build_description = "Build lift binaries",
         .build_deps = &.{
-            &bench_stats.install.step, &perf_report.install.step, &lift_bench_perf.install.step,
+            &bench_stats.install.step,
         },
         .test_deps = &.{test_lift},
     });
@@ -53,7 +46,6 @@ pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
 fn addLiftTests(
     b: *std.Build,
     lift_bench_root: *std.Build.Module,
-    lift_report_root: *std.Build.Module,
     lift_bench_perf_root: *std.Build.Module,
 ) *std.Build.Step {
     const run_lift_bench_tests = support.addTestStep(
@@ -61,12 +53,6 @@ fn addLiftTests(
         lift_bench_root,
         "test-lift-bench-stats",
         "Run bench_stats tests",
-    );
-    const run_lift_report_tests = support.addTestStep(
-        b,
-        lift_report_root,
-        "test-lift-perf-report",
-        "Run perf_report tests",
     );
     const run_lift_bench_perf_tests = support.addTestStep(
         b,
@@ -76,7 +62,6 @@ fn addLiftTests(
     );
     const test_lift = b.step("test-lift", "Run all lift tests");
     test_lift.dependOn(&run_lift_bench_tests.step);
-    test_lift.dependOn(&run_lift_report_tests.step);
     test_lift.dependOn(&run_lift_bench_perf_tests.step);
     return test_lift;
 }

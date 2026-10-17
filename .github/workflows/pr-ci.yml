@@ -37,7 +37,6 @@ jobs:
       cas: ${{ steps.classify.outputs.cas }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
-      typesafe: ${{ steps.classify.outputs.typesafe }}
       perf: ${{ steps.classify.outputs.perf }}
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +61,7 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas ledger memory-note typesafe; do
+          for app in seq lift cas ledger memory-note; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -103,6 +102,8 @@ jobs:
         run: .github/scripts/test_seq_ci_job.sh
       - name: Test Seq qualify-before-tag release transaction
         run: .github/scripts/test_seq_release_transaction.sh
+      - name: Test Lift archive verifier
+        run: .github/scripts/test_verify_lift_archive.sh
       - name: Test CAS archive verifier
         run: .github/scripts/test_verify_cas_archive.sh
       - name: Require VERSION bumps for release-relevant CLI changes
@@ -364,8 +365,7 @@ jobs:
               for binary in \
                 cas cas_account cas_app_server_preflight cas_automation \
                 cas_smoke_check cas_instance_runner cas_review_session \
-                cas_session_inquiry cas_conformance_suite cas_goal \
-                cas-perf-budget-governor; do
+                cas_session_inquiry cas_conformance_suite cas_goal; do
                 if objdump -p "zig-out/bin/${binary}" | grep -Fq NEEDED; then
                   echo "CAS release binary is dynamically linked: ${binary}" >&2
                   exit 1
@@ -387,9 +387,9 @@ jobs:
         if: matrix.platform == 'linux-x86_64'
         run: |
           set -euo pipefail
-          package_dir="${RUNNER_TEMP}/cas-release"
+          package_dir="$(mktemp -d "${RUNNER_TEMP}/cas-release.XXXXXX")"
+          trap 'rm -rf "$package_dir"' EXIT
           archive="${RUNNER_TEMP}/cas-pr-linux-x86_64.tar.gz"
-          mkdir -p "${package_dir}"
           cp zig-out/bin/cas "${package_dir}/cas"
           cp zig-out/bin/cas_account "${package_dir}/cas_account"
           cp zig-out/bin/cas_app_server_preflight "${package_dir}/cas_app_server_preflight"
@@ -406,7 +406,6 @@ jobs:
           cp zig-out/bin/cas_conformance_suite "${package_dir}/cas-conformance-suite"
           cp zig-out/bin/cas_goal "${package_dir}/cas_goal"
           cp zig-out/bin/cas_goal "${package_dir}/cas-goal"
-          cp zig-out/bin/cas-perf-budget-governor "${package_dir}/cas-perf-budget-governor"
           tar -czf "${archive}" -C "${package_dir}" .
           .github/scripts/verify_cas_archive.sh linux-x86_64 "${archive}"
       - name: Test generic CAS surfaces
@@ -480,17 +479,3 @@ jobs:
         run: zig build test-memory-note
       - name: Verify memory-note selected layout and immutable migration
         run: bash apps/memory-note/scripts/test-cli.sh zig-out/bin/memory-note
-
-  typesafe:
-    needs: changes
-    if: needs.changes.outputs.typesafe == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0
-      - name: Build typesafe
-        run: zig build build-typesafe -Doptimize=fast
-      - name: Test typesafe
-        run: zig build test-typesafe

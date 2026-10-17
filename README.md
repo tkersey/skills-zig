@@ -5,13 +5,18 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 ## CLIs
 
 - `seq` (passive observation definitions over execution/session evidence)
-- `lift` (`bench_stats`, `perf_report`)
+- `lift` (`bench_stats`)
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and Codex automation)
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
-- `typesafe` (document review triage with the TypeSafe API)
 
-No unified umbrella CLI is introduced. Binaries remain separate.
+The five Homebrew formulas expose 14 executable names: one each for Seq, Lift,
+Ledger, and memory-note, plus CAS and its nine functional siblings. A clean root
+`zig build` additionally installs the local `perf_hub`, for 15 names in `zig-out/bin`.
+There is no umbrella `lift` executable.
+
+TypeSafe and `perf_report` are retired; see [migration](docs/release/README.md#cli-retirement-migration)
+for existing installations.
 Codex automation is owned by CAS 0.4 and is invoked through `cas automation`;
 it shares CAS's build, version, tag, release, and formula identity, with no
 separate compatibility alias.
@@ -23,7 +28,6 @@ separate compatibility alias.
 - `apps/cas`
 - `apps/ledger`
 - `apps/memory-note`
-- `apps/typesafe`
 - `libs/core`
 - `libs/definition_core`
 - `libs/durable_store`
@@ -61,7 +65,6 @@ zig build build-lift -Doptimize=fast
 zig build build-cas -Doptimize=fast
 zig build build-ledger -Doptimize=fast
 zig build build-memory-note -Doptimize=fast
-zig build build-typesafe -Doptimize=fast
 ```
 
 Run helpers:
@@ -102,6 +105,19 @@ atomically updates `reports/current-capsule.json`, the non-authoritative
 locator verified by `perf-report-local`. Interrupted runs leave that locator
 incomplete; unmatched targets preserve the prior locator.
 Representative native qualification inputs remain beside the owning runtime.
+The Lift parser and CAS budget-governor benchmarks remain development tools:
+
+```bash
+zig build bench-lift-bench-stats -Doptimize=fast -- --config /absolute/path/to/workload_config.json --artifact /absolute/path/to/result.json
+zig build bench-cas-budget-governor -Doptimize=fast -- --config /absolute/path/to/workload_config.json --artifact /absolute/path/to/result.json
+```
+
+These targets create no benchmark install artifact. See the [Lift](apps/lift/README.md)
+and [CAS](apps/cas/README.md#development-benchmark) guides for workloads and gates.
+`perf-report-local` remains the existing `perf_hub report` entrypoint. Historical
+capsules retain their original bytes and revisions. Capsules containing retired
+utility cases may fail current registry-bound validation; inspect them with their
+recorded original revision/toolchain where available.
 
 ## Release Model
 
@@ -112,7 +128,6 @@ Per-app VERSION files are the source of truth:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/typesafe/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that

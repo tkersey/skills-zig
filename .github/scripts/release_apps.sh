@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note typesafe)
+apps=(seq lift cas ledger memory-note)
 
 resolve_ref() {
   local ref=$1
@@ -132,7 +132,7 @@ case "$mode" in
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;
-        .github/workflows/release-lift.yml)
+        .github/workflows/release-lift.yml|.github/scripts/verify_lift_archive.sh|.github/scripts/test_verify_lift_archive.sh)
           mark_app lift
           ;;
         .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
@@ -143,9 +143,6 @@ case "$mode" in
           ;;
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
-          ;;
-        .github/workflows/release-typesafe.yml)
-          mark_app typesafe
           ;;
         apps/*)
           matched=0

@@ -7,7 +7,6 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
-- `typesafe`: `.github/workflows/release-typesafe.yml` on tag `typesafe-v*`
 
 Codex automation is part of CAS 0.4 and is invoked through `cas automation`.
 It uses the CAS build, version, tag, release archives, and tap formula; there is
@@ -20,7 +19,6 @@ Per-app VERSION files:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/typesafe/VERSION`
 
 Release contract:
 
@@ -42,7 +40,7 @@ Release contract:
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Direct Zig downloads must match the pinned archive checksum; setup-zig verifies the upstream signature. Clean runners prepare the package-cache directory before fetching dependencies. macOS artifacts require macOS 15 and use the explicit `aarch64-macos.15.0` target; tap formulas must declare the same minimum.
 
 Root build assembly creates the shared modules once through `build/support.zig` and
-passes them to the six `build/apps/<cli>.zig` owners. The root package includes the
+passes them to the five `build/apps/<cli>.zig` owners. The root package includes the
 whole `build/` directory; PR CI, Auto Release, cache inputs, and lint cover it.
 The install guard remains in `apps/seq/build_support.zig` so both root and standalone
 Seq builds share the same make-time admission. Releases build the repository checkout
@@ -61,7 +59,6 @@ Release tags must match file versions:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `typesafe-v<version>` where `<version>` equals `apps/typesafe/VERSION`
 
 Each workflow publishes two release archives for its independently versioned CLI. CAS neither bundles nor executes Ledger; caller workflows validate inquiry carriers before handing them to CAS.
 
@@ -80,8 +77,6 @@ Examples:
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
-- `typesafe-v1.2.3-linux-x86_64.tar.gz`
-- `typesafe-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 
@@ -133,3 +128,37 @@ propagation is not blocked:
    - `brew upgrade --formula tkersey/tap/<cli>`
    - `brew test tkersey/tap/<cli>`
    - `<cli> --version`
+
+## CLI retirement migration
+
+TypeSafe is retired. Lift now ships only `bench_stats`; `perf_report` is removed.
+The Lift parser and CAS budget-governor benchmarks remain available through
+`zig build bench-lift-bench-stats` and `zig build bench-cas-budget-governor`, with
+no installed or packaged benchmark executable. Existing data and evidence need
+no migration. Historical releases and evidence remain unchanged.
+
+After all five release families are published, update the tap's five surviving
+formulas together using the actual two-platform archive hashes, and remove its
+TypeSafe formula. Lift archives contain only the executable `lift-bench-stats`,
+renamed to `bench_stats` by the formula. CAS archives contain the ten functional
+executables and six existing hyphenated compatibility copies (16 members); its
+formula exposes ten names. Always stage explicit filenames in a fresh directory
+and run the respective archive verifier before publication.
+
+For an existing installation, check `brew list --versions` and `brew list --pinned`
+first. Upgrade only installed formulas, without automatically unpinning anything:
+
+```bash
+brew update
+brew upgrade --formula tkersey/tap/seq tkersey/tap/lift tkersey/tap/cas tkersey/tap/ledger tkersey/tap/memory-note
+# Only if the owned TypeSafe package is installed:
+brew uninstall --formula tkersey/tap/typesafe
+```
+
+If the deleted formula name cannot be resolved, inspect the existing keg's recorded
+identity and use Homebrew's supported uninstall path for that installation.
+Do not delete same-name files manually. Verify actual formula prefixes and versions,
+Lift's one-name bin inventory, CAS's ten-name bin inventory, and the active prefix's
+absence of `typesafe`, `perf_report`, `lift-perf-bench-stats`, and
+`cas-perf-budget-governor`. Check command resolution for independent copies and
+alternate prefixes; report them separately. Old unlinked kegs are not active commands.

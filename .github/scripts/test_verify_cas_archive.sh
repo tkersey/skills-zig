@@ -78,14 +78,7 @@ write_stub_set() {
     cas_review_session \
     cas_session_inquiry \
     cas_conformance_suite \
-    cas_goal \
-    cas-smoke-check \
-    cas-instance-runner \
-    cas-review-session \
-    cas-session-inquiry \
-    cas-conformance-suite \
-    cas-goal \
-    cas-perf-budget-governor; do
+    cas_goal; do
     stub_marker="$name"
     if [[ "$name" == "cas_app_server_preflight" ]]; then
       stub_marker="cas app-server"
@@ -97,6 +90,9 @@ write_stub_set() {
       stub_marker="cas review"
     fi
     write_stub "$dir/$name" "$stub_marker"
+  done
+  for stem in smoke_check instance_runner review_session session_inquiry conformance_suite goal; do
+    cp "$dir/cas_$stem" "$dir/cas-${stem//_/-}"
   done
   : "$target"
 }
@@ -147,6 +143,10 @@ clone_set "$tmp/base-linux" "$tmp/bundled-cas-trial"
 write_stub "$tmp/bundled-cas-trial/cas_trial" cas_trial
 archive_dot "$tmp/bundled-cas-trial" "$tmp/bundled-cas-trial.tar.gz"
 
+clone_set "$tmp/base-linux" "$tmp/bundled-benchmark"
+write_stub "$tmp/bundled-benchmark/cas-perf-budget-governor" cas-perf-budget-governor
+archive_dot "$tmp/bundled-benchmark" "$tmp/bundled-benchmark.tar.gz"
+
 clone_set "$tmp/base-linux" "$tmp/non-executable-sibling"
 chmod -x "$tmp/non-executable-sibling/cas_review_session"
 archive_dot "$tmp/non-executable-sibling" "$tmp/non-executable-sibling.tar.gz"
@@ -164,6 +164,10 @@ archive_dot "$tmp/hardlink-sibling" "$tmp/hardlink-sibling.tar.gz"
 clone_set "$tmp/base-linux" "$tmp/missing-alias"
 rm "$tmp/missing-alias/cas-review-session"
 archive_dot "$tmp/missing-alias" "$tmp/missing-alias.tar.gz"
+
+clone_set "$tmp/base-linux" "$tmp/different-alias"
+write_stub "$tmp/different-alias/cas-goal" different-alias
+archive_dot "$tmp/different-alias" "$tmp/different-alias.tar.gz"
 
 clone_set "$tmp/base-linux" "$tmp/broken-dispatcher"
 write_dispatcher "$tmp/broken-dispatcher" account
@@ -190,13 +194,15 @@ expect_fail linux-x86_64 "$tmp/missing-automation.tar.gz" "missing automation si
 expect_fail linux-x86_64 "$tmp/bundled-ledger.tar.gz" "bundled Ledger executable"
 expect_fail linux-x86_64 "$tmp/bundled-cron.tar.gz" "bundled Cron executable"
 expect_fail linux-x86_64 "$tmp/bundled-cas-trial.tar.gz" "bundled cas_trial executable"
+expect_fail linux-x86_64 "$tmp/bundled-benchmark.tar.gz" "bundled development benchmark"
 expect_fail linux-x86_64 "$tmp/non-executable-sibling.tar.gz" "non-executable dispatcher sibling"
 expect_fail linux-x86_64 "$tmp/symlink-sibling.tar.gz" "symbolic-link dispatcher sibling"
 expect_fail linux-x86_64 "$tmp/hardlink-sibling.tar.gz" "hard-link dispatcher sibling"
 expect_fail linux-x86_64 "$tmp/missing-alias.tar.gz" "missing compatibility alias"
+expect_fail linux-x86_64 "$tmp/different-alias.tar.gz" "different compatibility copy"
 expect_fail linux-x86_64 "$tmp/broken-dispatcher.tar.gz" "broken packaged dispatcher"
 expect_fail linux-x86_64 "$tmp/broken-app-server-dispatch.tar.gz" "broken app-server dispatch"
 expect_fail linux-x86_64 "$tmp/broken-automation-dispatch.tar.gz" "broken automation dispatch"
 expect_fail linux-x86_64 "$tmp/wrong-version.tar.gz" "wrong executable version"
 
-echo "CAS archive verifier: 17/17 cases passed"
+echo "CAS archive verifier: 19/19 cases passed"

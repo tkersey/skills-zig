@@ -52,12 +52,12 @@ jobs:
         run: zig build build-lift -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=fast
       - name: Package lift artifact
         run: |
-          mkdir -p dist/lift
-          cp zig-out/bin/bench_stats dist/lift/lift-bench-stats
-          cp zig-out/bin/perf_report dist/lift/lift-perf-report
-          cp zig-out/bin/lift-perf-bench-stats dist/lift/lift-perf-bench-stats
+          package_dir="$(mktemp -d)"
+          trap 'rm -rf "$package_dir"' EXIT
+          cp zig-out/bin/bench_stats "$package_dir/lift-bench-stats"
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
-          tar -czf "${TAR_NAME}" -C dist/lift .
+          tar -czf "${TAR_NAME}" -C "$package_dir" .
+          .github/scripts/verify_lift_archive.sh "$TAR_NAME"
       - name: Upload lift workflow artifact
         uses: actions/upload-artifact@v4
         with:

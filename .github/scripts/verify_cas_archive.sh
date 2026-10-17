@@ -51,7 +51,6 @@ expected_members=(
   cas-session-inquiry
   cas-conformance-suite
   cas-goal
-  cas-perf-budget-governor
 )
 
 expected_normalized="$scratch/expected-normalized"
@@ -106,6 +105,15 @@ for name in "${expected_members[@]}"; do
   fi
   if [[ -n "$(find "$payload" -type f -links +1 -print -quit)" ]]; then
     echo "CAS archive member must not be a hard link: $name" >&2
+    exit 1
+  fi
+done
+
+# Compatibility copies must carry exactly the corresponding functional binary.
+for stem in smoke_check instance_runner review_session session_inquiry conformance_suite goal; do
+  alias_name="cas-${stem//_/-}"
+  if ! cmp -s "$payload_dir/cas_$stem" "$payload_dir/$alias_name"; then
+    echo "CAS compatibility copy differs from cas_$stem: $alias_name" >&2
     exit 1
   fi
 done

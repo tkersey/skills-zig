@@ -243,6 +243,13 @@ pub fn build(ctx: BuildContext, shared: SharedModules) CasBuild {
     const commands = CasCommandModules.init(ctx, shared, runtime, meta);
     const admin = CasAdminModules.init(ctx, shared, runtime, meta);
     const artifacts = CasArtifacts.init(ctx, commands, admin, release);
+    const budget_perf = support.addExecutable(b, "cas-perf-budget-governor", admin.budget_perf);
+    support.addBenchStep(
+        b,
+        budget_perf,
+        "bench-cas-budget-governor",
+        "Run budget_governor performance harness",
+    );
     const tests = b.step("test-cas", "Run all cas tests");
     addCasCommandTests(b, commands, tests);
     addCasRuntimeTests(b, runtime, tests);
@@ -259,8 +266,7 @@ pub fn build(ctx: BuildContext, shared: SharedModules) CasBuild {
                 &artifacts.review.install.step,      &artifacts.inquiry.install.step,
                 &artifacts.conformance.install.step, &artifacts.goal.install.step,
                 &artifacts.account.install.step,     &artifacts.preflight.install.step,
-                &artifacts.budget_perf.install.step, &artifacts.dispatcher.install.step,
-                &artifacts.automation.install.step,
+                &artifacts.dispatcher.install.step,  &artifacts.automation.install.step,
             },
             .test_deps = &.{tests},
         }),
@@ -276,7 +282,6 @@ const CasArtifacts = struct {
     goal: InstalledExecutable,
     account: InstalledExecutable,
     preflight: InstalledExecutable,
-    budget_perf: InstalledExecutable,
     dispatcher: InstalledExecutable,
     automation: InstalledExecutable,
 
@@ -304,11 +309,6 @@ const CasArtifacts = struct {
                 "cas_app_server_preflight",
                 admin.preflight,
             ),
-            .budget_perf = support.addInstalledExecutable(
-                b,
-                "cas-perf-budget-governor",
-                admin.budget_perf,
-            ),
             .dispatcher = support.addInstalledExecutable(b, "cas", admin.dispatcher),
             .automation = support.addInstalledExecutable(b, "cas_automation", admin.automation),
         };
@@ -328,14 +328,7 @@ const CasArtifacts = struct {
             result.inquiry.exe,
             result.conformance.exe,
             result.goal.exe,
-            result.budget_perf.exe,
         });
-        support.addBenchStep(
-            b,
-            result.budget_perf.exe,
-            "bench-cas-budget-governor",
-            "Run budget_governor performance harness",
-        );
         return result;
     }
 };

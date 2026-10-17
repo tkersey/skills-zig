@@ -30,7 +30,6 @@ pub fn build(b: *std.Build) void {
         cas.surface,
         ledger.surface,
         @import("build/apps/memory-note.zig").build(ctx, shared),
-        @import("build/apps/typesafe.zig").build(ctx, shared),
     };
     for (surfaces) |surface| {
         _ = support.addGroupedStep(

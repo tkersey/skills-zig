@@ -86,8 +86,7 @@ jobs:
               for binary in \
                 cas cas_account cas_app_server_preflight cas_automation \
                 cas_smoke_check cas_instance_runner cas_review_session \
-                cas_session_inquiry cas_conformance_suite cas_goal \
-                cas-perf-budget-governor; do
+                cas_session_inquiry cas_conformance_suite cas_goal; do
                 if objdump -p "zig-out/bin/${binary}" | grep -Fq NEEDED; then
                   echo "CAS release binary is dynamically linked: ${binary}" >&2
                   exit 1
@@ -129,25 +128,25 @@ jobs:
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
-          mkdir -p dist/cas
-          cp zig-out/bin/cas dist/cas/cas
-          cp zig-out/bin/cas_account dist/cas/cas_account
-          cp zig-out/bin/cas_app_server_preflight dist/cas/cas_app_server_preflight
-          cp zig-out/bin/cas_automation dist/cas/cas_automation
-          cp zig-out/bin/cas_smoke_check dist/cas/cas_smoke_check
-          cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
-          cp zig-out/bin/cas_instance_runner dist/cas/cas_instance_runner
-          cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
-          cp zig-out/bin/cas_review_session dist/cas/cas_review_session
-          cp zig-out/bin/cas_review_session dist/cas/cas-review-session
-          cp zig-out/bin/cas_session_inquiry dist/cas/cas_session_inquiry
-          cp zig-out/bin/cas_session_inquiry dist/cas/cas-session-inquiry
-          cp zig-out/bin/cas_conformance_suite dist/cas/cas_conformance_suite
-          cp zig-out/bin/cas_conformance_suite dist/cas/cas-conformance-suite
-          cp zig-out/bin/cas_goal dist/cas/cas_goal
-          cp zig-out/bin/cas_goal dist/cas/cas-goal
-          cp zig-out/bin/cas-perf-budget-governor dist/cas/cas-perf-budget-governor
-          tar -czf "${TAR_NAME}" -C dist/cas .
+          package_dir="$(mktemp -d)"
+          trap 'rm -rf "$package_dir"' EXIT
+          cp zig-out/bin/cas "${package_dir}/cas"
+          cp zig-out/bin/cas_account "${package_dir}/cas_account"
+          cp zig-out/bin/cas_app_server_preflight "${package_dir}/cas_app_server_preflight"
+          cp zig-out/bin/cas_automation "${package_dir}/cas_automation"
+          cp zig-out/bin/cas_smoke_check "${package_dir}/cas_smoke_check"
+          cp zig-out/bin/cas_smoke_check "${package_dir}/cas-smoke-check"
+          cp zig-out/bin/cas_instance_runner "${package_dir}/cas_instance_runner"
+          cp zig-out/bin/cas_instance_runner "${package_dir}/cas-instance-runner"
+          cp zig-out/bin/cas_review_session "${package_dir}/cas_review_session"
+          cp zig-out/bin/cas_review_session "${package_dir}/cas-review-session"
+          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas_session_inquiry"
+          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas-session-inquiry"
+          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas_conformance_suite"
+          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas-conformance-suite"
+          cp zig-out/bin/cas_goal "${package_dir}/cas_goal"
+          cp zig-out/bin/cas_goal "${package_dir}/cas-goal"
+          tar -czf "${TAR_NAME}" -C "$package_dir" .
       - name: Verify platform-specific cas archive contents
         run: .github/scripts/verify_cas_archive.sh "${{ matrix.target }}" "${TAR_NAME}"
       - name: Upload cas workflow artifact
