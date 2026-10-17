@@ -180,23 +180,36 @@ pub const OwnedGovernor = struct {
     }
 };
 
-// The returned owner retains an input-bounded parsed tree. CLI input is capped
-// at 16 MiB; every string is owned even when the original input is overwritten.
+// Only four output strings come from the input. Retain those in the returned
+// owner; the parsed tree is temporary. CLI input remains capped at 16 MiB.
 pub fn computeBudgetGovernorFromSlice(
     allocator: std.mem.Allocator,
     input: []const u8,
     now_sec: i64,
 ) !OwnedGovernor {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{
-        .allocate = .alloc_always,
-    });
+    var buffer: [4096]u8 = undefined;
+    var scratch = std.heap.BufferFirstAllocator.init(&buffer, allocator);
+    var parse_arena = std.heap.ArenaAllocator.init(scratch.allocator());
+    defer parse_arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        parse_arena.allocator(),
+        input,
+        .{ .allocate = .alloc_if_needed },
+    );
     const root = switch (parsed) {
         .object => |obj| obj,
         else => return error.ExpectedJsonObject,
     };
-    return .{ .value = computeBudgetGovernor(root, now_sec), .arena = arena };
+    var value = computeBudgetGovernor(root, now_sec);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    inline for (.{ "bucketKey", "limitId", "limitName", "planType" }) |field| {
+        if (@field(value, field)) |text| {
+            @field(value, field) = try arena.allocator().dupe(u8, text);
+        }
+    }
+    return .{ .value = value, .arena = arena };
 }
 
 const ParsedArgs = struct {
@@ -615,7 +628,7 @@ test "pacing arithmetic accepts the full timestamp and duration domain" {
     try std.testing.expectEqual(@as(?f64, 100), past.elapsedPercent);
 }
 
-test "owned governor preserves escaped fields after freeing its input" {
+test "owned governor preserves plain and escaped fields after freeing its input" {
     try @import("test_support").checkAllAllocationFailures(
         std.testing.allocator,
         checkOwnedGovernor,
@@ -624,11 +637,22 @@ test "owned governor preserves escaped fields after freeing its input" {
 }
 
 fn checkOwnedGovernor(allocator: std.mem.Allocator) !void {
-    const json =
+    const escaped =
         \\{"rateLimitsByLimitId":{"team\u002dlimit":{"limitId":"id\u002d1",
         \\"limitName":"team\u0020quota","planType":"pro\u0020plan",
         \\"primary":{"usedPercent":50,"resetsAt":200,"windowDurationMins":100}}}}
     ;
+    const plain =
+        \\{"rateLimitsByLimitId":{"team-limit":{"limitId":"id-1",
+        \\"limitName":"team quota","planType":"pro plan",
+        \\"primary":{"usedPercent":50,"resetsAt":200,"windowDurationMins":100}}}}
+    ;
+    for ([_][]const u8{ plain, escaped }) |json| {
+        try checkOwnedGovernorInput(allocator, json);
+    }
+}
+
+fn checkOwnedGovernorInput(allocator: std.mem.Allocator, json: []const u8) !void {
     var owned = blk: {
         const input = try allocator.dupe(u8, json);
         defer allocator.free(input);
@@ -641,4 +665,31 @@ fn checkOwnedGovernor(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("id-1", owned.value.limitId.?);
     try std.testing.expectEqualStrings("team quota", owned.value.limitName.?);
     try std.testing.expectEqualStrings("pro plan", owned.value.planType.?);
+}
+
+test "owned governor survives scratch spill and allocation failure" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkLargeOwnedGovernor,
+        .{},
+    );
+}
+
+fn checkLargeOwnedGovernor(allocator: std.mem.Allocator) !void {
+    const expected: [8192]u8 = @splat('a');
+    const escaped = try allocator.alloc(u8, expected.len * 6);
+    defer allocator.free(escaped);
+    for (0..expected.len) |i| @memcpy(escaped[i * 6 ..][0..6], "\\u0061");
+    var owned = blk: {
+        const input = try allocator.print(
+            "{{\"rateLimits\":{{\"limitName\":\"{s}\",\"primary\":{{\"usedPercent\":50}}}}}}",
+            .{escaped},
+        );
+        defer allocator.free(input);
+        const result = try computeBudgetGovernorFromSlice(allocator, input, 100);
+        @memset(input, '?');
+        break :blk result;
+    };
+    defer owned.deinit();
+    try std.testing.expectEqualStrings(&expected, owned.value.limitName.?);
 }
